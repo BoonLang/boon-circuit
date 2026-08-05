@@ -209,6 +209,16 @@ pub enum OwnerConstraintEdgeRole {
     ThenOutput,
     InfixLeft,
     InfixRight,
+    MatchSelector,
+    MatchBinding {
+        name: String,
+    },
+    /// A read of the exact selector inside one pattern arm. The projection is
+    /// relative to that selector and is inferred against an arm-local payload,
+    /// not against the callable's public parameter contract.
+    MatchNarrowedSelector {
+        projection: Box<[String]>,
+    },
     MatchOutput,
     BlockBinding {
         name: String,
@@ -586,6 +596,7 @@ impl OwnerInterfaceScc {
 pub struct OwnerInterfaceTopology {
     pub sccs: Box<[OwnerInterfaceScc]>,
     pub stats: ProjectionGraphStats,
+    scc_by_owner: BTreeMap<StableCheckOwnerKey, usize>,
     fingerprint_v1: [u8; 32],
 }
 
@@ -595,9 +606,7 @@ impl OwnerInterfaceTopology {
     }
 
     pub fn scc_for_owner(&self, owner: &StableCheckOwnerKey) -> Option<&OwnerInterfaceScc> {
-        self.sccs
-            .iter()
-            .find(|scc| scc.key.members.binary_search(owner).is_ok())
+        self.sccs.get(*self.scc_by_owner.get(owner)?)
     }
 }
 
@@ -633,9 +642,21 @@ pub fn build_owner_interface_topology<'a>(
         owner_by_projection.insert(projection, summary.owner.clone());
     }
 
+    // `OwnerConstraintSummary` retains both semantic interface dependencies
+    // and reverse actual/PASS currentness edges. Only dependencies consumed by
+    // the summary's own public interface participate in the solve graph. The
+    // reverse edges remain in the summary for invalidation and checked-body
+    // currentness, but must not collapse an ordinary one-way call graph into a
+    // project-wide interface SCC.
     let mut edges = summaries
         .iter()
-        .flat_map(|summary| summary.dependencies.iter().cloned())
+        .flat_map(|summary| {
+            summary
+                .dependencies
+                .iter()
+                .filter(|edge| edge.request == summary.owner)
+                .cloned()
+        })
         .collect::<Vec<_>>();
     edges.sort();
     edges.dedup();
@@ -715,14 +736,17 @@ pub fn build_owner_interface_topology<'a>(
         });
     }
 
+    let mut topology_edges_by_component = std::iter::repeat_with(Vec::new)
+        .take(component_keys.len())
+        .collect::<Vec<_>>();
+    for edge in topology_edges {
+        let component = component_by_owner[&edge.request];
+        topology_edges_by_component[component].push(edge);
+    }
+
     let mut sccs = Vec::with_capacity(component_keys.len());
     for (component, key) in component_keys.iter().cloned().enumerate() {
-        let members = key.members.iter().cloned().collect::<BTreeSet<_>>();
-        let component_edges = topology_edges
-            .iter()
-            .filter(|edge| members.contains(&edge.request))
-            .cloned()
-            .collect::<Vec<_>>();
+        let component_edges = std::mem::take(&mut topology_edges_by_component[component]);
         let dependency_components = component_edges
             .iter()
             .map(|edge| component_by_owner[&edge.dependency])
@@ -740,10 +764,15 @@ pub fn build_owner_interface_topology<'a>(
             .iter()
             .map(|dependency| component_keys[*dependency].clone())
             .collect::<Vec<_>>();
-        let member_fingerprints = summaries
+        let member_fingerprints = key
+            .members
             .iter()
-            .filter(|summary| members.contains(&summary.owner))
-            .map(|summary| {
+            .map(|member| {
+                let summary = summaries
+                    .binary_search_by(|summary| summary.owner.cmp(member))
+                    .ok()
+                    .map(|index| summaries[index])
+                    .expect("component member has a registered owner summary");
                 (
                     stable_check_owner_key_fingerprint_v1(&summary.owner),
                     summary.topology_fingerprint_v1(),
@@ -781,6 +810,7 @@ pub fn build_owner_interface_topology<'a>(
     Ok(OwnerInterfaceTopology {
         sccs: sccs.into_boxed_slice(),
         stats,
+        scc_by_owner: component_by_owner,
         fingerprint_v1,
     })
 }
@@ -930,6 +960,9 @@ fn append_callable_interface_dependencies(
             | OwnerConstraintEdgeRole::ThenOutput
             | OwnerConstraintEdgeRole::InfixLeft
             | OwnerConstraintEdgeRole::InfixRight
+            | OwnerConstraintEdgeRole::MatchSelector
+            | OwnerConstraintEdgeRole::MatchBinding { .. }
+            | OwnerConstraintEdgeRole::MatchNarrowedSelector { .. }
             | OwnerConstraintEdgeRole::MatchOutput
             | OwnerConstraintEdgeRole::BlockBinding { .. }
             | OwnerConstraintEdgeRole::BlockResult
@@ -1326,6 +1359,17 @@ fn project_expression(
             pass,
             arms,
         } => {
+            if op == "WHILE" {
+                push_edge(&mut inputs, OwnerConstraintEdgeRole::WhenInput, *input)?;
+                for arm in arms {
+                    push_edge(&mut inputs, OwnerConstraintEdgeRole::WhenArm, *arm)?;
+                }
+                return Ok(OwnerExpressionConstraint {
+                    expression: expression.stable_key.clone(),
+                    kind: OwnerConstraintNodeKind::When,
+                    inputs: inputs.into_boxed_slice(),
+                });
+            }
             references.insert(OwnerSymbolReference {
                 expression: expression.stable_key.clone(),
                 kind: OwnerReferenceKind::Callable,
@@ -1398,6 +1442,13 @@ fn project_expression(
             pattern: value,
             output,
         } => {
+            if let Some(selector) = expression.pattern_selector {
+                push_edge(
+                    &mut inputs,
+                    OwnerConstraintEdgeRole::MatchSelector,
+                    selector as usize,
+                )?;
+            }
             if let Some(output) = output {
                 push_edge(&mut inputs, OwnerConstraintEdgeRole::MatchOutput, *output)?;
             }
@@ -1486,6 +1537,294 @@ fn project_expression(
         kind,
         inputs: inputs.into_boxed_slice(),
     })
+}
+
+fn pattern_constraint_names(pattern: &OwnerPatternConstraint) -> BTreeSet<String> {
+    match pattern {
+        OwnerPatternConstraint::Binding { name } => BTreeSet::from([name.clone()]),
+        OwnerPatternConstraint::Tag { fields, .. } => fields.iter().cloned().collect(),
+        OwnerPatternConstraint::Wildcard
+        | OwnerPatternConstraint::Number
+        | OwnerPatternConstraint::Text
+        | OwnerPatternConstraint::Bits { .. }
+        | OwnerPatternConstraint::Invalid => BTreeSet::new(),
+    }
+}
+
+fn collect_pattern_binding_reads(
+    expressions: &[OwnerExpressionConstraint],
+    reference: u32,
+    active_names: &BTreeSet<String>,
+    reads: &mut BTreeSet<(String, u32)>,
+    active_expressions: &mut BTreeSet<u32>,
+) {
+    let Some(expression) = expressions.get(reference as usize) else {
+        return;
+    };
+    if !active_expressions.insert(reference) {
+        return;
+    }
+    if let OwnerConstraintNodeKind::Reference { parts } = &expression.kind
+        && let Some(name) = parts.first()
+        && active_names.contains(name)
+    {
+        reads.insert((name.clone(), reference));
+        active_expressions.remove(&reference);
+        return;
+    }
+    match &expression.kind {
+        OwnerConstraintNodeKind::Block => {
+            let mut visible = active_names.clone();
+            for input in &expression.inputs {
+                match &input.role {
+                    OwnerConstraintEdgeRole::BlockBinding { name } => {
+                        collect_pattern_binding_reads(
+                            expressions,
+                            input.expression,
+                            &visible,
+                            reads,
+                            active_expressions,
+                        );
+                        visible.remove(name);
+                    }
+                    OwnerConstraintEdgeRole::BlockResult => collect_pattern_binding_reads(
+                        expressions,
+                        input.expression,
+                        &visible,
+                        reads,
+                        active_expressions,
+                    ),
+                    _ => {}
+                }
+            }
+        }
+        OwnerConstraintNodeKind::MatchArm { pattern }
+        | OwnerConstraintNodeKind::Arrow { pattern } => {
+            let mut output_names = active_names.clone();
+            for name in pattern_constraint_names(pattern) {
+                output_names.remove(&name);
+            }
+            for input in &expression.inputs {
+                let names = if matches!(
+                    input.role,
+                    OwnerConstraintEdgeRole::MatchOutput | OwnerConstraintEdgeRole::ArrowOutput
+                ) {
+                    &output_names
+                } else {
+                    active_names
+                };
+                collect_pattern_binding_reads(
+                    expressions,
+                    input.expression,
+                    names,
+                    reads,
+                    active_expressions,
+                );
+            }
+        }
+        _ => {
+            for input in &expression.inputs {
+                collect_pattern_binding_reads(
+                    expressions,
+                    input.expression,
+                    active_names,
+                    reads,
+                    active_expressions,
+                );
+            }
+        }
+    }
+    active_expressions.remove(&reference);
+}
+
+fn collect_match_narrowed_selector_reads(
+    expressions: &[OwnerExpressionConstraint],
+    reference: u32,
+    selector_parts: &[String],
+    selector_visible: bool,
+    reads: &mut BTreeSet<(Vec<String>, u32)>,
+    active_expressions: &mut BTreeSet<u32>,
+) {
+    let Some(expression) = expressions.get(reference as usize) else {
+        return;
+    };
+    if !active_expressions.insert(reference) {
+        return;
+    }
+    if selector_visible
+        && let OwnerConstraintNodeKind::Reference { parts }
+        | OwnerConstraintNodeKind::Drain { parts } = &expression.kind
+        && parts.starts_with(selector_parts)
+    {
+        reads.insert((parts[selector_parts.len()..].to_vec(), reference));
+        active_expressions.remove(&reference);
+        return;
+    }
+    match &expression.kind {
+        OwnerConstraintNodeKind::Block => {
+            let mut visible = selector_visible;
+            for input in &expression.inputs {
+                match &input.role {
+                    OwnerConstraintEdgeRole::BlockBinding { name } => {
+                        collect_match_narrowed_selector_reads(
+                            expressions,
+                            input.expression,
+                            selector_parts,
+                            visible,
+                            reads,
+                            active_expressions,
+                        );
+                        if selector_parts.first() == Some(name) {
+                            visible = false;
+                        }
+                    }
+                    OwnerConstraintEdgeRole::BlockResult => {
+                        collect_match_narrowed_selector_reads(
+                            expressions,
+                            input.expression,
+                            selector_parts,
+                            visible,
+                            reads,
+                            active_expressions,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        OwnerConstraintNodeKind::MatchArm { pattern }
+        | OwnerConstraintNodeKind::Arrow { pattern } => {
+            let output_visible = selector_visible
+                && selector_parts
+                    .first()
+                    .is_none_or(|root| !pattern_constraint_names(pattern).contains(root));
+            for input in &expression.inputs {
+                let visible = if matches!(
+                    input.role,
+                    OwnerConstraintEdgeRole::MatchOutput | OwnerConstraintEdgeRole::ArrowOutput
+                ) {
+                    output_visible
+                } else {
+                    selector_visible
+                };
+                collect_match_narrowed_selector_reads(
+                    expressions,
+                    input.expression,
+                    selector_parts,
+                    visible,
+                    reads,
+                    active_expressions,
+                );
+            }
+        }
+        _ => {
+            for input in &expression.inputs {
+                collect_match_narrowed_selector_reads(
+                    expressions,
+                    input.expression,
+                    selector_parts,
+                    selector_visible,
+                    reads,
+                    active_expressions,
+                );
+            }
+        }
+    }
+    active_expressions.remove(&reference);
+}
+
+fn attach_pattern_binding_constraints(
+    expressions: &mut [OwnerExpressionConstraint],
+    references: &mut BTreeSet<OwnerSymbolReference>,
+) {
+    let mut bindings = Vec::new();
+    let mut narrowed_selectors = Vec::new();
+    for (arm, expression) in expressions.iter().enumerate() {
+        let OwnerConstraintNodeKind::MatchArm { pattern } = &expression.kind else {
+            continue;
+        };
+        if !expression
+            .inputs
+            .iter()
+            .any(|input| matches!(input.role, OwnerConstraintEdgeRole::MatchSelector))
+        {
+            continue;
+        }
+        let Some(output) = expression.inputs.iter().find_map(|input| {
+            matches!(input.role, OwnerConstraintEdgeRole::MatchOutput).then_some(input.expression)
+        }) else {
+            continue;
+        };
+        let names = pattern_constraint_names(pattern);
+        let mut reads = BTreeSet::new();
+        collect_pattern_binding_reads(
+            expressions,
+            output,
+            &names,
+            &mut reads,
+            &mut BTreeSet::new(),
+        );
+        bindings.push((arm, reads));
+
+        if !matches!(
+            pattern,
+            OwnerPatternConstraint::Wildcard
+                | OwnerPatternConstraint::Binding { .. }
+                | OwnerPatternConstraint::Invalid
+        ) && let Some(selector) = expression.inputs.iter().find_map(|input| {
+            matches!(input.role, OwnerConstraintEdgeRole::MatchSelector).then_some(input.expression)
+        }) && let Some(
+            OwnerConstraintNodeKind::Reference { parts } | OwnerConstraintNodeKind::Drain { parts },
+        ) = expressions
+            .get(selector as usize)
+            .map(|expression| &expression.kind)
+        {
+            let mut reads = BTreeSet::new();
+            collect_match_narrowed_selector_reads(
+                expressions,
+                output,
+                parts,
+                true,
+                &mut reads,
+                &mut BTreeSet::new(),
+            );
+            narrowed_selectors.push((arm, reads));
+        }
+    }
+    for (arm, reads) in bindings {
+        for (name, read) in reads {
+            let expression = expressions[read as usize].expression.clone();
+            references.retain(|reference| reference.expression != expression);
+            expressions[arm].inputs = expressions[arm]
+                .inputs
+                .iter()
+                .cloned()
+                .chain([OwnerConstraintEdge {
+                    role: OwnerConstraintEdgeRole::MatchBinding { name },
+                    expression: read,
+                }])
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+        }
+    }
+    for (arm, reads) in narrowed_selectors {
+        expressions[arm].inputs = expressions[arm]
+            .inputs
+            .iter()
+            .cloned()
+            .chain(
+                reads
+                    .into_iter()
+                    .map(|(projection, expression)| OwnerConstraintEdge {
+                        role: OwnerConstraintEdgeRole::MatchNarrowedSelector {
+                            projection: projection.into_boxed_slice(),
+                        },
+                        expression,
+                    }),
+            )
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+    }
 }
 
 fn static_bits_width_argument(function: &str) -> Option<&'static str> {
@@ -1962,11 +2301,12 @@ pub fn project_owner_constraint_seed(
         })
         .collect::<Vec<_>>();
     let mut references = BTreeSet::new();
-    let expressions = input
+    let mut expressions = input
         .expressions
         .iter()
         .map(|expression| project_expression(expression, &mut references))
         .collect::<Result<Vec<_>, _>>()?;
+    attach_pattern_binding_constraints(&mut expressions, &mut references);
     let expression_flush_plans = project_expression_flush_plans(input, &syntax_graph);
     let source_payload_queries =
         project_source_payload_queries(input, &statement_values, &expressions)?;
@@ -2130,6 +2470,41 @@ mod tests {
     }
 
     #[test]
+    fn while_is_a_control_constraint_without_a_callable_reference() {
+        let unit = link(concat!(
+            "value: True |> WHILE {\n",
+            "    True => 1\n",
+            "    False => 2\n",
+            "}\n",
+        ));
+        let owner = owner_named(&unit, "value");
+        let seed = summary(&unit, &owner);
+
+        assert!(seed.references.iter().all(|reference| {
+            reference.kind != OwnerReferenceKind::Callable || reference.parts.as_ref() != ["WHILE"]
+        }));
+        let while_constraint = seed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(expression.kind, OwnerConstraintNodeKind::When)
+                    && expression
+                        .inputs
+                        .iter()
+                        .any(|input| matches!(input.role, OwnerConstraintEdgeRole::WhenInput))
+            })
+            .expect("WHILE control constraint");
+        assert_eq!(
+            while_constraint
+                .inputs
+                .iter()
+                .filter(|input| matches!(input.role, OwnerConstraintEdgeRole::WhenArm))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn body_constraint_changes_preserve_dependency_topology() {
         let before = link("FUNCTION identity(input) {\n    input\n}\n");
         let after = link("FUNCTION identity(input) {\n    input + 0\n}\n");
@@ -2214,8 +2589,8 @@ mod tests {
             Some(1),
         )));
         assert!(edges.contains(&(
-            callable,
-            caller,
+            callable.clone(),
+            caller.clone(),
             OwnerConstraintDependencyKind::PassedContext,
             None,
         )));
@@ -2223,11 +2598,12 @@ mod tests {
         let callable_summary = resolve_owner_constraint_seed(&callable_seed, []).unwrap();
         let topology = build_owner_interface_topology([&callable_summary, &resolved]).unwrap();
         assert_eq!(topology.stats.nodes, 2);
-        assert_eq!(topology.stats.components, 1);
-        assert_eq!(topology.stats.cyclic_components, 1);
-        assert_eq!(topology.sccs.len(), 1);
-        assert_eq!(topology.sccs[0].key.members.len(), 2);
-        assert!(topology.sccs[0].dependencies.is_empty());
+        assert_eq!(topology.stats.components, 2);
+        assert_eq!(topology.stats.cyclic_components, 0);
+        let callable_scc = topology.scc_for_owner(&callable).unwrap();
+        let caller_scc = topology.scc_for_owner(&caller).unwrap();
+        assert!(callable_scc.dependencies.is_empty());
+        assert_eq!(caller_scc.dependencies.as_ref(), [callable_scc.key.clone()]);
     }
 
     #[test]

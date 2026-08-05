@@ -2233,3 +2233,32 @@ unknown: missing_value
         editor.report.render_slot_failure_count
     );
 }
+
+#[test]
+fn tagged_payloads_satisfy_structural_object_parameters() {
+    let actual = Type::VariantSet(
+        vec![Variant::Tagged {
+            tag: "VariableRow".to_owned(),
+            fields: SharedObjectShape::new(ObjectShape::from_ordered_fields(
+                [
+                    (
+                        "item_kind".to_owned(),
+                        Type::VariantSet(vec![Variant::Tag("VariableRow".to_owned())].into()),
+                    ),
+                    ("base".to_owned(), Type::Number),
+                ],
+                false,
+            )),
+        }]
+        .into(),
+    );
+    let expected = Type::object(ObjectShape::from_ordered_fields(
+        [
+            ("item_kind".to_owned(), Type::Unknown),
+            ("base".to_owned(), Type::Number),
+        ],
+        false,
+    ));
+
+    assert!(type_is_assignable_to(&actual, &expected));
+}

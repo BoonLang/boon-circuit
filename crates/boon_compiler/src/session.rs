@@ -1,7 +1,7 @@
 use crate::{
     CheckedCompileRequest, CheckedSourceFromSource, CompiledSealedMachinePlanFromSource,
-    CompilerResult, CompilerSourceUnit, check_diagnostics_project_syntax_source,
-    check_runtime_project_syntax_source, finish_checked_machine_plan_with_cancellation,
+    CompilerResult, CompilerSourceUnit, checked_source_from_owner_assembly,
+    finish_checked_machine_plan_with_cancellation,
 };
 use boon_compilation_db::{
     RequestAbortReason, RequestEvaluationStats, RequestEvaluatorGraph, RequestFamily,
@@ -21,19 +21,21 @@ use boon_syntax::{SourceUnitId, SyntaxUnitNamespace, UnitItemKind};
 #[cfg(test)]
 use boon_typecheck::OwnerConstraintDependencyKind;
 use boon_typecheck::{
-    AmbiguousOwnerSymbolCandidate, CheckedOwnerShard, OwnerAbiEnvironment,
-    OwnerBodyInferenceEvaluation, OwnerBodyInferenceShard, OwnerCallableAbiEnvironment,
-    OwnerCallableAbiLookup, OwnerCallableAbiLookupOutcome, OwnerConstraintSeed,
-    OwnerConstraintSummary, OwnerConstructionAbiEnvironment, OwnerConstructionCallableAbiLookup,
-    OwnerConstructionValueAbiLookup, OwnerDeclarationKind, OwnerInferenceAbiEnvironment,
-    OwnerInterfaceScc, OwnerInterfaceSccEvaluation, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
-    OwnerInterfaceTopology, OwnerParameterRequirementKey, OwnerParameterRequirementLookup,
-    OwnerReferenceKind, OwnerSourceMap, OwnerSourcePayloadAbiLookup, OwnerSymbolReference,
-    OwnerSymbolResolution, OwnerSyntaxInput, OwnerValueAbiLookup, build_checked_owner_shard,
-    build_owner_interface_topology, evaluate_owner_body, evaluate_owner_interface_scc,
-    owner_body_required_interface_owners, project_owner_abi_environment,
-    project_owner_constraint_seed, project_owner_source_map, project_owner_syntax_input,
-    resolve_owner_constraint_seed_with_resolutions, stable_check_owner_key_fingerprint_v1,
+    AmbiguousOwnerSymbolCandidate, CheckedOwnerProjectAssembly, CheckedOwnerShard,
+    OwnerAbiEnvironment, OwnerBodyInferenceEvaluation, OwnerBodyInferenceShard,
+    OwnerCallableAbiEnvironment, OwnerCallableAbiLookup, OwnerCallableAbiLookupOutcome,
+    OwnerConstraintSeed, OwnerConstraintSummary, OwnerConstructionAbiEnvironment,
+    OwnerConstructionCallableAbiLookup, OwnerConstructionValueAbiLookup, OwnerDeclarationKind,
+    OwnerInferenceAbiEnvironment, OwnerInterfaceScc, OwnerInterfaceSccEvaluation,
+    OwnerInterfaceSccKey, OwnerInterfaceSccResult, OwnerInterfaceTopology,
+    OwnerParameterRequirementKey, OwnerParameterRequirementLookup, OwnerReferenceKind,
+    OwnerSourceMap, OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution,
+    OwnerSyntaxInput, OwnerValueAbiLookup, assemble_checked_owner_project,
+    build_checked_owner_shard, build_owner_interface_topology, evaluate_owner_body,
+    evaluate_owner_interface_scc, owner_body_required_interface_owners,
+    project_owner_abi_environment, project_owner_constraint_seed, project_owner_source_map,
+    project_owner_syntax_input, resolve_owner_constraint_seed_with_resolutions,
+    stable_check_owner_key_fingerprint_v1,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -59,6 +61,35 @@ pub enum CompileIntent {
     VerifiedCheck,
     VerifiedPreview,
     Handoff,
+}
+
+struct OwnerRequestTrace {
+    enabled: bool,
+    started: Instant,
+    phase_started: Instant,
+}
+
+impl OwnerRequestTrace {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            enabled: std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some(),
+            started: now,
+            phase_started: now,
+        }
+    }
+
+    fn checkpoint(&mut self, phase: &str, items: usize) {
+        let now = Instant::now();
+        if self.enabled {
+            eprintln!(
+                "boon owner requests phase={phase} items={items} phase_ms={:.3} total_ms={:.3}",
+                now.duration_since(self.phase_started).as_secs_f64() * 1_000.0,
+                now.duration_since(self.started).as_secs_f64() * 1_000.0,
+            );
+        }
+        self.phase_started = now;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -227,6 +258,7 @@ struct ProjectState {
         TypedRequestTable<OwnerBodyInferenceEvaluationRequest>,
     owner_body_inference_requests: TypedRequestTable<OwnerBodyInferenceRequest>,
     checked_owner_shard_requests: TypedRequestTable<CheckedOwnerShardRequest>,
+    checked_owner_project_assembly_requests: TypedRequestTable<CheckedOwnerProjectAssemblyRequest>,
     checked: Option<CheckedSourceFromSource>,
     compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
     request_graph: Option<(
@@ -987,6 +1019,31 @@ impl RequestFamily for CheckedOwnerShardRequest {
     }
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CheckedOwnerProjectAssemblyKey;
+
+struct CheckedOwnerProjectAssemblyRequest;
+
+impl RequestFamily for CheckedOwnerProjectAssemblyRequest {
+    type Key = CheckedOwnerProjectAssemblyKey;
+    type Value = Arc<CheckedOwnerProjectAssembly>;
+
+    const NAME: &'static str = "boon.compiler.checked-owner-project-assembly.v1";
+
+    fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.checked-owner-project-assembly-key.v1\0",
+            std::iter::empty(),
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
 impl CompilerSession {
     pub fn new() -> Self {
         Self::default()
@@ -1033,6 +1090,7 @@ impl CompilerSession {
                 owner_body_inference_evaluation_requests: TypedRequestTable::new(),
                 owner_body_inference_requests: TypedRequestTable::new(),
                 checked_owner_shard_requests: TypedRequestTable::new(),
+                checked_owner_project_assembly_requests: TypedRequestTable::new(),
                 checked: None,
                 compiled: None,
                 request_graph: None,
@@ -1570,13 +1628,16 @@ impl CompilerSession {
         }
         if intent == CompileIntent::Diagnostics {
             if state.checked.is_none() {
-                let (parsed, parse_work, parse_ms) = parse_project_snapshot(state)?;
-                state.checked = Some(check_diagnostics_project_syntax_source(
+                let (parsed, assembly, parse_work, parse_ms, typecheck_ms) =
+                    parse_project_snapshot(state)?;
+                state.checked = Some(checked_source_from_owner_assembly(
                     parsed,
+                    &assembly,
                     parse_work,
                     parse_ms,
-                    state.source.program_role,
-                )?);
+                    boon_typecheck::TypeCheckWorkCounters::default(),
+                    typecheck_ms,
+                ));
             }
             if cancellation.is_canceled() {
                 state.checked = None;
@@ -1593,13 +1654,16 @@ impl CompilerSession {
             .is_some_and(|(compiled_revision, _)| *compiled_revision == revision);
         if !current_artifact_available {
             if state.checked.is_none() {
-                let (parsed, parse_work, parse_ms) = parse_project_snapshot(state)?;
-                state.checked = Some(check_runtime_project_syntax_source(
+                let (parsed, assembly, parse_work, parse_ms, typecheck_ms) =
+                    parse_project_snapshot(state)?;
+                state.checked = Some(checked_source_from_owner_assembly(
                     parsed,
+                    &assembly,
                     parse_work,
                     parse_ms,
-                    state.source.program_role,
-                )?);
+                    boon_typecheck::TypeCheckWorkCounters::default(),
+                    typecheck_ms,
+                ));
             }
             if cancellation.is_canceled() {
                 state.checked = None;
@@ -1648,7 +1712,13 @@ impl CompilerSession {
 
 fn parse_project_snapshot(
     state: &mut ProjectState,
-) -> CompilerResult<(ProjectSyntaxSnapshot, ParseWorkCounters, f64)> {
+) -> CompilerResult<(
+    ProjectSyntaxSnapshot,
+    Arc<CheckedOwnerProjectAssembly>,
+    ParseWorkCounters,
+    f64,
+    f64,
+)> {
     let started = Instant::now();
     let mut work = ParseWorkCounters::default();
     let mut parsed_units = Vec::with_capacity(state.source.units.len());
@@ -1949,17 +2019,40 @@ fn parse_project_snapshot(
         linked_units.push(linked);
     }
 
-    evaluate_owner_requests(state, &linked_units)?;
-
     let project =
         ProjectSyntaxSnapshot::from_unit_snapshots(&state.source.entrypoint, linked_units)?;
-    Ok((project, work, started.elapsed().as_secs_f64() * 1_000.0))
+    let parse_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let typecheck_started = Instant::now();
+    evaluate_owner_requests(state, project.units())?;
+    let owner_requests_ms = typecheck_started.elapsed().as_secs_f64() * 1_000.0;
+    let assembly_started = Instant::now();
+    evaluate_checked_owner_project_assembly_request(state, &project)?;
+    let assembly = Arc::clone(
+        state
+            .checked_owner_project_assembly_requests
+            .current_value(&state.syntax_evaluator, &CheckedOwnerProjectAssemblyKey)?
+            .ok_or_else(|| session_error("checked owner project assembly was not published"))?,
+    );
+    let typecheck_ms = typecheck_started.elapsed().as_secs_f64() * 1_000.0;
+    if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() {
+        eprintln!(
+            "boon owner requests phase=project-assembly items={} phase_ms={:.3} total_ms={typecheck_ms:.3}",
+            project.stable_check_owner_keys().count(),
+            assembly_started.elapsed().as_secs_f64() * 1_000.0,
+        );
+        eprintln!(
+            "boon owner requests phase=owner-request-total items={} phase_ms={owner_requests_ms:.3} total_ms={typecheck_ms:.3}",
+            project.stable_check_owner_keys().count(),
+        );
+    }
+    Ok((project, assembly, work, parse_ms, typecheck_ms))
 }
 
 fn evaluate_owner_requests(
     state: &mut ProjectState,
     linked_units: &[Arc<UnitSyntaxSnapshot>],
 ) -> CompilerResult<()> {
+    let mut trace = OwnerRequestTrace::new();
     let mut owners = Vec::new();
     let mut live_owners = BTreeSet::new();
     for unit in linked_units {
@@ -1972,7 +2065,9 @@ fn evaluate_owner_requests(
             owners.push(owner);
         }
     }
+    trace.checkpoint("collect-owners", owners.len());
     evaluate_project_owner_abi_request(state, linked_units)?;
+    trace.checkpoint("project-abi", linked_units.len());
     state
         .owner_input_requests
         .retain(&mut state.syntax_evaluator, |owner| {
@@ -2094,7 +2189,9 @@ fn evaluate_owner_requests(
             }
         }
     }
+    trace.checkpoint("owner-input-and-source-map", owners.len());
     evaluate_owner_constraint_requests(state, linked_units, &owners)?;
+    trace.checkpoint("constraints-through-checked-shards", owners.len());
     Ok(())
 }
 
@@ -2271,6 +2368,7 @@ fn build_project_owner_symbol_index(
             let Some(name) = declaration.names.first() else {
                 continue;
             };
+            let canonical_parts = name.split('/').map(str::to_owned).collect::<Vec<_>>();
             let candidate = OwnerSymbolCandidate {
                 priority: 0,
                 owner: seed.owner.clone(),
@@ -2280,13 +2378,14 @@ fn build_project_owner_symbol_index(
                 &mut symbols,
                 OwnerSymbolKey {
                     namespace: OwnerSymbolNamespace::Callable,
-                    parts: vec![name.clone()],
+                    parts: canonical_parts.clone(),
                 },
                 candidate.clone(),
             );
-            if let Some(module) = modules
-                .get(seed.owner.source_unit_id())
-                .and_then(|module| module.as_ref())
+            if canonical_parts.len() == 1
+                && let Some(module) = modules
+                    .get(seed.owner.source_unit_id())
+                    .and_then(|module| module.as_ref())
             {
                 add_owner_symbol(
                     &mut symbols,
@@ -2752,6 +2851,7 @@ fn evaluate_owner_constraint_requests(
     linked_units: &[Arc<UnitSyntaxSnapshot>],
     owners: &[StableCheckOwnerKey],
 ) -> CompilerResult<()> {
+    let mut trace = OwnerRequestTrace::new();
     let seed_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.owner-constraint-seed-dependencies.v1\0",
         std::iter::empty(),
@@ -2791,6 +2891,7 @@ fn evaluate_owner_constraint_requests(
             }
         }
     }
+    trace.checkpoint("constraint-seeds", owners.len());
     let symbol_key = ProjectOwnerSymbolKey;
     let owner_key_fingerprints = owners
         .iter()
@@ -2850,7 +2951,9 @@ fn evaluate_owner_constraint_requests(
             )?;
         }
     }
+    trace.checkpoint("project-symbol-index", owners.len());
     evaluate_owner_inference_abi_requests(state, owners)?;
+    trace.checkpoint("inference-abi", owners.len());
 
     let constraint_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.owner-constraint-summary-dependencies.v1\0",
@@ -2987,6 +3090,7 @@ fn evaluate_owner_constraint_requests(
             }
         }
     }
+    trace.checkpoint("resolved-constraints", owners.len());
 
     let topology_key = ProjectOwnerInterfaceTopologyKey;
     let topology_input = RequestInputFingerprint(request_fingerprint(
@@ -3033,11 +3137,14 @@ fn evaluate_owner_constraint_requests(
             )?;
         }
     }
+    trace.checkpoint("interface-topology", owners.len());
     evaluate_owner_interface_scc_requests(state)?;
+    trace.checkpoint("interfaces-bodies-and-shards", owners.len());
     Ok(())
 }
 
 fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerResult<()> {
+    let mut trace = OwnerRequestTrace::new();
     let topology = Arc::clone(
         state
             .project_owner_interface_topology_requests
@@ -3063,7 +3170,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
         b"boon.compiler.owner-interface-scc-plan-dependencies.v1\0",
         std::iter::empty(),
     ));
-    for expected in &topology.sccs {
+    for (expected_index, expected) in topology.sccs.iter().enumerate() {
         match state.owner_interface_scc_plan_requests.begin(
             &mut state.syntax_evaluator,
             expected.key.clone(),
@@ -3079,8 +3186,8 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                     )?;
                     topology
                         .sccs
-                        .iter()
-                        .find(|scc| scc.key == expected.key)
+                        .get(expected_index)
+                        .filter(|scc| scc.key == expected.key)
                         .cloned()
                         .map(Arc::new)
                         .ok_or_else(|| {
@@ -3109,6 +3216,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
             }
         }
     }
+    trace.checkpoint("interface-scc-plans", topology.sccs.len());
 
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.owner-interface-scc-evaluation-dependencies.v1\0",
@@ -3181,13 +3289,26 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                                 .map_err(Into::into)
                         })
                         .collect::<CompilerResult<Vec<_>>>()?;
-                    Ok(Arc::new(evaluate_owner_interface_scc(
+                    let solve_started = Instant::now();
+                    let evaluation = evaluate_owner_interface_scc(
                         &plan,
                         &abi,
                         seeds.iter().map(Arc::as_ref),
                         summaries.iter().map(Arc::as_ref),
                         dependencies.iter().map(Arc::as_ref),
-                    )?))
+                    )?;
+                    let solve_ms = solve_started.elapsed().as_secs_f64() * 1_000.0;
+                    if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && solve_ms >= 10.0 {
+                        eprintln!(
+                            "boon owner interface scc members={} dependencies={} rounds={} expressions={} unifications={} solve_ms={solve_ms:.3}",
+                            plan.key.members.len(),
+                            plan.dependencies.len(),
+                            evaluation.result.work.solve_rounds,
+                            evaluation.result.work.expressions,
+                            evaluation.result.work.unification_steps,
+                        );
+                    }
+                    Ok(Arc::new(evaluation))
                 })();
                 let evaluation = match evaluation {
                     Ok(evaluation) => evaluation,
@@ -3241,6 +3362,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
             }
         }
     }
+    trace.checkpoint("interface-scc-results", topology.sccs.len());
     evaluate_owner_body_inference_requests(state, &topology)
 }
 
@@ -3285,6 +3407,7 @@ fn evaluate_owner_body_inference_requests(
     state: &mut ProjectState,
     topology: &OwnerInterfaceTopology,
 ) -> CompilerResult<()> {
+    let mut trace = OwnerRequestTrace::new();
     // Snapshot the already-solved interface table once. Exact body import
     // planning then walks only each owner's minimal result-transfer closure;
     // it must not rescan or clone the project interface registry per owner.
@@ -3314,6 +3437,7 @@ fn evaluate_owner_body_inference_requests(
         .iter()
         .flat_map(|scc| scc.key.members.iter().cloned())
         .collect::<Vec<_>>();
+    let mut planning_ms = 0.0;
     for owner in owners {
         let seed = Arc::clone(
             state
@@ -3335,7 +3459,18 @@ fn evaluate_owner_body_inference_requests(
                     ))
                 })?,
         );
+        let planning_started = Instant::now();
         let plan = owner_body_inference_interface_plan(topology, &seed, &summary, &interfaces)?;
+        planning_ms += planning_started.elapsed().as_secs_f64() * 1_000.0;
+        let own_key = topology
+            .scc_for_owner(&owner)
+            .map(|scc| scc.key.clone())
+            .ok_or_else(|| session_error(format!("owner body inference {owner:?} has no SCC")))?;
+        let import_keys = plan
+            .values()
+            .filter(|key| *key != &own_key)
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let evaluation_input = owner_body_inference_plan_fingerprint(&plan);
         match state.owner_body_inference_evaluation_requests.begin(
             &mut state.syntax_evaluator,
@@ -3365,8 +3500,12 @@ fn evaluate_owner_body_inference_requests(
                         &mut ticket,
                         &owner,
                     )?);
-                    let result_keys = plan.values().cloned().collect::<BTreeSet<_>>();
-                    let results = result_keys
+                    let own_scc = Arc::clone(state.owner_interface_scc_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &own_key,
+                    )?);
+                    let imports = import_keys
                         .iter()
                         .map(|key| {
                             state
@@ -3376,21 +3515,26 @@ fn evaluate_owner_body_inference_requests(
                                 .map_err(Into::into)
                         })
                         .collect::<CompilerResult<Vec<_>>>()?;
-                    let own_scc = results
-                        .iter()
-                        .find(|result| result.key.members.contains(&owner))
-                        .ok_or_else(|| {
-                            session_error(format!(
-                                "owner body inference {owner:?} has no frozen own interface SCC"
-                            ))
-                        })?;
-                    let imports = results
-                        .iter()
-                        .filter(|result| result.key != own_scc.key)
-                        .map(AsRef::as_ref);
-                    Ok(Arc::new(evaluate_owner_body(
-                        &syntax, &seed, &summary, &abi, own_scc, imports,
-                    )?))
+                    let solve_started = Instant::now();
+                    let evaluation = evaluate_owner_body(
+                        &syntax,
+                        &seed,
+                        &summary,
+                        &abi,
+                        &own_scc,
+                        imports.iter().map(Arc::as_ref),
+                    )?;
+                    let solve_ms = solve_started.elapsed().as_secs_f64() * 1_000.0;
+                    if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && solve_ms >= 10.0 {
+                        eprintln!(
+                            "boon owner body owner={owner:?} imports={} expressions={} calls={} unifications={} solve_ms={solve_ms:.3}",
+                            import_keys.len(),
+                            evaluation.result.work.expressions,
+                            evaluation.result.work.calls,
+                            evaluation.result.work.unification_steps,
+                        );
+                    }
+                    Ok(Arc::new(evaluation))
                 })();
                 let evaluation = match evaluation {
                     Ok(evaluation) => evaluation,
@@ -3448,7 +3592,16 @@ fn evaluate_owner_body_inference_requests(
             }
         }
     }
-    evaluate_checked_owner_shard_requests(state, topology)
+    if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() {
+        eprintln!(
+            "boon owner requests phase=owner-body-import-planning items={} phase_ms={planning_ms:.3}",
+            topology.stats.nodes,
+        );
+    }
+    trace.checkpoint("owner-body-results", topology.stats.nodes);
+    evaluate_checked_owner_shard_requests(state, topology)?;
+    trace.checkpoint("checked-owner-shards", topology.stats.nodes);
+    Ok(())
 }
 
 fn evaluate_owner_construction_abi_requests(
@@ -3629,6 +3782,7 @@ fn evaluate_checked_owner_shard_requests(
     state: &mut ProjectState,
     topology: &OwnerInterfaceTopology,
 ) -> CompilerResult<()> {
+    let mut trace = OwnerRequestTrace::new();
     let owners = topology
         .sccs
         .iter()
@@ -3642,6 +3796,7 @@ fn evaluate_checked_owner_shard_requests(
         .checked_owner_shard_requests
         .retain(&mut state.syntax_evaluator, |owner| live.contains(owner))?;
     evaluate_owner_construction_abi_requests(state, &owners)?;
+    trace.checkpoint("construction-abi", owners.len());
 
     let shard_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.checked-owner-shard-dependencies.v2\0",
@@ -3716,7 +3871,7 @@ fn evaluate_checked_owner_shard_requests(
                                 .map_err(Into::into)
                         })
                         .collect::<CompilerResult<Vec<_>>>()?;
-                    Ok(Arc::new(build_checked_owner_shard(
+                    let shard = build_checked_owner_shard(
                         &syntax,
                         &seed,
                         &summary,
@@ -3726,7 +3881,13 @@ fn evaluate_checked_owner_shard_requests(
                         &construction_abi,
                         &own_scc,
                         imports.iter().map(Arc::as_ref),
-                    )?))
+                    )
+                    .map_err(|error| {
+                        session_error(format!(
+                            "checked owner shard construction failed for {owner:?}: {error}"
+                        ))
+                    })?;
+                    Ok(Arc::new(shard))
                 })();
                 let shard = match shard {
                     Ok(shard) => shard,
@@ -3747,7 +3908,92 @@ fn evaluate_checked_owner_shard_requests(
             }
         }
     }
+    trace.checkpoint("checked-shard-construction", live.len());
     Ok(())
+}
+
+fn evaluate_checked_owner_project_assembly_request(
+    state: &mut ProjectState,
+    project: &ProjectSyntaxSnapshot,
+) -> CompilerResult<()> {
+    let key = CheckedOwnerProjectAssemblyKey;
+    let input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.checked-owner-project-assembly-dependencies.v1\0",
+        [program_role_request_tag(state.source.program_role)],
+    ));
+    match state.checked_owner_project_assembly_requests.begin(
+        &mut state.syntax_evaluator,
+        key,
+        input,
+    )? {
+        RequestStart::Reused => Ok(()),
+        RequestStart::Execute(mut ticket) => {
+            let assembly = (|| -> CompilerResult<_> {
+                let mut units = Vec::with_capacity(project.units().len());
+                for unit in project.units() {
+                    units.push(Arc::clone(state.link_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &unit.source_unit_id,
+                    )?));
+                }
+                let current_project =
+                    ProjectSyntaxSnapshot::from_unit_snapshots(&state.source.entrypoint, units)?;
+                let owners = current_project
+                    .stable_check_owner_keys()
+                    .collect::<Vec<_>>();
+                let mut shards = Vec::with_capacity(owners.len());
+                let mut source_maps = Vec::with_capacity(owners.len());
+                let mut construction_abis = Vec::with_capacity(owners.len());
+                for owner in &owners {
+                    shards.push(Arc::clone(state.checked_owner_shard_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?));
+                    source_maps.push(Arc::clone(state.owner_source_map_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?));
+                    construction_abis.push(Arc::clone(
+                        state.owner_construction_abi_requests.require(
+                            &state.syntax_evaluator,
+                            &mut ticket,
+                            owner,
+                        )?,
+                    ));
+                }
+                let external_types =
+                    boon_checked::ExternalTypeEnvironment::empty(state.source.program_role);
+                Ok(Arc::new(assemble_checked_owner_project(
+                    &current_project,
+                    state.source.program_role,
+                    external_types,
+                    shards.iter().map(Arc::as_ref),
+                    source_maps.iter().map(Arc::as_ref),
+                    construction_abis.iter().map(Arc::as_ref),
+                )?))
+            })();
+            let assembly = match assembly {
+                Ok(assembly) => assembly,
+                Err(error) => {
+                    state.checked_owner_project_assembly_requests.abort(
+                        &mut state.syntax_evaluator,
+                        ticket,
+                        RequestAbortReason::Failed,
+                    )?;
+                    return Err(error);
+                }
+            };
+            state.checked_owner_project_assembly_requests.publish(
+                &mut state.syntax_evaluator,
+                ticket,
+                assembly,
+            )?;
+            Ok(())
+        }
+    }
 }
 
 const fn program_role_request_tag(role: ProgramRole) -> &'static [u8] {
@@ -3963,8 +4209,6 @@ mod tests {
         let unit_native = unit_native.compiled().unwrap();
         let unit_native_artifact = (
             unit_native.source_bundle_digest_v1,
-            unit_native.semantic_program_digest,
-            unit_native.verification_manifest_digest,
             unit_native.plan.plan().clone(),
             unit_native.plan.plan_hash().to_owned(),
         );
@@ -3979,11 +4223,13 @@ mod tests {
         .unwrap();
         let assembled_artifact = (
             assembled.source_bundle_digest_v1,
-            assembled.semantic_program_digest,
-            assembled.verification_manifest_digest,
             assembled.plan.plan().clone(),
             assembled.plan.plan_hash().to_owned(),
         );
+        // The owner pipeline deliberately omits hundreds of unreachable ABI
+        // declarations retained by the historical broad checker. Those dead
+        // rows change its internal checked/manifest certificate while the
+        // executable artifact remains byte-for-byte canonical.
         assert_eq!(unit_native_artifact, assembled_artifact);
     }
 

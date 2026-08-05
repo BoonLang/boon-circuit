@@ -669,7 +669,7 @@ pub struct OwnerCallResultPathRow {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerPatternBindingRow {
     pub declaration: OwnerDeclarationId,
-    pub selector: OwnerExpressionId,
+    pub selector: OwnerExpressionRef,
     pub projection: Vec<String>,
 }
 

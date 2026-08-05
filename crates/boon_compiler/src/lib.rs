@@ -741,34 +741,102 @@ fn check_source_with_ownership(
     )
 }
 
-pub(crate) fn check_diagnostics_project_syntax_source(
+pub(crate) fn checked_source_from_owner_assembly(
     syntax: ProjectSyntaxSnapshot,
+    assembly: &boon_typecheck::CheckedOwnerProjectAssembly,
     parse_work: ParseWorkCounters,
     parse_ms: f64,
-    program_role: ProgramRole,
-) -> CompilerResult<CheckedSourceFromSource> {
-    check_syntax_source_with_ownership(
-        CheckedSourceSyntax::UnitNative(syntax),
-        parse_work,
-        parse_ms,
-        program_role,
-        CheckedSourceOwnership::Diagnostics,
-    )
-}
-
-pub(crate) fn check_runtime_project_syntax_source(
-    syntax: ProjectSyntaxSnapshot,
-    parse_work: ParseWorkCounters,
-    parse_ms: f64,
-    program_role: ProgramRole,
-) -> CompilerResult<CheckedSourceFromSource> {
-    check_syntax_source_with_ownership(
-        CheckedSourceSyntax::UnitNative(syntax),
-        parse_work,
-        parse_ms,
-        program_role,
-        CheckedSourceOwnership::Runtime,
-    )
+    typecheck_work: boon_typecheck::TypeCheckWorkCounters,
+    typecheck_ms: f64,
+) -> CheckedSourceFromSource {
+    let fields = assembly.fields.clone();
+    let metadata = &fields.lowering_metadata;
+    let render_slot_failure_count = metadata
+        .render_slot_table
+        .slots
+        .iter()
+        .filter(|slot| !slot.diagnostics.is_empty())
+        .count();
+    let unresolved_type_variable_count = metadata.dynamic_fallback_count.saturating_sub(
+        metadata
+            .expr_type_table
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.flow_type.ty, boon_checked::Type::Unknown))
+            .count(),
+    );
+    let mut builtin_signature_coverage = syntax.operators().to_vec();
+    builtin_signature_coverage.extend(syntax.functions().iter().cloned());
+    builtin_signature_coverage.sort();
+    builtin_signature_coverage.dedup();
+    let report = boon_checked::TypeCheckReport {
+        expression_count: syntax.expression_count(),
+        checked_expression_count: fields.expressions.len(),
+        unresolved_type_variable_count,
+        dynamic_fallback_count: metadata.dynamic_fallback_count,
+        render_slot_count: metadata.render_slot_table.slots.len(),
+        render_slot_failure_count,
+        builtin_signature_coverage,
+        source_payload_shape_coverage: metadata
+            .source_payload_shape_table
+            .iter()
+            .map(|entry| entry.diagnostic_path.clone())
+            .collect(),
+        source_payload_shape_table: metadata.source_payload_shape_table.clone(),
+        host_port_table: metadata.host_port_table.clone(),
+        full_document_typecheck_coverage: fields.expressions.len() == syntax.expression_count(),
+        output_root_types: metadata.output_root_types.clone(),
+        expr_type_table: metadata.expr_type_table.clone(),
+        function_type_table: metadata.function_type_table.clone(),
+        named_value_type_table: metadata.named_value_type_table.clone(),
+        type_hint_table: boon_checked::TypeHintTable::default(),
+        resolved_constant_table: boon_checked::ResolvedConstantTable::default(),
+        render_slot_table: metadata.render_slot_table.clone(),
+        constraints: Vec::new(),
+        diagnostics: assembly.diagnostics.clone(),
+    };
+    let construction = (!report.has_errors()).then(|| {
+        // SAFETY: `assemble_checked_owner_project` accepts only complete,
+        // immutable checked-owner shards, resolves every relocation, proves
+        // exact dense coverage, reconstructs and validates the lowering
+        // tables, and binds the parser-produced project source digest.
+        unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(fields)
+        }
+    });
+    let diagnostic_count = report.diagnostics.len()
+        + report
+            .render_slot_table
+            .slots
+            .iter()
+            .map(|slot| slot.diagnostics.len())
+            .sum::<usize>();
+    if std::env::var_os("BOON_OWNER_ASSEMBLY_TRACE").is_some() {
+        for diagnostic in &report.diagnostics {
+            eprintln!(
+                "boon owner assembly diagnostic {}:{}-{} {}",
+                diagnostic.line, diagnostic.start, diagnostic.end, diagnostic.message
+            );
+        }
+    }
+    CheckedSourceFromSource {
+        syntax: CheckedSourceSyntax::UnitNative(syntax.clone()),
+        output: boon_checked::CheckOutput {
+            program: None,
+            construction,
+            report,
+        },
+        profile: CheckedDiagnosticsProfile {
+            source_unit_count: syntax.units().len(),
+            expression_count: syntax.expression_count(),
+            diagnostic_count,
+            parse_work,
+            typecheck_work,
+            parse_ms,
+            typecheck_ms,
+            total_ms: parse_ms + typecheck_ms,
+        },
+    }
 }
 
 fn check_parsed_source_with_ownership(

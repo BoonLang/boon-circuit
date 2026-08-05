@@ -4,7 +4,8 @@ use crate::{
     OwnerConstraintSeed, OwnerConstraintSeedError, OwnerConstraintSummary, OwnerDeclarationKind,
     OwnerInferenceAbiEnvironment, OwnerInterfaceScc, OwnerInterfaceSccKey, OwnerParameterKind,
     OwnerPatternConstraint, OwnerReferenceKind, OwnerSymbolResolution, RenderContractRegistry,
-    host_effect_signature, infix_returns_bool, session_info_intrinsic_type,
+    host_effect_signature, infix_requires_number_operands, infix_returns_bool,
+    session_info_intrinsic_type,
 };
 use boon_checked::{
     BytesType, CheckedEffectSummary, CheckedParameterKind, CheckedParameterRequirement, FlowMode,
@@ -12,12 +13,14 @@ use boon_checked::{
 };
 use boon_syntax::{StableCheckOwnerKey, StableExpressionKey};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V1: &[u8] = b"boon.owner-interface-scc-result.v1\0";
 const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V1: &[u8] =
     b"boon.owner-interface-scc-currentness.v1\0";
+const OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V1: &[u8] = b"boon.owner-body-interface-import.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerInterfaceParameter {
@@ -152,6 +155,19 @@ pub enum OwnerResultTransfer {
     },
 }
 
+/// Exact enclosing expression captured by one child-owner interface.
+///
+/// Captures are demand-shaped: the consumer publishes only the expressions
+/// named by its owner-bounded syntax. The provider body remains private, while
+/// the consumer body can be re-evaluated from this frozen interface surface.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerInterfaceCapture {
+    pub owner: StableCheckOwnerKey,
+    pub expression: StableExpressionKey,
+    pub flow_type: FlowType,
+    pub flush_type: Option<Type>,
+}
+
 /// Alpha-normalized public currentness surface of one authored check owner.
 ///
 /// Source positions, body-only literal payloads, dense IDs, and implementation
@@ -170,9 +186,18 @@ pub struct OwnerPublicInterface {
     /// transfers cannot accidentally discard a FLUSH alternative.
     pub result_flush_type: Option<Type>,
     pub result_transfer: OwnerResultTransfer,
+    pub captures: Box<[OwnerInterfaceCapture]>,
     pub context: Option<OwnerContextInterface>,
     pub effect: CheckedEffectSummary,
     pub type_variables: Box<[TypeVar]>,
+    #[serde(skip)]
+    fingerprint_v1: [u8; 32],
+}
+
+impl OwnerPublicInterface {
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -181,6 +206,7 @@ pub struct OwnerInterfaceSolveWork {
     pub expressions: u64,
     pub local_constraints: u64,
     pub cross_owner_constraints: u64,
+    pub solve_rounds: u64,
     pub unification_steps: u64,
 }
 
@@ -310,6 +336,7 @@ pub(crate) struct TypeUnifier {
     ranks: Vec<u8>,
     bindings: Vec<Option<Type>>,
     steps: u64,
+    changes: u64,
 }
 
 impl TypeUnifier {
@@ -462,6 +489,7 @@ impl TypeUnifier {
             std::mem::swap(&mut left, &mut right);
         }
         self.parents[right.0 as usize] = left.0;
+        self.changes = self.changes.saturating_add(1);
         if self.ranks[left.0 as usize] == self.ranks[right.0 as usize] {
             self.ranks[left.0 as usize] = self.ranks[left.0 as usize].saturating_add(1);
         }
@@ -483,10 +511,50 @@ impl TypeUnifier {
             return;
         }
         let slot = self.bindings[variable.0 as usize].take();
-        let merged = slot.map_or(incoming.clone(), |current| {
-            self.merge_resolved(current, incoming.clone())
-        });
+        let (merged, changed) = match slot {
+            None => (incoming, true),
+            Some(current) if current == incoming => (current, false),
+            Some(current) => {
+                let merged = self.merge_resolved(current.clone(), incoming);
+                let changed = merged != current;
+                (merged, changed)
+            }
+        };
         self.bindings[variable.0 as usize] = Some(merged);
+        if changed {
+            self.changes = self.changes.saturating_add(1);
+        }
+    }
+
+    /// Bind the result of a value-flow edge without turning that edge into an
+    /// equality constraint on its producer.
+    ///
+    /// Branch joins, transparent wrappers, and block results are covariant:
+    /// a richer alternative can widen the consumer result, but it must not add
+    /// fields to a parameter returned by another alternative. The ordinary
+    /// unifier remains appropriate for true type equations such as a HOLD's
+    /// stored value or a numeric operand contract.
+    pub(crate) fn bind_flow_result(&mut self, variable: TypeVar, incoming: Type) {
+        self.steps = self.steps.saturating_add(1);
+        let variable = self.root(variable);
+        let incoming = self.resolve(&incoming);
+        if self.occurs(variable, &incoming) {
+            return;
+        }
+        let slot = self.bindings[variable.0 as usize].take();
+        let (merged, changed) = match slot {
+            None => (incoming, true),
+            Some(current) if current == incoming => (current, false),
+            Some(current) => {
+                let merged = boon_checked::canonical_union_type(vec![current.clone(), incoming]);
+                let changed = merged != current;
+                (merged, changed)
+            }
+        };
+        self.bindings[variable.0 as usize] = Some(merged);
+        if changed {
+            self.changes = self.changes.saturating_add(1);
+        }
     }
 
     fn merge_resolved(&mut self, left: Type, right: Type) -> Type {
@@ -585,6 +653,136 @@ impl TypeUnifier {
     pub(crate) const fn steps(&self) -> u64 {
         self.steps
     }
+
+    pub(crate) const fn changes(&self) -> u64 {
+        self.changes
+    }
+
+    fn hash_resolved_type(&self, ty: &Type, hasher: &mut Sha256, active: &mut BTreeSet<TypeVar>) {
+        match ty {
+            Type::Var(variable) => {
+                hasher.update([0]);
+                let root = self.root_readonly(*variable);
+                if !active.insert(root) {
+                    hasher.update([0]);
+                    hasher.update(root.0.to_le_bytes());
+                    return;
+                }
+                if let Some(binding) = &self.bindings[root.0 as usize] {
+                    hasher.update([1]);
+                    self.hash_resolved_type(binding, hasher, active);
+                } else {
+                    hasher.update([2]);
+                    hasher.update(root.0.to_le_bytes());
+                }
+                active.remove(&root);
+            }
+            Type::Text => hasher.update([1]),
+            Type::Number => hasher.update([2]),
+            Type::Bytes(BytesType::Dynamic) => hasher.update([3, 0]),
+            Type::Bytes(BytesType::Fixed(size)) => {
+                hasher.update([3, 1]);
+                hasher.update((*size as u64).to_le_bytes());
+            }
+            Type::Absent => hasher.update([4]),
+            Type::VariantSet(variants) => {
+                hasher.update([5]);
+                hash_length(hasher, variants.len());
+                for variant in variants.iter() {
+                    match variant {
+                        Variant::Tag(tag) => {
+                            hasher.update([0]);
+                            hash_length(hasher, tag.len());
+                            hasher.update(tag.as_bytes());
+                        }
+                        Variant::Tagged { tag, fields } => {
+                            hasher.update([1]);
+                            hash_length(hasher, tag.len());
+                            hasher.update(tag.as_bytes());
+                            hash_object_shape(self, fields, hasher, active);
+                        }
+                    }
+                }
+            }
+            Type::Object(shape) => {
+                hasher.update([6]);
+                hash_object_shape(self, shape, hasher, active);
+            }
+            Type::RenderContract => hasher.update([7]),
+            Type::List(item) => {
+                hasher.update([8]);
+                self.hash_resolved_type(item, hasher, active);
+            }
+            Type::Function { args, result } => {
+                hasher.update([9]);
+                hash_length(hasher, args.len());
+                for argument in args {
+                    self.hash_resolved_type(argument, hasher, active);
+                }
+                hasher.update([flow_mode_tag(result.mode)]);
+                self.hash_resolved_type(&result.ty, hasher, active);
+            }
+            Type::UnresolvedShape { reason } => {
+                hasher.update([10]);
+                hash_length(hasher, reason.len());
+                hasher.update(reason.as_bytes());
+            }
+            Type::Unknown => hasher.update([11]),
+            Type::Union(members) => {
+                hasher.update([12]);
+                hash_length(hasher, members.len());
+                for member in members {
+                    self.hash_resolved_type(member, hasher, active);
+                }
+            }
+            Type::Map { key, value } => {
+                hasher.update([13]);
+                self.hash_resolved_type(key, hasher, active);
+                self.hash_resolved_type(value, hasher, active);
+            }
+            Type::Set(item) => {
+                hasher.update([14]);
+                self.hash_resolved_type(item, hasher, active);
+            }
+            Type::Bits { width } => {
+                hasher.update([15]);
+                hasher.update(width.to_le_bytes());
+            }
+        }
+    }
+}
+
+fn hash_length(hasher: &mut Sha256, len: usize) {
+    hasher.update((len as u64).to_le_bytes());
+}
+
+const fn flow_mode_tag(mode: FlowMode) -> u8 {
+    match mode {
+        FlowMode::Continuous => 0,
+        FlowMode::TickPresent => 1,
+        FlowMode::PresentOrAbsent => 2,
+        FlowMode::Absent => 3,
+    }
+}
+
+fn hash_object_shape(
+    unifier: &TypeUnifier,
+    shape: &ObjectShape,
+    hasher: &mut Sha256,
+    active: &mut BTreeSet<TypeVar>,
+) {
+    hasher.update((shape.fields.len() as u64).to_le_bytes());
+    for (name, ty) in &shape.fields {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        unifier.hash_resolved_type(ty, hasher, active);
+    }
+    hasher.update((shape.field_order.len() as u64).to_le_bytes());
+    for name in &shape.field_order {
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+    }
+    hasher.update([u8::from(shape.open)]);
 }
 
 #[derive(Clone)]
@@ -625,6 +823,138 @@ struct CrossCall {
     inputs: Box<[(OwnerConstraintEdgeRole, u32)]>,
     stable_expression: StableExpressionKey,
     flush: TypeVar,
+}
+
+#[derive(Clone)]
+pub(crate) struct OwnerPatternNarrowing {
+    pub selector: TypeVar,
+    pub pattern: OwnerPatternConstraint,
+    pub bindings: Box<[(String, TypeVar)]>,
+    pub selector_reads: Box<[(Box<[String]>, TypeVar)]>,
+}
+
+fn matching_pattern_variants(ty: &Type, tag: &str, matches: &mut Vec<Variant>) {
+    match ty {
+        Type::VariantSet(variants) => matches.extend(variants.iter().filter_map(|variant| {
+            let candidate = match variant {
+                Variant::Tag(candidate) | Variant::Tagged { tag: candidate, .. } => candidate,
+            };
+            (candidate == tag).then(|| variant.clone())
+        })),
+        Type::Union(members) => {
+            for member in members {
+                matching_pattern_variants(member, tag, matches);
+            }
+        }
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::Object(_)
+        | Type::List(_)
+        | Type::Set(_)
+        | Type::Map { .. }
+        | Type::Function { .. }
+        | Type::RenderContract
+        | Type::Var(_)
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown => {}
+    }
+}
+
+fn matching_pattern_type(selector: &Type, pattern: &OwnerPatternConstraint) -> Option<Type> {
+    match pattern {
+        OwnerPatternConstraint::Wildcard | OwnerPatternConstraint::Binding { .. } => {
+            Some(selector.clone())
+        }
+        OwnerPatternConstraint::Number if matches!(selector, Type::Number) => Some(Type::Number),
+        OwnerPatternConstraint::Text if matches!(selector, Type::Text) => Some(Type::Text),
+        OwnerPatternConstraint::Bits { width } if matches!(selector, Type::Bits { width: actual } if actual == width) => {
+            Some(Type::Bits { width: *width })
+        }
+        OwnerPatternConstraint::Tag { name, .. } => {
+            let mut variants = Vec::new();
+            matching_pattern_variants(selector, name, &mut variants);
+            (!variants.is_empty()).then(|| Type::VariantSet(variants.into()))
+        }
+        OwnerPatternConstraint::Number
+        | OwnerPatternConstraint::Text
+        | OwnerPatternConstraint::Bits { .. }
+        | OwnerPatternConstraint::Invalid => None,
+    }
+}
+
+fn matching_pattern_field(
+    selector: &Type,
+    pattern: &OwnerPatternConstraint,
+    name: &str,
+) -> Option<Type> {
+    match pattern {
+        OwnerPatternConstraint::Binding { name: binding } if binding == name => {
+            Some(selector.clone())
+        }
+        OwnerPatternConstraint::Tag { name: tag, fields }
+            if fields.iter().any(|field| field == name) =>
+        {
+            let mut variants = Vec::new();
+            matching_pattern_variants(selector, tag, &mut variants);
+            variants
+                .into_iter()
+                .filter_map(|variant| match variant {
+                    Variant::Tagged { fields, .. } => fields.fields.get(name).cloned(),
+                    Variant::Tag(_) => None,
+                })
+                .reduce(|left, right| boon_checked::canonical_union_type(vec![left, right]))
+        }
+        _ => None,
+    }
+}
+
+fn matching_selector_projection(
+    selector: &Type,
+    pattern: &OwnerPatternConstraint,
+    projection: &[String],
+) -> Option<Type> {
+    let selected = matching_pattern_type(selector, pattern)?;
+    if projection.is_empty() {
+        return Some(selected);
+    }
+    let OwnerPatternConstraint::Tag { name, .. } = pattern else {
+        return None;
+    };
+    let mut variants = Vec::new();
+    matching_pattern_variants(&selected, name, &mut variants);
+    variants
+        .into_iter()
+        .filter_map(|variant| match variant {
+            Variant::Tagged { fields, .. } => {
+                crate::type_for_nested_path(&Type::Object(fields), projection)
+            }
+            Variant::Tag(_) => None,
+        })
+        .reduce(|left, right| boon_checked::canonical_union_type(vec![left, right]))
+}
+
+pub(crate) fn refine_owner_pattern_narrowings(
+    unifier: &mut TypeUnifier,
+    narrowings: &[OwnerPatternNarrowing],
+) {
+    for narrowing in narrowings {
+        let selector = unifier.resolve(&Type::Var(narrowing.selector));
+        for (name, binding) in &narrowing.bindings {
+            if let Some(ty) = matching_pattern_field(&selector, &narrowing.pattern, name) {
+                unifier.bind_flow_result(*binding, ty);
+            }
+        }
+        for (projection, read) in &narrowing.selector_reads {
+            if let Some(ty) =
+                matching_selector_projection(&selector, &narrowing.pattern, projection)
+            {
+                unifier.bind_flow_result(*read, ty);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -785,6 +1115,33 @@ pub(crate) fn pattern_type(pattern: &OwnerPatternConstraint, unifier: &mut TypeU
     }
 }
 
+pub(crate) fn pattern_binding_type_from_pattern(
+    pattern: &OwnerPatternConstraint,
+    pattern_ty: &Type,
+    name: &str,
+) -> Option<Type> {
+    match pattern {
+        OwnerPatternConstraint::Binding { name: binding } if binding == name => {
+            Some(pattern_ty.clone())
+        }
+        OwnerPatternConstraint::Tag { name: tag, fields }
+            if fields.iter().any(|field| field == name) =>
+        {
+            let Type::VariantSet(variants) = pattern_ty else {
+                return None;
+            };
+            variants.iter().find_map(|variant| match variant {
+                Variant::Tagged {
+                    tag: candidate,
+                    fields,
+                } if candidate == tag => fields.fields.get(name).cloned(),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn bind_projection(
     unifier: &mut TypeUnifier,
     root: TypeVar,
@@ -814,6 +1171,15 @@ pub(crate) fn bind_projection(
         current = next;
     }
     current
+}
+
+pub(crate) fn bind_flow_variables(
+    unifier: &mut TypeUnifier,
+    output: TypeVar,
+    inputs: impl IntoIterator<Item = TypeVar>,
+) {
+    let inputs = inputs.into_iter().map(Type::Var).collect::<Vec<_>>();
+    unifier.bind_flow_result(output, boon_checked::canonical_union_type(inputs));
 }
 
 fn expression_variable(state: &OwnerSolveState<'_>, reference: u32) -> Option<TypeVar> {
@@ -1237,42 +1603,35 @@ fn build_owner_result_transfer(
     })
 }
 
-fn solver_surface_snapshot(
-    unifier: &mut TypeUnifier,
+fn solver_surface_fingerprint(
+    unifier: &TypeUnifier,
     states: &BTreeMap<StableCheckOwnerKey, OwnerSolveState<'_>>,
-) -> Vec<(
-    StableCheckOwnerKey,
-    Vec<Type>,
-    Type,
-    Type,
-    Type,
-    CheckedEffectSummary,
-    Vec<Option<FlowMode>>,
-    Vec<OwnerInterfaceEvaluationScope>,
-)> {
-    states
-        .iter()
-        .map(|(owner, state)| {
-            (
-                owner.clone(),
-                state
-                    .parameters
-                    .iter()
-                    .map(|parameter| unifier.resolve(&Type::Var(parameter.variable)))
-                    .collect(),
-                unifier.resolve(&Type::Var(state.result)),
-                unifier.resolve(&Type::Var(state.result_flush)),
-                unifier.resolve(&Type::Var(state.context)),
-                state.effect,
-                state.modes.clone(),
-                state
-                    .parameters
-                    .iter()
-                    .map(|parameter| parameter.evaluation_scope)
-                    .collect(),
-            )
-        })
-        .collect()
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"boon.owner-interface-solver-surface.v1\0");
+    hash_length(&mut hasher, states.len());
+    let mut active = BTreeSet::new();
+    for state in states.values() {
+        hash_length(&mut hasher, state.parameters.len());
+        for parameter in &state.parameters {
+            unifier.hash_resolved_type(&Type::Var(parameter.variable), &mut hasher, &mut active);
+        }
+        for variable in [state.result, state.result_flush, state.context] {
+            unifier.hash_resolved_type(&Type::Var(variable), &mut hasher, &mut active);
+        }
+        for (external, variable) in state
+            .seed
+            .external_expressions
+            .iter()
+            .zip(&state.external_expressions)
+            .filter(|(external, _)| external.is_exact_enclosing_capture_for(&state.seed.owner))
+        {
+            hash_length(&mut hasher, external.expression.route_digest_v1.len());
+            hasher.update(external.expression.route_digest_v1);
+            unifier.hash_resolved_type(&Type::Var(*variable), &mut hasher, &mut active);
+        }
+    }
+    hasher.finalize().into()
 }
 
 pub(crate) fn authoritative_signature(
@@ -1875,6 +2234,7 @@ pub fn evaluate_owner_interface_scc<'a>(
     }
 
     let mut calls = Vec::new();
+    let mut pattern_narrowings = Vec::new();
     let mut work = OwnerInterfaceSolveWork {
         owners: states.len() as u64,
         ..OwnerInterfaceSolveWork::default()
@@ -1883,6 +2243,20 @@ pub fn evaluate_owner_interface_scc<'a>(
         work.expressions = work
             .expressions
             .saturating_add(state.seed.expressions.len() as u64);
+        let arm_local_expressions = state
+            .seed
+            .expressions
+            .iter()
+            .flat_map(|expression| &expression.inputs)
+            .filter_map(|input| {
+                matches!(
+                    input.role,
+                    OwnerConstraintEdgeRole::MatchBinding { .. }
+                        | OwnerConstraintEdgeRole::MatchNarrowedSelector { .. }
+                )
+                .then_some(input.expression)
+            })
+            .collect::<BTreeSet<_>>();
         let resolved = state
             .summary
             .resolved_references
@@ -1938,7 +2312,10 @@ pub fn evaluate_owner_interface_scc<'a>(
                 }
                 OwnerConstraintNodeKind::Reference { parts }
                 | OwnerConstraintNodeKind::Drain { parts } => {
-                    if let Some(target) = resolved.get(&expression.expression) {
+                    if arm_local_expressions.contains(&(index as u32)) {
+                        // The owning match arm binds this occurrence against
+                        // an arm-local pattern value below.
+                    } else if let Some(target) = resolved.get(&expression.expression) {
                         if target.reference.kind == OwnerReferenceKind::Value {
                             // Cross-owner value reads are wired after all local
                             // interfaces exist.
@@ -2033,7 +2410,7 @@ pub fn evaluate_owner_interface_scc<'a>(
                         .first()
                         .and_then(|input| expression_variable(state, input.expression))
                     {
-                        unifier.unify(Type::Var(variable), Type::Var(input));
+                        bind_flow_variables(&mut unifier, variable, [input]);
                     }
                     mode = None;
                 }
@@ -2049,25 +2426,24 @@ pub fn evaluate_owner_interface_scc<'a>(
                     state.effect.writes_state = true;
                 }
                 OwnerConstraintNodeKind::Latest => {
-                    for input in &expression.inputs {
-                        if let Some(input) = expression_variable(state, input.expression) {
-                            unifier.unify(Type::Var(variable), Type::Var(input));
-                        }
-                    }
+                    let inputs = expression
+                        .inputs
+                        .iter()
+                        .filter_map(|input| expression_variable(state, input.expression))
+                        .collect::<Vec<_>>();
+                    bind_flow_variables(&mut unifier, variable, inputs);
                     state.effect.reads_state = true;
                     state.effect.writes_state = true;
                     mode = None;
                 }
                 OwnerConstraintNodeKind::When => {
-                    for input in expression
+                    let inputs = expression
                         .inputs
                         .iter()
                         .filter(|input| matches!(input.role, OwnerConstraintEdgeRole::WhenArm))
-                    {
-                        if let Some(input) = expression_variable(state, input.expression) {
-                            unifier.unify(Type::Var(variable), Type::Var(input));
-                        }
-                    }
+                        .filter_map(|input| expression_variable(state, input.expression))
+                        .collect::<Vec<_>>();
+                    bind_flow_variables(&mut unifier, variable, inputs);
                     mode = None;
                 }
                 OwnerConstraintNodeKind::Then => {
@@ -2084,14 +2460,16 @@ pub fn evaluate_owner_interface_scc<'a>(
                     if let Some(input) =
                         input.and_then(|input| expression_variable(state, input.expression))
                     {
-                        unifier.unify(Type::Var(variable), Type::Var(input));
+                        bind_flow_variables(&mut unifier, variable, [input]);
                     }
                     mode = Some(FlowMode::PresentOrAbsent);
                 }
                 OwnerConstraintNodeKind::Infix { operation } => {
-                    for input in &expression.inputs {
-                        if let Some(input) = expression_variable(state, input.expression) {
-                            unifier.bind_var(input, Type::Number);
+                    if infix_requires_number_operands(operation) {
+                        for input in &expression.inputs {
+                            if let Some(input) = expression_variable(state, input.expression) {
+                                unifier.bind_var(input, Type::Number);
+                            }
                         }
                     }
                     unifier.bind_var(
@@ -2110,14 +2488,87 @@ pub fn evaluate_owner_interface_scc<'a>(
                         .find(|input| matches!(input.role, OwnerConstraintEdgeRole::MatchOutput))
                     {
                         if let Some(output) = expression_variable(state, output.expression) {
-                            unifier.unify(Type::Var(variable), Type::Var(output));
+                            bind_flow_variables(&mut unifier, variable, [output]);
                         }
                         mode = None;
                     } else {
                         unifier.bind_var(variable, Type::Absent);
                         mode = Some(FlowMode::Absent);
                     }
-                    let _ = pattern_type(pattern, &mut unifier);
+                    let pattern_ty = pattern_type(pattern, &mut unifier);
+                    // A pattern describes one branch, not the public input
+                    // contract of its selector. Feeding the pattern domain
+                    // into the selector closes a callable parameter over the
+                    // tags currently named by its body. That makes unrelated
+                    // callers reverse dependencies of the callee interface
+                    // and incorrectly rejects values handled by a wildcard
+                    // (or by the ordinary no-matching-arm result). Keep the
+                    // pattern-local type only for lexical binding projection;
+                    // actual selector values specialize the frozen result
+                    // transfer independently at each call occurrence.
+                    let bindings = expression
+                        .inputs
+                        .iter()
+                        .filter_map(|input| {
+                            let OwnerConstraintEdgeRole::MatchBinding { name } = &input.role else {
+                                return None;
+                            };
+                            expression_variable(state, input.expression)
+                                .map(|read| (name.clone(), read))
+                        })
+                        .collect::<Vec<_>>();
+                    for (name, read) in &bindings {
+                        if let Some(binding_ty) =
+                            pattern_binding_type_from_pattern(pattern, &pattern_ty, name)
+                        {
+                            unifier.unify(Type::Var(*read), binding_ty);
+                        }
+                    }
+                    let narrowed_payload = unifier.fresh();
+                    if let (OwnerPatternConstraint::Tag { name, .. }, Type::VariantSet(variants)) =
+                        (pattern, &pattern_ty)
+                        && let Some(fields) = variants.iter().find_map(|variant| match variant {
+                            Variant::Tagged { tag, fields } if tag == name => Some(fields.clone()),
+                            Variant::Tag(_) | Variant::Tagged { .. } => None,
+                        })
+                    {
+                        unifier.bind_var(narrowed_payload, Type::Object(fields));
+                    }
+                    let selector_reads = expression
+                        .inputs
+                        .iter()
+                        .filter_map(|input| {
+                            let OwnerConstraintEdgeRole::MatchNarrowedSelector { projection } =
+                                &input.role
+                            else {
+                                return None;
+                            };
+                            expression_variable(state, input.expression)
+                                .map(|read| (projection.clone(), read))
+                        })
+                        .collect::<Vec<_>>();
+                    for (projection, read) in &selector_reads {
+                        if projection.is_empty() {
+                            unifier.bind_flow_result(*read, pattern_ty.clone());
+                        } else {
+                            let projected =
+                                bind_projection(&mut unifier, narrowed_payload, projection);
+                            unifier.unify(Type::Var(*read), Type::Var(projected));
+                        }
+                    }
+                    if let Some(selector) = expression
+                        .inputs
+                        .iter()
+                        .find(|input| matches!(input.role, OwnerConstraintEdgeRole::MatchSelector))
+                        .and_then(|input| expression_variable(state, input.expression))
+                    {
+                        pattern_narrowings.push(OwnerPatternNarrowing {
+                            selector,
+                            pattern: pattern.clone(),
+                            bindings: bindings.into_boxed_slice(),
+                            selector_reads: selector_reads.into_boxed_slice(),
+                        });
+                    }
                 }
                 OwnerConstraintNodeKind::Block => {
                     if let Some(result) = expression
@@ -2126,7 +2577,7 @@ pub fn evaluate_owner_interface_scc<'a>(
                         .find(|input| matches!(input.role, OwnerConstraintEdgeRole::BlockResult))
                     {
                         if let Some(result) = expression_variable(state, result.expression) {
-                            unifier.unify(Type::Var(variable), Type::Var(result));
+                            bind_flow_variables(&mut unifier, variable, [result]);
                         }
                         mode = None;
                     } else {
@@ -2190,7 +2641,7 @@ pub fn evaluate_owner_interface_scc<'a>(
                         .find(|input| matches!(input.role, OwnerConstraintEdgeRole::ArrowOutput))
                     {
                         if let Some(output) = expression_variable(state, output.expression) {
-                            unifier.unify(Type::Var(variable), Type::Var(output));
+                            bind_flow_variables(&mut unifier, variable, [output]);
                         }
                     }
                     let _ = pattern_type(pattern, &mut unifier);
@@ -2232,6 +2683,20 @@ pub fn evaluate_owner_interface_scc<'a>(
         .iter()
         .map(|(owner, state)| (owner.clone(), (state.result, state.result_flush)))
         .collect::<BTreeMap<_, _>>();
+    let internal_expressions = states
+        .iter()
+        .flat_map(|(owner, state)| {
+            state
+                .expression_by_key
+                .iter()
+                .map(move |(expression, index)| {
+                    (
+                        (owner.clone(), expression.clone()),
+                        (state.expressions[*index], state.expression_flushes[*index]),
+                    )
+                })
+        })
+        .collect::<BTreeMap<_, _>>();
     for state in states.values() {
         for ((external, variable), flush_variable) in state
             .seed
@@ -2240,7 +2705,19 @@ pub fn evaluate_owner_interface_scc<'a>(
             .zip(&state.external_expressions)
             .zip(&state.external_expression_flushes)
         {
-            if let Some((result, result_flush)) = internal_results.get(&external.owner) {
+            if external.is_exact_enclosing_capture_for(&state.seed.owner) {
+                let (expression, expression_flush) = internal_expressions
+                    .get(&(external.owner.clone(), external.expression.clone()))
+                    .copied()
+                    .ok_or_else(|| {
+                        OwnerConstraintSeedError::new(format!(
+                            "owner interface {:?} captures expression {:?} outside its interface SCC",
+                            state.seed.owner, external.expression
+                        ))
+                    })?;
+                unifier.unify(Type::Var(*variable), Type::Var(expression));
+                unifier.unify(Type::Var(*flush_variable), Type::Var(expression_flush));
+            } else if let Some((result, result_flush)) = internal_results.get(&external.owner) {
                 unifier.unify(Type::Var(*variable), Type::Var(*result));
                 unifier.unify(Type::Var(*flush_variable), Type::Var(*result_flush));
             } else if let Some(interface) = dependency_interfaces.get(&external.owner) {
@@ -2340,10 +2817,13 @@ pub fn evaluate_owner_interface_scc<'a>(
     // substitution map would incorrectly couple a wrapper's result type to its
     // inherited context leaf.
     let mut call_context_variables = vec![BTreeMap::new(); calls.len()];
-    let mut previous = solver_surface_snapshot(&mut unifier, &states);
+    let mut previous_surface = solver_surface_fingerprint(&unifier, &states);
     let maximum_rounds = states.len().saturating_add(calls.len()).saturating_add(2);
     let mut converged = calls.is_empty();
     for _round in 0..maximum_rounds {
+        work.solve_rounds = work.solve_rounds.saturating_add(1);
+        let changes_before = unifier.changes();
+        let mut surface_changed = false;
         for (call_index, call) in calls.iter().enumerate() {
             let caller = states.get(&call.caller).ok_or_else(|| {
                 OwnerConstraintSeedError::new("interface call has no caller state")
@@ -2620,10 +3100,13 @@ pub fn evaluate_owner_interface_scc<'a>(
             );
             if let Some(state) = states.get_mut(&call.caller) {
                 if call_valid {
-                    state.effect = merge_effects(state.effect, effect);
+                    let merged = merge_effects(state.effect, effect);
+                    surface_changed |= merged != state.effect;
+                    state.effect = merged;
                 }
-                state.modes[call.expression] =
-                    flow_mode_join(state.modes[call.expression], Some(result_mode));
+                let mode = flow_mode_join(state.modes[call.expression], Some(result_mode));
+                surface_changed |= mode != state.modes[call.expression];
+                state.modes[call.expression] = mode;
                 for (ordinal, incoming) in evaluation_scope_updates {
                     let parameter = state
                         .parameters
@@ -2638,6 +3121,7 @@ pub fn evaluate_owner_interface_scc<'a>(
                     match (parameter.evaluation_scope, incoming) {
                         (OwnerInterfaceEvaluationScope::Parent, incoming) => {
                             parameter.evaluation_scope = incoming;
+                            surface_changed = true;
                         }
                         (current, incoming) if current == incoming => {}
                         (current, incoming) => {
@@ -2652,12 +3136,17 @@ pub fn evaluate_owner_interface_scc<'a>(
             let _ = call.stable_expression;
             work.cross_owner_constraints = work.cross_owner_constraints.saturating_add(1);
         }
-        let current = solver_surface_snapshot(&mut unifier, &states);
-        if current == previous {
+        refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
+        if unifier.changes() == changes_before && !surface_changed {
             converged = true;
             break;
         }
-        previous = current;
+        let current_surface = solver_surface_fingerprint(&unifier, &states);
+        if current_surface == previous_surface && !surface_changed {
+            converged = true;
+            break;
+        }
+        previous_surface = current_surface;
     }
     if !converged {
         return Err(OwnerConstraintSeedError::new(format!(
@@ -2736,6 +3225,38 @@ pub fn evaluate_owner_interface_scc<'a>(
             &mut alpha_variables,
             &mut next_alpha,
         )?;
+        let captures = state
+            .seed
+            .external_expressions
+            .iter()
+            .filter(|external| external.is_exact_enclosing_capture_for(&state.seed.owner))
+            .map(|external| {
+                let provider = &states[&external.owner];
+                let expression = *provider
+                    .expression_by_key
+                    .get(&external.expression)
+                    .expect("validated enclosing capture has a provider expression");
+                let mode = provider.modes[expression].unwrap_or(FlowMode::Continuous);
+                let flow_type =
+                    resolved_expression_boundary(provider, expression as u32, &mut unifier, mode);
+                let flush_type =
+                    resolved_expression_flush_type(provider, expression as u32, &mut unifier);
+                OwnerInterfaceCapture {
+                    owner: external.owner.clone(),
+                    expression: external.expression.clone(),
+                    flow_type: FlowType {
+                        mode: flow_type.mode,
+                        ty: alpha_normalize_type(
+                            &flow_type.ty,
+                            &mut alpha_variables,
+                            &mut next_alpha,
+                        ),
+                    },
+                    flush_type: flush_type
+                        .map(|ty| alpha_normalize_type(&ty, &mut alpha_variables, &mut next_alpha)),
+                }
+            })
+            .collect::<Vec<_>>();
         let mut type_variables = BTreeSet::new();
         for parameter in &parameters {
             collect_type_variables(&parameter.flow_type.ty, &mut type_variables);
@@ -2747,12 +3268,18 @@ pub fn evaluate_owner_interface_scc<'a>(
         if let Some(context) = &context {
             collect_type_variables(&context.flow_type.ty, &mut type_variables);
         }
+        for capture in &captures {
+            collect_type_variables(&capture.flow_type.ty, &mut type_variables);
+            if let Some(flush_type) = &capture.flush_type {
+                collect_type_variables(flush_type, &mut type_variables);
+            }
+        }
         if let OwnerResultTransfer::Expression { nodes, .. } = &result_transfer {
             for node in nodes {
                 collect_type_variables(&node.flow_type.ty, &mut type_variables);
             }
         }
-        interfaces.push(OwnerPublicInterface {
+        let mut interface = OwnerPublicInterface {
             owner: owner.clone(),
             declaration_kind: state.declaration_kind,
             names: state.names.clone(),
@@ -2760,13 +3287,25 @@ pub fn evaluate_owner_interface_scc<'a>(
             result,
             result_flush_type,
             result_transfer,
+            captures: captures.into_boxed_slice(),
             context,
             effect: state.effect,
             type_variables: type_variables
                 .into_iter()
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-        });
+            fingerprint_v1: [0; 32],
+        };
+        interface.fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+            OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V1,
+            &interface,
+        )
+        .map_err(|error| {
+            OwnerConstraintSeedError::new(format!(
+                "cannot fingerprint owner body interface import: {error}"
+            ))
+        })?;
+        interfaces.push(interface);
     }
     work.unification_steps = unifier.steps;
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
@@ -3067,7 +3606,10 @@ mod tests {
         let seed = seed(&unit, &owner);
         let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
         let results = solve(&[seed], &[summary]);
-        let interface = results[0].owner(&owner).unwrap();
+        let interface = results
+            .iter()
+            .find_map(|result| result.owner(&owner))
+            .unwrap();
         let checked = checked_callable_interface(source, name);
         let parameters = interface
             .parameters
@@ -3209,6 +3751,127 @@ mod tests {
     }
 
     #[test]
+    fn match_patterns_do_not_close_the_public_selector_contract() {
+        let unit = link(concat!(
+            "FUNCTION label(tone) {\n",
+            "    tone |> WHEN {\n",
+            "        Dark => TEXT { dark }\n",
+            "        __ => TEXT { other }\n",
+            "    }\n",
+            "}\n",
+        ));
+        let owner = owner_named(&unit, "label");
+        let seed = seed(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let results = solve(&[seed], &[summary]);
+        let interface = results[0].owner(&owner).unwrap();
+
+        assert_eq!(interface.parameters[0].flow_type.ty, Type::Var(TypeVar(0)));
+        assert_eq!(interface.type_variables.as_ref(), [TypeVar(0)]);
+        assert_eq!(interface.result.ty, Type::Text);
+    }
+
+    #[test]
+    fn match_arm_field_reads_remain_branch_local() {
+        let unit = link(concat!(
+            "FUNCTION label(value) {\n",
+            "    value |> WHEN {\n",
+            "        StringValue => value.text\n",
+            "        RealValue => value.value |> Number/to_text(radix: 10)\n",
+            "        __ => TEXT { ? }\n",
+            "    }\n",
+            "}\n",
+        ));
+        let owner = owner_named(&unit, "label");
+        let seed = seed(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let results = solve(&[seed], &[summary]);
+        let interface = results[0].owner(&owner).unwrap();
+
+        assert!(matches!(interface.parameters[0].flow_type.ty, Type::Var(_)));
+    }
+
+    #[test]
+    fn pattern_bindings_shadow_same_named_parameters_without_type_leakage() {
+        let unit = link(concat!(
+            "FUNCTION parsed_or_length(value) {\n",
+            "    value |> Text/to_number() |> WHEN {\n",
+            "        Parsed[value] => value\n",
+            "        InvalidNumber[reason, position] => value |> Text/length()\n",
+            "    }\n",
+            "}\n",
+        ));
+        let owner = owner_named(&unit, "parsed_or_length");
+        let seed = seed(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let results = solve(&[seed], &[summary]);
+        let interface = results[0].owner(&owner).unwrap();
+
+        assert_eq!(interface.parameters[0].flow_type.ty, Type::Text);
+        assert_eq!(interface.result.ty, Type::Number);
+    }
+
+    #[test]
+    fn branch_result_widening_does_not_write_fields_back_into_a_parameter() {
+        let unit = link(concat!(
+            "FUNCTION widen(row) {\n",
+            "    row.item_kind |> WHEN {\n",
+            "        VariableRow => [item_kind: row.item_kind, base: row.base, generated: 1]\n",
+            "        __ => row\n",
+            "    }\n",
+            "}\n",
+        ));
+        let owner = owner_named(&unit, "widen");
+        let seed = seed(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let results = solve(&[seed], &[summary]);
+        let interface = results[0].owner(&owner).unwrap();
+        let Type::Object(parameter) = &interface.parameters[0].flow_type.ty else {
+            panic!("row parameter must retain its structural read requirements");
+        };
+
+        assert!(parameter.fields.contains_key("item_kind"));
+        assert!(parameter.fields.contains_key("base"));
+        assert!(!parameter.fields.contains_key("generated"));
+    }
+
+    #[test]
+    fn hold_owner_interface_retains_its_initialized_value_domain() {
+        let unit = link(concat!(
+            "state:\n",
+            "    0 |> HOLD state {\n",
+            "        LATEST {\n",
+            "            1 |> THEN { 2 }\n",
+            "        }\n",
+            "    }\n",
+        ));
+        let owners = unit.stable_check_owner_keys().collect::<Vec<_>>();
+        let owner = owner_named(&unit, "state");
+        let syntax = project_owner_syntax_input(unit.owner_view_for_key(&owner).unwrap()).unwrap();
+        let parent_seed = project_owner_constraint_seed(&syntax).unwrap();
+        let seeds = owners
+            .iter()
+            .filter(|owner| matches!(owner, StableCheckOwnerKey::Item(_)))
+            .map(|owner| seed(&unit, owner))
+            .collect::<Vec<_>>();
+        let summaries = seeds
+            .iter()
+            .map(|seed| resolve_owner_constraint_seed(seed, []).unwrap())
+            .collect::<Vec<_>>();
+        let results = solve(&seeds, &summaries);
+        let interface = results
+            .iter()
+            .find_map(|result| result.owner(&owner))
+            .unwrap();
+
+        assert_eq!(
+            interface.result.ty,
+            Type::Number,
+            "owners: {owners:#?}\nsyntax: {syntax:#?}\nseed: {parent_seed:#?}"
+        );
+    }
+
+    #[test]
     fn flush_control_is_frozen_separately_and_unionized_at_callable_boundary() {
         let source = "FUNCTION stop() {\n    FLUSH { Error }\n}\n";
         assert_checked_interface_parity(source, "stop");
@@ -3259,7 +3922,7 @@ mod tests {
     }
 
     #[test]
-    fn interface_scc_fixed_point_is_independent_of_owner_traversal_order() {
+    fn dependency_first_interface_results_are_independent_of_owner_traversal_order() {
         let unit = link(
             "FUNCTION alpha(input) {\n    zed(input: input)\n}\nFUNCTION zed(input) {\n    Number/to_text(value: input)\n}\n",
         );
@@ -3298,9 +3961,15 @@ mod tests {
         let zed_summary = resolve_owner_constraint_seed(&zed_seed, []).unwrap();
 
         let results = solve(&[alpha_seed, zed_seed], &[alpha_summary, zed_summary]);
-        assert_eq!(results.len(), 1);
-        let alpha_interface = results[0].owner(&alpha).unwrap();
-        let zed_interface = results[0].owner(&zed).unwrap();
+        assert_eq!(results.len(), 2);
+        let alpha_interface = results
+            .iter()
+            .find_map(|result| result.owner(&alpha))
+            .unwrap();
+        let zed_interface = results
+            .iter()
+            .find_map(|result| result.owner(&zed))
+            .unwrap();
         assert_eq!(zed_interface.parameters[0].flow_type.ty, Type::Number);
         assert_eq!(zed_interface.result.ty, Type::Text);
         assert_eq!(alpha_interface.result.ty, Type::Text);

@@ -434,6 +434,25 @@ impl OwnerSyntaxGraph {
         }
     }
 
+    fn child_owner_value(
+        &self,
+        syntax: &OwnerSyntaxInput,
+        child: &OwnerStatementChild,
+    ) -> Option<OwnerExpressionRef> {
+        let OwnerStatementChild::Owner { owner } = child else {
+            return None;
+        };
+        syntax
+            .child_owners
+            .iter()
+            .find(|child| &child.owner == owner)
+            .and_then(|child| child.result_expression.clone())
+            .map(|expression| OwnerExpressionRef::Child {
+                owner: owner.clone(),
+                expression,
+            })
+    }
+
     fn local_expression<'a>(
         &self,
         syntax: &'a OwnerSyntaxInput,
@@ -592,6 +611,8 @@ impl OwnerSyntaxGraph {
     fn first_child_expression(&self, statement: OwnerStatementId) -> Option<OwnerExpressionRef> {
         let statement = self.statement(statement)?;
         for child in &statement.children {
+            // This helper is called only with a validated graph; the child
+            // value itself is resolved by callers that also retain syntax.
             let Some(child) = self.local_statement(child) else {
                 continue;
             };
@@ -622,6 +643,10 @@ impl OwnerSyntaxGraph {
         }
         let mut expression_children = Vec::new();
         for child in &statement_node.children {
+            if let Some(value) = self.child_owner_value(syntax, child) {
+                expression_children.push(value);
+                continue;
+            }
             let Some(child) = self.local_statement(child) else {
                 continue;
             };
@@ -743,7 +768,21 @@ impl OwnerSyntaxGraph {
         statements: &[OwnerStatementChild],
         index: usize,
     ) -> Option<OwnerExpressionRef> {
-        let statement_id = self.local_statement(statements.get(index)?)?;
+        let child = statements.get(index)?;
+        if let Some(value) = self.child_owner_value(syntax, child) {
+            let mut expressions = vec![value.clone()];
+            self.collect_following_sibling_pipe_continuations(
+                syntax,
+                statements,
+                index + 1,
+                &mut expressions,
+            );
+            return self
+                .expression_sequence_is_pipeline(syntax, &expressions)
+                .then(|| expressions.last().expect("pipeline has a result").clone())
+                .or(Some(value));
+        }
+        let statement_id = self.local_statement(child)?;
         let statement = self.statement(statement_id)?;
         let pipeline_value = statement.direct_value.as_ref().and_then(|direct| {
             self.statement_pipeline_final(syntax, statement_id)
@@ -780,10 +819,13 @@ impl OwnerSyntaxGraph {
     ) -> Option<OwnerExpressionRef> {
         let mut result = None;
         for (index, child) in statements.iter().enumerate() {
-            let Some(statement) = self.local_statement(child) else {
-                continue;
-            };
-            if self.statement_is_source_pipe_continuation(syntax, statement) && result.is_some() {
+            if self
+                .local_statement(child)
+                .is_some_and(|statement| {
+                    self.statement_is_source_pipe_continuation(syntax, statement)
+                })
+                && result.is_some()
+            {
                 continue;
             }
             if let Some(value) = self.canonical_statement_value_at(syntax, statements, index) {
@@ -865,6 +907,9 @@ fn validate_expression_table(syntax: &OwnerSyntaxInput) -> Result<(), OwnerSynta
             .chain(expression.linked_input)
         {
             let _ = expression_reference(syntax, reference)?;
+        }
+        if let Some(selector) = expression.pattern_selector {
+            let _ = expression_reference(syntax, selector)?;
         }
         if let AstExprKind::Block { bindings, .. } = &expression.kind {
             for binding in bindings {

@@ -2,6 +2,7 @@ use boon_checked::*;
 mod owner_abi;
 mod owner_body;
 mod owner_checked;
+mod owner_compat;
 mod owner_constraints;
 mod owner_interface;
 mod owner_shard_builder;
@@ -9,6 +10,7 @@ mod owner_syntax;
 pub use owner_abi::*;
 pub use owner_body::*;
 pub use owner_checked::*;
+pub use owner_compat::*;
 pub use owner_constraints::*;
 pub use owner_interface::*;
 pub use owner_shard_builder::*;
@@ -16548,10 +16550,42 @@ fn validate_source_payload_shape_table(
         }
     }
 
-    if covered_sources != expected_sources {
+    // Entries are grouped by diagnostic path. Two sources with the same path
+    // need not be adjacent in the dense checked-source arena, so flattening
+    // path groups is not itself a global source order. Compare the canonical
+    // identity set while still rejecting duplicate coverage explicitly.
+    covered_sources.sort_unstable();
+    if covered_sources.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(format!(
-            "source payload shapes do not exactly cover checked sources: table {:?}, checked {:?}",
-            covered_sources, expected_sources
+            "source payload shapes cover a checked source more than once: {covered_sources:?}"
+        ));
+    }
+    if covered_sources != expected_sources {
+        let covered = covered_sources.iter().copied().collect::<BTreeSet<_>>();
+        let missing = program
+            .sources
+            .iter()
+            .filter(|source| !covered.contains(&source.id))
+            .map(|source| {
+                let declaration = lookup
+                    .declarations
+                    .get(&source.path.anchor)
+                    .map(|declaration| {
+                        format!(
+                            "{} {:?} `{}`",
+                            declaration.id.0, declaration.kind, declaration.name
+                        )
+                    })
+                    .unwrap_or_else(|| format!("missing {}", source.path.anchor.0));
+                format!(
+                    "{} (anchor {declaration}, projection {:?})",
+                    source.id.0, source.path.projection
+                )
+            })
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "source payload shapes do not exactly cover checked sources: table {:?}, checked {:?}, missing {:?}",
+            covered_sources, expected_sources, missing
         ));
     }
     Ok(())
@@ -30441,7 +30475,7 @@ fn infix_returns_bool(op: &str) -> bool {
     matches!(op, "==" | "!=" | ">" | "<" | ">=" | "<=")
 }
 
-fn infix_requires_number_operands(op: &str) -> bool {
+pub(crate) fn infix_requires_number_operands(op: &str) -> bool {
     matches!(op, "+" | "-" | "*" | "/" | "%" | ">" | "<" | ">=" | "<=")
 }
 
@@ -30547,6 +30581,16 @@ fn type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
         (Type::RenderContract, Type::RenderContract) => true,
         (actual, Type::RenderContract) => is_renderable_type(actual),
         (Type::List(actual), Type::List(expected)) => type_is_assignable_to(actual, expected),
+        (Type::VariantSet(actual), Type::Object(expected)) => actual.iter().all(|variant| {
+            let fields = match variant {
+                Variant::Tag(_) => return expected.fields.is_empty(),
+                Variant::Tagged { fields, .. } => fields,
+            };
+            type_is_assignable_to(
+                &Type::Object(fields.clone()),
+                &Type::Object(expected.clone()),
+            )
+        }),
         (Type::Object(actual), Type::Object(expected)) => {
             expected.fields.iter().all(|(field, expected_field)| {
                 actual
@@ -34980,6 +35024,31 @@ enum CheckedSourceResolution {
     Output(DeclId, Vec<String>),
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CheckedSourceResolutionNode {
+    Declaration(DeclId),
+    Expression(CheckedExprId),
+    ListItem(CheckedExprId),
+    Output(DeclId),
+}
+
+impl CheckedSourceResolution {
+    const fn node(&self) -> CheckedSourceResolutionNode {
+        match self {
+            Self::Declaration(declaration, _) => {
+                CheckedSourceResolutionNode::Declaration(*declaration)
+            }
+            Self::Expression(expression, _) => {
+                CheckedSourceResolutionNode::Expression(*expression)
+            }
+            Self::ListItem(expression, _) => {
+                CheckedSourceResolutionNode::ListItem(*expression)
+            }
+            Self::Output(declaration, _) => CheckedSourceResolutionNode::Output(*declaration),
+        }
+    }
+}
+
 struct CheckedSourceProvenanceResolver<'a> {
     declarations: BTreeMap<DeclId, &'a CheckedDeclaration>,
     callables: BTreeMap<DeclId, &'a CheckedCallableSignature>,
@@ -35106,8 +35175,14 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
         if let Some(cached) = self.declaration_cache.get(&key) {
             return cached.clone();
         }
+        // Provenance is graph reachability: revisiting the same resolution
+        // state within one query cannot reveal a different suffix or source.
+        // Keep the explored set for the entire query so shared diamonds are
+        // traversed once instead of once per incoming path.
+        let mut explored = BTreeSet::new();
+        let mut active = BTreeSet::new();
         let resolved = self
-            .declaration_sources(target, projection, &mut BTreeSet::new())
+            .declaration_sources(target, projection, &mut explored, &mut active)
             .into_iter()
             .collect::<Vec<_>>();
         self.declaration_cache.insert(key, resolved.clone());
@@ -35118,18 +35193,28 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
         &self,
         target: DeclId,
         projection: &[String],
-        visiting: &mut BTreeSet<CheckedSourceResolution>,
+        explored: &mut BTreeSet<CheckedSourceResolution>,
+        active: &mut BTreeSet<CheckedSourceResolutionNode>,
     ) -> BTreeSet<CheckedSourceRead> {
         let key = CheckedSourceResolution::Declaration(target, projection.to_vec());
-        if !visiting.insert(key.clone()) {
+        let node = key.node();
+        // A declaration/expression cycle remains the same dataflow cycle even
+        // when aliases prepend another field to the requested projection. A
+        // source origin always has a simple path through this finite graph, so
+        // expanding a node twice on one path is both redundant and unbounded.
+        if active.contains(&node) {
             return BTreeSet::new();
         }
+        if !explored.insert(key) {
+            return BTreeSet::new();
+        }
+        active.insert(node);
         let mut resolved = BTreeSet::new();
         if let Some(source) = self.source_paths.exact_read(target, projection) {
             resolved.insert(source);
         }
         let Some(declaration) = self.declarations.get(&target).copied() else {
-            visiting.remove(&key);
+            active.remove(&node);
             return resolved;
         };
         if declaration.kind == CheckedDeclarationKind::ValueParameter {
@@ -35139,26 +35224,26 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                 .into_iter()
                 .flatten()
             {
-                resolved.extend(self.expression_sources(*actual, projection, visiting));
+                resolved.extend(self.expression_sources(*actual, projection, explored, active));
             }
         }
         if matches!(
             declaration.kind,
             CheckedDeclarationKind::FreshOut | CheckedDeclarationKind::OutParameter
         ) {
-            resolved.extend(self.output_sources(target, projection, visiting));
+            resolved.extend(self.output_sources(target, projection, explored, active));
         }
         if let Some(value) = declaration.value {
-            resolved.extend(self.expression_sources(value, projection, visiting));
+            resolved.extend(self.expression_sources(value, projection, explored, active));
         }
         if let Some(result) = self
             .callables
             .get(&target)
             .and_then(|callable| callable.result_expression)
         {
-            resolved.extend(self.expression_sources(result, projection, visiting));
+            resolved.extend(self.expression_sources(result, projection, explored, active));
         }
-        visiting.remove(&key);
+        active.remove(&node);
         resolved
     }
 
@@ -35166,23 +35251,29 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
         &self,
         expression_id: CheckedExprId,
         projection: &[String],
-        visiting: &mut BTreeSet<CheckedSourceResolution>,
+        explored: &mut BTreeSet<CheckedSourceResolution>,
+        active: &mut BTreeSet<CheckedSourceResolutionNode>,
     ) -> BTreeSet<CheckedSourceRead> {
         let key = CheckedSourceResolution::Expression(expression_id, projection.to_vec());
-        if !visiting.insert(key.clone()) {
+        let node = key.node();
+        if active.contains(&node) {
             return BTreeSet::new();
         }
+        if !explored.insert(key) {
+            return BTreeSet::new();
+        }
+        active.insert(node);
         let mut resolved = BTreeSet::new();
         if let Some(sources) = self.source_expressions.get(&expression_id) {
             resolved.extend(sources.iter().map(|source| CheckedSourceRead {
                 source: *source,
                 payload_projection: canonical_checked_source_payload_projection(projection),
             }));
-            visiting.remove(&key);
+            active.remove(&node);
             return resolved;
         }
         let Some(expression) = self.expressions.get(&expression_id).copied() else {
-            visiting.remove(&key);
+            active.remove(&node);
             return resolved;
         };
         match &expression.kind {
@@ -35197,13 +35288,18 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             } => {
                 let mut combined = read_projection.clone();
                 combined.extend_from_slice(projection);
-                resolved.extend(self.declaration_sources(*target, &combined, visiting));
+                resolved.extend(self.declaration_sources(*target, &combined, explored, active));
             }
             CheckedExpressionKind::TaggedObject { fields, .. }
             | CheckedExpressionKind::Object { fields } => {
                 if let Some((field, rest)) = projection.split_first() {
                     for candidate in fields.iter().filter(|candidate| candidate.name == *field) {
-                        resolved.extend(self.expression_sources(candidate.value, rest, visiting));
+                        resolved.extend(self.expression_sources(
+                            candidate.value,
+                            rest,
+                            explored,
+                            active,
+                        ));
                     }
                 }
             }
@@ -35213,7 +35309,12 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                 {
                     if callable.kind == CheckedCallableKind::User {
                         if let Some(result) = callable.result_expression {
-                            resolved.extend(self.expression_sources(result, projection, visiting));
+                            resolved.extend(self.expression_sources(
+                                result,
+                                projection,
+                                explored,
+                                active,
+                            ));
                         }
                     } else if (matches!(
                         callable.contextual_operation,
@@ -35223,51 +35324,81 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                         "List/get" | "List/latest" | "List/find"
                     )) && let Some(list) = checked_call_input(call, "list")
                     {
-                        resolved.extend(self.list_item_sources(list, projection, visiting));
+                        resolved.extend(self.list_item_sources(
+                            list,
+                            projection,
+                            explored,
+                            active,
+                        ));
                     }
                 }
             }
             CheckedExpressionKind::Draining { input }
             | CheckedExpressionKind::Hold { initial: input, .. } => {
-                resolved.extend(self.expression_sources(*input, projection, visiting));
+                resolved.extend(self.expression_sources(*input, projection, explored, active));
             }
             CheckedExpressionKind::Flush { payload } => {
-                resolved.extend(self.expression_sources(*payload, projection, visiting));
+                resolved.extend(self.expression_sources(*payload, projection, explored, active));
             }
             CheckedExpressionKind::Latest { branches } => {
                 for branch in branches {
-                    resolved.extend(self.expression_sources(*branch, projection, visiting));
+                    resolved.extend(self.expression_sources(
+                        *branch,
+                        projection,
+                        explored,
+                        active,
+                    ));
                 }
             }
             CheckedExpressionKind::When { arms, .. }
             | CheckedExpressionKind::While { arms, .. } => {
                 for arm in arms {
-                    resolved.extend(self.expression_sources(*arm, projection, visiting));
+                    resolved.extend(self.expression_sources(*arm, projection, explored, active));
                 }
             }
             CheckedExpressionKind::Then { output, .. }
             | CheckedExpressionKind::MatchArm { output, .. } => {
                 if let Some(output) = output {
-                    resolved.extend(self.expression_sources(*output, projection, visiting));
+                    resolved.extend(self.expression_sources(
+                        *output,
+                        projection,
+                        explored,
+                        active,
+                    ));
                 }
             }
             CheckedExpressionKind::Block { result, .. } => {
                 if let Some(result) = result {
-                    resolved.extend(self.expression_sources(*result, projection, visiting));
+                    resolved.extend(self.expression_sources(
+                        *result,
+                        projection,
+                        explored,
+                        active,
+                    ));
                 }
             }
             CheckedExpressionKind::MapEntry { key, value } => {
-                resolved.extend(self.expression_sources(*key, &[], visiting));
-                resolved.extend(self.expression_sources(*value, projection, visiting));
+                resolved.extend(self.expression_sources(*key, &[], explored, active));
+                resolved.extend(self.expression_sources(
+                    *value,
+                    projection,
+                    explored,
+                    active,
+                ));
             }
             CheckedExpressionKind::Map { entries } => {
                 for entry in entries {
-                    resolved.extend(self.expression_sources(*entry, projection, visiting));
+                    resolved.extend(self.expression_sources(
+                        *entry,
+                        projection,
+                        explored,
+                        active,
+                    ));
                 }
             }
             CheckedExpressionKind::Set { items } => {
                 for item in items {
-                    resolved.extend(self.expression_sources(*item, projection, visiting));
+                    resolved.extend(self.expression_sources(*item, projection, explored, active));
                 }
             }
             CheckedExpressionKind::List { .. }
@@ -35286,7 +35417,7 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             | CheckedExpressionKind::Delimiter
             | CheckedExpressionKind::Invalid { .. } => {}
         }
-        visiting.remove(&key);
+        active.remove(&node);
         resolved
     }
 
@@ -35294,21 +35425,27 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
         &self,
         expression_id: CheckedExprId,
         projection: &[String],
-        visiting: &mut BTreeSet<CheckedSourceResolution>,
+        explored: &mut BTreeSet<CheckedSourceResolution>,
+        active: &mut BTreeSet<CheckedSourceResolutionNode>,
     ) -> BTreeSet<CheckedSourceRead> {
         let key = CheckedSourceResolution::ListItem(expression_id, projection.to_vec());
-        if !visiting.insert(key.clone()) {
+        let node = key.node();
+        if active.contains(&node) {
             return BTreeSet::new();
         }
+        if !explored.insert(key) {
+            return BTreeSet::new();
+        }
+        active.insert(node);
         let mut resolved = BTreeSet::new();
         let Some(expression) = self.expressions.get(&expression_id).copied() else {
-            visiting.remove(&key);
+            active.remove(&node);
             return resolved;
         };
         match &expression.kind {
             CheckedExpressionKind::List { items, .. } => {
                 for item in items {
-                    resolved.extend(self.expression_sources(*item, projection, visiting));
+                    resolved.extend(self.expression_sources(*item, projection, explored, active));
                 }
             }
             CheckedExpressionKind::Read {
@@ -35326,11 +35463,21 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                             .into_iter()
                             .flatten()
                         {
-                            resolved.extend(self.list_item_sources(*actual, projection, visiting));
+                            resolved.extend(self.list_item_sources(
+                                *actual,
+                                projection,
+                                explored,
+                                active,
+                            ));
                         }
                     }
                     if let Some(value) = declaration.value {
-                        resolved.extend(self.list_item_sources(value, projection, visiting));
+                        resolved.extend(self.list_item_sources(
+                            value,
+                            projection,
+                            explored,
+                            active,
+                        ));
                     }
                 }
             }
@@ -35340,14 +35487,24 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                 {
                     if callable.kind == CheckedCallableKind::User {
                         if let Some(result) = callable.result_expression {
-                            resolved.extend(self.list_item_sources(result, projection, visiting));
+                            resolved.extend(self.list_item_sources(
+                                result,
+                                projection,
+                                explored,
+                                active,
+                            ));
                         }
                     } else {
                         match callable.contextual_operation {
                             Some(CheckedContextualOperation::Map { body, .. }) => {
                                 if let Some(body) = checked_call_formal_input(call, body) {
                                     resolved.extend(
-                                        self.expression_sources(body, projection, visiting),
+                                        self.expression_sources(
+                                            body,
+                                            projection,
+                                            explored,
+                                            active,
+                                        ),
                                     );
                                 }
                             }
@@ -35360,7 +35517,12 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                             ) => {
                                 if let Some(list) = checked_call_formal_input(call, list) {
                                     resolved
-                                        .extend(self.list_item_sources(list, projection, visiting));
+                                        .extend(self.list_item_sources(
+                                            list,
+                                            projection,
+                                            explored,
+                                            active,
+                                        ));
                                 }
                             }
                             Some(
@@ -35373,7 +35535,12 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                                     && let Some(list) = checked_call_input(call, "list")
                                 {
                                     resolved
-                                        .extend(self.list_item_sources(list, projection, visiting));
+                                        .extend(self.list_item_sources(
+                                            list,
+                                            projection,
+                                            explored,
+                                            active,
+                                        ));
                                 }
                             }
                         }
@@ -35382,28 +35549,38 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             }
             CheckedExpressionKind::Draining { input }
             | CheckedExpressionKind::Hold { initial: input, .. } => {
-                resolved.extend(self.list_item_sources(*input, projection, visiting));
+                resolved.extend(self.list_item_sources(*input, projection, explored, active));
             }
             CheckedExpressionKind::Latest { branches } => {
                 for branch in branches {
-                    resolved.extend(self.list_item_sources(*branch, projection, visiting));
+                    resolved.extend(self.list_item_sources(*branch, projection, explored, active));
                 }
             }
             CheckedExpressionKind::When { arms, .. }
             | CheckedExpressionKind::While { arms, .. } => {
                 for arm in arms {
-                    resolved.extend(self.list_item_sources(*arm, projection, visiting));
+                    resolved.extend(self.list_item_sources(*arm, projection, explored, active));
                 }
             }
             CheckedExpressionKind::Then { output, .. }
             | CheckedExpressionKind::MatchArm { output, .. } => {
                 if let Some(output) = output {
-                    resolved.extend(self.list_item_sources(*output, projection, visiting));
+                    resolved.extend(self.list_item_sources(
+                        *output,
+                        projection,
+                        explored,
+                        active,
+                    ));
                 }
             }
             CheckedExpressionKind::Block { result, .. } => {
                 if let Some(result) = result {
-                    resolved.extend(self.list_item_sources(*result, projection, visiting));
+                    resolved.extend(self.list_item_sources(
+                        *result,
+                        projection,
+                        explored,
+                        active,
+                    ));
                 }
             }
             CheckedExpressionKind::TaggedObject { .. }
@@ -35428,7 +35605,7 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             | CheckedExpressionKind::Delimiter
             | CheckedExpressionKind::Invalid { .. } => {}
         }
-        visiting.remove(&key);
+        active.remove(&node);
         resolved
     }
 
@@ -35436,12 +35613,18 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
         &self,
         target: DeclId,
         projection: &[String],
-        visiting: &mut BTreeSet<CheckedSourceResolution>,
+        explored: &mut BTreeSet<CheckedSourceResolution>,
+        active: &mut BTreeSet<CheckedSourceResolutionNode>,
     ) -> BTreeSet<CheckedSourceRead> {
         let key = CheckedSourceResolution::Output(target, projection.to_vec());
-        if !visiting.insert(key.clone()) {
+        let node = key.node();
+        if active.contains(&node) {
             return BTreeSet::new();
         }
+        if !explored.insert(key) {
+            return BTreeSet::new();
+        }
+        active.insert(node);
         let mut resolved = BTreeSet::new();
         for list in self
             .contextual_lists_by_output
@@ -35449,7 +35632,7 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             .into_iter()
             .flatten()
         {
-            resolved.extend(self.list_item_sources(*list, projection, visiting));
+            resolved.extend(self.list_item_sources(*list, projection, explored, active));
         }
         for output in self
             .forwarded_outputs_by_formal
@@ -35457,9 +35640,9 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             .into_iter()
             .flatten()
         {
-            resolved.extend(self.output_sources(*output, projection, visiting));
+            resolved.extend(self.output_sources(*output, projection, explored, active));
         }
-        visiting.remove(&key);
+        active.remove(&node);
         resolved
     }
 }

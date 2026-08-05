@@ -52,6 +52,9 @@ pub struct OwnerStatementInput {
 pub struct OwnerExpressionInput {
     pub stable_key: StableExpressionKey,
     pub linked_input: Option<u32>,
+    /// Exact `WHEN`/`WHILE` selector for a match arm. This can address an
+    /// enclosing owner when an authored child item owns the arm body.
+    pub pattern_selector: Option<u32>,
     pub kind: AstExprKind,
 }
 
@@ -65,6 +68,15 @@ pub struct OwnerExpressionInput {
 pub struct OwnerExternalExpressionInput {
     pub owner: StableCheckOwnerKey,
     pub expression: StableExpressionKey,
+    pub exact_enclosing_capture: bool,
+}
+
+impl OwnerExternalExpressionInput {
+    /// Whether this reference captures one exact expression from an enclosing
+    /// owner rather than consuming a descendant owner's public result.
+    pub fn is_exact_enclosing_capture_for(&self, consumer: &StableCheckOwnerKey) -> bool {
+        self.exact_enclosing_capture && is_descendant_owner(&self.owner, consumer)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -72,6 +84,9 @@ pub struct OwnerChildInput {
     pub owner: StableCheckOwnerKey,
     pub parent: Option<u32>,
     pub child_index: u32,
+    /// Stable identity of the child's public result at this boundary. A
+    /// function declaration has no value in its containing statement lane.
+    pub result_expression: Option<StableExpressionKey>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -257,6 +272,7 @@ impl<'a> ExpressionProjection<'a> {
         expression: usize,
         context: &str,
         allow_enclosing: bool,
+        exact_enclosing_capture: bool,
     ) -> Result<u32, OwnerSyntaxProjectionError> {
         if let Some(local) = self.local_by_syntax.get(&expression) {
             return Ok(*local);
@@ -264,20 +280,29 @@ impl<'a> ExpressionProjection<'a> {
         if let Some(external) = self.external_by_syntax.get(&expression) {
             let external_index = (*external as usize)
                 .checked_sub(self.local_by_syntax.len())
-                .and_then(|index| self.external_expressions.get(index))
                 .ok_or_else(|| {
                     OwnerSyntaxProjectionError::new(
                         "owner external-expression interner is inconsistent",
                     )
                 })?;
-            let permitted = is_descendant_owner(self.owner, &external_index.owner)
-                || (allow_enclosing && is_descendant_owner(&external_index.owner, self.owner));
+            let external_expression = self
+                .external_expressions
+                .get_mut(external_index)
+                .ok_or_else(|| {
+                    OwnerSyntaxProjectionError::new(
+                        "owner external-expression interner is inconsistent",
+                    )
+                })?;
+            let permitted = is_descendant_owner(self.owner, &external_expression.owner)
+                || (allow_enclosing && is_descendant_owner(&external_expression.owner, self.owner));
             if permitted {
+                external_expression.exact_enclosing_capture |= exact_enclosing_capture
+                    && is_descendant_owner(&external_expression.owner, self.owner);
                 return Ok(*external);
             }
             return Err(OwnerSyntaxProjectionError::new(format!(
                 "owner {:?} {context} references expression {expression} owned outside its permitted boundary by {:?}",
-                self.owner, external_index.owner
+                self.owner, external_expression.owner
             )));
         }
         let external_owner = self
@@ -316,6 +341,8 @@ impl<'a> ExpressionProjection<'a> {
         })?;
         self.external_expressions
             .push(OwnerExternalExpressionInput {
+                exact_enclosing_capture: exact_enclosing_capture
+                    && is_descendant_owner(&external_owner, self.owner),
                 owner: external_owner,
                 expression: stable_key,
             });
@@ -328,15 +355,7 @@ impl<'a> ExpressionProjection<'a> {
         expression: usize,
         context: &str,
     ) -> Result<u32, OwnerSyntaxProjectionError> {
-        self.mapped_with_enclosing(expression, context, false)
-    }
-
-    fn mapped_linked_input(
-        &mut self,
-        expression: usize,
-        context: &str,
-    ) -> Result<u32, OwnerSyntaxProjectionError> {
-        self.mapped_with_enclosing(expression, context, true)
+        self.mapped_with_enclosing(expression, context, false, false)
     }
 
     fn remap(
@@ -919,7 +938,26 @@ pub fn project_owner_syntax_input(
         );
         let linked_input = expression
             .linked_input
-            .map(|input| expression_projection.mapped_linked_input(input, "linked input"))
+            .map(|input| {
+                expression_projection.mapped_with_enclosing(
+                    input,
+                    "linked input",
+                    true,
+                    matches!(expression.kind, AstExprKind::Hold { .. }),
+                )
+            })
+            .transpose()?;
+        let pattern_selector = matches!(expression.kind, AstExprKind::MatchArm { .. })
+            .then(|| view.pattern_selector_for_syntax_expression(expression.id))
+            .flatten()
+            .map(|selector| {
+                expression_projection.mapped_with_enclosing(
+                    selector,
+                    "pattern selector",
+                    true,
+                    true,
+                )
+            })
             .transpose()?;
         let mut kind = expression.kind.clone();
         normalize_expression_kind(
@@ -931,6 +969,7 @@ pub fn project_owner_syntax_input(
         expressions.push(OwnerExpressionInput {
             stable_key,
             linked_input,
+            pattern_selector,
             kind,
         });
     }
@@ -939,8 +978,6 @@ pub fn project_owner_syntax_input(
         &expressions,
         containing_scope_is_render_context(&containing_scope),
     );
-    let external_expressions = expression_projection.into_external_expressions();
-
     let mut child_owners = Vec::with_capacity(view.child_owners().len());
     for boundary in view.child_owners() {
         let parent = boundary
@@ -953,12 +990,31 @@ pub fn project_owner_syntax_input(
                 })
             })
             .transpose()?;
+        let child_owner = child_owner_key(&owner, boundary.route.clone());
+        let result_expression = view
+            .child_owner_result_expression(boundary)
+            .map(|expression| {
+                // The containing owner consumes the child's frozen public
+                // result just like any other descendant expression. Intern it
+                // in the compact external-expression namespace even when no
+                // retained local expression points at it directly.
+                expression_projection.mapped(expression, "child-owner public result")?;
+                view.stable_expression_key_for_syntax(expression)
+                    .ok_or_else(|| {
+                        OwnerSyntaxProjectionError::new(format!(
+                            "owner {owner:?} child {child_owner:?} has no stable public result expression"
+                        ))
+                    })
+            })
+            .transpose()?;
         child_owners.push(OwnerChildInput {
-            owner: child_owner_key(&owner, boundary.route.clone()),
+            owner: child_owner,
             parent,
             child_index: checked_u32(boundary.child_index(), "child-owner position")?,
+            result_expression,
         });
     }
+    let external_expressions = expression_projection.into_external_expressions();
 
     let fingerprint_v1 = fingerprint_serialized(
         OWNER_SYNTAX_FINGERPRINT_DOMAIN_V1,

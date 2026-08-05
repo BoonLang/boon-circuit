@@ -1,6 +1,8 @@
 use crate::owner_interface::{
-    TypeUnifier, add_local_root, alpha_normalize_type, bind_projection, flow_mode_join,
-    instantiate_type, merge_effects, pattern_type, true_false_type,
+    OwnerPatternNarrowing, TypeUnifier, add_local_root, alpha_normalize_type, bind_flow_variables,
+    bind_projection, flow_mode_join, instantiate_type, merge_effects,
+    pattern_binding_type_from_pattern, pattern_type, refine_owner_pattern_narrowings,
+    true_false_type,
 };
 use crate::{
     OwnerAbiEvaluationScope, OwnerArgumentKind, OwnerCollectionKind, OwnerConstraintEdgeRole,
@@ -10,7 +12,8 @@ use crate::{
     OwnerResultAbiContract, OwnerResultAbiParameterContract, OwnerResultCallTarget,
     OwnerResultExpressionRef, OwnerResultTransfer, OwnerResultTransferNode, OwnerSourceAnchorRole,
     OwnerSourceAnchorSite, OwnerSourceMap, OwnerSymbolResolution, OwnerSyntaxInput,
-    OwnerValueAbiForbiddenReason, OwnerValueAbiLookupOutcome, infix_returns_bool,
+    OwnerValueAbiForbiddenReason, OwnerValueAbiLookupOutcome, infix_requires_number_operands,
+    infix_returns_bool,
 };
 use boon_checked::{
     BytesType, CheckedCallableKind, CheckedEffectSummary, CheckedParameterKind,
@@ -30,7 +33,6 @@ use std::sync::Arc;
 
 const OWNER_BODY_INFERENCE_DOMAIN_V1: &[u8] = b"boon.owner-body-inference.v1\0";
 const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V1: &[u8] = b"boon.owner-body-inference-content.v1\0";
-const OWNER_BODY_INTERFACE_DOMAIN_V1: &[u8] = b"boon.owner-body-interface-import.v1\0";
 const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V1: &[u8] =
     b"boon.owner-body-inference-currentness.v1\0";
 
@@ -336,7 +338,7 @@ fn fingerprint<T: Serialize>(
 pub(crate) fn owner_body_interface_fingerprint_v1(
     interface: &OwnerPublicInterface,
 ) -> Result<[u8; 32], OwnerBodyInferenceError> {
-    fingerprint(OWNER_BODY_INTERFACE_DOMAIN_V1, interface)
+    Ok(interface.fingerprint_v1())
 }
 
 fn checked_u32(value: usize, context: &str) -> Result<u32, OwnerBodyInferenceError> {
@@ -945,8 +947,22 @@ fn bind_local_constraints(
     modes: &mut [Option<FlowMode>],
     direct_effects: &mut [CheckedEffectSummary],
     calls: &mut Vec<BodyCallPlan>,
+    pattern_narrowings: &mut Vec<OwnerPatternNarrowing>,
     work: &mut OwnerBodyInferenceWork,
 ) {
+    let arm_local_expressions = seed
+        .expressions
+        .iter()
+        .flat_map(|expression| &expression.inputs)
+        .filter_map(|input| {
+            matches!(
+                input.role,
+                OwnerConstraintEdgeRole::MatchBinding { .. }
+                    | OwnerConstraintEdgeRole::MatchNarrowedSelector { .. }
+            )
+            .then_some(input.expression)
+        })
+        .collect::<BTreeSet<_>>();
     let resolved = summary
         .resolved_references
         .iter()
@@ -997,7 +1013,10 @@ fn bind_local_constraints(
             }
             OwnerConstraintNodeKind::Reference { parts }
             | OwnerConstraintNodeKind::Drain { parts } => {
-                if resolved.contains_key(&expression.expression) {
+                if arm_local_expressions.contains(&(index as u32)) {
+                    // The owning match arm binds this occurrence against an
+                    // arm-local pattern value below.
+                } else if resolved.contains_key(&expression.expression) {
                     // Cross-owner value reads are wired after all interfaces
                     // have been instantiated into this body namespace.
                 } else if matches!(
@@ -1100,7 +1119,7 @@ fn bind_local_constraints(
                 if let Some(input) = expression.inputs.first().and_then(|input| {
                     expression_variable(expressions, external_expressions, input.expression)
                 }) {
-                    unifier.unify(Type::Var(variable), Type::Var(input));
+                    bind_flow_variables(unifier, variable, [input]);
                 }
                 mode = None;
             }
@@ -1114,27 +1133,26 @@ fn bind_local_constraints(
                 direct_effects[index].writes_state = true;
             }
             OwnerConstraintNodeKind::Latest => {
-                for input in &expression.inputs {
-                    if let Some(input) =
+                let inputs = expression
+                    .inputs
+                    .iter()
+                    .filter_map(|input| {
                         expression_variable(expressions, external_expressions, input.expression)
-                    {
-                        unifier.unify(Type::Var(variable), Type::Var(input));
-                    }
-                }
+                    })
+                    .collect::<Vec<_>>();
+                bind_flow_variables(unifier, variable, inputs);
                 mode = None;
             }
             OwnerConstraintNodeKind::When => {
-                for input in expression
+                let inputs = expression
                     .inputs
                     .iter()
                     .filter(|input| matches!(input.role, OwnerConstraintEdgeRole::WhenArm))
-                {
-                    if let Some(input) =
+                    .filter_map(|input| {
                         expression_variable(expressions, external_expressions, input.expression)
-                    {
-                        unifier.unify(Type::Var(variable), Type::Var(input));
-                    }
-                }
+                    })
+                    .collect::<Vec<_>>();
+                bind_flow_variables(unifier, variable, inputs);
                 mode = None;
             }
             OwnerConstraintNodeKind::Then => {
@@ -1151,16 +1169,18 @@ fn bind_local_constraints(
                 if let Some(input) = input.and_then(|input| {
                     expression_variable(expressions, external_expressions, input.expression)
                 }) {
-                    unifier.unify(Type::Var(variable), Type::Var(input));
+                    bind_flow_variables(unifier, variable, [input]);
                 }
                 mode = Some(FlowMode::PresentOrAbsent);
             }
             OwnerConstraintNodeKind::Infix { operation } => {
-                for input in &expression.inputs {
-                    if let Some(input) =
-                        expression_variable(expressions, external_expressions, input.expression)
-                    {
-                        unifier.bind_var(input, Type::Number);
+                if infix_requires_number_operands(operation) {
+                    for input in &expression.inputs {
+                        if let Some(input) =
+                            expression_variable(expressions, external_expressions, input.expression)
+                        {
+                            unifier.bind_var(input, Type::Number);
+                        }
                     }
                 }
                 unifier.bind_var(
@@ -1181,14 +1201,78 @@ fn bind_local_constraints(
                     if let Some(output) =
                         expression_variable(expressions, external_expressions, output.expression)
                     {
-                        unifier.unify(Type::Var(variable), Type::Var(output));
+                        bind_flow_variables(unifier, variable, [output]);
                     }
                     mode = None;
                 } else {
                     unifier.bind_var(variable, Type::Absent);
                     mode = Some(FlowMode::Absent);
                 }
-                let _ = pattern_type(pattern, unifier);
+                let pattern_ty = pattern_type(pattern, unifier);
+                let bindings = expression
+                    .inputs
+                    .iter()
+                    .filter_map(|input| {
+                        let OwnerConstraintEdgeRole::MatchBinding { name } = &input.role else {
+                            return None;
+                        };
+                        expression_variable(expressions, external_expressions, input.expression)
+                            .map(|read| (name.clone(), read))
+                    })
+                    .collect::<Vec<_>>();
+                for (name, read) in &bindings {
+                    if let Some(binding_ty) =
+                        pattern_binding_type_from_pattern(pattern, &pattern_ty, name)
+                    {
+                        unifier.unify(Type::Var(*read), binding_ty);
+                    }
+                }
+                let narrowed_payload = unifier.fresh();
+                if let (crate::OwnerPatternConstraint::Tag { name, .. }, Type::VariantSet(variants)) =
+                    (pattern, &pattern_ty)
+                    && let Some(fields) = variants.iter().find_map(|variant| match variant {
+                        Variant::Tagged { tag, fields } if tag == name => Some(fields.clone()),
+                        Variant::Tag(_) | Variant::Tagged { .. } => None,
+                    })
+                {
+                    unifier.bind_var(narrowed_payload, Type::Object(fields));
+                }
+                let selector_reads = expression
+                    .inputs
+                    .iter()
+                    .filter_map(|input| {
+                        let OwnerConstraintEdgeRole::MatchNarrowedSelector { projection } =
+                            &input.role
+                        else {
+                            return None;
+                        };
+                        expression_variable(expressions, external_expressions, input.expression)
+                            .map(|read| (projection.clone(), read))
+                    })
+                    .collect::<Vec<_>>();
+                for (projection, read) in &selector_reads {
+                    if projection.is_empty() {
+                        unifier.bind_flow_result(*read, pattern_ty.clone());
+                    } else {
+                        let projected = bind_projection(unifier, narrowed_payload, projection);
+                        unifier.unify(Type::Var(*read), Type::Var(projected));
+                    }
+                }
+                if let Some(selector) = expression
+                    .inputs
+                    .iter()
+                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::MatchSelector))
+                    .and_then(|input| {
+                        expression_variable(expressions, external_expressions, input.expression)
+                    })
+                {
+                    pattern_narrowings.push(OwnerPatternNarrowing {
+                        selector,
+                        pattern: pattern.clone(),
+                        bindings: bindings.into_boxed_slice(),
+                        selector_reads: selector_reads.into_boxed_slice(),
+                    });
+                }
             }
             OwnerConstraintNodeKind::Block => {
                 if let Some(result) = expression
@@ -1199,7 +1283,7 @@ fn bind_local_constraints(
                     if let Some(result) =
                         expression_variable(expressions, external_expressions, result.expression)
                     {
-                        unifier.unify(Type::Var(variable), Type::Var(result));
+                        bind_flow_variables(unifier, variable, [result]);
                     }
                     mode = None;
                 } else {
@@ -1279,7 +1363,7 @@ fn bind_local_constraints(
                         expression_variable(expressions, external_expressions, output.expression)
                     })
                 {
-                    unifier.unify(Type::Var(variable), Type::Var(output));
+                    bind_flow_variables(unifier, variable, [output]);
                 }
                 let _ = pattern_type(pattern, unifier);
             }
@@ -3835,6 +3919,7 @@ pub fn evaluate_owner_body<'a>(
     let call_flushes = (0..seed.expressions.len())
         .map(|_| unifier.fresh())
         .collect::<Vec<_>>();
+    let mut own_variables = BTreeMap::new();
 
     for ((external, variable), flush_variable) in seed
         .external_expressions
@@ -3842,16 +3927,39 @@ pub fn evaluate_owner_body<'a>(
         .zip(&external_expressions)
         .zip(&external_expression_flushes)
     {
-        let interface = interfaces[&external.owner];
-        let mut variables = BTreeMap::new();
-        let ty = instantiate_type(&interface.result.ty, &mut unifier, &mut variables);
+        let (ty, flush_type) = if external.is_exact_enclosing_capture_for(&seed.owner) {
+            let capture = own_interface
+                .captures
+                .iter()
+                .find(|capture| {
+                    capture.owner == external.owner && capture.expression == external.expression
+                })
+                .ok_or_else(|| {
+                    OwnerBodyInferenceError::new(format!(
+                        "owner body {:?} is missing enclosing capture {:?}",
+                        seed.owner, external.expression
+                    ))
+                })?;
+            (
+                instantiate_type(&capture.flow_type.ty, &mut unifier, &mut own_variables),
+                capture.flush_type.as_ref().map_or(Type::Absent, |ty| {
+                    instantiate_type(ty, &mut unifier, &mut own_variables)
+                }),
+            )
+        } else {
+            let interface = interfaces[&external.owner];
+            let mut variables = BTreeMap::new();
+            (
+                instantiate_type(&interface.result.ty, &mut unifier, &mut variables),
+                interface
+                    .result_flush_type
+                    .as_ref()
+                    .map_or(Type::Absent, |ty| {
+                        instantiate_type(ty, &mut unifier, &mut variables)
+                    }),
+            )
+        };
         unifier.bind_var(*variable, ty);
-        let flush_type = interface
-            .result_flush_type
-            .as_ref()
-            .map_or(Type::Absent, |ty| {
-                instantiate_type(ty, &mut unifier, &mut variables)
-            });
         unifier.bind_var(*flush_variable, flush_type);
         work.interface_imports = work.interface_imports.saturating_add(1);
     }
@@ -3891,7 +3999,6 @@ pub fn evaluate_owner_body<'a>(
         );
     }
     let mut local_roots = BTreeMap::new();
-    let mut own_variables = BTreeMap::new();
     let mut own_parameter_variables = Vec::with_capacity(own_interface.parameters.len());
     for parameter in &own_interface.parameters {
         let variable = unifier.fresh();
@@ -3954,6 +4061,7 @@ pub fn evaluate_owner_body<'a>(
     let mut modes = vec![None; expressions.len()];
     let mut direct_effects = vec![CheckedEffectSummary::default(); expressions.len()];
     let mut calls = Vec::new();
+    let mut pattern_narrowings = Vec::new();
     bind_local_constraints(
         seed,
         summary,
@@ -3966,6 +4074,7 @@ pub fn evaluate_owner_body<'a>(
         &mut modes,
         &mut direct_effects,
         &mut calls,
+        &mut pattern_narrowings,
         &mut work,
     );
 
@@ -4032,6 +4141,7 @@ pub fn evaluate_owner_body<'a>(
         context,
         &mut modes,
     );
+    refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
     validate_owner_call_types(
         &mut call_drafts,
         &interfaces,
@@ -5027,11 +5137,14 @@ mod tests {
         );
         let body = infer(&held_syntax, &held_seed, &held_summary, &interfaces);
 
-        assert!(body.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "hold_initializer_flush"
-                && diagnostic.message
-                    == "a `HOLD` initializer must produce a valid storable value and cannot `FLUSH`"
-        }));
+        assert!(
+            body.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "hold_initializer_flush"
+                    && diagnostic.message
+                        == "a `HOLD` initializer must produce a valid storable value and cannot `FLUSH`"
+            }),
+            "interfaces: {interfaces:#?}\nbody: {body:#?}"
+        );
     }
 
     #[test]

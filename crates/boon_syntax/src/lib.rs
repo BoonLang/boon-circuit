@@ -809,6 +809,7 @@ pub struct UnitOwnerIndex {
     statement_routes: Box<[StableStatementRoute]>,
     statement_owners: Box<[UnitCheckOwnerSlot]>,
     expression_owners: Box<[UnitCheckOwnerSlot]>,
+    expression_parents: Box<[Option<UnitLocalExpressionId>]>,
 }
 
 impl UnitOwnerIndex {
@@ -819,6 +820,7 @@ impl UnitOwnerIndex {
         statement_routes: Vec<StableStatementRoute>,
         statement_owners: Vec<UnitCheckOwnerSlot>,
         expression_owners: Vec<UnitCheckOwnerSlot>,
+        expression_parents: Vec<Option<UnitLocalExpressionId>>,
     ) -> Self {
         Self {
             entries: entries.into_boxed_slice(),
@@ -826,6 +828,7 @@ impl UnitOwnerIndex {
             statement_routes: statement_routes.into_boxed_slice(),
             statement_owners: statement_owners.into_boxed_slice(),
             expression_owners: expression_owners.into_boxed_slice(),
+            expression_parents: expression_parents.into_boxed_slice(),
         }
     }
 
@@ -883,6 +886,16 @@ impl UnitOwnerIndex {
             .get(expression.as_usize())
             .copied()
             .filter(|owner| owner.is_routed())
+    }
+
+    pub fn expression_parent(
+        &self,
+        expression: UnitLocalExpressionId,
+    ) -> Option<UnitLocalExpressionId> {
+        self.expression_parents
+            .get(expression.as_usize())
+            .copied()
+            .flatten()
     }
 }
 

@@ -424,6 +424,7 @@ struct OwnerRowConstruction<'a> {
     statement_scopes: Vec<OwnerScopeRef>,
     statement_body_scopes: BTreeMap<OwnerStatementId, OwnerScopeId>,
     expression_scopes: Vec<OwnerScopeRef>,
+    expression_owned: Vec<bool>,
     expression_declarations: Vec<Option<OwnerDeclarationRef>>,
     pattern_declarations: BTreeMap<(OwnerExpressionId, String), OwnerDeclarationId>,
     pattern_bindings: Vec<OwnerPatternBindingRow>,
@@ -478,6 +479,7 @@ impl<'a> OwnerRowConstruction<'a> {
             statement_scopes: vec![containing_scope; syntax.statements.len()],
             statement_body_scopes: BTreeMap::new(),
             expression_scopes: vec![OwnerScopeRef::ProjectRoot; syntax.expressions.len()],
+            expression_owned: vec![false; syntax.expressions.len()],
             expression_declarations: vec![None; syntax.expressions.len()],
             pattern_declarations: BTreeMap::new(),
             pattern_bindings: Vec::new(),
@@ -714,6 +716,9 @@ impl<'a> OwnerRowConstruction<'a> {
                 .graph
                 .statement(statement_id)
                 .and_then(|statement| statement.canonical_value.clone());
+            let declaration_value = (declaration.kind != OwnerDeclarationKind::Function)
+                .then(|| value.clone())
+                .flatten();
             let flow_type = if declaration.public {
                 public_declaration_flow_type(self.own_interface)
             } else {
@@ -740,7 +745,7 @@ impl<'a> OwnerRowConstruction<'a> {
                         .to_owned(),
                     kind: checked_declaration_kind(declaration.kind),
                     flow_type,
-                    value,
+                    value: declaration_value,
                     body_scope: self.statement_body_scopes.get(&statement_id).copied(),
                     source: statement_source(statement),
                 },
@@ -898,40 +903,28 @@ impl<'a> OwnerRowConstruction<'a> {
                 self.expression_scopes[index] = self.containing_scope.clone();
             }
         }
+        self.expression_owned = assigned;
         Ok(())
     }
 
     fn prepare_pattern_bindings(&mut self) -> Result<(), CheckedOwnerBuildError> {
         let mut arms = Vec::new();
-        for (parent, expression) in self.syntax.expressions.iter().enumerate() {
-            let (selector, candidates) = match &expression.kind {
-                AstExprKind::When { input, arms } => (*input, arms.as_slice()),
-                AstExprKind::Pipe {
-                    input, op, arms, ..
-                } if op == "WHILE" => (*input, arms.as_slice()),
-                _ => continue,
+        for (arm, expression) in self.syntax.expressions.iter().enumerate() {
+            let AstExprKind::MatchArm { pattern, output } = &expression.kind else {
+                continue;
             };
-            if selector >= self.syntax.expressions.len() {
-                return Err(CheckedOwnerBuildError::new(
-                    "owner pattern selector crosses an unsupported child-owner boundary",
-                ));
-            }
-            for arm in candidates {
-                let Some(input) = self.syntax.expressions.get(*arm) else {
-                    return Err(CheckedOwnerBuildError::new(
-                        "owner pattern arm crosses an unsupported child-owner boundary",
-                    ));
-                };
-                let AstExprKind::MatchArm { pattern, output } = &input.kind else {
-                    continue;
-                };
-                arms.push((parent, selector, *arm, pattern.clone(), *output));
-            }
+            let selector = expression.pattern_selector.ok_or_else(|| {
+                CheckedOwnerBuildError::new(format!(
+                    "owner match arm {:?} has no structural selector",
+                    expression.stable_key
+                ))
+            })?;
+            arms.push((selector, arm, pattern.clone(), *output));
         }
 
-        for (parent, selector, arm, pattern, output) in arms {
+        for (selector, arm, pattern, output) in arms {
             let arm_id = OwnerExpressionId(checked_u32(arm, "owner pattern arm")?);
-            let selector_id = OwnerExpressionId(checked_u32(selector, "owner pattern selector")?);
+            let selector_ref = owner_expression_ref(self.syntax, selector as usize)?;
             let stable_expression = self.syntax.expressions[arm].stable_key.clone();
             let stable_scope = OwnerScopeStableKey::Expression {
                 expression: stable_expression.clone(),
@@ -942,7 +935,7 @@ impl<'a> OwnerRowConstruction<'a> {
                 scope,
                 ScopeSpec {
                     stable_key: stable_scope,
-                    parent: Some(self.expression_scopes[parent].clone()),
+                    parent: Some(self.expression_scopes[arm].clone()),
                     owner: None,
                     kind: CheckedScopeKind::Block,
                     source: Some(expression_source(&self.syntax.expressions[arm])),
@@ -979,7 +972,37 @@ impl<'a> OwnerRowConstruction<'a> {
                 )?;
             }
 
-            let selector_type = &self.body.expressions[selector].flow_type.ty;
+            let selector_type = match &selector_ref {
+                OwnerExpressionRef::Local { expression } => {
+                    &self
+                        .body
+                        .expressions
+                        .get(expression.0 as usize)
+                        .ok_or_else(|| {
+                            CheckedOwnerBuildError::new(
+                                "owner pattern selector inference is missing",
+                            )
+                        })?
+                        .flow_type
+                        .ty
+                }
+                OwnerExpressionRef::Child { owner, expression } => {
+                    &self
+                        .own_interface
+                        .captures
+                        .iter()
+                        .find(|capture| {
+                            &capture.owner == owner && &capture.expression == expression
+                        })
+                        .ok_or_else(|| {
+                            CheckedOwnerBuildError::new(
+                                "owner pattern selector capture is missing from its interface",
+                            )
+                        })?
+                        .flow_type
+                        .ty
+                }
+            };
             for (ordinal, name) in pattern_variable_names(&pattern).into_iter().enumerate() {
                 let ordinal = checked_u32(ordinal, "owner pattern binding ordinal")?;
                 let stable_key = OwnerDeclarationStableKey::PatternBinding {
@@ -1015,7 +1038,7 @@ impl<'a> OwnerRowConstruction<'a> {
                 }
                 self.pattern_bindings.push(OwnerPatternBindingRow {
                     declaration,
-                    selector: selector_id,
+                    selector: selector_ref.clone(),
                     projection: match &pattern {
                         AstMatchPattern::Tag { fields, .. } if fields.contains(&name) => {
                             vec![name]
@@ -2362,7 +2385,17 @@ impl<'a> OwnerRowConstruction<'a> {
         let containing_statements = self.containing_expression_statements(statements, expressions);
 
         for expression in expressions.iter().filter(|expression| {
-            matches!(expression.kind, OwnerExpressionKind::Source) || expression.effect.emits_source
+            if matches!(expression.kind, OwnerExpressionKind::Source) {
+                return true;
+            }
+            let OwnerExpressionKind::Call { call } = &expression.kind else {
+                return false;
+            };
+            expression.effect.emits_source
+                && self
+                    .call_rows
+                    .get(call.0 as usize)
+                    .is_some_and(|call| matches!(call.callable, OwnerDeclarationRef::Abi { .. }))
         }) {
             let Some(declaration) = expression.declaration.clone() else {
                 continue;
@@ -3788,17 +3821,18 @@ impl<'a> OwnerRowConstruction<'a> {
             )?;
         }
         for row in &rows.pattern_bindings {
+            let mut relocations = Vec::new();
             let stable_key = self.local_declaration_key(row.declaration)?;
             let payload = json!({
                 "declaration": stable_key,
-                "selector": self.local_expression_key(row.selector)?,
+                "selector": self.normalize_expression_ref(&row.selector, &mut relocations)?,
                 "projection": row.projection,
             });
             sink.record(
                 OwnerCheckedRowDomain::PatternBinding,
                 stable_key,
                 &payload,
-                std::iter::empty(),
+                relocations,
             )?;
         }
         for row in &rows.resource_projection_seeds {
@@ -4127,6 +4161,16 @@ impl<'a> OwnerRowConstruction<'a> {
         id: OwnerExpressionId,
         kind: &AstExprKind,
     ) -> Result<OwnerExpressionKind, CheckedOwnerBuildError> {
+        if !self
+            .expression_owned
+            .get(id.0 as usize)
+            .copied()
+            .unwrap_or(false)
+        {
+            return Ok(OwnerExpressionKind::Invalid {
+                tokens: vec!["unowned_parser_expression".to_owned()],
+            });
+        }
         let expression = &self.syntax.expressions[id.0 as usize];
         let expression_ref = |reference| owner_expression_ref(self.syntax, reference);
         let fields = |fields: &[boon_syntax::AstRecordField]| {
@@ -5057,9 +5101,9 @@ pub fn build_checked_owner_shard<'a>(
 mod tests {
     use super::*;
     use crate::{
-        build_owner_interface_topology, evaluate_owner_body, project_owner_abi_environment,
-        project_owner_constraint_seed, project_owner_syntax_input, resolve_owner_constraint_seed,
-        solve_owner_interface_scc,
+        build_owner_interface_topology, evaluate_owner_body, owner_body_required_interface_owners,
+        project_owner_abi_environment, project_owner_constraint_seed, project_owner_syntax_input,
+        resolve_owner_constraint_seed, solve_owner_interface_scc,
     };
     use boon_checked::{ExternalTypeEnvironment, OwnerAbiMemberRef};
     use boon_parser::{ProjectSyntaxSnapshot, parse_project_source_unit, project_unit_link_keys};
@@ -5097,10 +5141,22 @@ mod tests {
                 matches!(
                     owner,
                     StableCheckOwnerKey::Item(owner)
-                        if owner.item_route.segments().last().is_some_and(|segment| {
-                            segment.names.as_ref() == [name]
-                        })
+                        if name == "<list>"
+                            && owner.item_route.segments().last().is_some_and(|segment| {
+                                segment.kind == boon_syntax::UnitItemKind::List
+                            })
                 )
+            })
+            .or_else(|| {
+                owners.iter().find(|owner| {
+                    matches!(
+                        owner,
+                        StableCheckOwnerKey::Item(owner)
+                            if owner.item_route.segments().last().is_some_and(|segment| {
+                                segment.names.as_ref() == [name]
+                            })
+                    )
+                })
             })
             .or_else(|| {
                 owners.iter().find(|owner| {
@@ -5123,6 +5179,160 @@ mod tests {
             &ExternalTypeEnvironment::empty(ProgramRole::Client),
         )
         .unwrap();
+        if name == "<list>" || !seed.external_expressions.is_empty() {
+            let syntaxes = owners
+                .iter()
+                .map(|owner| {
+                    (
+                        owner.clone(),
+                        project_owner_syntax_input(unit.owner_view_for_key(owner).unwrap())
+                            .unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let seeds = syntaxes
+                .iter()
+                .map(|(owner, syntax)| {
+                    (
+                        owner.clone(),
+                        project_owner_constraint_seed(syntax).unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let summaries = seeds
+                .iter()
+                .map(|(owner, seed)| {
+                    (
+                        owner.clone(),
+                        resolve_owner_constraint_seed(seed, []).unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let topology = build_owner_interface_topology(summaries.values()).unwrap();
+            let mut interface_results = BTreeMap::new();
+            for scc in &topology.sccs {
+                let parameter_requirements = scc
+                    .key
+                    .members
+                    .iter()
+                    .flat_map(|member| {
+                        seeds[member]
+                            .parameter_requirement_keys()
+                            .into_vec()
+                            .into_iter()
+                            .map(|key| {
+                                let (function, parameter) = seeds[member]
+                                    .parameter_requirement_names(key.parameter_ordinal())
+                                    .unwrap();
+                                abi.parameter_requirement_lookup(key, function, parameter)
+                                    .unwrap()
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                let interface_abi = abi
+                    .complete_inference_environment_with_requirements(
+                        scc.key.members.iter().cloned(),
+                        scc.key.members.iter().flat_map(|member| {
+                            summaries[member].authoritative_abi_names().into_vec()
+                        }),
+                        scc.key.members.iter().flat_map(|member| {
+                            summaries[member].authoritative_value_abi_paths().into_vec()
+                        }),
+                        scc.key
+                            .members
+                            .iter()
+                            .flat_map(|member| seeds[member].source_payload_abi_paths().into_vec()),
+                        parameter_requirements,
+                    )
+                    .unwrap();
+                let dependencies = scc
+                    .dependencies
+                    .iter()
+                    .map(|dependency| &interface_results[dependency])
+                    .collect::<Vec<_>>();
+                let result = solve_owner_interface_scc(
+                    scc,
+                    &interface_abi,
+                    scc.key.members.iter().map(|member| &seeds[member]),
+                    scc.key.members.iter().map(|member| &summaries[member]),
+                    dependencies,
+                )
+                .unwrap();
+                interface_results.insert(scc.key.clone(), result);
+            }
+            let own_scc = topology.scc_for_owner(&owner).unwrap();
+            let interface = interface_results[&own_scc.key].clone();
+            let syntax = syntaxes.get(&owner).unwrap().clone();
+            let seed = seeds.get(&owner).unwrap().clone();
+            let summary = summaries.get(&owner).unwrap().clone();
+            let parameter_requirements = seed
+                .parameter_requirement_keys()
+                .into_vec()
+                .into_iter()
+                .map(|key| {
+                    let (function, parameter) = seed
+                        .parameter_requirement_names(key.parameter_ordinal())
+                        .unwrap();
+                    abi.parameter_requirement_lookup(key, function, parameter)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let inference_abi = abi
+                .complete_inference_environment_with_requirements(
+                    [seed.owner.clone()],
+                    summary.authoritative_abi_names().into_vec(),
+                    summary.authoritative_value_abi_paths().into_vec(),
+                    seed.source_payload_abi_paths().into_vec(),
+                    parameter_requirements,
+                )
+                .unwrap();
+            let available_interfaces = interface_results
+                .values()
+                .flat_map(|result| &result.owners)
+                .map(|interface| (interface.owner.clone(), interface))
+                .collect::<BTreeMap<_, _>>();
+            let required =
+                owner_body_required_interface_owners(&seed, &summary, &available_interfaces)
+                    .unwrap();
+            let imported = interface_results
+                .values()
+                .filter(|result| result.key != own_scc.key)
+                .filter(|result| {
+                    result
+                        .key
+                        .members
+                        .iter()
+                        .any(|owner| required.contains(owner))
+                })
+                .collect::<Vec<_>>();
+            let body_evaluation = evaluate_owner_body(
+                &syntax,
+                &seed,
+                &summary,
+                &inference_abi,
+                &interface,
+                imported,
+            )
+            .unwrap();
+            let body = Arc::unwrap_or_clone(body_evaluation.result);
+            let construction_abi = abi
+                .construction_environment(
+                    seed.owner.clone(),
+                    summary.authoritative_abi_names().into_vec(),
+                    summary.authoritative_value_abi_paths().into_vec(),
+                )
+                .unwrap();
+            return Fixture {
+                syntax,
+                seed,
+                summary,
+                inference_abi,
+                construction_abi,
+                interface,
+                body,
+                body_currentness: body_evaluation.currentness,
+            };
+        }
         let parameter_requirements = seed
             .parameter_requirement_keys()
             .into_vec()
@@ -5461,6 +5671,26 @@ mod tests {
     }
 
     #[test]
+    fn pattern_binding_wrapping_a_child_list_owner_is_retained() {
+        let fixture = fixture(
+            concat!(
+                "value:\n",
+                "    Found[item: 1]\n",
+                "    |> WHEN {\n",
+                "        Found[item] => LIST { item }\n",
+                "    }\n",
+            ),
+            "<list>",
+        );
+        let rows = rows(&fixture);
+        assert_eq!(rows.pattern_bindings.len(), 1);
+        assert!(matches!(
+            rows.pattern_bindings[0].selector,
+            OwnerExpressionRef::Child { .. }
+        ));
+    }
+
+    #[test]
     fn lexical_statement_reads_do_not_fall_through_to_external_values() {
         let fixture = fixture(
             "FUNCTION identity(input) {\n    local: input\n    local\n}\n",
@@ -5734,5 +5964,24 @@ mod tests {
         let call_rows = rows(&call);
         assert_eq!(call_rows.call_result_paths.len(), 1);
         assert_eq!(call_rows.call_result_paths[0].projection, ["text"]);
+    }
+
+    #[test]
+    fn user_calls_do_not_duplicate_sources_owned_by_the_callee() {
+        let source = concat!(
+            "FUNCTION source_factory() {\n",
+            "    event: SOURCE\n",
+            "    event\n",
+            "}\n",
+            "FUNCTION wrapper() {\n",
+            "    source_factory()\n",
+            "}\n",
+            "value: wrapper()\n",
+        );
+        let source_factory = rows(&fixture(source, "source_factory"));
+        let wrapper = rows(&fixture(source, "wrapper"));
+
+        assert_eq!(source_factory.sources.len(), 1);
+        assert!(wrapper.sources.is_empty());
     }
 }

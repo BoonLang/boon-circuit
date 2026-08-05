@@ -386,6 +386,28 @@ impl<'a> UnitOwnerSyntaxView<'a> {
             .map(|boundary| &boundary.route)
     }
 
+    /// Return the exact public value expression exported by a child-owner
+    /// boundary, when that child is a value-bearing item.
+    ///
+    /// The parent keeps only this stable result identity; it never traverses
+    /// the child body. Function declarations intentionally export no value at
+    /// their placement in the containing statement sequence.
+    pub fn child_owner_result_expression(
+        &self,
+        boundary: &UnitChildOwnerBoundary,
+    ) -> Option<usize> {
+        if boundary.route.segments().last()?.kind == UnitItemKind::Function {
+            return None;
+        }
+        let entry = self
+            .fields
+            .owner_index
+            .entry(&UnitOwnerRoute::Item(boundary.route.clone()))?;
+        let public = *entry.statements.first()?;
+        let statement = unit_statement_by_local_id(self.fields, public, 0)?;
+        statement_value_expression(statement, &self.fields.ast.expressions)
+    }
+
     pub fn statement_ids(&self) -> &'a [UnitLocalStatementId] {
         &self.entry.statements
     }
@@ -449,6 +471,30 @@ impl<'a> UnitOwnerSyntaxView<'a> {
             &self.fields.item_index,
             self.fields.owner_index.expression_owner(expression)?,
         )
+    }
+
+    /// Return the selector structurally owning one `WHEN`/`WHILE` match arm.
+    ///
+    /// The selector can live in an enclosing owner when the arm wraps an
+    /// authored child item such as `LIST`. The owner projection retains this
+    /// exact cross-boundary expression instead of guessing from the enclosing
+    /// owner's public result.
+    pub fn pattern_selector_for_syntax_expression(&self, expression_id: usize) -> Option<usize> {
+        let expression = self.local_expression_id(expression_id)?;
+        let parent = self.fields.owner_index.expression_parent(expression)?;
+        let parent = self.fields.ast.expressions.get(parent.as_usize())?;
+        let selector = match &parent.kind {
+            AstExprKind::When { input, arms } if arms.contains(&expression_id) => {
+                parent.linked_input.unwrap_or(*input)
+            }
+            AstExprKind::Pipe {
+                input, op, arms, ..
+            } if op == "WHILE" && arms.contains(&expression_id) => {
+                parent.linked_input.unwrap_or(*input)
+            }
+            _ => return None,
+        };
+        Some(selector)
     }
 
     fn local_expression_id(&self, expression_id: usize) -> Option<UnitLocalExpressionId> {
@@ -9167,12 +9213,29 @@ fn build_unit_expression_identities(
             },
         )
         .collect::<Vec<_>>();
+    let expression_parents = parents
+        .iter()
+        .map(|parent| {
+            parent
+                .as_ref()
+                .map(|parent| {
+                    UnitLocalExpressionId::__parser_new(parent.expression).ok_or_else(|| {
+                        parsed_source_unit_invariant_error(
+                            path,
+                            "expression parent exceeds the unit-local id bound",
+                        )
+                    })
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let owner_index = UnitOwnerIndex::__parser_new(
         owner_entries,
         statement_locators,
         statement_routes,
         statement_owners,
         expression_owners,
+        expression_parents,
     );
     let mut occurrence_routes = vec![None; expression_count];
     for expression in &ast.expressions {

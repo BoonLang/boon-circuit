@@ -84,8 +84,8 @@ pub struct OwnerResultAbiContract {
     pub result: FlowType,
 }
 
-impl From<&crate::OwnerAbiCallableContract> for OwnerResultAbiContract {
-    fn from(contract: &crate::OwnerAbiCallableContract) -> Self {
+impl From<&crate::OwnerInferenceCallableContract> for OwnerResultAbiContract {
+    fn from(contract: &crate::OwnerInferenceCallableContract) -> Self {
         Self {
             kind: contract.kind,
             parameters: contract

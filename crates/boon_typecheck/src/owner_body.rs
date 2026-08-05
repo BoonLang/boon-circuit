@@ -3196,8 +3196,8 @@ fn refine_owner_call_transfers(
 
 fn body_input_for_abi_parameter(
     call: &BodyCallPlan,
-    parameter: &crate::OwnerAbiParameterContract,
-    parameters: &[crate::OwnerAbiParameterContract],
+    parameter: &crate::OwnerInferenceParameterContract,
+    parameters: &[crate::OwnerInferenceParameterContract],
 ) -> Option<u32> {
     call.inputs.iter().find_map(|(role, expression)| {
         let matches_parameter = match role {

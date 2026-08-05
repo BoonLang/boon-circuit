@@ -157,6 +157,65 @@ pub struct OwnerAbiCallableContract {
     pub contextual_operation: Option<OwnerAbiContextualOperation>,
 }
 
+/// Parameter surface consumed by owner interface and body inference.
+///
+/// This is intentionally separate from the construction ABI so future link or
+/// runtime metadata cannot silently widen an inference dependency.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerInferenceParameterContract {
+    pub name: String,
+    pub kind: CheckedParameterKind,
+    pub ordinal: u32,
+    pub flow_type: FlowType,
+    pub requirement: CheckedParameterRequirement,
+    pub evaluation_scope: OwnerAbiEvaluationScope,
+}
+
+impl From<&OwnerAbiParameterContract> for OwnerInferenceParameterContract {
+    fn from(contract: &OwnerAbiParameterContract) -> Self {
+        Self {
+            name: contract.name.clone(),
+            kind: contract.kind,
+            ordinal: contract.ordinal,
+            flow_type: contract.flow_type.clone(),
+            requirement: contract.requirement.clone(),
+            evaluation_scope: contract.evaluation_scope,
+        }
+    }
+}
+
+/// Minimal authoritative callable contract consumed by type inference.
+///
+/// Intrinsic lowering, external identity, program role, callable-context rows,
+/// and contextual-operation metadata belong to checked-shard construction and
+/// linking. Changes to those fields must not reopen an otherwise unchanged
+/// owner inference cone.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerInferenceCallableContract {
+    pub name: String,
+    pub kind: CheckedCallableKind,
+    pub parameters: Box<[OwnerInferenceParameterContract]>,
+    pub result: FlowType,
+    pub effect: CheckedEffectSummary,
+}
+
+impl From<&OwnerAbiCallableContract> for OwnerInferenceCallableContract {
+    fn from(contract: &OwnerAbiCallableContract) -> Self {
+        Self {
+            name: contract.name.clone(),
+            kind: contract.kind,
+            parameters: contract
+                .parameters
+                .iter()
+                .map(OwnerInferenceParameterContract::from)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            result: contract.result.clone(),
+            effect: contract.effect,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerAbiValueContract {
     pub canonical_path: String,
@@ -223,11 +282,11 @@ pub struct OwnerCallableAbiEnvironment {
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum OwnerCallableAbiLookupOutcome {
     Found {
-        contract: OwnerAbiCallableContract,
+        contract: OwnerInferenceCallableContract,
     },
     Missing,
     Conflict {
-        contracts: Box<[OwnerAbiCallableContract]>,
+        contracts: Box<[OwnerInferenceCallableContract]>,
     },
 }
 
@@ -287,7 +346,7 @@ impl OwnerCallableAbiLookup {
 
     pub fn found(
         canonical_name: impl Into<String>,
-        contract: OwnerAbiCallableContract,
+        contract: OwnerInferenceCallableContract,
     ) -> Result<Self, OwnerAbiEnvironmentError> {
         Self::new(
             canonical_name.into(),
@@ -304,7 +363,7 @@ impl OwnerCallableAbiLookup {
 
     pub fn conflict(
         canonical_name: impl Into<String>,
-        contracts: impl IntoIterator<Item = OwnerAbiCallableContract>,
+        contracts: impl IntoIterator<Item = OwnerInferenceCallableContract>,
     ) -> Result<Self, OwnerAbiEnvironmentError> {
         Self::new(
             canonical_name.into(),
@@ -322,7 +381,7 @@ impl OwnerCallableAbiLookup {
         &self.outcome
     }
 
-    pub fn contract(&self) -> Option<&OwnerAbiCallableContract> {
+    pub fn contract(&self) -> Option<&OwnerInferenceCallableContract> {
         match &self.outcome {
             OwnerCallableAbiLookupOutcome::Found { contract } => Some(contract),
             OwnerCallableAbiLookupOutcome::Missing
@@ -424,7 +483,7 @@ impl OwnerInferenceAbiEnvironment {
             .and_then(|index| self.lookups.get(index))
     }
 
-    pub fn callable(&self, canonical_name: &str) -> Option<&OwnerAbiCallableContract> {
+    pub fn callable(&self, canonical_name: &str) -> Option<&OwnerInferenceCallableContract> {
         self.lookup(canonical_name)
             .and_then(OwnerCallableAbiLookup::contract)
     }
@@ -452,7 +511,12 @@ impl OwnerCallableAbiEnvironment {
     ) -> Result<OwnerCallableAbiLookup, OwnerAbiEnvironmentError> {
         self.callable(canonical_name).cloned().map_or_else(
             || OwnerCallableAbiLookup::missing(canonical_name),
-            |contract| OwnerCallableAbiLookup::found(canonical_name, contract),
+            |contract| {
+                OwnerCallableAbiLookup::found(
+                    canonical_name,
+                    OwnerInferenceCallableContract::from(&contract),
+                )
+            },
         )
     }
 
@@ -1211,7 +1275,8 @@ mod tests {
         .unwrap()
         .callable_environment()
         .unwrap();
-        let contract = provider.callable("Number/to_text").unwrap().clone();
+        let contract =
+            OwnerInferenceCallableContract::from(provider.callable("Number/to_text").unwrap());
         let found = OwnerCallableAbiLookup::found("Number/to_text", contract.clone()).unwrap();
         let conflict =
             OwnerCallableAbiLookup::conflict("Number/to_text", [contract.clone(), contract])
@@ -1222,5 +1287,37 @@ mod tests {
             OwnerCallableAbiLookupOutcome::Conflict { contracts } if contracts.len() == 2
         ));
         assert_ne!(found.fingerprint_v1(), conflict.fingerprint_v1());
+    }
+
+    #[test]
+    fn construction_only_callable_metadata_stays_outside_inference_fingerprints() {
+        let provider = project_owner_abi_environment(
+            &project("value: 1\n"),
+            &ExternalTypeEnvironment::empty(ProgramRole::Client),
+        )
+        .unwrap()
+        .callable_environment()
+        .unwrap();
+        let contract = provider.callable("Number/to_text").unwrap();
+        let before = OwnerCallableAbiLookup::found(
+            "Number/to_text",
+            OwnerInferenceCallableContract::from(contract),
+        )
+        .unwrap();
+        let mut construction_changed = contract.clone();
+        construction_changed.role = if construction_changed.role == ProgramRole::Client {
+            ProgramRole::Server
+        } else {
+            ProgramRole::Client
+        };
+        let after = OwnerCallableAbiLookup::found(
+            "Number/to_text",
+            OwnerInferenceCallableContract::from(&construction_changed),
+        )
+        .unwrap();
+
+        assert_ne!(contract, &construction_changed);
+        assert_eq!(before.outcome(), after.outcome());
+        assert_eq!(before.fingerprint_v1(), after.fingerprint_v1());
     }
 }

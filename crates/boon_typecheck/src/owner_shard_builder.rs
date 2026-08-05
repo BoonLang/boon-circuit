@@ -5194,7 +5194,7 @@ pub fn build_checked_owner_shard<'a>(
 mod tests {
     use super::*;
     use crate::{
-        build_owner_interface_topology, evaluate_owner_body, owner_body_required_interface_owners,
+        build_owner_interface_topology, evaluate_owner_body, plan_owner_body_interfaces,
         project_owner_abi_environment, project_owner_constraint_seed, project_owner_syntax_input,
         resolve_owner_constraint_seed, solve_owner_interface_scc,
     };
@@ -5379,23 +5379,15 @@ mod tests {
                     parameter_requirements,
                 )
                 .unwrap();
-            let available_interfaces = interface_results
-                .values()
-                .flat_map(|result| &result.owners)
-                .map(|interface| (interface.owner.clone(), interface))
-                .collect::<BTreeMap<_, _>>();
-            let required =
-                owner_body_required_interface_owners(&seed, &summary, &available_interfaces)
-                    .unwrap();
+            let interface_plan =
+                plan_owner_body_interfaces(&seed, &summary, interface_results.values()).unwrap();
             let imported = interface_results
                 .values()
-                .filter(|result| result.key != own_scc.key)
                 .filter(|result| {
-                    result
-                        .key
-                        .members
+                    interface_plan
+                        .imports()
                         .iter()
-                        .any(|owner| required.contains(owner))
+                        .any(|import| import.key() == &result.key)
                 })
                 .collect::<Vec<_>>();
             let body_evaluation = evaluate_owner_body(
@@ -5403,6 +5395,7 @@ mod tests {
                 &seed,
                 &summary,
                 &inference_abi,
+                &interface_plan,
                 &interface,
                 imported,
             )
@@ -5456,8 +5449,17 @@ mod tests {
             [],
         )
         .unwrap();
-        let body_evaluation =
-            evaluate_owner_body(&syntax, &seed, &summary, &inference_abi, &interface, []).unwrap();
+        let interface_plan = plan_owner_body_interfaces(&seed, &summary, [&interface]).unwrap();
+        let body_evaluation = evaluate_owner_body(
+            &syntax,
+            &seed,
+            &summary,
+            &inference_abi,
+            &interface_plan,
+            &interface,
+            [],
+        )
+        .unwrap();
         let body = Arc::unwrap_or_clone(body_evaluation.result);
         let construction_abi = abi
             .construction_environment(

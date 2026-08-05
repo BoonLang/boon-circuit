@@ -37,6 +37,7 @@ const OWNER_BODY_INFERENCE_DOMAIN_V2: &[u8] = b"boon.owner-body-inference.v2\0";
 const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V1: &[u8] = b"boon.owner-body-inference-content.v1\0";
 const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V1: &[u8] =
     b"boon.owner-body-inference-currentness.v1\0";
+const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V1: &[u8] = b"boon.owner-body-interface-plan.v1\0";
 const OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V1: &[u8] = b"boon.owner-diagnostics-aggregate.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +60,249 @@ impl fmt::Display for OwnerBodyInferenceError {
 }
 
 impl Error for OwnerBodyInferenceError {}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerBodyInterfaceSccPlan {
+    key: OwnerInterfaceSccKey,
+    /// Sorted exact member indices in `key.members` used by this body.
+    /// Stable owner keys remain owned once by the SCC key instead of being
+    /// copied into every importing body plan.
+    referenced_members: Box<[u32]>,
+}
+
+impl OwnerBodyInterfaceSccPlan {
+    pub fn key(&self) -> &OwnerInterfaceSccKey {
+        &self.key
+    }
+
+    pub fn referenced_owners(&self) -> impl Iterator<Item = &StableCheckOwnerKey> {
+        self.referenced_members
+            .iter()
+            .map(|index| &self.key.members[*index as usize])
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OwnerBodyInterfacePlanWork {
+    pub direct_owners: u64,
+    pub required_owners: u64,
+    pub provider_sccs: u64,
+    pub result_transfers: u64,
+    pub result_transfer_nodes: u64,
+    pub result_transfer_edges: u64,
+}
+
+/// Exact immutable public-interface demand for one owner body.
+///
+/// The plan is discovered once from direct syntax imports and transitive
+/// public result-transfer slices. Body inference consumes this sealed result;
+/// it does not rediscover the closure from the supplied SCC values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerBodyInterfacePlan {
+    owner: StableCheckOwnerKey,
+    own_scc: OwnerBodyInterfaceSccPlan,
+    imports: Box<[OwnerBodyInterfaceSccPlan]>,
+    work: OwnerBodyInterfacePlanWork,
+    fingerprint_v1: [u8; 32],
+}
+
+impl OwnerBodyInterfacePlan {
+    pub fn owner(&self) -> &StableCheckOwnerKey {
+        &self.owner
+    }
+
+    pub fn own_scc(&self) -> &OwnerBodyInterfaceSccPlan {
+        &self.own_scc
+    }
+
+    pub fn imports(&self) -> &[OwnerBodyInterfaceSccPlan] {
+        &self.imports
+    }
+
+    pub fn sccs(&self) -> impl Iterator<Item = &OwnerBodyInterfaceSccPlan> {
+        std::iter::once(&self.own_scc).chain(self.imports.iter())
+    }
+
+    pub fn required_owner_count(&self) -> usize {
+        self.sccs().map(|scc| scc.referenced_members.len()).sum()
+    }
+
+    pub const fn work(&self) -> OwnerBodyInterfacePlanWork {
+        self.work
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+}
+
+/// Stateful demand walker used by typed request evaluators.
+///
+/// Callers ask for [`next_required_owner`](Self::next_required_owner), require
+/// that owner's current provider SCC through their request graph, and feed the
+/// result to [`provide_interface_scc`](Self::provide_interface_scc). This keeps
+/// dependency discovery in the typechecker while allowing the evaluator to
+/// record exact dynamic request edges.
+pub struct OwnerBodyInterfacePlanner {
+    owner: StableCheckOwnerKey,
+    required: BTreeSet<StableCheckOwnerKey>,
+    pending: VecDeque<StableCheckOwnerKey>,
+    provider_sccs: Vec<OwnerInterfaceSccKey>,
+    providers: BTreeMap<StableCheckOwnerKey, usize>,
+    work: OwnerBodyInterfacePlanWork,
+}
+
+impl OwnerBodyInterfacePlanner {
+    pub fn new(
+        seed: &OwnerConstraintSeed,
+        summary: &OwnerConstraintSummary,
+    ) -> Result<Self, OwnerBodyInferenceError> {
+        if summary.owner != seed.owner || summary.seed_fingerprint_v1 != seed.fingerprint_v1() {
+            return Err(OwnerBodyInferenceError::new(
+                "owner body interface planning has mismatched seed and summary",
+            ));
+        }
+        let required = directly_required_interface_owners(seed, summary);
+        let pending = required.iter().cloned().collect::<VecDeque<_>>();
+        let direct_owners = required.len() as u64;
+        Ok(Self {
+            owner: seed.owner.clone(),
+            required,
+            pending,
+            provider_sccs: Vec::new(),
+            providers: BTreeMap::new(),
+            work: OwnerBodyInterfacePlanWork {
+                direct_owners,
+                ..OwnerBodyInterfacePlanWork::default()
+            },
+        })
+    }
+
+    pub fn next_required_owner(&self) -> Option<&StableCheckOwnerKey> {
+        self.pending.front()
+    }
+
+    pub fn provide_interface_scc(
+        &mut self,
+        result: &OwnerInterfaceSccResult,
+    ) -> Result<(), OwnerBodyInferenceError> {
+        let owner = self.pending.pop_front().ok_or_else(|| {
+            OwnerBodyInferenceError::new("owner body interface planner received an extra SCC")
+        })?;
+        let interface = result.owner(&owner).ok_or_else(|| {
+            OwnerBodyInferenceError::new(format!(
+                "owner body interface planner expected provider for {owner:?}, got {:?}",
+                result.key
+            ))
+        })?;
+        let provider = self
+            .provider_sccs
+            .iter()
+            .position(|key| key == &result.key)
+            .unwrap_or_else(|| {
+                self.provider_sccs.push(result.key.clone());
+                self.provider_sccs.len() - 1
+            });
+        if self.providers.insert(owner.clone(), provider).is_some() {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "owner body interface planner received {owner:?} twice"
+            )));
+        }
+        self.work.result_transfers = self.work.result_transfers.saturating_add(1);
+        if let OwnerResultTransfer::Expression { nodes, .. } = &interface.result_transfer {
+            self.work.result_transfer_nodes = self
+                .work
+                .result_transfer_nodes
+                .saturating_add(nodes.len() as u64);
+            self.work.result_transfer_edges = self.work.result_transfer_edges.saturating_add(
+                nodes
+                    .iter()
+                    .map(|node| node.inputs.len() as u64 + u64::from(node.call_target.is_some()))
+                    .sum::<u64>(),
+            );
+        }
+        for dependency in owner_result_transfer_dependencies(&interface.result_transfer) {
+            if self.required.insert(dependency.clone()) {
+                self.pending.push_back(dependency);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<OwnerBodyInterfacePlan, OwnerBodyInferenceError> {
+        if !self.pending.is_empty() || self.providers.len() != self.required.len() {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "owner body interface plan for {:?} is incomplete",
+                self.owner
+            )));
+        }
+        let own_provider = self.providers.get(&self.owner).copied().ok_or_else(|| {
+            OwnerBodyInferenceError::new(format!(
+                "owner body interface plan for {:?} has no own provider",
+                self.owner
+            ))
+        })?;
+        let mut owners_by_scc = BTreeMap::<usize, Vec<StableCheckOwnerKey>>::new();
+        for (owner, provider) in self.providers {
+            owners_by_scc.entry(provider).or_default().push(owner);
+        }
+        let provider_sccs = self.provider_sccs;
+        let own_referenced_owners = owners_by_scc.remove(&own_provider).ok_or_else(|| {
+            OwnerBodyInferenceError::new("owner body interface plan lost its own SCC")
+        })?;
+        let seal_scc = |provider: usize,
+                        referenced_owners: Vec<StableCheckOwnerKey>|
+         -> Result<OwnerBodyInterfaceSccPlan, OwnerBodyInferenceError> {
+            let key = provider_sccs.get(provider).cloned().ok_or_else(|| {
+                OwnerBodyInferenceError::new("owner body interface plan lost a provider SCC")
+            })?;
+            let referenced_members = referenced_owners
+                .iter()
+                .map(|owner| {
+                    key.members
+                        .binary_search(owner)
+                        .map_err(|_| {
+                            OwnerBodyInferenceError::new(format!(
+                                "owner body interface provider {:?} does not contain {owner:?}",
+                                key
+                            ))
+                        })
+                        .and_then(|index| {
+                            u32::try_from(index).map_err(|_| {
+                                OwnerBodyInferenceError::new(
+                                    "owner body interface SCC exceeds the u32 member bound",
+                                )
+                            })
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(OwnerBodyInterfaceSccPlan {
+                key,
+                referenced_members: referenced_members.into_boxed_slice(),
+            })
+        };
+        let own_scc = seal_scc(own_provider, own_referenced_owners)?;
+        let mut imports = owners_by_scc
+            .into_iter()
+            .map(|(provider, referenced_owners)| seal_scc(provider, referenced_owners))
+            .collect::<Result<Vec<_>, _>>()?;
+        imports.sort_by(|left, right| left.key.cmp(&right.key));
+        let imports = imports.into_boxed_slice();
+        self.work.required_owners = self.required.len() as u64;
+        self.work.provider_sccs = imports.len() as u64 + 1;
+        let fingerprint_v1 = fingerprint(
+            OWNER_BODY_INTERFACE_PLAN_DOMAIN_V1,
+            &(&self.owner, &own_scc, &imports),
+        )?;
+        Ok(OwnerBodyInterfacePlan {
+            owner: self.owner,
+            own_scc,
+            imports,
+            work: self.work,
+            fingerprint_v1,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
@@ -215,6 +459,12 @@ pub struct OwnerBodyInferenceWork {
     pub expressions: u64,
     pub local_constraints: u64,
     pub interface_imports: u64,
+    pub interface_plan_direct_owners: u64,
+    pub interface_plan_required_owners: u64,
+    pub interface_plan_provider_sccs: u64,
+    pub interface_plan_result_transfers: u64,
+    pub interface_plan_transfer_nodes: u64,
+    pub interface_plan_transfer_edges: u64,
     pub calls: u64,
     pub unification_steps: u64,
 }
@@ -1076,50 +1326,78 @@ fn owner_result_transfer_dependencies(
     dependencies
 }
 
-/// Exact frozen-interface closure needed to infer one owner body.
+/// Build an exact body-interface plan from already available SCC results.
 ///
-/// Direct syntax imports are only the first frontier. A callable's public
-/// result-transfer slice may itself invoke another callable, so callers also
-/// freeze the transitive interfaces reachable through those minimal slices.
-/// Unrelated calls in a callee body are absent from the transfer and therefore
-/// cannot enlarge this dependency set or backdate the caller.
-pub fn owner_body_required_interface_owners(
+/// Persistent evaluators should normally drive [`OwnerBodyInterfacePlanner`]
+/// directly so each provider lookup becomes an exact request dependency. This
+/// convenience boundary is useful for direct typechecker callers and tests.
+pub fn plan_owner_body_interfaces<'a>(
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
-    interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
-) -> Result<BTreeSet<StableCheckOwnerKey>, OwnerBodyInferenceError> {
-    let mut required = directly_required_interface_owners(seed, summary);
-    let mut pending = required.iter().cloned().collect::<VecDeque<_>>();
-    while let Some(owner) = pending.pop_front() {
-        let interface = interfaces.get(&owner).ok_or_else(|| {
-            OwnerBodyInferenceError::new(format!(
-                "owner body inference {:?} is missing required interface {owner:?}",
-                seed.owner
-            ))
-        })?;
-        for dependency in owner_result_transfer_dependencies(&interface.result_transfer) {
-            if required.insert(dependency.clone()) {
-                pending.push_back(dependency);
+    available_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
+) -> Result<OwnerBodyInterfacePlan, OwnerBodyInferenceError> {
+    let mut provider_by_owner = BTreeMap::new();
+    let mut result_by_key = BTreeMap::new();
+    for result in available_sccs {
+        if let Some(previous) = result_by_key.insert(result.key.clone(), result)
+            && previous != result
+        {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "owner body interface planning received conflicting SCC {:?}",
+                result.key
+            )));
+        }
+        for interface in &result.owners {
+            if let Some(previous) = provider_by_owner.insert(interface.owner.clone(), result)
+                && previous.key != result.key
+            {
+                return Err(OwnerBodyInferenceError::new(format!(
+                    "owner body interface planning received multiple providers for {:?}",
+                    interface.owner
+                )));
             }
         }
     }
-    Ok(required)
+    let mut planner = OwnerBodyInterfacePlanner::new(seed, summary)?;
+    while let Some(owner) = planner.next_required_owner().cloned() {
+        let result = provider_by_owner.get(&owner).copied().ok_or_else(|| {
+            OwnerBodyInferenceError::new(format!(
+                "owner body interface planning {:?} is missing required interface {owner:?}",
+                seed.owner
+            ))
+        })?;
+        planner.provide_interface_scc(result)?;
+    }
+    planner.finish()
 }
 
 fn frozen_scc_ref(
     result: &OwnerInterfaceSccResult,
-    required: &BTreeSet<StableCheckOwnerKey>,
+    plan: &OwnerBodyInterfaceSccPlan,
 ) -> Result<FrozenOwnerInterfaceSccRef, OwnerBodyInferenceError> {
-    let referenced_owners = result
-        .key
-        .members
-        .iter()
-        .filter(|owner| required.contains(*owner))
-        .cloned()
-        .collect::<Vec<_>>();
-    if referenced_owners.is_empty() {
+    if result.key != plan.key {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "owner body interface plan expected SCC {:?}, got {:?}",
+            plan.key, result.key
+        )));
+    }
+    if plan.referenced_members.is_empty() {
         return Err(OwnerBodyInferenceError::new(format!(
             "owner body inference received unused interface SCC {:?}",
+            result.key
+        )));
+    }
+    if plan
+        .referenced_members
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+        || plan
+            .referenced_members
+            .iter()
+            .any(|index| *index as usize >= result.key.members.len())
+    {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "owner body interface plan has invalid referenced members for SCC {:?}",
             result.key
         )));
     }
@@ -1127,7 +1405,11 @@ fn frozen_scc_ref(
         key: result.key.clone(),
         result_fingerprint_v1: result.fingerprint_v1(),
         type_variable_count: result.type_variable_count,
-        referenced_owners: referenced_owners.into_boxed_slice(),
+        referenced_owners: plan
+            .referenced_owners()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
     })
 }
 
@@ -3948,16 +4230,28 @@ fn validate_inputs(
 /// project-global checked identity. The caller must provide exactly the own,
 /// child-value, value-read, and callable interfaces named by the resolved
 /// owner inputs plus the exact transitive dependencies of their public result
-/// transfer slices.
+/// transfer slices, as sealed by `interface_plan`.
 pub fn evaluate_owner_body<'a>(
     syntax: &OwnerSyntaxInput,
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     abi: &OwnerInferenceAbiEnvironment,
+    interface_plan: &OwnerBodyInterfacePlan,
     own_scc: &'a OwnerInterfaceSccResult,
     imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<OwnerBodyInferenceEvaluation, OwnerBodyInferenceError> {
     validate_inputs(syntax, seed, summary, own_scc)?;
+    if interface_plan.owner() != &seed.owner {
+        return Err(OwnerBodyInferenceError::new(
+            "owner body inference received an interface plan for another owner",
+        ));
+    }
+    if interface_plan.own_scc().key != own_scc.key {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "owner body inference {:?} received the wrong own interface SCC",
+            seed.owner
+        )));
+    }
     if abi.subjects() != std::slice::from_ref(&seed.owner) {
         return Err(OwnerBodyInferenceError::new(
             "owner body inference ABI does not match its exact owner",
@@ -4019,27 +4313,34 @@ pub fn evaluate_owner_body<'a>(
             "owner body inference ABI does not match its exact parameter requirement lookup set",
         ));
     }
-    let mut supplied_keys = BTreeSet::new();
-    let mut supplied_results = Vec::new();
-    let mut available_interfaces = BTreeMap::new();
+    let mut supplied_results = BTreeMap::new();
     for result in std::iter::once(own_scc).chain(imported_sccs) {
-        if !supplied_keys.insert(result.key.clone()) {
+        if supplied_results
+            .insert(result.key.clone(), result)
+            .is_some()
+        {
             return Err(OwnerBodyInferenceError::new(format!(
                 "owner body inference received duplicate interface SCC {:?}",
                 result.key
             )));
         }
-        for interface in &result.owners {
-            insert_interface(&mut available_interfaces, interface)?;
-        }
-        supplied_results.push(result);
     }
-    let required = owner_body_required_interface_owners(seed, summary, &available_interfaces)?;
+    let planned_keys = interface_plan
+        .sccs()
+        .map(|scc| scc.key.clone())
+        .collect::<BTreeSet<_>>();
+    if supplied_results.keys().cloned().collect::<BTreeSet<_>>() != planned_keys {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "owner body inference {:?} did not receive its exact planned interface SCCs",
+            seed.owner
+        )));
+    }
     let mut interfaces = BTreeMap::new();
     let mut providers = BTreeMap::new();
     let mut frozen_results = Vec::new();
-    for result in supplied_results {
-        let frozen = frozen_scc_ref(result, &required)?;
+    for planned_scc in interface_plan.sccs() {
+        let result = supplied_results[&planned_scc.key];
+        let frozen = frozen_scc_ref(result, planned_scc)?;
         for owner in &frozen.referenced_owners {
             let interface = result.owner(owner).ok_or_else(|| {
                 OwnerBodyInferenceError::new(format!(
@@ -4056,13 +4357,18 @@ pub fn evaluate_owner_body<'a>(
         }
         frozen_results.push(frozen);
     }
-    if interfaces.keys().cloned().collect::<BTreeSet<_>>() != required {
+    if interfaces.len() != interface_plan.required_owner_count() {
         return Err(OwnerBodyInferenceError::new(format!(
             "owner body inference {:?} did not receive its exact interface import set",
             seed.owner
         )));
     }
-    let own_interface = interfaces[&seed.owner];
+    let own_interface = interfaces.get(&seed.owner).copied().ok_or_else(|| {
+        OwnerBodyInferenceError::new(format!(
+            "owner body inference {:?} has no planned own interface",
+            seed.owner
+        ))
+    })?;
     let own_scc_index = frozen_results
         .iter()
         .position(|frozen| frozen.key == own_scc.key)
@@ -4097,6 +4403,12 @@ pub fn evaluate_owner_body<'a>(
     let mut work = OwnerBodyInferenceWork {
         statements: syntax.statements.len() as u64,
         expressions: syntax.expressions.len() as u64,
+        interface_plan_direct_owners: interface_plan.work.direct_owners,
+        interface_plan_required_owners: interface_plan.work.required_owners,
+        interface_plan_provider_sccs: interface_plan.work.provider_sccs,
+        interface_plan_result_transfers: interface_plan.work.result_transfers,
+        interface_plan_transfer_nodes: interface_plan.work.result_transfer_nodes,
+        interface_plan_transfer_edges: interface_plan.work.result_transfer_edges,
         ..OwnerBodyInferenceWork::default()
     };
     let mut unifier = TypeUnifier::default();
@@ -4543,8 +4855,22 @@ pub fn infer_owner_body<'a>(
     own_scc: &'a OwnerInterfaceSccResult,
     imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<OwnerBodyInferenceShard, OwnerBodyInferenceError> {
-    evaluate_owner_body(syntax, seed, summary, abi, own_scc, imported_sccs)
-        .map(|evaluation| Arc::unwrap_or_clone(evaluation.result))
+    let imported_sccs = imported_sccs.into_iter().collect::<Vec<_>>();
+    let interface_plan = plan_owner_body_interfaces(
+        seed,
+        summary,
+        std::iter::once(own_scc).chain(imported_sccs.iter().copied()),
+    )?;
+    evaluate_owner_body(
+        syntax,
+        seed,
+        summary,
+        abi,
+        &interface_plan,
+        own_scc,
+        imported_sccs,
+    )
+    .map(|evaluation| Arc::unwrap_or_clone(evaluation.result))
 }
 
 #[cfg(test)]

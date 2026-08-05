@@ -758,6 +758,24 @@ Current checkpoints to preserve and audit rather than redo:
   optional editor-presentation sidecar. Cut over and rescore only after the
   complete multi-unit invalid oracle and editor projection pass. Consider
   narrow profiled unsafe kernels only after those architectural deletions;
+- preserve the 2026-08-04 interface-import ownership cut. The body-evaluation
+  request now drives one authoritative `OwnerBodyInterfacePlanner`, records
+  exact dynamic owner-to-SCC and interface-result dependencies, and publishes
+  frozen imports through its existing currentness receipt. Provider keys are
+  shared, plan references are compact SCC-member indices, the former duplicate
+  closure walk is deleted, and no one-consumer plan request remains. Focused
+  transitive-import and warm-invalidation tests pass. The adjacent
+  representation-equivalent directional debug NovyWave candidate is
+  5,922.097 ms/337,556 KiB with the exact checked hash; private-field
+  encapsulation followed without a producer relink, so this is not a
+  checkout-fresh score. Its trace reports 196.127 ms import planning versus
+  2,073.631 ms body requests,
+  1,766.536 ms checked-shard construction, and 736.461 ms assembly. Treat this
+  as an ownership checkpoint, not a gate pass. Finish the single lexical scope
+  plan and move complete diagnostic facts into the staged aggregate so public
+  diagnostics deletes checked-shard/assembly work. Reprofile body evaluation
+  afterward; do not use unsafe for import planning or compatibility work still
+  scheduled for deletion;
 - follow the post-`e510726` macro-architecture audit, reconciled through
   `a48f488`, in
   `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`. The historical trace exposed

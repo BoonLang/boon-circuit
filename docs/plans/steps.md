@@ -666,6 +666,28 @@ stronger three-reviewer performance closure defined below.
    architecture deletions; never use unsafe to speed work still scheduled for
    removal.
 
+   The first interface-import ownership cut is now implemented. One
+   `OwnerBodyInterfacePlanner` discovers direct and transitive public
+   result-transfer demand inside the consuming body-evaluation request; exact
+   owner-to-SCC provider requests record dynamic dependencies, provider keys
+   are shared, and plans retain compact SCC-member indices. Body evaluation no
+   longer rebuilds the closure, and a rejected one-consumer plan-request layer
+   is absent. Focused transitive-import and warm invalidation tests pass. An
+   adjacent, representation-equivalent directional debug NovyWave sample
+   preserves checked hash
+   `9b5abdb1d09d2658ce75fbfa86916a06054080fc9550cbc753fc484e0dab540f`
+   at 5,922.097 ms/337,556 KiB; TodoMVC is 2,452.069 ms/86,220 KiB with its
+   exact hash. Private-field encapsulation followed without another producer
+   relink, so this is not checkout-fresh scored evidence. The trace counts
+   4,404 direct and 9,611 exact closure interface-owner demands, each including
+   the body's own interface, plus 125,844 transfer nodes and 157,860 transfer
+   edges; planning is only 196.127
+   ms versus 2,073.631 ms for body requests, 1,766.536 ms for checked shards,
+   and 736.461 ms for assembly. This is an ownership checkpoint, not a gate
+   pass. Complete the single lexical scope plan and diagnostic-fact/public-root
+   cutover next; do not apply unsafe or tune import containers while the larger
+   compatibility work remains scheduled for deletion.
+
    Documentation, instrumentation, a crate split, a focused test pass, or an
    authorized checkpoint commit is not this step's exit. After each checkpoint,
    continue with the next red or missing performance gate in the same goal run.

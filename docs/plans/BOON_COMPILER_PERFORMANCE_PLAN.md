@@ -2,7 +2,7 @@
 
 Date: 2026-08-02
 
-Last architecture reconciliation: 2026-08-03
+Last architecture reconciliation: 2026-08-04
 
 Status: authoritative blocking implementation contract for compiler latency,
 memory, invalidation, cancellation, and compiler-service ownership.
@@ -1820,6 +1820,63 @@ encapsulated unsafe implementation only when a safe A/B oracle proves that one
 low-level `TypeUnifier`, CSR, packed-offset, or exact-size initialization kernel
 dominates, with documented invariants, parity, Miri/fuzz coverage, and material
 whole-run improvement.
+
+#### 2026-08-04 interface-import ownership and demand cut
+
+The first half of the lexical/import tranche now has one semantic owner.
+`OwnerBodyInterfacePlanner` starts from the body's exact direct syntax and
+resolved-reference owners, follows only public result-transfer slices, and
+seals the exact provider SCCs plus referenced SCC-member indices. The compiler
+publishes a backdatable owner-to-SCC provider projection, then drives the plan
+inside the consuming owner-body evaluation request. That request records the
+exact provider and interface-result edges and publishes the same frozen imports
+through `OwnerBodyInferenceCurrentnessReceipt`; body inference no longer walks
+the result-transfer closure again. A briefly tested separate plan request was
+removed because it had one consumer and retained a second copy of the plan.
+Provider SCC keys are shared across their members, and body plans use compact
+`u32` member indices rather than copied stable owner keys.
+
+This follows the demand-recording and red/green model described by
+[Salsa](https://salsa-rs.github.io/salsa/overview.html), the
+[rust-analyzer architecture](https://rust-analyzer.github.io/book/contributing/architecture.html)
+invariant that a body edit must not invalidate unrelated global facts, and the
+[TypeScript builder-program](https://github.com/microsoft/TypeScript/wiki/Using-the-Compiler-API#writing-an-incremental-program-watcher)
+split between affected diagnostics and broader emit. In Boon the concrete
+consequence is not a generic query framework: it is one immutable owner-body
+currentness product with exact dynamically recorded interface dependencies and
+no one-consumer intermediate request.
+
+The focused transitive-result-transfer, single-unit reuse, and module-interface
+versus body-edit invalidation tests pass. One direct debug NovyWave
+empty-session diagnostics observation from the immediately preceding
+representation-equivalent candidate preserves checked hash
+`9b5abdb1d09d2658ce75fbfa86916a06054080fc9550cbc753fc484e0dab540f`
+at 5,922.097 ms, 337,556 KiB, 25,135,380 allocations, and 3,303,045,969
+allocated bytes. The adjacent TodoMVC observation preserves checked hash
+`a8a1fb77797c773a182f364514fbe840977e50a329acfd69fa33dd19fe888a9c`
+at 2,452.069 ms and 86,220 KiB. These single debug observations are directional
+only: compared with the preceding 6,118.881 ms/335,496 KiB NovyWave sample,
+time moves down but RSS is about 2 MiB higher and Todo timing remains noisy, so
+they are not an acceptance or percentile claim. The final edit made the plan's
+fields private behind checked accessors and was compiler/test checked without
+another producer relink; therefore these observations are deliberately not
+presented as checkout-fresh scored evidence.
+
+The new allocation-free phase counters make the next decision unambiguous. An
+adjacent traced NovyWave run has 4,404 direct interface-owner demands and 9,611
+exact closure interface-owner demands, each including the body's own interface, plus
+8,588 provider-SCC consumptions, 125,844 public result-transfer nodes, and
+157,860 transfer edges. Import planning itself is
+196.127 ms; complete owner-body requests are 2,073.631 ms, checked-shard
+construction is 1,766.536 ms, and project assembly is 736.461 ms. Therefore
+neither unsafe planning containers nor another import-map micro-optimization is
+the next owner-level cut. Finish the still-missing single lexical scope walk,
+then move forward-OUT/order/output/render/host diagnostics out of the
+compatibility shard and cut public diagnostics to the staged aggregate. That
+deletes the measured checked-shard and assembly work instead of accelerating
+it. Reprofile the remaining approximately two-second body evaluator afterward;
+only then consider safe representation changes or a narrow unsafe unifier/CSR
+kernel if a finer profile proves low-level mechanics dominate.
 
 Checkpoint `a48f488` remains the unit-native M1 ancestor of `42c1aa9`; preserve
 its production checking, compact execution receipt, proof/sealed-plan, and

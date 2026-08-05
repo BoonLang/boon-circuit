@@ -23,19 +23,19 @@ use boon_typecheck::OwnerConstraintDependencyKind;
 use boon_typecheck::{
     AmbiguousOwnerSymbolCandidate, CheckedOwnerProjectAssembly, CheckedOwnerShard,
     OwnerAbiEnvironment, OwnerBodyInferenceEvaluation, OwnerBodyInferenceShard,
-    OwnerCallableAbiEnvironment, OwnerCallableAbiLookup, OwnerCallableAbiLookupOutcome,
-    OwnerConstraintSeed, OwnerConstraintSummary, OwnerConstructionAbiEnvironment,
-    OwnerConstructionCallableAbiLookup, OwnerConstructionValueAbiLookup, OwnerDeclarationKind,
-    OwnerDiagnosticsAggregate, OwnerInferenceAbiEnvironment, OwnerInterfaceScc,
-    OwnerInterfaceSccEvaluation, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
-    OwnerInterfaceTopology, OwnerParameterRequirementKey, OwnerParameterRequirementLookup,
-    OwnerReferenceKind, OwnerSourceMap, OwnerSourcePayloadAbiLookup, OwnerSymbolReference,
-    OwnerSymbolResolution, OwnerSyntaxInput, OwnerValueAbiLookup, aggregate_owner_diagnostics,
+    OwnerBodyInterfacePlanner, OwnerCallableAbiEnvironment, OwnerCallableAbiLookup,
+    OwnerCallableAbiLookupOutcome, OwnerConstraintSeed, OwnerConstraintSummary,
+    OwnerConstructionAbiEnvironment, OwnerConstructionCallableAbiLookup,
+    OwnerConstructionValueAbiLookup, OwnerDeclarationKind, OwnerDiagnosticsAggregate,
+    OwnerInferenceAbiEnvironment, OwnerInterfaceScc, OwnerInterfaceSccEvaluation,
+    OwnerInterfaceSccKey, OwnerInterfaceSccResult, OwnerInterfaceTopology,
+    OwnerParameterRequirementKey, OwnerParameterRequirementLookup, OwnerReferenceKind,
+    OwnerSourceMap, OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution,
+    OwnerSyntaxInput, OwnerValueAbiLookup, aggregate_owner_diagnostics,
     assemble_checked_owner_project, build_checked_owner_shard, build_owner_interface_topology,
-    evaluate_owner_body, evaluate_owner_interface_scc, owner_body_required_interface_owners,
-    project_owner_abi_environment, project_owner_constraint_seed, project_owner_source_map,
-    project_owner_syntax_input, resolve_owner_constraint_seed_with_resolutions,
-    stable_check_owner_key_fingerprint_v1,
+    evaluate_owner_body, evaluate_owner_interface_scc, project_owner_abi_environment,
+    project_owner_constraint_seed, project_owner_source_map, project_owner_syntax_input,
+    resolve_owner_constraint_seed_with_resolutions, stable_check_owner_key_fingerprint_v1,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -254,6 +254,7 @@ struct ProjectState {
     owner_interface_scc_plan_requests: TypedRequestTable<OwnerInterfaceSccPlanRequest>,
     owner_interface_scc_evaluation_requests: TypedRequestTable<OwnerInterfaceSccEvaluationRequest>,
     owner_interface_scc_requests: TypedRequestTable<OwnerInterfaceSccRequest>,
+    owner_interface_provider_requests: TypedRequestTable<OwnerInterfaceProviderRequest>,
     owner_body_inference_evaluation_requests:
         TypedRequestTable<OwnerBodyInferenceEvaluationRequest>,
     owner_body_inference_requests: TypedRequestTable<OwnerBodyInferenceRequest>,
@@ -966,6 +967,32 @@ impl RequestFamily for OwnerInterfaceSccRequest {
     }
 }
 
+/// Per-owner projection of the current interface topology.
+///
+/// Its input is the exact SCC key, so an unrelated topology change can
+/// backdate this owner-to-provider mapping instead of invalidating every body
+/// import plan through the project-wide topology result.
+struct OwnerInterfaceProviderRequest;
+
+impl RequestFamily for OwnerInterfaceProviderRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<OwnerInterfaceSccKey>;
+
+    const NAME: &'static str = "boon.compiler.owner-interface-provider.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(
+            OwnerInterfaceSccPlanRequest::key_fingerprint(value),
+        ))
+    }
+}
+
 struct OwnerBodyInferenceEvaluationRequest;
 
 impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
@@ -1116,6 +1143,7 @@ impl CompilerSession {
                 owner_interface_scc_plan_requests: TypedRequestTable::new(),
                 owner_interface_scc_evaluation_requests: TypedRequestTable::new(),
                 owner_interface_scc_requests: TypedRequestTable::new(),
+                owner_interface_provider_requests: TypedRequestTable::new(),
                 owner_body_inference_evaluation_requests: TypedRequestTable::new(),
                 owner_body_inference_requests: TypedRequestTable::new(),
                 owner_diagnostics_aggregate_requests: TypedRequestTable::new(),
@@ -1402,6 +1430,11 @@ impl CompilerSession {
                 key.members
                     .iter()
                     .all(|owner| surviving_sources.contains(owner.source_unit_id()))
+            })?;
+        state
+            .owner_interface_provider_requests
+            .retain(&mut state.syntax_evaluator, |owner| {
+                surviving_sources.contains(owner.source_unit_id())
             })?;
         state
             .owner_body_inference_evaluation_requests
@@ -2163,6 +2196,11 @@ fn evaluate_owner_body_requests(
         })?;
     state
         .owner_constraint_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
+    state
+        .owner_interface_provider_requests
         .retain(&mut state.syntax_evaluator, |owner| {
             live_owners.contains(owner)
         })?;
@@ -3253,6 +3291,39 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
         .owner_interface_scc_requests
         .retain(&mut state.syntax_evaluator, |key| live_keys.contains(key))?;
 
+    let live_owners = topology
+        .sccs
+        .iter()
+        .flat_map(|scc| scc.key.members.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    state
+        .owner_interface_provider_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
+    for expected in &topology.sccs {
+        let provider_input =
+            RequestInputFingerprint(OwnerInterfaceSccPlanRequest::key_fingerprint(&expected.key));
+        let provider = Arc::new(expected.key.clone());
+        for owner in &expected.key.members {
+            match state.owner_interface_provider_requests.begin(
+                &mut state.syntax_evaluator,
+                owner.clone(),
+                provider_input,
+            )? {
+                RequestStart::Reused => {}
+                RequestStart::Execute(ticket) => {
+                    state.owner_interface_provider_requests.publish(
+                        &mut state.syntax_evaluator,
+                        ticket,
+                        Arc::clone(&provider),
+                    )?;
+                }
+            }
+        }
+    }
+    trace.checkpoint("interface-providers", live_owners.len());
+
     let plan_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.owner-interface-scc-plan-dependencies.v1\0",
         std::iter::empty(),
@@ -3453,112 +3524,29 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
     evaluate_owner_body_inference_requests(state, &topology)
 }
 
-fn owner_body_inference_interface_plan(
-    topology: &OwnerInterfaceTopology,
-    seed: &OwnerConstraintSeed,
-    summary: &OwnerConstraintSummary,
-    interfaces: &BTreeMap<StableCheckOwnerKey, &boon_typecheck::OwnerPublicInterface>,
-) -> CompilerResult<BTreeMap<StableCheckOwnerKey, OwnerInterfaceSccKey>> {
-    let required = owner_body_required_interface_owners(seed, summary, interfaces)?;
-    required
-        .into_iter()
-        .map(|owner| {
-            let key = topology
-                .scc_for_owner(&owner)
-                .map(|scc| scc.key.clone())
-                .ok_or_else(|| {
-                    session_error(format!(
-                        "owner body inference {:?} imports owner {owner:?} without an interface SCC",
-                        seed.owner
-                    ))
-                })?;
-            Ok((owner, key))
-        })
-        .collect()
-}
-
-fn owner_body_inference_plan_fingerprint(
-    plan: &BTreeMap<StableCheckOwnerKey, OwnerInterfaceSccKey>,
-) -> RequestInputFingerprint {
-    let mut hasher = Sha256::new();
-    hasher.update(b"boon.compiler.owner-body-inference-dependencies.v2\0");
-    hasher.update((plan.len() as u64).to_le_bytes());
-    for (owner, scc) in plan {
-        hasher.update(stable_check_owner_key_fingerprint_v1(owner));
-        hasher.update(OwnerInterfaceSccPlanRequest::key_fingerprint(scc));
-    }
-    RequestInputFingerprint(hasher.finalize().into())
-}
-
 fn evaluate_owner_body_inference_requests(
     state: &mut ProjectState,
     topology: &OwnerInterfaceTopology,
 ) -> CompilerResult<()> {
     let mut trace = OwnerRequestTrace::new();
-    // Snapshot the already-solved interface table once. Exact body import
-    // planning then walks only each owner's minimal result-transfer closure;
-    // it must not rescan or clone the project interface registry per owner.
-    let interface_results = topology
-        .sccs
-        .iter()
-        .map(|scc| {
-            state
-                .owner_interface_scc_requests
-                .current_value(&state.syntax_evaluator, &scc.key)?
-                .cloned()
-                .ok_or_else(|| {
-                    session_error(format!(
-                        "owner body inference has no current interface SCC {:?}",
-                        scc.key
-                    ))
-                })
-        })
-        .collect::<CompilerResult<Vec<_>>>()?;
-    let interfaces = interface_results
-        .iter()
-        .flat_map(|result| result.owners.iter())
-        .map(|interface| (interface.owner.clone(), interface))
-        .collect::<BTreeMap<_, _>>();
     let owners = topology
         .sccs
         .iter()
         .flat_map(|scc| scc.key.members.iter().cloned())
         .collect::<Vec<_>>();
+    let evaluation_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-body-inference-evaluation-dependencies.v4\0",
+        std::iter::empty(),
+    ));
     let mut planning_ms = 0.0;
+    let mut direct_owners = 0_u64;
+    let mut required_owners = 0_u64;
+    let mut provider_sccs = 0_u64;
+    let mut result_transfers = 0_u64;
+    let mut result_transfer_nodes = 0_u64;
+    let mut result_transfer_edges = 0_u64;
     for owner in owners {
-        let seed = Arc::clone(
-            state
-                .owner_constraint_seed_requests
-                .current_value(&state.syntax_evaluator, &owner)?
-                .ok_or_else(|| {
-                    session_error(format!(
-                        "owner body inference {owner:?} has no current constraint seed"
-                    ))
-                })?,
-        );
-        let summary = Arc::clone(
-            state
-                .owner_constraint_requests
-                .current_value(&state.syntax_evaluator, &owner)?
-                .ok_or_else(|| {
-                    session_error(format!(
-                        "owner body inference {owner:?} has no current resolved summary"
-                    ))
-                })?,
-        );
-        let planning_started = Instant::now();
-        let plan = owner_body_inference_interface_plan(topology, &seed, &summary, &interfaces)?;
-        planning_ms += planning_started.elapsed().as_secs_f64() * 1_000.0;
-        let own_key = topology
-            .scc_for_owner(&owner)
-            .map(|scc| scc.key.clone())
-            .ok_or_else(|| session_error(format!("owner body inference {owner:?} has no SCC")))?;
-        let import_keys = plan
-            .values()
-            .filter(|key| *key != &own_key)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let evaluation_input = owner_body_inference_plan_fingerprint(&plan);
+        let mut owner_planning_ms = 0.0;
         match state.owner_body_inference_evaluation_requests.begin(
             &mut state.syntax_evaluator,
             owner.clone(),
@@ -3587,19 +3575,51 @@ fn evaluate_owner_body_inference_requests(
                         &mut ticket,
                         &owner,
                     )?);
-                    let own_scc = Arc::clone(state.owner_interface_scc_requests.require(
-                        &state.syntax_evaluator,
-                        &mut ticket,
-                        &own_key,
-                    )?);
-                    let imports = import_keys
+                    let planning_started = Instant::now();
+                    let mut planner = OwnerBodyInterfacePlanner::new(&seed, &summary)?;
+                    let mut interface_results = BTreeMap::new();
+                    while let Some(required_owner) = planner.next_required_owner().cloned() {
+                        let provider =
+                            Arc::clone(state.owner_interface_provider_requests.require(
+                                &state.syntax_evaluator,
+                                &mut ticket,
+                                &required_owner,
+                            )?);
+                        let result = if let Some(result) = interface_results.get(provider.as_ref())
+                        {
+                            Arc::clone(result)
+                        } else {
+                            let result = Arc::clone(state.owner_interface_scc_requests.require(
+                                &state.syntax_evaluator,
+                                &mut ticket,
+                                provider.as_ref(),
+                            )?);
+                            interface_results.insert((*provider).clone(), Arc::clone(&result));
+                            result
+                        };
+                        planner.provide_interface_scc(&result)?;
+                    }
+                    let interface_plan = planner.finish()?;
+                    owner_planning_ms = planning_started.elapsed().as_secs_f64() * 1_000.0;
+                    let own_scc = Arc::clone(
+                        interface_results
+                            .get(interface_plan.own_scc().key())
+                            .ok_or_else(|| {
+                                session_error(format!(
+                                    "owner body inference {owner:?} has no planned own SCC result"
+                                ))
+                            })?,
+                    );
+                    let imports = interface_plan
+                        .imports()
                         .iter()
-                        .map(|key| {
-                            state
-                                .owner_interface_scc_requests
-                                .require(&state.syntax_evaluator, &mut ticket, key)
-                                .map(Arc::clone)
-                                .map_err(Into::into)
+                        .map(|planned| {
+                            interface_results.get(planned.key()).cloned().ok_or_else(|| {
+                                session_error(format!(
+                                    "owner body inference {owner:?} has no planned import SCC result {:?}",
+                                    planned.key()
+                                ))
+                            })
                         })
                         .collect::<CompilerResult<Vec<_>>>()?;
                     let solve_started = Instant::now();
@@ -3608,14 +3628,16 @@ fn evaluate_owner_body_inference_requests(
                         &seed,
                         &summary,
                         &abi,
+                        &interface_plan,
                         &own_scc,
                         imports.iter().map(Arc::as_ref),
                     )?;
                     let solve_ms = solve_started.elapsed().as_secs_f64() * 1_000.0;
                     if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && solve_ms >= 10.0 {
                         eprintln!(
-                            "boon owner body owner={owner:?} imports={} expressions={} calls={} unifications={} solve_ms={solve_ms:.3}",
-                            import_keys.len(),
+                            "boon owner body owner={owner:?} import_sccs={} import_owners={} expressions={} calls={} unifications={} solve_ms={solve_ms:.3}",
+                            interface_plan.imports().len(),
+                            interface_plan.required_owner_count().saturating_sub(1),
                             evaluation.result.work.expressions,
                             evaluation.result.work.calls,
                             evaluation.result.work.unification_steps,
@@ -3641,6 +3663,25 @@ fn evaluate_owner_body_inference_requests(
                 )?;
             }
         }
+        planning_ms += owner_planning_ms;
+        let body_evaluation = state
+            .owner_body_inference_evaluation_requests
+            .current_value(&state.syntax_evaluator, &owner)?
+            .ok_or_else(|| {
+                session_error(format!(
+                    "owner body inference {owner:?} has no current evaluation"
+                ))
+            })?;
+        let body_work = body_evaluation.result.work;
+        direct_owners = direct_owners.saturating_add(body_work.interface_plan_direct_owners);
+        required_owners = required_owners.saturating_add(body_work.interface_plan_required_owners);
+        provider_sccs = provider_sccs.saturating_add(body_work.interface_plan_provider_sccs);
+        result_transfers =
+            result_transfers.saturating_add(body_work.interface_plan_result_transfers);
+        result_transfer_nodes =
+            result_transfer_nodes.saturating_add(body_work.interface_plan_transfer_nodes);
+        result_transfer_edges =
+            result_transfer_edges.saturating_add(body_work.interface_plan_transfer_edges);
         let result_input = RequestInputFingerprint(request_fingerprint(
             b"boon.compiler.owner-body-inference-result-projection-dependencies.v2\0",
             std::iter::empty(),
@@ -3681,8 +3722,14 @@ fn evaluate_owner_body_inference_requests(
     }
     if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() {
         eprintln!(
-            "boon owner requests phase=owner-body-import-planning items={} phase_ms={planning_ms:.3}",
+            "boon owner requests phase=owner-body-import-planning items={} direct_owners={} required_owners={} provider_sccs={} result_transfers={} transfer_nodes={} transfer_edges={} phase_ms={planning_ms:.3}",
             topology.stats.nodes,
+            direct_owners,
+            required_owners,
+            provider_sccs,
+            result_transfers,
+            result_transfer_nodes,
+            result_transfer_edges,
         );
     }
     trace.checkpoint("owner-body-results", topology.stats.nodes);
@@ -4664,13 +4711,13 @@ mod tests {
             second.profile.parse_work
         };
         let second_stats = session.frontend_request_stats(project).unwrap();
-        // Counts include exact inference/construction ABI and checked-owner
-        // requests. The warm edit reuses 49 requests and changes only the
-        // edited owner's dependency cone despite conservatively
-        // reexecuting/backdating shared providers.
+        // Counts include exact provider/import-plan, inference/construction
+        // ABI, and checked-owner requests. The warm edit reuses 53 requests
+        // and changes only the edited owner's dependency cone despite
+        // conservatively reexecuting/backdating shared providers.
         assert_eq!(
             (first_request_counts, request_counts(second_stats)),
-            ((62, 62, 0, 0, 62), (124, 75, 49, 7, 68))
+            ((67, 67, 0, 0, 67), (134, 81, 53, 7, 74))
         );
 
         let mut isolated = CompilerSession::new();
@@ -5606,6 +5653,8 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(imported, BTreeSet::from([value, inherited, leaf]));
+        assert_eq!(body.work.interface_plan_required_owners, 3);
+        assert_eq!(body.work.interface_plan_result_transfers, 3);
         assert_eq!(body.calls[0].result.ty, boon_checked::Type::Number);
     }
 
@@ -5712,13 +5761,13 @@ mod tests {
         assert!(Arc::ptr_eq(&interface_topology, &body_topology));
         let body_stats = session.frontend_request_stats(project).unwrap();
         let body_delta = request_delta(body_stats, interface_stats);
-        // The exact callable/parameter lookup, inference/construction ABI, and
-        // checked-owner families are included here: they may reexecute and
-        // backdate after the broad provider changes while preserving
-        // unchanged owner results.
+        // The exact interface-provider/import-plan, callable/parameter lookup,
+        // inference/construction ABI, and checked-owner families are included
+        // here: they may reexecute and backdate after the broad provider
+        // changes while preserving unchanged owner results.
         assert_eq!(
             (interface_delta, body_delta),
-            ((105, 51, 54, 25, 26), (105, 22, 83, 10, 12))
+            ((113, 53, 60, 25, 28), (113, 23, 90, 10, 13))
         );
     }
 

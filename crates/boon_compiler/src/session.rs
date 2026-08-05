@@ -26,12 +26,13 @@ use boon_typecheck::{
     OwnerCallableAbiLookupOutcome, OwnerConstraintSeed, OwnerConstraintSummary,
     OwnerDeclarationKind, OwnerInferenceAbiEnvironment, OwnerInterfaceScc,
     OwnerInterfaceSccEvaluation, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
-    OwnerInterfaceTopology, OwnerReferenceKind, OwnerSourceMap, OwnerSourcePayloadAbiLookup,
-    OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput, OwnerValueAbiLookup,
-    build_owner_interface_topology, evaluate_owner_body, evaluate_owner_interface_scc,
-    owner_body_required_interface_owners, project_owner_abi_environment,
-    project_owner_constraint_seed, project_owner_source_map, project_owner_syntax_input,
-    resolve_owner_constraint_seed_with_resolutions, stable_check_owner_key_fingerprint_v1,
+    OwnerInterfaceTopology, OwnerParameterRequirementKey, OwnerParameterRequirementLookup,
+    OwnerReferenceKind, OwnerSourceMap, OwnerSourcePayloadAbiLookup, OwnerSymbolReference,
+    OwnerSymbolResolution, OwnerSyntaxInput, OwnerValueAbiLookup, build_owner_interface_topology,
+    evaluate_owner_body, evaluate_owner_interface_scc, owner_body_required_interface_owners,
+    project_owner_abi_environment, project_owner_constraint_seed, project_owner_source_map,
+    project_owner_syntax_input, resolve_owner_constraint_seed_with_resolutions,
+    stable_check_owner_key_fingerprint_v1,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -206,6 +207,8 @@ struct ProjectState {
     owner_callable_abi_lookup_requests: TypedRequestTable<OwnerCallableAbiLookupRequest>,
     owner_value_abi_lookup_requests: TypedRequestTable<OwnerValueAbiLookupRequest>,
     owner_source_payload_abi_lookup_requests: TypedRequestTable<OwnerSourcePayloadAbiLookupRequest>,
+    owner_parameter_requirement_lookup_requests:
+        TypedRequestTable<OwnerParameterRequirementLookupRequest>,
     owner_inference_abi_requests: TypedRequestTable<OwnerInferenceAbiRequest>,
     project_owner_symbol_requests: TypedRequestTable<ProjectOwnerSymbolRequest>,
     owner_constraint_requests: TypedRequestTable<OwnerConstraintRequest>,
@@ -556,13 +559,38 @@ impl RequestFamily for OwnerSourcePayloadAbiLookupRequest {
     }
 }
 
+struct OwnerParameterRequirementLookupRequest;
+
+impl RequestFamily for OwnerParameterRequirementLookupRequest {
+    type Key = OwnerParameterRequirementKey;
+    type Value = Arc<OwnerParameterRequirementLookup>;
+
+    const NAME: &'static str = "boon.compiler.owner-parameter-requirement-lookup.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.owner-parameter-requirement-lookup-key.v1\0",
+            [
+                stable_check_owner_key_fingerprint_v1(key.owner()).as_slice(),
+                key.parameter_ordinal().to_le_bytes().as_slice(),
+            ],
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
 struct OwnerInferenceAbiRequest;
 
 impl RequestFamily for OwnerInferenceAbiRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerInferenceAbiEnvironment>;
 
-    const NAME: &'static str = "boon.compiler.owner-inference-abi.v3";
+    const NAME: &'static str = "boon.compiler.owner-inference-abi.v4";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -902,6 +930,7 @@ impl CompilerSession {
                 owner_callable_abi_lookup_requests: TypedRequestTable::new(),
                 owner_value_abi_lookup_requests: TypedRequestTable::new(),
                 owner_source_payload_abi_lookup_requests: TypedRequestTable::new(),
+                owner_parameter_requirement_lookup_requests: TypedRequestTable::new(),
                 owner_inference_abi_requests: TypedRequestTable::new(),
                 project_owner_symbol_requests: TypedRequestTable::new(),
                 owner_constraint_requests: TypedRequestTable::new(),
@@ -2276,6 +2305,23 @@ fn evaluate_owner_inference_abi_requests(
         .into_iter()
         .flatten()
         .collect::<BTreeSet<_>>();
+    let parameter_requirement_keys = owners
+        .iter()
+        .map(|owner| {
+            state
+                .owner_constraint_seed_requests
+                .current_value(&state.syntax_evaluator, owner)?
+                .map(|seed| seed.parameter_requirement_keys().into_vec())
+                .ok_or_else(|| {
+                    session_error(format!(
+                        "owner inference ABI {owner:?} has no current constraint seed"
+                    ))
+                })
+        })
+        .collect::<CompilerResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
     state
         .owner_callable_abi_lookup_requests
         .retain(&mut state.syntax_evaluator, |name| {
@@ -2290,6 +2336,11 @@ fn evaluate_owner_inference_abi_requests(
         .owner_source_payload_abi_lookup_requests
         .retain(&mut state.syntax_evaluator, |path| {
             source_payload_paths.contains(path)
+        })?;
+    state
+        .owner_parameter_requirement_lookup_requests
+        .retain(&mut state.syntax_evaluator, |key| {
+            parameter_requirement_keys.contains(key)
         })?;
 
     let lookup_input = RequestInputFingerprint(request_fingerprint(
@@ -2412,8 +2463,64 @@ fn evaluate_owner_inference_abi_requests(
         }
     }
 
+    let parameter_requirement_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-parameter-requirement-lookup-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    for key in &parameter_requirement_keys {
+        match state.owner_parameter_requirement_lookup_requests.begin(
+            &mut state.syntax_evaluator,
+            key.clone(),
+            parameter_requirement_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let lookup = (|| -> CompilerResult<_> {
+                    let seed = state.owner_constraint_seed_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        key.owner(),
+                    )?;
+                    let (function, parameter) = seed
+                        .parameter_requirement_names(key.parameter_ordinal())
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "parameter requirement key {key:?} has no matching function parameter"
+                            ))
+                        })?;
+                    let abi = state.project_owner_abi_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &ProjectOwnerAbiKey,
+                    )?;
+                    Ok(Arc::new(abi.parameter_requirement_lookup(
+                        key.clone(),
+                        function,
+                        parameter,
+                    )?))
+                })();
+                let lookup = match lookup {
+                    Ok(lookup) => lookup,
+                    Err(error) => {
+                        state.owner_parameter_requirement_lookup_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_parameter_requirement_lookup_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    lookup,
+                )?;
+            }
+        }
+    }
+
     let owner_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-inference-abi-dependencies.v3\0",
+        b"boon.compiler.owner-inference-abi-dependencies.v4\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -2466,12 +2573,24 @@ fn evaluate_owner_inference_abi_requests(
                                 .map_err(Into::into)
                         })
                         .collect::<CompilerResult<Vec<_>>>()?;
+                    let parameter_requirement_lookups = seed
+                        .parameter_requirement_keys()
+                        .iter()
+                        .map(|key| {
+                            state
+                                .owner_parameter_requirement_lookup_requests
+                                .require(&state.syntax_evaluator, &mut ticket, key)
+                                .map(|lookup| lookup.as_ref().clone())
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
                     Ok(Arc::new(
-                        OwnerInferenceAbiEnvironment::from_all_lookup_sets(
+                        OwnerInferenceAbiEnvironment::from_complete_lookup_sets(
                             [owner.clone()],
                             lookups,
                             value_lookups,
                             source_payload_lookups,
+                            parameter_requirement_lookups,
                         )?,
                     ))
                 })();
@@ -4274,6 +4393,49 @@ mod tests {
     }
 
     #[test]
+    fn function_parameter_has_one_exact_missing_requirement_lookup() {
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(project("FUNCTION identity(input) {\n    input\n}\n"))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let owner = unit
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| segment.names == ["identity"])
+                )
+            })
+            .unwrap();
+        let key = OwnerParameterRequirementKey::new(owner.clone(), 0);
+        let state = session.projects.get(&project).unwrap();
+        let lookup = state
+            .owner_parameter_requirement_lookup_requests
+            .current_value(&state.syntax_evaluator, &key)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            lookup.outcome(),
+            boon_typecheck::OwnerParameterRequirementLookupOutcome::Missing
+        ));
+        let abi = state
+            .owner_inference_abi_requests
+            .current_value(&state.syntax_evaluator, &owner)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            abi.parameter_requirement_lookups(),
+            std::slice::from_ref(lookup.as_ref())
+        );
+    }
+
+    #[test]
     fn unrelated_source_payload_change_stays_outside_the_owner_cone() {
         let before = concat!(
             "keep: SOURCE\n",
@@ -4574,12 +4736,13 @@ mod tests {
         assert!(Arc::ptr_eq(&interface_topology, &body_topology));
         let body_stats = session.frontend_request_stats(project).unwrap();
         let body_delta = request_delta(body_stats, interface_stats);
-        // The exact callable lookup and per-owner inference ABI families are
-        // included here: they may reexecute and backdate after the broad
-        // provider changes, while preserving unchanged owner results.
+        // The exact callable/parameter lookup and per-owner inference ABI
+        // families are included here: they may reexecute and backdate after
+        // the broad provider changes, while preserving unchanged owner
+        // results.
         assert_eq!(
             (interface_delta, body_delta),
-            ((88, 48, 40, 25, 23), (88, 20, 68, 8, 12))
+            ((91, 48, 43, 25, 23), (91, 20, 71, 9, 11))
         );
     }
 

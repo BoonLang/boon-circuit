@@ -1,9 +1,8 @@
 use crate::{
     AuthoritativeCallableSignature, AuthoritativeParameter, BuiltinSignatureRegistry,
     ContextualBuiltinKind, RenderContractRegistry, SourcePayloadPathLookup, TypecheckSyntaxProgram,
-    checked_intrinsic_v1, function_param_requirements, host_effect_signature, host_port_table,
-    merge_external_function_param_requirements, scene_root, session_info_intrinsic_type,
-    source_payload_shape_table, syntax_source_sites,
+    checked_intrinsic_v1, host_effect_signature, host_port_table, scene_root,
+    session_info_intrinsic_type, source_payload_shape_table, syntax_source_sites,
 };
 use boon_checked::{
     CheckedCallContextKind, CheckedCallableKind, CheckedEffectSummary,
@@ -24,8 +23,10 @@ const OWNER_VALUE_ABI_LOOKUP_DOMAIN_V1: &[u8] = b"boon.owner-value-abi-lookup.v1
 const OWNER_SOURCE_PAYLOAD_ABI_LOOKUP_DOMAIN_V1: &[u8] =
     b"boon.owner-source-payload-abi-lookup.v1\0";
 const OWNER_SOURCE_PAYLOAD_ABI_TYPE_DOMAIN_V1: &[u8] = b"boon.owner-source-payload-abi-type.v1\0";
-const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V3: &[u8] =
-    b"boon.owner-inference-abi-environment.v3\0";
+const OWNER_PARAMETER_REQUIREMENT_LOOKUP_DOMAIN_V1: &[u8] =
+    b"boon.owner-parameter-requirement-lookup.v1\0";
+const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V4: &[u8] =
+    b"boon.owner-inference-abi-environment.v4\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerAbiEnvironmentError {
@@ -245,6 +246,96 @@ pub struct OwnerAbiLocalFunctionRequirement {
     pub parameters: Box<[OwnerAbiNamedTypeRequirement]>,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct OwnerParameterRequirementKey {
+    owner: StableCheckOwnerKey,
+    parameter_ordinal: u32,
+}
+
+impl OwnerParameterRequirementKey {
+    pub const fn new(owner: StableCheckOwnerKey, parameter_ordinal: u32) -> Self {
+        Self {
+            owner,
+            parameter_ordinal,
+        }
+    }
+
+    pub const fn owner(&self) -> &StableCheckOwnerKey {
+        &self.owner
+    }
+
+    pub const fn parameter_ordinal(&self) -> u32 {
+        self.parameter_ordinal
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum OwnerParameterRequirementLookupOutcome {
+    Found { ty: Type },
+    Missing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerParameterRequirementLookup {
+    key: OwnerParameterRequirementKey,
+    outcome: OwnerParameterRequirementLookupOutcome,
+    #[serde(skip)]
+    fingerprint_v1: [u8; 32],
+}
+
+impl OwnerParameterRequirementLookup {
+    fn new(
+        key: OwnerParameterRequirementKey,
+        outcome: OwnerParameterRequirementLookupOutcome,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+            OWNER_PARAMETER_REQUIREMENT_LOOKUP_DOMAIN_V1,
+            &(&key, &outcome),
+        )
+        .map_err(|error| {
+            OwnerAbiEnvironmentError::new(format!(
+                "cannot fingerprint owner parameter requirement lookup: {error}"
+            ))
+        })?;
+        Ok(Self {
+            key,
+            outcome,
+            fingerprint_v1,
+        })
+    }
+
+    pub fn found(
+        key: OwnerParameterRequirementKey,
+        ty: Type,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        Self::new(key, OwnerParameterRequirementLookupOutcome::Found { ty })
+    }
+
+    pub fn missing(key: OwnerParameterRequirementKey) -> Result<Self, OwnerAbiEnvironmentError> {
+        Self::new(key, OwnerParameterRequirementLookupOutcome::Missing)
+    }
+
+    pub const fn key(&self) -> &OwnerParameterRequirementKey {
+        &self.key
+    }
+
+    pub const fn outcome(&self) -> &OwnerParameterRequirementLookupOutcome {
+        &self.outcome
+    }
+
+    pub fn ty(&self) -> Option<&Type> {
+        match &self.outcome {
+            OwnerParameterRequirementLookupOutcome::Found { ty } => Some(ty),
+            OwnerParameterRequirementLookupOutcome::Missing => None,
+        }
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+}
+
 /// Frozen authoritative input shared by interface and owner-body requests.
 ///
 /// This is the only owner path representation of builtin, render, host,
@@ -259,6 +350,9 @@ pub struct OwnerAbiEnvironment {
     pub callables: Box<[OwnerAbiCallableContract]>,
     pub values: Box<[OwnerAbiValueContract]>,
     pub source_payloads: Box<[OwnerAbiSourcePayloadContract]>,
+    /// Distributed/cross-role requirements injected into local function
+    /// parameters. Project-derived requirements are owner constraints and are
+    /// deliberately absent from this ABI.
     pub local_function_requirements: Box<[OwnerAbiLocalFunctionRequirement]>,
     fingerprint_v1: [u8; 32],
 }
@@ -615,6 +709,7 @@ pub struct OwnerInferenceAbiEnvironment {
     lookups: Box<[OwnerCallableAbiLookup]>,
     value_lookups: Box<[OwnerValueAbiLookup]>,
     source_payload_lookups: Box<[OwnerSourcePayloadAbiLookup]>,
+    parameter_requirement_lookups: Box<[OwnerParameterRequirementLookup]>,
     #[serde(skip)]
     fingerprint_v1: [u8; 32],
 }
@@ -640,6 +735,22 @@ impl OwnerInferenceAbiEnvironment {
         lookups: impl IntoIterator<Item = OwnerCallableAbiLookup>,
         value_lookups: impl IntoIterator<Item = OwnerValueAbiLookup>,
         source_payload_lookups: impl IntoIterator<Item = OwnerSourcePayloadAbiLookup>,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        Self::from_complete_lookup_sets(
+            subjects,
+            lookups,
+            value_lookups,
+            source_payload_lookups,
+            [],
+        )
+    }
+
+    pub fn from_complete_lookup_sets(
+        subjects: impl IntoIterator<Item = StableCheckOwnerKey>,
+        lookups: impl IntoIterator<Item = OwnerCallableAbiLookup>,
+        value_lookups: impl IntoIterator<Item = OwnerValueAbiLookup>,
+        source_payload_lookups: impl IntoIterator<Item = OwnerSourcePayloadAbiLookup>,
+        parameter_requirement_lookups: impl IntoIterator<Item = OwnerParameterRequirementLookup>,
     ) -> Result<Self, OwnerAbiEnvironmentError> {
         let mut subjects = subjects.into_iter().collect::<Vec<_>>();
         subjects.sort();
@@ -698,9 +809,31 @@ impl OwnerInferenceAbiEnvironment {
             }
         }
         let source_payload_lookups = payloads_by_path.into_values().collect::<Vec<_>>();
+        let mut requirements_by_key = BTreeMap::new();
+        for lookup in parameter_requirement_lookups {
+            match requirements_by_key.entry(lookup.key.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(lookup);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &lookup => {}
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    return Err(OwnerAbiEnvironmentError::new(format!(
+                        "owner inference ABI environment has inconsistent duplicate parameter requirement lookup {:?}",
+                        entry.key()
+                    )));
+                }
+            }
+        }
+        let parameter_requirement_lookups = requirements_by_key.into_values().collect::<Vec<_>>();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V3,
-            &(&subjects, &lookups, &value_lookups, &source_payload_lookups),
+            OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V4,
+            &(
+                &subjects,
+                &lookups,
+                &value_lookups,
+                &source_payload_lookups,
+                &parameter_requirement_lookups,
+            ),
         )
         .map_err(|error| {
             OwnerAbiEnvironmentError::new(format!(
@@ -712,6 +845,7 @@ impl OwnerInferenceAbiEnvironment {
             lookups: lookups.into_boxed_slice(),
             value_lookups: value_lookups.into_boxed_slice(),
             source_payload_lookups: source_payload_lookups.into_boxed_slice(),
+            parameter_requirement_lookups: parameter_requirement_lookups.into_boxed_slice(),
             fingerprint_v1,
         })
     }
@@ -720,7 +854,7 @@ impl OwnerInferenceAbiEnvironment {
         environments: impl IntoIterator<Item = &'a Self>,
     ) -> Result<Self, OwnerAbiEnvironmentError> {
         let environments = environments.into_iter().collect::<Vec<_>>();
-        Self::from_all_lookup_sets(
+        Self::from_complete_lookup_sets(
             environments
                 .iter()
                 .flat_map(|environment| environment.subjects.iter().cloned()),
@@ -733,6 +867,9 @@ impl OwnerInferenceAbiEnvironment {
             environments
                 .iter()
                 .flat_map(|environment| environment.source_payload_lookups.iter().cloned()),
+            environments
+                .iter()
+                .flat_map(|environment| environment.parameter_requirement_lookups.iter().cloned()),
         )
     }
 
@@ -774,6 +911,20 @@ impl OwnerInferenceAbiEnvironment {
             .binary_search_by(|lookup| lookup.canonical_path.as_str().cmp(canonical_path))
             .ok()
             .and_then(|index| self.source_payload_lookups.get(index))
+    }
+
+    pub fn parameter_requirement_lookups(&self) -> &[OwnerParameterRequirementLookup] {
+        &self.parameter_requirement_lookups
+    }
+
+    pub fn parameter_requirement_lookup(
+        &self,
+        key: &OwnerParameterRequirementKey,
+    ) -> Option<&OwnerParameterRequirementLookup> {
+        self.parameter_requirement_lookups
+            .binary_search_by(|lookup| lookup.key.cmp(key))
+            .ok()
+            .and_then(|index| self.parameter_requirement_lookups.get(index))
     }
 
     pub fn callable(&self, canonical_name: &str) -> Option<&OwnerInferenceCallableContract> {
@@ -833,6 +984,34 @@ impl OwnerCallableAbiEnvironment {
 impl OwnerAbiEnvironment {
     pub const fn fingerprint_v1(&self) -> [u8; 32] {
         self.fingerprint_v1
+    }
+
+    pub fn local_parameter_requirement(&self, function: &str, parameter: &str) -> Option<&Type> {
+        self.local_function_requirements
+            .binary_search_by(|requirement| requirement.function.as_str().cmp(function))
+            .ok()
+            .and_then(|index| self.local_function_requirements.get(index))
+            .and_then(|requirement| {
+                requirement
+                    .parameters
+                    .binary_search_by(|candidate| candidate.name.as_str().cmp(parameter))
+                    .ok()
+                    .and_then(|index| requirement.parameters.get(index))
+            })
+            .map(|requirement| &requirement.ty)
+    }
+
+    pub fn parameter_requirement_lookup(
+        &self,
+        key: OwnerParameterRequirementKey,
+        function: &str,
+        parameter: &str,
+    ) -> Result<OwnerParameterRequirementLookup, OwnerAbiEnvironmentError> {
+        if let Some(ty) = self.local_parameter_requirement(function, parameter) {
+            OwnerParameterRequirementLookup::found(key, ty.clone())
+        } else {
+            OwnerParameterRequirementLookup::missing(key)
+        }
     }
 
     pub fn callable(&self, name: &str) -> Option<&OwnerAbiCallableContract> {
@@ -964,8 +1143,25 @@ impl OwnerAbiEnvironment {
         canonical_value_paths: impl IntoIterator<Item = String>,
         source_payload_paths: impl IntoIterator<Item = String>,
     ) -> Result<OwnerInferenceAbiEnvironment, OwnerAbiEnvironmentError> {
+        self.complete_inference_environment_with_requirements(
+            subjects,
+            canonical_names,
+            canonical_value_paths,
+            source_payload_paths,
+            [],
+        )
+    }
+
+    pub fn complete_inference_environment_with_requirements(
+        &self,
+        subjects: impl IntoIterator<Item = StableCheckOwnerKey>,
+        canonical_names: impl IntoIterator<Item = String>,
+        canonical_value_paths: impl IntoIterator<Item = String>,
+        source_payload_paths: impl IntoIterator<Item = String>,
+        parameter_requirement_lookups: impl IntoIterator<Item = OwnerParameterRequirementLookup>,
+    ) -> Result<OwnerInferenceAbiEnvironment, OwnerAbiEnvironmentError> {
         let callable_provider = self.callable_environment()?;
-        OwnerInferenceAbiEnvironment::from_all_lookup_sets(
+        OwnerInferenceAbiEnvironment::from_complete_lookup_sets(
             subjects,
             canonical_names
                 .into_iter()
@@ -985,6 +1181,7 @@ impl OwnerAbiEnvironment {
                 .into_iter()
                 .map(|path| self.source_payload_lookup(&path))
                 .collect::<Result<Vec<_>, _>>()?,
+            parameter_requirement_lookups,
         )
     }
 }
@@ -1420,18 +1617,20 @@ pub fn project_owner_abi_environment(
             })
             .collect::<Vec<_>>();
 
-    let mut local_requirements = function_param_requirements(&program);
-    merge_external_function_param_requirements(
-        &mut local_requirements,
-        &external_types.local_function_requirements,
-    );
-    let local_function_requirements = local_requirements
-        .into_iter()
+    // Owner-local syntax constraints already carry project-derived parameter
+    // requirements. Only requirements arriving from distributed/cross-role
+    // call sites belong to the ABI provider.
+    let local_function_requirements = external_types
+        .local_function_requirements
+        .iter()
         .map(|(function, parameters)| OwnerAbiLocalFunctionRequirement {
-            function,
+            function: function.clone(),
             parameters: parameters
-                .into_iter()
-                .map(|(name, ty)| OwnerAbiNamedTypeRequirement { name, ty })
+                .iter()
+                .map(|(name, ty)| OwnerAbiNamedTypeRequirement {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         })
@@ -1599,6 +1798,51 @@ mod tests {
             second.value("Server.value").unwrap().flow_type.ty,
             Type::Text
         );
+    }
+
+    #[test]
+    fn project_derived_parameter_requirements_stay_outside_the_abi() {
+        let abi = project_owner_abi_environment(
+            &project("FUNCTION title(row) {\n    row.title\n}\n"),
+            &ExternalTypeEnvironment::empty(ProgramRole::Client),
+        )
+        .unwrap();
+        assert!(abi.local_function_requirements.is_empty());
+    }
+
+    #[test]
+    fn external_parameter_requirement_lookup_uses_stable_owner_and_ordinal() {
+        let source = "FUNCTION identity(input) {\n    input\n}\n";
+        let owner = owner(source, "identity");
+        let key = OwnerParameterRequirementKey::new(owner.clone(), 0);
+        let mut external = ExternalTypeEnvironment::empty(ProgramRole::Client);
+        external
+            .local_function_requirements
+            .entry("identity".to_owned())
+            .or_default()
+            .insert("input".to_owned(), Type::Number);
+        let abi = project_owner_abi_environment(&project(source), &external).unwrap();
+        let found = abi
+            .parameter_requirement_lookup(key.clone(), "identity", "input")
+            .unwrap();
+        let missing = abi
+            .parameter_requirement_lookup(
+                OwnerParameterRequirementKey::new(owner, 1),
+                "identity",
+                "missing",
+            )
+            .unwrap();
+
+        assert_eq!(found.key(), &key);
+        assert!(matches!(
+            found.outcome(),
+            OwnerParameterRequirementLookupOutcome::Found { ty: Type::Number }
+        ));
+        assert!(matches!(
+            missing.outcome(),
+            OwnerParameterRequirementLookupOutcome::Missing
+        ));
+        assert_ne!(found.fingerprint_v1(), missing.fingerprint_v1());
     }
 
     #[test]

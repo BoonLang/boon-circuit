@@ -3728,6 +3728,17 @@ pub fn evaluate_owner_body<'a>(
             )));
         }
     }
+    let expected_parameter_requirement_keys = seed.parameter_requirement_keys().into_vec();
+    let actual_parameter_requirement_keys = abi
+        .parameter_requirement_lookups()
+        .iter()
+        .map(|lookup| lookup.key().clone())
+        .collect::<Vec<_>>();
+    if actual_parameter_requirement_keys != expected_parameter_requirement_keys {
+        return Err(OwnerBodyInferenceError::new(
+            "owner body inference ABI does not match its exact parameter requirement lookup set",
+        ));
+    }
     let mut supplied_keys = BTreeSet::new();
     let mut supplied_results = Vec::new();
     let mut available_interfaces = BTreeMap::new();
@@ -4303,6 +4314,27 @@ mod tests {
         .unwrap()
     }
 
+    fn parameter_requirement_lookups<'a>(
+        abi: &crate::OwnerAbiEnvironment,
+        seeds: impl IntoIterator<Item = &'a OwnerConstraintSeed>,
+    ) -> Vec<crate::OwnerParameterRequirementLookup> {
+        seeds
+            .into_iter()
+            .flat_map(|seed| {
+                seed.parameter_requirement_keys()
+                    .into_vec()
+                    .into_iter()
+                    .map(|key| {
+                        let (function, parameter) = seed
+                            .parameter_requirement_names(key.parameter_ordinal())
+                            .unwrap();
+                        abi.parameter_requirement_lookup(key, function, parameter)
+                            .unwrap()
+                    })
+            })
+            .collect()
+    }
+
     fn solve(
         seeds: &[OwnerConstraintSeed],
         summaries: &[OwnerConstraintSummary],
@@ -4327,8 +4359,12 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let mut results = BTreeMap::new();
         for scc in &topology.sccs {
+            let requirements = parameter_requirement_lookups(
+                abi_provider,
+                scc.key.members.iter().map(|owner| seeds[owner]),
+            );
             let abi = abi_provider
-                .complete_inference_environment(
+                .complete_inference_environment_with_requirements(
                     scc.key.members.iter().cloned(),
                     scc.key
                         .members
@@ -4341,6 +4377,7 @@ mod tests {
                         .members
                         .iter()
                         .flat_map(|owner| seeds[owner].source_payload_abi_paths().into_vec()),
+                    requirements,
                 )
                 .unwrap();
             let dependencies = scc
@@ -4382,12 +4419,14 @@ mod tests {
         results: &[OwnerInterfaceSccResult],
         abi_provider: &crate::OwnerAbiEnvironment,
     ) -> OwnerBodyInferenceShard {
+        let requirements = parameter_requirement_lookups(abi_provider, [seed]);
         let abi = abi_provider
-            .complete_inference_environment(
+            .complete_inference_environment_with_requirements(
                 [seed.owner.clone()],
                 summary.authoritative_abi_names().into_vec(),
                 summary.authoritative_value_abi_paths().into_vec(),
                 seed.source_payload_abi_paths().into_vec(),
+                requirements,
             )
             .unwrap();
         let own_scc = results

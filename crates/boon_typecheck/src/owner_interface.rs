@@ -1641,6 +1641,20 @@ pub fn evaluate_owner_interface_scc<'a>(
             }
         }
     }
+    let expected_parameter_requirement_keys = seeds
+        .values()
+        .flat_map(|seed| seed.parameter_requirement_keys().into_vec())
+        .collect::<BTreeSet<_>>();
+    let actual_parameter_requirement_keys = abi
+        .parameter_requirement_lookups()
+        .iter()
+        .map(|lookup| lookup.key().clone())
+        .collect::<BTreeSet<_>>();
+    if actual_parameter_requirement_keys != expected_parameter_requirement_keys {
+        return Err(OwnerConstraintSeedError::new(
+            "interface SCC inference ABI does not match its exact parameter requirement lookup set",
+        ));
+    }
     if seeds.keys().cloned().collect::<BTreeSet<_>>() != expected
         || summaries.keys().cloned().collect::<BTreeSet<_>>() != expected
     {
@@ -1721,6 +1735,16 @@ pub fn evaluate_owner_interface_scc<'a>(
         if let Some(public) = public {
             for parameter in &public.parameters {
                 let variable = unifier.fresh();
+                let requirement_key =
+                    crate::OwnerParameterRequirementKey::new(seed.owner.clone(), parameter.ordinal);
+                let requirement = abi
+                    .parameter_requirement_lookup(&requirement_key)
+                    .expect("parameter requirement lookup set was validated above");
+                if let Some(ty) = requirement.ty() {
+                    let mut variables = BTreeMap::new();
+                    let ty = instantiate_type(ty, &mut unifier, &mut variables);
+                    unifier.bind_var(variable, ty);
+                }
                 parameters.push(OwnerSolveParameter {
                     name: parameter.name.clone(),
                     kind: parameter.kind,
@@ -2827,7 +2851,7 @@ mod tests {
         project_owner_constraint_seed(&syntax).unwrap()
     }
 
-    fn test_abi() -> crate::OwnerCallableAbiEnvironment {
+    fn test_abi() -> crate::OwnerAbiEnvironment {
         let unit = link("value: 1\n");
         let project =
             ProjectSyntaxSnapshot::from_unit_snapshots("app/RUN.bn", vec![Arc::new(unit)]).unwrap();
@@ -2836,8 +2860,6 @@ mod tests {
             &boon_checked::ExternalTypeEnvironment::empty(boon_checked::ProgramRole::Client),
         )
         .unwrap()
-        .callable_environment()
-        .unwrap()
     }
 
     fn solve(
@@ -2845,6 +2867,14 @@ mod tests {
         summaries: &[OwnerConstraintSummary],
     ) -> Vec<OwnerInterfaceSccResult> {
         let abi_provider = test_abi();
+        solve_with_provider(seeds, summaries, &abi_provider)
+    }
+
+    fn solve_with_provider(
+        seeds: &[OwnerConstraintSeed],
+        summaries: &[OwnerConstraintSummary],
+        abi_provider: &crate::OwnerAbiEnvironment,
+    ) -> Vec<OwnerInterfaceSccResult> {
         let topology = build_owner_interface_topology(summaries.iter()).unwrap();
         let seeds = seeds
             .iter()
@@ -2856,13 +2886,40 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let mut results = BTreeMap::new();
         for scc in &topology.sccs {
+            let parameter_requirement_lookups = scc
+                .key
+                .members
+                .iter()
+                .flat_map(|owner| {
+                    seeds[owner]
+                        .parameter_requirement_keys()
+                        .into_vec()
+                        .into_iter()
+                        .map(|key| {
+                            let (function, parameter) = seeds[owner]
+                                .parameter_requirement_names(key.parameter_ordinal())
+                                .unwrap();
+                            abi_provider
+                                .parameter_requirement_lookup(key, function, parameter)
+                                .unwrap()
+                        })
+                })
+                .collect::<Vec<_>>();
             let abi = abi_provider
-                .inference_environment(
+                .complete_inference_environment_with_requirements(
                     scc.key.members.iter().cloned(),
                     scc.key
                         .members
                         .iter()
                         .flat_map(|owner| summaries[owner].authoritative_abi_names().into_vec()),
+                    scc.key.members.iter().flat_map(|owner| {
+                        summaries[owner].authoritative_value_abi_paths().into_vec()
+                    }),
+                    scc.key
+                        .members
+                        .iter()
+                        .flat_map(|owner| seeds[owner].source_payload_abi_paths().into_vec()),
+                    parameter_requirement_lookups,
                 )
                 .unwrap();
             let dependencies = scc
@@ -2906,12 +2963,24 @@ mod tests {
     }
 
     fn checked_callable_interface(source: &str, name: &str) -> NormalizedCheckedInterface {
+        checked_callable_interface_with_external(
+            source,
+            name,
+            &boon_checked::ExternalTypeEnvironment::empty(boon_checked::ProgramRole::Client),
+        )
+    }
+
+    fn checked_callable_interface_with_external(
+        source: &str,
+        name: &str,
+        external: &boon_checked::ExternalTypeEnvironment,
+    ) -> NormalizedCheckedInterface {
         let parsed = boon_parser::parse_project(
             "app/RUN.bn",
             [("app/RUN.bn".to_owned(), source.to_owned())],
         )
         .unwrap();
-        let checked = crate::check_program(&parsed);
+        let checked = crate::check_program_with_external_types(&parsed, external);
         let fields = checked.checked_program_fields().unwrap();
         let callable = fields
             .callables
@@ -3042,6 +3111,37 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn external_parameter_requirement_is_keyed_by_owner_and_ordinal() {
+        let source = "FUNCTION identity(input) {\n    input\n}\n";
+        let unit = link(source);
+        let owner = owner_named(&unit, "identity");
+        let seed = seed(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let mut external =
+            boon_checked::ExternalTypeEnvironment::empty(boon_checked::ProgramRole::Client);
+        external
+            .local_function_requirements
+            .entry("identity".to_owned())
+            .or_default()
+            .insert("input".to_owned(), Type::Number);
+        let project =
+            ProjectSyntaxSnapshot::from_unit_snapshots("app/RUN.bn", vec![Arc::new(unit)]).unwrap();
+        let provider = crate::project_owner_abi_environment(&project, &external).unwrap();
+        let results = solve_with_provider(&[seed], &[summary], &provider);
+        let interface = results[0].owner(&owner).unwrap();
+        assert_eq!(interface.parameters[0].flow_type.ty, Type::Number);
+        assert_eq!(interface.result.ty, Type::Number);
+        assert!(interface.type_variables.is_empty());
+
+        let checked = checked_callable_interface_with_external(source, "identity", &external);
+        assert_eq!(
+            interface.parameters[0].flow_type,
+            checked.parameters[0].flow_type
+        );
+        assert_eq!(interface.result, checked.result);
     }
 
     #[test]

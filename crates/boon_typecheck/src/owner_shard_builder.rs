@@ -129,12 +129,29 @@ fn validate_inputs(
             "checked owner inputs disagree on stable owner {owner:?}"
         )));
     }
+    let parameter_requirements = seed
+        .parameter_requirement_keys()
+        .into_vec()
+        .into_iter()
+        .map(|key| {
+            let (function, parameter) = seed
+                .parameter_requirement_names(key.parameter_ordinal())
+                .ok_or_else(|| {
+                CheckedOwnerBuildError::new(
+                    "checked owner parameter requirement key has no declaration",
+                )
+            })?;
+            abi.parameter_requirement_lookup(key, function, parameter)
+                .map_err(|error| CheckedOwnerBuildError::new(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let inference_abi_fingerprint_v1 = abi
-        .complete_inference_environment(
+        .complete_inference_environment_with_requirements(
             [owner.clone()],
             summary.authoritative_abi_names().into_vec(),
             summary.authoritative_value_abi_paths().into_vec(),
             seed.source_payload_abi_paths().into_vec(),
+            parameter_requirements,
         )
         .map_err(|error| {
             CheckedOwnerBuildError::new(format!(
@@ -5084,12 +5101,25 @@ mod tests {
             &ExternalTypeEnvironment::empty(ProgramRole::Client),
         )
         .unwrap();
+        let parameter_requirements = seed
+            .parameter_requirement_keys()
+            .into_vec()
+            .into_iter()
+            .map(|key| {
+                let (function, parameter) = seed
+                    .parameter_requirement_names(key.parameter_ordinal())
+                    .unwrap();
+                abi.parameter_requirement_lookup(key, function, parameter)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
         let inference_abi = abi
-            .complete_inference_environment(
+            .complete_inference_environment_with_requirements(
                 [seed.owner.clone()],
                 summary.authoritative_abi_names().into_vec(),
                 summary.authoritative_value_abi_paths().into_vec(),
                 seed.source_payload_abi_paths().into_vec(),
+                parameter_requirements,
             )
             .unwrap();
         let topology = build_owner_interface_topology([&summary]).unwrap();

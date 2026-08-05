@@ -334,6 +334,33 @@ impl OwnerConstraintSeed {
             .collect::<Vec<_>>()
             .into_boxed_slice()
     }
+
+    pub fn parameter_requirement_keys(&self) -> Box<[crate::OwnerParameterRequirementKey]> {
+        self.declarations
+            .iter()
+            .find(|declaration| {
+                declaration.public && declaration.kind == OwnerDeclarationKind::Function
+            })
+            .into_iter()
+            .flat_map(|declaration| &declaration.parameters)
+            .map(|parameter| {
+                crate::OwnerParameterRequirementKey::new(self.owner.clone(), parameter.ordinal)
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    pub fn parameter_requirement_names(&self, ordinal: u32) -> Option<(&str, &str)> {
+        let declaration = self.declarations.iter().find(|declaration| {
+            declaration.public && declaration.kind == OwnerDeclarationKind::Function
+        })?;
+        let function = declaration.names.first()?;
+        let parameter = declaration
+            .parameters
+            .iter()
+            .find(|parameter| parameter.ordinal == ordinal)?;
+        Some((function, &parameter.name))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]

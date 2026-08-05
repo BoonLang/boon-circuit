@@ -980,6 +980,18 @@ fn bind_local_constraints(
                 Type::VariantSet(vec![Variant::Tag(name.clone())].into()),
             ),
             OwnerConstraintNodeKind::Source => {
+                if let Some(query) = seed
+                    .source_payload_queries
+                    .iter()
+                    .find(|query| query.expression == expression.expression)
+                    && let Some(payload_type) = abi
+                        .source_payload_lookup(&query.canonical_path)
+                        .and_then(crate::OwnerSourcePayloadAbiLookup::payload_type)
+                {
+                    let mut variables = BTreeMap::new();
+                    let payload_type = instantiate_type(payload_type, unifier, &mut variables);
+                    unifier.bind_var(variable, payload_type);
+                }
                 mode = Some(FlowMode::PresentOrAbsent);
                 direct_effects[index].emits_source = true;
             }
@@ -3693,6 +3705,29 @@ pub fn evaluate_owner_body<'a>(
             "owner body inference ABI does not match its exact external value lookup set",
         ));
     }
+    let expected_source_payload_paths = seed.source_payload_abi_paths().into_vec();
+    let actual_source_payload_paths = abi
+        .source_payload_lookups()
+        .iter()
+        .map(|lookup| lookup.canonical_path().to_owned())
+        .collect::<Vec<_>>();
+    if actual_source_payload_paths != expected_source_payload_paths {
+        return Err(OwnerBodyInferenceError::new(
+            "owner body inference ABI does not match its exact source payload lookup set",
+        ));
+    }
+    for query in &seed.source_payload_queries {
+        if abi
+            .source_payload_lookup(&query.canonical_path)
+            .and_then(crate::OwnerSourcePayloadAbiLookup::payload_type)
+            .is_none()
+        {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "source `{}` has no unique payload ABI contract",
+                query.canonical_path
+            )));
+        }
+    }
     let mut supplied_keys = BTreeSet::new();
     let mut supplied_results = Vec::new();
     let mut available_interfaces = BTreeMap::new();
@@ -4293,7 +4328,7 @@ mod tests {
         let mut results = BTreeMap::new();
         for scc in &topology.sccs {
             let abi = abi_provider
-                .exact_inference_environment(
+                .complete_inference_environment(
                     scc.key.members.iter().cloned(),
                     scc.key
                         .members
@@ -4302,6 +4337,10 @@ mod tests {
                     scc.key.members.iter().flat_map(|owner| {
                         summaries[owner].authoritative_value_abi_paths().into_vec()
                     }),
+                    scc.key
+                        .members
+                        .iter()
+                        .flat_map(|owner| seeds[owner].source_payload_abi_paths().into_vec()),
                 )
                 .unwrap();
             let dependencies = scc
@@ -4344,10 +4383,11 @@ mod tests {
         abi_provider: &crate::OwnerAbiEnvironment,
     ) -> OwnerBodyInferenceShard {
         let abi = abi_provider
-            .exact_inference_environment(
+            .complete_inference_environment(
                 [seed.owner.clone()],
                 summary.authoritative_abi_names().into_vec(),
                 summary.authoritative_value_abi_paths().into_vec(),
+                seed.source_payload_abi_paths().into_vec(),
             )
             .unwrap();
         let own_scc = results
@@ -5341,7 +5381,146 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         let oracle = crate::check_program_with_external_types(&parsed, &external);
-        assert!(oracle.report.diagnostics.is_empty());
+        assert!(
+            oracle.report.diagnostics.is_empty(),
+            "external value oracle diagnostics: {:#?}",
+            oracle.report.diagnostics
+        );
+        let oracle_types = oracle
+            .report
+            .expr_type_table
+            .entries
+            .iter()
+            .map(|entry| (entry.expr_id, entry.flow_type.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for expression in &body.expressions {
+            assert_eq!(
+                expression.flow_type,
+                oracle_types[&syntax_ids[&expression.stable_key]]
+            );
+        }
+    }
+
+    #[test]
+    fn source_payload_flow_matches_the_independent_whole_checker_oracle() {
+        let source = "event: SOURCE\nuse: event.key\n";
+        let unit = link(source);
+        let owner = owner_named(&unit, "event");
+        let (syntax, _, seed) = inputs(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        assert_eq!(seed.source_payload_queries.len(), 1);
+        assert_eq!(seed.source_payload_queries[0].canonical_path, "event");
+
+        let project =
+            ProjectSyntaxSnapshot::from_unit_snapshots("app/RUN.bn", vec![Arc::new(unit.clone())])
+                .unwrap();
+        let abi = crate::project_owner_abi_environment(
+            &project,
+            &boon_checked::ExternalTypeEnvironment::empty(boon_checked::ProgramRole::Client),
+        )
+        .unwrap();
+        let interfaces = solve_with_abi(&[seed.clone()], &[summary.clone()], &abi);
+        let body = infer_with_abi(&syntax, &seed, &summary, &interfaces, &abi);
+        assert!(body.diagnostics.is_empty());
+        let source_expression = body
+            .expression(&seed.source_payload_queries[0].expression)
+            .unwrap();
+        assert!(matches!(
+            &source_expression.flow_type.ty,
+            Type::Object(shape) if shape.fields.get("key") == Some(&Type::Text)
+        ));
+
+        let parsed = boon_parser::parse_project(
+            "app/RUN.bn",
+            [("app/RUN.bn".to_owned(), source.to_owned())],
+        )
+        .unwrap();
+        let syntax_ids = parsed
+            .expressions
+            .iter()
+            .filter_map(|expression| {
+                parsed
+                    .stable_expression_key(expression.id)
+                    .map(|stable| (stable, expression.id))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let oracle = crate::check_program(&parsed);
+        assert!(
+            oracle.report.diagnostics.is_empty(),
+            "source payload oracle diagnostics: {:#?}",
+            oracle.report.diagnostics
+        );
+        let oracle_types = oracle
+            .report
+            .expr_type_table
+            .entries
+            .iter()
+            .map(|entry| (entry.expr_id, entry.flow_type.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for expression in &body.expressions {
+            assert_eq!(
+                expression.flow_type,
+                oracle_types[&syntax_ids[&expression.stable_key]]
+            );
+        }
+    }
+
+    #[test]
+    fn interval_source_call_matches_the_oracle_without_a_payload_inference_lookup() {
+        let source = concat!(
+            "tick: Duration[milliseconds: 16] |> Timer/interval()\n",
+            "use: tick.key\n",
+        );
+        let unit = link(source);
+        let owner = owner_named(&unit, "tick");
+        let (syntax, _, seed) = inputs(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        assert!(seed.source_payload_queries.is_empty());
+
+        let project =
+            ProjectSyntaxSnapshot::from_unit_snapshots("app/RUN.bn", vec![Arc::new(unit.clone())])
+                .unwrap();
+        let abi = crate::project_owner_abi_environment(
+            &project,
+            &boon_checked::ExternalTypeEnvironment::empty(boon_checked::ProgramRole::Client),
+        )
+        .unwrap();
+        let interfaces = solve_with_abi(&[seed.clone()], &[summary.clone()], &abi);
+        let body = infer_with_abi(&syntax, &seed, &summary, &interfaces, &abi);
+        assert!(body.diagnostics.is_empty());
+        let source_call = body
+            .calls
+            .iter()
+            .find(|call| call.function == "Timer/interval")
+            .unwrap();
+        let source_expression = body.expression(&source_call.expression).unwrap();
+        assert_eq!(source_expression.flow_type.mode, FlowMode::Continuous);
+        assert!(matches!(
+            &source_expression.flow_type.ty,
+            Type::Object(shape) if shape.open
+        ));
+        assert!(source_expression.direct_effect.emits_source);
+
+        let parsed = boon_parser::parse_project(
+            "app/RUN.bn",
+            [("app/RUN.bn".to_owned(), source.to_owned())],
+        )
+        .unwrap();
+        let syntax_ids = parsed
+            .expressions
+            .iter()
+            .filter_map(|expression| {
+                parsed
+                    .stable_expression_key(expression.id)
+                    .map(|stable| (stable, expression.id))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let oracle = crate::check_program(&parsed);
+        assert!(
+            oracle.report.diagnostics.is_empty(),
+            "interval source oracle diagnostics: {:#?}",
+            oracle.report.diagnostics
+        );
         let oracle_types = oracle
             .report
             .expr_type_table

@@ -21,8 +21,11 @@ const OWNER_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] = b"boon.owner-abi-environment.v1\0
 const OWNER_CALLABLE_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] = b"boon.owner-callable-abi-environment.v1\0";
 const OWNER_CALLABLE_ABI_LOOKUP_DOMAIN_V1: &[u8] = b"boon.owner-callable-abi-lookup.v1\0";
 const OWNER_VALUE_ABI_LOOKUP_DOMAIN_V1: &[u8] = b"boon.owner-value-abi-lookup.v1\0";
-const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V2: &[u8] =
-    b"boon.owner-inference-abi-environment.v2\0";
+const OWNER_SOURCE_PAYLOAD_ABI_LOOKUP_DOMAIN_V1: &[u8] =
+    b"boon.owner-source-payload-abi-lookup.v1\0";
+const OWNER_SOURCE_PAYLOAD_ABI_TYPE_DOMAIN_V1: &[u8] = b"boon.owner-source-payload-abi-type.v1\0";
+const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V3: &[u8] =
+    b"boon.owner-inference-abi-environment.v3\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerAbiEnvironmentError {
@@ -485,17 +488,133 @@ impl OwnerValueAbiLookup {
     }
 }
 
-/// Exact callable ABI surface consumed by one owner or one interface SCC.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum OwnerSourcePayloadAbiLookupOutcome {
+    Found { payload_type: Type },
+    Missing,
+    Conflict { payload_types: Box<[Type]> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerSourcePayloadAbiLookup {
+    canonical_path: String,
+    outcome: OwnerSourcePayloadAbiLookupOutcome,
+    #[serde(skip)]
+    fingerprint_v1: [u8; 32],
+}
+
+impl OwnerSourcePayloadAbiLookup {
+    fn from_payload_types(
+        canonical_path: String,
+        payload_types: impl IntoIterator<Item = Type>,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        if canonical_path.is_empty() {
+            return Err(OwnerAbiEnvironmentError::new(
+                "owner source payload ABI lookup path is empty",
+            ));
+        }
+        let mut by_fingerprint = BTreeMap::new();
+        for payload_type in payload_types {
+            let fingerprint = boon_contract::canonical_serde_hash_v1(
+                OWNER_SOURCE_PAYLOAD_ABI_TYPE_DOMAIN_V1,
+                &payload_type,
+            )
+            .map_err(|error| {
+                OwnerAbiEnvironmentError::new(format!(
+                    "cannot fingerprint source payload type for `{canonical_path}`: {error}"
+                ))
+            })?;
+            match by_fingerprint.entry(fingerprint) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(payload_type);
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get() == &payload_type => {}
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(OwnerAbiEnvironmentError::new(format!(
+                        "source payload type digest collision for `{canonical_path}`"
+                    )));
+                }
+            }
+        }
+        let payload_types = by_fingerprint.into_values().collect::<Vec<_>>();
+        let outcome = match payload_types.as_slice() {
+            [] => OwnerSourcePayloadAbiLookupOutcome::Missing,
+            [payload_type] => OwnerSourcePayloadAbiLookupOutcome::Found {
+                payload_type: payload_type.clone(),
+            },
+            _ => OwnerSourcePayloadAbiLookupOutcome::Conflict {
+                payload_types: payload_types.into_boxed_slice(),
+            },
+        };
+        let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+            OWNER_SOURCE_PAYLOAD_ABI_LOOKUP_DOMAIN_V1,
+            &(&canonical_path, &outcome),
+        )
+        .map_err(|error| {
+            OwnerAbiEnvironmentError::new(format!(
+                "cannot fingerprint owner source payload ABI lookup `{canonical_path}`: {error}"
+            ))
+        })?;
+        Ok(Self {
+            canonical_path,
+            outcome,
+            fingerprint_v1,
+        })
+    }
+
+    pub fn found(
+        canonical_path: impl Into<String>,
+        payload_type: Type,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        Self::from_payload_types(canonical_path.into(), [payload_type])
+    }
+
+    pub fn missing(canonical_path: impl Into<String>) -> Result<Self, OwnerAbiEnvironmentError> {
+        Self::from_payload_types(canonical_path.into(), [])
+    }
+
+    pub fn conflict(
+        canonical_path: impl Into<String>,
+        payload_types: impl IntoIterator<Item = Type>,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        Self::from_payload_types(canonical_path.into(), payload_types)
+    }
+
+    pub fn canonical_path(&self) -> &str {
+        &self.canonical_path
+    }
+
+    pub const fn outcome(&self) -> &OwnerSourcePayloadAbiLookupOutcome {
+        &self.outcome
+    }
+
+    pub fn payload_type(&self) -> Option<&Type> {
+        match &self.outcome {
+            OwnerSourcePayloadAbiLookupOutcome::Found { payload_type } => Some(payload_type),
+            OwnerSourcePayloadAbiLookupOutcome::Missing
+            | OwnerSourcePayloadAbiLookupOutcome::Conflict { .. } => None,
+        }
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+}
+
+/// Exact inference ABI surface consumed by one owner or one interface SCC.
 ///
-/// This value contains only requested names, including explicit missing or
+/// This value contains only requested inputs, including explicit missing or
 /// conflict outcomes. Its fingerprint therefore does not change when an
-/// unrelated builtin, field projection, host function, or external callable
-/// is added elsewhere in the project.
+/// unrelated builtin, value, source payload, host function, or external
+/// callable is added elsewhere in the project.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerInferenceAbiEnvironment {
     subjects: Box<[StableCheckOwnerKey]>,
     lookups: Box<[OwnerCallableAbiLookup]>,
     value_lookups: Box<[OwnerValueAbiLookup]>,
+    source_payload_lookups: Box<[OwnerSourcePayloadAbiLookup]>,
     #[serde(skip)]
     fingerprint_v1: [u8; 32],
 }
@@ -512,6 +631,15 @@ impl OwnerInferenceAbiEnvironment {
         subjects: impl IntoIterator<Item = StableCheckOwnerKey>,
         lookups: impl IntoIterator<Item = OwnerCallableAbiLookup>,
         value_lookups: impl IntoIterator<Item = OwnerValueAbiLookup>,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        Self::from_all_lookup_sets(subjects, lookups, value_lookups, [])
+    }
+
+    pub fn from_all_lookup_sets(
+        subjects: impl IntoIterator<Item = StableCheckOwnerKey>,
+        lookups: impl IntoIterator<Item = OwnerCallableAbiLookup>,
+        value_lookups: impl IntoIterator<Item = OwnerValueAbiLookup>,
+        source_payload_lookups: impl IntoIterator<Item = OwnerSourcePayloadAbiLookup>,
     ) -> Result<Self, OwnerAbiEnvironmentError> {
         let mut subjects = subjects.into_iter().collect::<Vec<_>>();
         subjects.sort();
@@ -554,9 +682,25 @@ impl OwnerInferenceAbiEnvironment {
             }
         }
         let value_lookups = values_by_path.into_values().collect::<Vec<_>>();
+        let mut payloads_by_path = BTreeMap::new();
+        for lookup in source_payload_lookups {
+            match payloads_by_path.entry(lookup.canonical_path.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(lookup);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &lookup => {}
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    return Err(OwnerAbiEnvironmentError::new(format!(
+                        "owner inference ABI environment has inconsistent duplicate source payload lookup `{}`",
+                        entry.key()
+                    )));
+                }
+            }
+        }
+        let source_payload_lookups = payloads_by_path.into_values().collect::<Vec<_>>();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V2,
-            &(&subjects, &lookups, &value_lookups),
+            OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V3,
+            &(&subjects, &lookups, &value_lookups, &source_payload_lookups),
         )
         .map_err(|error| {
             OwnerAbiEnvironmentError::new(format!(
@@ -567,6 +711,7 @@ impl OwnerInferenceAbiEnvironment {
             subjects: subjects.into_boxed_slice(),
             lookups: lookups.into_boxed_slice(),
             value_lookups: value_lookups.into_boxed_slice(),
+            source_payload_lookups: source_payload_lookups.into_boxed_slice(),
             fingerprint_v1,
         })
     }
@@ -575,7 +720,7 @@ impl OwnerInferenceAbiEnvironment {
         environments: impl IntoIterator<Item = &'a Self>,
     ) -> Result<Self, OwnerAbiEnvironmentError> {
         let environments = environments.into_iter().collect::<Vec<_>>();
-        Self::from_lookup_sets(
+        Self::from_all_lookup_sets(
             environments
                 .iter()
                 .flat_map(|environment| environment.subjects.iter().cloned()),
@@ -585,6 +730,9 @@ impl OwnerInferenceAbiEnvironment {
             environments
                 .iter()
                 .flat_map(|environment| environment.value_lookups.iter().cloned()),
+            environments
+                .iter()
+                .flat_map(|environment| environment.source_payload_lookups.iter().cloned()),
         )
     }
 
@@ -612,6 +760,20 @@ impl OwnerInferenceAbiEnvironment {
             .binary_search_by(|lookup| lookup.canonical_path.as_str().cmp(canonical_path))
             .ok()
             .and_then(|index| self.value_lookups.get(index))
+    }
+
+    pub fn source_payload_lookups(&self) -> &[OwnerSourcePayloadAbiLookup] {
+        &self.source_payload_lookups
+    }
+
+    pub fn source_payload_lookup(
+        &self,
+        canonical_path: &str,
+    ) -> Option<&OwnerSourcePayloadAbiLookup> {
+        self.source_payload_lookups
+            .binary_search_by(|lookup| lookup.canonical_path.as_str().cmp(canonical_path))
+            .ok()
+            .and_then(|index| self.source_payload_lookups.get(index))
     }
 
     pub fn callable(&self, canonical_name: &str) -> Option<&OwnerInferenceCallableContract> {
@@ -735,9 +897,21 @@ impl OwnerAbiEnvironment {
 
     pub fn source_payload(&self, canonical_path: &str) -> Option<&OwnerAbiSourcePayloadContract> {
         self.source_payloads
-            .binary_search_by(|contract| contract.canonical_path.as_str().cmp(canonical_path))
-            .ok()
-            .and_then(|index| self.source_payloads.get(index))
+            .iter()
+            .find(|contract| contract.canonical_path == canonical_path)
+    }
+
+    pub fn source_payload_lookup(
+        &self,
+        canonical_path: &str,
+    ) -> Result<OwnerSourcePayloadAbiLookup, OwnerAbiEnvironmentError> {
+        OwnerSourcePayloadAbiLookup::from_payload_types(
+            canonical_path.to_owned(),
+            self.source_payloads
+                .iter()
+                .filter(|contract| contract.canonical_path == canonical_path)
+                .map(|contract| contract.payload_type.clone()),
+        )
     }
 
     pub fn callable_environment(
@@ -780,8 +954,18 @@ impl OwnerAbiEnvironment {
         canonical_names: impl IntoIterator<Item = String>,
         canonical_value_paths: impl IntoIterator<Item = String>,
     ) -> Result<OwnerInferenceAbiEnvironment, OwnerAbiEnvironmentError> {
+        self.complete_inference_environment(subjects, canonical_names, canonical_value_paths, [])
+    }
+
+    pub fn complete_inference_environment(
+        &self,
+        subjects: impl IntoIterator<Item = StableCheckOwnerKey>,
+        canonical_names: impl IntoIterator<Item = String>,
+        canonical_value_paths: impl IntoIterator<Item = String>,
+        source_payload_paths: impl IntoIterator<Item = String>,
+    ) -> Result<OwnerInferenceAbiEnvironment, OwnerAbiEnvironmentError> {
         let callable_provider = self.callable_environment()?;
-        OwnerInferenceAbiEnvironment::from_lookup_sets(
+        OwnerInferenceAbiEnvironment::from_all_lookup_sets(
             subjects,
             canonical_names
                 .into_iter()
@@ -794,6 +978,12 @@ impl OwnerAbiEnvironment {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .map(|path| self.value_lookup(&path))
+                .collect::<Result<Vec<_>, _>>()?,
+            source_payload_paths
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|path| self.source_payload_lookup(&path))
                 .collect::<Result<Vec<_>, _>>()?,
         )
     }
@@ -1584,5 +1774,27 @@ mod tests {
             strict_missing.fingerprint_v1(),
             provisional_missing.fingerprint_v1()
         );
+    }
+
+    #[test]
+    fn source_payload_lookup_freezes_one_exact_inference_contract() {
+        let abi = project_owner_abi_environment(
+            &project("events: [press: SOURCE]\nuse: events.press.key\n"),
+            &ExternalTypeEnvironment::empty(ProgramRole::Client),
+        )
+        .unwrap();
+        let lookup = abi.source_payload_lookup("events.press").unwrap();
+        assert!(matches!(
+            lookup.outcome(),
+            OwnerSourcePayloadAbiLookupOutcome::Found {
+                payload_type: Type::Object(shape)
+            } if shape.fields.get("key") == Some(&Type::Text)
+        ));
+        assert!(matches!(
+            abi.source_payload_lookup("events.missing")
+                .unwrap()
+                .outcome(),
+            OwnerSourcePayloadAbiLookupOutcome::Missing
+        ));
     }
 }

@@ -1613,6 +1613,34 @@ pub fn evaluate_owner_interface_scc<'a>(
             "interface SCC inference ABI does not match its exact external value lookup set",
         ));
     }
+    let expected_source_payload_paths = seeds
+        .values()
+        .flat_map(|seed| seed.source_payload_abi_paths().into_vec())
+        .collect::<BTreeSet<_>>();
+    let actual_source_payload_paths = abi
+        .source_payload_lookups()
+        .iter()
+        .map(|lookup| lookup.canonical_path().to_owned())
+        .collect::<BTreeSet<_>>();
+    if actual_source_payload_paths != expected_source_payload_paths {
+        return Err(OwnerConstraintSeedError::new(
+            "interface SCC inference ABI does not match its exact source payload lookup set",
+        ));
+    }
+    for seed in seeds.values() {
+        for query in &seed.source_payload_queries {
+            if abi
+                .source_payload_lookup(&query.canonical_path)
+                .and_then(crate::OwnerSourcePayloadAbiLookup::payload_type)
+                .is_none()
+            {
+                return Err(OwnerConstraintSeedError::new(format!(
+                    "source `{}` has no unique payload ABI contract",
+                    query.canonical_path
+                )));
+            }
+        }
+    }
     if seeds.keys().cloned().collect::<BTreeSet<_>>() != expected
         || summaries.keys().cloned().collect::<BTreeSet<_>>() != expected
     {
@@ -1866,6 +1894,21 @@ pub fn evaluate_owner_interface_scc<'a>(
                     Type::VariantSet(vec![Variant::Tag(name.clone())].into()),
                 ),
                 OwnerConstraintNodeKind::Source => {
+                    if let Some(query) = state
+                        .seed
+                        .source_payload_queries
+                        .iter()
+                        .find(|query| query.expression == expression.expression)
+                    {
+                        let payload_type = abi
+                            .source_payload_lookup(&query.canonical_path)
+                            .and_then(crate::OwnerSourcePayloadAbiLookup::payload_type)
+                            .expect("source payload lookup was validated above");
+                        let mut variables = BTreeMap::new();
+                        let payload_type =
+                            instantiate_type(payload_type, &mut unifier, &mut variables);
+                        unifier.bind_var(variable, payload_type);
+                    }
                     mode = Some(FlowMode::PresentOrAbsent);
                     state.effect.emits_source = true;
                 }

@@ -8,7 +8,8 @@ use boon_compilation_db::{
 };
 use boon_syntax::{
     AstCallArgKind, AstDrainPath, AstExprKind, AstMatchPattern, AstStatementKind, AstTextSegment,
-    BytesSizeSyntax, StableCheckOwnerKey, StableExpressionKey,
+    BytesSizeSyntax, StableCheckOwnerKey, StableExpressionKey, StableStatementKey,
+    StableStatementKind, UnitItemKind,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -266,6 +267,12 @@ pub struct OwnerResultStaticNumber {
     pub literal: String,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct OwnerSourcePayloadQuery {
+    pub expression: StableExpressionKey,
+    pub canonical_path: String,
+}
+
 /// Interface-relevant constraints for one owner.
 ///
 /// Source positions and body-only literal payloads are deliberately absent.
@@ -284,6 +291,10 @@ pub struct OwnerConstraintSeed {
     pub expression_flush_plans: Box<[OwnerFlushConstraint]>,
     pub references: Box<[OwnerSymbolReference]>,
     pub external_expressions: Box<[OwnerExternalExpressionInput]>,
+    /// Stable source declarations whose payload contracts affect this owner.
+    /// The path is derived from the body-insensitive owner route plus record
+    /// projections, never from dense statement or expression ids.
+    pub source_payload_queries: Box<[OwnerSourcePayloadQuery]>,
     pub result_static_numbers: Box<[OwnerResultStaticNumber]>,
     pub effect_seed: OwnerEffectConstraintSeed,
     fingerprint_v1: [u8; 32],
@@ -308,6 +319,16 @@ impl OwnerConstraintSeed {
             .iter()
             .filter(|reference| reference.kind == OwnerReferenceKind::Callable)
             .map(|reference| reference.parts.join("/"))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    pub fn source_payload_abi_paths(&self) -> Box<[String]> {
+        self.source_payload_queries
+            .iter()
+            .map(|query| query.canonical_path.clone())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>()
@@ -1552,6 +1573,141 @@ fn project_result_static_numbers(
         .into_boxed_slice()
 }
 
+fn statement_source_path_prefix(statement: &StableStatementKey) -> Vec<String> {
+    let mut prefix = statement
+        .route
+        .owner
+        .iter()
+        .flat_map(|owner| owner.segments())
+        .filter_map(|segment| {
+            let name = segment.names.first()?;
+            Some(match segment.kind {
+                UnitItemKind::Function => format!("FUNCTION:{name}"),
+                UnitItemKind::Field
+                | UnitItemKind::Source
+                | UnitItemKind::Hold
+                | UnitItemKind::List => name.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    prefix.extend(
+        statement
+            .route
+            .statement_route
+            .iter()
+            .filter_map(|segment| {
+                let name = segment.names.first()?;
+                Some(match segment.kind {
+                    StableStatementKind::Function => format!("FUNCTION:{name}"),
+                    StableStatementKind::Field
+                    | StableStatementKind::Source
+                    | StableStatementKind::Hold
+                    | StableStatementKind::List => name.clone(),
+                    StableStatementKind::Block
+                    | StableStatementKind::Spread
+                    | StableStatementKind::Expression => return None,
+                })
+            }),
+    );
+    prefix
+}
+
+fn project_source_payload_queries(
+    input: &OwnerSyntaxInput,
+    statement_values: &[(u32, u32)],
+    expressions: &[OwnerExpressionConstraint],
+) -> Result<Box<[OwnerSourcePayloadQuery]>, OwnerConstraintSeedError> {
+    fn visit(
+        reference: u32,
+        expressions: &[OwnerExpressionConstraint],
+        prefix: &[String],
+        projection: &mut Vec<String>,
+        active: &mut BTreeSet<u32>,
+        queries: &mut BTreeMap<StableExpressionKey, String>,
+    ) -> Result<(), OwnerConstraintSeedError> {
+        let Some(expression) = expressions.get(reference as usize) else {
+            return Ok(());
+        };
+        if !active.insert(reference) {
+            return Ok(());
+        }
+        // Literal SOURCE consumes its inferred host payload shape. Source-
+        // emitting calls such as Timer/interval consume their type, mode, and
+        // effect from the callable ABI; their source-route metadata belongs to
+        // checked-owner construction rather than this inference ABI.
+        if expression.kind == OwnerConstraintNodeKind::Source {
+            let canonical_path = prefix
+                .iter()
+                .chain(projection.iter())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(".");
+            if !canonical_path.is_empty() {
+                match queries.entry(expression.expression.clone()) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(canonical_path);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get() == &canonical_path => {}
+                    std::collections::btree_map::Entry::Occupied(entry) => {
+                        return Err(OwnerConstraintSeedError::new(format!(
+                            "source expression {:?} has conflicting stable paths `{}` and `{canonical_path}`",
+                            expression.expression,
+                            entry.get()
+                        )));
+                    }
+                }
+            }
+        }
+        for input in &expression.inputs {
+            let projection_len = projection.len();
+            if let OwnerConstraintEdgeRole::RecordField {
+                name,
+                spread: false,
+            } = &input.role
+            {
+                projection.push(name.clone());
+            }
+            visit(
+                input.expression,
+                expressions,
+                prefix,
+                projection,
+                active,
+                queries,
+            )?;
+            projection.truncate(projection_len);
+        }
+        active.remove(&reference);
+        Ok(())
+    }
+
+    let mut queries = BTreeMap::new();
+    for (statement, expression) in statement_values {
+        let statement = input
+            .statements
+            .get(*statement as usize)
+            .ok_or_else(|| OwnerConstraintSeedError::new("source query statement is missing"))?;
+        let prefix = statement_source_path_prefix(&statement.stable_key);
+        visit(
+            *expression,
+            expressions,
+            &prefix,
+            &mut Vec::new(),
+            &mut BTreeSet::new(),
+            &mut queries,
+        )?;
+    }
+    Ok(queries
+        .into_iter()
+        .map(|(expression, canonical_path)| OwnerSourcePayloadQuery {
+            expression,
+            canonical_path,
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice())
+}
+
 fn flush_reference_index(input: &OwnerSyntaxInput, reference: &OwnerExpressionRef) -> Option<u32> {
     match reference {
         OwnerExpressionRef::Local { expression } => Some(expression.0),
@@ -1785,6 +1941,8 @@ pub fn project_owner_constraint_seed(
         .map(|expression| project_expression(expression, &mut references))
         .collect::<Result<Vec<_>, _>>()?;
     let expression_flush_plans = project_expression_flush_plans(input, &syntax_graph);
+    let source_payload_queries =
+        project_source_payload_queries(input, &statement_values, &expressions)?;
     // Preserve the compact namespace order: expression edges address external
     // values after the local-expression range. `OwnerSyntaxInput` already
     // interns each referenced syntax expression exactly once.
@@ -1823,6 +1981,7 @@ pub fn project_owner_constraint_seed(
             &expression_flush_plans,
             &references,
             &external_expressions,
+            &source_payload_queries,
             &result_static_numbers,
             effect_seed,
         ),
@@ -1835,6 +1994,7 @@ pub fn project_owner_constraint_seed(
         expression_flush_plans,
         references: references.into_boxed_slice(),
         external_expressions: external_expressions.into_boxed_slice(),
+        source_payload_queries,
         result_static_numbers,
         effect_seed,
         fingerprint_v1,
@@ -2092,6 +2252,71 @@ mod tests {
         assert!(matches!(
             resolved.symbol_resolutions.as_ref(),
             [OwnerSymbolResolution::Authoritative { .. }]
+        ));
+    }
+
+    #[test]
+    fn source_payload_queries_use_stable_owner_routes_and_record_projections() {
+        let unit = link("controls: [events: [press: SOURCE]]\n");
+        let controls = unit
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().iter().any(|segment| {
+                            segment.names.iter().any(|name| name == "controls")
+                        })
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "controls owner missing from {:#?}",
+                    unit.stable_check_owner_keys().collect::<Vec<_>>()
+                )
+            });
+        let seed = summary(&unit, &controls);
+
+        assert_eq!(seed.source_payload_queries.len(), 1);
+        assert_eq!(
+            seed.source_payload_queries[0].canonical_path,
+            "controls.events.press"
+        );
+        assert_eq!(
+            seed.source_payload_abi_paths().as_ref(),
+            ["controls.events.press"]
+        );
+    }
+
+    #[test]
+    fn interval_source_calls_do_not_create_payload_inference_queries() {
+        let unit = link("clock: [tick: Duration[milliseconds: 16] |> Timer/interval()]\n");
+        let clock = unit
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().iter().any(|segment| {
+                            segment.names.iter().any(|name| name == "clock")
+                        })
+                )
+            })
+            .unwrap();
+        let seed = summary(&unit, &clock);
+
+        assert!(seed.source_payload_queries.is_empty());
+        assert!(matches!(
+            seed.expressions
+                .iter()
+                .find(|expression| matches!(
+                    &expression.kind,
+                    OwnerConstraintNodeKind::Pipe { operation }
+                        if operation == "Timer/interval"
+                ))
+                .map(|expression| &expression.kind),
+            Some(OwnerConstraintNodeKind::Pipe { operation })
+                if operation == "Timer/interval"
         ));
     }
 }

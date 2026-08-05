@@ -4994,28 +4994,30 @@ pub fn build_checked_owner_shard<'a>(
     let (rows, receipts, diagnostics) =
         OwnerRowConstruction::new(syntax, seed, summary, body, own_interface, abi, interfaces)?
             .build_base_rows()?;
-
-    // The row builder lands immediately after this typed validation/basis
-    // boundary.  Keep this fail-closed while it is incomplete: returning an
-    // empty shard would let a session accidentally publish a semantically
-    // partial checked owner.
-    let _ = (
+    let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+        CHECKED_OWNER_SHARD_DOMAIN_V1,
+        &(&basis, &rows, &diagnostics, &receipts),
+    )
+    .map_err(|error| {
+        CheckedOwnerBuildError::new(format!(
+            "cannot fingerprint checked owner {:?}: {error}",
+            syntax.owner
+        ))
+    })?;
+    Ok(CheckedOwnerShard {
         basis,
         rows,
-        receipts,
         diagnostics,
-        CHECKED_OWNER_SHARD_DOMAIN_V1,
-    );
-    Err(CheckedOwnerBuildError::new(
-        "checked owner row construction is not complete",
-    ))
+        receipts,
+        fingerprint_v1,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        build_owner_interface_topology, infer_owner_body, project_owner_abi_environment,
+        build_owner_interface_topology, evaluate_owner_body, project_owner_abi_environment,
         project_owner_constraint_seed, project_owner_syntax_input, resolve_owner_constraint_seed,
         solve_owner_interface_scc,
     };
@@ -5030,6 +5032,7 @@ mod tests {
         abi: OwnerAbiEnvironment,
         interface: OwnerInterfaceSccResult,
         body: OwnerBodyInferenceShard,
+        body_currentness: OwnerBodyInferenceCurrentnessReceipt,
     }
 
     fn fixture(source: &str, name: &str) -> Fixture {
@@ -5094,8 +5097,9 @@ mod tests {
             [],
         )
         .unwrap();
-        let body =
-            infer_owner_body(&syntax, &seed, &summary, &inference_abi, &interface, []).unwrap();
+        let body_evaluation =
+            evaluate_owner_body(&syntax, &seed, &summary, &inference_abi, &interface, []).unwrap();
+        let body = Arc::unwrap_or_clone(body_evaluation.result);
         Fixture {
             syntax,
             seed,
@@ -5103,6 +5107,7 @@ mod tests {
             abi,
             interface,
             body,
+            body_currentness: body_evaluation.currentness,
         }
     }
 
@@ -5125,6 +5130,37 @@ mod tests {
 
     fn rows(fixture: &Fixture) -> CheckedOwnerRows {
         built_rows(fixture).0
+    }
+
+    #[test]
+    fn complete_checked_owner_shard_closes_rows_receipts_and_currentness() {
+        let fixture = fixture("record: [value: 1]\n", "record");
+        let shard = build_checked_owner_shard(
+            &fixture.syntax,
+            &fixture.seed,
+            &fixture.summary,
+            &fixture.body,
+            &fixture.body_currentness,
+            &fixture.abi,
+            &fixture.interface,
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(shard.owner(), &fixture.syntax.owner);
+        assert_eq!(
+            shard.basis.body_currentness_fingerprint_v1,
+            fixture.body_currentness.fingerprint_v1()
+        );
+        assert_eq!(
+            shard.receipts.row_receipts.as_ref(),
+            shard.rows.receipts.as_slice()
+        );
+        assert_eq!(
+            shard.receipts.relocations.as_ref(),
+            shard.rows.relocations.as_slice()
+        );
+        assert_ne!(shard.fingerprint_v1(), [0; 32]);
     }
 
     #[test]

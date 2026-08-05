@@ -21,18 +21,19 @@ use boon_syntax::{SourceUnitId, SyntaxUnitNamespace, UnitItemKind};
 #[cfg(test)]
 use boon_typecheck::OwnerConstraintDependencyKind;
 use boon_typecheck::{
-    AmbiguousOwnerSymbolCandidate, OwnerAbiEnvironment, OwnerBodyInferenceEvaluation,
-    OwnerBodyInferenceShard, OwnerCallableAbiEnvironment, OwnerCallableAbiLookup,
-    OwnerCallableAbiLookupOutcome, OwnerConstraintSeed, OwnerConstraintSummary,
-    OwnerDeclarationKind, OwnerInferenceAbiEnvironment, OwnerInterfaceScc,
-    OwnerInterfaceSccEvaluation, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
+    AmbiguousOwnerSymbolCandidate, CheckedOwnerShard, OwnerAbiEnvironment,
+    OwnerBodyInferenceEvaluation, OwnerBodyInferenceShard, OwnerCallableAbiEnvironment,
+    OwnerCallableAbiLookup, OwnerCallableAbiLookupOutcome, OwnerConstraintSeed,
+    OwnerConstraintSummary, OwnerConstructionAbiEnvironment, OwnerConstructionCallableAbiLookup,
+    OwnerConstructionValueAbiLookup, OwnerDeclarationKind, OwnerInferenceAbiEnvironment,
+    OwnerInterfaceScc, OwnerInterfaceSccEvaluation, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
     OwnerInterfaceTopology, OwnerParameterRequirementKey, OwnerParameterRequirementLookup,
     OwnerReferenceKind, OwnerSourceMap, OwnerSourcePayloadAbiLookup, OwnerSymbolReference,
-    OwnerSymbolResolution, OwnerSyntaxInput, OwnerValueAbiLookup, build_owner_interface_topology,
-    evaluate_owner_body, evaluate_owner_interface_scc, owner_body_required_interface_owners,
-    project_owner_abi_environment, project_owner_constraint_seed, project_owner_source_map,
-    project_owner_syntax_input, resolve_owner_constraint_seed_with_resolutions,
-    stable_check_owner_key_fingerprint_v1,
+    OwnerSymbolResolution, OwnerSyntaxInput, OwnerValueAbiLookup, build_checked_owner_shard,
+    build_owner_interface_topology, evaluate_owner_body, evaluate_owner_interface_scc,
+    owner_body_required_interface_owners, project_owner_abi_environment,
+    project_owner_constraint_seed, project_owner_source_map, project_owner_syntax_input,
+    resolve_owner_constraint_seed_with_resolutions, stable_check_owner_key_fingerprint_v1,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -210,6 +211,11 @@ struct ProjectState {
     owner_parameter_requirement_lookup_requests:
         TypedRequestTable<OwnerParameterRequirementLookupRequest>,
     owner_inference_abi_requests: TypedRequestTable<OwnerInferenceAbiRequest>,
+    owner_construction_callable_abi_lookup_requests:
+        TypedRequestTable<OwnerConstructionCallableAbiLookupRequest>,
+    owner_construction_value_abi_lookup_requests:
+        TypedRequestTable<OwnerConstructionValueAbiLookupRequest>,
+    owner_construction_abi_requests: TypedRequestTable<OwnerConstructionAbiRequest>,
     project_owner_symbol_requests: TypedRequestTable<ProjectOwnerSymbolRequest>,
     owner_constraint_requests: TypedRequestTable<OwnerConstraintRequest>,
     project_owner_interface_topology_requests:
@@ -220,6 +226,7 @@ struct ProjectState {
     owner_body_inference_evaluation_requests:
         TypedRequestTable<OwnerBodyInferenceEvaluationRequest>,
     owner_body_inference_requests: TypedRequestTable<OwnerBodyInferenceRequest>,
+    checked_owner_shard_requests: TypedRequestTable<CheckedOwnerShardRequest>,
     checked: Option<CheckedSourceFromSource>,
     compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
     request_graph: Option<(
@@ -603,6 +610,69 @@ impl RequestFamily for OwnerInferenceAbiRequest {
     }
 }
 
+struct OwnerConstructionCallableAbiLookupRequest;
+
+impl RequestFamily for OwnerConstructionCallableAbiLookupRequest {
+    type Key = String;
+    type Value = Arc<OwnerConstructionCallableAbiLookup>;
+
+    const NAME: &'static str = "boon.compiler.owner-construction-callable-abi-lookup.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.owner-construction-callable-abi-lookup-key.v1\0",
+            [key.as_bytes()],
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+struct OwnerConstructionValueAbiLookupRequest;
+
+impl RequestFamily for OwnerConstructionValueAbiLookupRequest {
+    type Key = String;
+    type Value = Arc<OwnerConstructionValueAbiLookup>;
+
+    const NAME: &'static str = "boon.compiler.owner-construction-value-abi-lookup.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.owner-construction-value-abi-lookup-key.v1\0",
+            [key.as_bytes()],
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+struct OwnerConstructionAbiRequest;
+
+impl RequestFamily for OwnerConstructionAbiRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<OwnerConstructionAbiEnvironment>;
+
+    const NAME: &'static str = "boon.compiler.owner-construction-abi.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProjectOwnerSymbolKey;
 
@@ -898,6 +968,25 @@ impl RequestFamily for OwnerBodyInferenceRequest {
     }
 }
 
+struct CheckedOwnerShardRequest;
+
+impl RequestFamily for CheckedOwnerShardRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<CheckedOwnerShard>;
+
+    const NAME: &'static str = "boon.compiler.checked-owner-shard.v2";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
 impl CompilerSession {
     pub fn new() -> Self {
         Self::default()
@@ -932,6 +1021,9 @@ impl CompilerSession {
                 owner_source_payload_abi_lookup_requests: TypedRequestTable::new(),
                 owner_parameter_requirement_lookup_requests: TypedRequestTable::new(),
                 owner_inference_abi_requests: TypedRequestTable::new(),
+                owner_construction_callable_abi_lookup_requests: TypedRequestTable::new(),
+                owner_construction_value_abi_lookup_requests: TypedRequestTable::new(),
+                owner_construction_abi_requests: TypedRequestTable::new(),
                 project_owner_symbol_requests: TypedRequestTable::new(),
                 owner_constraint_requests: TypedRequestTable::new(),
                 project_owner_interface_topology_requests: TypedRequestTable::new(),
@@ -940,6 +1032,7 @@ impl CompilerSession {
                 owner_interface_scc_requests: TypedRequestTable::new(),
                 owner_body_inference_evaluation_requests: TypedRequestTable::new(),
                 owner_body_inference_requests: TypedRequestTable::new(),
+                checked_owner_shard_requests: TypedRequestTable::new(),
                 checked: None,
                 compiled: None,
                 request_graph: None,
@@ -1199,6 +1292,16 @@ impl CompilerSession {
                 surviving_sources.contains(key.source_unit_id())
             })?;
         state
+            .owner_inference_abi_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key.source_unit_id())
+            })?;
+        state
+            .owner_construction_abi_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key.source_unit_id())
+            })?;
+        state
             .owner_interface_scc_plan_requests
             .retain(&mut state.syntax_evaluator, |key| {
                 key.members
@@ -1213,7 +1316,17 @@ impl CompilerSession {
                     .all(|owner| surviving_sources.contains(owner.source_unit_id()))
             })?;
         state
+            .owner_body_inference_evaluation_requests
+            .retain(&mut state.syntax_evaluator, |owner| {
+                surviving_sources.contains(owner.source_unit_id())
+            })?;
+        state
             .owner_body_inference_requests
+            .retain(&mut state.syntax_evaluator, |owner| {
+                surviving_sources.contains(owner.source_unit_id())
+            })?;
+        state
+            .checked_owner_shard_requests
             .retain(&mut state.syntax_evaluator, |owner| {
                 surviving_sources.contains(owner.source_unit_id())
             })?;
@@ -1413,6 +1526,24 @@ impl CompilerSession {
             .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
         Ok(state
             .owner_body_inference_requests
+            .current_value(&state.syntax_evaluator, owner)?
+            .map(Arc::clone))
+    }
+
+    /// Returns the current complete span-free checked product for one stable
+    /// authored owner. Dense compatibility IDs and source positions are
+    /// deliberately assigned by a separate non-checking assembly request.
+    pub fn checked_owner_shard(
+        &self,
+        project: ProjectId,
+        owner: &StableCheckOwnerKey,
+    ) -> CompilerResult<Option<Arc<CheckedOwnerShard>>> {
+        let state = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        Ok(state
+            .checked_owner_shard_requests
             .current_value(&state.syntax_evaluator, owner)?
             .map(Arc::clone))
     }
@@ -3317,7 +3448,314 @@ fn evaluate_owner_body_inference_requests(
             }
         }
     }
+    evaluate_checked_owner_shard_requests(state, topology)
+}
+
+fn evaluate_owner_construction_abi_requests(
+    state: &mut ProjectState,
+    owners: &[StableCheckOwnerKey],
+) -> CompilerResult<()> {
+    let mut callable_names = BTreeSet::new();
+    let mut value_paths = BTreeSet::new();
+    for owner in owners {
+        let summary = state
+            .owner_constraint_requests
+            .current_value(&state.syntax_evaluator, owner)?
+            .ok_or_else(|| {
+                session_error(format!(
+                    "owner construction ABI {owner:?} has no current constraint summary"
+                ))
+            })?;
+        callable_names.extend(summary.authoritative_abi_names().into_vec());
+        value_paths.extend(summary.authoritative_value_abi_paths().into_vec());
+    }
+    state
+        .owner_construction_callable_abi_lookup_requests
+        .retain(&mut state.syntax_evaluator, |name| {
+            callable_names.contains(name)
+        })?;
+    state
+        .owner_construction_value_abi_lookup_requests
+        .retain(&mut state.syntax_evaluator, |path| {
+            value_paths.contains(path)
+        })?;
+
+    let lookup_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-construction-abi-lookup-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    for name in callable_names {
+        match state
+            .owner_construction_callable_abi_lookup_requests
+            .begin(&mut state.syntax_evaluator, name.clone(), lookup_input)?
+        {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let lookup = (|| -> CompilerResult<_> {
+                    let abi = state.project_owner_abi_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &ProjectOwnerAbiKey,
+                    )?;
+                    Ok(Arc::new(abi.construction_callable_lookup(&name)?))
+                })();
+                let lookup = match lookup {
+                    Ok(lookup) => lookup,
+                    Err(error) => {
+                        state
+                            .owner_construction_callable_abi_lookup_requests
+                            .abort(
+                                &mut state.syntax_evaluator,
+                                ticket,
+                                RequestAbortReason::Failed,
+                            )?;
+                        return Err(error);
+                    }
+                };
+                state
+                    .owner_construction_callable_abi_lookup_requests
+                    .publish(&mut state.syntax_evaluator, ticket, lookup)?;
+            }
+        }
+    }
+    for path in value_paths {
+        match state.owner_construction_value_abi_lookup_requests.begin(
+            &mut state.syntax_evaluator,
+            path.clone(),
+            lookup_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let lookup = (|| -> CompilerResult<_> {
+                    let abi = state.project_owner_abi_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &ProjectOwnerAbiKey,
+                    )?;
+                    Ok(Arc::new(abi.construction_value_lookup(&path)?))
+                })();
+                let lookup = match lookup {
+                    Ok(lookup) => lookup,
+                    Err(error) => {
+                        state.owner_construction_value_abi_lookup_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_construction_value_abi_lookup_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    lookup,
+                )?;
+            }
+        }
+    }
+
+    let construction_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-construction-abi-dependencies.v1\0",
+        [program_role_request_tag(state.source.program_role)],
+    ));
+    for owner in owners {
+        match state.owner_construction_abi_requests.begin(
+            &mut state.syntax_evaluator,
+            owner.clone(),
+            construction_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let environment = (|| -> CompilerResult<_> {
+                    let summary = Arc::clone(state.owner_constraint_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?);
+                    let callables = summary
+                        .authoritative_abi_names()
+                        .into_vec()
+                        .into_iter()
+                        .map(|name| {
+                            state
+                                .owner_construction_callable_abi_lookup_requests
+                                .require(&state.syntax_evaluator, &mut ticket, &name)
+                                .map(|lookup| lookup.as_ref().clone())
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    let values = summary
+                        .authoritative_value_abi_paths()
+                        .into_vec()
+                        .into_iter()
+                        .map(|path| {
+                            state
+                                .owner_construction_value_abi_lookup_requests
+                                .require(&state.syntax_evaluator, &mut ticket, &path)
+                                .map(|lookup| lookup.as_ref().clone())
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    Ok(Arc::new(OwnerConstructionAbiEnvironment::new(
+                        owner.clone(),
+                        state.source.program_role,
+                        callables,
+                        values,
+                    )?))
+                })();
+                let environment = match environment {
+                    Ok(environment) => environment,
+                    Err(error) => {
+                        state.owner_construction_abi_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_construction_abi_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    environment,
+                )?;
+            }
+        }
+    }
     Ok(())
+}
+
+fn evaluate_checked_owner_shard_requests(
+    state: &mut ProjectState,
+    topology: &OwnerInterfaceTopology,
+) -> CompilerResult<()> {
+    let owners = topology
+        .sccs
+        .iter()
+        .flat_map(|scc| scc.key.members.iter().cloned())
+        .collect::<Vec<_>>();
+    let live = owners.iter().cloned().collect::<BTreeSet<_>>();
+    state
+        .owner_construction_abi_requests
+        .retain(&mut state.syntax_evaluator, |owner| live.contains(owner))?;
+    state
+        .checked_owner_shard_requests
+        .retain(&mut state.syntax_evaluator, |owner| live.contains(owner))?;
+    evaluate_owner_construction_abi_requests(state, &owners)?;
+
+    let shard_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.checked-owner-shard-dependencies.v2\0",
+        std::iter::empty(),
+    ));
+    for owner in owners {
+        match state.checked_owner_shard_requests.begin(
+            &mut state.syntax_evaluator,
+            owner.clone(),
+            shard_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let shard = (|| -> CompilerResult<_> {
+                    let syntax = Arc::clone(state.owner_input_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &owner,
+                    )?);
+                    let seed = Arc::clone(state.owner_constraint_seed_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &owner,
+                    )?);
+                    let summary = Arc::clone(state.owner_constraint_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &owner,
+                    )?);
+                    let evaluation =
+                        Arc::clone(state.owner_body_inference_evaluation_requests.require(
+                            &state.syntax_evaluator,
+                            &mut ticket,
+                            &owner,
+                        )?);
+                    let body = Arc::clone(state.owner_body_inference_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &owner,
+                    )?);
+                    let inference_abi = Arc::clone(state.owner_inference_abi_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &owner,
+                    )?);
+                    let construction_abi =
+                        Arc::clone(state.owner_construction_abi_requests.require(
+                            &state.syntax_evaluator,
+                            &mut ticket,
+                            &owner,
+                        )?);
+                    let own_key = &evaluation.currentness.basis().own_scc.key;
+                    let own_scc = Arc::clone(state.owner_interface_scc_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        own_key,
+                    )?);
+                    let import_keys = evaluation
+                        .currentness
+                        .interface_imports()
+                        .iter()
+                        .map(|import| import.provider_scc.clone())
+                        .filter(|key| key != own_key)
+                        .collect::<BTreeSet<_>>();
+                    let imports = import_keys
+                        .iter()
+                        .map(|key| {
+                            state
+                                .owner_interface_scc_requests
+                                .require(&state.syntax_evaluator, &mut ticket, key)
+                                .map(Arc::clone)
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    Ok(Arc::new(build_checked_owner_shard(
+                        &syntax,
+                        &seed,
+                        &summary,
+                        &body,
+                        &evaluation.currentness,
+                        &inference_abi,
+                        &construction_abi,
+                        &own_scc,
+                        imports.iter().map(Arc::as_ref),
+                    )?))
+                })();
+                let shard = match shard {
+                    Ok(shard) => shard,
+                    Err(error) => {
+                        state.checked_owner_shard_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.checked_owner_shard_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    shard,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+const fn program_role_request_tag(role: ProgramRole) -> &'static [u8] {
+    match role {
+        ProgramRole::Client => b"client",
+        ProgramRole::Session => b"session",
+        ProgramRole::Server => b"server",
+    }
 }
 
 fn source_unit_request_fingerprint(path: &str, source: &str) -> RequestFingerprint {
@@ -3737,12 +4175,13 @@ mod tests {
             second.profile.parse_work
         };
         let second_stats = session.frontend_request_stats(project).unwrap();
-        // Counts include exact per-owner inference ABI requests. The warm edit
-        // reuses 42 requests and changes only the edited owner's dependency
-        // cone despite conservatively reexecuting/backdating shared providers.
+        // Counts include exact inference/construction ABI and checked-owner
+        // requests. The warm edit reuses 49 requests and changes only the
+        // edited owner's dependency cone despite conservatively
+        // reexecuting/backdating shared providers.
         assert_eq!(
             (first_request_counts, request_counts(second_stats)),
-            ((54, 54, 0, 0, 54), (108, 66, 42, 7, 59))
+            ((62, 62, 0, 0, 62), (124, 75, 49, 7, 68))
         );
 
         let mut isolated = CompilerSession::new();
@@ -4190,7 +4629,14 @@ mod tests {
             .owner_body_inference(project, &keep)
             .unwrap()
             .unwrap();
-        let (first_provider_fingerprint, first_lookup, first_keep_abi, first_other_abi) = {
+        let (
+            first_provider_fingerprint,
+            first_lookup,
+            first_keep_abi,
+            first_other_abi,
+            first_keep_construction_abi,
+            first_keep_shard,
+        ) = {
             let state = session.projects.get(&project).unwrap();
             (
                 state
@@ -4217,6 +4663,20 @@ mod tests {
                     state
                         .owner_inference_abi_requests
                         .current_value(&state.syntax_evaluator, &other)
+                        .unwrap()
+                        .unwrap(),
+                ),
+                Arc::clone(
+                    state
+                        .owner_construction_abi_requests
+                        .current_value(&state.syntax_evaluator, &keep)
+                        .unwrap()
+                        .unwrap(),
+                ),
+                Arc::clone(
+                    state
+                        .checked_owner_shard_requests
+                        .current_value(&state.syntax_evaluator, &keep)
                         .unwrap()
                         .unwrap(),
                 ),
@@ -4261,6 +4721,16 @@ mod tests {
             .current_value(&state.syntax_evaluator, &other)
             .unwrap()
             .unwrap();
+        let second_keep_construction_abi = state
+            .owner_construction_abi_requests
+            .current_value(&state.syntax_evaluator, &keep)
+            .unwrap()
+            .unwrap();
+        let second_keep_shard = state
+            .checked_owner_shard_requests
+            .current_value(&state.syntax_evaluator, &keep)
+            .unwrap()
+            .unwrap();
 
         assert_ne!(first_provider_fingerprint, second_provider_fingerprint);
         assert!(Arc::ptr_eq(&first_lookup, second_lookup));
@@ -4269,6 +4739,11 @@ mod tests {
         assert!(Arc::ptr_eq(&first_summary, &second_summary));
         assert!(Arc::ptr_eq(&first_interface, &second_interface));
         assert!(Arc::ptr_eq(&first_body, &second_body));
+        assert!(Arc::ptr_eq(
+            &first_keep_construction_abi,
+            second_keep_construction_abi
+        ));
+        assert!(Arc::ptr_eq(&first_keep_shard, second_keep_shard));
 
         let lookup_memo = state
             .owner_callable_abi_lookup_requests
@@ -4282,6 +4757,18 @@ mod tests {
             .unwrap();
         assert_eq!(keep_abi_memo.changed_at, EvaluationRevision(0));
         assert_eq!(keep_abi_memo.verified_at, EvaluationRevision(1));
+        let construction_memo = state
+            .owner_construction_abi_requests
+            .memo(&state.syntax_evaluator, &keep)
+            .unwrap();
+        assert_eq!(construction_memo.changed_at, EvaluationRevision(0));
+        assert_eq!(construction_memo.verified_at, EvaluationRevision(1));
+        let shard_memo = state
+            .checked_owner_shard_requests
+            .memo(&state.syntax_evaluator, &keep)
+            .unwrap();
+        assert_eq!(shard_memo.changed_at, EvaluationRevision(0));
+        assert_eq!(shard_memo.verified_at, EvaluationRevision(1));
     }
 
     #[test]
@@ -4736,13 +5223,13 @@ mod tests {
         assert!(Arc::ptr_eq(&interface_topology, &body_topology));
         let body_stats = session.frontend_request_stats(project).unwrap();
         let body_delta = request_delta(body_stats, interface_stats);
-        // The exact callable/parameter lookup and per-owner inference ABI
-        // families are included here: they may reexecute and backdate after
-        // the broad provider changes, while preserving unchanged owner
-        // results.
+        // The exact callable/parameter lookup, inference/construction ABI, and
+        // checked-owner families are included here: they may reexecute and
+        // backdate after the broad provider changes while preserving
+        // unchanged owner results.
         assert_eq!(
             (interface_delta, body_delta),
-            ((91, 48, 43, 25, 23), (91, 20, 71, 9, 11))
+            ((105, 51, 54, 25, 26), (105, 22, 83, 10, 12))
         );
     }
 

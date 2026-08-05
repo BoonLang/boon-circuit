@@ -724,6 +724,24 @@ Current checkpoints to preserve and audit rather than redo:
   shard/CSR kernels only after a profile shows safe mechanics dominate the new
   architecture and require safe API encapsulation plus parity and Miri/fuzz
   evidence;
+- preserve the post-`2a84c47` safe owner-representation checkpoint. It reuses
+  variable-free shared types, seals body/shard content through compact
+  construction receipts, removes duplicate checked-row receipt storage, and
+  makes shard/source-map/assembly proof payloads externally immutable with
+  exact ABI/role input checks. A memory-capped debug NovyWave empty-session
+  observation preserves
+  `9b5abdb1d09d2658ce75fbfa86916a06054080fc9550cbc753fc484e0dab540f`
+  while moving from 6,948.653 to 6,118.881 ms, 27,146,292 to 25,198,810
+  allocations, and 347,876 to 335,496 KiB. TodoMVC moves from 2,615.818 to
+  2,388.892 ms with its exact hash. This is not a gate pass. Independent audits
+  require complete invalid-diagnostic parity, a `DiagnosticsAggregate` demand
+  root that constructs zero checked/dense/executable rows, authoritative
+  resource/order/project facts, and deletion of compatibility semantic
+  recomputation, `ProjectState.checked`, old production checker entrypoints,
+  and `checked_image_handoff`. Do that architecture work next. Consider narrow
+  unsafe `TypeUnifier`/CSR/packed-row kernels only afterward if a fresh profile
+  proves safe mechanics dominate and a safe A/B oracle, invariants, parity,
+  Miri/fuzz evidence, and material whole-run improvement all pass;
 - follow the post-`e510726` macro-architecture audit, reconciled through
   `a48f488`, in
   `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`. The historical trace exposed

@@ -177,15 +177,31 @@ pub struct OwnerSourceAnchor {
 /// its semantics so formatting edits cannot invalidate checked body results.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerSourceMap {
-    pub owner: StableCheckOwnerKey,
-    pub path: String,
-    pub statements: Box<[OwnerStatementSource]>,
-    pub expressions: Box<[OwnerExpressionSource]>,
-    pub anchors: Box<[OwnerSourceAnchor]>,
+    owner: StableCheckOwnerKey,
+    path: String,
+    statements: Box<[OwnerStatementSource]>,
+    expressions: Box<[OwnerExpressionSource]>,
+    anchors: Box<[OwnerSourceAnchor]>,
     fingerprint_v2: [u8; 32],
 }
 
 impl OwnerSourceMap {
+    pub const fn owner(&self) -> &StableCheckOwnerKey {
+        &self.owner
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn statements(&self) -> &[OwnerStatementSource] {
+        &self.statements
+    }
+
+    pub fn expressions(&self) -> &[OwnerExpressionSource] {
+        &self.expressions
+    }
+
     pub const fn fingerprint_v2(&self) -> [u8; 32] {
         self.fingerprint_v2
     }

@@ -623,6 +623,26 @@ stronger three-reviewer performance closure defined below.
    establish a required ownership/invalidation boundary, preserve artifact and
    diagnostic parity, and immediately enable the next optimization.
 
+   The post-`2a84c47` safe owner-representation slice is a measured checkpoint,
+   not this step's exit. Variable-free shared types, compact body/shard seals,
+   one receipt owner, and immutable proof-bearing payloads preserve the exact
+   NovyWave and TodoMVC checked hashes. One memory-capped debug observation
+   moves NovyWave empty-session diagnostics from 6,948.653 to 6,118.881 ms,
+   removes about 1.95 million allocations and 377 MB of allocation traffic, and
+   lowers peak RSS from 347,876 to 335,496 KiB. TodoMVC moves from 2,615.818 to
+   2,388.892 ms. These remain far above the gates.
+
+   Three independent audits require the next tranche to complete diagnostic
+   authority and add `DiagnosticsAggregate` as a smaller demand root so
+   diagnostics constructs zero checked shards, dense compatibility rows, or
+   executable products. Freeze invalid-program parity first; then remove the
+   compatibility layer's resource/order/output/render/host semantic
+   recomputation and complete the production owner flag day. Do not introduce
+   unsafe merely to accelerate those scheduled-for-deletion request families.
+   Reconsider only narrow profiled `TypeUnifier`, CSR, packed-offset, or local
+   row-initialization kernels after the safe architecture deletions, with a
+   safe A/B oracle and invariant, parity, Miri/fuzz, and whole-run evidence.
+
    Documentation, instrumentation, a crate split, a focused test pass, or an
    authorized checkpoint commit is not this step's exit. After each checkpoint,
    continue with the next red or missing performance gate in the same goal run.

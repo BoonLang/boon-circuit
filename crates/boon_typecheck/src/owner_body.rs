@@ -31,7 +31,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-const OWNER_BODY_INFERENCE_DOMAIN_V1: &[u8] = b"boon.owner-body-inference.v1\0";
+const OWNER_BODY_INFERENCE_DOMAIN_V2: &[u8] = b"boon.owner-body-inference.v2\0";
 const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V1: &[u8] = b"boon.owner-body-inference-content.v1\0";
 const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V1: &[u8] =
     b"boon.owner-body-inference-currentness.v1\0";
@@ -361,7 +361,8 @@ fn materialized_span(
         let anchor = source_map.anchor(&diagnostic.site, role).ok_or_else(|| {
             OwnerBodyInferenceError::new(format!(
                 "owner {:?} diagnostic {} has no exact source anchor",
-                source_map.owner, diagnostic.code
+                source_map.owner(),
+                diagnostic.code
             ))
         })?;
         return Ok((
@@ -373,13 +374,15 @@ fn materialized_span(
     match &diagnostic.site {
         OwnerSourceAnchorSite::Statement { statement } => {
             let source = source_map
-                .statements
+                .statements()
                 .get(*statement as usize)
                 .filter(|source| source.statement == *statement)
                 .ok_or_else(|| {
                     OwnerBodyInferenceError::new(format!(
                         "owner {:?} diagnostic {} references missing statement {}",
-                        source_map.owner, diagnostic.code, statement
+                        source_map.owner(),
+                        diagnostic.code,
+                        statement
                     ))
                 })?;
             Ok((
@@ -390,13 +393,14 @@ fn materialized_span(
         }
         OwnerSourceAnchorSite::Expression { expression } => {
             let source = source_map
-                .expressions
+                .expressions()
                 .iter()
                 .find(|source| &source.expression == expression)
                 .ok_or_else(|| {
                     OwnerBodyInferenceError::new(format!(
                         "owner {:?} diagnostic {} references missing expression",
-                        source_map.owner, diagnostic.code
+                        source_map.owner(),
+                        diagnostic.code
                     ))
                 })?;
             Ok((
@@ -412,7 +416,7 @@ pub fn materialize_owner_diagnostics(
     shard: &OwnerBodyInferenceShard,
     source_map: &OwnerSourceMap,
 ) -> Result<Vec<TypeDiagnostic>, OwnerBodyInferenceError> {
-    if shard.owner() != &source_map.owner {
+    if shard.owner() != source_map.owner() {
         return Err(OwnerBodyInferenceError::new(
             "owner body inference and source map have different owners",
         ));
@@ -4307,20 +4311,10 @@ pub fn evaluate_owner_body<'a>(
         diagnostic_rows: checked_u32(diagnostics.len(), "inferred diagnostic row count")?,
         local_content_digest_v1,
     };
-    let fingerprint_v1 = fingerprint(
-        OWNER_BODY_INFERENCE_DOMAIN_V1,
-        &(
-            &seed.owner,
-            &inferred_statements,
-            &inferred_children,
-            &inferred_expressions,
-            &inferred_calls,
-            &relocations,
-            &diagnostics,
-            own_interface.effect,
-            &receipt,
-        ),
-    )?;
+    // The construction receipt already commits every semantic row, diagnostic,
+    // effect, and row count above. Bind the stable owner to that compact seal
+    // instead of serializing the same rich body a second time.
+    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V2, &(&seed.owner, &receipt))?;
     work.unification_steps = unifier.steps();
     let result = Arc::new(OwnerBodyInferenceShard {
         owner: seed.owner.clone(),
@@ -5350,6 +5344,33 @@ mod tests {
             materialize_owner_diagnostics(&body, &formatted_source_map).unwrap();
         assert_eq!(diagnostics[0].message, "unknown function `mystery`");
         assert_ne!(diagnostics[0].start, formatted_diagnostics[0].start);
+    }
+
+    #[test]
+    fn compact_body_seal_changes_with_semantic_content() {
+        let original = link("value: 1\n");
+        let changed = link("value: 2\n");
+        let owner = owner_named(&original, "value");
+        let changed_owner = owner_named(&changed, "value");
+        let (syntax, _, seed) = inputs(&original, &owner);
+        let (changed_syntax, _, changed_seed) = inputs(&changed, &changed_owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let changed_summary = resolve_owner_constraint_seed(&changed_seed, []).unwrap();
+        let interfaces = solve(&[seed.clone()], &[summary.clone()]);
+        let changed_interfaces = solve(&[changed_seed.clone()], &[changed_summary.clone()]);
+        let body = infer(&syntax, &seed, &summary, &interfaces);
+        let changed_body = infer(
+            &changed_syntax,
+            &changed_seed,
+            &changed_summary,
+            &changed_interfaces,
+        );
+
+        assert_ne!(body.fingerprint_v1(), changed_body.fingerprint_v1());
+        assert_ne!(
+            body.receipt.local_content_digest_v1,
+            changed_body.receipt.local_content_digest_v1
+        );
     }
 
     #[test]

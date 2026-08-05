@@ -1716,6 +1716,66 @@ whether narrowly encapsulated unsafe shard/CSR construction has measurable
 value; Polars-style unsafe is not permission to accelerate work that the plan
 requires deleting.
 
+#### Post-`2a84c47` owner representation and seal checkpoint
+
+The owner spine is now a substantial partial implementation, but the flag-day
+deletion described above is not complete. The first safe representation slice
+after `2a84c47`:
+
+- reuses variable-free immutable recursive `Type` graphs across owner
+  resolution, occurs checks, instantiation, and alpha-normalization;
+- makes body and checked-shard fingerprints commit construction-owned compact
+  receipts instead of serializing the same rich rows a second time;
+- removes the duplicate receipt/relocation copy from `CheckedOwnerRows`;
+- makes checked-shard, source-map, and dense-assembly proof-bearing payloads
+  externally immutable; and
+- makes compatibility assembly reject duplicate owner inputs, stale compact
+  shard seals, mismatched construction ABIs, and role/external-environment
+  disagreement. Detailed CSR receipts are constructed and audited once; normal
+  assembly does not rehash that inventory on every consumer.
+
+One direct, memory-capped debug edit-loop sample on 2026-08-04 preserves the
+NovyWave checked-result hash
+`9b5abdb1d09d2658ce75fbfa86916a06054080fc9550cbc753fc484e0dab540f`,
+zero diagnostics, and full coverage while moving from the pre-slice
+6,948.653 ms, 347,876 KiB, 27,146,292 allocations, and 3,655,483,641 allocated
+bytes to 6,118.881 ms, 335,496 KiB, 25,198,810 allocations, and
+3,278,060,014 allocated bytes. The same directional TodoMVC sample preserves
+`a8a1fb77797c773a182f364514fbe840977e50a329acfd69fa33dd19fe888a9c`
+and moves from 2,615.818 to 2,388.892 ms, from 11,859,678 to 10,887,892
+allocations, and from 1,361,512,190 to 1,233,475,990 allocated bytes. These are
+single debug observations, not percentile acceptance. Ninety focused owner
+tests and the `boon_compiler` check pass. A downstream debug CLI rebuild still
+takes about 2m06s with two jobs, which keeps measured crate-boundary work open
+but does not count as Boon latency.
+
+Three independent read-only audits reject treating this checkpoint as the
+flag-day exit. Owner diagnostics still lack legacy parity for unresolved and
+ambiguous values, concrete type conflicts, malformed literals and patterns,
+recursion, host effects, match/style/collection rules, and several project
+closures. Diagnostics intent still constructs every checked shard and the
+dense compatibility DTO. Compatibility still derives resource projections,
+source payload refinement, order chains, output/render/host tables, and
+structural validation instead of being receipt-authenticated relocation only.
+`ProjectState.checked`, production monolithic-checker entrypoints,
+`checked_image_handoff`, and the distributed external-environment path also
+remain. Resource projection receipts are produced but are not authoritative
+inputs to compatibility assembly.
+
+The next coherent architecture slice is therefore diagnostic authority, not
+another local type or hash optimization: freeze a normalized invalid-program
+oracle, port complete owner/project diagnostics, add `DiagnosticsAggregate` as
+a smaller demand root, and prove diagnostics constructs zero construction-ABI,
+checked-shard, compatibility, or executable rows. Then make verified-only
+assembly consume authoritative resource/order/project facts and receipts,
+delete its semantic recomputation, and proceed with the production flag day.
+Only after these owner and later semantic/thin-link deletions, with a fresh
+profile showing one allocation-free loop dominates, may a safe/unsafe A/B test
+be retained. Candidate boundaries are the `TypeUnifier` parallel arrays,
+receipt CSR slicing, immutable packed-row offsets, and exact-size local row
+initialization; stable-key/currentness logic, diagnostics, serialization, and
+the compilation database remain safe.
+
 Checkpoint `a48f488` remains the unit-native M1 ancestor of `42c1aa9`; preserve
 its production checking, compact execution receipt, proof/sealed-plan, and
 activation/effect contracts while continuing from the newer checkpoint.

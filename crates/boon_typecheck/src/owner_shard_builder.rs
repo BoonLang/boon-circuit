@@ -21,16 +21,16 @@ use boon_checked::{
     CheckedPassedAccess, CheckedScopeKind, CheckedStateKind, FlowMode, FlowType,
     OwnerAbiDeclarationKey, OwnerAbiDeclarationKind, OwnerAbiMemberRef, OwnerBlockBinding,
     OwnerCallContextRow, OwnerCallEntry, OwnerCallId, OwnerCallResultPathRow, OwnerCallRow,
-    OwnerCallableContextRow, OwnerCallableRow, OwnerCheckedReceiptSet, OwnerCheckedRowDomain,
-    OwnerContextBinding, OwnerContextFormalId, OwnerContextFormalRef, OwnerContextFormalRow,
-    OwnerContextTypeSubstitution, OwnerDeclarationId, OwnerDeclarationRef, OwnerDeclarationRow,
-    OwnerDeclarationStableKey, OwnerEvaluationScope, OwnerExpressionId, OwnerExpressionKind,
-    OwnerExpressionRef, OwnerExpressionRow, OwnerInterfaceMemberRef, OwnerListId, OwnerListRow,
-    OwnerOccurrenceRow, OwnerParameterRow, OwnerPatternBindingRow, OwnerRecordField,
-    OwnerRelocationTarget, OwnerResourceBinding, OwnerResourceProjectionSeedRow, OwnerScopeId,
-    OwnerScopeRef, OwnerScopeRow, OwnerScopeStableKey, OwnerSemanticPath, OwnerSourceId,
-    OwnerSourceRow, OwnerSourceSite, OwnerSourceStableKey, OwnerStateId, OwnerStateRow,
-    OwnerStatementChild, OwnerStatementId, OwnerStatementKind, OwnerStatementRow,
+    OwnerCallableContextRow, OwnerCallableRow, OwnerCheckedDomainCount, OwnerCheckedReceiptSet,
+    OwnerCheckedRowDomain, OwnerContextBinding, OwnerContextFormalId, OwnerContextFormalRef,
+    OwnerContextFormalRow, OwnerContextTypeSubstitution, OwnerDeclarationId, OwnerDeclarationRef,
+    OwnerDeclarationRow, OwnerDeclarationStableKey, OwnerEvaluationScope, OwnerExpressionId,
+    OwnerExpressionKind, OwnerExpressionRef, OwnerExpressionRow, OwnerInterfaceMemberRef,
+    OwnerListId, OwnerListRow, OwnerOccurrenceRow, OwnerParameterRow, OwnerPatternBindingRow,
+    OwnerRecordField, OwnerRelocationTarget, OwnerResourceBinding, OwnerResourceProjectionSeedRow,
+    OwnerScopeId, OwnerScopeRef, OwnerScopeRow, OwnerScopeStableKey, OwnerSemanticPath,
+    OwnerSourceId, OwnerSourceRow, OwnerSourceSite, OwnerSourceStableKey, OwnerStateId,
+    OwnerStateRow, OwnerStatementChild, OwnerStatementId, OwnerStatementKind, OwnerStatementRow,
     OwnerStatementScopeRole, OwnerTextSegment, OwnerTypeSubstitution, ProgramRole,
     SemanticOccurrenceKind, Type, Variant,
 };
@@ -45,7 +45,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-const CHECKED_OWNER_SHARD_DOMAIN_V2: &[u8] = b"boon.checked-owner-shard.v2\0";
+const CHECKED_OWNER_SHARD_DOMAIN_V3: &[u8] = b"boon.checked-owner-shard.v3\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CheckedOwnerShardBasis {
@@ -63,14 +63,14 @@ pub struct CheckedOwnerShardBasis {
 ///
 /// Diagnostics retain owner source-anchor templates and are materialized
 /// against the independently current `OwnerSourceMap`.  `receipts` are
-/// construction-owned proof material; the compatibility linker consumes them
-/// without rescanning `rows`.
+/// construction-owned proof material. The compatibility linker validates this
+/// seal before reading the immutable rows for dense projection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckedOwnerShard {
-    pub basis: CheckedOwnerShardBasis,
-    pub rows: CheckedOwnerRows,
-    pub diagnostics: Box<[crate::OwnerDiagnosticTemplate]>,
-    pub receipts: OwnerCheckedReceiptSet,
+    basis: CheckedOwnerShardBasis,
+    rows: CheckedOwnerRows,
+    diagnostics: Box<[crate::OwnerDiagnosticTemplate]>,
+    receipts: OwnerCheckedReceiptSet,
     fingerprint_v1: [u8; 32],
 }
 
@@ -81,6 +81,98 @@ impl CheckedOwnerShard {
 
     pub const fn fingerprint_v1(&self) -> [u8; 32] {
         self.fingerprint_v1
+    }
+
+    pub(crate) const fn rows(&self) -> &CheckedOwnerRows {
+        &self.rows
+    }
+
+    pub(crate) fn diagnostic_templates(&self) -> &[crate::OwnerDiagnosticTemplate] {
+        &self.diagnostics
+    }
+
+    pub(crate) fn validate_seal(
+        &self,
+        construction_abi: &OwnerConstructionAbiEnvironment,
+    ) -> Result<(), CheckedOwnerBuildError> {
+        if construction_abi.owner() != self.owner()
+            || construction_abi.fingerprint_v1() != self.basis.construction_abi_fingerprint_v1
+        {
+            return Err(CheckedOwnerBuildError::new(format!(
+                "checked owner {:?} does not match its exact construction ABI",
+                self.owner()
+            )));
+        }
+        let counts = [
+            (OwnerCheckedRowDomain::Scope, self.rows.scopes.len()),
+            (
+                OwnerCheckedRowDomain::Declaration,
+                self.rows.declarations.len(),
+            ),
+            (OwnerCheckedRowDomain::Statement, self.rows.statements.len()),
+            (
+                OwnerCheckedRowDomain::Expression,
+                self.rows.expressions.len(),
+            ),
+            (OwnerCheckedRowDomain::Callable, self.rows.callables.len()),
+            (
+                OwnerCheckedRowDomain::ContextFormal,
+                self.rows.context_formals.len(),
+            ),
+            (OwnerCheckedRowDomain::Call, self.rows.calls.len()),
+            (
+                OwnerCheckedRowDomain::CallResultPath,
+                self.rows.call_result_paths.len(),
+            ),
+            (
+                OwnerCheckedRowDomain::PatternBinding,
+                self.rows.pattern_bindings.len(),
+            ),
+            (
+                OwnerCheckedRowDomain::ResourceProjection,
+                self.rows.resource_projection_seeds.len(),
+            ),
+            (OwnerCheckedRowDomain::Source, self.rows.sources.len()),
+            (OwnerCheckedRowDomain::State, self.rows.states.len()),
+            (OwnerCheckedRowDomain::List, self.rows.lists.len()),
+            (
+                OwnerCheckedRowDomain::Occurrence,
+                self.rows.occurrences.len(),
+            ),
+            (OwnerCheckedRowDomain::Diagnostic, self.diagnostics.len()),
+        ]
+        .into_iter()
+        .filter(|(_, rows)| *rows != 0)
+        .map(|(domain, rows)| {
+            Ok(OwnerCheckedDomainCount {
+                domain,
+                rows: checked_u32(rows, "sealed owner domain row count")?,
+            })
+        })
+        .collect::<Result<Vec<_>, CheckedOwnerBuildError>>()?;
+        if self.receipts.construction.domain_counts.as_ref() != counts.as_slice() {
+            return Err(CheckedOwnerBuildError::new(format!(
+                "checked owner {:?} has inconsistent construction receipt counts",
+                self.owner()
+            )));
+        }
+        let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+            CHECKED_OWNER_SHARD_DOMAIN_V3,
+            &(&self.basis, &self.receipts.construction),
+        )
+        .map_err(|error| {
+            CheckedOwnerBuildError::new(format!(
+                "cannot validate checked owner {:?} seal: {error}",
+                self.owner()
+            ))
+        })?;
+        if fingerprint_v1 != self.fingerprint_v1 {
+            return Err(CheckedOwnerBuildError::new(format!(
+                "checked owner {:?} has a stale construction seal",
+                self.owner()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -3967,8 +4059,6 @@ impl<'a> OwnerRowConstruction<'a> {
             )?;
         }
         let receipts = sink.finish()?;
-        rows.relocations = receipts.relocations.to_vec();
-        rows.receipts = receipts.row_receipts.to_vec();
         Ok((rows, receipts, self.diagnostics.into_boxed_slice()))
     }
 
@@ -5078,9 +5168,12 @@ pub fn build_checked_owner_shard<'a>(
         interfaces,
     )?
     .build_base_rows()?;
+    // The construction receipt commits every normalized row, diagnostic, and
+    // relocation. Bind that compact seal to the exact current basis instead of
+    // serializing the complete rich row tables for a second time.
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        CHECKED_OWNER_SHARD_DOMAIN_V2,
-        &(&basis, &rows, &diagnostics, &receipts),
+        CHECKED_OWNER_SHARD_DOMAIN_V3,
+        &(&basis, &receipts.construction),
     )
     .map_err(|error| {
         CheckedOwnerBuildError::new(format!(
@@ -5432,14 +5525,92 @@ mod tests {
             fixture.construction_abi.fingerprint_v1()
         );
         assert_eq!(
-            shard.receipts.row_receipts.as_ref(),
-            shard.rows.receipts.as_slice()
+            shard.receipts.construction.row_receipt_count as usize,
+            shard.receipts.row_receipts.len()
         );
         assert_eq!(
-            shard.receipts.relocations.as_ref(),
-            shard.rows.relocations.as_slice()
+            shard.receipts.construction.relocation_count as usize,
+            shard.receipts.relocations.len()
         );
+        crate::owner_checked::validate_owner_checked_receipts(&shard.receipts).unwrap();
         assert_ne!(shard.fingerprint_v1(), [0; 32]);
+    }
+
+    #[test]
+    fn compact_checked_owner_seal_changes_with_row_content() {
+        let build = |fixture: &Fixture| {
+            build_checked_owner_shard(
+                &fixture.syntax,
+                &fixture.seed,
+                &fixture.summary,
+                &fixture.body,
+                &fixture.body_currentness,
+                &fixture.inference_abi,
+                &fixture.construction_abi,
+                &fixture.interface,
+                [],
+            )
+            .unwrap()
+        };
+        let original = fixture("record: [value: 1]\n", "record");
+        let changed = fixture("record: [value: 2]\n", "record");
+        let original = build(&original);
+        let changed = build(&changed);
+
+        assert_ne!(original.fingerprint_v1(), changed.fingerprint_v1());
+        assert_ne!(
+            original.receipts.construction.local_content_digest_v1,
+            changed.receipts.construction.local_content_digest_v1
+        );
+    }
+
+    #[test]
+    fn checked_owner_seal_rejects_stale_proof_or_construction_abi() {
+        let fixture = fixture("record: [value: 1]\n", "record");
+        let build = || {
+            build_checked_owner_shard(
+                &fixture.syntax,
+                &fixture.seed,
+                &fixture.summary,
+                &fixture.body,
+                &fixture.body_currentness,
+                &fixture.inference_abi,
+                &fixture.construction_abi,
+                &fixture.interface,
+                [],
+            )
+            .unwrap()
+        };
+
+        let mut shard = build();
+        assert!(shard.validate_seal(&fixture.construction_abi).is_ok());
+        let wrong_abi = OwnerConstructionAbiEnvironment::new(
+            fixture.syntax.owner.clone(),
+            ProgramRole::Server,
+            [],
+            [],
+        )
+        .unwrap();
+        assert!(
+            shard
+                .validate_seal(&wrong_abi)
+                .unwrap_err()
+                .to_string()
+                .contains("exact construction ABI")
+        );
+
+        shard.fingerprint_v1[0] ^= 1;
+        assert!(
+            shard
+                .validate_seal(&fixture.construction_abi)
+                .unwrap_err()
+                .to_string()
+                .contains("stale construction seal")
+        );
+
+        let mut shard = build();
+        shard.receipts.construction.domain_counts[0].rows += 1;
+        assert!(shard.validate_seal(&fixture.construction_abi).is_err());
     }
 
     #[test]
@@ -5637,8 +5808,6 @@ mod tests {
             + rows.occurrences.len()
             + fixture.body.diagnostics.len();
         assert_eq!(receipts.row_receipts.len(), expected);
-        assert_eq!(rows.receipts.as_slice(), receipts.row_receipts.as_ref());
-        assert_eq!(rows.relocations.as_slice(), receipts.relocations.as_ref());
         assert_eq!(
             receipts.construction.row_receipt_count as usize,
             receipts.row_receipts.len()

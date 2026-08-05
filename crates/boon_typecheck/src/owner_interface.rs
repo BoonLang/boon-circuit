@@ -330,6 +330,36 @@ pub struct OwnerInterfaceSccEvaluation {
     pub result: Arc<OwnerInterfaceSccResult>,
 }
 
+fn type_contains_inference_variable(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => true,
+        Type::Object(shape) => shape.fields.values().any(type_contains_inference_variable),
+        Type::List(item) | Type::Set(item) => type_contains_inference_variable(item),
+        Type::Map { key, value } => {
+            type_contains_inference_variable(key) || type_contains_inference_variable(value)
+        }
+        Type::Function { args, result } => {
+            args.iter().any(type_contains_inference_variable)
+                || type_contains_inference_variable(&result.ty)
+        }
+        Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+            Variant::Tag(_) => false,
+            Variant::Tagged { fields, .. } => {
+                fields.fields.values().any(type_contains_inference_variable)
+            }
+        }),
+        Type::Union(members) => members.iter().any(type_contains_inference_variable),
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown => false,
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct TypeUnifier {
     parents: Vec<u32>,
@@ -370,6 +400,9 @@ impl TypeUnifier {
     }
 
     pub(crate) fn resolve(&mut self, ty: &Type) -> Type {
+        if !type_contains_inference_variable(ty) {
+            return ty.clone();
+        }
         self.resolve_inner(ty, &mut BTreeSet::new())
     }
 
@@ -453,6 +486,9 @@ impl TypeUnifier {
     }
 
     fn occurs(&self, variable: TypeVar, ty: &Type) -> bool {
+        if !type_contains_inference_variable(ty) {
+            return false;
+        }
         match ty {
             Type::Var(candidate) => self.root_readonly(*candidate) == variable,
             Type::Object(shape) => shape.fields.values().any(|ty| self.occurs(variable, ty)),
@@ -1729,6 +1765,9 @@ pub(crate) fn instantiate_type(
     unifier: &mut TypeUnifier,
     variables: &mut BTreeMap<TypeVar, TypeVar>,
 ) -> Type {
+    if !type_contains_inference_variable(ty) {
+        return ty.clone();
+    }
     match ty {
         Type::Var(variable) => Type::Var(
             *variables
@@ -1851,6 +1890,9 @@ pub(crate) fn alpha_normalize_type(
     variables: &mut BTreeMap<TypeVar, TypeVar>,
     next: &mut u32,
 ) -> Type {
+    if !type_contains_inference_variable(ty) {
+        return ty.clone();
+    }
     match ty {
         Type::Var(variable) => Type::Var(*variables.entry(*variable).or_insert_with(|| {
             let normalized = TypeVar(*next);
@@ -3630,6 +3672,41 @@ mod tests {
             "{name} context interface"
         );
         assert_eq!(interface.effect, checked.effect, "{name} effect interface");
+    }
+
+    #[test]
+    fn variable_free_shared_types_are_reused_across_owner_inference_transforms() {
+        let ty = Type::object(ObjectShape {
+            fields: [(
+                "nested".to_owned(),
+                Type::object(ObjectShape {
+                    fields: [("value".to_owned(), Type::Number)].into(),
+                    field_order: vec!["value".to_owned()],
+                    open: false,
+                }),
+            )]
+            .into(),
+            field_order: vec!["nested".to_owned()],
+            open: true,
+        });
+        let Type::Object(original) = &ty else {
+            unreachable!();
+        };
+
+        let mut unifier = TypeUnifier::default();
+        let resolved = unifier.resolve(&ty);
+        let instantiated = instantiate_type(&ty, &mut unifier, &mut BTreeMap::new());
+        let normalized = alpha_normalize_type(&ty, &mut BTreeMap::new(), &mut 0);
+
+        for transformed in [&resolved, &instantiated, &normalized] {
+            let Type::Object(transformed) = transformed else {
+                panic!("variable-free object type changed representation");
+            };
+            assert!(boon_checked::SharedObjectShape::ptr_eq(
+                original,
+                transformed
+            ));
+        }
     }
 
     #[test]

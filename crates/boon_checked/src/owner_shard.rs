@@ -834,8 +834,8 @@ pub struct OwnerCheckedConstructionReceipt {
 /// Canonical proof material closed by the owner-local checked-row builder.
 ///
 /// Keeping the detailed receipts beside the compact construction receipt lets
-/// the later non-checking linker consume exact CSR spans without reopening or
-/// serializing the rich checked rows.
+/// receipt audits and the future receipt-authenticated linker validate exact
+/// CSR spans without serializing the rich checked rows again.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerCheckedReceiptSet {
     pub construction: OwnerCheckedConstructionReceipt,
@@ -859,6 +859,4 @@ pub struct CheckedOwnerRows {
     pub states: Vec<OwnerStateRow>,
     pub lists: Vec<OwnerListRow>,
     pub occurrences: Vec<OwnerOccurrenceRow>,
-    pub relocations: Vec<OwnerCheckedRelocation>,
-    pub receipts: Vec<OwnerCheckedRowReceipt>,
 }

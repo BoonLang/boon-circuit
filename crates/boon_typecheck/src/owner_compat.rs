@@ -62,14 +62,22 @@ impl From<OwnerAbiEnvironmentError> for OwnerCompatibilityAssemblyError {
 /// retain these exact fields without constructing a second checked graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckedOwnerProjectAssembly {
-    pub fields: CheckedProgramFields,
-    pub diagnostics: Vec<TypeDiagnostic>,
+    fields: CheckedProgramFields,
+    diagnostics: Vec<TypeDiagnostic>,
     fingerprint_v1: [u8; 32],
 }
 
 impl CheckedOwnerProjectAssembly {
     pub const fn fingerprint_v1(&self) -> [u8; 32] {
         self.fingerprint_v1
+    }
+
+    pub const fn fields(&self) -> &CheckedProgramFields {
+        &self.fields
+    }
+
+    pub fn diagnostics(&self) -> &[TypeDiagnostic] {
+        &self.diagnostics
     }
 }
 
@@ -185,38 +193,70 @@ fn allocate_decl(next: &mut u32) -> Result<DeclId, OwnerCompatibilityAssemblyErr
 impl<'a> CompatibilityLayout<'a> {
     fn new(
         project: &'a ProjectSyntaxSnapshot,
-        shards: impl IntoIterator<Item = &'a CheckedOwnerShard>,
-        source_maps: impl IntoIterator<Item = &'a OwnerSourceMap>,
+        role: ProgramRole,
+        shard_inputs: impl IntoIterator<Item = &'a CheckedOwnerShard>,
+        source_map_inputs: impl IntoIterator<Item = &'a OwnerSourceMap>,
         construction_abis: impl IntoIterator<Item = &'a OwnerConstructionAbiEnvironment>,
     ) -> Result<Self, OwnerCompatibilityAssemblyError> {
-        let shards = shards
-            .into_iter()
-            .map(|shard| (shard.owner().clone(), shard))
-            .collect::<BTreeMap<_, _>>();
-        let source_maps = source_maps
-            .into_iter()
-            .map(|map| (map.owner.clone(), map))
-            .collect::<BTreeMap<_, _>>();
-        let project_owners = project.stable_check_owner_keys().collect::<BTreeSet<_>>();
-        if shards.keys().cloned().collect::<BTreeSet<_>>() != project_owners
-            || source_maps.keys().cloned().collect::<BTreeSet<_>>() != project_owners
-        {
-            return Err(OwnerCompatibilityAssemblyError::new(
-                "checked owner assembly does not exactly cover the project owner set",
-            ));
+        let mut shards = BTreeMap::new();
+        for shard in shard_inputs {
+            if shards.insert(shard.owner().clone(), shard).is_some() {
+                return Err(OwnerCompatibilityAssemblyError::new(format!(
+                    "checked owner assembly has duplicate shard for {:?}",
+                    shard.owner()
+                )));
+            }
         }
-
-        let mut abi_callables =
-            BTreeMap::<(String, OwnerAbiDeclarationKey), AbiCallableEntry>::new();
-        let mut abi_values = BTreeMap::<(String, OwnerAbiDeclarationKey), AbiValueEntry>::new();
-        let mut abi_owners = BTreeSet::new();
+        let mut source_maps = BTreeMap::new();
+        for map in source_map_inputs {
+            if source_maps.insert(map.owner().clone(), map).is_some() {
+                return Err(OwnerCompatibilityAssemblyError::new(format!(
+                    "checked owner assembly has duplicate source map for {:?}",
+                    map.owner()
+                )));
+            }
+        }
+        let mut construction_abis_by_owner = BTreeMap::new();
         for abi in construction_abis {
-            if !abi_owners.insert(abi.owner().clone()) {
+            if abi.role() != role {
+                return Err(OwnerCompatibilityAssemblyError::new(format!(
+                    "checked owner assembly construction ABI for {:?} has the wrong program role",
+                    abi.owner()
+                )));
+            }
+            if construction_abis_by_owner
+                .insert(abi.owner().clone(), abi)
+                .is_some()
+            {
                 return Err(OwnerCompatibilityAssemblyError::new(format!(
                     "checked owner assembly has duplicate construction ABI for {:?}",
                     abi.owner()
                 )));
             }
+        }
+        let project_owners = project.stable_check_owner_keys().collect::<BTreeSet<_>>();
+        if shards.keys().cloned().collect::<BTreeSet<_>>() != project_owners
+            || source_maps.keys().cloned().collect::<BTreeSet<_>>() != project_owners
+            || construction_abis_by_owner
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                != project_owners
+        {
+            return Err(OwnerCompatibilityAssemblyError::new(
+                "checked owner assembly inputs do not exactly cover the project owner set",
+            ));
+        }
+        for (owner, shard) in &shards {
+            shard
+                .validate_seal(construction_abis_by_owner[owner])
+                .map_err(|error| OwnerCompatibilityAssemblyError::new(error.to_string()))?;
+        }
+
+        let mut abi_callables =
+            BTreeMap::<(String, OwnerAbiDeclarationKey), AbiCallableEntry>::new();
+        let mut abi_values = BTreeMap::<(String, OwnerAbiDeclarationKey), AbiValueEntry>::new();
+        for abi in construction_abis_by_owner.into_values() {
             for lookup in abi.callable_lookups() {
                 let OwnerConstructionCallableAbiLookupOutcome::Found { contract } =
                     lookup.outcome()
@@ -267,12 +307,6 @@ impl<'a> CompatibilityLayout<'a> {
                 }
             }
         }
-        if abi_owners != project_owners {
-            return Err(OwnerCompatibilityAssemblyError::new(
-                "checked owner assembly does not exactly cover construction ABIs",
-            ));
-        }
-
         let mut statement_by_key = BTreeMap::new();
         for slot in 0..project.statement_count() {
             let syntax = project.statement_id_for_slot(slot).ok_or_else(|| {
@@ -338,7 +372,7 @@ impl<'a> CompatibilityLayout<'a> {
     fn assign_dense_ids(&mut self) -> Result<(), OwnerCompatibilityAssemblyError> {
         for (owner, shard) in &self.shards {
             let statements = shard
-                .rows
+                .rows()
                 .statements
                 .iter()
                 .map(|row| {
@@ -353,7 +387,7 @@ impl<'a> CompatibilityLayout<'a> {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let expressions = shard
-                .rows
+                .rows()
                 .expressions
                 .iter()
                 .map(|row| {
@@ -384,7 +418,7 @@ impl<'a> CompatibilityLayout<'a> {
         // User callable identities and formals precede authoritative ABI rows,
         // matching the legacy checker's stable high-level allocation shape.
         for (owner, shard) in &self.shards {
-            for callable in &shard.rows.callables {
+            for callable in &shard.rows().callables {
                 if callable.kind != CheckedCallableKind::User {
                     continue;
                 }
@@ -393,7 +427,7 @@ impl<'a> CompatibilityLayout<'a> {
                     .get_mut(owner)
                     .expect("owner layout exists")
                     .declarations
-                    .resize(shard.rows.declarations.len(), DeclId(u32::MAX));
+                    .resize(shard.rows().declarations.len(), DeclId(u32::MAX));
                 self.owners.get_mut(owner).unwrap().declarations[callable.declaration.0 as usize] =
                     declaration;
                 self.owner_public_declaration
@@ -445,8 +479,8 @@ impl<'a> CompatibilityLayout<'a> {
         }
         for (owner, shard) in &self.shards {
             let dense = &mut self.owners.get_mut(owner).unwrap().declarations;
-            dense.resize(shard.rows.declarations.len(), DeclId(u32::MAX));
-            for row in &shard.rows.declarations {
+            dense.resize(shard.rows().declarations.len(), DeclId(u32::MAX));
+            for row in &shard.rows().declarations {
                 let slot = &mut dense[row.id.0 as usize];
                 if slot.0 == u32::MAX {
                     *slot = allocate_decl(&mut next_declaration)?;
@@ -466,7 +500,7 @@ impl<'a> CompatibilityLayout<'a> {
         for (owner, shard) in &self.shards {
             let dense = &mut self.owners.get_mut(owner).unwrap();
             dense.scopes = shard
-                .rows
+                .rows()
                 .scopes
                 .iter()
                 .map(|row| {
@@ -480,7 +514,7 @@ impl<'a> CompatibilityLayout<'a> {
                 })
                 .collect::<Result<Vec<_>, OwnerCompatibilityAssemblyError>>()?;
             dense.context_formals = shard
-                .rows
+                .rows()
                 .context_formals
                 .iter()
                 .map(|_| {
@@ -500,7 +534,7 @@ impl<'a> CompatibilityLayout<'a> {
 
         let mut calls = Vec::new();
         for (owner, shard) in &self.shards {
-            for row in &shard.rows.calls {
+            for row in &shard.rows().calls {
                 let expression = self.owners[owner].expressions[row.expression.0 as usize];
                 calls.push((expression, owner.clone(), row.id));
             }
@@ -509,7 +543,7 @@ impl<'a> CompatibilityLayout<'a> {
         for (index, (_, owner, local)) in calls.into_iter().enumerate() {
             let dense = &mut self.owners.get_mut(&owner).unwrap().calls;
             dense.resize(
-                self.shards[&owner].rows.calls.len(),
+                self.shards[&owner].rows().calls.len(),
                 CheckedCallId(u32::MAX),
             );
             dense[local.0 as usize] = CheckedCallId(checked_u32(index, "call identity")?);
@@ -521,7 +555,7 @@ impl<'a> CompatibilityLayout<'a> {
         for (owner, shard) in &self.shards {
             let dense = self.owners.get_mut(owner).unwrap();
             dense.sources = shard
-                .rows
+                .rows()
                 .sources
                 .iter()
                 .map(|row| {
@@ -534,7 +568,7 @@ impl<'a> CompatibilityLayout<'a> {
                 })
                 .collect::<Result<Vec<_>, OwnerCompatibilityAssemblyError>>()?;
             dense.states = shard
-                .rows
+                .rows()
                 .states
                 .iter()
                 .map(|_| {
@@ -546,7 +580,7 @@ impl<'a> CompatibilityLayout<'a> {
                 })
                 .collect::<Result<Vec<_>, OwnerCompatibilityAssemblyError>>()?;
             dense.lists = shard
-                .rows
+                .rows()
                 .lists
                 .iter()
                 .map(|_| {
@@ -872,7 +906,7 @@ impl CompatibilityLayout<'_> {
         for (owner, shard) in &self.shards {
             let owner_layout = &self.owners[owner];
             if let Some(local) = owner_layout.scopes.iter().position(|id| *id == dense) {
-                let row = &shard.rows.scopes[local];
+                let row = &shard.rows().scopes[local];
                 if let Some(reference) = &row.owner {
                     return self.declaration(owner, reference);
                 }
@@ -1022,7 +1056,7 @@ impl CompatibilityLayout<'_> {
         let (line, start, end) = match site {
             OwnerSourceSite::Statement { statement } => {
                 let source = map
-                    .statements
+                    .statements()
                     .iter()
                     .find(|source| &source.stable_key == statement)
                     .ok_or_else(|| {
@@ -1034,7 +1068,7 @@ impl CompatibilityLayout<'_> {
             }
             OwnerSourceSite::Expression { expression } => {
                 let source = map
-                    .expressions
+                    .expressions()
                     .iter()
                     .find(|source| &source.expression == expression)
                     .ok_or_else(|| {
@@ -1046,7 +1080,7 @@ impl CompatibilityLayout<'_> {
             }
             OwnerSourceSite::FunctionParameter { statement, ordinal } => {
                 let local = map
-                    .statements
+                    .statements()
                     .iter()
                     .find(|source| &source.stable_key == statement)
                     .map(|source| source.statement)
@@ -1110,7 +1144,7 @@ impl CompatibilityLayout<'_> {
                 ordinal: _,
             } => {
                 let source = map
-                    .expressions
+                    .expressions()
                     .iter()
                     .find(|source| &source.expression == expression)
                     .ok_or_else(|| {
@@ -1141,7 +1175,7 @@ impl CompatibilityLayout<'_> {
             .ok_or_else(|| {
                 OwnerCompatibilityAssemblyError::new(format!(
                     "owner {:?} source map has no exact expression anchor",
-                    map.owner
+                    map.owner()
                 ))
             })?;
         Ok((anchor.line, anchor.start, anchor.end))
@@ -1192,7 +1226,7 @@ impl CompatibilityLayout<'_> {
             (OwnerSourceAnchorSite::Statement { statement }, None) => {
                 let source = self
                     .source_map(owner)?
-                    .statements
+                    .statements()
                     .get(*statement as usize)
                     .ok_or_else(|| {
                         OwnerCompatibilityAssemblyError::new(
@@ -1211,7 +1245,7 @@ impl CompatibilityLayout<'_> {
             (OwnerSourceAnchorSite::Statement { statement }, Some(role)) => {
                 let source = self
                     .source_map(owner)?
-                    .statements
+                    .statements()
                     .get(*statement as usize)
                     .ok_or_else(|| {
                         OwnerCompatibilityAssemblyError::new(
@@ -2212,6 +2246,11 @@ pub fn assemble_checked_owner_project<'a>(
     source_maps: impl IntoIterator<Item = &'a OwnerSourceMap>,
     construction_abis: impl IntoIterator<Item = &'a OwnerConstructionAbiEnvironment>,
 ) -> Result<CheckedOwnerProjectAssembly, OwnerCompatibilityAssemblyError> {
+    if external_types.current_role != role {
+        return Err(OwnerCompatibilityAssemblyError::new(
+            "checked owner assembly role does not match its external type environment",
+        ));
+    }
     let trace = std::env::var_os("BOON_OWNER_COMPAT_TRACE").is_some();
     let mut phase_started = Instant::now();
     let shards = shards.into_iter().collect::<Vec<_>>();
@@ -2223,7 +2262,7 @@ pub fn assemble_checked_owner_project<'a>(
         .collect::<Vec<_>>();
     let mut source_map_fingerprints = source_maps
         .iter()
-        .map(|source_map| (source_map.owner.clone(), source_map.fingerprint_v2()))
+        .map(|source_map| (source_map.owner().clone(), source_map.fingerprint_v2()))
         .collect::<Vec<_>>();
     let mut construction_abi_fingerprints = construction_abis
         .iter()
@@ -2258,6 +2297,7 @@ pub fn assemble_checked_owner_project<'a>(
     trace_compat_phase(trace, "compact-basis", &mut phase_started, shards.len());
     let layout = CompatibilityLayout::new(
         project,
+        role,
         shards.iter().copied(),
         source_maps.iter().copied(),
         construction_abis.iter().copied(),
@@ -2415,7 +2455,7 @@ pub fn assemble_checked_owner_project<'a>(
     let call_count = layout
         .shards
         .values()
-        .map(|shard| shard.rows.calls.len())
+        .map(|shard| shard.rows().calls.len())
         .sum();
     let mut calls = std::iter::repeat_with(|| None)
         .take(call_count)
@@ -2423,17 +2463,17 @@ pub fn assemble_checked_owner_project<'a>(
     let source_count = layout
         .shards
         .values()
-        .map(|shard| shard.rows.sources.len())
+        .map(|shard| shard.rows().sources.len())
         .sum();
     let state_count = layout
         .shards
         .values()
-        .map(|shard| shard.rows.states.len())
+        .map(|shard| shard.rows().states.len())
         .sum();
     let list_count = layout
         .shards
         .values()
-        .map(|shard| shard.rows.lists.len())
+        .map(|shard| shard.rows().lists.len())
         .sum();
     let mut sources = std::iter::repeat_with(|| None)
         .take(source_count)
@@ -2452,7 +2492,7 @@ pub fn assemble_checked_owner_project<'a>(
 
     for (owner, shard) in &layout.shards {
         let dense = layout.owner_layout(owner)?;
-        for row in &shard.rows.scopes {
+        for row in &shard.rows().scopes {
             scopes.push(CheckedScope {
                 id: layout.local_scope(owner, row.id)?,
                 parent: row
@@ -2474,7 +2514,7 @@ pub fn assemble_checked_owner_project<'a>(
                     .unwrap_or_default(),
             });
         }
-        for row in &shard.rows.declarations {
+        for row in &shard.rows().declarations {
             declarations.push(CheckedDeclaration {
                 id: layout.local_declaration(owner, row.id)?,
                 scope_id: layout.scope(owner, &row.scope)?,
@@ -2493,7 +2533,7 @@ pub fn assemble_checked_owner_project<'a>(
                 span: layout.source_span(owner, &row.source)?,
             });
         }
-        for row in &shard.rows.statements {
+        for row in &shard.rows().statements {
             let id = layout.local_statement(owner, row.id)?;
             insert_dense(
                 &mut statements,
@@ -2523,7 +2563,7 @@ pub fn assemble_checked_owner_project<'a>(
                 "statement",
             )?;
         }
-        for row in &shard.rows.expressions {
+        for row in &shard.rows().expressions {
             let id = layout.local_expression(owner, row.id)?;
             insert_dense(
                 &mut expressions,
@@ -2545,7 +2585,7 @@ pub fn assemble_checked_owner_project<'a>(
                 "expression",
             )?;
         }
-        for row in &shard.rows.callables {
+        for row in &shard.rows().callables {
             callables.push(CheckedCallableSignature {
                 decl_id: layout.local_declaration(owner, row.declaration)?,
                 scope_id: layout.scope(owner, &row.scope)?,
@@ -2607,7 +2647,7 @@ pub fn assemble_checked_owner_project<'a>(
                     .transpose()?,
             });
         }
-        for row in &shard.rows.context_formals {
+        for row in &shard.rows().context_formals {
             context_formals.push(CheckedContextFormal {
                 id: layout.local_context_formal(owner, row.id)?,
                 callable: layout.local_declaration(owner, row.callable)?,
@@ -2617,7 +2657,7 @@ pub fn assemble_checked_owner_project<'a>(
                 },
             });
         }
-        for row in &shard.rows.calls {
+        for row in &shard.rows().calls {
             let id = layout.local_call(owner, row.id)?;
             insert_dense(
                 &mut calls,
@@ -2680,7 +2720,7 @@ pub fn assemble_checked_owner_project<'a>(
         }
         call_result_paths.extend(
             shard
-                .rows
+                .rows()
                 .call_result_paths
                 .iter()
                 .map(|row| {
@@ -2696,7 +2736,7 @@ pub fn assemble_checked_owner_project<'a>(
         );
         pattern_bindings.extend(
             shard
-                .rows
+                .rows()
                 .pattern_bindings
                 .iter()
                 .map(|row| {
@@ -2708,7 +2748,7 @@ pub fn assemble_checked_owner_project<'a>(
                 })
                 .collect::<Result<Vec<_>, OwnerCompatibilityAssemblyError>>()?,
         );
-        for row in &shard.rows.sources {
+        for row in &shard.rows().sources {
             let id = layout.local_source(owner, row.id)?;
             insert_dense(
                 &mut sources,
@@ -2727,7 +2767,7 @@ pub fn assemble_checked_owner_project<'a>(
                 "source",
             )?;
         }
-        for row in &shard.rows.states {
+        for row in &shard.rows().states {
             let id = layout.local_state(owner, row.id)?;
             insert_dense(
                 &mut states,
@@ -2747,7 +2787,7 @@ pub fn assemble_checked_owner_project<'a>(
                 "state",
             )?;
         }
-        for row in &shard.rows.lists {
+        for row in &shard.rows().lists {
             let id = layout.local_list(owner, row.id)?;
             insert_dense(
                 &mut lists,
@@ -2769,7 +2809,7 @@ pub fn assemble_checked_owner_project<'a>(
         }
         occurrences.extend(
             shard
-                .rows
+                .rows()
                 .occurrences
                 .iter()
                 .map(|row| {
@@ -2783,12 +2823,12 @@ pub fn assemble_checked_owner_project<'a>(
         );
         diagnostics.extend(
             shard
-                .diagnostics
+                .diagnostic_templates()
                 .iter()
                 .map(|diagnostic| layout.diagnostic(owner, diagnostic))
                 .collect::<Result<Vec<_>, _>>()?,
         );
-        debug_assert_eq!(dense.statements.len(), shard.rows.statements.len());
+        debug_assert_eq!(dense.statements.len(), shard.rows().statements.len());
     }
     trace_compat_phase(
         trace,

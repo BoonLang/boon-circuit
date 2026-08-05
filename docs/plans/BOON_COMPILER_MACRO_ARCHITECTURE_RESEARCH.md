@@ -528,6 +528,25 @@ show a dominant safe-language overhead. Prefer exact-size safe collection and
 narrow, encapsulated behind a safe API, measured against the safe version, and
 covered by mutation, fuzz/Miri where applicable, parity, and generation tests.
 
+The post-`2a84c47` audit sharpens this rule. Safe sharing and compact seals
+already remove about 830 ms and 377 MB of allocation traffic from one debug
+NovyWave empty-session observation, but 2.34 seconds remain in owner bodies,
+1.77 seconds in checked-shard construction, and about 0.75 seconds in dense
+compatibility assembly. Diagnostics should demand none of the latter two
+products. Moreover, the compatibility layer still owns project semantics and
+the owner diagnostic surface is incomplete. Unchecked indexing cannot remove
+those request families, rich representations, semantic rescans, or roughly
+25.2 million allocations. Finish the diagnostics demand root and the
+receipt/fact-authority flag day before profiling narrow safe/unsafe kernels.
+
+If unsafe becomes justified later, prove each boundary's complete invariant
+first: equal and in-range `TypeUnifier` arrays with an acyclic parent forest;
+canonical receipt domain counts with contiguous CSR spans that partition the
+relocation table; monotone packed-row offsets ending at the edge length; or
+exactly initialized local dense slots with panic-safe drop. Keep the safe
+implementation as an A/B oracle until deterministic diagnostics, artifacts,
+Miri/fuzz where applicable, and a material whole-run improvement all pass.
+
 ### M3. Carry one definition through normalized semantic facts and plan code
 
 - Publish one `DefinitionExecutableArtifact` containing checked body receipt,

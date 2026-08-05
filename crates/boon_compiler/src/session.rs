@@ -968,7 +968,7 @@ impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v1";
+    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -987,7 +987,7 @@ impl RequestFamily for OwnerBodyInferenceRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceShard>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference.v1";
+    const NAME: &'static str = "boon.compiler.owner-body-inference.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1006,7 +1006,7 @@ impl RequestFamily for CheckedOwnerShardRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<CheckedOwnerShard>;
 
-    const NAME: &'static str = "boon.compiler.checked-owner-shard.v2";
+    const NAME: &'static str = "boon.compiler.checked-owner-shard.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -3394,7 +3394,7 @@ fn owner_body_inference_plan_fingerprint(
     plan: &BTreeMap<StableCheckOwnerKey, OwnerInterfaceSccKey>,
 ) -> RequestInputFingerprint {
     let mut hasher = Sha256::new();
-    hasher.update(b"boon.compiler.owner-body-inference-dependencies.v1\0");
+    hasher.update(b"boon.compiler.owner-body-inference-dependencies.v2\0");
     hasher.update((plan.len() as u64).to_le_bytes());
     for (owner, scc) in plan {
         hasher.update(stable_check_owner_key_fingerprint_v1(owner));
@@ -3555,7 +3555,7 @@ fn evaluate_owner_body_inference_requests(
             }
         }
         let result_input = RequestInputFingerprint(request_fingerprint(
-            b"boon.compiler.owner-body-inference-result-projection-dependencies.v1\0",
+            b"boon.compiler.owner-body-inference-result-projection-dependencies.v2\0",
             std::iter::empty(),
         ));
         match state.owner_body_inference_requests.begin(
@@ -3799,7 +3799,7 @@ fn evaluate_checked_owner_shard_requests(
     trace.checkpoint("construction-abi", owners.len());
 
     let shard_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.checked-owner-shard-dependencies.v2\0",
+        b"boon.compiler.checked-owner-shard-dependencies.v3\0",
         std::iter::empty(),
     ));
     for owner in owners {

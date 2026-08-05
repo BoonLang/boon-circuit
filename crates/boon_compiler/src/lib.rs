@@ -749,7 +749,7 @@ pub(crate) fn checked_source_from_owner_assembly(
     typecheck_work: boon_typecheck::TypeCheckWorkCounters,
     typecheck_ms: f64,
 ) -> CheckedSourceFromSource {
-    let fields = assembly.fields.clone();
+    let fields = assembly.fields().clone();
     let metadata = &fields.lowering_metadata;
     let render_slot_failure_count = metadata
         .render_slot_table
@@ -793,7 +793,7 @@ pub(crate) fn checked_source_from_owner_assembly(
         resolved_constant_table: boon_checked::ResolvedConstantTable::default(),
         render_slot_table: metadata.render_slot_table.clone(),
         constraints: Vec::new(),
-        diagnostics: assembly.diagnostics.clone(),
+        diagnostics: assembly.diagnostics().to_vec(),
     };
     let construction = (!report.has_errors()).then(|| {
         // SAFETY: `assemble_checked_owner_project` accepts only complete,

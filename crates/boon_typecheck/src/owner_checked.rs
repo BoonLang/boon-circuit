@@ -191,6 +191,95 @@ impl OwnerCheckedReceiptSink {
     }
 }
 
+/// Audit one construction-owned receipt inventory without reopening rich rows.
+///
+/// Normal checked-owner consumers trust the immutable compact seal. This
+/// explicit path is for adversarial tests, imported proof validation, and
+/// diagnostics that need to inspect the detailed CSR inventory once.
+pub fn validate_owner_checked_receipts(
+    receipts: &OwnerCheckedReceiptSet,
+) -> Result<(), OwnerCheckedReceiptError> {
+    if receipts.construction.row_receipt_count as usize != receipts.row_receipts.len()
+        || receipts.construction.relocation_count as usize != receipts.relocations.len()
+    {
+        return Err(OwnerCheckedReceiptError::new(
+            "owner checked receipt inventory counts do not match their compact receipt",
+        ));
+    }
+
+    let mut domain_counts = BTreeMap::<OwnerCheckedRowDomain, u32>::new();
+    let mut next_relocation = 0usize;
+    for receipt in &receipts.row_receipts {
+        let expected_row = *domain_counts.get(&receipt.domain).unwrap_or(&0);
+        if receipt.row != expected_row {
+            return Err(OwnerCheckedReceiptError::new(format!(
+                "owner checked {:?} receipt row {} is not the next canonical row {}",
+                receipt.domain, receipt.row, expected_row
+            )));
+        }
+        domain_counts.insert(
+            receipt.domain,
+            expected_row.checked_add(1).ok_or_else(|| {
+                OwnerCheckedReceiptError::new("owner checked receipt row count exceeds u32")
+            })?,
+        );
+
+        let range = receipt.relocations.checked_range().ok_or_else(|| {
+            OwnerCheckedReceiptError::new("owner checked receipt has an invalid relocation span")
+        })?;
+        if range.start != next_relocation {
+            return Err(OwnerCheckedReceiptError::new(
+                "owner checked receipt relocation spans are not canonical and contiguous",
+            ));
+        }
+        let relocations = receipts.relocations.get(range.clone()).ok_or_else(|| {
+            OwnerCheckedReceiptError::new("owner checked receipt relocation span is out of range")
+        })?;
+        if relocations.iter().any(|relocation| {
+            relocation.source_domain != receipt.domain || relocation.source_row != receipt.row
+        }) {
+            return Err(OwnerCheckedReceiptError::new(
+                "owner checked relocation is attached to the wrong source row",
+            ));
+        }
+        next_relocation = range.end;
+    }
+    if next_relocation != receipts.relocations.len() {
+        return Err(OwnerCheckedReceiptError::new(
+            "owner checked receipt leaves unclaimed relocations",
+        ));
+    }
+
+    let domain_counts = domain_counts
+        .into_iter()
+        .map(|(domain, rows)| OwnerCheckedDomainCount { domain, rows })
+        .collect::<Vec<_>>();
+    if receipts.construction.domain_counts.as_ref() != domain_counts.as_slice() {
+        return Err(OwnerCheckedReceiptError::new(
+            "owner checked domain counts do not match the canonical receipt inventory",
+        ));
+    }
+    let local_content_digest_v1 = boon_contract::canonical_serde_hash_v1(
+        OWNER_CHECKED_LOCAL_CONTENT_DOMAIN_V1,
+        &(
+            &domain_counts,
+            &receipts.row_receipts,
+            &receipts.relocations,
+        ),
+    )
+    .map_err(|error| {
+        OwnerCheckedReceiptError::new(format!(
+            "failed to validate owner checked construction receipt: {error}"
+        ))
+    })?;
+    if local_content_digest_v1 != receipts.construction.local_content_digest_v1 {
+        return Err(OwnerCheckedReceiptError::new(
+            "owner checked construction receipt has a stale local content digest",
+        ));
+    }
+    Ok(())
+}
+
 fn checked_receipt_u32(value: usize, context: &str) -> Result<u32, OwnerCheckedReceiptError> {
     u32::try_from(value)
         .map_err(|_| OwnerCheckedReceiptError::new(format!("{context} exceeds u32")))

@@ -1,19 +1,18 @@
 use crate::owner_interface::{
-    OwnerPatternNarrowing, TypeUnifier, add_local_root, alpha_normalize_type, bind_flow_variables,
-    bind_projection, flow_mode_join, instantiate_type, merge_effects,
-    pattern_binding_type_from_pattern, pattern_type, refine_owner_pattern_narrowings,
-    true_false_type,
+    OwnerPatternNarrowing, TypeUnifier, alpha_normalize_type, bind_flow_variables, bind_projection,
+    flow_mode_join, instantiate_type, merge_effects, pattern_binding_type_from_pattern,
+    pattern_type, refine_owner_pattern_narrowings, true_false_type,
 };
 use crate::{
     OwnerAbiEvaluationScope, OwnerArgumentKind, OwnerCollectionKind, OwnerConstraintEdgeRole,
     OwnerConstraintNodeKind, OwnerConstraintSeed, OwnerConstraintSummary,
     OwnerInferenceAbiEnvironment, OwnerInterfaceEvaluationScope, OwnerInterfaceSccKey,
-    OwnerInterfaceSccResult, OwnerParameterKind, OwnerPublicInterface, OwnerReferenceKind,
-    OwnerResultAbiContract, OwnerResultAbiParameterContract, OwnerResultCallTarget,
-    OwnerResultExpressionRef, OwnerResultTransfer, OwnerResultTransferNode, OwnerSourceAnchorRole,
-    OwnerSourceAnchorSite, OwnerSourceMap, OwnerSymbolResolution, OwnerSyntaxInput,
-    OwnerValueAbiForbiddenReason, OwnerValueAbiLookupOutcome, infix_requires_number_operands,
-    infix_returns_bool,
+    OwnerInterfaceSccResult, OwnerLexicalDeclarationTarget, OwnerLexicalPlan, OwnerParameterKind,
+    OwnerPublicInterface, OwnerReferenceKind, OwnerResultAbiContract,
+    OwnerResultAbiParameterContract, OwnerResultCallTarget, OwnerResultExpressionRef,
+    OwnerResultTransfer, OwnerResultTransferNode, OwnerSourceAnchorRole, OwnerSourceAnchorSite,
+    OwnerSourceMap, OwnerSymbolResolution, OwnerSyntaxInput, OwnerValueAbiForbiddenReason,
+    OwnerValueAbiLookupOutcome, infix_requires_number_operands, infix_returns_bool,
 };
 use boon_checked::{
     BytesType, CheckedCallableKind, CheckedEffectSummary, CheckedParameterKind,
@@ -33,10 +32,10 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-const OWNER_BODY_INFERENCE_DOMAIN_V2: &[u8] = b"boon.owner-body-inference.v2\0";
+const OWNER_BODY_INFERENCE_DOMAIN_V3: &[u8] = b"boon.owner-body-inference.v3\0";
 const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V1: &[u8] = b"boon.owner-body-inference-content.v1\0";
-const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V1: &[u8] =
-    b"boon.owner-body-inference-currentness.v1\0";
+const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V2: &[u8] =
+    b"boon.owner-body-inference-currentness.v2\0";
 const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V1: &[u8] = b"boon.owner-body-interface-plan.v1\0";
 const OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V1: &[u8] = b"boon.owner-diagnostics-aggregate.v1\0";
 
@@ -365,6 +364,7 @@ pub struct FrozenOwnerInterfaceSccRef {
 pub struct OwnerBodyInferenceBasis {
     pub owner: StableCheckOwnerKey,
     pub syntax_fingerprint_v1: [u8; 32],
+    pub lexical_plan_fingerprint_v1: [u8; 32],
     pub seed_fingerprint_v1: [u8; 32],
     pub summary_fingerprint_v1: [u8; 32],
     pub own_scc: FrozenOwnerInterfaceSccRef,
@@ -561,7 +561,7 @@ impl OwnerBodyInferenceCurrentnessReceipt {
         }
         let result_fingerprint_v1 = result.fingerprint_v1();
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V1,
+            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V2,
             &(&basis, &interface_imports, result_fingerprint_v1),
         )?;
         Ok(Self {
@@ -925,6 +925,132 @@ fn body_expression_boundary_variable(
         boon_checked::canonical_union_type(vec![Type::Var(value), Type::Var(flush)]),
     );
     Some(boundary)
+}
+
+#[derive(Clone, Copy)]
+enum PlannedLexicalRead {
+    Unplanned,
+    Bound(TypeVar),
+    Reserved,
+}
+
+fn planned_lexical_read_variables(
+    syntax: &OwnerSyntaxInput,
+    lexical_plan: &OwnerLexicalPlan,
+    expressions: &[TypeVar],
+    external_expressions: &[TypeVar],
+    expression_flushes: &[TypeVar],
+    external_expression_flushes: &[TypeVar],
+    parameter_variables: &BTreeMap<u32, TypeVar>,
+    context: Option<TypeVar>,
+    unifier: &mut TypeUnifier,
+) -> Result<Vec<PlannedLexicalRead>, OwnerBodyInferenceError> {
+    if lexical_plan.reads().len() != syntax.expressions.len() {
+        return Err(OwnerBodyInferenceError::new(
+            "owner body lexical plan does not cover its expression table",
+        ));
+    }
+
+    let mut statement_variables = BTreeMap::new();
+    for (statement, expression) in lexical_plan.statement_values() {
+        if let Some(variable) = body_expression_boundary_variable(
+            expressions,
+            external_expressions,
+            expression_flushes,
+            external_expression_flushes,
+            *expression,
+            unifier,
+        ) {
+            statement_variables.insert(*statement, variable);
+        }
+    }
+
+    let mut record_field_variables = BTreeMap::new();
+    for field in lexical_plan.record_fields() {
+        let expression = syntax
+            .expressions
+            .get(field.object as usize)
+            .ok_or_else(|| {
+                OwnerBodyInferenceError::new(
+                    "owner body lexical record field references a missing expression",
+                )
+            })?;
+        let fields = match &expression.kind {
+            AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => fields,
+            _ => {
+                return Err(OwnerBodyInferenceError::new(
+                    "owner body lexical record field belongs to a non-record expression",
+                ));
+            }
+        };
+        let value = fields.get(field.ordinal as usize).ok_or_else(|| {
+            OwnerBodyInferenceError::new("owner body lexical record field ordinal is missing")
+        })?;
+        if value.spread || value.name != field.name {
+            return Err(OwnerBodyInferenceError::new(
+                "owner body lexical record field does not match its syntax field",
+            ));
+        }
+        let value = checked_u32(value.value, "owner body lexical record field value")?;
+        let variable = body_expression_boundary_variable(
+            expressions,
+            external_expressions,
+            expression_flushes,
+            external_expression_flushes,
+            value,
+            unifier,
+        )
+        .ok_or_else(|| {
+            OwnerBodyInferenceError::new(
+                "owner body lexical record field value is outside its expression namespace",
+            )
+        })?;
+        record_field_variables.insert((field.object, field.ordinal), variable);
+    }
+
+    let mut reads = Vec::with_capacity(lexical_plan.reads().len());
+    for read in lexical_plan.reads() {
+        let Some(read) = read else {
+            reads.push(PlannedLexicalRead::Unplanned);
+            continue;
+        };
+        let root = match &read.target {
+            OwnerLexicalDeclarationTarget::Parameter { ordinal } => Some(
+                parameter_variables.get(ordinal).copied().ok_or_else(|| {
+                    OwnerBodyInferenceError::new(format!(
+                        "owner body lexical plan references missing parameter {ordinal}"
+                    ))
+                })?,
+            ),
+            OwnerLexicalDeclarationTarget::Statement { statement } => Some(
+                statement_variables.get(statement).copied().ok_or_else(|| {
+                    OwnerBodyInferenceError::new(format!(
+                        "owner body lexical plan references valueless statement {statement}"
+                    ))
+                })?,
+            ),
+            OwnerLexicalDeclarationTarget::RecordField {
+                object, ordinal, ..
+            } => Some(
+                record_field_variables
+                    .get(&(*object, *ordinal))
+                    .copied()
+                    .ok_or_else(|| {
+                    OwnerBodyInferenceError::new(format!(
+                        "owner body lexical plan references missing record field {object}:{ordinal}"
+                    ))
+                    })?,
+            ),
+            OwnerLexicalDeclarationTarget::Passed => context,
+            OwnerLexicalDeclarationTarget::PatternBinding { .. }
+            | OwnerLexicalDeclarationTarget::Ambiguous { .. } => None,
+        };
+        // Defer projection binding until the ordinary lexical-read branch.
+        // Branch-local selector narrowing owns its projection independently
+        // and must not close the root's public/body type in advance.
+        reads.push(root.map_or(PlannedLexicalRead::Reserved, PlannedLexicalRead::Bound));
+    }
+    Ok(reads)
 }
 
 fn inferred_expression_ref(
@@ -1420,8 +1546,7 @@ fn bind_local_constraints(
     unifier: &mut TypeUnifier,
     expressions: &[TypeVar],
     external_expressions: &[TypeVar],
-    local_roots: &BTreeMap<String, Option<TypeVar>>,
-    context: Option<TypeVar>,
+    planned_lexical_reads: &[PlannedLexicalRead],
     modes: &mut [Option<FlowMode>],
     direct_effects: &mut [CheckedEffectSummary],
     calls: &mut Vec<BodyCallPlan>,
@@ -1494,6 +1619,18 @@ fn bind_local_constraints(
                 if arm_local_expressions.contains(&(index as u32)) {
                     // The owning match arm binds this occurrence against an
                     // arm-local pattern value below.
+                } else if let PlannedLexicalRead::Bound(root) = planned_lexical_reads[index] {
+                    // The shared lexical plan is authoritative over project
+                    // symbol resolution. This is what makes whole-scope and
+                    // record-field shadowing stable during inference.
+                    let read = seed.lexical_reads()[index]
+                        .as_ref()
+                        .expect("bound lexical root must have a read plan");
+                    let local = bind_projection(unifier, root, &read.projection);
+                    unifier.unify(Type::Var(variable), Type::Var(local));
+                } else if matches!(planned_lexical_reads[index], PlannedLexicalRead::Reserved) {
+                    // Ambiguous/PASSED-without-context reads are still planned
+                    // locals and must not fall through to project symbols.
                 } else if resolved.contains_key(&expression.expression) {
                     // Cross-owner value reads are wired after all interfaces
                     // have been instantiated into this body namespace.
@@ -1511,16 +1648,6 @@ fn bind_local_constraints(
                         let ty = instantiate_type(&flow_type.ty, unifier, &mut variables);
                         unifier.bind_var(variable, ty);
                         mode = Some(flow_type.mode);
-                    }
-                } else if let Some((root, projection)) = parts.split_first() {
-                    let local = if root == "PASSED" {
-                        context
-                    } else {
-                        local_roots.get(root).copied().flatten()
-                    };
-                    if let Some(local) = local {
-                        let projected = bind_projection(unifier, local, projection);
-                        unifier.unify(Type::Var(variable), Type::Var(projected));
                     }
                 }
             }
@@ -4193,11 +4320,13 @@ fn validate_owner_call_types(
 
 fn validate_inputs(
     syntax: &OwnerSyntaxInput,
+    lexical_plan: &OwnerLexicalPlan,
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     own_scc: &OwnerInterfaceSccResult,
 ) -> Result<(), OwnerBodyInferenceError> {
-    if syntax.owner != seed.owner
+    if !lexical_plan.matches_input(syntax)
+        || syntax.owner != seed.owner
         || seed.owner != summary.owner
         || !own_scc.key.members.contains(&seed.owner)
     {
@@ -4208,6 +4337,11 @@ fn validate_inputs(
     if summary.seed_fingerprint_v1 != seed.fingerprint_v1() {
         return Err(OwnerBodyInferenceError::new(
             "owner body inference has mismatched seed and resolved summary",
+        ));
+    }
+    if seed.lexical_reads_fingerprint_v1() != lexical_plan.reads_fingerprint_v1() {
+        return Err(OwnerBodyInferenceError::new(
+            "owner body inference has mismatched seed and lexical plan",
         ));
     }
     if syntax.expressions.len() != seed.expressions.len()
@@ -4233,6 +4367,7 @@ fn validate_inputs(
 /// transfer slices, as sealed by `interface_plan`.
 pub fn evaluate_owner_body<'a>(
     syntax: &OwnerSyntaxInput,
+    lexical_plan: &OwnerLexicalPlan,
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     abi: &OwnerInferenceAbiEnvironment,
@@ -4240,7 +4375,7 @@ pub fn evaluate_owner_body<'a>(
     own_scc: &'a OwnerInterfaceSccResult,
     imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<OwnerBodyInferenceEvaluation, OwnerBodyInferenceError> {
-    validate_inputs(syntax, seed, summary, own_scc)?;
+    validate_inputs(syntax, lexical_plan, seed, summary, own_scc)?;
     if interface_plan.owner() != &seed.owner {
         return Err(OwnerBodyInferenceError::new(
             "owner body inference received an interface plan for another owner",
@@ -4379,6 +4514,7 @@ pub fn evaluate_owner_body<'a>(
     let basis = OwnerBodyInferenceBasis {
         owner: seed.owner.clone(),
         syntax_fingerprint_v1: syntax.fingerprint_v1(),
+        lexical_plan_fingerprint_v1: lexical_plan.fingerprint_v1(),
         seed_fingerprint_v1: seed.fingerprint_v1(),
         summary_fingerprint_v1: summary.fingerprint_v1(),
         own_scc: own_scc_ref,
@@ -4506,13 +4642,21 @@ pub fn evaluate_owner_body<'a>(
             },
         );
     }
-    let mut local_roots = BTreeMap::new();
     let mut own_parameter_variables = Vec::with_capacity(own_interface.parameters.len());
+    let mut own_parameter_variables_by_ordinal = BTreeMap::new();
     for parameter in &own_interface.parameters {
         let variable = unifier.fresh();
         let ty = instantiate_type(&parameter.flow_type.ty, &mut unifier, &mut own_variables);
         unifier.bind_var(variable, ty);
-        add_local_root(&mut local_roots, parameter.name.clone(), variable);
+        if own_parameter_variables_by_ordinal
+            .insert(parameter.ordinal, variable)
+            .is_some()
+        {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "owner body interface repeats parameter ordinal {}",
+                parameter.ordinal
+            )));
+        }
         own_parameter_variables.push(variable);
     }
     let context = own_interface.context.as_ref().map(|context| {
@@ -4523,48 +4667,17 @@ pub fn evaluate_owner_body<'a>(
     });
     let own_result = instantiate_type(&own_interface.result.ty, &mut unifier, &mut own_variables);
 
-    for declaration in &seed.declarations {
-        let Some((_, expression)) = seed
-            .statement_values
-            .iter()
-            .find(|(statement, _)| *statement == declaration.statement)
-        else {
-            continue;
-        };
-        let Some(variable) = body_expression_boundary_variable(
-            &expressions,
-            &external_expressions,
-            &expression_flushes,
-            &external_expression_flushes,
-            *expression,
-            &mut unifier,
-        ) else {
-            continue;
-        };
-        for name in &declaration.names {
-            add_local_root(&mut local_roots, name.clone(), variable);
-        }
-    }
-    for expression in &seed.expressions {
-        if !matches!(expression.kind, OwnerConstraintNodeKind::Block) {
-            continue;
-        }
-        for input in &expression.inputs {
-            let OwnerConstraintEdgeRole::BlockBinding { name } = &input.role else {
-                continue;
-            };
-            if let Some(variable) = body_expression_boundary_variable(
-                &expressions,
-                &external_expressions,
-                &expression_flushes,
-                &external_expression_flushes,
-                input.expression,
-                &mut unifier,
-            ) {
-                add_local_root(&mut local_roots, name.clone(), variable);
-            }
-        }
-    }
+    let planned_lexical_reads = planned_lexical_read_variables(
+        syntax,
+        lexical_plan,
+        &expressions,
+        &external_expressions,
+        &expression_flushes,
+        &external_expression_flushes,
+        &own_parameter_variables_by_ordinal,
+        context,
+        &mut unifier,
+    )?;
 
     let mut modes = vec![None; expressions.len()];
     let mut direct_effects = vec![CheckedEffectSummary::default(); expressions.len()];
@@ -4577,8 +4690,7 @@ pub fn evaluate_owner_body<'a>(
         &mut unifier,
         &expressions,
         &external_expressions,
-        &local_roots,
-        context,
+        &planned_lexical_reads,
         &mut modes,
         &mut direct_effects,
         &mut calls,
@@ -4818,7 +4930,7 @@ pub fn evaluate_owner_body<'a>(
     // The construction receipt already commits every semantic row, diagnostic,
     // effect, and row count above. Bind the stable owner to that compact seal
     // instead of serializing the same rich body a second time.
-    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V2, &(&seed.owner, &receipt))?;
+    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V3, &(&seed.owner, &receipt))?;
     work.unification_steps = unifier.steps();
     let result = Arc::new(OwnerBodyInferenceShard {
         owner: seed.owner.clone(),
@@ -4849,6 +4961,7 @@ pub fn evaluate_owner_body<'a>(
 /// semantic body as separate request families.
 pub fn infer_owner_body<'a>(
     syntax: &OwnerSyntaxInput,
+    lexical_plan: &OwnerLexicalPlan,
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     abi: &OwnerInferenceAbiEnvironment,
@@ -4863,6 +4976,7 @@ pub fn infer_owner_body<'a>(
     )?;
     evaluate_owner_body(
         syntax,
+        lexical_plan,
         seed,
         summary,
         abi,
@@ -4878,8 +4992,8 @@ mod tests {
     use super::*;
     use crate::{
         ResolvedOwnerSymbolReference, build_owner_interface_topology,
-        project_owner_constraint_seed, project_owner_source_map, project_owner_syntax_input,
-        resolve_owner_constraint_seed, solve_owner_interface_scc,
+        project_owner_constraint_seed, project_owner_lexical_plan, project_owner_source_map,
+        project_owner_syntax_input, resolve_owner_constraint_seed, solve_owner_interface_scc,
     };
     use boon_parser::{
         ProjectSyntaxSnapshot, UnitSyntaxSnapshot, parse_project_source_unit,
@@ -5055,8 +5169,10 @@ mod tests {
             .iter()
             .find(|result| result.key.members.contains(&seed.owner))
             .unwrap();
+        let lexical_plan = project_owner_lexical_plan(syntax).unwrap();
         infer_owner_body(
             syntax,
+            &lexical_plan,
             seed,
             summary,
             &abi,

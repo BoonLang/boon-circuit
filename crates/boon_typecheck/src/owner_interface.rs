@@ -2,10 +2,10 @@ use crate::{
     AuthoritativeCallableSignature, AuthoritativeParameter, BuiltinSignatureRegistry,
     OwnerArgumentKind, OwnerCollectionKind, OwnerConstraintEdgeRole, OwnerConstraintNodeKind,
     OwnerConstraintSeed, OwnerConstraintSeedError, OwnerConstraintSummary, OwnerDeclarationKind,
-    OwnerInferenceAbiEnvironment, OwnerInterfaceScc, OwnerInterfaceSccKey, OwnerParameterKind,
-    OwnerPatternConstraint, OwnerReferenceKind, OwnerSymbolResolution, RenderContractRegistry,
-    host_effect_signature, infix_requires_number_operands, infix_returns_bool,
-    session_info_intrinsic_type,
+    OwnerInferenceAbiEnvironment, OwnerInterfaceScc, OwnerInterfaceSccKey,
+    OwnerLexicalDeclarationTarget, OwnerParameterKind, OwnerPatternConstraint, OwnerReferenceKind,
+    OwnerSymbolResolution, RenderContractRegistry, host_effect_signature,
+    infix_requires_number_operands, infix_returns_bool, session_info_intrinsic_type,
 };
 use boon_checked::{
     BytesType, CheckedEffectSummary, CheckedParameterKind, CheckedParameterRequirement, FlowMode,
@@ -17,9 +17,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V1: &[u8] = b"boon.owner-interface-scc-result.v1\0";
-const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V1: &[u8] =
-    b"boon.owner-interface-scc-currentness.v1\0";
+const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V2: &[u8] = b"boon.owner-interface-scc-result.v2\0";
+const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V2: &[u8] =
+    b"boon.owner-interface-scc-currentness.v2\0";
 const OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V1: &[u8] = b"boon.owner-body-interface-import.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -213,6 +213,7 @@ pub struct OwnerInterfaceSolveWork {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerInterfaceSccOwnerBasis {
     pub owner: StableCheckOwnerKey,
+    pub lexical_reads_fingerprint_v1: [u8; 32],
     pub seed_fingerprint_v1: [u8; 32],
     pub summary_fingerprint_v1: [u8; 32],
 }
@@ -303,7 +304,7 @@ impl OwnerInterfaceSccCurrentnessReceipt {
         }
         let result_fingerprint_v1 = result.fingerprint_v1();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V1,
+            OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V2,
             &(&basis, result_fingerprint_v1),
         )
         .map_err(|error| {
@@ -830,6 +831,13 @@ struct OwnerSolveParameter {
     evaluation_scope: OwnerInterfaceEvaluationScope,
 }
 
+#[derive(Clone, Copy)]
+enum PlannedLexicalRead {
+    Unplanned,
+    Bound(TypeVar),
+    Reserved,
+}
+
 #[derive(Clone)]
 struct OwnerSolveState<'a> {
     seed: &'a OwnerConstraintSeed,
@@ -845,7 +853,7 @@ struct OwnerSolveState<'a> {
     expression_by_key: BTreeMap<StableExpressionKey, usize>,
     external_expressions: Vec<TypeVar>,
     external_expression_flushes: Vec<TypeVar>,
-    local_roots: BTreeMap<String, Option<TypeVar>>,
+    planned_lexical_reads: Vec<PlannedLexicalRead>,
     modes: Vec<Option<FlowMode>>,
     effect: CheckedEffectSummary,
 }
@@ -1073,23 +1081,6 @@ fn interface_call_shape_is_valid(
         }))
 }
 
-pub(crate) fn add_local_root(
-    roots: &mut BTreeMap<String, Option<TypeVar>>,
-    name: String,
-    variable: TypeVar,
-) {
-    match roots.entry(name) {
-        std::collections::btree_map::Entry::Vacant(entry) => {
-            entry.insert(Some(variable));
-        }
-        std::collections::btree_map::Entry::Occupied(mut entry) => {
-            if entry.get().is_some_and(|existing| existing != variable) {
-                entry.insert(None);
-            }
-        }
-    }
-}
-
 pub(crate) fn flow_mode_join(left: Option<FlowMode>, right: Option<FlowMode>) -> Option<FlowMode> {
     match (left, right) {
         (None, mode) | (mode, None) => mode,
@@ -1257,6 +1248,117 @@ fn expression_boundary_variable(
     Some(boundary)
 }
 
+fn planned_lexical_read_variables(
+    state: &OwnerSolveState<'_>,
+    unifier: &mut TypeUnifier,
+) -> Result<Vec<PlannedLexicalRead>, OwnerConstraintSeedError> {
+    if state.seed.lexical_reads().len() != state.seed.expressions.len() {
+        return Err(OwnerConstraintSeedError::new(
+            "interface lexical plan does not cover its expression table",
+        ));
+    }
+
+    let mut statement_variables = BTreeMap::new();
+    for (statement, expression) in &state.seed.statement_values {
+        if let Some(variable) = expression_boundary_variable(state, *expression, unifier) {
+            statement_variables.insert(*statement, variable);
+        }
+    }
+    let mut record_field_variables = BTreeMap::new();
+    let mut record_fields = BTreeMap::new();
+    for read in state.seed.lexical_reads().iter().flatten() {
+        if let OwnerLexicalDeclarationTarget::RecordField {
+            object,
+            ordinal,
+            name,
+        } = &read.target
+        {
+            record_fields.insert((*object, *ordinal), name.clone());
+        }
+    }
+    for ((object_id, ordinal), field_name) in record_fields {
+        let object = state
+            .seed
+            .expressions
+            .get(object_id as usize)
+            .ok_or_else(|| {
+                OwnerConstraintSeedError::new(
+                    "interface lexical record field references a missing expression",
+                )
+            })?;
+        let input = object.inputs.get(ordinal as usize).ok_or_else(|| {
+            OwnerConstraintSeedError::new("interface lexical record field ordinal is missing")
+        })?;
+        if !matches!(
+            &input.role,
+            OwnerConstraintEdgeRole::RecordField {
+                name,
+                spread: false,
+            } if name == &field_name
+        ) {
+            return Err(OwnerConstraintSeedError::new(
+                "interface lexical record field does not match its constraint edge",
+            ));
+        }
+        let variable =
+            expression_boundary_variable(state, input.expression, unifier).ok_or_else(|| {
+                OwnerConstraintSeedError::new(
+                    "interface lexical record field value is outside its expression namespace",
+                )
+            })?;
+        record_field_variables.insert((object_id, ordinal), variable);
+    }
+
+    let mut reads = Vec::with_capacity(state.seed.lexical_reads().len());
+    for read in state.seed.lexical_reads() {
+        let Some(read) = read else {
+            reads.push(PlannedLexicalRead::Unplanned);
+            continue;
+        };
+        let root = match &read.target {
+            OwnerLexicalDeclarationTarget::Parameter { ordinal } => Some(
+                state
+                    .parameters
+                    .iter()
+                    .find(|parameter| parameter.ordinal == *ordinal)
+                    .map(|parameter| parameter.variable)
+                    .ok_or_else(|| {
+                        OwnerConstraintSeedError::new(format!(
+                            "interface lexical plan references missing parameter {ordinal}"
+                        ))
+                    })?,
+            ),
+            OwnerLexicalDeclarationTarget::Statement { statement } => Some(
+                statement_variables.get(statement).copied().ok_or_else(|| {
+                    OwnerConstraintSeedError::new(format!(
+                        "interface lexical plan references valueless statement {statement}"
+                    ))
+                })?,
+            ),
+            OwnerLexicalDeclarationTarget::RecordField {
+                object, ordinal, ..
+            } => Some(
+                record_field_variables
+                    .get(&(*object, *ordinal))
+                    .copied()
+                    .ok_or_else(|| {
+                        OwnerConstraintSeedError::new(format!(
+                            "interface lexical plan references missing record field {object}:{ordinal}"
+                        ))
+                    })?,
+            ),
+            OwnerLexicalDeclarationTarget::Passed => Some(state.context),
+            OwnerLexicalDeclarationTarget::PatternBinding { .. }
+            | OwnerLexicalDeclarationTarget::Ambiguous { .. } => None,
+        };
+        // Keep the root lazy. A selector projection owned by branch-local
+        // pattern narrowing must not constrain the public root merely because
+        // the base lexical plan can name it.
+        reads.push(root.map_or(PlannedLexicalRead::Reserved, PlannedLexicalRead::Bound));
+    }
+    Ok(reads)
+}
+
 fn resolved_expression_flush_type(
     state: &OwnerSolveState<'_>,
     reference: u32,
@@ -1294,21 +1396,18 @@ fn resolved_expression_boundary(
 }
 
 fn direct_owner_parameter_ordinal(state: &OwnerSolveState<'_>, reference: u32) -> Option<u32> {
-    let expression = state.seed.expressions.get(reference as usize)?;
-    let parts = match &expression.kind {
-        OwnerConstraintNodeKind::Reference { parts } | OwnerConstraintNodeKind::Drain { parts } => {
-            parts
-        }
-        _ => return None,
-    };
-    let [name] = parts.as_ref() else {
+    let read = state
+        .seed
+        .lexical_reads()
+        .get(reference as usize)?
+        .as_ref()?;
+    if !read.projection.is_empty() {
         return None;
-    };
-    let parameter = state
-        .parameters
-        .iter()
-        .find(|parameter| parameter.name == *name)?;
-    (state.local_roots.get(name) == Some(&Some(parameter.variable))).then_some(parameter.ordinal)
+    }
+    match &read.target {
+        OwnerLexicalDeclarationTarget::Parameter { ordinal } => Some(*ordinal),
+        _ => None,
+    }
 }
 
 fn referenced_owner_parameter_ordinals(
@@ -1323,16 +1422,14 @@ fn referenced_owner_parameter_ordinals(
             continue;
         }
         let expression = &state.seed.expressions[reference as usize];
-        if let OwnerConstraintNodeKind::Reference { parts }
-        | OwnerConstraintNodeKind::Drain { parts } = &expression.kind
-            && let Some(name) = parts.first()
-            && let Some(parameter) = state
-                .parameters
-                .iter()
-                .find(|parameter| parameter.name == *name)
-            && state.local_roots.get(name) == Some(&Some(parameter.variable))
+        if let Some(OwnerLexicalDeclarationTarget::Parameter { ordinal }) = state
+            .seed
+            .lexical_reads()
+            .get(reference as usize)
+            .and_then(Option::as_ref)
+            .map(|read| &read.target)
         {
-            referenced.insert(parameter.ordinal);
+            referenced.insert(*ordinal);
         }
         pending.extend(expression.inputs.iter().map(|input| input.expression));
     }
@@ -1439,22 +1536,17 @@ fn owner_result_parameter_read(
     state: &OwnerSolveState<'_>,
     expression: &crate::OwnerExpressionConstraint,
 ) -> Option<OwnerResultParameterRead> {
-    let parts = match &expression.kind {
-        OwnerConstraintNodeKind::Reference { parts } | OwnerConstraintNodeKind::Drain { parts } => {
-            parts
-        }
-        _ => return None,
+    let index = state
+        .expression_by_key
+        .get(&expression.expression)
+        .copied()?;
+    let read = state.seed.lexical_reads().get(index)?.as_ref()?;
+    let OwnerLexicalDeclarationTarget::Parameter { ordinal } = &read.target else {
+        return None;
     };
-    let (name, projection) = parts.split_first()?;
-    let parameter = state
-        .parameters
-        .iter()
-        .find(|parameter| parameter.name == *name)?;
-    (state.local_roots.get(name) == Some(&Some(parameter.variable))).then(|| {
-        OwnerResultParameterRead {
-            parameter_ordinal: parameter.ordinal,
-            projection: projection.to_vec().into_boxed_slice(),
-        }
+    Some(OwnerResultParameterRead {
+        parameter_ordinal: *ordinal,
+        projection: read.projection.clone(),
     })
 }
 
@@ -1509,53 +1601,72 @@ fn owner_result_parameter_alias(
     state: &OwnerSolveState<'_>,
     reference: u32,
 ) -> Option<OwnerResultParameterRead> {
+    fn append_projection(
+        mut read: OwnerResultParameterRead,
+        projection: &[String],
+    ) -> OwnerResultParameterRead {
+        let mut path = read.projection.into_vec();
+        path.extend(projection.iter().cloned());
+        read.projection = path.into_boxed_slice();
+        read
+    }
+
     fn resolve(
         state: &OwnerSolveState<'_>,
         reference: u32,
-        lexical: &BTreeMap<String, Option<OwnerResultParameterRead>>,
         active: &mut BTreeSet<u32>,
     ) -> Option<OwnerResultParameterRead> {
         let expression = state.seed.expressions.get(reference as usize)?;
         if !active.insert(reference) {
             return None;
         }
-        let result = match &expression.kind {
-            OwnerConstraintNodeKind::Reference { parts } => {
-                let (name, projection) = parts.split_first()?;
-                if let Some(read) = lexical.get(name) {
-                    read.clone().map(|mut read| {
-                        let mut path = read.projection.into_vec();
-                        path.extend(projection.iter().cloned());
-                        read.projection = path.into_boxed_slice();
-                        read
+        let result = if let Some(read) = state
+            .seed
+            .lexical_reads()
+            .get(reference as usize)
+            .and_then(Option::as_ref)
+        {
+            let target = match &read.target {
+                OwnerLexicalDeclarationTarget::Parameter { ordinal } => {
+                    Some(OwnerResultParameterRead {
+                        parameter_ordinal: *ordinal,
+                        projection: Box::new([]),
                     })
-                } else {
-                    owner_result_parameter_read(state, expression)
                 }
-            }
-            OwnerConstraintNodeKind::Block => {
-                let mut lexical = lexical.clone();
-                for input in &expression.inputs {
-                    if let OwnerConstraintEdgeRole::BlockBinding { name } = &input.role {
-                        let binding = resolve(state, input.expression, &lexical, active);
-                        // Preserve lexical shadowing even when the binding is
-                        // not a transparent alias of an owner parameter.
-                        lexical.insert(name.clone(), binding);
-                    }
-                }
-                expression
+                OwnerLexicalDeclarationTarget::Statement { statement } => state
+                    .seed
+                    .statement_values
+                    .iter()
+                    .find(|(candidate, _)| candidate == statement)
+                    .and_then(|(_, value)| resolve(state, *value, active)),
+                OwnerLexicalDeclarationTarget::RecordField {
+                    object, ordinal, ..
+                } => state
+                    .seed
+                    .expressions
+                    .get(*object as usize)
+                    .and_then(|object| object.inputs.get(*ordinal as usize))
+                    .and_then(|input| resolve(state, input.expression, active)),
+                OwnerLexicalDeclarationTarget::PatternBinding { .. }
+                | OwnerLexicalDeclarationTarget::Passed
+                | OwnerLexicalDeclarationTarget::Ambiguous { .. } => None,
+            };
+            target.map(|target| append_projection(target, &read.projection))
+        } else {
+            match &expression.kind {
+                OwnerConstraintNodeKind::Block => expression
                     .inputs
                     .iter()
                     .find(|input| matches!(input.role, OwnerConstraintEdgeRole::BlockResult))
-                    .and_then(|input| resolve(state, input.expression, &lexical, active))
+                    .and_then(|input| resolve(state, input.expression, active)),
+                _ => None,
             }
-            _ => None,
         };
         active.remove(&reference);
         result
     }
 
-    resolve(state, reference, &BTreeMap::new(), &mut BTreeSet::new())
+    resolve(state, reference, &mut BTreeSet::new())
 }
 
 fn build_owner_result_transfer(
@@ -2103,6 +2214,7 @@ pub fn evaluate_owner_interface_scc<'a>(
         .iter()
         .map(|owner| OwnerInterfaceSccOwnerBasis {
             owner: owner.clone(),
+            lexical_reads_fingerprint_v1: seeds[owner].lexical_reads_fingerprint_v1(),
             seed_fingerprint_v1: seeds[owner].fingerprint_v1(),
             summary_fingerprint_v1: summaries[owner].fingerprint_v1(),
         })
@@ -2132,7 +2244,6 @@ pub fn evaluate_owner_interface_scc<'a>(
             .iter()
             .find(|declaration| declaration.public);
         let mut parameters = Vec::new();
-        let mut local_roots = BTreeMap::new();
         if let Some(public) = public {
             for parameter in &public.parameters {
                 let variable = unifier.fresh();
@@ -2153,7 +2264,6 @@ pub fn evaluate_owner_interface_scc<'a>(
                     variable,
                     evaluation_scope: OwnerInterfaceEvaluationScope::Parent,
                 });
-                add_local_root(&mut local_roots, parameter.name.clone(), variable);
             }
         }
         let expressions = (0..seed.expressions.len())
@@ -2203,47 +2313,18 @@ pub fn evaluate_owner_interface_scc<'a>(
                 expression_by_key,
                 external_expressions,
                 external_expression_flushes,
-                local_roots,
+                planned_lexical_reads: Vec::new(),
                 modes: vec![None; seed.expressions.len()],
                 effect,
             },
         );
     }
 
-    // Publish owner-local declaration and BLOCK binding roots before resolving
-    // reads. Duplicate names fail closed to an unconstrained reference rather
-    // than silently selecting one declaration.
+    // Project exact per-expression local bindings from the shared lexical
+    // authority before solving constraints. This preserves whole-scope
+    // shadowing without an owner-wide name map.
     for state in states.values_mut() {
-        for declaration in &state.seed.declarations {
-            let Some((_, expression)) = state
-                .seed
-                .statement_values
-                .iter()
-                .find(|(statement, _)| *statement == declaration.statement)
-            else {
-                continue;
-            };
-            let Some(variable) = expression_boundary_variable(state, *expression, &mut unifier)
-            else {
-                continue;
-            };
-            for name in &declaration.names {
-                add_local_root(&mut state.local_roots, name.clone(), variable);
-            }
-        }
-        for expression in &state.seed.expressions {
-            if !matches!(expression.kind, OwnerConstraintNodeKind::Block) {
-                continue;
-            }
-            for input in &expression.inputs {
-                let OwnerConstraintEdgeRole::BlockBinding { name } = &input.role else {
-                    continue;
-                };
-                if let Some(variable) = expression_variable(state, input.expression) {
-                    add_local_root(&mut state.local_roots, name.clone(), variable);
-                }
-            }
-        }
+        state.planned_lexical_reads = planned_lexical_read_variables(state, &mut unifier)?;
     }
 
     // A transparent result wrapper is part of the public type equation, not
@@ -2357,6 +2438,20 @@ pub fn evaluate_owner_interface_scc<'a>(
                     if arm_local_expressions.contains(&(index as u32)) {
                         // The owning match arm binds this occurrence against
                         // an arm-local pattern value below.
+                    } else if let PlannedLexicalRead::Bound(root) =
+                        state.planned_lexical_reads[index]
+                    {
+                        let read = state.seed.lexical_reads()[index]
+                            .as_ref()
+                            .expect("bound lexical root must have a read plan");
+                        let local = bind_projection(&mut unifier, root, &read.projection);
+                        unifier.unify(Type::Var(variable), Type::Var(local));
+                    } else if matches!(
+                        state.planned_lexical_reads[index],
+                        PlannedLexicalRead::Reserved
+                    ) {
+                        // Planned ambiguous/contextless locals cannot fall
+                        // through to a project or ABI symbol.
                     } else if let Some(target) = resolved.get(&expression.expression) {
                         if target.reference.kind == OwnerReferenceKind::Value {
                             // Cross-owner value reads are wired after all local
@@ -2376,16 +2471,6 @@ pub fn evaluate_owner_interface_scc<'a>(
                             let ty = instantiate_type(&flow_type.ty, &mut unifier, &mut variables);
                             unifier.bind_var(variable, ty);
                             mode = Some(flow_type.mode);
-                        }
-                    } else if let Some((root, projection)) = parts.split_first() {
-                        let local = if root == "PASSED" {
-                            Some(state.context)
-                        } else {
-                            state.local_roots.get(root).copied().flatten()
-                        };
-                        if let Some(local) = local {
-                            let projected = bind_projection(&mut unifier, local, projection);
-                            unifier.unify(Type::Var(variable), Type::Var(projected));
                         }
                     }
                 }
@@ -3351,7 +3436,7 @@ pub fn evaluate_owner_interface_scc<'a>(
     }
     work.unification_steps = unifier.steps;
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_INTERFACE_SCC_RESULT_DOMAIN_V1,
+        OWNER_INTERFACE_SCC_RESULT_DOMAIN_V2,
         &(&scc.key, &interfaces, next_alpha),
     )
     .map_err(|error| {
@@ -3791,6 +3876,47 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn forward_record_field_shadows_same_named_project_value_during_interface_inference() {
+        let unit = link(concat!(
+            "item: TEXT { outer }\n",
+            "record: [copy: item, item: 1]\n",
+        ));
+        let owner = owner_named(&unit, "record");
+        let seed = seed(&unit, &owner);
+        assert!(seed.references.iter().all(|reference| {
+            reference.kind != OwnerReferenceKind::Value || reference.parts.as_ref() != ["item"]
+        }));
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let results = solve(&[seed], &[summary]);
+        let interface = results[0].owner(&owner).unwrap();
+        let Type::Object(shape) = &interface.result.ty else {
+            panic!("record interface must publish an object: {interface:#?}");
+        };
+        assert_eq!(shape.fields.get("copy"), Some(&Type::Number));
+        assert_eq!(shape.fields.get("item"), Some(&Type::Number));
+    }
+
+    #[test]
+    fn record_field_whole_scope_shadows_same_named_parameter() {
+        let unit = link(concat!(
+            "FUNCTION make(item) {\n",
+            "    [copy: item, item: 1]\n",
+            "}\n",
+        ));
+        let owner = owner_named(&unit, "make");
+        let seed = seed(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let results = solve(&[seed], &[summary]);
+        let interface = results[0].owner(&owner).unwrap();
+        let Type::Object(shape) = &interface.result.ty else {
+            panic!("record interface must publish an object: {interface:#?}");
+        };
+        assert_eq!(shape.fields.get("copy"), Some(&Type::Number));
+        assert_eq!(shape.fields.get("item"), Some(&Type::Number));
+        assert_ne!(interface.parameters[0].flow_type.ty, Type::Number);
     }
 
     #[test]

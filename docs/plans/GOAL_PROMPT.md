@@ -776,6 +776,30 @@ Current checkpoints to preserve and audit rather than redo:
   diagnostics deletes checked-shard/assembly work. Reprofile body evaluation
   afterward; do not use unsafe for import planning or compatibility work still
   scheduled for deletion;
+- preserve the 2026-08-04 declaration-surface and base lexical-plan foundation.
+  Project symbol publication now consumes body-independent
+  `OwnerDeclarationSurface` requests; a body edit backdates the surface and
+  symbol index while changing the body seed. Constraint seed and checked-shard
+  construction share one current `OwnerLexicalPlan` and validated syntax graph,
+  and the constraint seed shares its immutable read projection by `Arc`.
+  Interface/body inference bind exact expression-indexed base targets; nested
+  pattern scopes use structural ancestry; every explicit record field owns a
+  demand-independent checked declaration/resource anchor while spreads remain
+  reads. Pattern-binding and selector-narrowing edges obey the same exact
+  targets, and branch-local selector projections are bound lazily. Forward/self
+  references, BLOCK/record shadowing, parameter/project shadowing, and
+  branch-local narrowing have focused oracles. Do not misreport this as the complete single lexical
+  walk or independent legacy parity for plan-owned record rows: add the
+  signature-backed fresh-OUT/call-context overlay, migrate and delete the
+  remaining seed/shard scans, then replace the global symbol table with stable
+  per-name/module projections. Split the globally red diagnostics aggregate
+  into per-owner semantic facts, source-unit
+  presentation projections, and a small project ordering/currentness receipt;
+  make order/output/render/host facts the shared authority for diagnostics and
+  verified assembly. Only then cut public diagnostics over and reprofile.
+  Broad unsafe remains deferred while these safe request families can be
+  deleted; consider only a dominant narrow kernel under the required safe A/B,
+  invariant, parity, Miri/fuzz, and whole-run gates;
 - follow the post-`e510726` macro-architecture audit, reconciled through
   `a48f488`, in
   `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`. The historical trace exposed

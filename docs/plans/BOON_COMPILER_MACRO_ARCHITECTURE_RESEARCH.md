@@ -547,6 +547,45 @@ exactly initialized local dense slots with panic-safe drop. Keep the safe
 implementation as an A/B oracle until deterministic diagnostics, artifacts,
 Miri/fuzz where applicable, and a material whole-run improvement all pass.
 
+#### Post-interface audit: projection firewalls before diagnostic cutover
+
+The 2026-08-04 interface-import checkpoint and its follow-up audits refine M2
+into four ordered ownership cuts:
+
+1. A body-independent `OwnerDeclarationSurface` feeds symbol publication, then
+   stable per-name/module projections replace the remaining globally consumed
+   symbol-index value.
+2. A syntax-owned base `OwnerLexicalPlan` shares one validated graph and static
+   scope/read classification across seed and shard construction. A
+   signature-backed overlay must add fresh-OUT and call-context declarations
+   before the independent seed/shard lexical scans can be deleted.
+3. Per-owner semantic diagnostic facts and source-unit presentation
+   projections replace the globally red `OwnerDiagnosticsAggregate` input
+   bundle. A small project receipt owns deterministic ordering/currentness.
+4. Shared order/output/render/host facts become the only semantic authority for
+   both diagnostics and verified assembly; compatibility code becomes checked
+   relocation only and is then deleted from the diagnostics demand root.
+
+The first part of items 1 and 2 is implemented: body edits backdate declaration
+surfaces and the project symbol index, and constraint-seed plus checked-shard
+construction share the lexical plan's graph. The checked builder validates
+complete base expression/candidate coverage. The constraint seed shares the
+plan's read table by `Arc`, and interface/body inference bind its exact local
+targets rather than repeating owner-wide name resolution. Dedicated record
+oracles cover forward/self references, parameter/project shadowing, spreads,
+ambiguity, and demand-independent resource anchors; every explicit field owns
+a stable checked declaration. A read-projection fingerprint preserves
+literal-only seed backdating, and checked lowering cannot select an arbitrary
+ambiguous declaration. Match-binding and selector-narrowing edges are filtered
+against the same exact targets, with selector projections bound lazily so
+branch-local narrowing neither overrides whole-scope BLOCK/record declarations
+nor closes the selector's public root. Nested inline pattern ancestry is derived structurally.
+This does not close M2 because signature-backed dynamic lexical overlays, the
+remaining seed/shard scans, the global symbol request, diagnostic fact split,
+and compatibility deletion remain. It also leaves no case for broad unsafe
+acceleration: the safe architecture still owns much larger removable request
+families than any measured low-level loop.
+
 ### M3. Carry one definition through normalized semantic facts and plan code
 
 - Publish one `DefinitionExecutableArtifact` containing checked body receipt,

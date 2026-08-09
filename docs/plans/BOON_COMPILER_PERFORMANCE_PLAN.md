@@ -1864,8 +1864,8 @@ presented as checkout-fresh scored evidence.
 
 The new allocation-free phase counters make the next decision unambiguous. An
 adjacent traced NovyWave run has 4,404 direct interface-owner demands and 9,611
-exact closure interface-owner demands, each including the body's own interface, plus
-8,588 provider-SCC consumptions, 125,844 public result-transfer nodes, and
+exact closure interface-owner demands, each including the body's own interface,
+plus 8,588 provider-SCC consumptions, 125,844 public result-transfer nodes, and
 157,860 transfer edges. Import planning itself is
 196.127 ms; complete owner-body requests are 2,073.631 ms, checked-shard
 construction is 1,766.536 ms, and project assembly is 736.461 ms. Therefore
@@ -1877,6 +1877,74 @@ deletes the measured checked-shard and assembly work instead of accelerating
 it. Reprofile the remaining approximately two-second body evaluator afterward;
 only then consider safe representation changes or a narrow unsafe unifier/CSR
 kernel if a finer profile proves low-level mechanics dominate.
+
+#### 2026-08-04 declaration-surface and base lexical-plan foundation
+
+The next safe ownership foundation separates the public declaration surface
+from the body-dependent constraint seed. The project symbol index now consumes
+`OwnerDeclarationSurface` requests, and a focused edit oracle proves that a
+body-only owner edit backdates both its declaration surface and the symbol
+index while correctly changing the constraint seed. This removes the direct
+all-owner-body dependency from symbol publication. It does not yet make symbol
+resolution fine grained: one project-wide symbol-index request still consumes
+every declaration surface, so the next symbol step is stable per-name/module
+candidate projections whose unchanged outputs can backdate independently.
+
+One immutable `OwnerLexicalPlan` now owns the validated `OwnerSyntaxGraph`,
+canonical statement values, compact syntax scopes, expression regions, static
+parameter/statement/inline-record-field/pattern/PASSED read targets,
+projections, drains, and external candidates. Explicit inline-record fields
+are predeclared while spreads remain reads. Every explicit field now owns a
+stable checked declaration, scope, and resource anchor independently of current
+read demand. The constraint seed shares the plan's immutable read table by
+`Arc`; interface and body inference bind exact expression-indexed lexical
+targets instead of rebuilding one owner-wide name map, so forward record fields
+shadow same-named parameters or project values consistently. Constraint-seed
+currentness seals the read-projection fingerprint rather than the whole syntax
+plan, preserving literal-only interface backdating. Checked lowering consumes
+the same exact targets and rejects ambiguous locals instead of selecting an
+arbitrary declaration. Pattern-binding and selector-narrowing edges are also
+filtered through those exact targets, and selector projections remain lazy
+until their owning inference path consumes them, so branch-local narrowing
+cannot override whole-scope record/BLOCK shadowing or close a public parameter.
+Constraint-seed
+and checked-shard requests require the same current plan, eliminating their two
+extra syntax-graph builds. Checked construction also fail-closes on a
+plan/input mismatch, checks complete expression and external-candidate
+coverage, and resolves non-ambiguous base targets before call preparation.
+Nested inline pattern scopes are parented structurally rather than by parser
+allocation order. Focused BLOCK, function-value, nested-pattern, forward-field,
+project/parameter-shadow, self-reference/spread, and resource-anchor oracles
+cover these contracts.
+
+This is deliberately a foundation, not the promised single-walk exit. The
+plan does not yet own signature-backed fresh-OUT or call-context overlays, so
+the seed still retains its independent reference/pattern classification and
+checked construction still materializes its dense scope/declaration rows. Do
+not filter project/ABI references from the base plan until the callable
+signature overlay proves exact output-evaluation membership, projection, and
+shadowing. Add that overlay, move seed/body/shard consumers to the combined
+plan with parity oracles, and then delete the superseded scans.
+
+The adversarial request audit also corrects the following diagnostic cut. The
+current singleton `OwnerDiagnosticsAggregate` is globally red whenever any
+covered owner/body/source map changes and its seal repeats whole-project input
+identity. Replace it with construction-independent per-owner semantic
+diagnostic facts, source-unit-local presentation projections, and a small
+project currentness/ordering receipt. Order, output-root, forward-OUT, render,
+and host validation must be compositional semantic facts shared by diagnostics
+and verified assembly; compatibility assembly may relocate authenticated facts
+but may not remain their second semantic owner. Only after complete invalid and
+editor-projection parity may public diagnostics switch roots and delete the
+measured 1,766.536 ms checked-shard plus 736.461 ms assembly families.
+
+The post-checkpoint `unsafe` review remains deferred. Large safe work is still
+measured and scheduled for deletion, while this tranche exposes no dominant
+allocation-free kernel. Reassess only after the signature overlay, exact symbol
+projections, diagnostic-fact cutover, and fresh profile. If one unifier/CSR/
+packed-offset/exact-initialization kernel then dominates, retain unsafe only
+behind the already-required safe A/B oracle, documented invariant, parity,
+Miri/fuzz where applicable, and material whole-run evidence.
 
 Checkpoint `a48f488` remains the unit-native M1 ancestor of `42c1aa9`; preserve
 its production checking, compact execution receipt, proof/sealed-plan, and

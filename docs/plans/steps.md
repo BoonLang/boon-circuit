@@ -688,6 +688,32 @@ stronger three-reviewer performance closure defined below.
    cutover next; do not apply unsafe or tune import containers while the larger
    compatibility work remains scheduled for deletion.
 
+   The declaration-surface and base lexical-plan foundation is now
+   implemented. Project symbol publication consumes body-independent
+   `OwnerDeclarationSurface` requests, and a focused edit oracle proves that a
+   body edit backdates both the surface and project symbol index while changing
+   the body seed. Constraint seed and checked-shard construction share one
+   current `OwnerLexicalPlan` and validated syntax graph. The seed shares its
+   read projection by `Arc`, interface/body inference bind exact base targets,
+   pattern/narrowing edges cannot override those targets, selector projections
+   bind lazily on their owning inference path, and nested pattern scopes follow
+   structural ancestry. Every explicit record field owns a stable checked
+   declaration/resource anchor regardless of read demand; forward/self
+   references, spreads, BLOCK/record shadowing, branch-local narrowing, and
+   parameter/project shadowing have focused oracles. This is not the single-walk exit: signature-backed
+   fresh-OUT/call-context overlays, remaining seed/shard scan deletion, and
+   per-name/module symbol projections remain next.
+
+   Then replace the globally red `OwnerDiagnosticsAggregate` bundle with
+   per-owner semantic diagnostic facts, source-unit presentation projections,
+   and a small project ordering/currentness receipt. Move forward-OUT, order,
+   output, render, and host validation into compositional facts shared by
+   diagnostics and verified assembly, finish invalid/editor parity, cut public
+   diagnostics over, and delete checked-shard/compatibility demand from that
+   intent. Reprofile only after those safe deletions. Consider unsafe only for
+   a remaining dominant narrow kernel under the safe A/B, invariant, parity,
+   Miri/fuzz, and material whole-run contract.
+
    Documentation, instrumentation, a crate split, a focused test pass, or an
    authorized checkpoint commit is not this step's exit. After each checkpoint,
    continue with the next red or missing performance gate in the same goal run.

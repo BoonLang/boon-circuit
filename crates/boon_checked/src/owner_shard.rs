@@ -43,6 +43,11 @@ pub enum OwnerDeclarationStableKey {
     Statement {
         statement: StableStatementKey,
     },
+    RecordField {
+        object: StableExpressionKey,
+        ordinal: u32,
+        name: String,
+    },
     PatternBinding {
         selector: StableExpressionKey,
         ordinal: u32,

@@ -26,15 +26,17 @@ use boon_typecheck::{
     OwnerBodyInterfacePlanner, OwnerCallableAbiEnvironment, OwnerCallableAbiLookup,
     OwnerCallableAbiLookupOutcome, OwnerConstraintSeed, OwnerConstraintSummary,
     OwnerConstructionAbiEnvironment, OwnerConstructionCallableAbiLookup,
-    OwnerConstructionValueAbiLookup, OwnerDeclarationKind, OwnerDiagnosticsAggregate,
-    OwnerInferenceAbiEnvironment, OwnerInterfaceScc, OwnerInterfaceSccEvaluation,
-    OwnerInterfaceSccKey, OwnerInterfaceSccResult, OwnerInterfaceTopology,
-    OwnerParameterRequirementKey, OwnerParameterRequirementLookup, OwnerReferenceKind,
-    OwnerSourceMap, OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution,
-    OwnerSyntaxInput, OwnerValueAbiLookup, aggregate_owner_diagnostics,
-    assemble_checked_owner_project, build_checked_owner_shard, build_owner_interface_topology,
-    evaluate_owner_body, evaluate_owner_interface_scc, project_owner_abi_environment,
-    project_owner_constraint_seed, project_owner_source_map, project_owner_syntax_input,
+    OwnerConstructionValueAbiLookup, OwnerDeclarationKind, OwnerDeclarationSurface,
+    OwnerDiagnosticsAggregate, OwnerInferenceAbiEnvironment, OwnerInterfaceScc,
+    OwnerInterfaceSccEvaluation, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
+    OwnerInterfaceTopology, OwnerLexicalPlan, OwnerParameterRequirementKey,
+    OwnerParameterRequirementLookup, OwnerReferenceKind, OwnerSourceMap,
+    OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput,
+    OwnerValueAbiLookup, aggregate_owner_diagnostics, assemble_checked_owner_project,
+    build_checked_owner_shard, build_owner_interface_topology, evaluate_owner_body,
+    evaluate_owner_interface_scc, project_owner_abi_environment,
+    project_owner_constraint_seed_with_lexical_plan, project_owner_declaration_surface,
+    project_owner_lexical_plan, project_owner_source_map, project_owner_syntax_input,
     resolve_owner_constraint_seed_with_resolutions, stable_check_owner_key_fingerprint_v1,
 };
 use serde::Serialize;
@@ -233,6 +235,8 @@ struct ProjectState {
     link_requests: TypedRequestTable<LinkUnitRequest>,
     owner_input_requests: TypedRequestTable<OwnerInputRequest>,
     owner_source_map_requests: TypedRequestTable<OwnerSourceMapRequest>,
+    owner_declaration_surface_requests: TypedRequestTable<OwnerDeclarationSurfaceRequest>,
+    owner_lexical_plan_requests: TypedRequestTable<OwnerLexicalPlanRequest>,
     owner_constraint_seed_requests: TypedRequestTable<OwnerConstraintSeedRequest>,
     project_owner_abi_requests: TypedRequestTable<ProjectOwnerAbiRequest>,
     project_owner_callable_abi_requests: TypedRequestTable<ProjectOwnerCallableAbiRequest>,
@@ -473,11 +477,49 @@ impl RequestFamily for OwnerSourceMapRequest {
 
 struct OwnerConstraintSeedRequest;
 
+struct OwnerDeclarationSurfaceRequest;
+
+impl RequestFamily for OwnerDeclarationSurfaceRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<OwnerDeclarationSurface>;
+
+    const NAME: &'static str = "boon.compiler.owner-declaration-surface.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+struct OwnerLexicalPlanRequest;
+
+impl RequestFamily for OwnerLexicalPlanRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<OwnerLexicalPlan>;
+
+    const NAME: &'static str = "boon.compiler.owner-lexical-plan.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
 impl RequestFamily for OwnerConstraintSeedRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerConstraintSeed>;
 
-    const NAME: &'static str = "boon.compiler.owner-constraint-seed.v1";
+    const NAME: &'static str = "boon.compiler.owner-constraint-seed.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -935,7 +977,7 @@ impl RequestFamily for OwnerInterfaceSccEvaluationRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceSccEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v1";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -954,7 +996,7 @@ impl RequestFamily for OwnerInterfaceSccRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceSccResult>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v1";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -999,7 +1041,7 @@ impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v2";
+    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1018,7 +1060,7 @@ impl RequestFamily for OwnerBodyInferenceRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceShard>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference.v2";
+    const NAME: &'static str = "boon.compiler.owner-body-inference.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1037,7 +1079,7 @@ impl RequestFamily for CheckedOwnerShardRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<CheckedOwnerShard>;
 
-    const NAME: &'static str = "boon.compiler.checked-owner-shard.v3";
+    const NAME: &'static str = "boon.compiler.checked-owner-shard.v4";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1126,6 +1168,8 @@ impl CompilerSession {
                 link_requests: TypedRequestTable::new(),
                 owner_input_requests: TypedRequestTable::new(),
                 owner_source_map_requests: TypedRequestTable::new(),
+                owner_declaration_surface_requests: TypedRequestTable::new(),
+                owner_lexical_plan_requests: TypedRequestTable::new(),
                 owner_constraint_seed_requests: TypedRequestTable::new(),
                 project_owner_abi_requests: TypedRequestTable::new(),
                 project_owner_callable_abi_requests: TypedRequestTable::new(),
@@ -1398,6 +1442,16 @@ impl CompilerSession {
                 surviving_sources.contains(key.source_unit_id())
             })?;
         state
+            .owner_declaration_surface_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key.source_unit_id())
+            })?;
+        state
+            .owner_lexical_plan_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key.source_unit_id())
+            })?;
+        state
             .owner_constraint_seed_requests
             .retain(&mut state.syntax_evaluator, |key| {
                 surviving_sources.contains(key.source_unit_id())
@@ -1572,6 +1626,38 @@ impl CompilerSession {
             .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
         Ok(state
             .owner_constraint_seed_requests
+            .current_value(&state.syntax_evaluator, owner)?
+            .map(Arc::clone))
+    }
+
+    /// Returns the body-independent public declaration projection.
+    pub fn owner_declaration_surface(
+        &self,
+        project: ProjectId,
+        owner: &StableCheckOwnerKey,
+    ) -> CompilerResult<Option<Arc<OwnerDeclarationSurface>>> {
+        let state = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        Ok(state
+            .owner_declaration_surface_requests
+            .current_value(&state.syntax_evaluator, owner)?
+            .map(Arc::clone))
+    }
+
+    /// Returns the syntax-owned base lexical plan for one owner.
+    pub fn owner_lexical_plan(
+        &self,
+        project: ProjectId,
+        owner: &StableCheckOwnerKey,
+    ) -> CompilerResult<Option<Arc<OwnerLexicalPlan>>> {
+        let state = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        Ok(state
+            .owner_lexical_plan_requests
             .current_value(&state.syntax_evaluator, owner)?
             .map(Arc::clone))
     }
@@ -2185,6 +2271,16 @@ fn evaluate_owner_body_requests(
             live_owners.contains(owner)
         })?;
     state
+        .owner_declaration_surface_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
+    state
+        .owner_lexical_plan_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
+    state
         .owner_constraint_seed_requests
         .retain(&mut state.syntax_evaluator, |owner| {
             live_owners.contains(owner)
@@ -2477,16 +2573,12 @@ fn add_owner_symbol(
 }
 
 fn build_project_owner_symbol_index(
-    seeds: &[Arc<OwnerConstraintSeed>],
+    surfaces: &[Arc<OwnerDeclarationSurface>],
     modules: &BTreeMap<SourceUnitId, Option<String>>,
 ) -> ProjectOwnerSymbolIndex {
     let mut symbols = BTreeMap::<OwnerSymbolKey, Vec<OwnerSymbolCandidate>>::new();
-    for seed in seeds {
-        let Some(declaration) = seed
-            .declarations
-            .iter()
-            .find(|declaration| declaration.public)
-        else {
+    for surface in surfaces {
+        let Some(declaration) = surface.public() else {
             continue;
         };
         if declaration.kind == OwnerDeclarationKind::Function {
@@ -2496,7 +2588,7 @@ fn build_project_owner_symbol_index(
             let canonical_parts = name.split('/').map(str::to_owned).collect::<Vec<_>>();
             let candidate = OwnerSymbolCandidate {
                 priority: 0,
-                owner: seed.owner.clone(),
+                owner: surface.owner().clone(),
                 parameters: declaration.parameters.clone(),
             };
             add_owner_symbol(
@@ -2509,7 +2601,7 @@ fn build_project_owner_symbol_index(
             );
             if canonical_parts.len() == 1
                 && let Some(module) = modules
-                    .get(seed.owner.source_unit_id())
+                    .get(surface.owner().source_unit_id())
                     .and_then(|module| module.as_ref())
             {
                 add_owner_symbol(
@@ -2526,7 +2618,7 @@ fn build_project_owner_symbol_index(
         let Some(priority) = owner_symbol_priority(declaration.kind) else {
             continue;
         };
-        let path = owner_route_value_path(&seed.owner, true);
+        let path = owner_route_value_path(surface.owner(), true);
         if path.is_empty() {
             continue;
         }
@@ -2538,7 +2630,7 @@ fn build_project_owner_symbol_index(
             },
             OwnerSymbolCandidate {
                 priority,
-                owner: seed.owner.clone(),
+                owner: surface.owner().clone(),
                 parameters: Box::new([]),
             },
         );
@@ -2977,11 +3069,81 @@ fn evaluate_owner_constraint_requests(
     owners: &[StableCheckOwnerKey],
 ) -> CompilerResult<()> {
     let mut trace = OwnerRequestTrace::new();
+    let projection_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-declaration-and-lexical-dependencies.v1\0",
+        std::iter::empty(),
+    ));
     let seed_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-constraint-seed-dependencies.v1\0",
+        b"boon.compiler.owner-constraint-seed-dependencies.v3\0",
         std::iter::empty(),
     ));
     for owner in owners {
+        match state.owner_declaration_surface_requests.begin(
+            &mut state.syntax_evaluator,
+            owner.clone(),
+            projection_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let surface = (|| -> CompilerResult<_> {
+                    let input = state.owner_input_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?;
+                    Ok(Arc::new(project_owner_declaration_surface(input)?))
+                })();
+                let surface = match surface {
+                    Ok(surface) => surface,
+                    Err(error) => {
+                        state.owner_declaration_surface_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_declaration_surface_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    surface,
+                )?;
+            }
+        }
+        match state.owner_lexical_plan_requests.begin(
+            &mut state.syntax_evaluator,
+            owner.clone(),
+            projection_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let plan = (|| -> CompilerResult<_> {
+                    let input = state.owner_input_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?;
+                    Ok(Arc::new(project_owner_lexical_plan(input)?))
+                })();
+                let plan = match plan {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        state.owner_lexical_plan_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_lexical_plan_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    plan,
+                )?;
+            }
+        }
         match state.owner_constraint_seed_requests.begin(
             &mut state.syntax_evaluator,
             owner.clone(),
@@ -2995,7 +3157,15 @@ fn evaluate_owner_constraint_requests(
                         &mut ticket,
                         owner,
                     )?;
-                    Ok(Arc::new(project_owner_constraint_seed(input)?))
+                    let lexical_plan = state.owner_lexical_plan_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?;
+                    Ok(Arc::new(project_owner_constraint_seed_with_lexical_plan(
+                        input,
+                        lexical_plan,
+                    )?))
                 })();
                 let seed = match seed {
                     Ok(seed) => seed,
@@ -3016,14 +3186,14 @@ fn evaluate_owner_constraint_requests(
             }
         }
     }
-    trace.checkpoint("constraint-seeds", owners.len());
+    trace.checkpoint("declaration-lexical-and-constraint-seeds", owners.len());
     let symbol_key = ProjectOwnerSymbolKey;
     let owner_key_fingerprints = owners
         .iter()
         .map(stable_check_owner_key_fingerprint_v1)
         .collect::<Vec<_>>();
     let symbol_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.project-owner-symbol-index-dependencies.v1\0",
+        b"boon.compiler.project-owner-symbol-index-dependencies.v2\0",
         owner_key_fingerprints.iter().map(<[u8; 32]>::as_slice),
     ));
     match state.project_owner_symbol_requests.begin(
@@ -3034,11 +3204,11 @@ fn evaluate_owner_constraint_requests(
         RequestStart::Reused => {}
         RequestStart::Execute(mut ticket) => {
             let symbols = (|| -> CompilerResult<_> {
-                let seeds = owners
+                let surfaces = owners
                     .iter()
                     .map(|owner| {
                         state
-                            .owner_constraint_seed_requests
+                            .owner_declaration_surface_requests
                             .require(&state.syntax_evaluator, &mut ticket, owner)
                             .map(Arc::clone)
                             .map_err(Into::into)
@@ -3056,7 +3226,9 @@ fn evaluate_owner_constraint_requests(
                         linked.module().map(str::to_owned),
                     );
                 }
-                Ok(Arc::new(build_project_owner_symbol_index(&seeds, &modules)))
+                Ok(Arc::new(build_project_owner_symbol_index(
+                    &surfaces, &modules,
+                )))
             })();
             let symbols = match symbols {
                 Ok(symbols) => symbols,
@@ -3377,7 +3549,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
     trace.checkpoint("interface-scc-plans", topology.sccs.len());
 
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v1\0",
+        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v2\0",
         std::iter::empty(),
     ));
     let result_input = RequestInputFingerprint(request_fingerprint(
@@ -3535,7 +3707,7 @@ fn evaluate_owner_body_inference_requests(
         .flat_map(|scc| scc.key.members.iter().cloned())
         .collect::<Vec<_>>();
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-body-inference-evaluation-dependencies.v4\0",
+        b"boon.compiler.owner-body-inference-evaluation-dependencies.v5\0",
         std::iter::empty(),
     ));
     let mut planning_ms = 0.0;
@@ -3556,6 +3728,11 @@ fn evaluate_owner_body_inference_requests(
             RequestStart::Execute(mut ticket) => {
                 let evaluation = (|| -> CompilerResult<_> {
                     let syntax = Arc::clone(state.owner_input_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &owner,
+                    )?);
+                    let lexical_plan = Arc::clone(state.owner_lexical_plan_requests.require(
                         &state.syntax_evaluator,
                         &mut ticket,
                         &owner,
@@ -3625,6 +3802,7 @@ fn evaluate_owner_body_inference_requests(
                     let solve_started = Instant::now();
                     let evaluation = evaluate_owner_body(
                         &syntax,
+                        &lexical_plan,
                         &seed,
                         &summary,
                         &abi,
@@ -3998,7 +4176,7 @@ fn evaluate_checked_owner_shard_requests(
     trace.checkpoint("construction-abi", owners.len());
 
     let shard_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.checked-owner-shard-dependencies.v3\0",
+        b"boon.compiler.checked-owner-shard-dependencies.v4\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -4011,6 +4189,11 @@ fn evaluate_checked_owner_shard_requests(
             RequestStart::Execute(mut ticket) => {
                 let shard = (|| -> CompilerResult<_> {
                     let syntax = Arc::clone(state.owner_input_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &owner,
+                    )?);
+                    let lexical_plan = Arc::clone(state.owner_lexical_plan_requests.require(
                         &state.syntax_evaluator,
                         &mut ticket,
                         &owner,
@@ -4072,6 +4255,7 @@ fn evaluate_checked_owner_shard_requests(
                         .collect::<CompilerResult<Vec<_>>>()?;
                     let shard = build_checked_owner_shard(
                         &syntax,
+                        &lexical_plan,
                         &seed,
                         &summary,
                         &body,
@@ -4711,13 +4895,14 @@ mod tests {
             second.profile.parse_work
         };
         let second_stats = session.frontend_request_stats(project).unwrap();
-        // Counts include exact provider/import-plan, inference/construction
-        // ABI, and checked-owner requests. The warm edit reuses 53 requests
-        // and changes only the edited owner's dependency cone despite
-        // conservatively reexecuting/backdating shared providers.
+        // Counts include declaration-surface/lexical-plan, exact provider,
+        // inference/construction ABI, and checked-owner requests. The warm
+        // edit reuses 59 requests and changes only the edited owner's
+        // dependency cone despite conservatively reexecuting/backdating
+        // shared providers.
         assert_eq!(
             (first_request_counts, request_counts(second_stats)),
-            ((67, 67, 0, 0, 67), (134, 81, 53, 7, 74))
+            ((75, 75, 0, 0, 75), (150, 91, 59, 8, 83))
         );
 
         let mut isolated = CompilerSession::new();
@@ -4974,6 +5159,74 @@ mod tests {
             body.expressions.last().unwrap().flow_type.ty,
             boon_checked::Type::Number
         );
+    }
+
+    #[test]
+    fn public_symbol_index_depends_on_declaration_surfaces_not_owner_bodies() {
+        let before = "FUNCTION identity(input) {\n    input\n}\nvalue: identity(input: 1)\n";
+        let after = "FUNCTION identity(input) {\n    input + 0\n}\nvalue: identity(input: 1)\n";
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project(before)).unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let identity = unit
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| segment.names == ["identity"])
+                )
+            })
+            .unwrap();
+        let first_surface = session
+            .owner_declaration_surface(project, &identity)
+            .unwrap()
+            .unwrap();
+        let first_seed = session
+            .owner_constraint_seed(project, &identity)
+            .unwrap()
+            .unwrap();
+        let first_symbols = {
+            let state = session.projects.get(&project).unwrap();
+            Arc::clone(
+                state
+                    .project_owner_symbol_requests
+                    .current_value(&state.syntax_evaluator, &ProjectOwnerSymbolKey)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+
+        session
+            .apply_update(project, UnitUpdate::new("RUN.bn", after))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let second_surface = session
+            .owner_declaration_surface(project, &identity)
+            .unwrap()
+            .unwrap();
+        let second_seed = session
+            .owner_constraint_seed(project, &identity)
+            .unwrap()
+            .unwrap();
+        let second_symbols = {
+            let state = session.projects.get(&project).unwrap();
+            Arc::clone(
+                state
+                    .project_owner_symbol_requests
+                    .current_value(&state.syntax_evaluator, &ProjectOwnerSymbolKey)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+
+        assert!(Arc::ptr_eq(&first_surface, &second_surface));
+        assert!(Arc::ptr_eq(&first_symbols, &second_symbols));
+        assert!(!Arc::ptr_eq(&first_seed, &second_seed));
     }
 
     #[test]
@@ -5761,13 +6014,14 @@ mod tests {
         assert!(Arc::ptr_eq(&interface_topology, &body_topology));
         let body_stats = session.frontend_request_stats(project).unwrap();
         let body_delta = request_delta(body_stats, interface_stats);
-        // The exact interface-provider/import-plan, callable/parameter lookup,
-        // inference/construction ABI, and checked-owner families are included
-        // here: they may reexecute and backdate after the broad provider
-        // changes while preserving unchanged owner results.
+        // Declaration-surface/lexical-plan, exact interface-provider,
+        // callable/parameter lookup, inference/construction ABI, and
+        // checked-owner families are included here: they may reexecute and
+        // backdate after broad provider changes while preserving unchanged
+        // owner results.
         assert_eq!(
             (interface_delta, body_delta),
-            ((113, 53, 60, 25, 28), (113, 23, 90, 10, 13))
+            ((127, 57, 70, 26, 31), (127, 25, 102, 11, 14))
         );
     }
 

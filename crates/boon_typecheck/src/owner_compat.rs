@@ -2439,12 +2439,7 @@ pub fn assemble_checked_owner_project<'a>(
             span: CheckedSpan::default(),
         });
     }
-    trace_compat_phase(
-        trace,
-        "abi-rows",
-        &mut phase_started,
-        declarations.len(),
-    );
+    trace_compat_phase(trace, "abi-rows", &mut phase_started, declarations.len());
 
     let mut statements = std::iter::repeat_with(|| None)
         .take(project.statement_count())

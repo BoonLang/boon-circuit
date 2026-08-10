@@ -18,7 +18,7 @@ use std::fmt;
 
 const OWNER_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] = b"boon.owner-abi-environment.v1\0";
 const OWNER_CALLABLE_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] = b"boon.owner-callable-abi-environment.v1\0";
-const OWNER_CALLABLE_ABI_LOOKUP_DOMAIN_V1: &[u8] = b"boon.owner-callable-abi-lookup.v1\0";
+const OWNER_CALLABLE_ABI_LOOKUP_DOMAIN_V2: &[u8] = b"boon.owner-callable-abi-lookup.v2\0";
 const OWNER_VALUE_ABI_LOOKUP_DOMAIN_V1: &[u8] = b"boon.owner-value-abi-lookup.v1\0";
 const OWNER_SOURCE_PAYLOAD_ABI_LOOKUP_DOMAIN_V1: &[u8] =
     b"boon.owner-source-payload-abi-lookup.v1\0";
@@ -31,8 +31,8 @@ const OWNER_CONSTRUCTION_VALUE_ABI_LOOKUP_DOMAIN_V1: &[u8] =
     b"boon.owner-construction-value-abi-lookup.v1\0";
 const OWNER_CONSTRUCTION_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] =
     b"boon.owner-construction-abi-environment.v1\0";
-const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V4: &[u8] =
-    b"boon.owner-inference-abi-environment.v4\0";
+const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V5: &[u8] =
+    b"boon.owner-inference-abi-environment.v5\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerAbiEnvironmentError {
@@ -195,17 +195,44 @@ impl From<&OwnerAbiParameterContract> for OwnerInferenceParameterContract {
     }
 }
 
+/// Minimal compiler-supplied call context consumed by lexical binding and
+/// type inference.
+///
+/// The checked context row still owns construction-only identity and lowering
+/// metadata. Its visible name, provider exclusion, kind, and flow type are
+/// semantic inputs: omitting them would let a checked read target a context
+/// declaration while retaining an unrelated or unknown inferred type.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerInferenceCallContextContract {
+    pub name: String,
+    pub kind: CheckedCallContextKind,
+    pub provider_parameter_ordinal: u32,
+    pub flow_type: FlowType,
+}
+
+impl From<&OwnerAbiCallContextContract> for OwnerInferenceCallContextContract {
+    fn from(contract: &OwnerAbiCallContextContract) -> Self {
+        Self {
+            name: contract.name.clone(),
+            kind: contract.kind,
+            provider_parameter_ordinal: contract.provider_parameter_ordinal,
+            flow_type: contract.flow_type.clone(),
+        }
+    }
+}
+
 /// Minimal authoritative callable contract consumed by type inference.
 ///
-/// Intrinsic lowering, external identity, program role, callable-context rows,
-/// and contextual-operation metadata belong to checked-shard construction and
-/// linking. Changes to those fields must not reopen an otherwise unchanged
-/// owner inference cone.
+/// Intrinsic lowering, external identity, program role, contextual-operation
+/// metadata, and checked context-row identity belong to checked-shard
+/// construction and linking. The context's lexical/type contract is retained
+/// here because it changes expression binding and inference.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerInferenceCallableContract {
     pub name: String,
     pub kind: CheckedCallableKind,
     pub parameters: Box<[OwnerInferenceParameterContract]>,
+    pub contexts: Box<[OwnerInferenceCallContextContract]>,
     pub result: FlowType,
     pub effect: CheckedEffectSummary,
 }
@@ -219,6 +246,12 @@ impl From<&OwnerAbiCallableContract> for OwnerInferenceCallableContract {
                 .parameters
                 .iter()
                 .map(OwnerInferenceParameterContract::from)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            contexts: contract
+                .contexts
+                .iter()
+                .map(OwnerInferenceCallContextContract::from)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             result: contract.result.clone(),
@@ -716,7 +749,7 @@ impl OwnerCallableAbiLookup {
             )));
         }
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_CALLABLE_ABI_LOOKUP_DOMAIN_V1,
+            OWNER_CALLABLE_ABI_LOOKUP_DOMAIN_V2,
             &(&canonical_name, &outcome),
         )
         .map_err(|error| {
@@ -1115,7 +1148,7 @@ impl OwnerInferenceAbiEnvironment {
         }
         let parameter_requirement_lookups = requirements_by_key.into_values().collect::<Vec<_>>();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V4,
+            OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V5,
             &(
                 &subjects,
                 &lookups,
@@ -2361,6 +2394,34 @@ mod tests {
             construction_before.fingerprint_v1(),
             construction_after.fingerprint_v1()
         );
+    }
+
+    #[test]
+    fn call_context_lexical_contract_participates_in_inference_fingerprints() {
+        let provider = project_owner_abi_environment(
+            &project("value: 1\n"),
+            &ExternalTypeEnvironment::empty(ProgramRole::Client),
+        )
+        .unwrap()
+        .callable_environment()
+        .unwrap();
+        let contract = provider.callable("Element/text").unwrap();
+        assert!(!contract.contexts.is_empty());
+        let before = OwnerCallableAbiLookup::found(
+            "Element/text",
+            OwnerInferenceCallableContract::from(contract),
+        )
+        .unwrap();
+        let mut context_changed = contract.clone();
+        context_changed.contexts[0].name.push_str("_changed");
+        let after = OwnerCallableAbiLookup::found(
+            "Element/text",
+            OwnerInferenceCallableContract::from(&context_changed),
+        )
+        .unwrap();
+
+        assert_ne!(before.outcome(), after.outcome());
+        assert_ne!(before.fingerprint_v1(), after.fingerprint_v1());
     }
 
     #[test]

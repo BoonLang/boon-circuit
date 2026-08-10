@@ -24,7 +24,9 @@ use boon_typecheck::{
     AmbiguousOwnerSymbolCandidate, CheckedOwnerProjectAssembly, CheckedOwnerShard,
     OwnerAbiEnvironment, OwnerBodyInferenceEvaluation, OwnerBodyInferenceShard,
     OwnerBodyInterfacePlanner, OwnerCallableAbiEnvironment, OwnerCallableAbiLookup,
-    OwnerCallableAbiLookupOutcome, OwnerConstraintSeed, OwnerConstraintSummary,
+    OwnerCallableAbiLookupOutcome, OwnerCallableResolutionPlan, OwnerCallableScopeScc,
+    OwnerCallableScopeSccEvaluation, OwnerCallableScopeSccKey, OwnerCallableScopeSccResult,
+    OwnerCallableScopeTopology, OwnerConstraintSeed, OwnerConstraintSummary,
     OwnerConstructionAbiEnvironment, OwnerConstructionCallableAbiLookup,
     OwnerConstructionValueAbiLookup, OwnerDeclarationKind, OwnerDeclarationSurface,
     OwnerDiagnosticsAggregate, OwnerInferenceAbiEnvironment, OwnerInterfaceScc,
@@ -33,11 +35,13 @@ use boon_typecheck::{
     OwnerParameterRequirementLookup, OwnerReferenceKind, OwnerSourceMap,
     OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput,
     OwnerValueAbiLookup, aggregate_owner_diagnostics, assemble_checked_owner_project,
-    build_checked_owner_shard, build_owner_interface_topology, evaluate_owner_body,
-    evaluate_owner_interface_scc, project_owner_abi_environment,
-    project_owner_constraint_seed_with_lexical_plan, project_owner_declaration_surface,
-    project_owner_lexical_plan, project_owner_source_map, project_owner_syntax_input,
-    resolve_owner_constraint_seed_with_resolutions, stable_check_owner_key_fingerprint_v1,
+    build_checked_owner_shard, build_owner_callable_scope_topology, build_owner_interface_topology,
+    evaluate_owner_body_with_signature_plan, evaluate_owner_callable_scope_scc,
+    evaluate_owner_interface_scc_with_signature_scopes, project_owner_abi_environment,
+    project_owner_callable_resolution_plan, project_owner_constraint_seed_with_lexical_plan,
+    project_owner_declaration_surface, project_owner_lexical_plan, project_owner_source_map,
+    project_owner_syntax_input, resolve_owner_constraint_seed_with_signature_plan,
+    stable_check_owner_key_fingerprint_v1,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -245,6 +249,7 @@ struct ProjectState {
     owner_source_payload_abi_lookup_requests: TypedRequestTable<OwnerSourcePayloadAbiLookupRequest>,
     owner_parameter_requirement_lookup_requests:
         TypedRequestTable<OwnerParameterRequirementLookupRequest>,
+    owner_callable_inference_abi_requests: TypedRequestTable<OwnerCallableInferenceAbiRequest>,
     owner_inference_abi_requests: TypedRequestTable<OwnerInferenceAbiRequest>,
     owner_construction_callable_abi_lookup_requests:
         TypedRequestTable<OwnerConstructionCallableAbiLookupRequest>,
@@ -252,6 +257,14 @@ struct ProjectState {
         TypedRequestTable<OwnerConstructionValueAbiLookupRequest>,
     owner_construction_abi_requests: TypedRequestTable<OwnerConstructionAbiRequest>,
     project_owner_symbol_requests: TypedRequestTable<ProjectOwnerSymbolRequest>,
+    owner_callable_resolution_requests: TypedRequestTable<OwnerCallableResolutionRequest>,
+    project_owner_callable_scope_topology_requests:
+        TypedRequestTable<ProjectOwnerCallableScopeTopologyRequest>,
+    owner_callable_scope_scc_plan_requests: TypedRequestTable<OwnerCallableScopeSccPlanRequest>,
+    owner_callable_scope_scc_evaluation_requests:
+        TypedRequestTable<OwnerCallableScopeSccEvaluationRequest>,
+    owner_callable_scope_scc_requests: TypedRequestTable<OwnerCallableScopeSccRequest>,
+    owner_callable_scope_provider_requests: TypedRequestTable<OwnerCallableScopeProviderRequest>,
     owner_constraint_requests: TypedRequestTable<OwnerConstraintRequest>,
     project_owner_interface_topology_requests:
         TypedRequestTable<ProjectOwnerInterfaceTopologyRequest>,
@@ -502,7 +515,7 @@ impl RequestFamily for OwnerLexicalPlanRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerLexicalPlan>;
 
-    const NAME: &'static str = "boon.compiler.owner-lexical-plan.v1";
+    const NAME: &'static str = "boon.compiler.owner-lexical-plan.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -519,7 +532,7 @@ impl RequestFamily for OwnerConstraintSeedRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerConstraintSeed>;
 
-    const NAME: &'static str = "boon.compiler.owner-constraint-seed.v2";
+    const NAME: &'static str = "boon.compiler.owner-constraint-seed.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -585,7 +598,7 @@ impl RequestFamily for OwnerCallableAbiLookupRequest {
     type Key = String;
     type Value = Arc<OwnerCallableAbiLookup>;
 
-    const NAME: &'static str = "boon.compiler.owner-callable-abi-lookup.v1";
+    const NAME: &'static str = "boon.compiler.owner-callable-abi-lookup.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -670,13 +683,13 @@ impl RequestFamily for OwnerParameterRequirementLookupRequest {
     }
 }
 
-struct OwnerInferenceAbiRequest;
+struct OwnerCallableInferenceAbiRequest;
 
-impl RequestFamily for OwnerInferenceAbiRequest {
+impl RequestFamily for OwnerCallableInferenceAbiRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerInferenceAbiEnvironment>;
 
-    const NAME: &'static str = "boon.compiler.owner-inference-abi.v4";
+    const NAME: &'static str = "boon.compiler.owner-callable-inference-abi.v1";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -686,6 +699,155 @@ impl RequestFamily for OwnerInferenceAbiRequest {
         value: &Self::Value,
     ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
         Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+struct OwnerInferenceAbiRequest;
+
+impl RequestFamily for OwnerInferenceAbiRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<OwnerInferenceAbiEnvironment>;
+
+    const NAME: &'static str = "boon.compiler.owner-inference-abi.v5";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+struct OwnerCallableResolutionRequest;
+
+impl RequestFamily for OwnerCallableResolutionRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<OwnerCallableResolutionPlan>;
+
+    const NAME: &'static str = "boon.compiler.owner-callable-resolution.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProjectOwnerCallableScopeTopologyKey;
+
+struct ProjectOwnerCallableScopeTopologyRequest;
+
+impl RequestFamily for ProjectOwnerCallableScopeTopologyRequest {
+    type Key = ProjectOwnerCallableScopeTopologyKey;
+    type Value = Arc<OwnerCallableScopeTopology>;
+
+    const NAME: &'static str = "boon.compiler.project-owner-callable-scope-topology.v1";
+
+    fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.project-owner-callable-scope-topology-key.v1\0",
+            std::iter::empty(),
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+struct OwnerCallableScopeSccPlanRequest;
+
+impl RequestFamily for OwnerCallableScopeSccPlanRequest {
+    type Key = OwnerCallableScopeSccKey;
+    type Value = Arc<OwnerCallableScopeScc>;
+
+    const NAME: &'static str = "boon.compiler.owner-callable-scope-scc-plan.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        let fingerprints = key
+            .members
+            .iter()
+            .map(stable_check_owner_key_fingerprint_v1)
+            .collect::<Vec<_>>();
+        request_fingerprint(
+            b"boon.compiler.owner-callable-scope-scc-key.v1\0",
+            fingerprints.iter().map(<[u8; 32]>::as_slice),
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+struct OwnerCallableScopeSccEvaluationRequest;
+
+impl RequestFamily for OwnerCallableScopeSccEvaluationRequest {
+    type Key = OwnerCallableScopeSccKey;
+    type Value = Arc<OwnerCallableScopeSccEvaluation>;
+
+    const NAME: &'static str = "boon.compiler.owner-callable-scope-scc-evaluation.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        OwnerCallableScopeSccPlanRequest::key_fingerprint(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.currentness.fingerprint_v1()))
+    }
+}
+
+struct OwnerCallableScopeSccRequest;
+
+impl RequestFamily for OwnerCallableScopeSccRequest {
+    type Key = OwnerCallableScopeSccKey;
+    type Value = Arc<OwnerCallableScopeSccResult>;
+
+    const NAME: &'static str = "boon.compiler.owner-callable-scope-scc-result.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        OwnerCallableScopeSccPlanRequest::key_fingerprint(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+struct OwnerCallableScopeProviderRequest;
+
+impl RequestFamily for OwnerCallableScopeProviderRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<OwnerCallableScopeSccKey>;
+
+    const NAME: &'static str = "boon.compiler.owner-callable-scope-provider.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(
+            OwnerCallableScopeSccPlanRequest::key_fingerprint(value),
+        ))
     }
 }
 
@@ -777,6 +939,7 @@ struct OwnerSymbolCandidate {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 struct ProjectOwnerSymbolIndex {
     symbols: BTreeMap<OwnerSymbolKey, Box<[OwnerSymbolCandidate]>>,
+    value_suffixes: BTreeMap<OwnerSymbolKey, Box<[OwnerSymbolCandidate]>>,
 }
 
 enum ProjectOwnerSymbolLookup {
@@ -820,9 +983,18 @@ impl ProjectOwnerSymbolIndex {
                 parts.len()
             };
             for prefix_len in (minimum_prefix..=parts.len()).rev() {
-                let Some(candidates) = self.symbols.get(&OwnerSymbolKey {
+                let key = OwnerSymbolKey {
                     namespace,
                     parts: parts[..prefix_len].to_vec(),
+                };
+                // Exact paths always win. Only when no exact declaration has
+                // that path may an unqualified, uniquely ranked nested value
+                // (for example `visible_todos` for `store.visible_todos`) be
+                // selected by suffix, matching the whole-program checker.
+                let Some(candidates) = self.symbols.get(&key).or_else(|| {
+                    (namespace == OwnerSymbolNamespace::Value)
+                        .then(|| self.value_suffixes.get(&key))
+                        .flatten()
                 }) else {
                     continue;
                 };
@@ -849,6 +1021,19 @@ impl ProjectOwnerSymbolIndex {
         }
         ProjectOwnerSymbolLookup::Unresolved
     }
+
+    fn resolves_callable_spelling(
+        &self,
+        owner: &StableCheckOwnerKey,
+        reference: &OwnerSymbolReference,
+    ) -> bool {
+        let mut callable = reference.clone();
+        callable.kind = OwnerReferenceKind::Callable;
+        !matches!(
+            self.resolve(owner, &callable),
+            ProjectOwnerSymbolLookup::Unresolved
+        )
+    }
 }
 
 struct ProjectOwnerSymbolRequest;
@@ -857,11 +1042,11 @@ impl RequestFamily for ProjectOwnerSymbolRequest {
     type Key = ProjectOwnerSymbolKey;
     type Value = Arc<ProjectOwnerSymbolIndex>;
 
-    const NAME: &'static str = "boon.compiler.project-owner-symbol-index.v1";
+    const NAME: &'static str = "boon.compiler.project-owner-symbol-index.v2";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
-            b"boon.compiler.project-owner-symbol-index-key.v1\0",
+            b"boon.compiler.project-owner-symbol-index-key.v2\0",
             std::iter::empty(),
         )
     }
@@ -870,7 +1055,7 @@ impl RequestFamily for ProjectOwnerSymbolRequest {
         value: &Self::Value,
     ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
         let mut hasher = Sha256::new();
-        hasher.update(b"boon.compiler.project-owner-symbol-index-result.v1\0");
+        hasher.update(b"boon.compiler.project-owner-symbol-index-result.v2\0");
         hasher.update((value.symbols.len() as u64).to_le_bytes());
         for (key, candidates) in &value.symbols {
             hasher.update([match key.namespace {
@@ -977,7 +1162,7 @@ impl RequestFamily for OwnerInterfaceSccEvaluationRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceSccEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v2";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1041,7 +1226,7 @@ impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v3";
+    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v4";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1060,7 +1245,7 @@ impl RequestFamily for OwnerBodyInferenceRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceShard>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference.v3";
+    const NAME: &'static str = "boon.compiler.owner-body-inference.v4";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1079,7 +1264,7 @@ impl RequestFamily for CheckedOwnerShardRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<CheckedOwnerShard>;
 
-    const NAME: &'static str = "boon.compiler.checked-owner-shard.v4";
+    const NAME: &'static str = "boon.compiler.checked-owner-shard.v5";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1177,11 +1362,18 @@ impl CompilerSession {
                 owner_value_abi_lookup_requests: TypedRequestTable::new(),
                 owner_source_payload_abi_lookup_requests: TypedRequestTable::new(),
                 owner_parameter_requirement_lookup_requests: TypedRequestTable::new(),
+                owner_callable_inference_abi_requests: TypedRequestTable::new(),
                 owner_inference_abi_requests: TypedRequestTable::new(),
                 owner_construction_callable_abi_lookup_requests: TypedRequestTable::new(),
                 owner_construction_value_abi_lookup_requests: TypedRequestTable::new(),
                 owner_construction_abi_requests: TypedRequestTable::new(),
                 project_owner_symbol_requests: TypedRequestTable::new(),
+                owner_callable_resolution_requests: TypedRequestTable::new(),
+                project_owner_callable_scope_topology_requests: TypedRequestTable::new(),
+                owner_callable_scope_scc_plan_requests: TypedRequestTable::new(),
+                owner_callable_scope_scc_evaluation_requests: TypedRequestTable::new(),
+                owner_callable_scope_scc_requests: TypedRequestTable::new(),
+                owner_callable_scope_provider_requests: TypedRequestTable::new(),
                 owner_constraint_requests: TypedRequestTable::new(),
                 project_owner_interface_topology_requests: TypedRequestTable::new(),
                 owner_interface_scc_plan_requests: TypedRequestTable::new(),
@@ -1462,6 +1654,16 @@ impl CompilerSession {
                 surviving_sources.contains(key.source_unit_id())
             })?;
         state
+            .owner_callable_resolution_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key.source_unit_id())
+            })?;
+        state
+            .owner_callable_inference_abi_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key.source_unit_id())
+            })?;
+        state
             .owner_inference_abi_requests
             .retain(&mut state.syntax_evaluator, |key| {
                 surviving_sources.contains(key.source_unit_id())
@@ -1470,6 +1672,34 @@ impl CompilerSession {
             .owner_construction_abi_requests
             .retain(&mut state.syntax_evaluator, |key| {
                 surviving_sources.contains(key.source_unit_id())
+            })?;
+        state.owner_callable_scope_scc_plan_requests.retain(
+            &mut state.syntax_evaluator,
+            |key| {
+                key.members
+                    .iter()
+                    .all(|owner| surviving_sources.contains(owner.source_unit_id()))
+            },
+        )?;
+        state.owner_callable_scope_scc_evaluation_requests.retain(
+            &mut state.syntax_evaluator,
+            |key| {
+                key.members
+                    .iter()
+                    .all(|owner| surviving_sources.contains(owner.source_unit_id()))
+            },
+        )?;
+        state
+            .owner_callable_scope_scc_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                key.members
+                    .iter()
+                    .all(|owner| surviving_sources.contains(owner.source_unit_id()))
+            })?;
+        state
+            .owner_callable_scope_provider_requests
+            .retain(&mut state.syntax_evaluator, |owner| {
+                surviving_sources.contains(owner.source_unit_id())
             })?;
         state
             .owner_interface_scc_plan_requests
@@ -2286,7 +2516,22 @@ fn evaluate_owner_body_requests(
             live_owners.contains(owner)
         })?;
     state
+        .owner_callable_resolution_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
+    state
+        .owner_callable_inference_abi_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
+    state
         .owner_inference_abi_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
+    state
+        .owner_callable_scope_provider_requests
         .retain(&mut state.syntax_evaluator, |owner| {
             live_owners.contains(owner)
         })?;
@@ -2577,6 +2822,7 @@ fn build_project_owner_symbol_index(
     modules: &BTreeMap<SourceUnitId, Option<String>>,
 ) -> ProjectOwnerSymbolIndex {
     let mut symbols = BTreeMap::<OwnerSymbolKey, Vec<OwnerSymbolCandidate>>::new();
+    let mut value_suffixes = BTreeMap::<OwnerSymbolKey, Vec<OwnerSymbolCandidate>>::new();
     for surface in surfaces {
         let Some(declaration) = surface.public() else {
             continue;
@@ -2622,28 +2868,43 @@ fn build_project_owner_symbol_index(
         if path.is_empty() {
             continue;
         }
+        let candidate = OwnerSymbolCandidate {
+            priority,
+            owner: surface.owner().clone(),
+            parameters: Box::new([]),
+        };
         add_owner_symbol(
             &mut symbols,
             OwnerSymbolKey {
                 namespace: OwnerSymbolNamespace::Value,
-                parts: path,
+                parts: path.clone(),
             },
-            OwnerSymbolCandidate {
-                priority,
-                owner: surface.owner().clone(),
-                parameters: Box::new([]),
-            },
+            candidate.clone(),
         );
+        for start in 1..path.len() {
+            add_owner_symbol(
+                &mut value_suffixes,
+                OwnerSymbolKey {
+                    namespace: OwnerSymbolNamespace::Value,
+                    parts: path[start..].to_vec(),
+                },
+                candidate.clone(),
+            );
+        }
     }
-    ProjectOwnerSymbolIndex {
-        symbols: symbols
+    let freeze = |symbols: BTreeMap<OwnerSymbolKey, Vec<OwnerSymbolCandidate>>| {
+        symbols
             .into_iter()
             .map(|(key, mut candidates)| {
                 candidates.sort();
                 candidates.dedup();
                 (key, candidates.into_boxed_slice())
             })
-            .collect(),
+            .collect()
+    };
+    ProjectOwnerSymbolIndex {
+        symbols: freeze(symbols),
+        value_suffixes: freeze(value_suffixes),
     }
 }
 
@@ -2668,12 +2929,38 @@ fn owner_authoritative_callable_names(
         .into_boxed_slice()
 }
 
-fn owner_authoritative_value_paths(
+fn owner_authoritative_callable_value_names(
     owner: &StableCheckOwnerKey,
-    seed: &OwnerConstraintSeed,
+    references: &[OwnerSymbolReference],
     symbols: &ProjectOwnerSymbolIndex,
 ) -> Box<[String]> {
-    seed.references
+    references
+        .iter()
+        .filter(|reference| {
+            reference.kind == OwnerReferenceKind::Value
+                && !reference
+                    .parts
+                    .first()
+                    .is_some_and(|part| boon_syntax::is_program_role_root(part))
+                && matches!(
+                    symbols.resolve(owner, reference),
+                    ProjectOwnerSymbolLookup::Unresolved
+                )
+                && !symbols.resolves_callable_spelling(owner, reference)
+        })
+        .map(|reference| reference.parts.join("/"))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn owner_authoritative_value_paths(
+    owner: &StableCheckOwnerKey,
+    references: &[OwnerSymbolReference],
+    symbols: &ProjectOwnerSymbolIndex,
+) -> Box<[String]> {
+    references
         .iter()
         .filter(|reference| {
             reference.kind == OwnerReferenceKind::Value
@@ -2693,7 +2980,7 @@ fn owner_authoritative_value_paths(
         .into_boxed_slice()
 }
 
-fn evaluate_owner_inference_abi_requests(
+fn evaluate_owner_callable_inference_abi_requests(
     state: &mut ProjectState,
     owners: &[StableCheckOwnerKey],
 ) -> CompilerResult<()> {
@@ -2710,6 +2997,131 @@ fn evaluate_owner_inference_abi_requests(
                 .map(|seed| owner_authoritative_callable_names(owner, seed, symbols).into_vec())
                 .ok_or_else(|| {
                     session_error(format!(
+                        "owner callable ABI {owner:?} has no current constraint seed"
+                    ))
+                })
+        })
+        .collect::<CompilerResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    let lookup_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-callable-abi-lookup-dependencies.v2\0",
+        std::iter::empty(),
+    ));
+    for name in &callable_names {
+        match state.owner_callable_abi_lookup_requests.begin(
+            &mut state.syntax_evaluator,
+            name.clone(),
+            lookup_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let lookup = (|| -> CompilerResult<_> {
+                    let abi = state.project_owner_callable_abi_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &ProjectOwnerAbiKey,
+                    )?;
+                    Ok(Arc::new(abi.lookup(name)?))
+                })();
+                let lookup = match lookup {
+                    Ok(lookup) => lookup,
+                    Err(error) => {
+                        state.owner_callable_abi_lookup_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_callable_abi_lookup_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    lookup,
+                )?;
+            }
+        }
+    }
+
+    let owner_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-callable-inference-abi-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    for owner in owners {
+        match state.owner_callable_inference_abi_requests.begin(
+            &mut state.syntax_evaluator,
+            owner.clone(),
+            owner_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let environment = (|| -> CompilerResult<_> {
+                    let seed = state.owner_constraint_seed_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?;
+                    let symbols = state.project_owner_symbol_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &ProjectOwnerSymbolKey,
+                    )?;
+                    let lookups = owner_authoritative_callable_names(owner, seed, symbols)
+                        .iter()
+                        .map(|name| {
+                            state
+                                .owner_callable_abi_lookup_requests
+                                .require(&state.syntax_evaluator, &mut ticket, name)
+                                .map(|lookup| lookup.as_ref().clone())
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    Ok(Arc::new(OwnerInferenceAbiEnvironment::from_lookups(
+                        [owner.clone()],
+                        lookups,
+                    )?))
+                })();
+                let environment = match environment {
+                    Ok(environment) => environment,
+                    Err(error) => {
+                        state.owner_callable_inference_abi_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_callable_inference_abi_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    environment,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn evaluate_owner_inference_abi_requests(
+    state: &mut ProjectState,
+    owners: &[StableCheckOwnerKey],
+) -> CompilerResult<()> {
+    let symbols = state
+        .project_owner_symbol_requests
+        .current_value(&state.syntax_evaluator, &ProjectOwnerSymbolKey)?
+        .ok_or_else(|| session_error("project owner symbol index was not published"))?;
+    let mut callable_names = owners
+        .iter()
+        .map(|owner| {
+            state
+                .owner_constraint_seed_requests
+                .current_value(&state.syntax_evaluator, owner)?
+                .map(|seed| owner_authoritative_callable_names(owner, seed, symbols).into_vec())
+                .ok_or_else(|| {
+                    session_error(format!(
                         "owner inference ABI {owner:?} has no current constraint seed"
                     ))
                 })
@@ -2718,18 +3130,74 @@ fn evaluate_owner_inference_abi_requests(
         .into_iter()
         .flatten()
         .collect::<BTreeSet<_>>();
+    callable_names.extend(
+        owners
+            .iter()
+            .map(|owner| {
+                let provider = state
+                    .owner_callable_scope_provider_requests
+                    .current_value(&state.syntax_evaluator, owner)?
+                    .ok_or_else(|| {
+                        session_error(format!(
+                            "owner inference ABI {owner:?} has no callable-scope provider"
+                        ))
+                    })?;
+                let result = state
+                    .owner_callable_scope_scc_requests
+                    .current_value(&state.syntax_evaluator, provider)?
+                    .ok_or_else(|| {
+                        session_error(format!(
+                            "owner inference ABI {owner:?} has no callable-scope result"
+                        ))
+                    })?;
+                let owner_result = result.owner(owner).ok_or_else(|| {
+                    session_error(format!(
+                        "owner callable-scope result {:?} omits {owner:?}",
+                        result.key
+                    ))
+                })?;
+                Ok(owner_authoritative_callable_value_names(
+                    owner,
+                    owner_result.lexical_plan().external_candidates(),
+                    symbols,
+                )
+                .into_vec())
+            })
+            .collect::<CompilerResult<Vec<_>>>()?
+            .into_iter()
+            .flatten(),
+    );
     let value_paths = owners
         .iter()
         .map(|owner| {
-            state
-                .owner_constraint_seed_requests
+            let provider = state
+                .owner_callable_scope_provider_requests
                 .current_value(&state.syntax_evaluator, owner)?
-                .map(|seed| owner_authoritative_value_paths(owner, seed, symbols).into_vec())
                 .ok_or_else(|| {
                     session_error(format!(
-                        "owner inference ABI {owner:?} has no current constraint seed"
+                        "owner inference ABI {owner:?} has no callable-scope provider"
                     ))
-                })
+                })?;
+            let result = state
+                .owner_callable_scope_scc_requests
+                .current_value(&state.syntax_evaluator, provider)?
+                .ok_or_else(|| {
+                    session_error(format!(
+                        "owner inference ABI {owner:?} has no callable-scope result"
+                    ))
+                })?;
+            let owner_result = result.owner(owner).ok_or_else(|| {
+                session_error(format!(
+                    "owner callable-scope result {:?} omits {owner:?}",
+                    result.key
+                ))
+            })?;
+            Ok(owner_authoritative_value_paths(
+                owner,
+                owner_result.lexical_plan().external_candidates(),
+                symbols,
+            )
+            .into_vec())
         })
         .collect::<CompilerResult<Vec<_>>>()?
         .into_iter()
@@ -2791,7 +3259,7 @@ fn evaluate_owner_inference_abi_requests(
         })?;
 
     let lookup_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-callable-abi-lookup-dependencies.v1\0",
+        b"boon.compiler.owner-callable-abi-lookup-dependencies.v2\0",
         std::iter::empty(),
     ));
     for name in &callable_names {
@@ -2967,7 +3435,7 @@ fn evaluate_owner_inference_abi_requests(
     }
 
     let owner_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-inference-abi-dependencies.v4\0",
+        b"boon.compiler.owner-inference-abi-dependencies.v5\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -2984,31 +3452,51 @@ fn evaluate_owner_inference_abi_requests(
                         &mut ticket,
                         owner,
                     )?;
+                    let callable_abi = state.owner_callable_inference_abi_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?;
                     let symbols = state.project_owner_symbol_requests.require(
                         &state.syntax_evaluator,
                         &mut ticket,
                         &ProjectOwnerSymbolKey,
                     )?;
-                    let lookups = owner_authoritative_callable_names(owner, seed, symbols)
-                        .iter()
-                        .map(|name| {
-                            state
-                                .owner_callable_abi_lookup_requests
-                                .require(&state.syntax_evaluator, &mut ticket, name)
-                                .map(|lookup| lookup.as_ref().clone())
-                                .map_err(Into::into)
-                        })
-                        .collect::<CompilerResult<Vec<_>>>()?;
-                    let value_lookups = owner_authoritative_value_paths(owner, seed, symbols)
-                        .iter()
-                        .map(|path| {
-                            state
-                                .owner_value_abi_lookup_requests
-                                .require(&state.syntax_evaluator, &mut ticket, path)
-                                .map(|lookup| lookup.as_ref().clone())
-                                .map_err(Into::into)
-                        })
-                        .collect::<CompilerResult<Vec<_>>>()?;
+                    let provider =
+                        Arc::clone(state.owner_callable_scope_provider_requests.require(
+                            &state.syntax_evaluator,
+                            &mut ticket,
+                            owner,
+                        )?);
+                    let scope_result = state.owner_callable_scope_scc_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &provider,
+                    )?;
+                    let signature_plan = &scope_result
+                        .owner(owner)
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "owner callable-scope result {:?} omits {owner:?}",
+                                scope_result.key
+                            ))
+                        })?
+                        .lexical_plan();
+                    let lookups = callable_abi.lookups().to_vec();
+                    let value_lookups = owner_authoritative_value_paths(
+                        owner,
+                        signature_plan.external_candidates(),
+                        symbols,
+                    )
+                    .iter()
+                    .map(|path| {
+                        state
+                            .owner_value_abi_lookup_requests
+                            .require(&state.syntax_evaluator, &mut ticket, path)
+                            .map(|lookup| lookup.as_ref().clone())
+                            .map_err(Into::into)
+                    })
+                    .collect::<CompilerResult<Vec<_>>>()?;
                     let source_payload_lookups = seed
                         .source_payload_abi_paths()
                         .iter()
@@ -3063,6 +3551,399 @@ fn evaluate_owner_inference_abi_requests(
     Ok(())
 }
 
+fn evaluate_owner_callable_scope_requests(
+    state: &mut ProjectState,
+    owners: &[StableCheckOwnerKey],
+) -> CompilerResult<()> {
+    let resolution_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-callable-resolution-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    for owner in owners {
+        match state.owner_callable_resolution_requests.begin(
+            &mut state.syntax_evaluator,
+            owner.clone(),
+            resolution_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let plan = (|| -> CompilerResult<_> {
+                    let seed = state.owner_constraint_seed_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?;
+                    let symbols = state.project_owner_symbol_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &ProjectOwnerSymbolKey,
+                    )?;
+                    let abi = state.owner_callable_inference_abi_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?;
+                    let resolutions = seed
+                        .references
+                        .iter()
+                        .filter(|reference| reference.kind == OwnerReferenceKind::Callable)
+                        .map(|reference| -> CompilerResult<_> {
+                            Ok(match symbols.resolve(owner, reference) {
+                                ProjectOwnerSymbolLookup::Resolved {
+                                    candidate,
+                                    projection,
+                                } => OwnerSymbolResolution::Resolved {
+                                    reference: reference.clone(),
+                                    owner: candidate.owner,
+                                    projection,
+                                    parameters: candidate.parameters,
+                                },
+                                ProjectOwnerSymbolLookup::Ambiguous { candidates } => {
+                                    OwnerSymbolResolution::Ambiguous {
+                                        reference: reference.clone(),
+                                        candidates: candidates
+                                            .into_vec()
+                                            .into_iter()
+                                            .map(|candidate| AmbiguousOwnerSymbolCandidate {
+                                                owner: candidate.owner,
+                                                parameters: candidate.parameters,
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .into_boxed_slice(),
+                                    }
+                                }
+                                ProjectOwnerSymbolLookup::Unresolved => {
+                                    let canonical_name = reference.parts.join("/");
+                                    let lookup = abi.lookup(&canonical_name).ok_or_else(|| {
+                                        session_error(format!(
+                                            "owner callable resolution {owner:?} has no exact ABI lookup for `{canonical_name}`"
+                                        ))
+                                    })?;
+                                    match lookup.outcome() {
+                                        OwnerCallableAbiLookupOutcome::Found { .. } => {
+                                            OwnerSymbolResolution::Authoritative {
+                                                reference: reference.clone(),
+                                            }
+                                        }
+                                        OwnerCallableAbiLookupOutcome::Missing => {
+                                            OwnerSymbolResolution::Unresolved {
+                                                reference: reference.clone(),
+                                            }
+                                        }
+                                        OwnerCallableAbiLookupOutcome::Conflict { .. } => {
+                                            return Err(session_error(format!(
+                                                "owner callable resolution {owner:?} has conflicting authoritative ABI contracts for `{canonical_name}`"
+                                            )));
+                                        }
+                                    }
+                                }
+                            })
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    Ok(Arc::new(project_owner_callable_resolution_plan(
+                        seed,
+                        resolutions,
+                    )?))
+                })();
+                let plan = match plan {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        state.owner_callable_resolution_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_callable_resolution_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    plan,
+                )?;
+            }
+        }
+    }
+
+    let topology_key = ProjectOwnerCallableScopeTopologyKey;
+    let topology_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.project-owner-callable-scope-topology-dependencies.v1\0",
+        owners
+            .iter()
+            .map(stable_check_owner_key_fingerprint_v1)
+            .collect::<Vec<_>>()
+            .iter()
+            .map(<[u8; 32]>::as_slice),
+    ));
+    match state.project_owner_callable_scope_topology_requests.begin(
+        &mut state.syntax_evaluator,
+        topology_key.clone(),
+        topology_input,
+    )? {
+        RequestStart::Reused => {}
+        RequestStart::Execute(mut ticket) => {
+            let topology = (|| -> CompilerResult<_> {
+                let plans = owners
+                    .iter()
+                    .map(|owner| {
+                        state
+                            .owner_callable_resolution_requests
+                            .require(&state.syntax_evaluator, &mut ticket, owner)
+                            .map(Arc::clone)
+                            .map_err(Into::into)
+                    })
+                    .collect::<CompilerResult<Vec<_>>>()?;
+                Ok(Arc::new(build_owner_callable_scope_topology(
+                    plans.iter().map(Arc::as_ref),
+                )?))
+            })();
+            let topology = match topology {
+                Ok(topology) => topology,
+                Err(error) => {
+                    state.project_owner_callable_scope_topology_requests.abort(
+                        &mut state.syntax_evaluator,
+                        ticket,
+                        RequestAbortReason::Failed,
+                    )?;
+                    return Err(error);
+                }
+            };
+            state
+                .project_owner_callable_scope_topology_requests
+                .publish(&mut state.syntax_evaluator, ticket, topology)?;
+        }
+    }
+    let topology = Arc::clone(
+        state
+            .project_owner_callable_scope_topology_requests
+            .current_value(&state.syntax_evaluator, &topology_key)?
+            .ok_or_else(|| session_error("owner callable scope topology was not published"))?,
+    );
+    let live_keys = topology
+        .sccs
+        .iter()
+        .map(|scc| scc.key.clone())
+        .collect::<BTreeSet<_>>();
+    let live_owners = owners.iter().cloned().collect::<BTreeSet<_>>();
+    state
+        .owner_callable_scope_scc_plan_requests
+        .retain(&mut state.syntax_evaluator, |key| live_keys.contains(key))?;
+    state
+        .owner_callable_scope_scc_evaluation_requests
+        .retain(&mut state.syntax_evaluator, |key| live_keys.contains(key))?;
+    state
+        .owner_callable_scope_scc_requests
+        .retain(&mut state.syntax_evaluator, |key| live_keys.contains(key))?;
+    state
+        .owner_callable_scope_provider_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
+    for expected in &topology.sccs {
+        let provider_input = RequestInputFingerprint(
+            OwnerCallableScopeSccPlanRequest::key_fingerprint(&expected.key),
+        );
+        let provider = Arc::new(expected.key.clone());
+        for owner in &expected.key.members {
+            match state.owner_callable_scope_provider_requests.begin(
+                &mut state.syntax_evaluator,
+                owner.clone(),
+                provider_input,
+            )? {
+                RequestStart::Reused => {}
+                RequestStart::Execute(ticket) => {
+                    state.owner_callable_scope_provider_requests.publish(
+                        &mut state.syntax_evaluator,
+                        ticket,
+                        Arc::clone(&provider),
+                    )?;
+                }
+            }
+        }
+    }
+
+    let plan_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-callable-scope-scc-plan-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    for (index, expected) in topology.sccs.iter().enumerate() {
+        match state.owner_callable_scope_scc_plan_requests.begin(
+            &mut state.syntax_evaluator,
+            expected.key.clone(),
+            plan_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let plan = (|| -> CompilerResult<_> {
+                    let topology = state
+                        .project_owner_callable_scope_topology_requests
+                        .require(&state.syntax_evaluator, &mut ticket, &topology_key)?;
+                    topology
+                        .sccs
+                        .get(index)
+                        .filter(|scc| scc.key == expected.key)
+                        .cloned()
+                        .map(Arc::new)
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "owner callable scope topology has no SCC plan for {:?}",
+                                expected.key
+                            ))
+                        })
+                })();
+                let plan = match plan {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        state.owner_callable_scope_scc_plan_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_callable_scope_scc_plan_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    plan,
+                )?;
+            }
+        }
+    }
+
+    let evaluation_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-callable-scope-scc-evaluation-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    let result_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-callable-scope-scc-result-projection-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    for expected in &topology.sccs {
+        match state.owner_callable_scope_scc_evaluation_requests.begin(
+            &mut state.syntax_evaluator,
+            expected.key.clone(),
+            evaluation_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let evaluation = (|| -> CompilerResult<_> {
+                    let plan = Arc::clone(state.owner_callable_scope_scc_plan_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &expected.key,
+                    )?);
+                    let seeds = plan
+                        .key
+                        .members
+                        .iter()
+                        .map(|owner| {
+                            state
+                                .owner_constraint_seed_requests
+                                .require(&state.syntax_evaluator, &mut ticket, owner)
+                                .map(Arc::clone)
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    let resolutions = plan
+                        .key
+                        .members
+                        .iter()
+                        .map(|owner| {
+                            state
+                                .owner_callable_resolution_requests
+                                .require(&state.syntax_evaluator, &mut ticket, owner)
+                                .map(Arc::clone)
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    let abi_slices = plan
+                        .key
+                        .members
+                        .iter()
+                        .map(|owner| {
+                            state
+                                .owner_callable_inference_abi_requests
+                                .require(&state.syntax_evaluator, &mut ticket, owner)
+                                .map(Arc::clone)
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    let abi =
+                        OwnerInferenceAbiEnvironment::merge(abi_slices.iter().map(Arc::as_ref))?;
+                    let dependencies = plan
+                        .dependencies
+                        .iter()
+                        .map(|dependency| {
+                            state
+                                .owner_callable_scope_scc_requests
+                                .require(&state.syntax_evaluator, &mut ticket, dependency)
+                                .map(Arc::clone)
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    Ok(Arc::new(evaluate_owner_callable_scope_scc(
+                        &plan,
+                        seeds.iter().map(Arc::as_ref),
+                        resolutions.iter().map(Arc::as_ref),
+                        &abi,
+                        dependencies.iter().map(Arc::as_ref),
+                    )?))
+                })();
+                let evaluation = match evaluation {
+                    Ok(evaluation) => evaluation,
+                    Err(error) => {
+                        state.owner_callable_scope_scc_evaluation_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_callable_scope_scc_evaluation_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    evaluation,
+                )?;
+            }
+        }
+        match state.owner_callable_scope_scc_requests.begin(
+            &mut state.syntax_evaluator,
+            expected.key.clone(),
+            result_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let result =
+                    (|| -> CompilerResult<_> {
+                        let evaluation = state
+                            .owner_callable_scope_scc_evaluation_requests
+                            .require(&state.syntax_evaluator, &mut ticket, &expected.key)?;
+                        Ok(Arc::clone(&evaluation.result))
+                    })();
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        state.owner_callable_scope_scc_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_callable_scope_scc_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    result,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn evaluate_owner_constraint_requests(
     state: &mut ProjectState,
     linked_units: &[Arc<UnitSyntaxSnapshot>],
@@ -3070,7 +3951,7 @@ fn evaluate_owner_constraint_requests(
 ) -> CompilerResult<()> {
     let mut trace = OwnerRequestTrace::new();
     let projection_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-declaration-and-lexical-dependencies.v1\0",
+        b"boon.compiler.owner-declaration-and-lexical-dependencies.v2\0",
         std::iter::empty(),
     ));
     let seed_input = RequestInputFingerprint(request_fingerprint(
@@ -3249,6 +4130,10 @@ fn evaluate_owner_constraint_requests(
         }
     }
     trace.checkpoint("project-symbol-index", owners.len());
+    evaluate_owner_callable_inference_abi_requests(state, owners)?;
+    trace.checkpoint("callable-inference-abi", owners.len());
+    evaluate_owner_callable_scope_requests(state, owners)?;
+    trace.checkpoint("callable-scopes", owners.len());
     evaluate_owner_inference_abi_requests(state, owners)?;
     trace.checkpoint("inference-abi", owners.len());
 
@@ -3280,10 +4165,66 @@ fn evaluate_owner_constraint_requests(
                         &mut ticket,
                         owner,
                     )?);
-                    let resolutions = seed
-                        .references
+                    let callable_resolutions = state.owner_callable_resolution_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?;
+                    let provider =
+                        Arc::clone(state.owner_callable_scope_provider_requests.require(
+                            &state.syntax_evaluator,
+                            &mut ticket,
+                            owner,
+                        )?);
+                    let scope_result = state.owner_callable_scope_scc_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &provider,
+                    )?;
+                    let signature_plan = &scope_result
+                        .owner(owner)
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "owner callable-scope result {:?} omits {owner:?}",
+                                scope_result.key
+                            ))
+                        })?
+                        .lexical_plan();
+                    let authoritative_callable_value_lookups =
+                        owner_authoritative_callable_value_names(
+                            owner,
+                            signature_plan.external_candidates(),
+                            &symbols,
+                        )
+                        .iter()
+                        .map(|name| {
+                            state
+                                .owner_callable_abi_lookup_requests
+                                .require(&state.syntax_evaluator, &mut ticket, name)
+                                .map(|lookup| (name.clone(), Arc::clone(lookup)))
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<BTreeMap<_, _>>>()?;
+                    let callable_by_reference = callable_resolutions
+                        .resolutions()
+                        .iter()
+                        .map(|resolution| (resolution.reference(), resolution))
+                        .collect::<BTreeMap<_, _>>();
+                    let resolutions = signature_plan
+                        .external_candidates()
                         .iter()
                         .map(|reference| -> CompilerResult<_> {
+                            if reference.kind == OwnerReferenceKind::Callable {
+                                return callable_by_reference
+                                    .get(reference)
+                                    .cloned()
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        session_error(format!(
+                                            "owner constraint {owner:?} has no callable resolution for {reference:?}"
+                                        ))
+                                    });
+                            }
                             Ok(match symbols.resolve(owner, reference) {
                             ProjectOwnerSymbolLookup::Resolved {
                                 candidate,
@@ -3329,30 +4270,14 @@ fn evaluate_owner_constraint_requests(
                                 }
                             }
                             ProjectOwnerSymbolLookup::Unresolved
-                                if reference.kind == OwnerReferenceKind::Callable =>
+                                if reference.kind == OwnerReferenceKind::Value
+                                    && (symbols.resolves_callable_spelling(owner, reference)
+                                        || authoritative_callable_value_lookups
+                                            .get(&reference.parts.join("/"))
+                                            .is_some_and(|lookup| lookup.contract().is_some())) =>
                             {
-                                let canonical_name = reference.parts.join("/");
-                                let lookup = abi.lookup(&canonical_name).ok_or_else(|| {
-                                    session_error(format!(
-                                        "owner constraint {owner:?} has no exact ABI lookup for `{canonical_name}`"
-                                    ))
-                                })?;
-                                match lookup.outcome() {
-                                    OwnerCallableAbiLookupOutcome::Found { .. } => {
-                                        OwnerSymbolResolution::Authoritative {
-                                            reference: reference.clone(),
-                                        }
-                                    }
-                                    OwnerCallableAbiLookupOutcome::Missing => {
-                                        OwnerSymbolResolution::Unresolved {
-                                            reference: reference.clone(),
-                                        }
-                                    }
-                                    OwnerCallableAbiLookupOutcome::Conflict { .. } => {
-                                        return Err(session_error(format!(
-                                            "owner constraint {owner:?} has conflicting authoritative ABI contracts for `{canonical_name}`"
-                                        )));
-                                    }
+                                OwnerSymbolResolution::CallableAsValue {
+                                    reference: reference.clone(),
                                 }
                             }
                             ProjectOwnerSymbolLookup::Unresolved => {
@@ -3363,8 +4288,9 @@ fn evaluate_owner_constraint_requests(
                         })
                         })
                         .collect::<CompilerResult<Vec<_>>>()?;
-                    Ok(Arc::new(resolve_owner_constraint_seed_with_resolutions(
+                    Ok(Arc::new(resolve_owner_constraint_seed_with_signature_plan(
                         &seed,
+                        signature_plan,
                         resolutions,
                     )?))
                 })();
@@ -3549,7 +4475,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
     trace.checkpoint("interface-scc-plans", topology.sccs.len());
 
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v2\0",
+        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v3\0",
         std::iter::empty(),
     ));
     let result_input = RequestInputFingerprint(request_fingerprint(
@@ -3619,13 +4545,46 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                                 .map_err(Into::into)
                         })
                         .collect::<CompilerResult<Vec<_>>>()?;
+                    let callable_scope_results = plan
+                        .key
+                        .members
+                        .iter()
+                        .map(|owner| -> CompilerResult<_> {
+                            let provider =
+                                Arc::clone(state.owner_callable_scope_provider_requests.require(
+                                    &state.syntax_evaluator,
+                                    &mut ticket,
+                                    owner,
+                                )?);
+                            state
+                                .owner_callable_scope_scc_requests
+                                .require(&state.syntax_evaluator, &mut ticket, &provider)
+                                .map(Arc::clone)
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    let signature_scopes = plan
+                        .key
+                        .members
+                        .iter()
+                        .zip(&callable_scope_results)
+                        .map(|(owner, result)| {
+                            result.owner(owner).ok_or_else(|| {
+                                session_error(format!(
+                                    "owner callable-scope result {:?} omits {owner:?}",
+                                    result.key
+                                ))
+                            })
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
                     let solve_started = Instant::now();
-                    let evaluation = evaluate_owner_interface_scc(
+                    let evaluation = evaluate_owner_interface_scc_with_signature_scopes(
                         &plan,
                         &abi,
                         seeds.iter().map(Arc::as_ref),
                         summaries.iter().map(Arc::as_ref),
                         dependencies.iter().map(Arc::as_ref),
+                        signature_scopes,
                     )?;
                     let solve_ms = solve_started.elapsed().as_secs_f64() * 1_000.0;
                     if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && solve_ms >= 10.0 {
@@ -3707,7 +4666,7 @@ fn evaluate_owner_body_inference_requests(
         .flat_map(|scc| scc.key.members.iter().cloned())
         .collect::<Vec<_>>();
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-body-inference-evaluation-dependencies.v5\0",
+        b"boon.compiler.owner-body-inference-evaluation-dependencies.v6\0",
         std::iter::empty(),
     ));
     let mut planning_ms = 0.0;
@@ -3799,8 +4758,28 @@ fn evaluate_owner_body_inference_requests(
                             })
                         })
                         .collect::<CompilerResult<Vec<_>>>()?;
+                    let callable_scope_provider =
+                        Arc::clone(state.owner_callable_scope_provider_requests.require(
+                            &state.syntax_evaluator,
+                            &mut ticket,
+                            &owner,
+                        )?);
+                    let callable_scope_result = state.owner_callable_scope_scc_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &callable_scope_provider,
+                    )?;
+                    let signature_lexical_plan = &callable_scope_result
+                        .owner(&owner)
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "owner callable-scope result {:?} omits {owner:?}",
+                                callable_scope_result.key
+                            ))
+                        })?
+                        .lexical_plan();
                     let solve_started = Instant::now();
-                    let evaluation = evaluate_owner_body(
+                    let evaluation = evaluate_owner_body_with_signature_plan(
                         &syntax,
                         &lexical_plan,
                         &seed,
@@ -3809,6 +4788,7 @@ fn evaluate_owner_body_inference_requests(
                         &interface_plan,
                         &own_scc,
                         imports.iter().map(Arc::as_ref),
+                        signature_lexical_plan,
                     )?;
                     let solve_ms = solve_started.elapsed().as_secs_f64() * 1_000.0;
                     if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && solve_ms >= 10.0 {
@@ -3861,7 +4841,7 @@ fn evaluate_owner_body_inference_requests(
         result_transfer_edges =
             result_transfer_edges.saturating_add(body_work.interface_plan_transfer_edges);
         let result_input = RequestInputFingerprint(request_fingerprint(
-            b"boon.compiler.owner-body-inference-result-projection-dependencies.v2\0",
+            b"boon.compiler.owner-body-inference-result-projection-dependencies.v3\0",
             std::iter::empty(),
         ));
         match state.owner_body_inference_requests.begin(
@@ -4176,7 +5156,7 @@ fn evaluate_checked_owner_shard_requests(
     trace.checkpoint("construction-abi", owners.len());
 
     let shard_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.checked-owner-shard-dependencies.v4\0",
+        b"boon.compiler.checked-owner-shard-dependencies.v5\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -4611,6 +5591,42 @@ mod tests {
     }
 
     #[test]
+    fn owner_diagnostics_aggregate_includes_signature_lexical_errors_without_checked_shards() {
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(project(concat!(
+                "FUNCTION fill_both(first: OUT, second: OUT) {\n",
+                "    first\n",
+                "}\n",
+                "FUNCTION caller(existing) {\n",
+                "    values: LIST { existing }\n",
+                "    fill_both(first, second: existing)\n",
+                "}\n",
+            )))
+            .unwrap();
+        let (_, aggregate, _, _, _) =
+            parse_project_diagnostics_snapshot(session.projects.get_mut(&project).unwrap())
+                .unwrap();
+        assert!(
+            aggregate.diagnostics().iter().any(|diagnostic| {
+                diagnostic.message
+                    == "no enclosing OUT named `existing` exists for output parameter `second`"
+            }),
+            "aggregate diagnostics: {aggregate:#?}"
+        );
+
+        let state = session.projects.get(&project).unwrap();
+        assert_eq!(state.owner_construction_abi_requests.request_count(), 0);
+        assert_eq!(state.checked_owner_shard_requests.request_count(), 0);
+        assert_eq!(
+            state
+                .checked_owner_project_assembly_requests
+                .request_count(),
+            0
+        );
+    }
+
+    #[test]
     fn checked_stage_is_consumed_once_by_verified_stage_and_then_reused() {
         let mut session = CompilerSession::new();
         let project = session.open_project(project("value: 1")).unwrap();
@@ -4895,14 +5911,14 @@ mod tests {
             second.profile.parse_work
         };
         let second_stats = session.frontend_request_stats(project).unwrap();
-        // Counts include declaration-surface/lexical-plan, exact provider,
-        // inference/construction ABI, and checked-owner requests. The warm
-        // edit reuses 59 requests and changes only the edited owner's
-        // dependency cone despite conservatively reexecuting/backdating
-        // shared providers.
+        // Counts include the callable-only ABI/resolution/scope SCC split in
+        // addition to declaration-surface/lexical-plan, exact interface
+        // provider, inference/construction ABI, and checked-owner requests.
+        // All 25 callable-scope requests are reused by this literal-only warm
+        // edit; the edited owner's ordinary dependency cone remains local.
         assert_eq!(
             (first_request_counts, request_counts(second_stats)),
-            ((75, 75, 0, 0, 75), (150, 91, 59, 8, 83))
+            ((100, 100, 0, 0, 100), (200, 116, 84, 8, 108))
         );
 
         let mut isolated = CompilerSession::new();
@@ -5158,6 +6174,97 @@ mod tests {
         assert_eq!(
             body.expressions.last().unwrap().flow_type.ty,
             boon_checked::Type::Number
+        );
+    }
+
+    #[test]
+    fn project_value_resolution_uses_only_unique_suffixes_and_prefers_exact_paths() {
+        let source = concat!(
+            "nested: TEXT { exact }\n",
+            "store: [\n",
+            "    nested: 1\n",
+            "    unique: 2\n",
+            "]\n",
+            "left: [\n",
+            "    duplicate: 3\n",
+            "]\n",
+            "right: [\n",
+            "    duplicate: 4\n",
+            "]\n",
+            "exact_value: nested\n",
+            "suffix_value: unique\n",
+            "ambiguous_value: duplicate\n",
+        );
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project(source)).unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let owners = unit.stable_check_owner_keys().collect::<Vec<_>>();
+        let named_owner = |name: &str| {
+            owners
+                .iter()
+                .find(|owner| {
+                    matches!(
+                        owner,
+                        StableCheckOwnerKey::Item(owner)
+                            if owner.item_route.segments().last().is_some_and(|segment| {
+                                segment.names.first().is_some_and(|candidate| candidate == name)
+                            })
+                    )
+                })
+                .cloned()
+                .unwrap()
+        };
+        let exact_declaration = owners
+            .iter()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().len() == 1
+                            && owner.item_route.segments()[0].names == ["nested"]
+                )
+            })
+            .cloned()
+            .unwrap();
+        let unique_declaration = named_owner("unique");
+
+        let exact_summary = session
+            .owner_constraint_summary(project, &named_owner("exact_value"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            exact_summary.resolved_references[0].owner,
+            exact_declaration
+        );
+
+        let suffix_summary = session
+            .owner_constraint_summary(project, &named_owner("suffix_value"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            suffix_summary.resolved_references[0].owner,
+            unique_declaration
+        );
+
+        let ambiguous_summary = session
+            .owner_constraint_summary(project, &named_owner("ambiguous_value"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            ambiguous_summary
+                .symbol_resolutions
+                .iter()
+                .any(|resolution| {
+                    matches!(
+                        resolution,
+                        OwnerSymbolResolution::Ambiguous { candidates, .. } if candidates.len() == 2
+                    )
+                }),
+            "ambiguous summary: {ambiguous_summary:#?}"
         );
     }
 
@@ -5619,6 +6726,162 @@ mod tests {
     }
 
     #[test]
+    fn cross_owner_function_used_as_value_keeps_exact_invalid_resolution() {
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(project("FUNCTION helper() {\n    1\n}\nvalue: helper\n"))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let owner = unit
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| segment.names == ["value"])
+                )
+            })
+            .unwrap();
+        let summary = session
+            .owner_constraint_summary(project, &owner)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            summary.symbol_resolutions.as_ref(),
+            [OwnerSymbolResolution::CallableAsValue { reference }]
+                if reference.parts.as_ref() == ["helper"]
+        ));
+        let body = session
+            .owner_body_inference(project, &owner)
+            .unwrap()
+            .unwrap();
+        assert!(body.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "function_must_be_called"
+                && diagnostic
+                    .message
+                    .contains("function `helper` must be called")
+        }));
+        assert!(
+            session
+                .checked_owner_shard(project, &owner)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn authoritative_callable_used_as_value_has_an_exact_callable_lookup() {
+        let mut session = CompilerSession::new();
+        let project_id = session
+            .open_project(project("value: Number.to_text\n"))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project_id).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project_id, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let owner = unit
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| segment.names == ["value"])
+                )
+            })
+            .unwrap();
+        let summary = session
+            .owner_constraint_summary(project_id, &owner)
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                summary.symbol_resolutions.as_ref(),
+                [OwnerSymbolResolution::CallableAsValue { reference }]
+                    if reference.parts.as_ref() == ["Number", "to_text"]
+            ),
+            "{:#?}",
+            summary.symbol_resolutions
+        );
+        let body = session
+            .owner_body_inference(project_id, &owner)
+            .unwrap()
+            .unwrap();
+        assert!(body.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "function_must_be_called"
+                && diagnostic
+                    .message
+                    .contains("function `Number/to_text` must be called")
+        }));
+        let state = session.projects.get(&project_id).unwrap();
+        let lookup = state
+            .owner_callable_abi_lookup_requests
+            .current_value(&state.syntax_evaluator, &"Number/to_text".to_owned())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            lookup.outcome(),
+            boon_typecheck::OwnerCallableAbiLookupOutcome::Found { .. }
+        ));
+
+        let mut shadowing_session = CompilerSession::new();
+        let shadowing_project = shadowing_session
+            .open_project(project(concat!(
+                "FUNCTION helper() {\n",
+                "    1\n",
+                "}\n",
+                "container: [\n",
+                "    helper: 7\n",
+                "    value: helper\n",
+                "]\n",
+            )))
+            .unwrap();
+        parse_project_snapshot(
+            shadowing_session
+                .projects
+                .get_mut(&shadowing_project)
+                .unwrap(),
+        )
+        .unwrap();
+        let unit = shadowing_session
+            .unit_syntax_snapshot(shadowing_project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let owner = unit
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| segment.names == ["value"])
+                )
+            })
+            .unwrap();
+        let summary = shadowing_session
+            .owner_constraint_summary(shadowing_project, &owner)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            summary.symbol_resolutions.as_ref(),
+            [OwnerSymbolResolution::Resolved { .. }]
+        ));
+        let body = shadowing_session
+            .owner_body_inference(shadowing_project, &owner)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !body
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "function_must_be_called")
+        );
+    }
+
+    #[test]
     fn source_payload_has_one_exact_owner_inference_lookup() {
         let mut session = CompilerSession::new();
         let project = session
@@ -6014,14 +7277,13 @@ mod tests {
         assert!(Arc::ptr_eq(&interface_topology, &body_topology));
         let body_stats = session.frontend_request_stats(project).unwrap();
         let body_delta = request_delta(body_stats, interface_stats);
-        // Declaration-surface/lexical-plan, exact interface-provider,
-        // callable/parameter lookup, inference/construction ABI, and
-        // checked-owner families are included here: they may reexecute and
-        // backdate after broad provider changes while preserving unchanged
-        // owner results.
+        // The callable-only ABI, resolution, scope topology/SCC, and provider
+        // families are included here. An exported callable change reexecutes
+        // its exact scope cone and backdates unchanged projections; the body-
+        // only edit reuses 141 of 170 demanded requests and changes only 16.
         assert_eq!(
             (interface_delta, body_delta),
-            ((127, 57, 70, 26, 31), (127, 25, 102, 11, 14))
+            ((170, 82, 88, 44, 38), (170, 29, 141, 13, 16))
         );
     }
 

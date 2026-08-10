@@ -1,11 +1,15 @@
+use crate::owner_signature_lexical::effective_narrowed_selector_read_matches;
 use crate::{
     AuthoritativeCallableSignature, AuthoritativeParameter, BuiltinSignatureRegistry,
-    OwnerArgumentKind, OwnerCollectionKind, OwnerConstraintEdgeRole, OwnerConstraintNodeKind,
-    OwnerConstraintSeed, OwnerConstraintSeedError, OwnerConstraintSummary, OwnerDeclarationKind,
-    OwnerInferenceAbiEnvironment, OwnerInterfaceScc, OwnerInterfaceSccKey,
-    OwnerLexicalDeclarationTarget, OwnerParameterKind, OwnerPatternConstraint, OwnerReferenceKind,
-    OwnerSymbolResolution, RenderContractRegistry, host_effect_signature,
-    infix_requires_number_operands, infix_returns_bool, session_info_intrinsic_type,
+    OwnerArgumentKind, OwnerCallableLexicalSignature, OwnerCallableScopeOwnerResult,
+    OwnerCollectionKind, OwnerConstraintEdgeRole, OwnerConstraintNodeKind, OwnerConstraintSeed,
+    OwnerConstraintSeedError, OwnerConstraintSummary, OwnerDeclarationKind,
+    OwnerEffectiveLexicalTarget, OwnerInferenceAbiEnvironment, OwnerInterfaceScc,
+    OwnerInterfaceSccKey, OwnerLexicalDeclarationTarget, OwnerParameterKind,
+    OwnerPatternConstraint, OwnerReferenceKind, OwnerSignatureDeclarationTarget,
+    OwnerSignatureLexicalPlan, OwnerSymbolResolution, RenderContractRegistry,
+    host_effect_signature, infix_requires_number_operands, infix_returns_bool,
+    project_owner_signature_lexical_scope_plans, session_info_intrinsic_type,
 };
 use boon_checked::{
     BytesType, CheckedEffectSummary, CheckedParameterKind, CheckedParameterRequirement, FlowMode,
@@ -18,8 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V2: &[u8] = b"boon.owner-interface-scc-result.v2\0";
-const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V2: &[u8] =
-    b"boon.owner-interface-scc-currentness.v2\0";
+const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V3: &[u8] =
+    b"boon.owner-interface-scc-currentness.v3\0";
 const OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V1: &[u8] = b"boon.owner-body-interface-import.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -61,6 +65,8 @@ pub enum OwnerResultExpressionRef {
 pub struct OwnerResultTransferInput {
     pub role: OwnerConstraintEdgeRole,
     pub expression: OwnerResultExpressionRef,
+    pub formal_ordinal: Option<u32>,
+    pub explicit_pass: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -214,6 +220,7 @@ pub struct OwnerInterfaceSolveWork {
 pub struct OwnerInterfaceSccOwnerBasis {
     pub owner: StableCheckOwnerKey,
     pub lexical_reads_fingerprint_v1: [u8; 32],
+    pub signature_lexical_plan_fingerprint_v1: [u8; 32],
     pub seed_fingerprint_v1: [u8; 32],
     pub summary_fingerprint_v1: [u8; 32],
 }
@@ -304,7 +311,7 @@ impl OwnerInterfaceSccCurrentnessReceipt {
         }
         let result_fingerprint_v1 = result.fingerprint_v1();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V2,
+            OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V3,
             &(&basis, result_fingerprint_v1),
         )
         .map_err(|error| {
@@ -835,6 +842,7 @@ struct OwnerSolveParameter {
 enum PlannedLexicalRead {
     Unplanned,
     Bound(TypeVar),
+    Dynamic,
     Reserved,
 }
 
@@ -842,6 +850,9 @@ enum PlannedLexicalRead {
 struct OwnerSolveState<'a> {
     seed: &'a OwnerConstraintSeed,
     summary: &'a OwnerConstraintSummary,
+    signature_lexical_plan: OwnerSignatureLexicalPlan,
+    signature_declaration_variables: BTreeMap<OwnerSignatureDeclarationTarget, TypeVar>,
+    signature_read_expressions: BTreeMap<OwnerSignatureDeclarationTarget, Vec<usize>>,
     declaration_kind: Option<OwnerDeclarationKind>,
     names: Box<[String]>,
     parameters: Vec<OwnerSolveParameter>,
@@ -850,6 +861,7 @@ struct OwnerSolveState<'a> {
     result_flush: TypeVar,
     expressions: Vec<TypeVar>,
     expression_flushes: Vec<TypeVar>,
+    call_flushes: Vec<Option<TypeVar>>,
     expression_by_key: BTreeMap<StableExpressionKey, usize>,
     external_expressions: Vec<TypeVar>,
     external_expression_flushes: Vec<TypeVar>,
@@ -864,7 +876,6 @@ struct CrossCall {
     expression: usize,
     target: Option<StableCheckOwnerKey>,
     function: String,
-    inputs: Box<[(OwnerConstraintEdgeRole, u32)]>,
     stable_expression: StableExpressionKey,
     flush: TypeVar,
 }
@@ -1003,82 +1014,18 @@ pub(crate) fn refine_owner_pattern_narrowings(
 
 #[derive(Clone)]
 struct InstantiatedInterfaceParameter {
-    name: String,
-    kind: OwnerParameterKind,
     ordinal: u32,
     ty: Type,
-    requirement: CheckedParameterRequirement,
-    evaluation_scope: OwnerInterfaceEvaluationScope,
+    mode: FlowMode,
 }
 
-fn interface_call_shape_is_valid(
-    call: &CrossCall,
-    parameters: &[InstantiatedInterfaceParameter],
-    authoritative: bool,
-) -> bool {
-    let pipe_input = call
-        .inputs
-        .iter()
-        .any(|(role, _)| matches!(role, OwnerConstraintEdgeRole::PipeInput));
-    let piped_parameter = pipe_input
-        .then(|| {
-            parameters
-                .iter()
-                .filter(|parameter| parameter.kind == OwnerParameterKind::Value)
-                .min_by_key(|parameter| parameter.ordinal)
-        })
-        .flatten();
-    if pipe_input && piped_parameter.is_none() {
-        return false;
-    }
-    let expected = parameters
-        .iter()
-        .filter(|parameter| piped_parameter.is_none_or(|piped| parameter.ordinal != piped.ordinal))
-        .collect::<Vec<_>>();
-    let mut expected_index = 0usize;
-    for (role, _) in call.inputs.iter().filter(|(role, _)| {
-        matches!(
-            role,
-            OwnerConstraintEdgeRole::CallArgument { .. }
-                | OwnerConstraintEdgeRole::PipeArgument { .. }
-        )
-    }) {
-        let (kind, name) = match role {
-            OwnerConstraintEdgeRole::CallArgument { kind, name, .. }
-            | OwnerConstraintEdgeRole::PipeArgument { kind, name, .. } => (*kind, name),
-            _ => unreachable!("filtered call argument role"),
-        };
-        while let Some(parameter) = expected.get(expected_index).copied()
-            && parameter.name != *name
-            && parameter.requirement.is_optional()
-        {
-            expected_index += 1;
-        }
-        let Some(parameter) = expected.get(expected_index).copied() else {
-            return false;
-        };
-        if parameter.name != *name
-            || (parameter.kind == OwnerParameterKind::Value
-                && kind == OwnerArgumentKind::BareBinding)
-        {
-            return false;
-        }
-        expected_index += 1;
-    }
-    if expected
-        .iter()
-        .skip(expected_index)
-        .any(|parameter| !parameter.requirement.is_optional())
-    {
-        return false;
-    }
-    !(authoritative
-        && call.inputs.iter().any(|(role, _)| {
-            matches!(
-                role,
-                OwnerConstraintEdgeRole::CallPass { .. } | OwnerConstraintEdgeRole::PipePass { .. }
-            )
-        }))
+#[derive(Clone)]
+struct InstantiatedInterfaceCallContext {
+    ordinal: u32,
+    name: String,
+    provider_parameter_ordinal: u32,
+    ty: Type,
+    mode: FlowMode,
 }
 
 pub(crate) fn flow_mode_join(left: Option<FlowMode>, right: Option<FlowMode>) -> Option<FlowMode> {
@@ -1252,9 +1199,11 @@ fn planned_lexical_read_variables(
     state: &OwnerSolveState<'_>,
     unifier: &mut TypeUnifier,
 ) -> Result<Vec<PlannedLexicalRead>, OwnerConstraintSeedError> {
-    if state.seed.lexical_reads().len() != state.seed.expressions.len() {
+    if state.signature_lexical_plan.reads().len() != state.seed.expressions.len()
+        || !state.signature_lexical_plan.matches_seed(state.seed)
+    {
         return Err(OwnerConstraintSeedError::new(
-            "interface lexical plan does not cover its expression table",
+            "interface signature lexical plan does not cover its current expression table",
         ));
     }
 
@@ -1266,11 +1215,14 @@ fn planned_lexical_read_variables(
     }
     let mut record_field_variables = BTreeMap::new();
     let mut record_fields = BTreeMap::new();
-    for read in state.seed.lexical_reads().iter().flatten() {
-        if let OwnerLexicalDeclarationTarget::RecordField {
-            object,
-            ordinal,
-            name,
+    for read in state.signature_lexical_plan.reads().iter().flatten() {
+        if let OwnerEffectiveLexicalTarget::Static {
+            target:
+                OwnerLexicalDeclarationTarget::RecordField {
+                    object,
+                    ordinal,
+                    name,
+                },
         } = &read.target
         {
             record_fields.insert((*object, *ordinal), name.clone());
@@ -1309,14 +1261,16 @@ fn planned_lexical_read_variables(
         record_field_variables.insert((object_id, ordinal), variable);
     }
 
-    let mut reads = Vec::with_capacity(state.seed.lexical_reads().len());
-    for read in state.seed.lexical_reads() {
+    let mut reads = Vec::with_capacity(state.signature_lexical_plan.reads().len());
+    for read in state.signature_lexical_plan.reads() {
         let Some(read) = read else {
             reads.push(PlannedLexicalRead::Unplanned);
             continue;
         };
         let root = match &read.target {
-            OwnerLexicalDeclarationTarget::Parameter { ordinal } => Some(
+            OwnerEffectiveLexicalTarget::Static {
+                target: OwnerLexicalDeclarationTarget::Parameter { ordinal },
+            } => Some(
                 state
                     .parameters
                     .iter()
@@ -1328,15 +1282,29 @@ fn planned_lexical_read_variables(
                         ))
                     })?,
             ),
-            OwnerLexicalDeclarationTarget::Statement { statement } => Some(
-                statement_variables.get(statement).copied().ok_or_else(|| {
-                    OwnerConstraintSeedError::new(format!(
+            OwnerEffectiveLexicalTarget::Static {
+                target: OwnerLexicalDeclarationTarget::Statement { statement },
+            } => match statement_variables.get(statement).copied() {
+                Some(variable) => Some(variable),
+                None
+                    if state.seed.declarations.iter().any(|declaration| {
+                        declaration.statement == *statement
+                            && declaration.kind == OwnerDeclarationKind::Function
+                    }) =>
+                {
+                    None
+                }
+                None => {
+                    return Err(OwnerConstraintSeedError::new(format!(
                         "interface lexical plan references valueless statement {statement}"
-                    ))
-                })?,
-            ),
-            OwnerLexicalDeclarationTarget::RecordField {
-                object, ordinal, ..
+                    )));
+                }
+            },
+            OwnerEffectiveLexicalTarget::Static {
+                target:
+                    OwnerLexicalDeclarationTarget::RecordField {
+                        object, ordinal, ..
+                    },
             } => Some(
                 record_field_variables
                     .get(&(*object, *ordinal))
@@ -1347,16 +1315,120 @@ fn planned_lexical_read_variables(
                         ))
                     })?,
             ),
-            OwnerLexicalDeclarationTarget::Passed => Some(state.context),
-            OwnerLexicalDeclarationTarget::PatternBinding { .. }
-            | OwnerLexicalDeclarationTarget::Ambiguous { .. } => None,
+            OwnerEffectiveLexicalTarget::Static {
+                target: OwnerLexicalDeclarationTarget::Passed,
+            } => (state.declaration_kind == Some(OwnerDeclarationKind::Function))
+                .then_some(state.context),
+            OwnerEffectiveLexicalTarget::FreshOut {
+                call,
+                formal_ordinal,
+            } => state
+                .signature_declaration_variables
+                .get(&OwnerSignatureDeclarationTarget::FreshOut {
+                    call: call.clone(),
+                    formal_ordinal: *formal_ordinal,
+                })
+                .copied(),
+            OwnerEffectiveLexicalTarget::CallContext {
+                call,
+                context_ordinal,
+            } => state
+                .signature_declaration_variables
+                .get(&OwnerSignatureDeclarationTarget::CallContext {
+                    call: call.clone(),
+                    context_ordinal: *context_ordinal,
+                })
+                .copied(),
+            OwnerEffectiveLexicalTarget::Static {
+                target:
+                    OwnerLexicalDeclarationTarget::PatternBinding { .. }
+                    | OwnerLexicalDeclarationTarget::Ambiguous { .. },
+            }
+            | OwnerEffectiveLexicalTarget::InvalidBareBinding { .. }
+            | OwnerEffectiveLexicalTarget::Ambiguous { .. } => None,
         };
         // Keep the root lazy. A selector projection owned by branch-local
         // pattern narrowing must not constrain the public root merely because
         // the base lexical plan can name it.
-        reads.push(root.map_or(PlannedLexicalRead::Reserved, PlannedLexicalRead::Bound));
+        let dynamic = matches!(
+            &read.target,
+            OwnerEffectiveLexicalTarget::FreshOut { .. }
+                | OwnerEffectiveLexicalTarget::CallContext { .. }
+        );
+        reads.push(root.map_or(PlannedLexicalRead::Reserved, |root| {
+            if dynamic {
+                let _ = root;
+                PlannedLexicalRead::Dynamic
+            } else {
+                PlannedLexicalRead::Bound(root)
+            }
+        }));
     }
     Ok(reads)
+}
+
+fn signature_read_preserves_base_target(state: &OwnerSolveState<'_>, expression: u32) -> bool {
+    let Some(base) = state
+        .seed
+        .lexical_reads()
+        .get(expression as usize)
+        .and_then(Option::as_ref)
+    else {
+        return false;
+    };
+    matches!(
+        state
+            .signature_lexical_plan
+            .reads()
+            .get(expression as usize)
+            .and_then(Option::as_ref),
+        Some(read)
+            if matches!(
+                &read.target,
+                OwnerEffectiveLexicalTarget::Static { target } if target == &base.target
+            ) && read.projection == base.projection
+    )
+}
+
+fn signature_narrowed_selector_read_matches(
+    state: &OwnerSolveState<'_>,
+    selector: u32,
+    projection: &[String],
+    candidate: u32,
+) -> bool {
+    effective_narrowed_selector_read_matches(
+        state.seed,
+        &state.signature_lexical_plan,
+        selector,
+        projection,
+        candidate,
+    )
+}
+
+fn bind_signature_declaration_reads(
+    state: &mut OwnerSolveState<'_>,
+    target: &OwnerSignatureDeclarationTarget,
+    root: TypeVar,
+    mode: FlowMode,
+    unifier: &mut TypeUnifier,
+) {
+    for expression in state
+        .signature_read_expressions
+        .get(target)
+        .into_iter()
+        .flatten()
+        .copied()
+    {
+        let Some(read) = state.signature_lexical_plan.reads()[expression].as_ref() else {
+            continue;
+        };
+        let projected = bind_projection(unifier, root, &read.projection);
+        unifier.unify(
+            Type::Var(state.expressions[expression]),
+            Type::Var(projected),
+        );
+        state.modes[expression] = flow_mode_join(state.modes[expression], Some(mode));
+    }
 }
 
 fn resolved_expression_flush_type(
@@ -1393,92 +1465,6 @@ fn resolved_expression_boundary(
             boon_checked::canonical_union_type(vec![value, flush])
         }),
     }
-}
-
-fn direct_owner_parameter_ordinal(state: &OwnerSolveState<'_>, reference: u32) -> Option<u32> {
-    let read = state
-        .seed
-        .lexical_reads()
-        .get(reference as usize)?
-        .as_ref()?;
-    if !read.projection.is_empty() {
-        return None;
-    }
-    match &read.target {
-        OwnerLexicalDeclarationTarget::Parameter { ordinal } => Some(*ordinal),
-        _ => None,
-    }
-}
-
-fn referenced_owner_parameter_ordinals(
-    state: &OwnerSolveState<'_>,
-    reference: u32,
-) -> BTreeSet<u32> {
-    let mut referenced = BTreeSet::new();
-    let mut pending = vec![reference];
-    let mut visited = BTreeSet::new();
-    while let Some(reference) = pending.pop() {
-        if reference as usize >= state.seed.expressions.len() || !visited.insert(reference) {
-            continue;
-        }
-        let expression = &state.seed.expressions[reference as usize];
-        if let Some(OwnerLexicalDeclarationTarget::Parameter { ordinal }) = state
-            .seed
-            .lexical_reads()
-            .get(reference as usize)
-            .and_then(Option::as_ref)
-            .map(|read| &read.target)
-        {
-            referenced.insert(*ordinal);
-        }
-        pending.extend(expression.inputs.iter().map(|input| input.expression));
-    }
-    referenced
-}
-
-fn call_input_for_parameter(
-    call: &CrossCall,
-    parameter: &InstantiatedInterfaceParameter,
-    parameters: &[InstantiatedInterfaceParameter],
-) -> Option<u32> {
-    call.inputs
-        .iter()
-        .find_map(|(role, expression)| match role {
-            OwnerConstraintEdgeRole::CallArgument { name, .. }
-            | OwnerConstraintEdgeRole::PipeArgument { name, .. }
-                if *name == parameter.name =>
-            {
-                Some(*expression)
-            }
-            OwnerConstraintEdgeRole::PipeInput
-                if parameters
-                    .iter()
-                    .find(|candidate| candidate.kind == OwnerParameterKind::Value)
-                    .is_some_and(|candidate| candidate.ordinal == parameter.ordinal) =>
-            {
-                Some(*expression)
-            }
-            _ => None,
-        })
-}
-
-fn forwarded_owner_output_ordinal(
-    caller: &OwnerSolveState<'_>,
-    call: &CrossCall,
-    parameters: &[InstantiatedInterfaceParameter],
-    output_ordinal: u32,
-) -> Option<u32> {
-    let output = parameters.iter().find(|parameter| {
-        parameter.kind == OwnerParameterKind::Out && parameter.ordinal == output_ordinal
-    })?;
-    let expression = call_input_for_parameter(call, output, parameters)?;
-    let owner_ordinal = direct_owner_parameter_ordinal(caller, expression)?;
-    caller
-        .parameters
-        .iter()
-        .find(|parameter| parameter.ordinal == owner_ordinal)
-        .filter(|parameter| parameter.kind == OwnerParameterKind::Out)
-        .map(|parameter| parameter.ordinal)
 }
 
 fn owner_result_expression(state: &OwnerSolveState<'_>) -> Option<u32> {
@@ -1540,8 +1526,11 @@ fn owner_result_parameter_read(
         .expression_by_key
         .get(&expression.expression)
         .copied()?;
-    let read = state.seed.lexical_reads().get(index)?.as_ref()?;
-    let OwnerLexicalDeclarationTarget::Parameter { ordinal } = &read.target else {
+    let read = state.signature_lexical_plan.reads().get(index)?.as_ref()?;
+    let OwnerEffectiveLexicalTarget::Static {
+        target: OwnerLexicalDeclarationTarget::Parameter { ordinal },
+    } = &read.target
+    else {
         return None;
     };
     Some(OwnerResultParameterRead {
@@ -1562,16 +1551,28 @@ fn owner_result_call_target(
         } => function,
         _ => return Ok(None),
     };
-    let resolution = state
-        .summary
-        .symbol_resolutions
-        .iter()
-        .find(|resolution| resolution.reference().expression == expression.expression);
-    let target = match resolution {
-        Some(OwnerSymbolResolution::Resolved { owner, .. }) => OwnerResultCallTarget::Owner {
+    let expression_index = state
+        .expression_by_key
+        .get(&expression.expression)
+        .copied()
+        .ok_or_else(|| {
+            OwnerConstraintSeedError::new(
+                "owner result transfer call is absent from the expression index",
+            )
+        })?;
+    let call = state
+        .signature_lexical_plan
+        .call(expression_index)
+        .ok_or_else(|| {
+            OwnerConstraintSeedError::new(
+                "owner result transfer call is absent from the exact signature plan",
+            )
+        })?;
+    let target = match &call.target {
+        crate::OwnerSignatureCallTarget::Owner { owner } => OwnerResultCallTarget::Owner {
             owner: owner.clone(),
         },
-        Some(OwnerSymbolResolution::Authoritative { .. }) => {
+        crate::OwnerSignatureCallTarget::Authoritative => {
             let contract = abi.callable(function).ok_or_else(|| {
                 OwnerConstraintSeedError::new(format!(
                     "owner result transfer {:?} resolved `{function}` as authoritative without a frozen ABI contract",
@@ -1583,16 +1584,12 @@ fn owner_result_call_target(
                 contract: OwnerResultAbiContract::from(contract),
             }
         }
-        Some(OwnerSymbolResolution::Ambiguous { candidates, .. }) => {
+        crate::OwnerSignatureCallTarget::Ambiguous { candidates } => {
             OwnerResultCallTarget::Ambiguous {
-                candidates: candidates
-                    .iter()
-                    .map(|candidate| candidate.owner.clone())
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
+                candidates: candidates.clone(),
             }
         }
-        Some(OwnerSymbolResolution::Unresolved { .. }) | None => OwnerResultCallTarget::Unresolved,
+        crate::OwnerSignatureCallTarget::Unresolved => OwnerResultCallTarget::Unresolved,
     };
     Ok(Some(target))
 }
@@ -1621,35 +1618,47 @@ fn owner_result_parameter_alias(
             return None;
         }
         let result = if let Some(read) = state
-            .seed
-            .lexical_reads()
+            .signature_lexical_plan
+            .reads()
             .get(reference as usize)
             .and_then(Option::as_ref)
         {
             let target = match &read.target {
-                OwnerLexicalDeclarationTarget::Parameter { ordinal } => {
-                    Some(OwnerResultParameterRead {
-                        parameter_ordinal: *ordinal,
-                        projection: Box::new([]),
-                    })
-                }
-                OwnerLexicalDeclarationTarget::Statement { statement } => state
+                OwnerEffectiveLexicalTarget::Static {
+                    target: OwnerLexicalDeclarationTarget::Parameter { ordinal },
+                } => Some(OwnerResultParameterRead {
+                    parameter_ordinal: *ordinal,
+                    projection: Box::new([]),
+                }),
+                OwnerEffectiveLexicalTarget::Static {
+                    target: OwnerLexicalDeclarationTarget::Statement { statement },
+                } => state
                     .seed
                     .statement_values
                     .iter()
                     .find(|(candidate, _)| candidate == statement)
                     .and_then(|(_, value)| resolve(state, *value, active)),
-                OwnerLexicalDeclarationTarget::RecordField {
-                    object, ordinal, ..
+                OwnerEffectiveLexicalTarget::Static {
+                    target:
+                        OwnerLexicalDeclarationTarget::RecordField {
+                            object, ordinal, ..
+                        },
                 } => state
                     .seed
                     .expressions
                     .get(*object as usize)
                     .and_then(|object| object.inputs.get(*ordinal as usize))
                     .and_then(|input| resolve(state, input.expression, active)),
-                OwnerLexicalDeclarationTarget::PatternBinding { .. }
-                | OwnerLexicalDeclarationTarget::Passed
-                | OwnerLexicalDeclarationTarget::Ambiguous { .. } => None,
+                OwnerEffectiveLexicalTarget::Static {
+                    target:
+                        OwnerLexicalDeclarationTarget::PatternBinding { .. }
+                        | OwnerLexicalDeclarationTarget::Passed
+                        | OwnerLexicalDeclarationTarget::Ambiguous { .. },
+                }
+                | OwnerEffectiveLexicalTarget::FreshOut { .. }
+                | OwnerEffectiveLexicalTarget::CallContext { .. }
+                | OwnerEffectiveLexicalTarget::InvalidBareBinding { .. }
+                | OwnerEffectiveLexicalTarget::Ambiguous { .. } => None,
             };
             target.map(|target| append_projection(target, &read.projection))
         } else {
@@ -1709,13 +1718,57 @@ fn build_owner_result_transfer(
         .into_iter()
         .map(|reference| {
             let expression = &state.seed.expressions[reference as usize];
+            let signature_call = state.signature_lexical_plan.call(reference as usize);
+            let mut formal_by_source = BTreeMap::new();
+            if let Some(call) = signature_call {
+                for input in &call.matched_inputs {
+                    if formal_by_source
+                        .insert((input.expression, input.source), input.formal_ordinal)
+                        .is_some()
+                    {
+                        return Err(OwnerConstraintSeedError::new(
+                            "owner result transfer call repeats an exact input source",
+                        ));
+                    }
+                }
+            }
             let inputs = expression
                 .inputs
                 .iter()
                 .map(|input| {
+                    let source = match input.role {
+                        OwnerConstraintEdgeRole::PipeInput => {
+                            Some(crate::OwnerSignatureMatchedInputSource::PipeInput)
+                        }
+                        OwnerConstraintEdgeRole::CallArgument { ordinal, .. } => {
+                            Some(crate::OwnerSignatureMatchedInputSource::CallArgument { ordinal })
+                        }
+                        OwnerConstraintEdgeRole::PipeArgument { ordinal, .. } => {
+                            Some(crate::OwnerSignatureMatchedInputSource::PipeArgument { ordinal })
+                        }
+                        _ => None,
+                    };
+                    let pass_source = match input.role {
+                        OwnerConstraintEdgeRole::CallPass { .. } => {
+                            Some(crate::OwnerSignaturePassSource::Call)
+                        }
+                        OwnerConstraintEdgeRole::PipePass { .. } => {
+                            Some(crate::OwnerSignaturePassSource::Pipe)
+                        }
+                        _ => None,
+                    };
                     Ok(OwnerResultTransferInput {
                         role: input.role.clone(),
                         expression: owner_result_expression_ref(state, input.expression)?,
+                        formal_ordinal: source.and_then(|source| {
+                            formal_by_source.get(&(input.expression, source)).copied()
+                        }),
+                        explicit_pass: signature_call
+                            .and_then(|call| call.explicit_pass.as_ref())
+                            .is_some_and(|pass| {
+                                pass.expression == input.expression
+                                    && pass_source == Some(pass.source)
+                            }),
                     })
                 })
                 .collect::<Result<Vec<_>, OwnerConstraintSeedError>>()?;
@@ -2083,6 +2136,35 @@ pub fn evaluate_owner_interface_scc<'a>(
     summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
     dependency_results: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<OwnerInterfaceSccEvaluation, OwnerConstraintSeedError> {
+    evaluate_owner_interface_scc_impl(scc, abi, seeds, summaries, dependency_results, None)
+}
+
+pub fn evaluate_owner_interface_scc_with_signature_scopes<'a, 'b>(
+    scc: &OwnerInterfaceScc,
+    abi: &OwnerInferenceAbiEnvironment,
+    seeds: impl IntoIterator<Item = &'a OwnerConstraintSeed>,
+    summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
+    dependency_results: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
+    signature_scopes: impl IntoIterator<Item = &'b OwnerCallableScopeOwnerResult>,
+) -> Result<OwnerInterfaceSccEvaluation, OwnerConstraintSeedError> {
+    evaluate_owner_interface_scc_impl(
+        scc,
+        abi,
+        seeds,
+        summaries,
+        dependency_results,
+        Some(signature_scopes.into_iter().collect()),
+    )
+}
+
+fn evaluate_owner_interface_scc_impl<'a>(
+    scc: &OwnerInterfaceScc,
+    abi: &OwnerInferenceAbiEnvironment,
+    seeds: impl IntoIterator<Item = &'a OwnerConstraintSeed>,
+    summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
+    dependency_results: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
+    signature_scopes: Option<Vec<&OwnerCallableScopeOwnerResult>>,
+) -> Result<OwnerInterfaceSccEvaluation, OwnerConstraintSeedError> {
     let seeds = seeds
         .into_iter()
         .map(|seed| (seed.owner.clone(), seed))
@@ -2208,6 +2290,89 @@ pub fn evaluate_owner_interface_scc<'a>(
         ));
     }
 
+    let supplied_signature_scopes = signature_scopes.is_some();
+    let (signature_scopes, signature_lexical_plans) = if let Some(signature_scopes) =
+        signature_scopes
+    {
+        let mut signatures = BTreeMap::new();
+        let mut plans = BTreeMap::new();
+        for scope in signature_scopes {
+            let owner = scope.owner();
+            if !expected.contains(owner)
+                || !scope.lexical_plan().matches_seed(seeds[owner])
+                || signatures
+                    .insert(owner.clone(), scope.signature().clone())
+                    .is_some()
+                || plans
+                    .insert(owner.clone(), scope.lexical_plan().clone())
+                    .is_some()
+            {
+                return Err(OwnerConstraintSeedError::new(
+                    "interface SCC received stale, duplicate, or foreign callable scope results",
+                ));
+            }
+        }
+        if signatures.keys().cloned().collect::<BTreeSet<_>>() != expected {
+            return Err(OwnerConstraintSeedError::new(
+                "interface SCC callable scope results do not cover every member",
+            ));
+        }
+        let available_signatures = signatures
+            .values()
+            .cloned()
+            .chain(
+                dependency_interfaces
+                    .values()
+                    .map(OwnerCallableLexicalSignature::from_interface),
+            )
+            .collect::<Vec<_>>();
+        for owner in &scc.key.members {
+            if !plans[owner]
+                .matches_signature_inputs(
+                    seeds[owner],
+                    summaries[owner],
+                    abi,
+                    available_signatures.iter().cloned(),
+                )
+                .map_err(|error| {
+                    OwnerConstraintSeedError::new(format!(
+                        "cannot validate owner signature lexical inputs for {owner:?}: {error}"
+                    ))
+                })?
+            {
+                return Err(OwnerConstraintSeedError::new(
+                    "interface SCC received a stale callable signature/lexical pair",
+                ));
+            }
+        }
+        (signatures, plans)
+    } else {
+        let projection = project_owner_signature_lexical_scope_plans(
+            seeds.values().copied(),
+            summaries.values().copied(),
+            abi,
+            dependency_interfaces.values(),
+        )
+        .map_err(|error| {
+            OwnerConstraintSeedError::new(format!(
+                "cannot project owner signature lexical scopes: {error}"
+            ))
+        })?;
+        (projection.signatures().clone(), projection.plans().clone())
+    };
+    if supplied_signature_scopes {
+        for owner in &scc.key.members {
+            if summaries[owner]
+                .matches_effective_references(signature_lexical_plans[owner].external_candidates())
+            {
+                continue;
+            }
+            return Err(OwnerConstraintSeedError::new(format!(
+                "interface SCC summary and exact signature references diverge for {owner:?}"
+            )));
+        }
+    }
+
     let owners = scc
         .key
         .members
@@ -2215,6 +2380,10 @@ pub fn evaluate_owner_interface_scc<'a>(
         .map(|owner| OwnerInterfaceSccOwnerBasis {
             owner: owner.clone(),
             lexical_reads_fingerprint_v1: seeds[owner].lexical_reads_fingerprint_v1(),
+            signature_lexical_plan_fingerprint_v1: signature_lexical_plans
+                .get(owner)
+                .expect("signature scope projection covers every SCC owner")
+                .fingerprint_v1(),
             seed_fingerprint_v1: seeds[owner].fingerprint_v1(),
             summary_fingerprint_v1: summaries[owner].fingerprint_v1(),
         })
@@ -2239,6 +2408,13 @@ pub fn evaluate_owner_interface_scc<'a>(
     for owner in &scc.key.members {
         let seed = seeds[owner];
         let summary = summaries[owner];
+        let signature = signature_scopes
+            .get(owner)
+            .expect("signature scope projection covers every SCC owner");
+        let signature_lexical_plan = signature_lexical_plans
+            .get(owner)
+            .expect("signature scope projection covers every SCC owner")
+            .clone();
         let public = seed
             .declarations
             .iter()
@@ -2262,7 +2438,17 @@ pub fn evaluate_owner_interface_scc<'a>(
                     kind: parameter.kind,
                     ordinal: parameter.ordinal,
                     variable,
-                    evaluation_scope: OwnerInterfaceEvaluationScope::Parent,
+                    evaluation_scope: signature
+                        .parameters
+                        .iter()
+                        .find(|candidate| candidate.ordinal == parameter.ordinal)
+                        .map(|candidate| candidate.evaluation_scope)
+                        .ok_or_else(|| {
+                            OwnerConstraintSeedError::new(format!(
+                                "owner signature scope projection omits parameter {} for {owner:?}",
+                                parameter.ordinal
+                            ))
+                        })?,
                 });
             }
         }
@@ -2295,11 +2481,67 @@ pub fn evaluate_owner_interface_scc<'a>(
             effect.reads_state = true;
             effect.writes_state = true;
         }
+        let mut signature_declaration_variables = BTreeMap::new();
+        for declaration in signature_lexical_plan.declarations() {
+            if signature_declaration_variables
+                .insert(declaration.target.clone(), unifier.fresh())
+                .is_some()
+            {
+                return Err(OwnerConstraintSeedError::new(format!(
+                    "owner signature lexical plan repeats a dynamic declaration for {owner:?}"
+                )));
+            }
+        }
+        let arm_local_expressions = seed
+            .expressions
+            .iter()
+            .flat_map(|expression| &expression.inputs)
+            .filter_map(|input| {
+                matches!(
+                    input.role,
+                    OwnerConstraintEdgeRole::MatchBinding { .. }
+                        | OwnerConstraintEdgeRole::MatchNarrowedSelector { .. }
+                )
+                .then_some(input.expression as usize)
+            })
+            .collect::<BTreeSet<_>>();
+        let mut signature_read_expressions =
+            BTreeMap::<OwnerSignatureDeclarationTarget, Vec<usize>>::new();
+        for (index, read) in signature_lexical_plan.reads().iter().enumerate() {
+            let target = match read.as_ref().map(|read| &read.target) {
+                Some(OwnerEffectiveLexicalTarget::FreshOut {
+                    call,
+                    formal_ordinal,
+                }) => Some(OwnerSignatureDeclarationTarget::FreshOut {
+                    call: call.clone(),
+                    formal_ordinal: *formal_ordinal,
+                }),
+                Some(OwnerEffectiveLexicalTarget::CallContext {
+                    call,
+                    context_ordinal,
+                }) => Some(OwnerSignatureDeclarationTarget::CallContext {
+                    call: call.clone(),
+                    context_ordinal: *context_ordinal,
+                }),
+                _ => None,
+            };
+            if let Some(target) = target
+                && !arm_local_expressions.contains(&index)
+            {
+                signature_read_expressions
+                    .entry(target)
+                    .or_default()
+                    .push(index);
+            }
+        }
         states.insert(
             owner.clone(),
             OwnerSolveState {
                 seed,
                 summary,
+                signature_lexical_plan,
+                signature_declaration_variables,
+                signature_read_expressions,
                 declaration_kind: public.map(|declaration| declaration.kind),
                 names: public
                     .map(|declaration| declaration.names.clone())
@@ -2310,6 +2552,7 @@ pub fn evaluate_owner_interface_scc<'a>(
                 result_flush,
                 expressions,
                 expression_flushes,
+                call_flushes: vec![None; seed.expressions.len()],
                 expression_by_key,
                 external_expressions,
                 external_expression_flushes,
@@ -2435,17 +2678,26 @@ pub fn evaluate_owner_interface_scc<'a>(
                 }
                 OwnerConstraintNodeKind::Reference { parts }
                 | OwnerConstraintNodeKind::Drain { parts } => {
-                    if arm_local_expressions.contains(&(index as u32)) {
+                    if arm_local_expressions.contains(&(index as u32))
+                        && signature_read_preserves_base_target(state, index as u32)
+                    {
                         // The owning match arm binds this occurrence against
                         // an arm-local pattern value below.
                     } else if let PlannedLexicalRead::Bound(root) =
                         state.planned_lexical_reads[index]
                     {
-                        let read = state.seed.lexical_reads()[index]
+                        let read = state.signature_lexical_plan.reads()[index]
                             .as_ref()
                             .expect("bound lexical root must have a read plan");
                         let local = bind_projection(&mut unifier, root, &read.projection);
                         unifier.unify(Type::Var(variable), Type::Var(local));
+                    } else if matches!(
+                        state.planned_lexical_reads[index],
+                        PlannedLexicalRead::Dynamic
+                    ) {
+                        // Signature-dependent roots and projections bind when
+                        // this call occurrence instantiates its exact formal
+                        // or context scheme below.
                     } else if matches!(
                         state.planned_lexical_reads[index],
                         PlannedLexicalRead::Reserved
@@ -2511,6 +2763,13 @@ pub fn evaluate_owner_interface_scc<'a>(
                     if boon_effect_schema::host_effect_spec(function).is_some() {
                         state.effect.invokes_host = true;
                     }
+                    let flush = unifier.fresh();
+                    if state.call_flushes[index].replace(flush).is_some() {
+                        return Err(OwnerConstraintSeedError::new(format!(
+                            "owner interface {:?} repeats call expression {index}",
+                            state.seed.owner
+                        )));
+                    }
                     calls.push(CrossCall {
                         caller: state.seed.owner.clone(),
                         expression: index,
@@ -2521,13 +2780,8 @@ pub fn evaluate_owner_interface_scc<'a>(
                             })
                             .map(|resolved| resolved.owner.clone()),
                         function: function.clone(),
-                        inputs: expression
-                            .inputs
-                            .iter()
-                            .map(|input| (input.role.clone(), input.expression))
-                            .collect(),
                         stable_expression: expression.expression.clone(),
-                        flush: unifier.fresh(),
+                        flush,
                     });
                     mode = None;
                 }
@@ -2640,6 +2894,9 @@ pub fn evaluate_owner_interface_scc<'a>(
                             let OwnerConstraintEdgeRole::MatchBinding { name } = &input.role else {
                                 return None;
                             };
+                            if !signature_read_preserves_base_target(state, input.expression) {
+                                return None;
+                            }
                             expression_variable(state, input.expression)
                                 .map(|read| (name.clone(), read))
                         })
@@ -2670,6 +2927,18 @@ pub fn evaluate_owner_interface_scc<'a>(
                             else {
                                 return None;
                             };
+                            let selector = expression.inputs.iter().find_map(|input| {
+                                matches!(input.role, OwnerConstraintEdgeRole::MatchSelector)
+                                    .then_some(input.expression)
+                            })?;
+                            if !signature_narrowed_selector_read_matches(
+                                state,
+                                selector,
+                                projection,
+                                input.expression,
+                            ) {
+                                return None;
+                            }
                             expression_variable(state, input.expression)
                                 .map(|read| (projection.clone(), read))
                         })
@@ -2867,14 +3136,17 @@ pub fn evaluate_owner_interface_scc<'a>(
             if resolved.reference.kind != OwnerReferenceKind::Value {
                 continue;
             }
-            let Some(expression) = state
+            let Some(index) = state
                 .expression_by_key
                 .get(&resolved.reference.expression)
-                .and_then(|expression| state.expressions.get(*expression))
                 .copied()
             else {
                 continue;
             };
+            if state.signature_lexical_plan.reads()[index].is_some() {
+                continue;
+            }
+            let expression = state.expressions[index];
             if let Some((result, _)) = internal_results.get(&resolved.owner) {
                 let result = bind_projection(&mut unifier, *result, &resolved.projection);
                 unifier.unify(Type::Var(expression), Type::Var(result));
@@ -2909,12 +3181,7 @@ pub fn evaluate_owner_interface_scc<'a>(
                     .filter_map(|input| expression_flush_variable(state, *input))
                     .map(Type::Var),
             );
-            candidates.extend(
-                calls
-                    .iter()
-                    .filter(|call| call.caller == state.seed.owner && call.expression == index)
-                    .map(|call| Type::Var(call.flush)),
-            );
+            candidates.extend(state.call_flushes[index].map(Type::Var));
             unifier.bind_var(
                 state.expression_flushes[index],
                 if candidates.is_empty() {
@@ -2957,159 +3224,108 @@ pub fn evaluate_owner_interface_scc<'a>(
             })?;
             let variables = &mut call_variables[call_index];
             let context_variables = &mut call_context_variables[call_index];
-            let (parameters, result, result_flush, result_mode, context, effect, signature_found) =
-                if let Some(target) = &call.target {
-                    if let Some(callee) = states.get(target) {
-                        let parameters = callee
-                            .parameters
-                            .iter()
-                            .map(|parameter| InstantiatedInterfaceParameter {
-                                name: parameter.name.clone(),
-                                kind: parameter.kind,
-                                ordinal: parameter.ordinal,
-                                ty: instantiate_type(
-                                    &unifier.resolve(&Type::Var(parameter.variable)),
-                                    &mut unifier,
-                                    &mut *variables,
-                                ),
-                                requirement: CheckedParameterRequirement::Required,
-                                evaluation_scope: parameter.evaluation_scope,
-                            })
-                            .collect::<Vec<_>>();
-                        let result = instantiate_type(
-                            &unifier.resolve(&Type::Var(callee.result)),
-                            &mut unifier,
-                            &mut *variables,
-                        );
-                        let result_flush = instantiate_type(
-                            &unifier.resolve(&Type::Var(callee.result_flush)),
-                            &mut unifier,
-                            &mut *variables,
-                        );
-                        let context = instantiate_type(
-                            &unifier.resolve(&Type::Var(callee.context)),
-                            &mut unifier,
-                            &mut *context_variables,
-                        );
-                        let result_mode = owner_result_expression(callee)
-                            .map(|expression| {
-                                let raw_mode = callee
-                                    .modes
-                                    .get(expression as usize)
-                                    .copied()
-                                    .flatten()
-                                    .unwrap_or(FlowMode::Continuous);
-                                resolved_expression_boundary(
-                                    callee,
-                                    expression,
-                                    &mut unifier,
-                                    raw_mode,
-                                )
-                                .mode
-                            })
-                            .unwrap_or(FlowMode::Continuous);
-                        (
-                            parameters,
-                            result,
-                            result_flush,
-                            result_mode,
-                            Some(context),
-                            callee.effect,
-                            true,
-                        )
-                    } else if let Some(callee) = dependency_interfaces.get(target) {
-                        let parameters = callee
-                            .parameters
-                            .iter()
-                            .map(|parameter| InstantiatedInterfaceParameter {
-                                name: parameter.name.clone(),
-                                kind: parameter.kind,
-                                ordinal: parameter.ordinal,
-                                ty: instantiate_type(
-                                    &parameter.flow_type.ty,
-                                    &mut unifier,
-                                    &mut *variables,
-                                ),
-                                requirement: parameter.requirement.clone(),
-                                evaluation_scope: parameter.evaluation_scope,
-                            })
-                            .collect();
-                        let result =
-                            instantiate_type(&callee.result.ty, &mut unifier, &mut *variables);
-                        let result_flush = callee
-                            .result_flush_type
-                            .as_ref()
-                            .map_or(Type::Absent, |ty| {
-                                instantiate_type(ty, &mut unifier, &mut *variables)
-                            });
-                        let context = callee.context.as_ref().map(|context| {
-                            instantiate_type(
-                                &context.flow_type.ty,
-                                &mut unifier,
-                                &mut *context_variables,
-                            )
-                        });
-                        (
-                            parameters,
-                            result,
-                            result_flush,
-                            callee.result.mode,
-                            context,
-                            callee.effect,
-                            true,
-                        )
-                    } else {
-                        (
-                            Vec::new(),
-                            Type::Unknown,
-                            Type::Absent,
-                            FlowMode::Continuous,
-                            None,
-                            CheckedEffectSummary::default(),
-                            false,
-                        )
-                    }
-                } else if let Some(signature) = abi.callable(&call.function) {
-                    let parameters = signature
+            let (
+                parameters,
+                call_contexts,
+                result,
+                result_flush,
+                result_mode,
+                context,
+                effect,
+                signature_found,
+            ) = if let Some(target) = &call.target {
+                if let Some(callee) = states.get(target) {
+                    let parameters = callee
                         .parameters
                         .iter()
-                        .enumerate()
-                        .map(|(ordinal, parameter)| InstantiatedInterfaceParameter {
-                            name: parameter.name.clone(),
-                            kind: match parameter.kind {
-                                CheckedParameterKind::Value => OwnerParameterKind::Value,
-                                CheckedParameterKind::Out => OwnerParameterKind::Out,
-                            },
-                            ordinal: ordinal as u32,
+                        .map(|parameter| InstantiatedInterfaceParameter {
+                            ordinal: parameter.ordinal,
+                            ty: instantiate_type(
+                                &unifier.resolve(&Type::Var(parameter.variable)),
+                                &mut unifier,
+                                &mut *variables,
+                            ),
+                            mode: FlowMode::Continuous,
+                        })
+                        .collect::<Vec<_>>();
+                    let result = instantiate_type(
+                        &unifier.resolve(&Type::Var(callee.result)),
+                        &mut unifier,
+                        &mut *variables,
+                    );
+                    let result_flush = instantiate_type(
+                        &unifier.resolve(&Type::Var(callee.result_flush)),
+                        &mut unifier,
+                        &mut *variables,
+                    );
+                    let context = instantiate_type(
+                        &unifier.resolve(&Type::Var(callee.context)),
+                        &mut unifier,
+                        &mut *context_variables,
+                    );
+                    let result_mode = owner_result_expression(callee)
+                        .map(|expression| {
+                            let raw_mode = callee
+                                .modes
+                                .get(expression as usize)
+                                .copied()
+                                .flatten()
+                                .unwrap_or(FlowMode::Continuous);
+                            resolved_expression_boundary(callee, expression, &mut unifier, raw_mode)
+                                .mode
+                        })
+                        .unwrap_or(FlowMode::Continuous);
+                    (
+                        parameters,
+                        Vec::new(),
+                        result,
+                        result_flush,
+                        result_mode,
+                        Some(context),
+                        callee.effect,
+                        true,
+                    )
+                } else if let Some(callee) = dependency_interfaces.get(target) {
+                    let parameters = callee
+                        .parameters
+                        .iter()
+                        .map(|parameter| InstantiatedInterfaceParameter {
+                            ordinal: parameter.ordinal,
                             ty: instantiate_type(
                                 &parameter.flow_type.ty,
                                 &mut unifier,
                                 &mut *variables,
                             ),
-                            requirement: parameter.requirement.clone(),
-                            evaluation_scope: match parameter.evaluation_scope {
-                                crate::OwnerAbiEvaluationScope::Parent => {
-                                    OwnerInterfaceEvaluationScope::Parent
-                                }
-                                crate::OwnerAbiEvaluationScope::Output { parameter_ordinal } => {
-                                    OwnerInterfaceEvaluationScope::Output { parameter_ordinal }
-                                }
-                            },
+                            mode: parameter.flow_type.mode,
                         })
                         .collect();
-                    let result =
-                        instantiate_type(&signature.result.ty, &mut unifier, &mut *variables);
+                    let result = instantiate_type(&callee.result.ty, &mut unifier, &mut *variables);
+                    let result_flush = callee
+                        .result_flush_type
+                        .as_ref()
+                        .map_or(Type::Absent, |ty| {
+                            instantiate_type(ty, &mut unifier, &mut *variables)
+                        });
+                    let context = callee.context.as_ref().map(|context| {
+                        instantiate_type(
+                            &context.flow_type.ty,
+                            &mut unifier,
+                            &mut *context_variables,
+                        )
+                    });
                     (
                         parameters,
+                        Vec::new(),
                         result,
-                        Type::Absent,
-                        signature.result.mode,
-                        None,
-                        signature.effect,
+                        result_flush,
+                        callee.result.mode,
+                        context,
+                        callee.effect,
                         true,
                     )
                 } else {
                     (
+                        Vec::new(),
                         Vec::new(),
                         Type::Unknown,
                         Type::Absent,
@@ -3118,49 +3334,84 @@ pub fn evaluate_owner_interface_scc<'a>(
                         CheckedEffectSummary::default(),
                         false,
                     )
-                };
-            let call_valid = signature_found
-                && interface_call_shape_is_valid(call, &parameters, call.target.is_none());
-
-            let mut evaluation_scope_updates = Vec::new();
-            for parameter in parameters.iter().filter(|_| call_valid) {
-                let OwnerInterfaceEvaluationScope::Output {
-                    parameter_ordinal: output_ordinal,
-                } = parameter.evaluation_scope
-                else {
-                    continue;
-                };
-                let Some(owner_output_ordinal) =
-                    forwarded_owner_output_ordinal(caller, call, &parameters, output_ordinal)
-                else {
-                    continue;
-                };
-                let Some(actual) = call_input_for_parameter(call, parameter, &parameters) else {
-                    continue;
-                };
-                for owner_parameter_ordinal in referenced_owner_parameter_ordinals(caller, actual) {
-                    if caller.parameters.iter().any(|owner_parameter| {
-                        owner_parameter.ordinal == owner_parameter_ordinal
-                            && owner_parameter.kind == OwnerParameterKind::Value
-                    }) {
-                        evaluation_scope_updates.push((
-                            owner_parameter_ordinal,
-                            OwnerInterfaceEvaluationScope::Output {
-                                parameter_ordinal: owner_output_ordinal,
-                            },
-                        ));
-                    }
                 }
-            }
+            } else if let Some(signature) = abi.callable(&call.function) {
+                let parameters = signature
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, parameter)| InstantiatedInterfaceParameter {
+                        ordinal: ordinal as u32,
+                        ty: instantiate_type(
+                            &parameter.flow_type.ty,
+                            &mut unifier,
+                            &mut *variables,
+                        ),
+                        mode: parameter.flow_type.mode,
+                    })
+                    .collect();
+                let call_contexts = signature
+                    .contexts
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, context)| {
+                        Ok(InstantiatedInterfaceCallContext {
+                            ordinal: u32::try_from(ordinal).map_err(|_| {
+                                OwnerConstraintSeedError::new(
+                                    "interface call context ordinal exceeds u32",
+                                )
+                            })?,
+                            name: context.name.clone(),
+                            provider_parameter_ordinal: context.provider_parameter_ordinal,
+                            ty: instantiate_type(
+                                &context.flow_type.ty,
+                                &mut unifier,
+                                &mut *variables,
+                            ),
+                            mode: context.flow_type.mode,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, OwnerConstraintSeedError>>()?;
+                let result = instantiate_type(&signature.result.ty, &mut unifier, &mut *variables);
+                (
+                    parameters,
+                    call_contexts,
+                    result,
+                    Type::Absent,
+                    signature.result.mode,
+                    None,
+                    signature.effect,
+                    true,
+                )
+            } else {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Type::Unknown,
+                    Type::Absent,
+                    FlowMode::Continuous,
+                    None,
+                    CheckedEffectSummary::default(),
+                    false,
+                )
+            };
+            let signature_call = caller
+                .signature_lexical_plan
+                .call(call.expression)
+                .ok_or_else(|| {
+                    OwnerConstraintSeedError::new(format!(
+                        "interface call {:?} is absent from its signature lexical plan",
+                        call.stable_expression
+                    ))
+                })?;
+            let has_explicit_pass = signature_call.explicit_pass.is_some();
+            let call_valid = signature_found
+                && signature_call.valid
+                && (has_explicit_pass
+                    || context.is_none()
+                    || caller.declaration_kind == Some(OwnerDeclarationKind::Function));
 
             let call_variable = caller.expressions[call.expression];
-            let has_explicit_pass = call.inputs.iter().any(|(role, _)| {
-                matches!(
-                    role,
-                    OwnerConstraintEdgeRole::CallPass { .. }
-                        | OwnerConstraintEdgeRole::PipePass { .. }
-                )
-            });
             if call_valid
                 && !has_explicit_pass
                 && let Some(context) = &context
@@ -3168,54 +3419,41 @@ pub fn evaluate_owner_interface_scc<'a>(
                 unifier.unify(Type::Var(caller.context), context.clone());
             }
             if call_valid && let Some(field) = call.function.strip_prefix("Field/") {
-                if let Some((_, input)) = call
-                    .inputs
+                if let Some(input) = signature_call
+                    .matched_inputs
                     .iter()
-                    .find(|(role, _)| matches!(role, OwnerConstraintEdgeRole::PipeInput))
-                    && let Some(input) = expression_variable(caller, *input)
+                    .find(|input| {
+                        input.source == crate::OwnerSignatureMatchedInputSource::PipeInput
+                    })
+                    .map(|input| input.expression)
+                    && let Some(input) = expression_variable(caller, input)
                 {
                     let projected = bind_projection(&mut unifier, input, &[field.to_owned()]);
                     unifier.unify(Type::Var(call_variable), Type::Var(projected));
                 }
-            } else {
+            } else if call_valid {
                 unifier.bind_var(call_variable, result);
             }
-            for (role, input) in call.inputs.iter().filter(|_| call_valid) {
-                let Some(input) = expression_variable(caller, *input) else {
+            for planned in signature_call.matched_inputs.iter().filter(|_| call_valid) {
+                let Some(input) = expression_variable(caller, planned.expression) else {
                     continue;
                 };
-                match role {
-                    OwnerConstraintEdgeRole::PipeInput => {
-                        if let Some(expected) = parameters
-                            .iter()
-                            .find(|parameter| parameter.kind == OwnerParameterKind::Value)
-                        {
-                            unifier.unify(Type::Var(input), expected.ty.clone());
-                        }
-                    }
-                    OwnerConstraintEdgeRole::CallArgument { kind, name, .. }
-                    | OwnerConstraintEdgeRole::PipeArgument { kind, name, .. } => {
-                        if let Some(parameter) =
-                            parameters.iter().find(|parameter| parameter.name == *name)
-                        {
-                            match (&parameter.kind, kind) {
-                                (OwnerParameterKind::Value, OwnerArgumentKind::Named)
-                                | (OwnerParameterKind::Out, OwnerArgumentKind::Named) => {
-                                    unifier.unify(Type::Var(input), parameter.ty.clone());
-                                }
-                                (OwnerParameterKind::Out, OwnerArgumentKind::BareBinding)
-                                | (OwnerParameterKind::Value, OwnerArgumentKind::BareBinding) => {}
-                            }
-                        }
-                    }
-                    OwnerConstraintEdgeRole::CallPass { .. }
-                    | OwnerConstraintEdgeRole::PipePass { .. } => {
-                        if let Some(context) = &context {
-                            unifier.unify(Type::Var(input), context.clone());
-                        }
-                    }
-                    _ => {}
+                let Some(parameter) = parameters
+                    .binary_search_by_key(&planned.formal_ordinal, |parameter| parameter.ordinal)
+                    .ok()
+                    .and_then(|index| parameters.get(index))
+                else {
+                    continue;
+                };
+                if planned.from_pipe || planned.argument_kind == OwnerArgumentKind::Named {
+                    unifier.unify(Type::Var(input), parameter.ty.clone());
                 }
+            }
+            if call_valid
+                && let (Some(pass), Some(context)) = (&signature_call.explicit_pass, &context)
+                && let Some(input) = expression_variable(caller, pass.expression)
+            {
+                unifier.unify(Type::Var(input), context.clone());
             }
             unifier.bind_var(
                 call.flush,
@@ -3226,38 +3464,76 @@ pub fn evaluate_owner_interface_scc<'a>(
                 },
             );
             if let Some(state) = states.get_mut(&call.caller) {
+                let signature_call = state
+                    .signature_lexical_plan
+                    .call(call.expression)
+                    .cloned()
+                    .ok_or_else(|| {
+                        OwnerConstraintSeedError::new(
+                            "interface signature lexical call disappeared during solving",
+                        )
+                    })?;
+                if call_valid && signature_call.valid {
+                    for output in &signature_call.outputs {
+                        let crate::OwnerSignatureOutputBindingPlan::Fresh { target, .. } = output
+                        else {
+                            continue;
+                        };
+                        let Some(variable) =
+                            state.signature_declaration_variables.get(target).copied()
+                        else {
+                            continue;
+                        };
+                        let Some(parameter) = parameters
+                            .iter()
+                            .find(|parameter| parameter.ordinal == output.formal_ordinal())
+                        else {
+                            continue;
+                        };
+                        unifier.unify(Type::Var(variable), parameter.ty.clone());
+                        bind_signature_declaration_reads(
+                            state,
+                            target,
+                            variable,
+                            parameter.mode,
+                            &mut unifier,
+                        );
+                    }
+                    for planned in &signature_call.contexts {
+                        let Some(variable) = state
+                            .signature_declaration_variables
+                            .get(&planned.target)
+                            .copied()
+                        else {
+                            continue;
+                        };
+                        let Some(context) = call_contexts.iter().find(|context| {
+                            context.ordinal == planned.context_ordinal
+                                && context.name == planned.name
+                                && context.provider_parameter_ordinal
+                                    == planned.provider_parameter_ordinal
+                        }) else {
+                            continue;
+                        };
+                        unifier.unify(Type::Var(variable), context.ty.clone());
+                        bind_signature_declaration_reads(
+                            state,
+                            &planned.target,
+                            variable,
+                            context.mode,
+                            &mut unifier,
+                        );
+                    }
+                }
                 if call_valid {
                     let merged = merge_effects(state.effect, effect);
                     surface_changed |= merged != state.effect;
                     state.effect = merged;
                 }
-                let mode = flow_mode_join(state.modes[call.expression], Some(result_mode));
-                surface_changed |= mode != state.modes[call.expression];
-                state.modes[call.expression] = mode;
-                for (ordinal, incoming) in evaluation_scope_updates {
-                    let parameter = state
-                        .parameters
-                        .iter_mut()
-                        .find(|parameter| parameter.ordinal == ordinal)
-                        .ok_or_else(|| {
-                            OwnerConstraintSeedError::new(format!(
-                                "owner interface {:?} has no parameter ordinal {ordinal}",
-                                state.seed.owner
-                            ))
-                        })?;
-                    match (parameter.evaluation_scope, incoming) {
-                        (OwnerInterfaceEvaluationScope::Parent, incoming) => {
-                            parameter.evaluation_scope = incoming;
-                            surface_changed = true;
-                        }
-                        (current, incoming) if current == incoming => {}
-                        (current, incoming) => {
-                            return Err(OwnerConstraintSeedError::new(format!(
-                                "owner interface {:?} parameter `{}` requires incompatible evaluation scopes {current:?} and {incoming:?}",
-                                state.seed.owner, parameter.name
-                            )));
-                        }
-                    }
+                if call_valid {
+                    let mode = flow_mode_join(state.modes[call.expression], Some(result_mode));
+                    surface_changed |= mode != state.modes[call.expression];
+                    state.modes[call.expression] = mode;
                 }
             }
             let _ = call.stable_expression;
@@ -3331,7 +3607,9 @@ pub fn evaluate_owner_interface_scc<'a>(
         let result_flush_type = resolved_result_flush_type
             .map(|ty| alpha_normalize_type(&ty, &mut alpha_variables, &mut next_alpha));
         let context_ty = unifier.resolve(&Type::Var(state.context));
-        let context = (!matches!(context_ty, Type::Var(_) | Type::Unknown)).then(|| {
+        let context = (state.declaration_kind == Some(OwnerDeclarationKind::Function)
+            && !matches!(context_ty, Type::Var(_) | Type::Unknown))
+        .then(|| {
             let flow_type = FlowType {
                 mode: FlowMode::Continuous,
                 ty: alpha_normalize_type(&context_ty, &mut alpha_variables, &mut next_alpha),

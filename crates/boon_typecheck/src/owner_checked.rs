@@ -908,12 +908,9 @@ impl OwnerSyntaxGraph {
     ) -> Option<OwnerExpressionRef> {
         let mut result = None;
         for (index, child) in statements.iter().enumerate() {
-            if self
-                .local_statement(child)
-                .is_some_and(|statement| {
-                    self.statement_is_source_pipe_continuation(syntax, statement)
-                })
-                && result.is_some()
+            if self.local_statement(child).is_some_and(|statement| {
+                self.statement_is_source_pipe_continuation(syntax, statement)
+            }) && result.is_some()
             {
                 continue;
             }

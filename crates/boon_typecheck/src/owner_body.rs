@@ -37,9 +37,9 @@ use std::sync::Arc;
 
 const OWNER_BODY_INFERENCE_DOMAIN_V5: &[u8] = b"boon.owner-body-inference.v5\0";
 const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V3: &[u8] = b"boon.owner-body-inference-content.v3\0";
-const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V4: &[u8] =
-    b"boon.owner-body-inference-currentness.v4\0";
-const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V2: &[u8] = b"boon.owner-body-interface-plan.v2\0";
+const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V5: &[u8] =
+    b"boon.owner-body-inference-currentness.v5\0";
+const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V3: &[u8] = b"boon.owner-body-interface-plan.v3\0";
 const OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V2: &[u8] = b"boon.owner-diagnostics-aggregate.v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,7 +65,9 @@ impl Error for OwnerBodyInferenceError {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerBodyInterfaceSccPlan {
+    #[serde(skip)]
     key: OwnerInterfaceSccKey,
+    key_fingerprint_v1: [u8; 32],
     /// Sorted exact member indices in `key.members` used by this body.
     /// Stable owner keys remain owned once by the SCC key instead of being
     /// copied into every importing body plan.
@@ -149,7 +151,7 @@ pub struct OwnerBodyInterfacePlanner {
     owner: StableCheckOwnerKey,
     required: BTreeSet<StableCheckOwnerKey>,
     pending: VecDeque<StableCheckOwnerKey>,
-    provider_sccs: Vec<OwnerInterfaceSccKey>,
+    provider_sccs: Vec<(OwnerInterfaceSccKey, [u8; 32])>,
     providers: BTreeMap<StableCheckOwnerKey, usize>,
     work: OwnerBodyInterfacePlanWork,
 }
@@ -200,9 +202,10 @@ impl OwnerBodyInterfacePlanner {
         let provider = self
             .provider_sccs
             .iter()
-            .position(|key| key == &result.key)
+            .position(|(key, _)| key == &result.key)
             .unwrap_or_else(|| {
-                self.provider_sccs.push(result.key.clone());
+                self.provider_sccs
+                    .push((result.key.clone(), result.key_fingerprint_v1()));
                 self.provider_sccs.len() - 1
             });
         if self.providers.insert(owner.clone(), provider).is_some() {
@@ -255,9 +258,10 @@ impl OwnerBodyInterfacePlanner {
         let seal_scc = |provider: usize,
                         referenced_owners: Vec<StableCheckOwnerKey>|
          -> Result<OwnerBodyInterfaceSccPlan, OwnerBodyInferenceError> {
-            let key = provider_sccs.get(provider).cloned().ok_or_else(|| {
-                OwnerBodyInferenceError::new("owner body interface plan lost a provider SCC")
-            })?;
+            let (key, key_fingerprint_v1) =
+                provider_sccs.get(provider).cloned().ok_or_else(|| {
+                    OwnerBodyInferenceError::new("owner body interface plan lost a provider SCC")
+                })?;
             let referenced_members = referenced_owners
                 .iter()
                 .map(|owner| {
@@ -280,6 +284,7 @@ impl OwnerBodyInterfacePlanner {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(OwnerBodyInterfaceSccPlan {
                 key,
+                key_fingerprint_v1,
                 referenced_members: referenced_members.into_boxed_slice(),
             })
         };
@@ -293,7 +298,7 @@ impl OwnerBodyInterfacePlanner {
         self.work.required_owners = self.required.len() as u64;
         self.work.provider_sccs = imports.len() as u64 + 1;
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INTERFACE_PLAN_DOMAIN_V2,
+            OWNER_BODY_INTERFACE_PLAN_DOMAIN_V3,
             &(&self.owner, &own_scc, &imports),
         )?;
         Ok(OwnerBodyInterfacePlan {
@@ -345,22 +350,29 @@ pub struct OwnerBodyRelocation {
 pub struct OwnerBodyInterfaceImport {
     pub owner: StableCheckOwnerKey,
     pub interface_fingerprint_v1: [u8; 32],
-    pub provider_scc: OwnerInterfaceSccKey,
-    pub provider_fingerprint_v1: [u8; 32],
-    pub provider_type_variable_count: u32,
+    /// Index into the currentness basis' canonical SCC sequence: own SCC
+    /// first, followed by sorted imports. Provider identity and its complete
+    /// currentness seal are stored once in that basis instead of being copied
+    /// into every imported owner row.
+    pub provider_scc: u32,
 }
 
 /// Frozen identity of one interface SCC consumed by owner-local inference.
 ///
-/// `referenced_owners` is the exact subset used by this owner. The full SCC
-/// result fingerprint and its alpha namespace remain attached so a cache hit
-/// cannot accidentally combine same-numbered `TypeVar`s from another SCC.
+/// `referenced_members` is the exact subset used by this owner, indexed into
+/// the runtime key. The key itself is retained for request routing but omitted
+/// from the compact currentness encoding; its content digest is sealed once.
+/// The full SCC result fingerprint and its alpha namespace remain attached so
+/// a cache hit cannot accidentally combine same-numbered `TypeVar`s from
+/// another SCC.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct FrozenOwnerInterfaceSccRef {
+    #[serde(skip)]
     pub key: OwnerInterfaceSccKey,
+    pub key_fingerprint_v1: [u8; 32],
     pub result_fingerprint_v1: [u8; 32],
     pub type_variable_count: u32,
-    pub referenced_owners: Box<[StableCheckOwnerKey]>,
+    pub referenced_members: Box<[u32]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -567,7 +579,7 @@ impl OwnerBodyInferenceCurrentnessReceipt {
         }
         let result_fingerprint_v1 = result.fingerprint_v1();
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V4,
+            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V5,
             &(&basis, &interface_imports, result_fingerprint_v1),
         )?;
         Ok(Self {
@@ -1753,7 +1765,7 @@ fn frozen_scc_ref(
     result: &OwnerInterfaceSccResult,
     plan: &OwnerBodyInterfaceSccPlan,
 ) -> Result<FrozenOwnerInterfaceSccRef, OwnerBodyInferenceError> {
-    if result.key != plan.key {
+    if result.key != plan.key || result.key_fingerprint_v1() != plan.key_fingerprint_v1 {
         return Err(OwnerBodyInferenceError::new(format!(
             "owner body interface plan expected SCC {:?}, got {:?}",
             plan.key, result.key
@@ -1781,13 +1793,10 @@ fn frozen_scc_ref(
     }
     Ok(FrozenOwnerInterfaceSccRef {
         key: result.key.clone(),
+        key_fingerprint_v1: result.key_fingerprint_v1(),
         result_fingerprint_v1: result.fingerprint_v1(),
         type_variable_count: result.type_variable_count,
-        referenced_owners: plan
-            .referenced_owners()
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
+        referenced_members: plan.referenced_members.clone(),
     })
 }
 
@@ -4747,7 +4756,13 @@ fn evaluate_owner_body_impl<'a>(
     for planned_scc in interface_plan.sccs() {
         let result = supplied_results[&planned_scc.key];
         let frozen = frozen_scc_ref(result, planned_scc)?;
-        for owner in &frozen.referenced_owners {
+        for member in &frozen.referenced_members {
+            let owner = frozen.key.members.get(*member as usize).ok_or_else(|| {
+                OwnerBodyInferenceError::new(format!(
+                    "interface SCC {:?} has no planned member {member}",
+                    result.key
+                ))
+            })?;
             let interface = result.owner(owner).ok_or_else(|| {
                 OwnerBodyInferenceError::new(format!(
                     "interface SCC {:?} does not publish its member {owner:?}",
@@ -4783,14 +4798,11 @@ fn evaluate_owner_body_impl<'a>(
     frozen_results.sort_by(|left, right| left.key.cmp(&right.key));
     let signature_lexical_plan = if let Some(plan) = supplied_signature_lexical_plan {
         let signature_inputs_match = plan
-            .matches_signature_inputs(
-                seed,
-                summary,
-                abi,
+            .matches_signature_inputs(seed, summary, abi, |owner| {
                 interfaces
-                    .values()
-                    .map(|interface| OwnerCallableLexicalSignature::from_interface(interface)),
-            )
+                    .get(owner)
+                    .map(|interface| OwnerCallableLexicalSignature::from_interface(interface))
+            })
             .map_err(|error| {
                 OwnerBodyInferenceError::new(format!(
                     "cannot validate owner body signature lexical inputs: {error}"
@@ -4828,6 +4840,35 @@ fn evaluate_owner_body_impl<'a>(
         )));
     }
     let inference_abi_fingerprint_v1 = abi.fingerprint_v1();
+    let mut interface_imports = interfaces
+        .values()
+        .map(|interface| {
+            let provider = providers[&interface.owner];
+            let provider_scc = if provider.key == own_scc_ref.key {
+                0
+            } else {
+                let index = frozen_results
+                    .binary_search_by(|frozen| frozen.key.cmp(&provider.key))
+                    .map_err(|_| {
+                        OwnerBodyInferenceError::new(format!(
+                            "owner body inference {:?} lost provider SCC {:?}",
+                            seed.owner, provider.key
+                        ))
+                    })?;
+                u32::try_from(index + 1).map_err(|_| {
+                    OwnerBodyInferenceError::new(
+                        "owner body interface provider index exceeds the u32 bound",
+                    )
+                })?
+            };
+            Ok(OwnerBodyInterfaceImport {
+                owner: interface.owner.clone(),
+                interface_fingerprint_v1: owner_body_interface_fingerprint_v1(interface)?,
+                provider_scc,
+            })
+        })
+        .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?;
+    interface_imports.sort_by(|left, right| left.owner.cmp(&right.owner));
     let basis = OwnerBodyInferenceBasis {
         owner: seed.owner.clone(),
         syntax_fingerprint_v1: syntax.fingerprint_v1(),
@@ -4839,20 +4880,6 @@ fn evaluate_owner_body_impl<'a>(
         imports: frozen_results.into_boxed_slice(),
         inference_abi_fingerprint_v1,
     };
-    let mut interface_imports = interfaces
-        .values()
-        .map(|interface| {
-            let provider = providers[&interface.owner];
-            Ok(OwnerBodyInterfaceImport {
-                owner: interface.owner.clone(),
-                interface_fingerprint_v1: owner_body_interface_fingerprint_v1(interface)?,
-                provider_scc: provider.key.clone(),
-                provider_fingerprint_v1: provider.fingerprint_v1(),
-                provider_type_variable_count: provider.type_variable_count,
-            })
-        })
-        .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?;
-    interface_imports.sort_by(|left, right| left.owner.cmp(&right.owner));
 
     let mut work = OwnerBodyInferenceWork {
         statements: syntax.statements.len() as u64,

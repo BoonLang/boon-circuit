@@ -21,11 +21,11 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-const OWNER_SIGNATURE_LEXICAL_PLAN_DOMAIN_V2: &[u8] = b"boon.owner-signature-lexical-plan.v2\0";
+const OWNER_SIGNATURE_LEXICAL_PLAN_DOMAIN_V3: &[u8] = b"boon.owner-signature-lexical-plan.v3\0";
 const OWNER_SIGNATURE_LEXICAL_READS_DOMAIN_V2: &[u8] = b"boon.owner-signature-lexical-reads.v2\0";
 const OWNER_SIGNATURE_LEXICAL_INPUTS_DOMAIN_V2: &[u8] = b"boon.owner-signature-lexical-inputs.v2\0";
-const OWNER_SIGNATURE_LEXICAL_ENVIRONMENT_DOMAIN_V1: &[u8] =
-    b"boon.owner-signature-lexical-environment.v1\0";
+const OWNER_SIGNATURE_LEXICAL_ENVIRONMENT_DOMAIN_V2: &[u8] =
+    b"boon.owner-signature-lexical-environment.v2\0";
 const OWNER_CALLABLE_SCOPE_COMPONENT_DOMAIN_V2: &[u8] = b"boon.owner-callable-scope-component.v2\0";
 const OWNER_LEXICAL_CONTAINMENT_CLUSTER_DOMAIN_V1: &[u8] =
     b"boon.owner-lexical-containment-cluster.v1\0";
@@ -707,7 +707,7 @@ impl OwnerSignatureLexicalPlan {
         seed: &OwnerConstraintSeed,
         summary: &OwnerConstraintSummary,
         abi: &OwnerInferenceAbiEnvironment,
-        signatures: impl IntoIterator<Item = OwnerCallableLexicalSignature>,
+        mut signature: impl FnMut(&StableCheckOwnerKey) -> Option<OwnerCallableLexicalSignature>,
     ) -> Result<bool, OwnerSignatureLexicalPlanError> {
         if !self.matches_seed(seed) {
             return Ok(false);
@@ -720,21 +720,26 @@ impl OwnerSignatureLexicalPlan {
                 .filter(|resolution| resolution.reference().kind == OwnerReferenceKind::Callable)
                 .cloned(),
         )?;
+        let required_owners = callable_resolutions
+            .resolutions()
+            .iter()
+            .filter_map(|resolution| match resolution {
+                OwnerSymbolResolution::Resolved { owner, .. } => Some(owner.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
         let mut by_owner = BTreeMap::new();
-        for signature in signatures {
-            match by_owner.entry(signature.owner.clone()) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(signature);
-                }
-                std::collections::btree_map::Entry::Occupied(entry)
-                    if entry.get() == &signature => {}
-                std::collections::btree_map::Entry::Occupied(entry) => {
-                    return Err(OwnerSignatureLexicalPlanError::new(format!(
-                        "owner signature input validation received conflicting signatures for {:?}",
-                        entry.key()
-                    )));
-                }
+        for owner in required_owners {
+            let Some(signature) = signature(&owner) else {
+                continue;
+            };
+            if signature.owner != owner {
+                return Err(OwnerSignatureLexicalPlanError::new(format!(
+                    "owner signature input validation requested {owner:?} but received {:?}",
+                    signature.owner
+                )));
             }
+            by_owner.insert(owner, signature);
         }
         let current = signature_inputs_fingerprint_v1(
             seed,
@@ -1610,7 +1615,7 @@ struct Planner<'a> {
     interfaces: &'a BTreeMap<StableCheckOwnerKey, OwnerCallableLexicalSignature>,
     resolution_by_expression: BTreeMap<StableExpressionKey, &'a OwnerSymbolResolution>,
     inherited_environment: Option<OwnerSignatureLexicalEnvironment>,
-    inherited_by_name: BTreeMap<String, crate::OwnerLexicalBoundaryBindingPlan>,
+    inherited_bindings: OwnerLexicalBoundaryBindings,
     child_binding_cache: BTreeMap<ChildBindingCacheKey, OwnerLexicalBoundaryBindings>,
     child_boundary_by_result:
         BTreeMap<StableExpressionKey, &'a crate::OwnerLexicalChildBoundaryPlan>,
@@ -1680,11 +1685,10 @@ impl<'a> Planner<'a> {
             .map(|resolution| (resolution.reference().expression.clone(), resolution))
             .collect();
         let inherited_environment = inherited_environment.cloned();
-        let inherited_by_name = inherited_environment
-            .iter()
-            .flat_map(|environment| environment.bindings.iter().cloned())
-            .map(|binding| (binding.name.clone(), binding))
-            .collect::<BTreeMap<_, _>>();
+        let inherited_bindings = inherited_environment
+            .as_ref()
+            .map(|environment| environment.bindings.clone())
+            .unwrap_or_default();
         let mut child_boundary_by_result = BTreeMap::new();
         for child in seed
             .signature_regions()
@@ -1734,7 +1738,7 @@ impl<'a> Planner<'a> {
             interfaces,
             resolution_by_expression,
             inherited_environment,
-            inherited_by_name,
+            inherited_bindings,
             child_binding_cache: BTreeMap::new(),
             child_boundary_by_result,
             child_environments: BTreeMap::new(),
@@ -2031,7 +2035,12 @@ impl<'a> Planner<'a> {
         let bindings = if let Some(bindings) = self.child_binding_cache.get(&binding_cache_key) {
             bindings.clone()
         } else {
-            let mut bindings = self.inherited_by_name.clone();
+            let mut bindings = self
+                .inherited_bindings
+                .iter()
+                .cloned()
+                .map(|binding| (binding.name.clone(), binding))
+                .collect::<BTreeMap<_, _>>();
             bindings.extend(
                 boundary
                     .bindings
@@ -2069,7 +2078,12 @@ impl<'a> Planner<'a> {
                     },
                 );
             }
-            let bindings = OwnerLexicalBoundaryBindings::new(bindings.into_values().collect());
+            let bindings = OwnerLexicalBoundaryBindings::try_new(bindings.into_values().collect())
+                .map_err(|error| {
+                    OwnerSignatureLexicalPlanError::new(format!(
+                        "cannot fingerprint signature lexical boundary bindings: {error}"
+                    ))
+                })?;
             self.child_binding_cache
                 .insert(binding_cache_key, bindings.clone());
             bindings
@@ -2098,13 +2112,13 @@ impl<'a> Planner<'a> {
             )
         })?;
         let fingerprint_v1 = fingerprint(
-            OWNER_SIGNATURE_LEXICAL_ENVIRONMENT_DOMAIN_V1,
+            OWNER_SIGNATURE_LEXICAL_ENVIRONMENT_DOMAIN_V2,
             &(
                 &self.seed.owner,
                 &boundary.owner,
                 &observation_expression,
                 &boundary.scope,
-                &bindings,
+                bindings.fingerprint_v1(),
                 &evaluation_scope,
             ),
         )?;
@@ -2175,7 +2189,7 @@ impl<'a> Planner<'a> {
                 .signature_regions()
                 .stable_target(&OwnerLexicalDeclarationTarget::Passed)
                 .is_none()
-                && let Some(binding) = self.inherited_by_name.get(root)
+                && let Some(binding) = self.inherited_bindings.get(root)
             {
                 return Some((Self::effective_imported_target(&binding.target), None));
             }
@@ -2187,7 +2201,7 @@ impl<'a> Planner<'a> {
             });
         }
         if root == "PASSED"
-            && let Some(binding) = self.inherited_by_name.get(root)
+            && let Some(binding) = self.inherited_bindings.get(root)
         {
             return Some((Self::effective_imported_target(&binding.target), None));
         }
@@ -2207,7 +2221,7 @@ impl<'a> Planner<'a> {
             )
         })
         .or_else(|| {
-            self.inherited_by_name
+            self.inherited_bindings
                 .get(root)
                 .map(|binding| (Self::effective_imported_target(&binding.target), None))
         })
@@ -2899,8 +2913,12 @@ impl<'a> Planner<'a> {
             OWNER_SIGNATURE_LEXICAL_READS_DOMAIN_V2,
             &(&self.seed.owner, &self.reads, &external_candidates),
         )?;
+        let child_environment_fingerprints = child_environments
+            .iter()
+            .map(OwnerSignatureLexicalEnvironment::fingerprint_v1)
+            .collect::<Vec<_>>();
         let fingerprint_v1 = fingerprint(
-            OWNER_SIGNATURE_LEXICAL_PLAN_DOMAIN_V2,
+            OWNER_SIGNATURE_LEXICAL_PLAN_DOMAIN_V3,
             &(
                 &self.seed.owner,
                 self.seed.fingerprint_v1(),
@@ -2914,7 +2932,7 @@ impl<'a> Planner<'a> {
                 self.inherited_environment
                     .as_ref()
                     .map(OwnerSignatureLexicalEnvironment::fingerprint_v1),
-                &child_environments,
+                &child_environment_fingerprints,
                 &imported_captures,
                 &imported_capture_sites,
                 &external_candidates,

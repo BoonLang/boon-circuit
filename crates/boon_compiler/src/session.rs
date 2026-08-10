@@ -832,11 +832,23 @@ impl RequestFamily for OwnerCallableScopeSccRequest {
 
 struct OwnerCallableScopeProviderRequest;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnerCallableScopeProvider {
+    key: Arc<OwnerCallableScopeSccKey>,
+    fingerprint: RequestFingerprint,
+}
+
+impl OwnerCallableScopeProvider {
+    fn key(&self) -> &OwnerCallableScopeSccKey {
+        &self.key
+    }
+}
+
 impl RequestFamily for OwnerCallableScopeProviderRequest {
     type Key = StableCheckOwnerKey;
-    type Value = Arc<OwnerCallableScopeSccKey>;
+    type Value = Arc<OwnerCallableScopeProvider>;
 
-    const NAME: &'static str = "boon.compiler.owner-callable-scope-provider.v2";
+    const NAME: &'static str = "boon.compiler.owner-callable-scope-provider.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -845,9 +857,7 @@ impl RequestFamily for OwnerCallableScopeProviderRequest {
     fn output_fingerprint(
         value: &Self::Value,
     ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
-        Ok(RequestOutputFingerprint(
-            OwnerCallableScopeSccPlanRequest::key_fingerprint(value),
-        ))
+        Ok(RequestOutputFingerprint(value.fingerprint))
     }
 }
 
@@ -1201,11 +1211,23 @@ impl RequestFamily for OwnerInterfaceSccRequest {
 /// import plan through the project-wide topology result.
 struct OwnerInterfaceProviderRequest;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnerInterfaceProvider {
+    key: Arc<OwnerInterfaceSccKey>,
+    fingerprint: RequestFingerprint,
+}
+
+impl OwnerInterfaceProvider {
+    fn key(&self) -> &OwnerInterfaceSccKey {
+        &self.key
+    }
+}
+
 impl RequestFamily for OwnerInterfaceProviderRequest {
     type Key = StableCheckOwnerKey;
-    type Value = Arc<OwnerInterfaceSccKey>;
+    type Value = Arc<OwnerInterfaceProvider>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-provider.v2";
+    const NAME: &'static str = "boon.compiler.owner-interface-provider.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1214,9 +1236,7 @@ impl RequestFamily for OwnerInterfaceProviderRequest {
     fn output_fingerprint(
         value: &Self::Value,
     ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
-        Ok(RequestOutputFingerprint(
-            OwnerInterfaceSccPlanRequest::key_fingerprint(value),
-        ))
+        Ok(RequestOutputFingerprint(value.fingerprint))
     }
 }
 
@@ -1226,7 +1246,7 @@ impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v5";
+    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v6";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1264,7 +1284,7 @@ impl RequestFamily for CheckedOwnerShardRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<CheckedOwnerShard>;
 
-    const NAME: &'static str = "boon.compiler.checked-owner-shard.v6";
+    const NAME: &'static str = "boon.compiler.checked-owner-shard.v7";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -2865,7 +2885,11 @@ fn build_project_owner_symbol_index(
             continue;
         };
         let path = owner_route_value_path(surface.owner(), true);
-        if path.is_empty() {
+        // A nested implementation owner can repeat its declaring field name,
+        // so the normalized public path gains no segment. It is not a second
+        // project value: the nearest ancestor with that path owns the public
+        // symbol, while lexical child/sibling references use stable imports.
+        if path.is_empty() || path == owner_parent_value_path(surface.owner()) {
             continue;
         }
         let candidate = OwnerSymbolCandidate {
@@ -3144,7 +3168,7 @@ fn evaluate_owner_inference_abi_requests(
                     })?;
                 let result = state
                     .owner_callable_scope_scc_requests
-                    .current_value(&state.syntax_evaluator, provider)?
+                    .current_value(&state.syntax_evaluator, provider.key())?
                     .ok_or_else(|| {
                         session_error(format!(
                             "owner inference ABI {owner:?} has no callable-scope result"
@@ -3180,7 +3204,7 @@ fn evaluate_owner_inference_abi_requests(
                 })?;
             let result = state
                 .owner_callable_scope_scc_requests
-                .current_value(&state.syntax_evaluator, provider)?
+                .current_value(&state.syntax_evaluator, provider.key())?
                 .ok_or_else(|| {
                     session_error(format!(
                         "owner inference ABI {owner:?} has no callable-scope result"
@@ -3471,7 +3495,7 @@ fn evaluate_owner_inference_abi_requests(
                     let scope_result = state.owner_callable_scope_scc_requests.require(
                         &state.syntax_evaluator,
                         &mut ticket,
-                        &provider,
+                        provider.key(),
                     )?;
                     let signature_plan = &scope_result
                         .owner(owner)
@@ -3555,6 +3579,7 @@ fn evaluate_owner_callable_scope_requests(
     state: &mut ProjectState,
     owners: &[StableCheckOwnerKey],
 ) -> CompilerResult<()> {
+    let mut trace = OwnerRequestTrace::new();
     let resolution_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.owner-callable-resolution-dependencies.v2\0",
         std::iter::empty(),
@@ -3664,6 +3689,7 @@ fn evaluate_owner_callable_scope_requests(
             }
         }
     }
+    trace.checkpoint("callable-resolution", owners.len());
 
     let topology_key = ProjectOwnerCallableScopeTopologyKey;
     let topology_input = RequestInputFingerprint(request_fingerprint(
@@ -3719,6 +3745,7 @@ fn evaluate_owner_callable_scope_requests(
             .current_value(&state.syntax_evaluator, &topology_key)?
             .ok_or_else(|| session_error("owner callable scope topology was not published"))?,
     );
+    trace.checkpoint("callable-scope-topology", topology.sccs.len());
     let live_keys = topology
         .sccs
         .iter()
@@ -3740,10 +3767,12 @@ fn evaluate_owner_callable_scope_requests(
             live_owners.contains(owner)
         })?;
     for expected in &topology.sccs {
-        let provider_input = RequestInputFingerprint(
-            OwnerCallableScopeSccPlanRequest::key_fingerprint(&expected.key),
-        );
-        let provider = Arc::new(expected.key.clone());
+        let fingerprint = OwnerCallableScopeSccPlanRequest::key_fingerprint(&expected.key);
+        let provider_input = RequestInputFingerprint(fingerprint);
+        let provider = Arc::new(OwnerCallableScopeProvider {
+            key: Arc::new(expected.key.clone()),
+            fingerprint,
+        });
         for owner in &expected.key.members {
             match state.owner_callable_scope_provider_requests.begin(
                 &mut state.syntax_evaluator,
@@ -3761,6 +3790,7 @@ fn evaluate_owner_callable_scope_requests(
             }
         }
     }
+    trace.checkpoint("callable-scope-providers", owners.len());
 
     let plan_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.owner-callable-scope-scc-plan-dependencies.v2\0",
@@ -3810,6 +3840,7 @@ fn evaluate_owner_callable_scope_requests(
             }
         }
     }
+    trace.checkpoint("callable-scope-plans", topology.sccs.len());
 
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.owner-callable-scope-scc-evaluation-dependencies.v2\0",
@@ -3882,13 +3913,26 @@ fn evaluate_owner_callable_scope_requests(
                                 .map_err(Into::into)
                         })
                         .collect::<CompilerResult<Vec<_>>>()?;
-                    Ok(Arc::new(evaluate_owner_callable_scope_scc(
+                    let solve_started = Instant::now();
+                    let evaluation = evaluate_owner_callable_scope_scc(
                         &plan,
                         seeds.iter().map(Arc::as_ref),
                         resolutions.iter().map(Arc::as_ref),
                         &abi,
                         dependencies.iter().map(Arc::as_ref),
-                    )?))
+                    )?;
+                    let solve_ms = solve_started.elapsed().as_secs_f64() * 1_000.0;
+                    if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && solve_ms >= 10.0 {
+                        eprintln!(
+                            "boon owner callable scope scc members={} clusters={} dependencies={} call_cyclic={} sample_members={:?} solve_ms={solve_ms:.3}",
+                            plan.key.members.len(),
+                            plan.containment_clusters.len(),
+                            plan.dependencies.len(),
+                            plan.call_cyclic,
+                            plan.key.members.iter().take(8).collect::<Vec<_>>(),
+                        );
+                    }
+                    Ok(Arc::new(evaluation))
                 })();
                 let evaluation = match evaluation {
                     Ok(evaluation) => evaluation,
@@ -3941,6 +3985,7 @@ fn evaluate_owner_callable_scope_requests(
             }
         }
     }
+    trace.checkpoint("callable-scope-results", topology.sccs.len());
     Ok(())
 }
 
@@ -4179,7 +4224,7 @@ fn evaluate_owner_constraint_requests(
                     let scope_result = state.owner_callable_scope_scc_requests.require(
                         &state.syntax_evaluator,
                         &mut ticket,
-                        &provider,
+                        provider.key(),
                     )?;
                     let signature_plan = &scope_result
                         .owner(owner)
@@ -4400,9 +4445,12 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
             live_owners.contains(owner)
         })?;
     for expected in &topology.sccs {
-        let provider_input =
-            RequestInputFingerprint(OwnerInterfaceSccPlanRequest::key_fingerprint(&expected.key));
-        let provider = Arc::new(expected.key.clone());
+        let fingerprint = OwnerInterfaceSccPlanRequest::key_fingerprint(&expected.key);
+        let provider_input = RequestInputFingerprint(fingerprint);
+        let provider = Arc::new(OwnerInterfaceProvider {
+            key: Arc::new(expected.key.clone()),
+            fingerprint,
+        });
         for owner in &expected.key.members {
             match state.owner_interface_provider_requests.begin(
                 &mut state.syntax_evaluator,
@@ -4558,7 +4606,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                                 )?);
                             state
                                 .owner_callable_scope_scc_requests
-                                .require(&state.syntax_evaluator, &mut ticket, &provider)
+                                .require(&state.syntax_evaluator, &mut ticket, provider.key())
                                 .map(Arc::clone)
                                 .map_err(Into::into)
                         })
@@ -4588,13 +4636,23 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                     )?;
                     let solve_ms = solve_started.elapsed().as_secs_f64() * 1_000.0;
                     if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && solve_ms >= 10.0 {
+                        let members = plan.key.members.iter().collect::<BTreeSet<_>>();
+                        let mut internal_edge_kinds = BTreeMap::new();
+                        for edge in plan
+                            .edges
+                            .iter()
+                            .filter(|edge| members.contains(&edge.dependency))
+                        {
+                            *internal_edge_kinds.entry(edge.kind).or_insert(0usize) += 1;
+                        }
                         eprintln!(
-                            "boon owner interface scc members={} dependencies={} rounds={} expressions={} unifications={} solve_ms={solve_ms:.3}",
+                            "boon owner interface scc members={} dependencies={} rounds={} expressions={} unifications={} internal_edges={internal_edge_kinds:?} sample_members={:?} solve_ms={solve_ms:.3}",
                             plan.key.members.len(),
                             plan.dependencies.len(),
                             evaluation.result.work.solve_rounds,
                             evaluation.result.work.expressions,
                             evaluation.result.work.unification_steps,
+                            plan.key.members.iter().take(8).collect::<Vec<_>>(),
                         );
                     }
                     Ok(Arc::new(evaluation))
@@ -4666,7 +4724,7 @@ fn evaluate_owner_body_inference_requests(
         .flat_map(|scc| scc.key.members.iter().cloned())
         .collect::<Vec<_>>();
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-body-inference-evaluation-dependencies.v7\0",
+        b"boon.compiler.owner-body-inference-evaluation-dependencies.v8\0",
         std::iter::empty(),
     ));
     let mut planning_ms = 0.0;
@@ -4721,16 +4779,15 @@ fn evaluate_owner_body_inference_requests(
                                 &mut ticket,
                                 &required_owner,
                             )?);
-                        let result = if let Some(result) = interface_results.get(provider.as_ref())
-                        {
+                        let result = if let Some(result) = interface_results.get(provider.key()) {
                             Arc::clone(result)
                         } else {
                             let result = Arc::clone(state.owner_interface_scc_requests.require(
                                 &state.syntax_evaluator,
                                 &mut ticket,
-                                provider.as_ref(),
+                                provider.key(),
                             )?);
-                            interface_results.insert((*provider).clone(), Arc::clone(&result));
+                            interface_results.insert(provider.key().clone(), Arc::clone(&result));
                             result
                         };
                         planner.provide_interface_scc(&result)?;
@@ -4767,7 +4824,7 @@ fn evaluate_owner_body_inference_requests(
                     let callable_scope_result = state.owner_callable_scope_scc_requests.require(
                         &state.syntax_evaluator,
                         &mut ticket,
-                        &callable_scope_provider,
+                        callable_scope_provider.key(),
                     )?;
                     let signature_lexical_plan = &callable_scope_result
                         .owner(&owner)
@@ -5156,7 +5213,7 @@ fn evaluate_checked_owner_shard_requests(
     trace.checkpoint("construction-abi", owners.len());
 
     let shard_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.checked-owner-shard-dependencies.v6\0",
+        b"boon.compiler.checked-owner-shard-dependencies.v7\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -5218,11 +5275,11 @@ fn evaluate_checked_owner_shard_requests(
                     )?);
                     let import_keys = evaluation
                         .currentness
-                        .interface_imports()
+                        .basis()
+                        .imports
                         .iter()
-                        .map(|import| import.provider_scc.clone())
-                        .filter(|key| key != own_key)
-                        .collect::<BTreeSet<_>>();
+                        .map(|frozen| frozen.key.clone())
+                        .collect::<Vec<_>>();
                     let imports = import_keys
                         .iter()
                         .map(|key| {
@@ -6178,6 +6235,47 @@ mod tests {
     }
 
     #[test]
+    fn project_value_resolution_ignores_nested_implementation_owners_at_the_same_path() {
+        let source = concat!(
+            "store: [\n",
+            "    target:\n",
+            "        LIST { 1 }\n",
+            "        |> List/map(item, new: item)\n",
+            "]\n",
+            "selected: store.target\n",
+        );
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project(source)).unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let selected = unit
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| {
+                            segment.names.as_ref() == ["selected"]
+                        })
+                )
+            })
+            .unwrap();
+        let summary = session
+            .owner_constraint_summary(project, &selected)
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.resolved_references.len(), 1, "{summary:#?}");
+        assert_eq!(
+            owner_route_value_path(&summary.resolved_references[0].owner, true),
+            ["store", "target"]
+        );
+        assert!(summary.resolved_references[0].projection.is_empty());
+    }
+
+    #[test]
     fn project_value_resolution_uses_only_unique_suffixes_and_prefers_exact_paths() {
         let source = concat!(
             "nested: TEXT { exact }\n",
@@ -6865,10 +6963,20 @@ mod tests {
             .owner_constraint_summary(shadowing_project, &owner)
             .unwrap()
             .unwrap();
-        assert!(matches!(
-            summary.symbol_resolutions.as_ref(),
-            [OwnerSymbolResolution::Resolved { .. }]
-        ));
+        // The record sibling is now an exact lexical import. It must never
+        // fall back through the project symbol index merely because a project
+        // function has the same spelling.
+        assert!(summary.symbol_resolutions.is_empty());
+        assert!(summary.lexical_captures.iter().any(|target| {
+            matches!(
+                target,
+                boon_checked::OwnerLexicalTargetRef::Declaration {
+                    declaration: boon_checked::OwnerDeclarationStableKey::Public,
+                    capability: boon_checked::OwnerLexicalDeclarationCapability::Value,
+                    ..
+                }
+            )
+        }));
         let body = shadowing_session
             .owner_body_inference(shadowing_project, &owner)
             .unwrap()
@@ -7281,9 +7389,12 @@ mod tests {
         // families are included here. An exported callable change reexecutes
         // its exact scope cone and backdates unchanged projections; the body-
         // only edit reuses 141 of 170 demanded requests and changes only 16.
+        // The exact child-boundary lexical projection adds five executions to
+        // the exported-interface cone while leaving that body-only cone
+        // unchanged.
         assert_eq!(
             (interface_delta, body_delta),
-            ((170, 82, 88, 44, 38), (170, 29, 141, 13, 16))
+            ((170, 87, 83, 42, 45), (170, 29, 141, 13, 16))
         );
     }
 

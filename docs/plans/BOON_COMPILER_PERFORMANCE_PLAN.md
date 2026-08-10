@@ -1917,14 +1917,52 @@ allocation order. Focused BLOCK, function-value, nested-pattern, forward-field,
 project/parameter-shadow, self-reference/spread, and resource-anchor oracles
 cover these contracts.
 
-This is deliberately a foundation, not the promised single-walk exit. The
-plan does not yet own signature-backed fresh-OUT or call-context overlays, so
-the seed still retains its independent reference/pattern classification and
-checked construction still materializes its dense scope/declaration rows. Do
-not filter project/ABI references from the base plan until the callable
-signature overlay proves exact output-evaluation membership, projection, and
-shadowing. Add that overlay, move seed/body/shard consumers to the combined
-plan with parity oracles, and then delete the superseded scans.
+#### 2026-08-10 signature and cross-owner lexical cut
+
+The post-`96f7f16` tranche completes the signature-backed and cross-owner
+lexical authority required before the diagnostics cutover. One signature plan
+now owns exact matched inputs, explicit PASS, FreshOut, ForwardOut, call
+contexts, output-evaluation regions, and the final external-candidate set. A
+stable child-boundary environment carries BLOCK, record, pattern,
+callable-only, ambiguous, drain, reactive-flow, and dynamic bindings through
+nested non-function owners without a project-name fallback; nested FUNCTION
+declarations reset the environment. Base and signature plans are paired by
+exact input fingerprints. Interface/body/checked construction consume the same
+targets, scopes, projections, captures, and flow modes, and provider-to-child
+generic constraints flow only into genuine inference holes rather than
+widening authoritative concrete fields. Exact negative tests reject forged
+boundary endpoints, parent roles, source units, stale plans, ambiguous reads,
+and dangling dynamic targets.
+
+The same tranche removes measured multipliers. Immutable boundary environments
+share one cached content digest; body-interface currentness retains compact
+SCC/member indices rather than copied provider identities; signature-input
+validation requests only exact call targets; and callable-scope/interface
+provider requests fingerprint each SCC key once rather than once per member.
+The typechecker suite passes 245 tests with two product-scale tests
+intentionally ignored, and the compiler/session suite passes all 43 tests.
+
+Two isolated direct debug empty-session NovyWave observations after the final
+provider cut take 7,710.631 and 7,712.530 ms. Both retain source digest
+`e8b6c437a3f112026ca4f8a58e9f9c98e04cb2e3826a29724f3dc8e72d8bda9b`,
+checked digest
+`8e2e1d06691efd597d36e8717e5a8ec18df6f524794772310e31bcbb73dc04f4`,
+zero diagnostics, and full 17,721-expression coverage. The traced observation
+reduces `callable-scope-providers` from about 1,658 ms immediately before the
+cache to 13.013 ms, while the complete callable-scope phase is about 833 ms.
+Peak RSS remains about 456,856 KiB and allocation traffic about 35.4 million
+calls/4.60 GB. Owner-body evaluation still costs about 2,931 ms,
+checked-shard construction about 1,854 ms, and project assembly about 641 ms.
+These are directional debug results and remain far above every acceptance
+gate.
+
+The next coherent deletion is therefore the already-planned diagnostic-fact
+and public-root cutover, not another lexical/import container tweak. Complete
+invalid/project/editor parity, make public diagnostics request the lean
+aggregate, and prove it constructs zero construction ABI, checked-shard,
+compatibility, or executable products. Reprofile after deleting those measured
+owners; only then optimize the remaining body evaluator or consider a narrow
+safe/unsafe kernel experiment.
 
 The adversarial request audit also corrects the following diagnostic cut. The
 current singleton `OwnerDiagnosticsAggregate` is globally red whenever any

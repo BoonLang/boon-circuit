@@ -26,7 +26,9 @@ const OWNER_CONSTRAINT_TOPOLOGY_DOMAIN_V2: &[u8] = b"boon.owner-constraint-topol
 const OWNER_DECLARATION_SURFACE_DOMAIN_V1: &[u8] = b"boon.owner-declaration-surface.v1\0";
 const OWNER_LEXICAL_PLAN_DOMAIN_V3: &[u8] = b"boon.owner-lexical-plan.v3\0";
 const OWNER_LEXICAL_READS_DOMAIN_V3: &[u8] = b"boon.owner-lexical-reads.v3\0";
-const OWNER_LEXICAL_CONTAINMENT_DOMAIN_V1: &[u8] = b"boon.owner-lexical-containment.v1\0";
+const OWNER_LEXICAL_BOUNDARY_BINDINGS_DOMAIN_V1: &[u8] =
+    b"boon.owner-lexical-boundary-bindings.v1\0";
+const OWNER_LEXICAL_CONTAINMENT_DOMAIN_V2: &[u8] = b"boon.owner-lexical-containment.v2\0";
 const OWNER_SIGNATURE_REGION_INDEX_DOMAIN_V2: &[u8] = b"boon.owner-signature-region-index.v2\0";
 const OWNER_RESOLVED_CONSTRAINT_SUMMARY_DOMAIN_V2: &[u8] =
     b"boon.owner-resolved-constraint-summary.v2\0";
@@ -208,27 +210,57 @@ pub struct OwnerLexicalBoundaryBindingPlan {
 }
 
 /// Immutable visible-binding set shared by child boundaries that occupy the
-/// same authored scope. Serialization remains the canonical flat binding
-/// sequence, so sharing is a storage/currentness implementation detail.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct OwnerLexicalBoundaryBindings(Arc<[OwnerLexicalBoundaryBindingPlan]>);
+/// same authored scope. The content digest lets enclosing artifacts commit the
+/// set once instead of serializing a wide record's identical environment for
+/// every child boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerLexicalBoundaryBindings {
+    rows: Arc<[OwnerLexicalBoundaryBindingPlan]>,
+    fingerprint_v1: [u8; 32],
+}
 
 impl OwnerLexicalBoundaryBindings {
-    pub(crate) fn new(bindings: Vec<OwnerLexicalBoundaryBindingPlan>) -> Self {
-        Self(Arc::from(bindings))
+    pub(crate) fn try_new(
+        bindings: Vec<OwnerLexicalBoundaryBindingPlan>,
+    ) -> Result<Self, boon_contract::CanonicalEncodingError> {
+        let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+            OWNER_LEXICAL_BOUNDARY_BINDINGS_DOMAIN_V1,
+            &bindings,
+        )?;
+        Ok(Self {
+            rows: Arc::from(bindings),
+            fingerprint_v1,
+        })
     }
 
     pub fn iter(&self) -> std::slice::Iter<'_, OwnerLexicalBoundaryBindingPlan> {
-        self.0.iter()
+        self.rows.iter()
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.rows.len()
+    }
+
+    pub(crate) fn get(&self, name: &str) -> Option<&OwnerLexicalBoundaryBindingPlan> {
+        self.rows
+            .binary_search_by(|binding| binding.name.as_str().cmp(name))
+            .ok()
+            .and_then(|index| self.rows.get(index))
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
     }
 
     #[cfg(test)]
     pub(crate) fn ptr_eq(left: &Self, right: &Self) -> bool {
-        Arc::ptr_eq(&left.0, &right.0)
+        Arc::ptr_eq(&left.rows, &right.rows)
+    }
+}
+
+impl Default for OwnerLexicalBoundaryBindings {
+    fn default() -> Self {
+        Self::try_new(Vec::new()).expect("empty lexical bindings are canonically serializable")
     }
 }
 
@@ -237,7 +269,7 @@ impl Serialize for OwnerLexicalBoundaryBindings {
     where
         S: Serializer,
     {
-        self.0.as_ref().serialize(serializer)
+        self.rows.as_ref().serialize(serializer)
     }
 }
 
@@ -1978,6 +2010,61 @@ fn lexical_record_fields(
     }
 }
 
+fn record_field_child_public_target(
+    input: &OwnerSyntaxInput,
+    value: usize,
+) -> Result<Option<OwnerLexicalTargetRef>, OwnerConstraintSeedError> {
+    if value < input.expressions.len() {
+        return Ok(None);
+    }
+    let external = input.external_expression(value).ok_or_else(|| {
+        OwnerConstraintSeedError::new(
+            "owner lexical record field references a missing external expression",
+        )
+    })?;
+    let mut matches = input.child_owners.iter().filter(|child| {
+        if child.result_expression.is_none()
+            || !(child.owner == external.owner
+                || crate::owner_syntax::is_descendant_owner(&child.owner, &external.owner))
+        {
+            return false;
+        }
+        match &child.result_placement {
+            crate::OwnerChildResultPlacementInput::Valueless => false,
+            crate::OwnerChildResultPlacementInput::StatementLane => child
+                .result_expression
+                .as_ref()
+                .is_some_and(|result| result == &external.expression),
+            crate::OwnerChildResultPlacementInput::ExpressionEdge { edge } => {
+                (edge.child_owner == external.owner && edge.child_expression == external.expression)
+                    || child
+                        .result_expression
+                        .as_ref()
+                        .is_some_and(|result| result == &external.expression)
+                    || child
+                        .boundary_expression
+                        .as_ref()
+                        .is_some_and(|boundary| boundary == &external.expression)
+            }
+        }
+    });
+    let child = matches.next().ok_or_else(|| {
+        OwnerConstraintSeedError::new(
+            "owner lexical record field has no exact child declaration provider",
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(OwnerConstraintSeedError::new(
+            "owner lexical record field has multiple child declaration providers",
+        ));
+    }
+    Ok(Some(OwnerLexicalTargetRef::Declaration {
+        owner: child.owner.clone(),
+        declaration: OwnerDeclarationStableKey::Public,
+        capability: OwnerLexicalDeclarationCapability::Value,
+    }))
+}
+
 fn assign_lexical_scope_regions(
     graph: &crate::OwnerSyntaxGraph,
     expression: OwnerExpressionId,
@@ -2479,7 +2566,7 @@ fn project_owner_lexical_containment(
                     // even if an authored declaration reused the spelling.
                     visible.insert("PASSED".to_owned(), (passed.clone(), None));
                 }
-                let bindings = OwnerLexicalBoundaryBindings::new(
+                let bindings = OwnerLexicalBoundaryBindings::try_new(
                     visible
                         .into_iter()
                         .map(|(name, (target, declaration_scope))| {
@@ -2490,7 +2577,12 @@ fn project_owner_lexical_containment(
                             }
                         })
                         .collect(),
-                );
+                )
+                .map_err(|error| {
+                    OwnerConstraintSeedError::new(format!(
+                        "cannot fingerprint owner lexical boundary bindings: {error}"
+                    ))
+                })?;
                 bindings_by_scope.insert(scope_id, bindings.clone());
                 bindings
             }
@@ -2508,9 +2600,28 @@ fn project_owner_lexical_containment(
             bindings,
         });
     }
+    let child_fingerprint_rows = children
+        .iter()
+        .map(|child| {
+            (
+                &child.owner,
+                &child.parent_statement,
+                child.child_index,
+                &child.boundary_expression,
+                &child.result_expression,
+                &child.result_placement,
+                &child.scope,
+                child.bindings.fingerprint_v1(),
+            )
+        })
+        .collect::<Vec<_>>();
     let fingerprint_v1 = fingerprint(
-        OWNER_LEXICAL_CONTAINMENT_DOMAIN_V1,
-        &(&input.owner, &input.containing_scope, &children),
+        OWNER_LEXICAL_CONTAINMENT_DOMAIN_V2,
+        &(
+            &input.owner,
+            &input.containing_scope,
+            &child_fingerprint_rows,
+        ),
     )?;
     Ok(OwnerLexicalContainmentPlan {
         owner: input.owner.clone(),
@@ -2678,7 +2789,7 @@ pub fn project_owner_lexical_plan(
     }
 
     let mut expression_boundaries = BTreeMap::new();
-    let mut statement_record_containers = BTreeSet::new();
+    let mut statement_record_scopes = BTreeMap::new();
     for (index, statement) in input.statements.iter().enumerate() {
         let Some(scope) = statement_body_scopes[index] else {
             continue;
@@ -2692,7 +2803,17 @@ pub fn project_owner_lexical_plan(
         let expression = checked_u32(expression, "owner lexical body container")?;
         expression_boundaries.insert(expression, scope);
         if matches!(container.kind, AstExprKind::Object(_)) {
-            statement_record_containers.insert(expression);
+            match statement_record_scopes.entry(expression) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(scope);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if *entry.get() == scope => {}
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(OwnerConstraintSeedError::new(
+                        "owner lexical record container belongs to conflicting statement scopes",
+                    ));
+                }
+            }
         }
     }
     for (arm, scope) in &pattern_scopes {
@@ -2703,7 +2824,7 @@ pub fn project_owner_lexical_plan(
     for (index, expression) in input.expressions.iter().enumerate() {
         let expression_id = checked_u32(index, "owner lexical record expression")?;
         if lexical_record_fields(expression).is_none()
-            || statement_record_containers.contains(&expression_id)
+            || statement_record_scopes.contains_key(&expression_id)
         {
             continue;
         }
@@ -2835,6 +2956,57 @@ pub fn project_owner_lexical_plan(
                     name: field.name.clone(),
                 },
             )?;
+        }
+    }
+
+    // A statement-bodied record can shard each field into an independently
+    // checked child owner. The child Public declaration is the field's stable
+    // lexical identity; routing sibling reads through a parent-owned synthetic
+    // RecordField would couple every field through the whole record interface
+    // and collapse wide records into one inference SCC.
+    for (object, scope) in &statement_record_scopes {
+        let fields = lexical_record_fields(&input.expressions[*object as usize])
+            .expect("statement record scopes belong to record expressions");
+        for (ordinal, field) in fields.iter().enumerate() {
+            if field.spread
+                || declarations.get(*scope as usize).is_some_and(|scope| {
+                    matches!(
+                        scope.get(&field.name),
+                        Some(
+                            OwnerLexicalDeclarationTarget::Statement { .. }
+                                | OwnerLexicalDeclarationTarget::Ambiguous { .. }
+                        )
+                    )
+                })
+            {
+                continue;
+            }
+            if let Some(target) = record_field_child_public_target(input, field.value)? {
+                insert_lexical_declaration(
+                    &mut declarations,
+                    *scope,
+                    field.name.clone(),
+                    OwnerLexicalDeclarationTarget::Imported { target },
+                )?;
+            } else {
+                let ordinal = checked_u32(ordinal, "owner lexical record field ordinal")?;
+                record_fields.push(OwnerLexicalRecordFieldPlan {
+                    object: *object,
+                    ordinal,
+                    name: field.name.clone(),
+                    scope: *scope,
+                });
+                insert_lexical_declaration(
+                    &mut declarations,
+                    *scope,
+                    field.name.clone(),
+                    OwnerLexicalDeclarationTarget::RecordField {
+                        object: *object,
+                        ordinal,
+                        name: field.name.clone(),
+                    },
+                )?;
+            }
         }
     }
 
@@ -4250,6 +4422,23 @@ mod tests {
         assert!(children.iter().skip(1).all(|child| {
             OwnerLexicalBoundaryBindings::ptr_eq(&children[0].bindings, &child.bindings)
         }));
+
+        let copied =
+            OwnerLexicalBoundaryBindings::try_new(children[0].bindings.iter().cloned().collect())
+                .unwrap();
+        assert_eq!(
+            copied.fingerprint_v1(),
+            children[0].bindings.fingerprint_v1(),
+            "equal binding environments must have one content identity",
+        );
+        let mut changed_rows = children[0].bindings.iter().cloned().collect::<Vec<_>>();
+        changed_rows[0].name.push_str("_changed");
+        let changed = OwnerLexicalBoundaryBindings::try_new(changed_rows).unwrap();
+        assert_ne!(
+            changed.fingerprint_v1(),
+            children[0].bindings.fingerprint_v1(),
+            "binding content changes must invalidate the shared environment identity",
+        );
     }
 
     #[test]

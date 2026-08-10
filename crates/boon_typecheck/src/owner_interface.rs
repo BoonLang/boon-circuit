@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V3: &[u8] = b"boon.owner-interface-scc-result.v3\0";
+const OWNER_INTERFACE_SCC_KEY_DOMAIN_V1: &[u8] = b"boon.owner-interface-scc-key.v1\0";
 const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V4: &[u8] =
     b"boon.owner-interface-scc-currentness.v4\0";
 const OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V2: &[u8] = b"boon.owner-body-interface-import.v2\0";
@@ -272,10 +273,15 @@ pub struct OwnerInterfaceSccResult {
     /// `TypeVar` values from distinct SCCs as globally unique.
     pub type_variable_count: u32,
     pub work: OwnerInterfaceSolveWork,
+    key_fingerprint_v1: [u8; 32],
     fingerprint_v1: [u8; 32],
 }
 
 impl OwnerInterfaceSccResult {
+    pub const fn key_fingerprint_v1(&self) -> [u8; 32] {
+        self.key_fingerprint_v1
+    }
+
     pub const fn fingerprint_v1(&self) -> [u8; 32] {
         self.fingerprint_v1
     }
@@ -2907,23 +2913,15 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 "interface SCC callable scope results do not cover every member",
             ));
         }
-        let available_signatures = signatures
-            .values()
-            .cloned()
-            .chain(
-                dependency_interfaces
-                    .values()
-                    .map(OwnerCallableLexicalSignature::from_interface),
-            )
-            .collect::<Vec<_>>();
         for owner in &scc.key.members {
             if !plans[owner]
-                .matches_signature_inputs(
-                    seeds[owner],
-                    summaries[owner],
-                    abi,
-                    available_signatures.iter().cloned(),
-                )
+                .matches_signature_inputs(seeds[owner], summaries[owner], abi, |target| {
+                    signatures.get(target).cloned().or_else(|| {
+                        dependency_interfaces.get(target).map(|interface| {
+                            OwnerCallableLexicalSignature::from_interface(interface)
+                        })
+                    })
+                })
                 .map_err(|error| {
                     OwnerConstraintSeedError::new(format!(
                         "cannot validate owner signature lexical inputs for {owner:?}: {error}"
@@ -4472,11 +4470,19 @@ fn evaluate_owner_interface_scc_impl<'a>(
             "cannot fingerprint owner interface SCC result: {error}"
         ))
     })?;
+    let key_fingerprint_v1 =
+        boon_contract::canonical_serde_hash_v1(OWNER_INTERFACE_SCC_KEY_DOMAIN_V1, &scc.key)
+            .map_err(|error| {
+                OwnerConstraintSeedError::new(format!(
+                    "cannot fingerprint owner interface SCC key: {error}"
+                ))
+            })?;
     let result = Arc::new(OwnerInterfaceSccResult {
         key: scc.key.clone(),
         owners: interfaces.into_boxed_slice(),
         type_variable_count: next_alpha,
         work,
+        key_fingerprint_v1,
         fingerprint_v1,
     });
     let currentness = OwnerInterfaceSccCurrentnessReceipt::from_current_evaluation(basis, &result)?;

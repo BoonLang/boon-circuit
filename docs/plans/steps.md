@@ -704,6 +704,40 @@ stronger three-reviewer performance closure defined below.
    fresh-OUT/call-context overlays, remaining seed/shard scan deletion, and
    per-name/module symbol projections remain next.
 
+   The post-`96f7f16` signature/cross-owner lexical tranche now completes the
+   next correctness boundary. One signature lexical plan owns matched inputs,
+   PASS, FreshOut, ForwardOut, call contexts, output-evaluation regions, and
+   effective external candidates. Exact child-boundary environments carry
+   BLOCK, record, pattern, callable-only, ambiguous, drain, reactive-flow, and
+   dynamic bindings by stable origin across nested non-function owners; local
+   declarations retain lexical precedence and nested FUNCTION declarations
+   reset capture. Provider-to-consumer interface propagation preserves generic
+   inference holes without allowing child demand to widen authoritative
+   concrete fields. Forged boundary endpoints, roles, source units, stale
+   plans, and unresolved fallbacks fail closed. The focused typechecker suite
+   passes 245 tests with two product-scale tests intentionally ignored, and the
+   compiler/session suite passes 43 tests.
+
+   This tranche also removes several measured request multipliers rather than
+   tuning their containers: shared immutable boundary environments cache one
+   content fingerprint, body currentness stores compact SCC/member indices,
+   signature-input validation requests only exact call targets, and callable-
+   scope/interface provider requests cache each SCC-key fingerprint once. On
+   the same direct debug empty-session NovyWave source, the final provider cut
+   reduces `callable-scope-providers` from about 1,658 ms to 13 ms and total
+   diagnostics from about 9,670 ms to 7,710/7,713 ms in two isolated producer
+   observations. Both retain source digest
+   `e8b6c437a3f112026ca4f8a58e9f9c98e04cb2e3826a29724f3dc8e72d8bda9b`,
+   checked digest
+   `8e2e1d06691efd597d36e8717e5a8ec18df6f524794772310e31bcbb73dc04f4`,
+   zero diagnostics, and full 17,721-expression coverage. Peak RSS remains
+   about 456,856 KiB and allocation traffic about 35.4 million calls/4.60 GB,
+   so this is a checkpoint, not a gate pass. The current dominant owners are
+   owner-body requests at about 2,931 ms, checked-shard construction at about
+   1,854 ms, and project assembly at about 641 ms. Continue with diagnostic
+   fact/parity completion and the public diagnostics-root cutover before
+   optimizing the body evaluator or considering unsafe.
+
    Then replace the globally red `OwnerDiagnosticsAggregate` bundle with
    per-owner semantic diagnostic facts, source-unit presentation projections,
    and a small project ordering/currentness receipt. Move forward-OUT, order,

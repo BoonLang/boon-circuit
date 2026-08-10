@@ -349,7 +349,9 @@ fn validated_frozen_interfaces<'a>(
         }
     }
 
-    if own_scc.key != body_basis.own_scc.key {
+    if own_scc.key != body_basis.own_scc.key
+        || own_scc.key_fingerprint_v1() != body_basis.own_scc.key_fingerprint_v1
+    {
         return Err(CheckedOwnerBuildError::new(format!(
             "checked owner {:?} received the wrong own interface SCC",
             body.owner()
@@ -376,7 +378,8 @@ fn validated_frozen_interfaces<'a>(
     let mut expected_owners = BTreeSet::new();
     for (key, frozen) in &expected {
         let result = actual[key];
-        if result.fingerprint_v1() != frozen.result_fingerprint_v1
+        if result.key_fingerprint_v1() != frozen.key_fingerprint_v1
+            || result.fingerprint_v1() != frozen.result_fingerprint_v1
             || result.type_variable_count != frozen.type_variable_count
         {
             return Err(CheckedOwnerBuildError::new(format!(
@@ -385,11 +388,14 @@ fn validated_frozen_interfaces<'a>(
             )));
         }
         let mut referenced = BTreeSet::new();
-        for owner in &frozen.referenced_owners {
-            if !referenced.insert(owner.clone())
-                || !key.members.contains(owner)
-                || result.owner(owner).is_none()
-            {
+        for member in &frozen.referenced_members {
+            let owner = key.members.get(*member as usize).ok_or_else(|| {
+                CheckedOwnerBuildError::new(format!(
+                    "checked owner {:?} has an out-of-range frozen interface member {member}",
+                    body.owner()
+                ))
+            })?;
+            if !referenced.insert(*member) || result.owner(owner).is_none() {
                 return Err(CheckedOwnerBuildError::new(format!(
                     "checked owner {:?} has an invalid frozen interface member {owner:?}",
                     body.owner()
@@ -421,22 +427,42 @@ fn validated_frozen_interfaces<'a>(
         )));
     }
 
+    let frozen_providers = std::iter::once(&body_basis.own_scc)
+        .chain(body_basis.imports.iter())
+        .collect::<Vec<_>>();
+    let actual_providers = frozen_providers
+        .iter()
+        .map(|frozen| actual[&frozen.key])
+        .collect::<Vec<_>>();
     let mut interfaces = BTreeMap::new();
     for (owner, import) in imports {
-        let result = actual.get(&import.provider_scc).copied().ok_or_else(|| {
+        let provider = usize::try_from(import.provider_scc).map_err(|_| {
             CheckedOwnerBuildError::new(format!(
-                "checked owner {:?} import {owner:?} has no frozen provider SCC",
+                "checked owner {:?} import {owner:?} has an invalid provider index",
                 body.owner()
             ))
         })?;
-        if result.fingerprint_v1() != import.provider_fingerprint_v1
-            || result.type_variable_count != import.provider_type_variable_count
-        {
+        let frozen = frozen_providers.get(provider).copied().ok_or_else(|| {
+            CheckedOwnerBuildError::new(format!(
+                "checked owner {:?} import {owner:?} has no frozen provider index {}",
+                body.owner(),
+                import.provider_scc
+            ))
+        })?;
+        let referenced = frozen
+            .key
+            .members
+            .binary_search(&owner)
+            .ok()
+            .and_then(|member| u32::try_from(member).ok())
+            .is_some_and(|member| frozen.referenced_members.binary_search(&member).is_ok());
+        if !referenced {
             return Err(CheckedOwnerBuildError::new(format!(
-                "checked owner {:?} import {owner:?} has a stale provider SCC",
+                "checked owner {:?} import {owner:?} selects an unrelated provider SCC",
                 body.owner()
             )));
         }
+        let result = actual_providers[provider];
         let interface = result.owner(&owner).ok_or_else(|| {
             CheckedOwnerBuildError::new(format!(
                 "checked owner {:?} provider does not publish interface {owner:?}",
@@ -1008,17 +1034,54 @@ impl<'a> OwnerRowConstruction<'a> {
                     CheckedOwnerBuildError::new("owner lexical record field ordinal is missing")
                 })?
                 .value;
-            let value = OwnerExpressionId(checked_u32(value, "owner record field value")?);
+            let value = owner_expression_ref(self.syntax, value)?;
             let flow_type = self
-                .body
-                .expressions
-                .get(value.0 as usize)
-                .map(|expression| expression.flow_type.clone())
+                .expression_flow_type(&value)
                 .unwrap_or_else(unknown_flow_type);
-            let flow_type = self.finalize_declaration_flow_type(
-                &OwnerExpressionRef::Local { expression: value },
-                flow_type,
-            );
+            let flow_type = self.finalize_declaration_flow_type(&value, flow_type);
+            let lexical_scope = self
+                .lexical_plan
+                .scopes()
+                .get(field.scope as usize)
+                .ok_or_else(|| {
+                    CheckedOwnerBuildError::new(
+                        "owner lexical record field references a missing scope",
+                    )
+                })?;
+            let scope = match lexical_scope.origin {
+                OwnerLexicalScopeOrigin::Root => self.containing_scope.clone(),
+                OwnerLexicalScopeOrigin::StatementBody { statement } => self
+                    .statement_body_scopes
+                    .get(&OwnerStatementId(statement))
+                    .copied()
+                    .map(local_scope_ref)
+                    .ok_or_else(|| {
+                        CheckedOwnerBuildError::new(
+                            "owner lexical record field statement scope is missing",
+                        )
+                    })?,
+                OwnerLexicalScopeOrigin::Record { expression } => self
+                    .record_expression_scopes
+                    .get(&OwnerExpressionId(expression))
+                    .copied()
+                    .map(local_scope_ref)
+                    .ok_or_else(|| {
+                        CheckedOwnerBuildError::new(
+                            "owner lexical record field expression scope is missing",
+                        )
+                    })?,
+                OwnerLexicalScopeOrigin::PatternArm { .. } => {
+                    return Err(CheckedOwnerBuildError::new(
+                        "owner lexical record field cannot be owned directly by a pattern scope",
+                    ));
+                }
+            };
+            let body_scope = match &value {
+                OwnerExpressionRef::Local { expression } => {
+                    self.record_expression_scopes.get(expression).copied()
+                }
+                OwnerExpressionRef::Child { .. } => None,
+            };
             self.define_declaration(
                 id,
                 DeclarationSpec {
@@ -1027,12 +1090,12 @@ impl<'a> OwnerRowConstruction<'a> {
                         ordinal: field.ordinal,
                         name: field.name.clone(),
                     },
-                    scope: local_scope_ref(self.record_expression_scopes[&object_id]),
+                    scope,
                     name: field.name.clone(),
                     kind: CheckedDeclarationKind::Field,
                     flow_type,
-                    value: Some(OwnerExpressionRef::Local { expression: value }),
-                    body_scope: self.record_expression_scopes.get(&value).copied(),
+                    value: Some(value),
+                    body_scope,
                     source: OwnerSourceSite::RecordField {
                         expression: object.stable_key.clone(),
                         ordinal: field.ordinal,
@@ -7464,6 +7527,35 @@ mod tests {
                     ..
                 } if projection.is_empty()
             )
+        }));
+    }
+
+    #[test]
+    fn child_owner_reads_the_exact_forward_record_sibling() {
+        let fixture = fixture(
+            concat!(
+                "item: TEXT { global }\n",
+                "container: [\n",
+                "    item: 1\n",
+                "    copy: item\n",
+                "]\n",
+            ),
+            "copy",
+        );
+        let rows = rows(&fixture);
+        assert!(rows.expressions.iter().any(|expression| {
+            expression.flow_type.ty == Type::Number
+                && matches!(
+                    &expression.kind,
+                    OwnerExpressionKind::Read {
+                        target: OwnerDeclarationRef::ImportedStable {
+                            declaration: OwnerDeclarationStableKey::Public,
+                            ..
+                        },
+                        projection,
+                        ..
+                    } if projection.is_empty()
+                )
         }));
     }
 

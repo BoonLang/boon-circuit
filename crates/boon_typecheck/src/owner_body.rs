@@ -1300,15 +1300,45 @@ pub fn aggregate_source_unit_owner_diagnostics<'a>(
     project_facts: &crate::ProjectDiagnosticFacts,
     projections: impl IntoIterator<Item = &'a SourceUnitOwnerDiagnostics>,
 ) -> Result<OwnerDiagnosticsAggregate, OwnerBodyInferenceError> {
+    let project_evaluations = project
+        .source_layouts()
+        .iter()
+        .map(|layout| {
+            crate::evaluate_source_unit_project_diagnostics(
+                project,
+                &layout.source_unit_id,
+                project_facts,
+            )
+            .map_err(|error| OwnerBodyInferenceError::new(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    aggregate_source_unit_diagnostics(
+        project,
+        project_facts,
+        projections,
+        project_evaluations.iter(),
+        project_evaluations
+            .iter()
+            .map(|evaluation| evaluation.result.as_ref()),
+    )
+}
+
+pub fn aggregate_source_unit_diagnostics<'a, 'b, 'c>(
+    project: &ProjectSyntaxSnapshot,
+    project_facts: &crate::ProjectDiagnosticFacts,
+    owner_projections: impl IntoIterator<Item = &'a SourceUnitOwnerDiagnostics>,
+    project_evaluations: impl IntoIterator<Item = &'b crate::SourceUnitProjectDiagnosticsEvaluation>,
+    project_projections: impl IntoIterator<Item = &'c crate::SourceUnitProjectDiagnostics>,
+) -> Result<OwnerDiagnosticsAggregate, OwnerBodyInferenceError> {
     let source_bundle_digest_v1 = project.source_bundle_digest_v1();
     if project_facts.source_bundle_digest_v1() != source_bundle_digest_v1 {
         return Err(OwnerBodyInferenceError::new(
             "owner diagnostics aggregate project facts have a different source bundle",
         ));
     }
-    let mut projections_by_unit = BTreeMap::new();
-    for projection in projections {
-        if projections_by_unit
+    let mut owner_projections_by_unit = BTreeMap::new();
+    for projection in owner_projections {
+        if owner_projections_by_unit
             .insert(projection.source_unit_id().clone(), projection)
             .is_some()
         {
@@ -1318,14 +1348,48 @@ pub fn aggregate_source_unit_owner_diagnostics<'a>(
             )));
         }
     }
+    let mut project_evaluations_by_unit = BTreeMap::new();
+    for evaluation in project_evaluations {
+        let source_unit_id = evaluation.result.source_unit_id().clone();
+        if project_evaluations_by_unit
+            .insert(source_unit_id.clone(), evaluation)
+            .is_some()
+        {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "owner diagnostics aggregate received duplicate project evaluation {source_unit_id:?}"
+            )));
+        }
+    }
+    let mut project_projections_by_unit = BTreeMap::new();
+    for projection in project_projections {
+        if project_projections_by_unit
+            .insert(projection.source_unit_id().clone(), projection)
+            .is_some()
+        {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "owner diagnostics aggregate received duplicate project projection {:?}",
+                projection.source_unit_id()
+            )));
+        }
+    }
     let expected_units = project
         .source_layouts()
         .iter()
         .map(|layout| layout.source_unit_id.clone())
         .collect::<BTreeSet<_>>();
-    if projections_by_unit.keys().ne(expected_units.iter()) {
+    if owner_projections_by_unit.keys().ne(expected_units.iter()) {
         return Err(OwnerBodyInferenceError::new(
-            "owner diagnostics aggregate unit coverage differs from the project source layout",
+            "owner diagnostics aggregate owner-unit coverage differs from the project source layout",
+        ));
+    }
+    if project_evaluations_by_unit.keys().ne(expected_units.iter()) {
+        return Err(OwnerBodyInferenceError::new(
+            "owner diagnostics aggregate project-evaluation coverage differs from the project source layout",
+        ));
+    }
+    if project_projections_by_unit.keys().ne(expected_units.iter()) {
+        return Err(OwnerBodyInferenceError::new(
+            "owner diagnostics aggregate project-unit coverage differs from the project source layout",
         ));
     }
 
@@ -1335,9 +1399,10 @@ pub fn aggregate_source_unit_owner_diagnostics<'a>(
     let mut expression_count = 0u32;
     let mut call_count = 0u32;
     let mut work = OwnerBodyInferenceWork::default();
+    let mut project_diagnostic_count = 0usize;
     for layout in project.source_layouts() {
-        let projection = projections_by_unit[&layout.source_unit_id];
-        if projection
+        let owner_projection = owner_projections_by_unit[&layout.source_unit_id];
+        if owner_projection
             .basis
             .iter()
             .any(|(owner, _, _)| owner.source_unit_id() != &layout.source_unit_id)
@@ -1346,7 +1411,7 @@ pub fn aggregate_source_unit_owner_diagnostics<'a>(
                 "owner diagnostics aggregate unit projection contains a foreign owner",
             ));
         }
-        for diagnostic in projection.diagnostics() {
+        for diagnostic in owner_projection.diagnostics() {
             let mut diagnostic = diagnostic.clone();
             diagnostic.line = layout
                 .start_line
@@ -1369,21 +1434,60 @@ pub fn aggregate_source_unit_owner_diagnostics<'a>(
                 })?;
             diagnostics.push(diagnostic);
         }
-        basis.extend(projection.basis.iter().cloned());
+        let project_evaluation = project_evaluations_by_unit[&layout.source_unit_id];
+        let project_projection = project_projections_by_unit[&layout.source_unit_id];
+        if !project_evaluation.matches_inputs(project, project_facts)
+            || project_evaluation.currentness.result_fingerprint_v1()
+                != project_projection.fingerprint_v1()
+        {
+            return Err(OwnerBodyInferenceError::new(
+                "owner diagnostics aggregate received stale source-unit project diagnostics",
+            ));
+        }
+        project_diagnostic_count = project_diagnostic_count
+            .checked_add(project_projection.rows().len())
+            .ok_or_else(|| OwnerBodyInferenceError::new("project diagnostic row count overflow"))?;
+        for row in project_projection.rows() {
+            let mut diagnostic = row.diagnostic().clone();
+            diagnostic.line = layout
+                .start_line
+                .checked_add(diagnostic.line.saturating_sub(1))
+                .ok_or_else(|| {
+                    OwnerBodyInferenceError::new("project diagnostic global line overflow")
+                })?;
+            if row.relocate_bytes() {
+                diagnostic.start =
+                    layout
+                        .start_byte
+                        .checked_add(diagnostic.start)
+                        .ok_or_else(|| {
+                            OwnerBodyInferenceError::new("project diagnostic global start overflow")
+                        })?;
+                diagnostic.end =
+                    layout
+                        .start_byte
+                        .checked_add(diagnostic.end)
+                        .ok_or_else(|| {
+                            OwnerBodyInferenceError::new("project diagnostic global end overflow")
+                        })?;
+            }
+            diagnostics.push(diagnostic);
+        }
+        basis.extend(owner_projection.basis.iter().cloned());
         reported_owner_count = reported_owner_count
-            .checked_add(projection.owner_count())
+            .checked_add(owner_projection.owner_count())
             .ok_or_else(|| {
                 OwnerBodyInferenceError::new("owner diagnostics owner count overflow")
             })?;
         expression_count = expression_count
-            .checked_add(projection.expression_count())
+            .checked_add(owner_projection.expression_count())
             .ok_or_else(|| {
                 OwnerBodyInferenceError::new("owner diagnostics expression count overflow")
             })?;
         call_count = call_count
-            .checked_add(projection.call_count())
+            .checked_add(owner_projection.call_count())
             .ok_or_else(|| OwnerBodyInferenceError::new("owner diagnostics call count overflow"))?;
-        work.accumulate(projection.work());
+        work.accumulate(owner_projection.work());
     }
     basis.sort_by(|left, right| left.0.cmp(&right.0));
     if basis.windows(2).any(|pair| pair[0].0 == pair[1].0) {
@@ -1401,8 +1505,11 @@ pub fn aggregate_source_unit_owner_diagnostics<'a>(
             "owner diagnostics aggregate owner coverage differs from the project owner set",
         ));
     }
-
-    diagnostics.extend(project_facts.diagnostics().iter().cloned());
+    if project_diagnostic_count != project_facts.diagnostics().len() {
+        return Err(OwnerBodyInferenceError::new(
+            "owner diagnostics aggregate project rows do not cover every project diagnostic",
+        ));
+    }
     canonicalize_diagnostics(&mut diagnostics);
     let owner_count = checked_u32(basis.len(), "owner diagnostics owner count")?;
     if reported_owner_count != owner_count {

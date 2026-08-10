@@ -28,8 +28,8 @@ use boon_contract::SourceBundleDigestV1;
 use boon_data::{Bits, ExactNumber};
 use boon_parser::ProjectSyntaxSnapshot;
 use boon_syntax::{
-    AstExprKind, AstParameterKind, AstStatementKind, StableCheckOwnerKey, StableExpressionKey,
-    StableStatementKey,
+    AstExprKind, AstParameterKind, AstStatementKind, SourceUnitId, StableCheckOwnerKey,
+    StableExpressionKey, StableStatementKey,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -42,6 +42,10 @@ const OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V3: &[u8] = b"boon.owner-diagnostic-r
 const OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V3: &[u8] =
     b"boon.owner-diagnostic-replay-currentness.v3\0";
 const PROJECT_OUTPUT_FLOW_FACTS_DOMAIN_V1: &[u8] = b"boon.project-output-flow-facts.v1\0";
+const SOURCE_UNIT_PROJECT_DIAGNOSTICS_DOMAIN_V1: &[u8] =
+    b"boon.source-unit-project-diagnostics.v1\0";
+const SOURCE_UNIT_PROJECT_DIAGNOSTICS_CURRENTNESS_DOMAIN_V1: &[u8] =
+    b"boon.source-unit-project-diagnostics-currentness.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectDiagnosticFactsError {
@@ -263,6 +267,232 @@ impl ProjectDiagnosticFacts {
     }
 }
 
+/// One project diagnostic relocated into a source unit's local coordinate
+/// space.
+///
+/// Legacy registry diagnostics sometimes carry only a global line and leave
+/// both byte offsets at zero. `relocate_bytes` preserves that representation
+/// exactly when the final project receipt reapplies layout offsets.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SourceUnitProjectDiagnosticRow {
+    diagnostic: TypeDiagnostic,
+    relocate_bytes: bool,
+}
+
+impl SourceUnitProjectDiagnosticRow {
+    pub const fn diagnostic(&self) -> &TypeDiagnostic {
+        &self.diagnostic
+    }
+
+    pub const fn relocate_bytes(&self) -> bool {
+        self.relocate_bytes
+    }
+}
+
+/// Backdatable source-unit-local presentation of project-wide diagnostic
+/// decisions. The output fingerprint intentionally excludes project layout
+/// and upstream bases; request currentness is carried by the paired evaluation
+/// receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceUnitProjectDiagnostics {
+    source_unit_id: SourceUnitId,
+    rows: Box<[SourceUnitProjectDiagnosticRow]>,
+    fingerprint_v1: [u8; 32],
+}
+
+impl SourceUnitProjectDiagnostics {
+    pub const fn source_unit_id(&self) -> &SourceUnitId {
+        &self.source_unit_id
+    }
+
+    pub fn rows(&self) -> &[SourceUnitProjectDiagnosticRow] {
+        &self.rows
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SourceUnitProjectDiagnosticsBasis {
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    project_facts_fingerprint_v1: [u8; 32],
+    source_unit_id: SourceUnitId,
+    layout_start_line: usize,
+    layout_start_byte: usize,
+    layout_source_len: usize,
+    layout_line_count: usize,
+}
+
+impl SourceUnitProjectDiagnosticsBasis {
+    fn from_inputs(
+        project: &ProjectSyntaxSnapshot,
+        source_unit_id: &SourceUnitId,
+        project_facts: &ProjectDiagnosticFacts,
+    ) -> Result<Self, ProjectDiagnosticFactsError> {
+        let source_bundle_digest_v1 = project.source_bundle_digest_v1();
+        if project_facts.source_bundle_digest_v1() != source_bundle_digest_v1 {
+            return Err(ProjectDiagnosticFactsError::new(
+                "source-unit project diagnostics received facts for another source bundle",
+            ));
+        }
+        let layout = project
+            .source_layouts()
+            .iter()
+            .find(|layout| &layout.source_unit_id == source_unit_id)
+            .ok_or_else(|| {
+                ProjectDiagnosticFactsError::new(
+                    "source-unit project diagnostics source unit is absent from the project layout",
+                )
+            })?;
+        Ok(Self {
+            source_bundle_digest_v1,
+            project_facts_fingerprint_v1: project_facts.fingerprint_v1(),
+            source_unit_id: source_unit_id.clone(),
+            layout_start_line: layout.start_line,
+            layout_start_byte: layout.start_byte,
+            layout_source_len: layout.source_len,
+            layout_line_count: layout.line_count,
+        })
+    }
+
+    fn matches_inputs(
+        &self,
+        project: &ProjectSyntaxSnapshot,
+        project_facts: &ProjectDiagnosticFacts,
+    ) -> bool {
+        Self::from_inputs(project, &self.source_unit_id, project_facts)
+            .is_ok_and(|basis| basis == *self)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SourceUnitProjectDiagnosticsCurrentness {
+    basis: SourceUnitProjectDiagnosticsBasis,
+    result_fingerprint_v1: [u8; 32],
+    fingerprint_v1: [u8; 32],
+}
+
+impl SourceUnitProjectDiagnosticsCurrentness {
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+
+    pub const fn result_fingerprint_v1(&self) -> [u8; 32] {
+        self.result_fingerprint_v1
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceUnitProjectDiagnosticsEvaluation {
+    pub currentness: SourceUnitProjectDiagnosticsCurrentness,
+    pub result: Arc<SourceUnitProjectDiagnostics>,
+}
+
+impl SourceUnitProjectDiagnosticsEvaluation {
+    pub fn matches_inputs(
+        &self,
+        project: &ProjectSyntaxSnapshot,
+        project_facts: &ProjectDiagnosticFacts,
+    ) -> bool {
+        self.currentness
+            .basis
+            .matches_inputs(project, project_facts)
+            && self.currentness.result_fingerprint_v1 == self.result.fingerprint_v1()
+    }
+}
+
+pub fn evaluate_source_unit_project_diagnostics(
+    project: &ProjectSyntaxSnapshot,
+    source_unit_id: &SourceUnitId,
+    project_facts: &ProjectDiagnosticFacts,
+) -> Result<SourceUnitProjectDiagnosticsEvaluation, ProjectDiagnosticFactsError> {
+    let basis =
+        SourceUnitProjectDiagnosticsBasis::from_inputs(project, source_unit_id, project_facts)?;
+    let line_end = basis
+        .layout_start_line
+        .checked_add(basis.layout_line_count.max(1))
+        .ok_or_else(|| {
+            ProjectDiagnosticFactsError::new("project diagnostic line range overflow")
+        })?;
+    let diagnostics = project_facts.diagnostics();
+    // ProjectDiagnosticFacts owns the canonical source ordering. Index the
+    // unit range directly instead of rescanning every project row per unit.
+    let start = diagnostics.partition_point(|diagnostic| diagnostic.line < basis.layout_start_line);
+    let end = diagnostics.partition_point(|diagnostic| diagnostic.line < line_end);
+    let byte_end = basis
+        .layout_start_byte
+        .checked_add(basis.layout_source_len)
+        .ok_or_else(|| {
+            ProjectDiagnosticFactsError::new("project diagnostic byte range overflow")
+        })?;
+    let mut rows = Vec::with_capacity(end.saturating_sub(start));
+    for diagnostic in &diagnostics[start..end] {
+        if diagnostic.line == 0 || diagnostic.start > diagnostic.end {
+            return Err(ProjectDiagnosticFactsError::new(
+                "project diagnostic has an invalid global source span",
+            ));
+        }
+        let relocate_bytes = diagnostic.start != 0 || diagnostic.end != 0;
+        let (local_start, local_end) = if relocate_bytes {
+            if diagnostic.start < basis.layout_start_byte || diagnostic.end > byte_end {
+                return Err(ProjectDiagnosticFactsError::new(
+                    "project diagnostic byte span crosses its source-unit layout",
+                ));
+            }
+            (
+                diagnostic.start - basis.layout_start_byte,
+                diagnostic.end - basis.layout_start_byte,
+            )
+        } else {
+            (0, 0)
+        };
+        rows.push(SourceUnitProjectDiagnosticRow {
+            diagnostic: TypeDiagnostic {
+                severity: diagnostic.severity,
+                line: diagnostic.line - basis.layout_start_line + 1,
+                start: local_start,
+                end: local_end,
+                message: diagnostic.message.clone(),
+            },
+            relocate_bytes,
+        });
+    }
+    let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+        SOURCE_UNIT_PROJECT_DIAGNOSTICS_DOMAIN_V1,
+        &(source_unit_id, &rows),
+    )
+    .map_err(|error| {
+        ProjectDiagnosticFactsError::new(format!(
+            "cannot fingerprint source-unit project diagnostics: {error}"
+        ))
+    })?;
+    let result = Arc::new(SourceUnitProjectDiagnostics {
+        source_unit_id: source_unit_id.clone(),
+        rows: rows.into_boxed_slice(),
+        fingerprint_v1,
+    });
+    let result_fingerprint_v1 = result.fingerprint_v1();
+    let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+        SOURCE_UNIT_PROJECT_DIAGNOSTICS_CURRENTNESS_DOMAIN_V1,
+        &(&basis, result_fingerprint_v1),
+    )
+    .map_err(|error| {
+        ProjectDiagnosticFactsError::new(format!(
+            "cannot fingerprint source-unit project diagnostics currentness: {error}"
+        ))
+    })?;
+    Ok(SourceUnitProjectDiagnosticsEvaluation {
+        currentness: SourceUnitProjectDiagnosticsCurrentness {
+            basis,
+            result_fingerprint_v1,
+            fingerprint_v1,
+        },
+        result,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct OwnerDiagnosticStableStatementValue {
     statement: StableStatementKey,
@@ -306,7 +536,9 @@ struct OwnerDiagnosticOutputDeclarationFact {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "target_kind", rename_all = "snake_case")]
 enum OwnerDiagnosticOutputCallTargetFact {
-    Owner { owner: StableCheckOwnerKey },
+    Owner {
+        owner: StableCheckOwnerKey,
+    },
     Abi {
         function: String,
         kind: CheckedCallableKind,

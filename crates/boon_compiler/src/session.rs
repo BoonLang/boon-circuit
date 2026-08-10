@@ -9,9 +9,10 @@ use boon_compilation_db::{
     Revision as EvaluationRevision, TypedRequestTable,
 };
 use boon_parser::{
-    ParseWorkCounters, ParsedSourceUnit, ProjectSyntaxSnapshot, ProjectUnitLinkKey,
-    UnitSyntaxSnapshot, link_project_source_unit_profiled, parse_project_source_unit_profiled,
-    project_module_name_for_source_unit, project_syntax_namespaces,
+    ParseWorkCounters, ParsedSourceUnit, ProjectSourceUnitLayout, ProjectSyntaxSnapshot,
+    ProjectUnitLinkKey, UnitSyntaxSnapshot, link_project_source_unit_profiled,
+    parse_project_source_unit_profiled, project_module_name_for_source_unit,
+    project_syntax_namespaces,
 };
 use boon_plan::{
     ApplicationIdentity, MigrationPredecessorBinding, PlanError, ProgramRole, TargetProfile,
@@ -36,12 +37,14 @@ use boon_typecheck::{
     OwnerParameterRequirementLookup, OwnerReferenceKind, OwnerSourceMap,
     OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput,
     OwnerValueAbiLookup, ProjectDiagnosticFacts, ProjectOutputFlowFacts,
-    SourceUnitOwnerDiagnostics, aggregate_source_unit_owner_diagnostics,
+    SourceUnitOwnerDiagnostics, SourceUnitProjectDiagnostics,
+    SourceUnitProjectDiagnosticsEvaluation, aggregate_source_unit_diagnostics,
     assemble_checked_owner_project, build_checked_owner_shard, build_owner_callable_scope_topology,
     build_owner_interface_topology, evaluate_owner_body_with_signature_plan,
     evaluate_owner_callable_scope_scc, evaluate_owner_diagnostic_replay_facts,
-    evaluate_owner_interface_scc_with_signature_scopes, owner_interface_transfer_dependency_owners,
-    project_diagnostic_facts, project_output_flow_facts, project_owner_abi_environment,
+    evaluate_owner_interface_scc_with_signature_scopes, evaluate_source_unit_project_diagnostics,
+    owner_interface_transfer_dependency_owners, project_diagnostic_facts,
+    project_output_flow_facts, project_owner_abi_environment,
     project_owner_callable_resolution_plan, project_owner_constraint_seed_with_lexical_plan,
     project_owner_declaration_surface, project_owner_interface_transfer_module,
     project_owner_lexical_plan, project_owner_source_map, project_owner_syntax_input,
@@ -299,6 +302,10 @@ struct ProjectState {
     project_output_flow_facts_requests: TypedRequestTable<ProjectOutputFlowFactsRequest>,
     project_diagnostic_facts_requests: TypedRequestTable<ProjectDiagnosticFactsRequest>,
     source_unit_owner_diagnostics_requests: TypedRequestTable<SourceUnitOwnerDiagnosticsRequest>,
+    source_unit_project_diagnostics_evaluation_requests:
+        TypedRequestTable<SourceUnitProjectDiagnosticsEvaluationRequest>,
+    source_unit_project_diagnostics_requests:
+        TypedRequestTable<SourceUnitProjectDiagnosticsRequest>,
     owner_diagnostics_aggregate_requests: TypedRequestTable<OwnerDiagnosticsAggregateRequest>,
     checked_owner_shard_requests: TypedRequestTable<CheckedOwnerShardRequest>,
     checked_owner_project_assembly_requests: TypedRequestTable<CheckedOwnerProjectAssemblyRequest>,
@@ -1405,13 +1412,57 @@ impl RequestFamily for SourceUnitOwnerDiagnosticsRequest {
     }
 }
 
+struct SourceUnitProjectDiagnosticsEvaluationRequest;
+
+impl RequestFamily for SourceUnitProjectDiagnosticsEvaluationRequest {
+    type Key = SourceUnitId;
+    type Value = Arc<SourceUnitProjectDiagnosticsEvaluation>;
+
+    const NAME: &'static str = "boon.compiler.source-unit-project-diagnostics-evaluation.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        source_unit_key_fingerprint(
+            b"boon.compiler.source-unit-project-diagnostics-evaluation-key.v1\0",
+            key,
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.currentness.fingerprint_v1()))
+    }
+}
+
+struct SourceUnitProjectDiagnosticsRequest;
+
+impl RequestFamily for SourceUnitProjectDiagnosticsRequest {
+    type Key = SourceUnitId;
+    type Value = Arc<SourceUnitProjectDiagnostics>;
+
+    const NAME: &'static str = "boon.compiler.source-unit-project-diagnostics.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        source_unit_key_fingerprint(
+            b"boon.compiler.source-unit-project-diagnostics-key.v1\0",
+            key,
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
 struct OwnerDiagnosticsAggregateRequest;
 
 impl RequestFamily for OwnerDiagnosticsAggregateRequest {
     type Key = OwnerDiagnosticsAggregateKey;
     type Value = Arc<OwnerDiagnosticsAggregate>;
 
-    const NAME: &'static str = "boon.compiler.owner-diagnostics-aggregate.v9";
+    const NAME: &'static str = "boon.compiler.owner-diagnostics-aggregate.v10";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -1563,6 +1614,8 @@ impl CompilerSession {
                 project_output_flow_facts_requests: TypedRequestTable::new(),
                 project_diagnostic_facts_requests: TypedRequestTable::new(),
                 source_unit_owner_diagnostics_requests: TypedRequestTable::new(),
+                source_unit_project_diagnostics_evaluation_requests: TypedRequestTable::new(),
+                source_unit_project_diagnostics_requests: TypedRequestTable::new(),
                 owner_diagnostics_aggregate_requests: TypedRequestTable::new(),
                 checked_owner_shard_requests: TypedRequestTable::new(),
                 checked_owner_project_assembly_requests: TypedRequestTable::new(),
@@ -1925,6 +1978,16 @@ impl CompilerSession {
             })?;
         state
             .source_unit_owner_diagnostics_requests
+            .retain(&mut state.syntax_evaluator, |source_unit_id| {
+                surviving_sources.contains(source_unit_id)
+            })?;
+        state
+            .source_unit_project_diagnostics_evaluation_requests
+            .retain(&mut state.syntax_evaluator, |source_unit_id| {
+                surviving_sources.contains(source_unit_id)
+            })?;
+        state
+            .source_unit_project_diagnostics_requests
             .retain(&mut state.syntax_evaluator, |source_unit_id| {
                 surviving_sources.contains(source_unit_id)
             })?;
@@ -2785,6 +2848,16 @@ fn evaluate_owner_body_requests(
         })?;
     state
         .source_unit_owner_diagnostics_requests
+        .retain(&mut state.syntax_evaluator, |source_unit_id| {
+            live_source_units.contains(source_unit_id)
+        })?;
+    state
+        .source_unit_project_diagnostics_evaluation_requests
+        .retain(&mut state.syntax_evaluator, |source_unit_id| {
+            live_source_units.contains(source_unit_id)
+        })?;
+    state
+        .source_unit_project_diagnostics_requests
         .retain(&mut state.syntax_evaluator, |source_unit_id| {
             live_source_units.contains(source_unit_id)
         })?;
@@ -5632,12 +5705,116 @@ fn evaluate_source_unit_owner_diagnostics_requests(
     Ok(())
 }
 
+fn evaluate_source_unit_project_diagnostics_requests(
+    state: &mut ProjectState,
+    project: &ProjectSyntaxSnapshot,
+) -> CompilerResult<()> {
+    evaluate_project_diagnostic_facts_request(state, project)?;
+    let expected_units = project
+        .source_layouts()
+        .iter()
+        .map(|layout| layout.source_unit_id.clone())
+        .collect::<BTreeSet<_>>();
+    state
+        .source_unit_project_diagnostics_evaluation_requests
+        .retain(&mut state.syntax_evaluator, |source_unit_id| {
+            expected_units.contains(source_unit_id)
+        })?;
+    state
+        .source_unit_project_diagnostics_requests
+        .retain(&mut state.syntax_evaluator, |source_unit_id| {
+            expected_units.contains(source_unit_id)
+        })?;
+
+    for layout in project.source_layouts() {
+        let source_unit_id = layout.source_unit_id.clone();
+        let input = RequestInputFingerprint(source_unit_project_diagnostics_input_fingerprint(
+            project, layout,
+        ));
+        match state
+            .source_unit_project_diagnostics_evaluation_requests
+            .begin(&mut state.syntax_evaluator, source_unit_id.clone(), input)?
+        {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let evaluation = (|| -> CompilerResult<_> {
+                    let project_facts =
+                        Arc::clone(state.project_diagnostic_facts_requests.require(
+                            &state.syntax_evaluator,
+                            &mut ticket,
+                            &ProjectDiagnosticFactsKey,
+                        )?);
+                    Ok(Arc::new(evaluate_source_unit_project_diagnostics(
+                        project,
+                        &source_unit_id,
+                        &project_facts,
+                    )?))
+                })();
+                let evaluation = match evaluation {
+                    Ok(evaluation) => evaluation,
+                    Err(error) => {
+                        state
+                            .source_unit_project_diagnostics_evaluation_requests
+                            .abort(
+                                &mut state.syntax_evaluator,
+                                ticket,
+                                RequestAbortReason::Failed,
+                            )?;
+                        return Err(error);
+                    }
+                };
+                state
+                    .source_unit_project_diagnostics_evaluation_requests
+                    .publish(&mut state.syntax_evaluator, ticket, evaluation)?;
+            }
+        }
+
+        let input = RequestInputFingerprint(source_unit_key_fingerprint(
+            b"boon.compiler.source-unit-project-diagnostics-dependencies.v1\0",
+            &source_unit_id,
+        ));
+        match state.source_unit_project_diagnostics_requests.begin(
+            &mut state.syntax_evaluator,
+            source_unit_id.clone(),
+            input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let projection = (|| -> CompilerResult<_> {
+                    let evaluation = state
+                        .source_unit_project_diagnostics_evaluation_requests
+                        .require(&state.syntax_evaluator, &mut ticket, &source_unit_id)?;
+                    Ok(Arc::clone(&evaluation.result))
+                })();
+                let projection = match projection {
+                    Ok(projection) => projection,
+                    Err(error) => {
+                        state.source_unit_project_diagnostics_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.source_unit_project_diagnostics_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    projection,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn evaluate_owner_diagnostics_aggregate_request(
     state: &mut ProjectState,
     project: &ProjectSyntaxSnapshot,
 ) -> CompilerResult<()> {
     evaluate_project_diagnostic_facts_request(state, project)?;
     evaluate_source_unit_owner_diagnostics_requests(state, project)?;
+    evaluate_source_unit_project_diagnostics_requests(state, project)?;
     let unit_fingerprints = project
         .source_layouts()
         .iter()
@@ -5650,7 +5827,7 @@ fn evaluate_owner_diagnostics_aggregate_request(
         .collect::<Vec<_>>();
     let source_digest = project.source_bundle_digest_v1().to_string();
     let input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-diagnostics-aggregate-dependencies.v9\0",
+        b"boon.compiler.owner-diagnostics-aggregate-dependencies.v10\0",
         std::iter::once(source_digest.as_bytes())
             .chain(unit_fingerprints.iter().map(<[u8; 32]>::as_slice)),
     ));
@@ -5669,6 +5846,8 @@ fn evaluate_owner_diagnostics_aggregate_request(
                     &ProjectDiagnosticFactsKey,
                 )?);
                 let mut projections = Vec::with_capacity(project.source_layouts().len());
+                let mut project_evaluations = Vec::with_capacity(project.source_layouts().len());
+                let mut project_projections = Vec::with_capacity(project.source_layouts().len());
                 for layout in project.source_layouts() {
                     projections.push(Arc::clone(
                         state.source_unit_owner_diagnostics_requests.require(
@@ -5677,11 +5856,29 @@ fn evaluate_owner_diagnostics_aggregate_request(
                             &layout.source_unit_id,
                         )?,
                     ));
+                    project_evaluations.push(Arc::clone(
+                        state
+                            .source_unit_project_diagnostics_evaluation_requests
+                            .require(
+                                &state.syntax_evaluator,
+                                &mut ticket,
+                                &layout.source_unit_id,
+                            )?,
+                    ));
+                    project_projections.push(Arc::clone(
+                        state.source_unit_project_diagnostics_requests.require(
+                            &state.syntax_evaluator,
+                            &mut ticket,
+                            &layout.source_unit_id,
+                        )?,
+                    ));
                 }
-                Ok(Arc::new(aggregate_source_unit_owner_diagnostics(
+                Ok(Arc::new(aggregate_source_unit_diagnostics(
                     project,
                     &project_facts,
                     projections.iter().map(Arc::as_ref),
+                    project_evaluations.iter().map(Arc::as_ref),
+                    project_projections.iter().map(Arc::as_ref),
                 )?))
             })();
             let aggregate = match aggregate {
@@ -6136,6 +6333,24 @@ fn source_unit_key_fingerprint(domain: &[u8], source_unit_id: &SourceUnitId) -> 
     request_fingerprint(domain, [source_unit_id.as_str().as_bytes()])
 }
 
+fn source_unit_project_diagnostics_input_fingerprint(
+    project: &ProjectSyntaxSnapshot,
+    layout: &ProjectSourceUnitLayout,
+) -> RequestFingerprint {
+    let mut hasher = Sha256::new();
+    hasher.update(b"boon.compiler.source-unit-project-diagnostics-evaluation-dependencies.v1\0");
+    update_request_fingerprint_part(
+        &mut hasher,
+        project.source_bundle_digest_v1().to_string().as_bytes(),
+    );
+    update_request_fingerprint_part(&mut hasher, layout.source_unit_id.as_str().as_bytes());
+    hasher.update(layout.start_line.to_le_bytes());
+    hasher.update(layout.start_byte.to_le_bytes());
+    hasher.update(layout.source_len.to_le_bytes());
+    hasher.update(layout.line_count.to_le_bytes());
+    hasher.finalize().into()
+}
+
 fn project_namespace_input_fingerprint<'a>(
     source_unit_ids: impl IntoIterator<Item = &'a SourceUnitId>,
 ) -> RequestFingerprint {
@@ -6413,6 +6628,135 @@ mod tests {
         assert_eq!(second_diagnostic.line, first_diagnostic.line + 1);
         assert_eq!(second_diagnostic.start, first_diagnostic.start + 1);
         assert_eq!(second_diagnostic.end, first_diagnostic.end + 1);
+    }
+
+    #[test]
+    fn source_unit_project_diagnostics_backdate_before_layout_relocation() {
+        let first_source = "value: 1\n";
+        let second_source = "document: [\n    root: 1\n]\n";
+        let project_source = |first_source: &str| {
+            CompilerProject::new(
+                "RUN.bn",
+                vec![
+                    CompilerSourceUnit {
+                        path: "RUN.bn".to_owned(),
+                        source: first_source.to_owned(),
+                    },
+                    CompilerSourceUnit {
+                        path: "Second.bn".to_owned(),
+                        source: second_source.to_owned(),
+                    },
+                ],
+                TargetProfile::SoftwareDefault,
+                ProgramRole::Client,
+                ApplicationIdentity::compiler_default(),
+            )
+        };
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project_source(first_source)).unwrap();
+        let second_id = SourceUnitId::from_path("Second.bn").unwrap();
+        let first_revision = session.revision(project).unwrap();
+        let first_result = session
+            .request(
+                project,
+                first_revision,
+                CompileIntent::Diagnostics,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let first_diagnostics = first_result.diagnostics().unwrap().diagnostics().to_vec();
+        let (first_evaluation, first_projection) = {
+            let state = session.projects.get(&project).unwrap();
+            (
+                Arc::clone(
+                    state
+                        .source_unit_project_diagnostics_evaluation_requests
+                        .current_value(&state.syntax_evaluator, &second_id)
+                        .unwrap()
+                        .unwrap(),
+                ),
+                Arc::clone(
+                    state
+                        .source_unit_project_diagnostics_requests
+                        .current_value(&state.syntax_evaluator, &second_id)
+                        .unwrap()
+                        .unwrap(),
+                ),
+            )
+        };
+        assert_eq!(first_projection.rows().len(), 1);
+        assert_eq!(first_projection.rows()[0].diagnostic().line, 2);
+        let message = first_projection.rows()[0].diagnostic().message.clone();
+        let first_diagnostic = first_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message == message)
+            .cloned()
+            .unwrap();
+
+        let updated_first_source = format!("\n{first_source}");
+        let second_revision = session
+            .apply_update(
+                project,
+                UnitUpdate::new("RUN.bn", updated_first_source.clone()),
+            )
+            .unwrap();
+        let second_result = session
+            .request(
+                project,
+                second_revision,
+                CompileIntent::Diagnostics,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let second_diagnostics = second_result.diagnostics().unwrap().diagnostics().to_vec();
+        let second_diagnostic = second_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message == message)
+            .cloned()
+            .unwrap();
+        let (second_evaluation, second_projection) = {
+            let state = session.projects.get(&project).unwrap();
+            (
+                Arc::clone(
+                    state
+                        .source_unit_project_diagnostics_evaluation_requests
+                        .current_value(&state.syntax_evaluator, &second_id)
+                        .unwrap()
+                        .unwrap(),
+                ),
+                Arc::clone(
+                    state
+                        .source_unit_project_diagnostics_requests
+                        .current_value(&state.syntax_evaluator, &second_id)
+                        .unwrap()
+                        .unwrap(),
+                ),
+            )
+        };
+
+        assert!(!Arc::ptr_eq(&first_evaluation, &second_evaluation));
+        assert!(Arc::ptr_eq(&first_projection, &second_projection));
+        assert_eq!(second_diagnostic.line, first_diagnostic.line + 1);
+        assert_eq!(second_diagnostic.start, first_diagnostic.start + 1);
+        assert_eq!(second_diagnostic.end, first_diagnostic.end + 1);
+
+        let mut clean = CompilerSession::new();
+        let clean_project = clean
+            .open_project(project_source(&updated_first_source))
+            .unwrap();
+        let clean_revision = clean.revision(clean_project).unwrap();
+        let clean_result = clean
+            .request(
+                clean_project,
+                clean_revision,
+                CompileIntent::Diagnostics,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            second_diagnostics,
+            clean_result.diagnostics().unwrap().diagnostics()
+        );
     }
 
     #[test]
@@ -8344,11 +8688,12 @@ mod tests {
         // executes cold and reuses its unchanged semantic result on this edit.
         // The project diagnostic-facts request executes once per revision and
         // changes when its exact owner-body input changes. Each source unit
-        // owns one local diagnostic-presentation request; the unchanged unit
-        // reuses its projection on the warm edit.
+        // owns one local owner-diagnostic projection plus a current project-
+        // diagnostic evaluation and independently backdatable project row
+        // projection; unchanged local rows reuse their retained value.
         assert_eq!(
             (first_request_counts, request_counts(second_stats)),
-            ((108, 108, 0, 0, 108), (216, 127, 89, 9, 118))
+            ((114, 112, 2, 0, 112), (228, 135, 93, 11, 124))
         );
 
         let mut isolated = CompilerSession::new();
@@ -10276,18 +10621,20 @@ mod tests {
         // The callable-only ABI, resolution, scope topology/SCC, and provider
         // families are included here. An exported callable change reexecutes
         // its exact scope cone and backdates unchanged projections; the body-
-        // only edit reuses 161 of 197 demanded requests and changes only 22.
+        // only edit reuses 163 of 205 demanded requests and changes only 25.
         // The exact child-boundary lexical projection adds five executions to
         // the exported-interface cone. The project diagnostic-facts request
         // adds one exact execution/change to both cones. Three source-unit
-        // presentation requests add one changed/reexecuted unit and two reused
-        // units to each cone. Each live owner also publishes one current
-        // diagnostic-replay evaluation and one normalized semantic fact.
+        // owner presentation requests add one changed/reexecuted unit and two
+        // reused units to each cone. Every source unit also publishes one
+        // current project-diagnostic evaluation and one independently
+        // backdatable local row projection. Each live owner publishes one
+        // current diagnostic-replay evaluation and one normalized semantic fact.
         // The shared output-flow component executes once per cone and
         // backdates when the body-only edit leaves its graph unchanged.
         assert_eq!(
             (interface_delta, body_delta),
-            ((197, 96, 101, 43, 53), (197, 36, 161, 14, 22))
+            ((205, 102, 103, 46, 56), (205, 42, 163, 17, 25))
         );
     }
 

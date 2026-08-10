@@ -3113,6 +3113,7 @@ struct InferredCallDraft {
     target: InferredOwnerCallableTarget,
     effect: CheckedEffectSummary,
     actual_inputs: BTreeMap<u32, Type>,
+    first_transfer: Option<OwnerCallTransferReplay>,
     resolved_result: Option<FlowType>,
     type_substitutions: Vec<(TypeVar, Type)>,
     contextual_type_variables: Vec<TypeVar>,
@@ -3120,7 +3121,7 @@ struct InferredCallDraft {
     valid: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct EvaluatedResultValue {
     flow_type: FlowType,
     parameter_derived: bool,
@@ -3128,16 +3129,60 @@ struct EvaluatedResultValue {
     static_number: Option<ExactNumber>,
 }
 
+#[derive(Clone, Eq, PartialEq)]
+struct OwnerCallTransferInvocation {
+    arguments: BTreeMap<u32, EvaluatedResultValue>,
+    context: Option<EvaluatedResultValue>,
+}
+
+#[derive(Clone)]
+struct OwnerCallTransferReplay {
+    invocation: OwnerCallTransferInvocation,
+    evaluation: EvaluatedOwnerResult,
+}
+
+#[derive(Clone)]
 struct EvaluatedOwnerResult {
     value: EvaluatedResultValue,
     type_substitutions: Vec<(TypeVar, Type)>,
     contextual_type_variables: Vec<TypeVar>,
+    owned_variables: Vec<TypeVar>,
 }
 
 struct OwnerResultTransferFallbacks {
     variables: BTreeMap<TypeVar, TypeVar>,
     substitutions: BTreeMap<TypeVar, Type>,
     values: BTreeMap<StableExpressionKey, EvaluatedResultValue>,
+}
+
+fn reinstantiate_owner_call_transfer(
+    cached: &EvaluatedOwnerResult,
+    unifier: &mut TypeUnifier,
+) -> EvaluatedOwnerResult {
+    let mut replacements = BTreeMap::new();
+    let mut owned_variables = Vec::with_capacity(cached.owned_variables.len());
+    for variable in &cached.owned_variables {
+        let replacement = unifier.fresh();
+        replacements.insert(*variable, Type::Var(replacement));
+        owned_variables.push(replacement);
+    }
+    let mut value = cached.value.clone();
+    value.flow_type.ty = apply_checked_type_substitution_lookup(&value.flow_type.ty, &replacements);
+    EvaluatedOwnerResult {
+        value,
+        type_substitutions: cached
+            .type_substitutions
+            .iter()
+            .map(|(variable, value)| {
+                (
+                    *variable,
+                    apply_checked_type_substitution_lookup(value, &replacements),
+                )
+            })
+            .collect(),
+        contextual_type_variables: cached.contextual_type_variables.clone(),
+        owned_variables,
+    }
 }
 
 impl OwnerResultTransferFallbacks {
@@ -3180,6 +3225,7 @@ struct OwnerResultTransferEvaluator<'a, 'unifier> {
     providers: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerInterfaceTransferModule>,
     unifier: &'unifier mut TypeUnifier,
     active_owners: BTreeSet<StableCheckOwnerKey>,
+    owned_variables: BTreeSet<TypeVar>,
 }
 
 impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
@@ -3191,6 +3237,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             providers,
             unifier,
             active_owners: BTreeSet::new(),
+            owned_variables: BTreeSet::new(),
         }
     }
 
@@ -3201,7 +3248,11 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         context: Option<&EvaluatedResultValue>,
     ) -> Option<EvaluatedOwnerResult> {
         let module = *self.providers.get(owner)?;
-        self.evaluate_owner_in_module(module, owner, arguments, context)
+        let mut result = self.evaluate_owner_in_module(module, owner, arguments, context)?;
+        result.owned_variables = std::mem::take(&mut self.owned_variables)
+            .into_iter()
+            .collect();
+        Some(result)
     }
 
     fn evaluate_owner_in_module(
@@ -3218,7 +3269,9 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         // the caller's local variables.
         let mut variables = BTreeMap::new();
         for variable in &interface.type_variables {
-            variables.insert(*variable, self.unifier.fresh());
+            let instantiated = self.unifier.fresh();
+            variables.insert(*variable, instantiated);
+            self.owned_variables.insert(instantiated);
         }
         let mut substitutions = BTreeMap::new();
         for parameter in &interface.parameters {
@@ -3274,6 +3327,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 },
                 type_substitutions,
                 contextual_type_variables: contextual_type_variables.into_iter().collect(),
+                owned_variables: Vec::new(),
             });
         }
         let evaluated = match &interface.result_transfer {
@@ -3349,6 +3403,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             value,
             type_substitutions,
             contextual_type_variables: contextual_type_variables.into_iter().collect(),
+            owned_variables: Vec::new(),
         })
     }
 
@@ -4778,6 +4833,7 @@ fn bind_calls(
                     CheckedEffectSummary::default()
                 },
                 actual_inputs: BTreeMap::new(),
+                first_transfer: None,
                 resolved_result: None,
                 type_substitutions: Vec::new(),
                 contextual_type_variables: Vec::new(),
@@ -4994,13 +5050,39 @@ fn refine_owner_call_at(
         syntax_selected: false,
         static_number: None,
     });
-    let evaluated = {
-        let mut evaluator = OwnerResultTransferEvaluator::new(providers, unifier);
-        evaluator.evaluate_owner(
-            target_owner,
-            &arguments,
-            explicit_context.as_ref().or(inherited_context.as_ref()),
-        )
+    let invocation = OwnerCallTransferInvocation {
+        arguments,
+        context: explicit_context.or(inherited_context),
+    };
+    // Compare the first pass exactly as it was observed. Re-resolving its
+    // variables here would let a value that became concrete between passes
+    // masquerade as the same transfer invocation even though it can select a
+    // different result branch.
+    let replayed = drafts[call_index]
+        .first_transfer
+        .as_ref()
+        .filter(|cached| cached.invocation == invocation)
+        .map(|cached| reinstantiate_owner_call_transfer(&cached.evaluation, unifier));
+    let evaluated = if let Some(replayed) = replayed {
+        Some(replayed)
+    } else {
+        let evaluated = {
+            let mut evaluator = OwnerResultTransferEvaluator::new(providers, unifier);
+            evaluator.evaluate_owner(
+                target_owner,
+                &invocation.arguments,
+                invocation.context.as_ref(),
+            )
+        };
+        if drafts[call_index].first_transfer.is_none()
+            && let Some(evaluation) = &evaluated
+        {
+            drafts[call_index].first_transfer = Some(OwnerCallTransferReplay {
+                invocation,
+                evaluation: evaluation.clone(),
+            });
+        }
+        evaluated
     };
     if let Some(evaluated) = evaluated {
         unifier.bind_var(
@@ -5641,7 +5723,6 @@ fn evaluate_owner_body_impl(
         imports: frozen_results.into_boxed_slice(),
         inference_abi_fingerprint_v1,
     };
-
     let mut work = OwnerBodyInferenceWork {
         statements: syntax.statements.len() as u64,
         expressions: syntax.expressions.len() as u64,
@@ -5996,7 +6077,6 @@ fn evaluate_owner_body_impl(
         effective_context,
         &mut diagnostics,
     );
-
     let mut alpha_variables = BTreeMap::new();
     let mut next_alpha = 0;
     for variable in own_parameter_variables {
@@ -6406,6 +6486,117 @@ mod tests {
             results.iter().filter(|result| result.key != own_scc.key),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn call_transfer_replay_freshens_only_invocation_owned_variables() {
+        let mut unifier = TypeUnifier::default();
+        let caller_variable = unifier.fresh();
+        let first_owned = unifier.fresh();
+        let second_owned = unifier.fresh();
+        let stable_substitution_variable = TypeVar(91);
+        let stable_contextual_variable = TypeVar(92);
+        let cached = EvaluatedOwnerResult {
+            value: EvaluatedResultValue {
+                flow_type: FlowType {
+                    mode: FlowMode::PresentOrAbsent,
+                    ty: Type::object(ObjectShape::from_ordered_fields(
+                        [
+                            ("caller".to_owned(), Type::Var(caller_variable)),
+                            (
+                                "owned".to_owned(),
+                                Type::List(Type::shared(Type::Var(first_owned))),
+                            ),
+                            (
+                                "nested".to_owned(),
+                                Type::Map {
+                                    key: Box::new(Type::Var(second_owned)),
+                                    value: Box::new(Type::Var(caller_variable)),
+                                },
+                            ),
+                        ],
+                        false,
+                    )),
+                },
+                parameter_derived: true,
+                syntax_selected: true,
+                static_number: Some(ExactNumber::from_i64(7)),
+            },
+            type_substitutions: vec![(
+                stable_substitution_variable,
+                Type::object(ObjectShape::from_ordered_fields(
+                    [
+                        ("owned".to_owned(), Type::Var(second_owned)),
+                        ("caller".to_owned(), Type::Var(caller_variable)),
+                    ],
+                    false,
+                )),
+            )],
+            contextual_type_variables: vec![stable_contextual_variable],
+            owned_variables: vec![first_owned, second_owned],
+        };
+
+        // Bind the first invocation's variables before replay. A replay must
+        // neither inherit these bindings nor replace caller-owned variables.
+        unifier.bind_var(first_owned, Type::Number);
+        unifier.bind_var(second_owned, Type::Text);
+        let replayed = reinstantiate_owner_call_transfer(&cached, &mut unifier);
+        let replay_first = replayed.owned_variables[0];
+        let replay_second = replayed.owned_variables[1];
+
+        assert_ne!(replay_first, first_owned);
+        assert_ne!(replay_second, second_owned);
+        assert_eq!(
+            unifier.resolve(&Type::Var(replay_first)),
+            Type::Var(replay_first)
+        );
+        assert_eq!(
+            unifier.resolve(&Type::Var(replay_second)),
+            Type::Var(replay_second)
+        );
+        assert_eq!(
+            replayed.value.flow_type,
+            FlowType {
+                mode: FlowMode::PresentOrAbsent,
+                ty: Type::object(ObjectShape::from_ordered_fields(
+                    [
+                        ("caller".to_owned(), Type::Var(caller_variable)),
+                        (
+                            "owned".to_owned(),
+                            Type::List(Type::shared(Type::Var(replay_first))),
+                        ),
+                        (
+                            "nested".to_owned(),
+                            Type::Map {
+                                key: Box::new(Type::Var(replay_second)),
+                                value: Box::new(Type::Var(caller_variable)),
+                            },
+                        ),
+                    ],
+                    false,
+                )),
+            }
+        );
+        assert_eq!(
+            replayed.type_substitutions,
+            vec![(
+                stable_substitution_variable,
+                Type::object(ObjectShape::from_ordered_fields(
+                    [
+                        ("owned".to_owned(), Type::Var(replay_second)),
+                        ("caller".to_owned(), Type::Var(caller_variable)),
+                    ],
+                    false,
+                )),
+            )]
+        );
+        assert_eq!(
+            replayed.contextual_type_variables,
+            vec![stable_contextual_variable]
+        );
+        assert!(replayed.value.parameter_derived);
+        assert!(replayed.value.syntax_selected);
+        assert_eq!(replayed.value.static_number, Some(ExactNumber::from_i64(7)));
     }
 
     #[test]

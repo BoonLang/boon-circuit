@@ -35,17 +35,18 @@ use boon_typecheck::{
     OwnerInterfaceTransferModule, OwnerLexicalPlan, OwnerParameterRequirementKey,
     OwnerParameterRequirementLookup, OwnerReferenceKind, OwnerSourceMap,
     OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput,
-    OwnerValueAbiLookup, ProjectDiagnosticFacts, SourceUnitOwnerDiagnostics,
-    aggregate_source_unit_owner_diagnostics, assemble_checked_owner_project,
-    build_checked_owner_shard, build_owner_callable_scope_topology, build_owner_interface_topology,
-    evaluate_owner_body_with_signature_plan, evaluate_owner_callable_scope_scc,
-    evaluate_owner_diagnostic_replay_facts, evaluate_owner_interface_scc_with_signature_scopes,
-    owner_interface_transfer_dependency_owners, project_diagnostic_facts,
-    project_owner_abi_environment, project_owner_callable_resolution_plan,
-    project_owner_constraint_seed_with_lexical_plan, project_owner_declaration_surface,
-    project_owner_interface_transfer_module, project_owner_lexical_plan, project_owner_source_map,
-    project_owner_syntax_input, project_source_unit_owner_diagnostics,
-    resolve_owner_constraint_seed_with_signature_plan, stable_check_owner_key_fingerprint_v1,
+    OwnerValueAbiLookup, ProjectDiagnosticFacts, ProjectOutputFlowFacts,
+    SourceUnitOwnerDiagnostics, aggregate_source_unit_owner_diagnostics,
+    assemble_checked_owner_project, build_checked_owner_shard, build_owner_callable_scope_topology,
+    build_owner_interface_topology, evaluate_owner_body_with_signature_plan,
+    evaluate_owner_callable_scope_scc, evaluate_owner_diagnostic_replay_facts,
+    evaluate_owner_interface_scc_with_signature_scopes, owner_interface_transfer_dependency_owners,
+    project_diagnostic_facts, project_output_flow_facts, project_owner_abi_environment,
+    project_owner_callable_resolution_plan, project_owner_constraint_seed_with_lexical_plan,
+    project_owner_declaration_surface, project_owner_interface_transfer_module,
+    project_owner_lexical_plan, project_owner_source_map, project_owner_syntax_input,
+    project_source_unit_owner_diagnostics, resolve_owner_constraint_seed_with_signature_plan,
+    stable_check_owner_key_fingerprint_v1,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -295,6 +296,7 @@ struct ProjectState {
     owner_diagnostic_replay_facts_evaluation_requests:
         TypedRequestTable<OwnerDiagnosticReplayFactsEvaluationRequest>,
     owner_diagnostic_replay_facts_requests: TypedRequestTable<OwnerDiagnosticReplayFactsRequest>,
+    project_output_flow_facts_requests: TypedRequestTable<ProjectOutputFlowFactsRequest>,
     project_diagnostic_facts_requests: TypedRequestTable<ProjectDiagnosticFactsRequest>,
     source_unit_owner_diagnostics_requests: TypedRequestTable<SourceUnitOwnerDiagnosticsRequest>,
     owner_diagnostics_aggregate_requests: TypedRequestTable<OwnerDiagnosticsAggregateRequest>,
@@ -1332,7 +1334,7 @@ impl RequestFamily for OwnerDiagnosticReplayFactsEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerDiagnosticReplayFactsEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts-evaluation.v2";
+    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts-evaluation.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1349,7 +1351,7 @@ impl RequestFamily for OwnerDiagnosticReplayFactsRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerDiagnosticReplayFacts>;
 
-    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts.v2";
+    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1426,6 +1428,31 @@ impl RequestFamily for OwnerDiagnosticsAggregateRequest {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProjectOutputFlowFactsKey;
+
+struct ProjectOutputFlowFactsRequest;
+
+impl RequestFamily for ProjectOutputFlowFactsRequest {
+    type Key = ProjectOutputFlowFactsKey;
+    type Value = Arc<ProjectOutputFlowFacts>;
+
+    const NAME: &'static str = "boon.compiler.project-output-flow-facts.v1";
+
+    fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.project-output-flow-facts-key.v1\0",
+            std::iter::empty(),
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProjectDiagnosticFactsKey;
 
 struct ProjectDiagnosticFactsRequest;
@@ -1434,7 +1461,7 @@ impl RequestFamily for ProjectDiagnosticFactsRequest {
     type Key = ProjectDiagnosticFactsKey;
     type Value = Arc<ProjectDiagnosticFacts>;
 
-    const NAME: &'static str = "boon.compiler.project-diagnostic-facts.v11";
+    const NAME: &'static str = "boon.compiler.project-diagnostic-facts.v12";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -1533,6 +1560,7 @@ impl CompilerSession {
                 owner_body_inference_requests: TypedRequestTable::new(),
                 owner_diagnostic_replay_facts_evaluation_requests: TypedRequestTable::new(),
                 owner_diagnostic_replay_facts_requests: TypedRequestTable::new(),
+                project_output_flow_facts_requests: TypedRequestTable::new(),
                 project_diagnostic_facts_requests: TypedRequestTable::new(),
                 source_unit_owner_diagnostics_requests: TypedRequestTable::new(),
                 owner_diagnostics_aggregate_requests: TypedRequestTable::new(),
@@ -5210,7 +5238,7 @@ fn evaluate_owner_diagnostic_replay_facts_requests(
     owners: &[StableCheckOwnerKey],
 ) -> CompilerResult<()> {
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-diagnostic-replay-facts-evaluation-dependencies.v2\0",
+        b"boon.compiler.owner-diagnostic-replay-facts-evaluation-dependencies.v3\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -5269,7 +5297,7 @@ fn evaluate_owner_diagnostic_replay_facts_requests(
     }
 
     let result_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-diagnostic-replay-facts-result-projection-dependencies.v2\0",
+        b"boon.compiler.owner-diagnostic-replay-facts-result-projection-dependencies.v3\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -5306,7 +5334,7 @@ fn evaluate_owner_diagnostic_replay_facts_requests(
     Ok(())
 }
 
-fn evaluate_project_diagnostic_facts_request(
+fn evaluate_project_output_flow_facts_request(
     state: &mut ProjectState,
     project: &ProjectSyntaxSnapshot,
 ) -> CompilerResult<()> {
@@ -5315,9 +5343,73 @@ fn evaluate_project_diagnostic_facts_request(
         .iter()
         .map(stable_check_owner_key_fingerprint_v1)
         .collect::<Vec<_>>();
+    let input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.project-output-flow-facts-dependencies.v1\0",
+        owner_fingerprints.iter().map(<[u8; 32]>::as_slice),
+    ));
+    let key = ProjectOutputFlowFactsKey;
+    match state
+        .project_output_flow_facts_requests
+        .begin(&mut state.syntax_evaluator, key, input)?
+    {
+        RequestStart::Reused => Ok(()),
+        RequestStart::Execute(mut ticket) => {
+            let facts = (|| -> CompilerResult<_> {
+                let abi = Arc::clone(state.project_owner_abi_requests.require(
+                    &state.syntax_evaluator,
+                    &mut ticket,
+                    &ProjectOwnerAbiKey,
+                )?);
+                let mut replay_facts = Vec::with_capacity(owners.len());
+                for owner in &owners {
+                    replay_facts.push(Arc::clone(
+                        state.owner_diagnostic_replay_facts_requests.require(
+                            &state.syntax_evaluator,
+                            &mut ticket,
+                            owner,
+                        )?,
+                    ));
+                }
+                Ok(Arc::new(project_output_flow_facts(
+                    &abi,
+                    owners.iter(),
+                    replay_facts.iter().map(Arc::as_ref),
+                )?))
+            })();
+            let facts = match facts {
+                Ok(facts) => facts,
+                Err(error) => {
+                    state.project_output_flow_facts_requests.abort(
+                        &mut state.syntax_evaluator,
+                        ticket,
+                        RequestAbortReason::Failed,
+                    )?;
+                    return Err(error);
+                }
+            };
+            state.project_output_flow_facts_requests.publish(
+                &mut state.syntax_evaluator,
+                ticket,
+                facts,
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn evaluate_project_diagnostic_facts_request(
+    state: &mut ProjectState,
+    project: &ProjectSyntaxSnapshot,
+) -> CompilerResult<()> {
+    evaluate_project_output_flow_facts_request(state, project)?;
+    let owners = project.stable_check_owner_keys().collect::<Vec<_>>();
+    let owner_fingerprints = owners
+        .iter()
+        .map(stable_check_owner_key_fingerprint_v1)
+        .collect::<Vec<_>>();
     let source_digest = project.source_bundle_digest_v1().to_string();
     let input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.project-diagnostic-facts-dependencies.v11\0",
+        b"boon.compiler.project-diagnostic-facts-dependencies.v12\0",
         std::iter::once(source_digest.as_bytes())
             .chain(std::iter::once(program_role_request_tag(
                 state.source.program_role,
@@ -5336,6 +5428,11 @@ fn evaluate_project_diagnostic_facts_request(
                     &state.syntax_evaluator,
                     &mut ticket,
                     &ProjectOwnerAbiKey,
+                )?);
+                let output_flow = Arc::clone(state.project_output_flow_facts_requests.require(
+                    &state.syntax_evaluator,
+                    &mut ticket,
+                    &ProjectOutputFlowFactsKey,
                 )?);
                 let mut syntax_inputs = Vec::with_capacity(owners.len());
                 let mut lexical_plans = Vec::with_capacity(owners.len());
@@ -5411,6 +5508,7 @@ fn evaluate_project_diagnostic_facts_request(
                 Ok(Arc::new(project_diagnostic_facts(
                     project,
                     &abi,
+                    &output_flow,
                     owners.iter(),
                     syntax_inputs.iter().map(Arc::as_ref),
                     lexical_plans.iter().map(Arc::as_ref),
@@ -8242,13 +8340,15 @@ mod tests {
         // ordinary dependency cone remains local.
         // Every owner also publishes one current diagnostic-replay evaluation
         // and one independently backdatable normalized semantic fact.
+        // One shared output-flow component is demanded after those facts; it
+        // executes cold and reuses its unchanged semantic result on this edit.
         // The project diagnostic-facts request executes once per revision and
         // changes when its exact owner-body input changes. Each source unit
         // owns one local diagnostic-presentation request; the unchanged unit
         // reuses its projection on the warm edit.
         assert_eq!(
             (first_request_counts, request_counts(second_stats)),
-            ((107, 107, 0, 0, 107), (214, 126, 88, 9, 117))
+            ((108, 108, 0, 0, 108), (216, 127, 89, 9, 118))
         );
 
         let mut isolated = CompilerSession::new();
@@ -8379,6 +8479,16 @@ mod tests {
                     .unwrap(),
             )
         };
+        let first_output_flow = {
+            let state = session.projects.get(&project).unwrap();
+            Arc::clone(
+                state
+                    .project_output_flow_facts_requests
+                    .current_value(&state.syntax_evaluator, &ProjectOutputFlowFactsKey)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
         assert_eq!(first_right_summary.dependencies.len(), 1);
         assert_eq!(first_right_summary.dependencies[0].request, right);
         assert_eq!(first_right_summary.dependencies[0].dependency, left);
@@ -8457,6 +8567,16 @@ mod tests {
                     .unwrap(),
             )
         };
+        let second_output_flow = {
+            let state = session.projects.get(&project).unwrap();
+            Arc::clone(
+                state
+                    .project_output_flow_facts_requests
+                    .current_value(&state.syntax_evaluator, &ProjectOutputFlowFactsKey)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
 
         assert!(Arc::ptr_eq(&first_root_input, &second_root_input));
         assert!(!Arc::ptr_eq(&first_left_input, &second_left_input));
@@ -8478,6 +8598,7 @@ mod tests {
             &first_left_replay_evaluation,
             &second_left_replay_evaluation
         ));
+        assert!(Arc::ptr_eq(&first_output_flow, &second_output_flow));
 
         let state = session.projects.get(&project).unwrap();
         let current_left_lexical = state
@@ -10155,16 +10276,18 @@ mod tests {
         // The callable-only ABI, resolution, scope topology/SCC, and provider
         // families are included here. An exported callable change reexecutes
         // its exact scope cone and backdates unchanged projections; the body-
-        // only edit reuses 161 of 196 demanded requests and changes only 22.
+        // only edit reuses 161 of 197 demanded requests and changes only 22.
         // The exact child-boundary lexical projection adds five executions to
         // the exported-interface cone. The project diagnostic-facts request
         // adds one exact execution/change to both cones. Three source-unit
         // presentation requests add one changed/reexecuted unit and two reused
         // units to each cone. Each live owner also publishes one current
         // diagnostic-replay evaluation and one normalized semantic fact.
+        // The shared output-flow component executes once per cone and
+        // backdates when the body-only edit leaves its graph unchanged.
         assert_eq!(
             (interface_delta, body_delta),
-            ((196, 95, 101, 43, 52), (196, 35, 161, 13, 22))
+            ((197, 96, 101, 43, 53), (197, 36, 161, 14, 22))
         );
     }
 

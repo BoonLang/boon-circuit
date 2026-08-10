@@ -9,7 +9,7 @@ use crate::{
     HostPortSyntaxTable, OwnerAbiEnvironment, OwnerBodyInferenceShard, OwnerConstraintSummary,
     OwnerContainingScopeInput, OwnerEffectiveLexicalTarget, OwnerExpressionRef,
     OwnerInferenceAbiEnvironment, OwnerInferenceExpressionId, OwnerInferenceExpressionRef,
-    OwnerLexicalAccess, OwnerLexicalDeclarationTarget, OwnerLexicalPlan, OwnerSignatureCallTarget,
+    OwnerLexicalAccess, OwnerLexicalDeclarationTarget, OwnerLexicalPlan,
     OwnerSignatureOutputBindingPlan, OwnerSourceAnchorRole, OwnerSourceAnchorSite, OwnerSourceMap,
     OwnerStatementId, OwnerSyntaxGraph, OwnerSyntaxInput, RenderContractRegistry,
     SourcePayloadPathLookup, TypecheckSyntaxProgram, canonicalize_diagnostics, diagnostic_at_line,
@@ -38,9 +38,10 @@ use std::fmt;
 use std::sync::Arc;
 
 const PROJECT_DIAGNOSTIC_FACTS_DOMAIN_V10: &[u8] = b"boon.project-diagnostic-facts.v10\0";
-const OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V2: &[u8] = b"boon.owner-diagnostic-replay-facts.v2\0";
-const OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V2: &[u8] =
-    b"boon.owner-diagnostic-replay-currentness.v2\0";
+const OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V3: &[u8] = b"boon.owner-diagnostic-replay-facts.v3\0";
+const OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V3: &[u8] =
+    b"boon.owner-diagnostic-replay-currentness.v3\0";
+const PROJECT_OUTPUT_FLOW_FACTS_DOMAIN_V1: &[u8] = b"boon.project-output-flow-facts.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectDiagnosticFactsError {
@@ -107,6 +108,57 @@ pub struct ProjectOutputDriverFact {
 pub struct ProjectOutputProducerFact {
     pub target: ProjectOutputTargetFact,
     pub drivers: Box<[ProjectOutputDriverFact]>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ProjectOutputDiagnosticSite {
+    FunctionParameter {
+        owner: StableCheckOwnerKey,
+        statement: StableStatementKey,
+        ordinal: u32,
+    },
+    Expression {
+        owner: StableCheckOwnerKey,
+        expression: StableExpressionKey,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ProjectOutputDiagnosticTemplate {
+    site: ProjectOutputDiagnosticSite,
+    message: String,
+}
+
+/// Span-free cross-owner OUT topology shared by exact flow projection and
+/// structural-producer diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectOutputFlowFacts {
+    owners: Box<[StableCheckOwnerKey]>,
+    producers: Box<[ProjectOutputProducerFact]>,
+    list_sources: BTreeMap<ProjectOutputTargetFact, Box<[ProjectOrderExpressionFact]>>,
+    forward_sources: BTreeMap<ProjectOutputTargetFact, Box<[ProjectOutputTargetFact]>>,
+    diagnostics: Box<[ProjectOutputDiagnosticTemplate]>,
+    fingerprint_v1: [u8; 32],
+}
+
+impl ProjectOutputFlowFacts {
+    pub fn producers(&self) -> &[ProjectOutputProducerFact] {
+        &self.producers
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+
+    fn matches_owners<'a>(
+        &self,
+        owners: impl IntoIterator<Item = &'a StableCheckOwnerKey>,
+    ) -> bool {
+        let owners = owners.into_iter().collect::<Vec<_>>();
+        let unique = owners.iter().copied().collect::<BTreeSet<_>>();
+        owners.len() == unique.len() && self.owners.iter().eq(unique.into_iter())
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -243,6 +295,46 @@ struct OwnerDiagnosticStableReadFact {
     read: crate::OwnerEffectiveLexicalReadPlan,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerDiagnosticOutputDeclarationFact {
+    target: ProjectOutputTargetFact,
+    name: String,
+    statement: StableStatementKey,
+    ordinal: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "target_kind", rename_all = "snake_case")]
+enum OwnerDiagnosticOutputCallTargetFact {
+    Owner { owner: StableCheckOwnerKey },
+    Abi {
+        function: String,
+        kind: CheckedCallableKind,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerDiagnosticOutputCallInputFact {
+    formal_ordinal: u32,
+    expression: ProjectOrderExpressionFact,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerDiagnosticOutputBindingFact {
+    target: ProjectOutputTargetFact,
+    formal_ordinal: u32,
+    fresh_name: Option<String>,
+    forwarding: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerDiagnosticOutputCallFact {
+    expression: StableExpressionKey,
+    target: OwnerDiagnosticOutputCallTargetFact,
+    inputs: Box<[OwnerDiagnosticOutputCallInputFact]>,
+    outputs: Box<[OwnerDiagnosticOutputBindingFact]>,
+}
+
 /// Stable, span-free replay inputs projected once for one owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerDiagnosticReplayFacts {
@@ -254,6 +346,8 @@ pub struct OwnerDiagnosticReplayFacts {
     call_inputs: Box<[OwnerDiagnosticStableCallInputFact]>,
     call_dispositions: Box<[OwnerDiagnosticStableCallDispositionFact]>,
     reads: Box<[OwnerDiagnosticStableReadFact]>,
+    output_declarations: Box<[OwnerDiagnosticOutputDeclarationFact]>,
+    output_calls: Box<[OwnerDiagnosticOutputCallFact]>,
     fingerprint_v1: [u8; 32],
 }
 
@@ -358,6 +452,26 @@ fn owner_diagnostic_stable_expression(
     }
 }
 
+fn owner_diagnostic_stable_dense_expression(
+    syntax: &OwnerSyntaxInput,
+    reference: u32,
+) -> Option<ProjectOrderExpressionFact> {
+    let reference = reference as usize;
+    if let Some(expression) = syntax.expressions.get(reference) {
+        return Some(ProjectOrderExpressionFact {
+            owner: syntax.owner.clone(),
+            expression: expression.stable_key.clone(),
+        });
+    }
+    let external = syntax
+        .external_expressions
+        .get(reference.checked_sub(syntax.expressions.len())?)?;
+    Some(ProjectOrderExpressionFact {
+        owner: external.owner.clone(),
+        expression: external.expression.clone(),
+    })
+}
+
 fn project_owner_diagnostic_replay_facts_with_lookup(
     syntax: &OwnerSyntaxInput,
     lexical_plan: &OwnerLexicalPlan,
@@ -397,7 +511,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
             )));
         }
     }
-    let mut stable_expressions = BTreeSet::new();
+    let mut stable_expressions = BTreeMap::new();
     for (index, (expression, input)) in body.expressions.iter().zip(&syntax.expressions).enumerate()
     {
         if expression.id.0 as usize != index
@@ -409,11 +523,37 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
                 syntax.owner
             )));
         }
-        if !stable_expressions.insert(expression.stable_key.clone()) {
+        if stable_expressions
+            .insert(expression.stable_key.clone(), index)
+            .is_some()
+        {
             return Err(ProjectDiagnosticFactsError::new(format!(
                 "owner diagnostic replay contains duplicate expression identities for {:?}",
                 syntax.owner
             )));
+        }
+    }
+
+    let mut output_declarations = Vec::new();
+    if let Some(statement) = syntax.statements.first()
+        && let AstStatementKind::Function { parameters, .. } = &statement.kind
+    {
+        for parameter in parameters
+            .iter()
+            .filter(|parameter| parameter.kind == AstParameterKind::Out)
+        {
+            let ordinal = u32::try_from(parameter.ordinal).map_err(|_| {
+                ProjectDiagnosticFactsError::new("OUT parameter ordinal exceeds u32")
+            })?;
+            output_declarations.push(OwnerDiagnosticOutputDeclarationFact {
+                target: ProjectOutputTargetFact::Parameter {
+                    owner: syntax.owner.clone(),
+                    ordinal,
+                },
+                name: parameter.name.clone(),
+                statement: statement.stable_key.clone(),
+                ordinal,
+            });
         }
     }
 
@@ -452,12 +592,13 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
 
     let mut call_dispositions = Vec::with_capacity(body.calls.len());
     let mut call_inputs = Vec::new();
+    let mut output_calls = Vec::new();
     for call in &body.calls {
-        if !stable_expressions.contains(&call.expression) {
+        let Some(expression_index) = stable_expressions.get(&call.expression).copied() else {
             return Err(ProjectDiagnosticFactsError::new(
                 "owner diagnostic replay call has no exact owner expression",
             ));
-        }
+        };
         let disposition = match &call.target {
             crate::InferredOwnerCallableTarget::Owner { owner } if call.valid => {
                 crate::OwnerDiagnosticCallDisposition::User {
@@ -495,7 +636,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         };
         call_dispositions.push(OwnerDiagnosticStableCallDispositionFact {
             expression: call.expression.clone(),
-            fact,
+            fact: fact.clone(),
         });
         for input in &call.inputs {
             let stable_input = owner_diagnostic_stable_expression(syntax, &input.expression)
@@ -508,6 +649,100 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
                 call: call.expression.clone(),
                 input: stable_input,
                 actual_type: input.actual_type.clone(),
+            });
+        }
+
+        if call.valid {
+            let plan = body
+                .signature_lexical_plan
+                .call(expression_index)
+                .ok_or_else(|| {
+                    ProjectDiagnosticFactsError::new(
+                        "valid owner diagnostic replay call has no signature lexical row",
+                    )
+                })?;
+            if !plan.valid
+                || plan.stable_expression != call.expression
+                || plan.function != call.function
+            {
+                return Err(ProjectDiagnosticFactsError::new(
+                    "valid owner diagnostic replay call differs from its signature lexical row",
+                ));
+            }
+            let target = match &fact.disposition {
+                crate::OwnerDiagnosticCallDisposition::User { owner } => {
+                    OwnerDiagnosticOutputCallTargetFact::Owner {
+                        owner: owner.clone(),
+                    }
+                }
+                crate::OwnerDiagnosticCallDisposition::Abi { kind } => {
+                    OwnerDiagnosticOutputCallTargetFact::Abi {
+                        function: call.function.clone(),
+                        kind: *kind,
+                    }
+                }
+                crate::OwnerDiagnosticCallDisposition::Invalid => {
+                    return Err(ProjectDiagnosticFactsError::new(
+                        "valid owner diagnostic replay call has an invalid disposition",
+                    ));
+                }
+            };
+            let outputs = plan
+                .outputs
+                .iter()
+                .map(|output| {
+                    let target = effective_output_target(&syntax.owner, &output.effective_target())
+                        .ok_or_else(|| {
+                            ProjectDiagnosticFactsError::new(
+                                "valid owner diagnostic replay output has no stable target",
+                            )
+                        })?;
+                    Ok(OwnerDiagnosticOutputBindingFact {
+                        target,
+                        formal_ordinal: output.formal_ordinal(),
+                        fresh_name: match output {
+                            OwnerSignatureOutputBindingPlan::Fresh { name, .. } => {
+                                Some(name.clone())
+                            }
+                            OwnerSignatureOutputBindingPlan::Forward { .. } => None,
+                        },
+                        forwarding: matches!(
+                            output,
+                            OwnerSignatureOutputBindingPlan::Forward { .. }
+                        ),
+                    })
+                })
+                .collect::<Result<Vec<_>, ProjectDiagnosticFactsError>>()?;
+            if outputs.is_empty() {
+                continue;
+            }
+            let inputs = if matches!(&target, OwnerDiagnosticOutputCallTargetFact::Abi { .. }) {
+                plan.matched_inputs
+                    .iter()
+                    .map(|input| {
+                        let expression = owner_diagnostic_stable_dense_expression(
+                            syntax,
+                            input.expression,
+                        )
+                        .ok_or_else(|| {
+                            ProjectDiagnosticFactsError::new(
+                                "valid owner diagnostic replay call input has no stable expression",
+                            )
+                        })?;
+                        Ok(OwnerDiagnosticOutputCallInputFact {
+                            formal_ordinal: input.formal_ordinal,
+                            expression,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ProjectDiagnosticFactsError>>()?
+            } else {
+                Vec::new()
+            };
+            output_calls.push(OwnerDiagnosticOutputCallFact {
+                expression: call.expression.clone(),
+                target,
+                inputs: inputs.into_boxed_slice(),
+                outputs: outputs.into_boxed_slice(),
             });
         }
     }
@@ -532,6 +767,24 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         }
     }
     call_inputs.dedup();
+    output_declarations.sort_by(|left, right| left.target.cmp(&right.target));
+    if output_declarations
+        .windows(2)
+        .any(|rows| rows[0].target == rows[1].target)
+    {
+        return Err(ProjectDiagnosticFactsError::new(
+            "owner diagnostic replay contains duplicate OUT declarations",
+        ));
+    }
+    output_calls.sort_by(|left, right| left.expression.cmp(&right.expression));
+    if output_calls
+        .windows(2)
+        .any(|rows| rows[0].expression == rows[1].expression)
+    {
+        return Err(ProjectDiagnosticFactsError::new(
+            "owner diagnostic replay contains duplicate output call expressions",
+        ));
+    }
 
     if body.signature_lexical_plan.reads().len() != body.expressions.len() {
         return Err(ProjectDiagnosticFactsError::new(format!(
@@ -578,7 +831,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         });
     let containing_scope = syntax.containing_scope.clone();
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V2,
+        OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V3,
         &(
             &syntax.owner,
             &containing_scope,
@@ -588,6 +841,8 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
             &call_inputs,
             &call_dispositions,
             &reads,
+            &output_declarations,
+            &output_calls,
         ),
     )
     .map_err(|error| {
@@ -604,6 +859,8 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         call_inputs: call_inputs.into_boxed_slice(),
         call_dispositions: call_dispositions.into_boxed_slice(),
         reads: reads.into_boxed_slice(),
+        output_declarations: output_declarations.into_boxed_slice(),
+        output_calls: output_calls.into_boxed_slice(),
         fingerprint_v1,
     })
 }
@@ -640,7 +897,7 @@ pub fn evaluate_owner_diagnostic_replay_facts(
     )?);
     let result_fingerprint_v1 = result.fingerprint_v1();
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V2,
+        OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V3,
         &(&basis, result_fingerprint_v1),
     )
     .map_err(|error| {
@@ -669,19 +926,6 @@ struct OwnerFactView<'a> {
 }
 
 type StableOrderExpression = ProjectOrderExpressionFact;
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum ProjectFlowOutputTarget {
-    Parameter {
-        owner: StableCheckOwnerKey,
-        ordinal: u32,
-    },
-    Fresh {
-        owner: StableCheckOwnerKey,
-        call: StableExpressionKey,
-        formal_ordinal: u32,
-    },
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProjectFieldPresence {
@@ -2097,9 +2341,8 @@ struct ProjectFlowModeCacheKey {
 struct ProjectFlowModeAnalyzer<'index, 'project> {
     index: &'index ProjectFactIndex<'project>,
     abi: &'index OwnerAbiEnvironment,
+    output_flow: &'index ProjectOutputFlowFacts,
     navigation: ProjectOrderAnalyzer<'index, 'project>,
-    output_list_sources: BTreeMap<ProjectFlowOutputTarget, Vec<StableOrderExpression>>,
-    output_forward_sources: BTreeMap<ProjectFlowOutputTarget, Vec<ProjectFlowOutputTarget>>,
     cache: BTreeMap<ProjectFlowModeCacheKey, FlowMode>,
     active: BTreeSet<ProjectFlowModeCacheKey>,
 }
@@ -2152,168 +2395,15 @@ impl<'index, 'project> ProjectFlowModeAnalyzer<'index, 'project> {
     fn new(
         index: &'index ProjectFactIndex<'project>,
         abi: &'index OwnerAbiEnvironment,
-    ) -> Result<Self, ProjectDiagnosticFactsError> {
-        let mut output_list_sources =
-            BTreeMap::<ProjectFlowOutputTarget, Vec<StableOrderExpression>>::new();
-        let mut output_forward_sources =
-            BTreeMap::<ProjectFlowOutputTarget, Vec<ProjectFlowOutputTarget>>::new();
-        for (call_expression, call) in &index.calls {
-            let (view, expression, _, _) =
-                index.order_expression(call_expression).ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "valid flow-mode call has no exact diagnostic expression row",
-                    )
-                })?;
-            let plan = view
-                .body
-                .signature_lexical_plan
-                .call(expression)
-                .ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "valid flow-mode call has no exact signature lexical row",
-                    )
-                })?;
-            for output in &plan.outputs {
-                let target = Self::effective_output_target(
-                    &call_expression.owner,
-                    &output.effective_target(),
-                )
-                .ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "valid flow-mode call output has no exact output target",
-                    )
-                })?;
-                match &call.target {
-                    crate::InferredOwnerCallableTarget::Owner { owner } => {
-                        let formal = ProjectFlowOutputTarget::Parameter {
-                            owner: owner.clone(),
-                            ordinal: output.formal_ordinal(),
-                        };
-                        output_forward_sources
-                            .entry(target.clone())
-                            .or_default()
-                            .push(formal.clone());
-                        output_forward_sources
-                            .entry(formal)
-                            .or_default()
-                            .push(target);
-                    }
-                    crate::InferredOwnerCallableTarget::Authoritative => {
-                        let Some(contract) = abi.callable(&call.function) else {
-                            return Err(ProjectDiagnosticFactsError::new(
-                                "authoritative flow-mode call has no exact ABI contract",
-                            ));
-                        };
-                        let Some((list, row)) = contract
-                            .contextual_operation
-                            .map(Self::contextual_list_and_row)
-                        else {
-                            continue;
-                        };
-                        if row != output.formal_ordinal() {
-                            continue;
-                        }
-                        let input = plan
-                            .matched_inputs
-                            .iter()
-                            .find(|input| input.formal_ordinal == list)
-                            .and_then(|input| {
-                                index
-                                    .stable_expression_ref(&call_expression.owner, input.expression)
-                            })
-                            .ok_or_else(|| {
-                                ProjectDiagnosticFactsError::new(
-                                    "contextual flow-mode call has no exact list input",
-                                )
-                            })?;
-                        output_list_sources.entry(target).or_default().push(input);
-                    }
-                    crate::InferredOwnerCallableTarget::Unresolved
-                    | crate::InferredOwnerCallableTarget::Ambiguous { .. } => {
-                        return Err(ProjectDiagnosticFactsError::new(
-                            "valid flow-mode call has an unresolved target",
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(Self {
+        output_flow: &'index ProjectOutputFlowFacts,
+    ) -> Self {
+        Self {
             index,
             abi,
+            output_flow,
             navigation: ProjectOrderAnalyzer::new(index),
-            output_list_sources,
-            output_forward_sources,
             cache: BTreeMap::new(),
             active: BTreeSet::new(),
-        })
-    }
-
-    const fn contextual_list_and_row(operation: crate::OwnerAbiContextualOperation) -> (u32, u32) {
-        match operation {
-            crate::OwnerAbiContextualOperation::Map { list, row, .. }
-            | crate::OwnerAbiContextualOperation::Filter { list, row, .. }
-            | crate::OwnerAbiContextualOperation::Retain { list, row, .. }
-            | crate::OwnerAbiContextualOperation::Remove { list, row, .. }
-            | crate::OwnerAbiContextualOperation::Every { list, row, .. }
-            | crate::OwnerAbiContextualOperation::Any { list, row, .. }
-            | crate::OwnerAbiContextualOperation::Find { list, row, .. }
-            | crate::OwnerAbiContextualOperation::SortBy { list, row, .. }
-            | crate::OwnerAbiContextualOperation::ThenBy { list, row, .. } => (list, row),
-        }
-    }
-
-    fn effective_output_target(
-        owner: &StableCheckOwnerKey,
-        target: &OwnerEffectiveLexicalTarget,
-    ) -> Option<ProjectFlowOutputTarget> {
-        match target {
-            OwnerEffectiveLexicalTarget::Static {
-                target: OwnerLexicalDeclarationTarget::Parameter { ordinal },
-            } => Some(ProjectFlowOutputTarget::Parameter {
-                owner: owner.clone(),
-                ordinal: *ordinal,
-            }),
-            OwnerEffectiveLexicalTarget::FreshOut {
-                call,
-                formal_ordinal,
-            } => Some(ProjectFlowOutputTarget::Fresh {
-                owner: owner.clone(),
-                call: call.clone(),
-                formal_ordinal: *formal_ordinal,
-            }),
-            OwnerEffectiveLexicalTarget::Static {
-                target: OwnerLexicalDeclarationTarget::Imported { target },
-            }
-            | OwnerEffectiveLexicalTarget::Imported { target } => match target {
-                OwnerLexicalTargetRef::Declaration {
-                    owner,
-                    declaration: OwnerDeclarationStableKey::Parameter { ordinal },
-                    ..
-                } => Some(ProjectFlowOutputTarget::Parameter {
-                    owner: owner.clone(),
-                    ordinal: *ordinal,
-                }),
-                OwnerLexicalTargetRef::Declaration {
-                    owner,
-                    declaration:
-                        OwnerDeclarationStableKey::FreshOut {
-                            call,
-                            formal_ordinal,
-                        },
-                    ..
-                } => Some(ProjectFlowOutputTarget::Fresh {
-                    owner: owner.clone(),
-                    call: call.clone(),
-                    formal_ordinal: *formal_ordinal,
-                }),
-                OwnerLexicalTargetRef::Declaration { .. }
-                | OwnerLexicalTargetRef::ContextFormal { .. }
-                | OwnerLexicalTargetRef::Ambiguous { .. } => None,
-            },
-            OwnerEffectiveLexicalTarget::Static { .. }
-            | OwnerEffectiveLexicalTarget::CallContext { .. }
-            | OwnerEffectiveLexicalTarget::InvalidBareBinding { .. }
-            | OwnerEffectiveLexicalTarget::Ambiguous { .. } => None,
         }
     }
 
@@ -2397,7 +2487,7 @@ impl<'index, 'project> ProjectFlowModeAnalyzer<'index, 'project> {
         frames: &[ProjectOrderFrame],
     ) -> Option<FlowMode> {
         self.flow_output_target_projection_mode(
-            &ProjectFlowOutputTarget::Fresh {
+            &ProjectOutputTargetFact::Fresh {
                 owner: owner.clone(),
                 call: call.clone(),
                 formal_ordinal,
@@ -2499,21 +2589,23 @@ impl<'index, 'project> ProjectFlowModeAnalyzer<'index, 'project> {
 
     fn flow_output_target_projection_mode(
         &mut self,
-        target: &ProjectFlowOutputTarget,
+        target: &ProjectOutputTargetFact,
         projection: &[String],
         frames: &[ProjectOrderFrame],
-        visited: &mut BTreeSet<ProjectFlowOutputTarget>,
+        visited: &mut BTreeSet<ProjectOutputTargetFact>,
     ) -> Option<FlowMode> {
         if !visited.insert(target.clone()) {
             return None;
         }
         let list_sources = self
-            .output_list_sources
+            .output_flow
+            .list_sources
             .get(target)
             .cloned()
             .unwrap_or_default();
         let forward_sources = self
-            .output_forward_sources
+            .output_flow
+            .forward_sources
             .get(target)
             .cloned()
             .unwrap_or_default();
@@ -2537,10 +2629,10 @@ impl<'index, 'project> ProjectFlowModeAnalyzer<'index, 'project> {
         ordinal: u32,
         projection: &[String],
         frames: &[ProjectOrderFrame],
-        visited: &mut BTreeSet<ProjectFlowOutputTarget>,
+        visited: &mut BTreeSet<ProjectOutputTargetFact>,
     ) -> Option<FlowMode> {
         self.flow_output_target_projection_mode(
-            &ProjectFlowOutputTarget::Parameter {
+            &ProjectOutputTargetFact::Parameter {
                 owner: owner.clone(),
                 ordinal,
             },
@@ -4273,7 +4365,7 @@ fn collection_authority_diagnostics(
 struct ProjectOutputInfo {
     label: String,
     cycle_label: String,
-    span: TypeDiagnosticSpan,
+    site: ProjectOutputDiagnosticSite,
 }
 
 #[derive(Clone)]
@@ -4392,125 +4484,169 @@ fn collect_output_cycle_nodes(
     cycles
 }
 
-fn output_producer_facts(
-    index: &ProjectFactIndex<'_>,
+fn contextual_list_and_row(operation: crate::OwnerAbiContextualOperation) -> (u32, u32) {
+    match operation {
+        crate::OwnerAbiContextualOperation::Map { list, row, .. }
+        | crate::OwnerAbiContextualOperation::Filter { list, row, .. }
+        | crate::OwnerAbiContextualOperation::Retain { list, row, .. }
+        | crate::OwnerAbiContextualOperation::Remove { list, row, .. }
+        | crate::OwnerAbiContextualOperation::Every { list, row, .. }
+        | crate::OwnerAbiContextualOperation::Any { list, row, .. }
+        | crate::OwnerAbiContextualOperation::Find { list, row, .. }
+        | crate::OwnerAbiContextualOperation::SortBy { list, row, .. }
+        | crate::OwnerAbiContextualOperation::ThenBy { list, row, .. } => (list, row),
+    }
+}
+
+pub fn project_output_flow_facts<'a>(
     abi: &OwnerAbiEnvironment,
-    diagnostics: &mut Vec<TypeDiagnostic>,
-) -> Result<Vec<ProjectOutputProducerFact>, ProjectDiagnosticFactsError> {
+    expected_owners: impl IntoIterator<Item = &'a StableCheckOwnerKey>,
+    replay_facts: impl IntoIterator<Item = &'a OwnerDiagnosticReplayFacts>,
+) -> Result<ProjectOutputFlowFacts, ProjectDiagnosticFactsError> {
+    let expected_owners = expected_owners.into_iter().collect::<Vec<_>>();
+    let unique_owners = expected_owners
+        .iter()
+        .copied()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if unique_owners.len() != expected_owners.len() {
+        return Err(ProjectDiagnosticFactsError::new(
+            "project output flow owners contain a duplicate",
+        ));
+    }
+    let owners = unique_owners.into_iter().collect::<Vec<_>>();
+    let replay_facts = unique_by_owner(
+        replay_facts.into_iter().map(|facts| (facts.owner(), facts)),
+        "output-flow replay facts",
+    )?;
+    if replay_facts.keys().ne(owners.iter()) {
+        return Err(ProjectDiagnosticFactsError::new(
+            "project output flow replay coverage differs from the project owner set",
+        ));
+    }
+
     let mut outputs = BTreeMap::<ProjectOutputTargetFact, ProjectOutputInfo>::new();
     let mut edges = Vec::new();
+    let mut list_sources =
+        BTreeMap::<ProjectOutputTargetFact, BTreeSet<ProjectOrderExpressionFact>>::new();
+    let mut forward_sources =
+        BTreeMap::<ProjectOutputTargetFact, BTreeSet<ProjectOutputTargetFact>>::new();
 
-    for (owner, view) in &index.owners {
-        if let Some(statement) = view.syntax.statements.first()
-            && let AstStatementKind::Function { name, parameters } = &statement.kind
-        {
-            for parameter in parameters
-                .iter()
-                .filter(|parameter| parameter.kind == AstParameterKind::Out)
-            {
-                let ordinal = u32::try_from(parameter.ordinal).map_err(|_| {
-                    ProjectDiagnosticFactsError::new("OUT parameter ordinal exceeds u32")
-                })?;
-                let target = ProjectOutputTargetFact::Parameter {
-                    owner: owner.clone(),
-                    ordinal,
-                };
-                let span = global_anchor_span(
-                    index.project,
-                    view.source_map,
-                    &OwnerSourceAnchorSite::Statement {
-                        statement: statement.id,
-                    },
-                    OwnerSourceAnchorRole::FunctionParameter { ordinal },
-                )?;
-                if outputs
-                    .insert(
-                        target,
-                        ProjectOutputInfo {
-                            label: format!("output `{}` in `FUNCTION {name}`", parameter.name),
-                            cycle_label: format!("output `{}`", parameter.name),
-                            span,
+    for owner in &owners {
+        let replay = replay_facts[owner];
+        for declaration in &replay.output_declarations {
+            if !matches!(
+                &declaration.target,
+                ProjectOutputTargetFact::Parameter { owner: target_owner, ordinal }
+                    if target_owner == owner && *ordinal == declaration.ordinal
+            ) {
+                return Err(ProjectDiagnosticFactsError::new(
+                    "owner output declaration has a foreign or mismatched target",
+                ));
+            }
+            let function_name = replay.function_name.as_deref().ok_or_else(|| {
+                ProjectDiagnosticFactsError::new("OUT declaration has no owning function")
+            })?;
+            if outputs
+                .insert(
+                    declaration.target.clone(),
+                    ProjectOutputInfo {
+                        label: format!(
+                            "output `{}` in `FUNCTION {function_name}`",
+                            declaration.name
+                        ),
+                        cycle_label: format!("output `{}`", declaration.name),
+                        site: ProjectOutputDiagnosticSite::FunctionParameter {
+                            owner: owner.clone(),
+                            statement: declaration.statement.clone(),
+                            ordinal: declaration.ordinal,
                         },
-                    )
-                    .is_some()
-                {
-                    return Err(ProjectDiagnosticFactsError::new(
-                        "project diagnostics received a duplicate user OUT target",
-                    ));
-                }
+                    },
+                )
+                .is_some()
+            {
+                return Err(ProjectDiagnosticFactsError::new(
+                    "project diagnostics received a duplicate user OUT target",
+                ));
             }
         }
 
-        let valid_calls = view
-            .body
-            .calls
-            .iter()
-            .filter(|call| call.valid)
-            .map(|call| call.expression.clone())
-            .collect::<BTreeSet<_>>();
-        for call in view
-            .body
-            .signature_lexical_plan
-            .calls()
-            .iter()
-            .filter(|call| call.valid && valid_calls.contains(&call.stable_expression))
-        {
-            let source_for = |formal_ordinal| -> Result<_, ProjectDiagnosticFactsError> {
-                match &call.target {
-                    OwnerSignatureCallTarget::Owner { owner } => {
-                        Ok(Some(ProjectOutputTargetFact::Parameter {
-                            owner: owner.clone(),
-                            ordinal: formal_ordinal,
-                        }))
-                    }
-                    OwnerSignatureCallTarget::Authoritative => match abi.callable(&call.function) {
-                        Some(contract) if contract.kind == CheckedCallableKind::Builtin => Ok(None),
-                        Some(_) => Err(ProjectDiagnosticFactsError::new(
-                            "authoritative external OUT cannot seed the project producer graph",
-                        )),
-                        None => Err(ProjectDiagnosticFactsError::new(
-                            "valid authoritative OUT call has no exact callable contract",
-                        )),
-                    },
-                    OwnerSignatureCallTarget::Unresolved
-                    | OwnerSignatureCallTarget::Ambiguous { .. } => {
-                        Err(ProjectDiagnosticFactsError::new(
-                            "valid OUT call has no exact callable target",
-                        ))
-                    }
-                }
-            };
+        for call in &replay.output_calls {
             for output in &call.outputs {
-                let formal_ordinal = output.formal_ordinal();
-                let source = source_for(formal_ordinal)?;
-                let target = effective_output_target(owner, &output.effective_target())
-                    .ok_or_else(|| {
-                        ProjectDiagnosticFactsError::new(
-                            "valid OUT call has no stable output target",
-                        )
-                    })?;
-                if let OwnerSignatureOutputBindingPlan::Fresh { name, .. } = output {
-                    let span = index.expression_span(&StableOrderExpression {
-                        owner: owner.clone(),
-                        expression: call.stable_expression.clone(),
-                    })?;
+                let source = match &call.target {
+                    OwnerDiagnosticOutputCallTargetFact::Owner { owner: callee } => {
+                        let formal = ProjectOutputTargetFact::Parameter {
+                            owner: callee.clone(),
+                            ordinal: output.formal_ordinal,
+                        };
+                        forward_sources
+                            .entry(output.target.clone())
+                            .or_default()
+                            .insert(formal.clone());
+                        forward_sources
+                            .entry(formal.clone())
+                            .or_default()
+                            .insert(output.target.clone());
+                        Some(formal)
+                    }
+                    OwnerDiagnosticOutputCallTargetFact::Abi { function, kind } => {
+                        let contract = abi.callable(function).ok_or_else(|| {
+                            ProjectDiagnosticFactsError::new(
+                                "valid authoritative OUT call has no exact callable contract",
+                            )
+                        })?;
+                        if contract.kind != *kind {
+                            return Err(ProjectDiagnosticFactsError::new(
+                                "owner output-flow ABI kind differs from its replay fact",
+                            ));
+                        }
+                        if *kind != CheckedCallableKind::Builtin {
+                            return Err(ProjectDiagnosticFactsError::new(
+                                "authoritative external OUT cannot seed the project producer graph",
+                            ));
+                        }
+                        if let Some(operation) = contract.contextual_operation {
+                            let (list, row) = contextual_list_and_row(operation);
+                            if row == output.formal_ordinal {
+                                let input = call
+                                    .inputs
+                                    .iter()
+                                    .find(|input| input.formal_ordinal == list)
+                                    .ok_or_else(|| {
+                                        ProjectDiagnosticFactsError::new(
+                                            "contextual flow-mode call has no exact list input",
+                                        )
+                                    })?;
+                                list_sources
+                                    .entry(output.target.clone())
+                                    .or_default()
+                                    .insert(input.expression.clone());
+                            }
+                        }
+                        None
+                    }
+                };
+                if let Some(name) = &output.fresh_name {
                     outputs
-                        .entry(target.clone())
+                        .entry(output.target.clone())
                         .or_insert_with(|| ProjectOutputInfo {
                             label: format!("fresh output `{name}`"),
                             cycle_label: format!("fresh output `{name}"),
-                            span,
+                            site: ProjectOutputDiagnosticSite::Expression {
+                                owner: owner.clone(),
+                                expression: call.expression.clone(),
+                            },
                         });
                 }
                 edges.push(ProjectOutputEdge {
                     source,
-                    target,
+                    target: output.target.clone(),
                     driver: ProjectOutputDriverFact {
                         owner: owner.clone(),
-                        call: call.stable_expression.clone(),
-                        formal_ordinal,
+                        call: call.expression.clone(),
+                        formal_ordinal: output.formal_ordinal,
                     },
-                    forwarding: matches!(output, OwnerSignatureOutputBindingPlan::Forward { .. }),
+                    forwarding: output.forwarding,
                 });
             }
         }
@@ -4580,15 +4716,13 @@ fn output_producer_facts(
     let cycle_nodes = collect_output_cycle_nodes(&cycle_graph);
 
     let mut facts = Vec::with_capacity(outputs.len());
+    let mut diagnostics = Vec::new();
     for (target, info) in outputs {
         let target_drivers = drivers.remove(&target).unwrap_or_default();
         let count = target_drivers.len();
         if count != 1 {
-            diagnostics.push(TypeDiagnostic {
-                severity: DiagnosticSeverity::Error,
-                line: info.span.line,
-                start: info.span.start,
-                end: info.span.end,
+            diagnostics.push(ProjectOutputDiagnosticTemplate {
+                site: info.site.clone(),
                 message: if count == 0 {
                     format!("{} has no structural producer", info.label)
                 } else {
@@ -4600,11 +4734,8 @@ fn output_producer_facts(
             });
         }
         if cycle_nodes.contains(&target) {
-            diagnostics.push(TypeDiagnostic {
-                severity: DiagnosticSeverity::Error,
-                line: info.span.line,
-                start: info.span.start,
-                end: info.span.end,
+            diagnostics.push(ProjectOutputDiagnosticTemplate {
+                site: info.site,
                 message: format!(
                     "{} participates in an OUT forwarding cycle",
                     info.cycle_label
@@ -4619,7 +4750,100 @@ fn output_producer_facts(
                 .into_boxed_slice(),
         });
     }
-    Ok(facts)
+    let list_sources = list_sources
+        .into_iter()
+        .map(|(target, sources)| {
+            (
+                target,
+                sources.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let forward_sources = forward_sources
+        .into_iter()
+        .map(|(target, sources)| {
+            (
+                target,
+                sources.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+        PROJECT_OUTPUT_FLOW_FACTS_DOMAIN_V1,
+        &(
+            &owners,
+            &facts,
+            &list_sources,
+            &forward_sources,
+            &diagnostics,
+        ),
+    )
+    .map_err(|error| {
+        ProjectDiagnosticFactsError::new(format!(
+            "cannot fingerprint project output flow facts: {error}"
+        ))
+    })?;
+    Ok(ProjectOutputFlowFacts {
+        owners: owners.into_boxed_slice(),
+        producers: facts.into_boxed_slice(),
+        list_sources,
+        forward_sources,
+        diagnostics: diagnostics.into_boxed_slice(),
+        fingerprint_v1,
+    })
+}
+
+fn output_flow_diagnostics(
+    index: &ProjectFactIndex<'_>,
+    output_flow: &ProjectOutputFlowFacts,
+) -> Result<Vec<TypeDiagnostic>, ProjectDiagnosticFactsError> {
+    let mut diagnostics = Vec::with_capacity(output_flow.diagnostics.len());
+    for template in &output_flow.diagnostics {
+        let span = match &template.site {
+            ProjectOutputDiagnosticSite::FunctionParameter {
+                owner,
+                statement,
+                ordinal,
+            } => {
+                let (site_owner, statement) = index.statements.get(statement).ok_or_else(|| {
+                    ProjectDiagnosticFactsError::new(
+                        "OUT diagnostic parameter site has no stable statement",
+                    )
+                })?;
+                if site_owner != owner {
+                    return Err(ProjectDiagnosticFactsError::new(
+                        "OUT diagnostic parameter site belongs to a foreign owner",
+                    ));
+                }
+                let view = index.owners.get(owner).ok_or_else(|| {
+                    ProjectDiagnosticFactsError::new(
+                        "OUT diagnostic parameter site has no owner facts",
+                    )
+                })?;
+                global_anchor_span(
+                    index.project,
+                    view.source_map,
+                    &OwnerSourceAnchorSite::Statement {
+                        statement: *statement,
+                    },
+                    OwnerSourceAnchorRole::FunctionParameter { ordinal: *ordinal },
+                )?
+            }
+            ProjectOutputDiagnosticSite::Expression { owner, expression } => index
+                .expression_span(&StableOrderExpression {
+                    owner: owner.clone(),
+                    expression: expression.clone(),
+                })?,
+        };
+        diagnostics.push(TypeDiagnostic {
+            severity: DiagnosticSeverity::Error,
+            line: span.line,
+            start: span.start,
+            end: span.end,
+            message: template.message.clone(),
+        });
+    }
+    Ok(diagnostics)
 }
 
 #[derive(Clone)]
@@ -6346,6 +6570,7 @@ fn host_facts(
 pub fn project_diagnostic_facts<'a>(
     project: &'a ProjectSyntaxSnapshot,
     abi: &OwnerAbiEnvironment,
+    output_flow: &ProjectOutputFlowFacts,
     expected_owners: impl IntoIterator<Item = &'a StableCheckOwnerKey>,
     syntax_inputs: impl IntoIterator<Item = &'a OwnerSyntaxInput>,
     lexical_plans: impl IntoIterator<Item = &'a OwnerLexicalPlan>,
@@ -6358,9 +6583,15 @@ pub fn project_diagnostic_facts<'a>(
     >,
     source_maps: impl IntoIterator<Item = &'a OwnerSourceMap>,
 ) -> Result<ProjectDiagnosticFacts, ProjectDiagnosticFactsError> {
+    let expected_owners = expected_owners.into_iter().collect::<Vec<_>>();
+    if !output_flow.matches_owners(expected_owners.iter().copied()) {
+        return Err(ProjectDiagnosticFactsError::new(
+            "project output flow coverage differs from the diagnostic owner set",
+        ));
+    }
     let index = ProjectFactIndex::new(
         project,
-        expected_owners,
+        expected_owners.iter().copied(),
         syntax_inputs,
         lexical_plans,
         summaries,
@@ -6382,7 +6613,7 @@ pub fn project_diagnostic_facts<'a>(
         .iter()
         .map(|payload| (payload.canonical_path.clone(), payload.payload_type.clone()))
         .collect::<Vec<_>>();
-    let exact_modes = ProjectFlowModeAnalyzer::new(&index, abi)?.all_modes();
+    let exact_modes = ProjectFlowModeAnalyzer::new(&index, abi, output_flow).all_modes();
     let (expression_flows, statement_values) = index.owner_flow_diagnostic_inputs(&exact_modes)?;
     let (expression_spans, statement_spans) = index.diagnostic_source_spans()?;
     let call_input_types = exact_call_input_types
@@ -6421,7 +6652,8 @@ pub fn project_diagnostic_facts<'a>(
     diagnostics.extend(match_pattern_diagnostics(&index)?);
     diagnostics.extend(duplicate_function_diagnostics(&index)?);
     diagnostics.extend(collection_authority_diagnostics(&index)?);
-    let output_producers = output_producer_facts(&index, abi, &mut diagnostics)?;
+    diagnostics.extend(output_flow_diagnostics(&index, output_flow)?);
+    let output_producers = output_flow.producers.clone();
     let output_roots = output_facts(project, &index, &mut diagnostics)?;
     let render_slots = render_facts(&index, &mut diagnostics)?;
     let (host_ports, host_port_resolution_error) =
@@ -6452,7 +6684,7 @@ pub fn project_diagnostic_facts<'a>(
     Ok(ProjectDiagnosticFacts {
         source_bundle_digest_v1,
         output_roots: output_roots.into_boxed_slice(),
-        output_producers: output_producers.into_boxed_slice(),
+        output_producers,
         order,
         render_slots: render_slots.into_boxed_slice(),
         host_ports,

@@ -537,7 +537,7 @@ impl PreviewCompiler {
                 let result = match self.session.request(
                     project,
                     revision,
-                    CompileIntent::Diagnostics,
+                    CompileIntent::EditorDiagnostics,
                     cancellation,
                 ) {
                     Ok(result) => result,
@@ -561,8 +561,8 @@ impl PreviewCompiler {
                         return Err(error_text);
                     }
                 };
-                let checked = result.diagnostics().ok_or_else(|| {
-                    "diagnostics compiler request produced no checked source".to_owned()
+                let checked = result.editor_diagnostics().ok_or_else(|| {
+                    "editor diagnostics compiler request produced no checked source".to_owned()
                 })?;
                 match &checked.syntax {
                     CheckedSourceSyntax::Assembled(program) => project_checked_language(
@@ -859,7 +859,7 @@ fn compile_source_bundle(
         let diagnostics = match session.request(
             project,
             revision,
-            CompileIntent::Diagnostics,
+            CompileIntent::EditorDiagnostics,
             cancellation,
         ) {
             Ok(result) => result,
@@ -883,9 +883,9 @@ fn compile_source_bundle(
                 return Err(error_text);
             }
         };
-        let checked = diagnostics
-            .diagnostics()
-            .ok_or_else(|| "migration diagnostics request produced no checked source".to_owned())?;
+        let checked = diagnostics.editor_diagnostics().ok_or_else(|| {
+            "migration editor diagnostics request produced no checked source".to_owned()
+        })?;
         *language = Some(match &checked.syntax {
             CheckedSourceSyntax::Assembled(program) => {
                 project_checked_language(language_revision, editor_units, program, &checked.output)?

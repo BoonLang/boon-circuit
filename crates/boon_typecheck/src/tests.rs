@@ -2262,3 +2262,14 @@ fn tagged_payloads_satisfy_structural_object_parameters() {
 
     assert!(type_is_assignable_to(&actual, &expected));
 }
+
+#[test]
+fn boolean_contract_defers_only_unresolved_union_branches() {
+    let boolean = true_false_type();
+    let unresolved_boolean =
+        boon_checked::canonical_union_type(vec![Type::Var(TypeVar(0)), boolean.clone()]);
+    let invalid = boon_checked::canonical_union_type(vec![Type::Var(TypeVar(0)), Type::Number]);
+
+    assert!(type_accepts_true_false_or_unresolved(&unresolved_boolean));
+    assert!(!type_accepts_true_false_or_unresolved(&invalid));
+}

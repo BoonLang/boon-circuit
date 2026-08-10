@@ -17,6 +17,7 @@ use crate::{
     OwnerSignatureDeclarationKind, OwnerSignatureDeclarationPlan, OwnerSignatureDeclarationTarget,
     OwnerSignatureMatchedInputSource, OwnerSignatureOutputBindingPlan, OwnerSignaturePassSource,
     OwnerSourceAnchorSite, OwnerSymbolResolution, OwnerSyntaxGraph, OwnerSyntaxInput,
+    owner_abi_callable_declaration_key, owner_abi_value_declaration_key,
 };
 use boon_checked::{
     CheckedCallContextKind, CheckedCallableKind, CheckedDeclarationKind, CheckedIntrinsicV1,
@@ -49,7 +50,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-const CHECKED_OWNER_SHARD_DOMAIN_V6: &[u8] = b"boon.checked-owner-shard.v6\0";
+const CHECKED_OWNER_SHARD_DOMAIN_V7: &[u8] = b"boon.checked-owner-shard.v7\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CheckedOwnerShardBasis {
@@ -91,10 +92,6 @@ impl CheckedOwnerShard {
 
     pub(crate) const fn rows(&self) -> &CheckedOwnerRows {
         &self.rows
-    }
-
-    pub(crate) fn diagnostic_templates(&self) -> &[crate::OwnerDiagnosticTemplate] {
-        &self.diagnostics
     }
 
     pub(crate) fn validate_seal(
@@ -163,7 +160,7 @@ impl CheckedOwnerShard {
             )));
         }
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            CHECKED_OWNER_SHARD_DOMAIN_V6,
+            CHECKED_OWNER_SHARD_DOMAIN_V7,
             &(&self.basis, &self.receipts.construction),
         )
         .map_err(|error| {
@@ -5680,42 +5677,16 @@ fn owner_parameter_ordinal(reference: &OwnerDeclarationRef) -> Option<u32> {
 fn abi_callable_key(
     contract: &OwnerAbiCallableContract,
 ) -> Result<OwnerAbiDeclarationKey, CheckedOwnerBuildError> {
-    let contract_fingerprint_v1 =
-        boon_contract::canonical_serde_hash_v1(b"boon.owner-checked-abi-callable.v1\0", contract)
-            .map_err(|error| {
-            CheckedOwnerBuildError::new(format!("cannot fingerprint owner ABI callable: {error}"))
-        })?;
-    Ok(OwnerAbiDeclarationKey {
-        role: contract.role,
-        kind: match contract.kind {
-            CheckedCallableKind::Builtin => OwnerAbiDeclarationKind::BuiltinCallable,
-            CheckedCallableKind::External => OwnerAbiDeclarationKind::ExternalCallable,
-            CheckedCallableKind::User => {
-                return Err(CheckedOwnerBuildError::new(
-                    "authoritative ABI cannot contain a user callable",
-                ));
-            }
-        },
-        contract_fingerprint_v1,
-        external_identity: contract.external_identity,
-    })
+    owner_abi_callable_declaration_key(contract)
+        .map_err(|error| CheckedOwnerBuildError::new(error.to_string()))
 }
 
 fn abi_value_key(
     role: ProgramRole,
     contract: &OwnerAbiValueContract,
 ) -> Result<OwnerAbiDeclarationKey, CheckedOwnerBuildError> {
-    let contract_fingerprint_v1 =
-        boon_contract::canonical_serde_hash_v1(b"boon.owner-checked-abi-value.v1\0", contract)
-            .map_err(|error| {
-                CheckedOwnerBuildError::new(format!("cannot fingerprint owner ABI value: {error}"))
-            })?;
-    Ok(OwnerAbiDeclarationKey {
-        role,
-        kind: OwnerAbiDeclarationKind::ExternalValue,
-        contract_fingerprint_v1,
-        external_identity: contract.external_identity,
-    })
+    owner_abi_value_declaration_key(role, contract)
+        .map_err(|error| CheckedOwnerBuildError::new(error.to_string()))
 }
 
 fn unknown_flow_type() -> FlowType {
@@ -6028,7 +5999,7 @@ pub fn build_checked_owner_shard<'a>(
     // relocation. Bind that compact seal to the exact current basis instead of
     // serializing the complete rich row tables for a second time.
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        CHECKED_OWNER_SHARD_DOMAIN_V6,
+        CHECKED_OWNER_SHARD_DOMAIN_V7,
         &(&basis, &receipts.construction),
     )
     .map_err(|error| {

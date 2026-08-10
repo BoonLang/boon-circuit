@@ -367,6 +367,24 @@ impl<'a> UnitOwnerSyntaxView<'a> {
         &self.fields.path
     }
 
+    /// Physical one-based source line containing `byte`.
+    ///
+    /// Parser expressions can span multiple lines while retaining the line of
+    /// their first token. Source-map subspans must instead use the line that
+    /// owns their exact byte start. The parsed line table is shared by every
+    /// owner view, so this lookup stays logarithmic without rescanning source
+    /// text per owner or anchor.
+    pub fn physical_line_for_byte(&self, byte: usize) -> Option<usize> {
+        let index = self
+            .fields
+            .ast
+            .lines
+            .partition_point(|line| line.start <= byte)
+            .checked_sub(1)?;
+        let line = self.fields.ast.lines.get(index)?;
+        (byte <= line.end).then_some(line.line)
+    }
+
     pub fn route(&self) -> &'a UnitOwnerRoute {
         &self.entry.route
     }
@@ -1193,6 +1211,7 @@ struct ProjectSyntaxSnapshotFields {
     expression_offsets: Vec<usize>,
     statement_offsets: Vec<usize>,
     expression_count: usize,
+    check_expression_count: usize,
     statement_count: usize,
 }
 
@@ -1224,6 +1243,7 @@ impl ProjectSyntaxSnapshot {
         let mut functions = Vec::new();
         let mut operators = Vec::new();
         let mut expression_count = 0usize;
+        let mut check_expression_count = 0usize;
         let mut statement_count = 0usize;
         let mut expression_offsets = Vec::with_capacity(units.len());
         let mut statement_offsets = Vec::with_capacity(units.len());
@@ -1254,6 +1274,20 @@ impl ProjectSyntaxSnapshot {
                     parsed_source_unit_invariant_error(
                         &unit.path,
                         "project expression count overflows usize",
+                    )
+                })?;
+            check_expression_count = check_expression_count
+                .checked_add(
+                    unit.owner_index
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.expressions.len())
+                        .sum::<usize>(),
+                )
+                .ok_or_else(|| {
+                    parsed_source_unit_invariant_error(
+                        &unit.path,
+                        "project check-expression count overflows usize",
                     )
                 })?;
             let mut expected_local_statement = 0usize;
@@ -1364,6 +1398,7 @@ impl ProjectSyntaxSnapshot {
                 expression_offsets,
                 statement_offsets,
                 expression_count,
+                check_expression_count,
                 statement_count,
             }),
         })
@@ -1424,6 +1459,13 @@ impl ProjectSyntaxSnapshot {
 
     pub fn expression_count(&self) -> usize {
         self.fields.expression_count
+    }
+
+    /// Reachable parser expressions assigned to exactly one type-check owner.
+    /// The raw arena can retain parser-internal expressions that are no longer
+    /// part of the final semantic graph; those rows are intentionally excluded.
+    pub fn check_expression_count(&self) -> usize {
+        self.fields.check_expression_count
     }
 
     pub fn statement_count(&self) -> usize {

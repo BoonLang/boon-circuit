@@ -1,7 +1,7 @@
 use crate::{
     CheckedCompileRequest, CheckedSourceFromSource, CompiledSealedMachinePlanFromSource,
-    CompilerResult, CompilerSourceUnit, checked_source_from_owner_assembly,
-    finish_checked_machine_plan_with_cancellation,
+    CompilerDiagnostics, CompilerResult, CompilerSourceUnit, checked_source_from_owner_assembly,
+    compiler_diagnostics_from_owner_aggregate, finish_checked_machine_plan_with_cancellation,
 };
 use boon_compilation_db::{
     RequestAbortReason, RequestEvaluationStats, RequestEvaluatorGraph, RequestFamily,
@@ -34,10 +34,11 @@ use boon_typecheck::{
     OwnerInterfaceTopology, OwnerLexicalPlan, OwnerParameterRequirementKey,
     OwnerParameterRequirementLookup, OwnerReferenceKind, OwnerSourceMap,
     OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput,
-    OwnerValueAbiLookup, aggregate_owner_diagnostics, assemble_checked_owner_project,
-    build_checked_owner_shard, build_owner_callable_scope_topology, build_owner_interface_topology,
-    evaluate_owner_body_with_signature_plan, evaluate_owner_callable_scope_scc,
-    evaluate_owner_interface_scc_with_signature_scopes, project_owner_abi_environment,
+    OwnerValueAbiLookup, ProjectDiagnosticFacts, aggregate_owner_diagnostics,
+    assemble_checked_owner_project, build_checked_owner_shard, build_owner_callable_scope_topology,
+    build_owner_interface_topology, evaluate_owner_body_with_signature_plan,
+    evaluate_owner_callable_scope_scc, evaluate_owner_interface_scc_with_signature_scopes,
+    project_diagnostic_facts, project_owner_abi_environment,
     project_owner_callable_resolution_plan, project_owner_constraint_seed_with_lexical_plan,
     project_owner_declaration_surface, project_owner_lexical_plan, project_owner_source_map,
     project_owner_syntax_input, resolve_owner_constraint_seed_with_signature_plan,
@@ -64,6 +65,9 @@ pub struct Revision(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompileIntent {
     Diagnostics,
+    /// Complete checked rows and editor-facing type/presentation tables without
+    /// sealing an executable artifact. Callers must opt into this larger root.
+    EditorDiagnostics,
     VerifiedCheck,
     VerifiedPreview,
     Handoff,
@@ -198,7 +202,8 @@ impl CancellationToken {
 }
 
 pub enum CompilerSessionResult<'a> {
-    Diagnostics(&'a CheckedSourceFromSource),
+    Diagnostics(&'a CompilerDiagnostics),
+    EditorDiagnostics(&'a CheckedSourceFromSource),
     Verified {
         intent: CompileIntent,
         compiled: &'a CompiledSealedMachinePlanFromSource,
@@ -206,16 +211,23 @@ pub enum CompilerSessionResult<'a> {
 }
 
 impl CompilerSessionResult<'_> {
-    pub fn diagnostics(&self) -> Option<&CheckedSourceFromSource> {
+    pub fn diagnostics(&self) -> Option<&CompilerDiagnostics> {
         match self {
-            Self::Diagnostics(checked) => Some(checked),
-            Self::Verified { .. } => None,
+            Self::Diagnostics(diagnostics) => Some(diagnostics),
+            Self::EditorDiagnostics(_) | Self::Verified { .. } => None,
+        }
+    }
+
+    pub fn editor_diagnostics(&self) -> Option<&CheckedSourceFromSource> {
+        match self {
+            Self::EditorDiagnostics(checked) => Some(checked),
+            Self::Diagnostics(_) | Self::Verified { .. } => None,
         }
     }
 
     pub fn compiled(&self) -> Option<&CompiledSealedMachinePlanFromSource> {
         match self {
-            Self::Diagnostics(_) => None,
+            Self::Diagnostics(_) | Self::EditorDiagnostics(_) => None,
             Self::Verified { compiled, .. } => Some(compiled),
         }
     }
@@ -275,12 +287,11 @@ struct ProjectState {
     owner_body_inference_evaluation_requests:
         TypedRequestTable<OwnerBodyInferenceEvaluationRequest>,
     owner_body_inference_requests: TypedRequestTable<OwnerBodyInferenceRequest>,
-    // Staged request root: kept off the public Diagnostics path until its
-    // diagnostic and presentation authorities are complete.
-    #[allow(dead_code)]
+    project_diagnostic_facts_requests: TypedRequestTable<ProjectDiagnosticFactsRequest>,
     owner_diagnostics_aggregate_requests: TypedRequestTable<OwnerDiagnosticsAggregateRequest>,
     checked_owner_shard_requests: TypedRequestTable<CheckedOwnerShardRequest>,
     checked_owner_project_assembly_requests: TypedRequestTable<CheckedOwnerProjectAssemblyRequest>,
+    diagnostics: Option<CompilerDiagnostics>,
     checked: Option<CheckedSourceFromSource>,
     compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
     request_graph: Option<(
@@ -515,7 +526,7 @@ impl RequestFamily for OwnerLexicalPlanRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerLexicalPlan>;
 
-    const NAME: &'static str = "boon.compiler.owner-lexical-plan.v3";
+    const NAME: &'static str = "boon.compiler.owner-lexical-plan.v4";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -532,7 +543,7 @@ impl RequestFamily for OwnerConstraintSeedRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerConstraintSeed>;
 
-    const NAME: &'static str = "boon.compiler.owner-constraint-seed.v4";
+    const NAME: &'static str = "boon.compiler.owner-constraint-seed.v5";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -554,7 +565,7 @@ impl RequestFamily for ProjectOwnerAbiRequest {
     type Key = ProjectOwnerAbiKey;
     type Value = Arc<OwnerAbiEnvironment>;
 
-    const NAME: &'static str = "boon.compiler.project-owner-abi.v1";
+    const NAME: &'static str = "boon.compiler.project-owner-abi.v2";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -576,7 +587,7 @@ impl RequestFamily for ProjectOwnerCallableAbiRequest {
     type Key = ProjectOwnerAbiKey;
     type Value = Arc<OwnerCallableAbiEnvironment>;
 
-    const NAME: &'static str = "boon.compiler.project-owner-callable-abi.v1";
+    const NAME: &'static str = "boon.compiler.project-owner-callable-abi.v2";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -598,7 +609,7 @@ impl RequestFamily for OwnerCallableAbiLookupRequest {
     type Key = String;
     type Value = Arc<OwnerCallableAbiLookup>;
 
-    const NAME: &'static str = "boon.compiler.owner-callable-abi-lookup.v2";
+    const NAME: &'static str = "boon.compiler.owner-callable-abi-lookup.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -689,7 +700,7 @@ impl RequestFamily for OwnerCallableInferenceAbiRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerInferenceAbiEnvironment>;
 
-    const NAME: &'static str = "boon.compiler.owner-callable-inference-abi.v1";
+    const NAME: &'static str = "boon.compiler.owner-callable-inference-abi.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -708,7 +719,7 @@ impl RequestFamily for OwnerInferenceAbiRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerInferenceAbiEnvironment>;
 
-    const NAME: &'static str = "boon.compiler.owner-inference-abi.v5";
+    const NAME: &'static str = "boon.compiler.owner-inference-abi.v6";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -867,7 +878,7 @@ impl RequestFamily for OwnerConstructionCallableAbiLookupRequest {
     type Key = String;
     type Value = Arc<OwnerConstructionCallableAbiLookup>;
 
-    const NAME: &'static str = "boon.compiler.owner-construction-callable-abi-lookup.v1";
+    const NAME: &'static str = "boon.compiler.owner-construction-callable-abi-lookup.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -911,7 +922,7 @@ impl RequestFamily for OwnerConstructionAbiRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerConstructionAbiEnvironment>;
 
-    const NAME: &'static str = "boon.compiler.owner-construction-abi.v1";
+    const NAME: &'static str = "boon.compiler.owner-construction-abi.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -979,16 +990,23 @@ impl ProjectOwnerSymbolIndex {
             loop {
                 let mut candidate = parent.clone();
                 candidate.extend(reference.parts.iter().cloned());
-                paths.push(candidate);
+                // A scoped lookup must consume at least the first component
+                // of the authored reference. Accepting the parent declaration
+                // alone would turn a sibling read such as `store.elements`
+                // from inside `theme_options` into the unrelated projection
+                // `theme_options.store.elements` and prevent the root-scope
+                // lookup from ever running.
+                paths.push((candidate, parent.len().saturating_add(1)));
                 if parent.pop().is_none() {
                     break;
                 }
             }
+        } else {
+            paths.push((reference.parts.to_vec(), reference.parts.len()));
         }
-        paths.push(reference.parts.to_vec());
-        for parts in paths {
+        for (parts, minimum_prefix) in paths {
             let minimum_prefix = if namespace == OwnerSymbolNamespace::Value {
-                1
+                minimum_prefix
             } else {
                 parts.len()
             };
@@ -1052,11 +1070,11 @@ impl RequestFamily for ProjectOwnerSymbolRequest {
     type Key = ProjectOwnerSymbolKey;
     type Value = Arc<ProjectOwnerSymbolIndex>;
 
-    const NAME: &'static str = "boon.compiler.project-owner-symbol-index.v2";
+    const NAME: &'static str = "boon.compiler.project-owner-symbol-index.v3";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
-            b"boon.compiler.project-owner-symbol-index-key.v2\0",
+            b"boon.compiler.project-owner-symbol-index-key.v3\0",
             std::iter::empty(),
         )
     }
@@ -1065,7 +1083,7 @@ impl RequestFamily for ProjectOwnerSymbolRequest {
         value: &Self::Value,
     ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
         let mut hasher = Sha256::new();
-        hasher.update(b"boon.compiler.project-owner-symbol-index-result.v2\0");
+        hasher.update(b"boon.compiler.project-owner-symbol-index-result.v3\0");
         hasher.update((value.symbols.len() as u64).to_le_bytes());
         for (key, candidates) in &value.symbols {
             hasher.update([match key.namespace {
@@ -1101,7 +1119,7 @@ impl RequestFamily for OwnerConstraintRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerConstraintSummary>;
 
-    const NAME: &'static str = "boon.compiler.owner-constraint-summary.v2";
+    const NAME: &'static str = "boon.compiler.owner-constraint-summary.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1172,7 +1190,7 @@ impl RequestFamily for OwnerInterfaceSccEvaluationRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceSccEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v4";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v5";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1191,7 +1209,7 @@ impl RequestFamily for OwnerInterfaceSccRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceSccResult>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v3";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v4";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1246,7 +1264,7 @@ impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v6";
+    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v8";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1265,7 +1283,7 @@ impl RequestFamily for OwnerBodyInferenceRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceShard>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference.v5";
+    const NAME: &'static str = "boon.compiler.owner-body-inference.v7";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1284,7 +1302,7 @@ impl RequestFamily for CheckedOwnerShardRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<CheckedOwnerShard>;
 
-    const NAME: &'static str = "boon.compiler.checked-owner-shard.v7";
+    const NAME: &'static str = "boon.compiler.checked-owner-shard.v8";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1306,11 +1324,36 @@ impl RequestFamily for OwnerDiagnosticsAggregateRequest {
     type Key = OwnerDiagnosticsAggregateKey;
     type Value = Arc<OwnerDiagnosticsAggregate>;
 
-    const NAME: &'static str = "boon.compiler.owner-diagnostics-aggregate.v2";
+    const NAME: &'static str = "boon.compiler.owner-diagnostics-aggregate.v8";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
             b"boon.compiler.owner-diagnostics-aggregate-key.v1\0",
+            std::iter::empty(),
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProjectDiagnosticFactsKey;
+
+struct ProjectDiagnosticFactsRequest;
+
+impl RequestFamily for ProjectDiagnosticFactsRequest {
+    type Key = ProjectDiagnosticFactsKey;
+    type Value = Arc<ProjectDiagnosticFacts>;
+
+    const NAME: &'static str = "boon.compiler.project-diagnostic-facts.v10";
+
+    fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.project-diagnostic-facts-key.v1\0",
             std::iter::empty(),
         )
     }
@@ -1331,7 +1374,7 @@ impl RequestFamily for CheckedOwnerProjectAssemblyRequest {
     type Key = CheckedOwnerProjectAssemblyKey;
     type Value = Arc<CheckedOwnerProjectAssembly>;
 
-    const NAME: &'static str = "boon.compiler.checked-owner-project-assembly.v2";
+    const NAME: &'static str = "boon.compiler.checked-owner-project-assembly.v6";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -1402,9 +1445,11 @@ impl CompilerSession {
                 owner_interface_provider_requests: TypedRequestTable::new(),
                 owner_body_inference_evaluation_requests: TypedRequestTable::new(),
                 owner_body_inference_requests: TypedRequestTable::new(),
+                project_diagnostic_facts_requests: TypedRequestTable::new(),
                 owner_diagnostics_aggregate_requests: TypedRequestTable::new(),
                 checked_owner_shard_requests: TypedRequestTable::new(),
                 checked_owner_project_assembly_requests: TypedRequestTable::new(),
+                diagnostics: None,
                 checked: None,
                 compiled: None,
                 request_graph: None,
@@ -1496,6 +1541,7 @@ impl CompilerSession {
             }
         }
         state.revision = Revision(next_revision);
+        state.diagnostics = None;
         state.checked = None;
         // Keep the last verified artifact alive while the replacement revision
         // checks and verifies. Invalid or canceled source must not blank a
@@ -1757,6 +1803,7 @@ impl CompilerSession {
             })?;
         state.source = candidate;
         state.revision = Revision(next_revision);
+        state.diagnostics = None;
         state.checked = None;
         Ok(state.revision)
     }
@@ -2026,12 +2073,28 @@ impl CompilerSession {
             )));
         }
         if intent == CompileIntent::Diagnostics {
+            if state.diagnostics.is_none() {
+                let (parsed, aggregate, parse_work, parse_ms, typecheck_ms) =
+                    parse_project_diagnostics_snapshot(state)?;
+                state.diagnostics = Some(compiler_diagnostics_from_owner_aggregate(
+                    parsed,
+                    &aggregate,
+                    parse_work,
+                    parse_ms,
+                    typecheck_ms,
+                )?);
+            }
+            if cancellation.is_canceled() {
+                state.diagnostics = None;
+                return Err(canceled_error());
+            }
+            return Ok(CompilerSessionResult::Diagnostics(
+                state.diagnostics.as_ref().expect("diagnostics project"),
+            ));
+        }
+
+        if intent == CompileIntent::EditorDiagnostics {
             if state.checked.is_none() {
-                // The lean owner aggregate is intentionally not the public
-                // diagnostics result until every project diagnostic and the
-                // editor projection have owner-backed authorities. Keep the
-                // complete checked assembly as the production contract while
-                // the smaller request root is proven independently below.
                 let (parsed, assembly, parse_work, parse_ms, typecheck_ms) =
                     parse_project_snapshot(state)?;
                 state.checked = Some(checked_source_from_owner_assembly(
@@ -2047,7 +2110,7 @@ impl CompilerSession {
                 state.checked = None;
                 return Err(canceled_error());
             }
-            return Ok(CompilerSessionResult::Diagnostics(
+            return Ok(CompilerSessionResult::EditorDiagnostics(
                 state.checked.as_ref().expect("checked project"),
             ));
         }
@@ -2459,7 +2522,6 @@ fn parse_project_snapshot(
     Ok((project, assembly, work, parse_ms, typecheck_ms))
 }
 
-#[allow(dead_code)]
 fn parse_project_diagnostics_snapshot(
     state: &mut ProjectState,
 ) -> CompilerResult<(
@@ -2686,7 +2748,7 @@ fn project_owner_abi_input_fingerprint(
     linked_units: &[Arc<UnitSyntaxSnapshot>],
 ) -> RequestInputFingerprint {
     let mut hasher = Sha256::new();
-    hasher.update(b"boon.compiler.project-owner-abi-dependencies.v1\0");
+    hasher.update(b"boon.compiler.project-owner-abi-dependencies.v2\0");
     update_request_fingerprint_part(&mut hasher, state.source.entrypoint.as_bytes());
     update_request_fingerprint_part(&mut hasher, state.source.program_role.as_str().as_bytes());
     hasher.update((linked_units.len() as u64).to_le_bytes());
@@ -2751,7 +2813,7 @@ fn evaluate_project_owner_abi_request(
 fn evaluate_project_owner_callable_abi_request(state: &mut ProjectState) -> CompilerResult<()> {
     let key = ProjectOwnerAbiKey;
     let input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.project-owner-callable-abi-dependencies.v1\0",
+        b"boon.compiler.project-owner-callable-abi-dependencies.v2\0",
         std::iter::empty(),
     ));
     match state.project_owner_callable_abi_requests.begin(
@@ -3030,7 +3092,7 @@ fn evaluate_owner_callable_inference_abi_requests(
         .flatten()
         .collect::<BTreeSet<_>>();
     let lookup_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-callable-abi-lookup-dependencies.v2\0",
+        b"boon.compiler.owner-callable-abi-lookup-dependencies.v3\0",
         std::iter::empty(),
     ));
     for name in &callable_names {
@@ -3070,7 +3132,7 @@ fn evaluate_owner_callable_inference_abi_requests(
     }
 
     let owner_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-callable-inference-abi-dependencies.v1\0",
+        b"boon.compiler.owner-callable-inference-abi-dependencies.v2\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -3283,7 +3345,7 @@ fn evaluate_owner_inference_abi_requests(
         })?;
 
     let lookup_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-callable-abi-lookup-dependencies.v2\0",
+        b"boon.compiler.owner-callable-abi-lookup-dependencies.v3\0",
         std::iter::empty(),
     ));
     for name in &callable_names {
@@ -3459,7 +3521,7 @@ fn evaluate_owner_inference_abi_requests(
     }
 
     let owner_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-inference-abi-dependencies.v5\0",
+        b"boon.compiler.owner-inference-abi-dependencies.v6\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -4000,7 +4062,7 @@ fn evaluate_owner_constraint_requests(
         std::iter::empty(),
     ));
     let seed_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-constraint-seed-dependencies.v4\0",
+        b"boon.compiler.owner-constraint-seed-dependencies.v5\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -4119,7 +4181,7 @@ fn evaluate_owner_constraint_requests(
         .map(stable_check_owner_key_fingerprint_v1)
         .collect::<Vec<_>>();
     let symbol_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.project-owner-symbol-index-dependencies.v2\0",
+        b"boon.compiler.project-owner-symbol-index-dependencies.v3\0",
         owner_key_fingerprints.iter().map(<[u8; 32]>::as_slice),
     ));
     match state.project_owner_symbol_requests.begin(
@@ -4183,7 +4245,7 @@ fn evaluate_owner_constraint_requests(
     trace.checkpoint("inference-abi", owners.len());
 
     let constraint_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-constraint-summary-dependencies.v2\0",
+        b"boon.compiler.owner-constraint-summary-dependencies.v3\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -4523,11 +4585,11 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
     trace.checkpoint("interface-scc-plans", topology.sccs.len());
 
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v4\0",
+        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v5\0",
         std::iter::empty(),
     ));
     let result_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-result-projection-dependencies.v2\0",
+        b"boon.compiler.owner-interface-scc-result-projection-dependencies.v3\0",
         std::iter::empty(),
     ));
     for expected in &topology.sccs {
@@ -4898,7 +4960,7 @@ fn evaluate_owner_body_inference_requests(
         result_transfer_edges =
             result_transfer_edges.saturating_add(body_work.interface_plan_transfer_edges);
         let result_input = RequestInputFingerprint(request_fingerprint(
-            b"boon.compiler.owner-body-inference-result-projection-dependencies.v4\0",
+            b"boon.compiler.owner-body-inference-result-projection-dependencies.v6\0",
             std::iter::empty(),
         ));
         match state.owner_body_inference_requests.begin(
@@ -4951,8 +5013,7 @@ fn evaluate_owner_body_inference_requests(
     Ok(())
 }
 
-#[allow(dead_code)]
-fn evaluate_owner_diagnostics_aggregate_request(
+fn evaluate_project_diagnostic_facts_request(
     state: &mut ProjectState,
     project: &ProjectSyntaxSnapshot,
 ) -> CompilerResult<()> {
@@ -4963,7 +5024,127 @@ fn evaluate_owner_diagnostics_aggregate_request(
         .collect::<Vec<_>>();
     let source_digest = project.source_bundle_digest_v1().to_string();
     let input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-diagnostics-aggregate-dependencies.v2\0",
+        b"boon.compiler.project-diagnostic-facts-dependencies.v10\0",
+        std::iter::once(source_digest.as_bytes())
+            .chain(std::iter::once(program_role_request_tag(
+                state.source.program_role,
+            )))
+            .chain(owner_fingerprints.iter().map(<[u8; 32]>::as_slice)),
+    ));
+    let key = ProjectDiagnosticFactsKey;
+    match state
+        .project_diagnostic_facts_requests
+        .begin(&mut state.syntax_evaluator, key, input)?
+    {
+        RequestStart::Reused => Ok(()),
+        RequestStart::Execute(mut ticket) => {
+            let facts = (|| -> CompilerResult<_> {
+                let abi = Arc::clone(state.project_owner_abi_requests.require(
+                    &state.syntax_evaluator,
+                    &mut ticket,
+                    &ProjectOwnerAbiKey,
+                )?);
+                let mut syntax_inputs = Vec::with_capacity(owners.len());
+                let mut lexical_plans = Vec::with_capacity(owners.len());
+                let mut summaries = Vec::with_capacity(owners.len());
+                let mut interfaces = Vec::with_capacity(owners.len());
+                let mut bodies = Vec::with_capacity(owners.len());
+                let mut source_maps = Vec::with_capacity(owners.len());
+                let mut interface_results = BTreeMap::new();
+                for owner in &owners {
+                    syntax_inputs.push(Arc::clone(state.owner_input_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?));
+                    lexical_plans.push(Arc::clone(state.owner_lexical_plan_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?));
+                    summaries.push(Arc::clone(state.owner_constraint_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?));
+                    let provider = Arc::clone(state.owner_interface_provider_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?);
+                    let result = if let Some(result) = interface_results.get(provider.key()) {
+                        Arc::clone(result)
+                    } else {
+                        let result = Arc::clone(state.owner_interface_scc_requests.require(
+                            &state.syntax_evaluator,
+                            &mut ticket,
+                            provider.key(),
+                        )?);
+                        interface_results.insert(provider.key().clone(), Arc::clone(&result));
+                        result
+                    };
+                    interfaces.push(result.owner(owner).cloned().ok_or_else(|| {
+                        session_error(format!(
+                            "project diagnostics interface SCC has no owner {owner:?}"
+                        ))
+                    })?);
+                    bodies.push(Arc::clone(state.owner_body_inference_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?));
+                    source_maps.push(Arc::clone(state.owner_source_map_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?));
+                }
+                Ok(Arc::new(project_diagnostic_facts(
+                    project,
+                    &abi,
+                    owners.iter(),
+                    syntax_inputs.iter().map(Arc::as_ref),
+                    lexical_plans.iter().map(Arc::as_ref),
+                    summaries.iter().map(Arc::as_ref),
+                    interfaces.iter(),
+                    bodies.iter().map(Arc::as_ref),
+                    source_maps.iter().map(Arc::as_ref),
+                )?))
+            })();
+            let facts = match facts {
+                Ok(facts) => facts,
+                Err(error) => {
+                    state.project_diagnostic_facts_requests.abort(
+                        &mut state.syntax_evaluator,
+                        ticket,
+                        RequestAbortReason::Failed,
+                    )?;
+                    return Err(error);
+                }
+            };
+            state.project_diagnostic_facts_requests.publish(
+                &mut state.syntax_evaluator,
+                ticket,
+                facts,
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn evaluate_owner_diagnostics_aggregate_request(
+    state: &mut ProjectState,
+    project: &ProjectSyntaxSnapshot,
+) -> CompilerResult<()> {
+    evaluate_project_diagnostic_facts_request(state, project)?;
+    let owners = project.stable_check_owner_keys().collect::<Vec<_>>();
+    let owner_fingerprints = owners
+        .iter()
+        .map(stable_check_owner_key_fingerprint_v1)
+        .collect::<Vec<_>>();
+    let source_digest = project.source_bundle_digest_v1().to_string();
+    let input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-diagnostics-aggregate-dependencies.v8\0",
         std::iter::once(source_digest.as_bytes())
             .chain(owner_fingerprints.iter().map(<[u8; 32]>::as_slice)),
     ));
@@ -4976,14 +5157,21 @@ fn evaluate_owner_diagnostics_aggregate_request(
         RequestStart::Reused => Ok(()),
         RequestStart::Execute(mut ticket) => {
             let aggregate = (|| -> CompilerResult<_> {
-                let mut bodies = Vec::with_capacity(owners.len());
+                let project_facts = Arc::clone(state.project_diagnostic_facts_requests.require(
+                    &state.syntax_evaluator,
+                    &mut ticket,
+                    &ProjectDiagnosticFactsKey,
+                )?);
+                let mut body_evaluations = Vec::with_capacity(owners.len());
                 let mut source_maps = Vec::with_capacity(owners.len());
                 for owner in &owners {
-                    bodies.push(Arc::clone(state.owner_body_inference_requests.require(
-                        &state.syntax_evaluator,
-                        &mut ticket,
-                        owner,
-                    )?));
+                    body_evaluations.push(Arc::clone(
+                        state.owner_body_inference_evaluation_requests.require(
+                            &state.syntax_evaluator,
+                            &mut ticket,
+                            owner,
+                        )?,
+                    ));
                     source_maps.push(Arc::clone(state.owner_source_map_requests.require(
                         &state.syntax_evaluator,
                         &mut ticket,
@@ -4992,8 +5180,11 @@ fn evaluate_owner_diagnostics_aggregate_request(
                 }
                 Ok(Arc::new(aggregate_owner_diagnostics(
                     project,
+                    &project_facts,
                     owners.iter(),
-                    bodies.iter().map(Arc::as_ref),
+                    body_evaluations
+                        .iter()
+                        .map(|evaluation| evaluation.result.as_ref()),
                     source_maps.iter().map(Arc::as_ref),
                 )?))
             })();
@@ -5048,7 +5239,7 @@ fn evaluate_owner_construction_abi_requests(
         })?;
 
     let lookup_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-construction-abi-lookup-dependencies.v1\0",
+        b"boon.compiler.owner-construction-abi-lookup-dependencies.v2\0",
         std::iter::empty(),
     ));
     for name in callable_names {
@@ -5122,7 +5313,7 @@ fn evaluate_owner_construction_abi_requests(
     }
 
     let construction_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-construction-abi-dependencies.v1\0",
+        b"boon.compiler.owner-construction-abi-dependencies.v2\0",
         [program_role_request_tag(state.source.program_role)],
     ));
     for owner in owners {
@@ -5213,7 +5404,7 @@ fn evaluate_checked_owner_shard_requests(
     trace.checkpoint("construction-abi", owners.len());
 
     let shard_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.checked-owner-shard-dependencies.v7\0",
+        b"boon.compiler.checked-owner-shard-dependencies.v8\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -5336,9 +5527,10 @@ fn evaluate_checked_owner_project_assembly_request(
     state: &mut ProjectState,
     project: &ProjectSyntaxSnapshot,
 ) -> CompilerResult<()> {
+    evaluate_owner_diagnostics_aggregate_request(state, project)?;
     let key = CheckedOwnerProjectAssemblyKey;
     let input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.checked-owner-project-assembly-dependencies.v2\0",
+        b"boon.compiler.checked-owner-project-assembly-dependencies.v6\0",
         [program_role_request_tag(state.source.program_role)],
     ));
     match state.checked_owner_project_assembly_requests.begin(
@@ -5359,6 +5551,17 @@ fn evaluate_checked_owner_project_assembly_request(
                 }
                 let current_project =
                     ProjectSyntaxSnapshot::from_unit_snapshots(&state.source.entrypoint, units)?;
+                let project_facts = Arc::clone(state.project_diagnostic_facts_requests.require(
+                    &state.syntax_evaluator,
+                    &mut ticket,
+                    &ProjectDiagnosticFactsKey,
+                )?);
+                let diagnostics_aggregate =
+                    Arc::clone(state.owner_diagnostics_aggregate_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &OwnerDiagnosticsAggregateKey,
+                    )?);
                 let owners = current_project
                     .stable_check_owner_keys()
                     .collect::<Vec<_>>();
@@ -5390,6 +5593,8 @@ fn evaluate_checked_owner_project_assembly_request(
                     &current_project,
                     state.source.program_role,
                     external_types,
+                    &project_facts,
+                    &diagnostics_aggregate,
                     shards.iter().map(Arc::as_ref),
                     source_maps.iter().map(Arc::as_ref),
                     construction_abis.iter().map(Arc::as_ref),
@@ -5578,7 +5783,7 @@ mod tests {
                 ApplicationIdentity::compiler_default(),
             ))
             .unwrap();
-        let (_, aggregate, _, _, _) =
+        let (syntax, aggregate, _, _, _) =
             parse_project_diagnostics_snapshot(session.projects.get_mut(&project).unwrap())
                 .unwrap();
         let diagnostics = aggregate
@@ -5591,9 +5796,212 @@ mod tests {
             2,
             "aggregate diagnostics: {aggregate:#?}"
         );
-        assert_ne!(diagnostics[0].line, diagnostics[1].line);
-        assert_ne!(diagnostics[0].start, diagnostics[1].start);
-        assert_ne!(diagnostics[0].end, diagnostics[1].end);
+        let actual = diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.line, diagnostic.start, diagnostic.end))
+            .collect::<BTreeSet<_>>();
+        let expected = syntax
+            .source_layouts()
+            .iter()
+            .map(|layout| {
+                (
+                    layout.start_line,
+                    layout.start_byte + source.find("mystery").unwrap(),
+                    layout.start_byte + source.trim_end().len(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+        let paths = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                syntax
+                    .source_layouts()
+                    .iter()
+                    .filter(|layout| layout.start_line <= diagnostic.line)
+                    .max_by_key(|layout| layout.start_line)
+                    .unwrap()
+                    .path
+                    .as_str()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(paths, BTreeSet::from(["RUN.bn", "Second.bn"]));
+    }
+
+    #[test]
+    fn multiline_owner_diagnostic_uses_exact_second_unit_anchor_and_path() {
+        let invalid = concat!(
+            "value:\n",
+            "    needs(\n",
+            "        input: 1\n",
+            "        extra: 2\n",
+            "    )\n",
+        );
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(CompilerProject::new(
+                "RUN.bn",
+                vec![
+                    CompilerSourceUnit {
+                        path: "RUN.bn".to_owned(),
+                        source: "FUNCTION needs(input) {\n    input\n}\n".to_owned(),
+                    },
+                    CompilerSourceUnit {
+                        path: "support/invalid.bn".to_owned(),
+                        source: invalid.to_owned(),
+                    },
+                ],
+                TargetProfile::SoftwareDefault,
+                ProgramRole::Server,
+                ApplicationIdentity::compiler_default(),
+            ))
+            .unwrap();
+        let revision = session.revision(project).unwrap();
+        let token = CancellationToken::new();
+        let result = session
+            .request(project, revision, CompileIntent::Diagnostics, &token)
+            .unwrap();
+        let diagnostics = result.diagnostics().unwrap();
+        let layout = diagnostics
+            .syntax
+            .source_layouts()
+            .iter()
+            .find(|layout| layout.path == "support/invalid.bn")
+            .unwrap();
+        let diagnostic = diagnostics
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.message == "`needs` has an unexpected extra call entry `extra`"
+            })
+            .unwrap_or_else(|| panic!("public diagnostics: {:#?}", diagnostics.diagnostics()));
+        let local_start = invalid.find("extra: 2").unwrap();
+        assert_eq!(diagnostic.line, layout.start_line + 3);
+        assert_eq!(diagnostic.start, layout.start_byte + local_start);
+        assert_eq!(diagnostic.end, diagnostic.start + "extra: 2".len());
+        assert_eq!(
+            &invalid[diagnostic.start - layout.start_byte..diagnostic.end - layout.start_byte],
+            "extra: 2"
+        );
+        let diagnostic_path = diagnostics
+            .syntax
+            .source_layouts()
+            .iter()
+            .filter(|candidate| candidate.start_line <= diagnostic.line)
+            .max_by_key(|candidate| candidate.start_line)
+            .unwrap()
+            .path
+            .as_str();
+        assert_eq!(diagnostic_path, "support/invalid.bn");
+    }
+
+    #[test]
+    fn multi_unit_host_port_lines_are_global_in_diagnostics_and_metadata() {
+        let ports = concat!(
+            "host_ports: [\n",
+            "    http: [\n",
+            "        request: gateway.request\n",
+            "        response: response\n",
+            "    ]\n",
+            "    websocket: [\n",
+            "        open: gateway.open\n",
+            "        message: gateway.message\n",
+            "        close: gateway.close\n",
+            "        error: gateway.error\n",
+            "        actions: actions\n",
+            "    ]\n",
+            "]\n",
+        );
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(CompilerProject::new(
+                "RUN.bn",
+                vec![
+                    CompilerSourceUnit {
+                        path: "RUN.bn".to_owned(),
+                        source: concat!(
+                            "gateway: [\n",
+                            "    request: SOURCE\n",
+                            "    open: SOURCE\n",
+                            "    message: SOURCE\n",
+                            "    close: SOURCE\n",
+                            "    error: SOURCE\n",
+                            "]\n",
+                            "outputs: [\n",
+                            "    response: 1\n",
+                            "    actions: 2\n",
+                            "]\n",
+                        )
+                        .to_owned(),
+                    },
+                    CompilerSourceUnit {
+                        path: "support/ports.bn".to_owned(),
+                        source: ports.to_owned(),
+                    },
+                ],
+                TargetProfile::SoftwareDefault,
+                ProgramRole::Server,
+                ApplicationIdentity::compiler_default(),
+            ))
+            .unwrap();
+        let revision = session.revision(project).unwrap();
+        let token = CancellationToken::new();
+        let result = session
+            .request(project, revision, CompileIntent::Diagnostics, &token)
+            .unwrap();
+        let diagnostics = result.diagnostics().unwrap();
+        let layout = diagnostics
+            .syntax
+            .source_layouts()
+            .iter()
+            .find(|layout| layout.path == "support/ports.bn")
+            .unwrap();
+        let local_line = |needle: &str| {
+            1 + ports.as_bytes()[..ports.find(needle).unwrap()]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+        };
+        let http_line = layout.start_line + local_line("http: [") - 1;
+        let websocket_line = layout.start_line + local_line("websocket: [") - 1;
+        let http = diagnostics
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .starts_with("host port `http.response` output `response` must be exactly")
+            })
+            .unwrap_or_else(|| panic!("public diagnostics: {:#?}", diagnostics.diagnostics()));
+        let websocket = diagnostics
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .message
+                    .starts_with("host port `websocket.actions` output `actions` must be a list")
+            })
+            .unwrap_or_else(|| panic!("public diagnostics: {:#?}", diagnostics.diagnostics()));
+        assert_eq!(http.line, http_line);
+        assert_eq!(websocket.line, websocket_line);
+        for diagnostic in [http, websocket] {
+            let path = diagnostics
+                .syntax
+                .source_layouts()
+                .iter()
+                .filter(|candidate| candidate.start_line <= diagnostic.line)
+                .max_by_key(|candidate| candidate.start_line)
+                .unwrap()
+                .path
+                .as_str();
+            assert_eq!(path, "support/ports.bn");
+        }
+
+        let state = session.projects.get_mut(&project).unwrap();
+        let (_, assembly, _, _, _) = parse_project_snapshot(state).unwrap();
+        let table = &assembly.fields().lowering_metadata.host_port_table;
+        assert_eq!(table.http.as_ref().unwrap().line, http_line);
+        assert_eq!(table.websocket.as_ref().unwrap().line, websocket_line);
     }
 
     #[test]
@@ -5684,25 +6092,1383 @@ mod tests {
     }
 
     #[test]
-    fn checked_stage_is_consumed_once_by_verified_stage_and_then_reused() {
+    fn project_diagnostic_facts_match_dense_project_diagnostics() {
+        fn normalized_complete_diagnostics(
+            checked: &CheckedSourceFromSource,
+        ) -> Vec<boon_checked::TypeDiagnostic> {
+            let mut diagnostics = checked.output.report.diagnostics.clone();
+            diagnostics.extend(
+                checked
+                    .output
+                    .report
+                    .render_slot_table
+                    .slots
+                    .iter()
+                    .flat_map(|slot| slot.diagnostics.iter().cloned()),
+            );
+            diagnostics.sort_by(|left, right| {
+                let severity = |severity| match severity {
+                    boon_checked::DiagnosticSeverity::Error => 0u8,
+                    boon_checked::DiagnosticSeverity::Warning => 1u8,
+                };
+                (
+                    left.line,
+                    left.start,
+                    left.end,
+                    severity(left.severity),
+                    &left.message,
+                )
+                    .cmp(&(
+                        right.line,
+                        right.start,
+                        right.end,
+                        severity(right.severity),
+                        &right.message,
+                    ))
+            });
+            diagnostics.dedup();
+            diagnostics
+        }
+
+        fn normalized_invalid_oracle<'a>(
+            diagnostics: impl IntoIterator<Item = &'a boon_checked::TypeDiagnostic>,
+        ) -> BTreeSet<(u8, String)> {
+            diagnostics
+                .into_iter()
+                .filter(|diagnostic| {
+                    // The old dense checker emitted additional diagnostics
+                    // containing revision-local declaration ids for the same
+                    // duplicate declaration already represented by the stable
+                    // record/output diagnostic. They are intentionally absent
+                    // from the normalized source-level contract. The legacy
+                    // checker also failed to bind the response output root in
+                    // the host-port declaration and classified a read of a
+                    // duplicated record-local field as an unknown project
+                    // value. The exact owner lexical plan fixes both false
+                    // positives while retaining the stable duplicate error.
+                    !diagnostic.message.contains("conflicts with declaration ")
+                        && !diagnostic
+                            .message
+                            .contains("canonical checked value contains an expansion cycle")
+                        && diagnostic.message != "unknown identifier `response`"
+                        && diagnostic.message != "unknown identifier `item`"
+                        && diagnostic.message != "unknown path `PASSED.store`"
+                })
+                .map(|diagnostic| {
+                    let severity = match diagnostic.severity {
+                        boon_checked::DiagnosticSeverity::Error => 0,
+                        boon_checked::DiagnosticSeverity::Warning => 1,
+                    };
+                    let quoted = diagnostic
+                        .message
+                        .split('`')
+                        .skip(1)
+                        .step_by(2)
+                        .collect::<Vec<_>>();
+                    let message = if (diagnostic.message.contains("unexpected extra call entry")
+                        || diagnostic.message.contains("does not accept argument"))
+                        && quoted.len() >= 2
+                    {
+                        format!("unexpected call entry `{}`.`{}`", quoted[0], quoted[1])
+                    } else {
+                        match diagnostic.message.as_str() {
+                            "`PASSED` has no enclosing callable context"
+                            | "`PASSED` is only available inside a user callable" => {
+                                "unbound `PASSED` callable context".to_owned()
+                            }
+                            _ => diagnostic.message.clone(),
+                        }
+                    };
+                    (severity, message)
+                })
+                .collect()
+        }
+
+        let fixtures = [
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION same() {\n",
+                    "    1\n",
+                    "}\n",
+                    "FUNCTION same() {\n",
+                    "    2\n",
+                    "}\n",
+                    "value: 1\n",
+                ),
+            ),
+            (
+                ProgramRole::Client,
+                concat!(
+                    "FUNCTION sized_box(size) {\n",
+                    "    Element/container(\n",
+                    "        element: []\n",
+                    "        style: [width: size]\n",
+                    "        child: Element/label(\n",
+                    "            element: []\n",
+                    "            style: []\n",
+                    "            label: TEXT { child }\n",
+                    "        )\n",
+                    "    )\n",
+                    "}\n",
+                    "document: Document/new(root: sized_box(size: TEXT { invalid }))\n",
+                ),
+            ),
+            (
+                ProgramRole::Client,
+                concat!(
+                    "FUNCTION sized_box(size) {\n",
+                    "    Element/container(\n",
+                    "        element: []\n",
+                    "        style: [width: size]\n",
+                    "        child: Element/label(\n",
+                    "            element: []\n",
+                    "            style: []\n",
+                    "            label: TEXT { child }\n",
+                    "        )\n",
+                    "    )\n",
+                    "}\n",
+                    "document: Document/new(root: sized_box(size: 24))\n",
+                ),
+            ),
+            (
+                ProgramRole::Client,
+                concat!(
+                    "FUNCTION sized_box(size) {\n",
+                    "    Element/container(\n",
+                    "        element: []\n",
+                    "        style: [width: size]\n",
+                    "        child: Element/label(\n",
+                    "            element: []\n",
+                    "            style: []\n",
+                    "            label: TEXT { child }\n",
+                    "        )\n",
+                    "    )\n",
+                    "}\n",
+                    "FUNCTION forwarded(value) {\n",
+                    "    sized_box(size: value)\n",
+                    "}\n",
+                    "document: Document/new(root: forwarded(value: TEXT { invalid }))\n",
+                ),
+            ),
+            (
+                ProgramRole::Client,
+                concat!(
+                    "FUNCTION sized_box_child(size) {\n",
+                    "    BLOCK {\n",
+                    "        rendered: Element/container(\n",
+                    "            element: []\n",
+                    "            style: [width: size]\n",
+                    "            child: Element/label(\n",
+                    "                element: []\n",
+                    "                style: []\n",
+                    "                label: TEXT { child }\n",
+                    "            )\n",
+                    "        )\n",
+                    "        rendered\n",
+                    "    }\n",
+                    "}\n",
+                    "document: Document/new(root: sized_box_child(size: TEXT { invalid }))\n",
+                ),
+            ),
+            (
+                ProgramRole::Client,
+                concat!(
+                    "FUNCTION styled_alias(first, second) {\n",
+                    "    BLOCK {\n",
+                    "        alias: second\n",
+                    "        rendered: Element/container(\n",
+                    "            element: []\n",
+                    "            style: [width: alias]\n",
+                    "            child: Element/label(\n",
+                    "                element: []\n",
+                    "                style: []\n",
+                    "                label: TEXT { child }\n",
+                    "            )\n",
+                    "        )\n",
+                    "        rendered\n",
+                    "    }\n",
+                    "}\n",
+                    "document: Document/new(root: styled_alias(first: 24, second: TEXT { invalid }))\n",
+                ),
+            ),
+            (
+                ProgramRole::Client,
+                concat!(
+                    "FUNCTION styled_alias(first, second) {\n",
+                    "    BLOCK {\n",
+                    "        alias: second\n",
+                    "        rendered: Element/container(\n",
+                    "            element: []\n",
+                    "            style: [width: alias]\n",
+                    "            child: Element/label(\n",
+                    "                element: []\n",
+                    "                style: []\n",
+                    "                label: TEXT { child }\n",
+                    "            )\n",
+                    "        )\n",
+                    "        rendered\n",
+                    "    }\n",
+                    "}\n",
+                    "document: Document/new(root: styled_alias(first: TEXT { invalid }, second: 24))\n",
+                ),
+            ),
+            (
+                ProgramRole::Client,
+                concat!(
+                    "FUNCTION identity(value) {\n",
+                    "    value\n",
+                    "}\n",
+                    "FUNCTION styled_call_alias(first, second) {\n",
+                    "    BLOCK {\n",
+                    "        alias: identity(value: second)\n",
+                    "        rendered: Element/container(\n",
+                    "            element: []\n",
+                    "            style: [width: alias]\n",
+                    "            child: Element/label(\n",
+                    "                element: []\n",
+                    "                style: []\n",
+                    "                label: TEXT { child }\n",
+                    "            )\n",
+                    "        )\n",
+                    "        rendered\n",
+                    "    }\n",
+                    "}\n",
+                    "document: Document/new(root: styled_call_alias(first: 24, second: TEXT { invalid }))\n",
+                ),
+            ),
+            (
+                ProgramRole::Client,
+                concat!(
+                    "FUNCTION identity(value) {\n",
+                    "    value\n",
+                    "}\n",
+                    "FUNCTION styled_call_alias(first, second) {\n",
+                    "    BLOCK {\n",
+                    "        alias: identity(value: second)\n",
+                    "        rendered: Element/container(\n",
+                    "            element: []\n",
+                    "            style: [width: alias]\n",
+                    "            child: Element/label(\n",
+                    "                element: []\n",
+                    "                style: []\n",
+                    "                label: TEXT { child }\n",
+                    "            )\n",
+                    "        )\n",
+                    "        rendered\n",
+                    "    }\n",
+                    "}\n",
+                    "document: Document/new(root: styled_call_alias(first: TEXT { invalid }, second: 24))\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION recurse_child() {\n",
+                    "    BLOCK {\n",
+                    "        next: recurse_child()\n",
+                    "        next\n",
+                    "    }\n",
+                    "}\n",
+                    "value: recurse_child()\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION make_nested() {\n",
+                    "    BLOCK {\n",
+                    "        result: LIST { 1 }\n",
+                    "        result\n",
+                    "    }\n",
+                    "}\n",
+                    "collection_parent: LIST { make_nested() }\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!("outputs: [\n", "    value: 1\n", "    value: 2\n", "]\n",),
+            ),
+            (
+                ProgramRole::Server,
+                concat!("outputs: [\n", "    pending:\n", "]\n",),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "store: [\n",
+                    "    request: SOURCE\n",
+                    "]\n",
+                    "outputs: [\n",
+                    "    response: 1\n",
+                    "]\n",
+                    "host_ports: [\n",
+                    "    http: [\n",
+                    "        request: store.request\n",
+                    "        response: response\n",
+                    "    ]\n",
+                    "]\n",
+                ),
+            ),
+            (ProgramRole::Client, "document: [\n    root: 1\n]\n"),
+            (ProgramRole::Client, "document: [\n    root:\n]\n"),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "gateway: [\n",
+                    "    request: SOURCE\n",
+                    "]\n",
+                    "outputs: [\n",
+                    "    other: 1\n",
+                    "]\n",
+                    "host_ports: [\n",
+                    "    http: [\n",
+                    "        request: gateway.request\n",
+                    "        response: missing\n",
+                    "    ]\n",
+                    "]\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "rows: LIST { [rank: 1] }\n",
+                    "ordered: rows |> List/then_by(item, key: item.rank, direction: Ascending)\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "rows: LIST { [rank: 1] }\n",
+                    "ordered:\n",
+                    "    rows\n",
+                    "    |> List/sort_by(item, key: item.rank, direction: Ascending)\n",
+                    "    |> List/append(item: [rank: 2])\n",
+                    "    |> List/then_by(item, key: item.rank, direction: Ascending)\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION sorted(list, entry: OUT, key) {\n",
+                    "    list |> List/sort_by(item: entry, key: key, direction: Ascending)\n",
+                    "}\n",
+                    "rows: LIST { [name: TEXT { Alpha }] }\n",
+                    "ordered: rows |> sorted(entry, key: [name: entry.name])\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "rows: LIST { [name: TEXT { Alpha }] }\n",
+                    "ordered:\n",
+                    "    rows\n",
+                    "    |> List/sort_by(\n",
+                    "        item\n",
+                    "        key: File/read_text(path: item.name)\n",
+                    "        direction: Ascending\n",
+                    "    )\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "rows: LIST { [rank: TEXT { 1 }] }\n",
+                    "ordered: rows |> List/sort_by(item, key: item.rank |> Text/to_number())\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "rows: LIST { [rank: 1, name: TEXT { A }] }\n",
+                    "ordered:\n",
+                    "    rows\n",
+                    "    |> List/sort_by(item, key: item.rank, direction: Ascending)\n",
+                    "    |> List/then_by(item, key: item.name, direction: Descending)\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "rows: LIST { [rank: 1] }\n",
+                    "ordered:\n",
+                    "    True\n",
+                    "    |> WHEN {\n",
+                    "        True => rows |> List/sort_by(item, key: item.rank)\n",
+                    "        False => rows |> List/sort_by(item, key: item.rank, direction: Ascending)\n",
+                    "    }\n",
+                    "    |> List/then_by(item, key: item.rank)\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION sorted(list, entry: OUT, key, direction) {\n",
+                    "    list |> List/sort_by(item: entry, key: key, direction: direction)\n",
+                    "}\n",
+                    "rows: LIST { [rank: 1] }\n",
+                    "ordered:\n",
+                    "    True\n",
+                    "    |> WHEN {\n",
+                    "        True => rows |> sorted(entry, key: entry.rank, direction: Ascending)\n",
+                    "        False => rows |> sorted(entry, key: entry.rank, direction: Descending)\n",
+                    "    }\n",
+                    "    |> List/then_by(item, key: item.rank)\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "rows: LIST { [rank: 1] }\n",
+                    "ordered:\n",
+                    "    True\n",
+                    "    |> WHEN {\n",
+                    "        True => rows |> List/sort_by(item, key: item.rank, direction: Ascending)\n",
+                    "        False => rows |> List/sort_by(item, key: item.rank, direction: Descending)\n",
+                    "    }\n",
+                    "    |> List/then_by(item, key: item.rank)\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "rows: LIST { [rank: 1] }\n",
+                    "ordered:\n",
+                    "    True\n",
+                    "    |> WHILE {\n",
+                    "        True => rows |> List/sort_by(item, key: item.rank)\n",
+                    "        False => rows |> List/sort_by(item, key: item.rank, direction: Ascending)\n",
+                    "    }\n",
+                    "    |> List/then_by(item, key: item.rank)\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "rows: LIST { [rank: 1] }\n",
+                    "ordered: rows |> List/sort_by(item, key: DRAIN { item.rank })\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION sorted(list, item: OUT) {\n",
+                    "    list |> List/sort_by(item: item, key: PASSED.key)\n",
+                    "}\n",
+                    "rows: LIST { [rank: 1] }\n",
+                    "ordered: sorted(list: rows, item, PASS: [key: 1])\n",
+                ),
+            ),
+            (ProgramRole::Server, "value: typo\n"),
+            (
+                ProgramRole::Server,
+                "FUNCTION helper() {\n    1\n}\nvalue: helper\n",
+            ),
+            (
+                ProgramRole::Server,
+                "value: [item: 1, item: 2, copy: item]\n",
+            ),
+            (ProgramRole::Server, "value: Node[...1]\n"),
+            (ProgramRole::Server, "value: Node[...[same: 1, same: 2]]\n"),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION pass_identity(value) {\n",
+                    "    context: PASSED.store\n",
+                    "    value\n",
+                    "}\n",
+                    "result: pass_identity(value: 1, PASS: [...1])\n",
+                ),
+            ),
+            (ProgramRole::Server, "value: PASSED.store\n"),
+            (
+                ProgramRole::Server,
+                "value: Number/to_text(value: 1, extra: 2)\n",
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION needs(input) {\n",
+                    "    input.required\n",
+                    "}\n",
+                    "value: needs(input: [other: 1])\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION fill_both(first: OUT, second: OUT) {\n",
+                    "    first\n",
+                    "}\n",
+                    "FUNCTION caller(existing) {\n",
+                    "    fill_both(first, second: existing)\n",
+                    "}\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION sink(item: OUT) {\n",
+                    "    item\n",
+                    "}\n",
+                    "FUNCTION wrapper(row: OUT) {\n",
+                    "    sink(item: DRAIN { row })\n",
+                    "}\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION left(x: OUT) {\n",
+                    "    right(x: x)\n",
+                    "}\n",
+                    "FUNCTION right(x: OUT) {\n",
+                    "    left(x: x)\n",
+                    "}\n",
+                ),
+            ),
+            (ProgramRole::Server, "value: TEXT { no } |> Bool/not()\n"),
+            (
+                ProgramRole::Server,
+                "value: 1 |> Number/round(to: 0, using: NearestEven, extra: 1)\n",
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "tick: SOURCE\n",
+                    "value:\n",
+                    "    tick\n",
+                    "    |> WHILE {\n",
+                    "        True => 1\n",
+                    "        False => 2\n",
+                    "    }\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "value:\n",
+                    "    1\n",
+                    "    |> THEN {\n",
+                    "        2\n",
+                    "    }\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION bad_out_then(signal: OUT) {\n",
+                    "    rendered: Number/to_text(value: signal)\n",
+                    "    signal |> THEN { 1 }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION drain_value_then(value) {\n",
+                    "    DRAIN { value } |> THEN { 1 }\n",
+                    "}\n",
+                    "result: drain_value_then(value: 0)\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "stored: 0 |> HOLD state {}\n",
+                    "bad_drain_state: DRAIN { stored } |> THEN { 1 }\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION probe_value_mode(value) {\n",
+                    "    value |> WHILE { __ => 1 }\n",
+                    "}\n",
+                    "tick: SOURCE\n",
+                    "result: probe_value_mode(value: tick)\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION probe_child_value_mode(value) {\n",
+                    "    BLOCK {\n",
+                    "        checked: value |> WHILE { __ => 1 }\n",
+                    "        checked\n",
+                    "    }\n",
+                    "}\n",
+                    "tick: SOURCE\n",
+                    "result: probe_child_value_mode(value: tick)\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION probe_out_mode(list, item: OUT) {\n",
+                    "    list\n",
+                    "    |> List/map(\n",
+                    "        item: item\n",
+                    "        new: item.flag |> WHILE { __ => 1 }\n",
+                    "    )\n",
+                    "}\n",
+                    "tick: SOURCE\n",
+                    "rows: LIST { [flag: tick] }\n",
+                    "result: probe_out_mode(list: rows, item)\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION probe_nested_out_mode(list, item: OUT) {\n",
+                    "    list\n",
+                    "    |> List/map(\n",
+                    "        item: item\n",
+                    "        new: item.flag |> WHILE { __ => 1 }\n",
+                    "    )\n",
+                    "}\n",
+                    "FUNCTION forward_nested_out_mode(list, row: OUT) {\n",
+                    "    probe_nested_out_mode(list: list, item: row)\n",
+                    "}\n",
+                    "tick: SOURCE\n",
+                    "rows: LIST { [flag: tick] }\n",
+                    "result: forward_nested_out_mode(list: rows, row)\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION probe_out_then_mode(list, item: OUT) {\n",
+                    "    list\n",
+                    "    |> List/map(\n",
+                    "        item: item\n",
+                    "        new: item.flag |> THEN { 1 }\n",
+                    "    )\n",
+                    "}\n",
+                    "tick: SOURCE\n",
+                    "rows: LIST { [flag: tick] }\n",
+                    "result: probe_out_then_mode(list: rows, item)\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "tick: SOURCE\n",
+                    "projected: tick |> Field/current()\n",
+                    "accepted: projected |> THEN { 1 }\n",
+                    "rejected: projected |> WHILE { __ => 1 }\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "tick: SOURCE\n",
+                    "projected: tick |> Field/current(extra: 0)\n",
+                    "rejected: projected |> WHILE { __ => 1 }\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION stateful_record() {\n",
+                    "    [\n",
+                    "        stored: 0 |> HOLD state {}\n",
+                    "        tick: stored |> THEN { 1 }\n",
+                    "    ]\n",
+                    "}\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "tick: SOURCE\n",
+                    "record: [flag: tick]\n",
+                    "mixed:\n",
+                    "    LATEST {\n",
+                    "        record.flag\n",
+                    "        []\n",
+                    "    }\n",
+                    "bad: mixed |> THEN { 1 }\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION spread_projection_mode(value) {\n",
+                    "    value.flag |> WHILE { __ => 1 }\n",
+                    "}\n",
+                    "tick: SOURCE\n",
+                    "accepted_spread: spread_projection_mode(value: [...[flag: tick]])\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION spread_projection_mode(value) {\n",
+                    "    value.flag |> WHILE { __ => 1 }\n",
+                    "}\n",
+                    "tick: SOURCE\n",
+                    "bad_spread_override: spread_projection_mode(\n",
+                    "    value: [flag: tick, ...[flag: 0]]\n",
+                    ")\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION spread_projection_mode(value) {\n",
+                    "    value.flag |> WHILE { __ => 1 }\n",
+                    "}\n",
+                    "tick: SOURCE\n",
+                    "steady: [flag: 0]\n",
+                    "accepted_named_steady: spread_projection_mode(\n",
+                    "    value: [flag: tick, ...steady]\n",
+                    ")\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION spread_projection_mode(value) {\n",
+                    "    value.flag |> WHILE { __ => 1 }\n",
+                    "}\n",
+                    "tick: SOURCE\n",
+                    "pulse: [flag: tick]\n",
+                    "rejected_named_pulse: spread_projection_mode(\n",
+                    "    value: [flag: 0, ...pulse]\n",
+                    ")\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION spread_projection_mode(value) {\n",
+                    "    value.flag |> WHILE { __ => 1 }\n",
+                    "}\n",
+                    "tick: SOURCE\n",
+                    "bad_multi_spread_override: spread_projection_mode(\n",
+                    "    value: [...[flag: tick], ...[flag: 0]]\n",
+                    ")\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "FUNCTION spread_projection_mode(value) {\n",
+                    "    value.flag |> WHILE { __ => 1 }\n",
+                    "}\n",
+                    "tick: SOURCE\n",
+                    "accepted_spread_override: spread_projection_mode(\n",
+                    "    value: [...[flag: 0], ...[flag: tick]]\n",
+                    ")\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "tick: SOURCE\n",
+                    "mixed:\n",
+                    "    LATEST {\n",
+                    "        tick |> THEN { 1 }\n",
+                    "        0\n",
+                    "    }\n",
+                    "bad: mixed |> THEN { 1 }\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "tick: SOURCE\n",
+                    "mixed:\n",
+                    "    LATEST {\n",
+                    "        tick |> THEN { 1 }\n",
+                    "        0\n",
+                    "    }\n",
+                    "value:\n",
+                    "    mixed\n",
+                    "    |> WHILE {\n",
+                    "        True => 1\n",
+                    "        False => 2\n",
+                    "    }\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "users: MAP {\n",
+                    "    1 => TEXT { first }\n",
+                    "    1.0 => TEXT { second }\n",
+                    "}\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "store: [\n",
+                    "    press: SOURCE\n",
+                    "    selected:\n",
+                    "        LATEST {\n",
+                    "            press |> THEN { TEXT { selected } }\n",
+                    "        }\n",
+                    "]\n",
+                ),
+            ),
+            (ProgramRole::Server, "value: BITS[3] { 2u1000 }\n"),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "value:\n",
+                    "    TEXT { hello }\n",
+                    "    |> WHEN {\n",
+                    "        1 => Yes\n",
+                    "        __ => No\n",
+                    "    }\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "child: MAP {\n",
+                    "    TEXT { sku } => 1\n",
+                    "}\n",
+                    "parents: LIST {\n",
+                    "    [name: A, nested: child]\n",
+                    "    [name: B, nested: child]\n",
+                    "}\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "nodes: MAP {}\n",
+                    "cyclic:\n",
+                    "    nodes\n",
+                    "    |> Map/upsert(\n",
+                    "        entry: [\n",
+                    "            key: TEXT { node }\n",
+                    "            value: nodes\n",
+                    "        ]\n",
+                    "    )\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "rows: LIST {\n",
+                    "    [\n",
+                    "        id: TEXT { row }\n",
+                    "        child: MAP { TEXT { sku } => 1 }\n",
+                    "    ]\n",
+                    "}\n",
+                    "escaped:\n",
+                    "    rows\n",
+                    "    |> List/map(item, new:\n",
+                    "        MAP {\n",
+                    "            TEXT { copy } => item.child\n",
+                    "        }\n",
+                    "    )\n",
+                ),
+            ),
+            (
+                ProgramRole::Server,
+                concat!(
+                    "rows: LIST {\n",
+                    "    [\n",
+                    "        id: TEXT { row }\n",
+                    "        child: MAP { TEXT { sku } => 1 }\n",
+                    "    ]\n",
+                    "}\n",
+                ),
+            ),
+        ];
+
+        for (role, source) in fixtures {
+            let units = vec![CompilerSourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: source.to_owned(),
+            }];
+            let mut session = CompilerSession::new();
+            let project = session
+                .open_project(CompilerProject::new(
+                    "RUN.bn",
+                    units.clone(),
+                    TargetProfile::SoftwareDefault,
+                    role,
+                    ApplicationIdentity::compiler_default(),
+                ))
+                .unwrap();
+            let state = session.projects.get_mut(&project).unwrap();
+            let (_, aggregate, _, _, _) =
+                parse_project_diagnostics_snapshot(state).unwrap_or_else(|error| {
+                    panic!("lean diagnostics failed for:\n{source}\n{error:?}")
+                });
+            let lean = aggregate.diagnostics().to_vec();
+            let deferred_style_message =
+                "style field `width` must be a number, `Fill` tag, or `Auto` tag";
+            if source.contains("TEXT { invalid }")
+                && !source.contains("styled_alias(first: TEXT { invalid }, second: 24)")
+                && !source.contains("styled_call_alias(first: TEXT { invalid }, second: 24)")
+            {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message == deferred_style_message),
+                    "missing deferred style diagnostic for:\n{source}\n{lean:#?}"
+                );
+            }
+            if source.contains("sized_box(size: 24)") {
+                assert!(
+                    lean.iter()
+                        .all(|diagnostic| diagnostic.message != deferred_style_message),
+                    "valid deferred style specialization was rejected:\n{source}\n{lean:#?}"
+                );
+            }
+            if source.contains("styled_alias(first: TEXT { invalid }, second: 24)") {
+                assert!(
+                    lean.iter()
+                        .all(|diagnostic| !diagnostic.message.contains("style field `width`")),
+                    "child alias used the wrong callable type-variable namespace:\n{lean:#?}"
+                );
+            }
+            if source.contains("styled_alias(first: 24, second: TEXT { invalid })") {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message.contains("style field `width`")),
+                    "child alias did not retain the second parameter namespace:\n{lean:#?}"
+                );
+            }
+            if source.contains("styled_call_alias(first: TEXT { invalid }, second: 24)") {
+                assert!(
+                    lean.iter()
+                        .all(|diagnostic| !diagnostic.message.contains("style field `width`")),
+                    "call alias used the wrong callable type-variable namespace:\n{lean:#?}"
+                );
+            }
+            if source.contains("styled_call_alias(first: 24, second: TEXT { invalid })") {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message.contains("style field `width`")),
+                    "call alias did not retain the second parameter namespace:\n{lean:#?}"
+                );
+            }
+            if source.contains("parents: LIST") {
+                assert!(
+                    lean.iter().any(|diagnostic| {
+                        diagnostic.message.contains("second parent")
+                            || diagnostic
+                                .message
+                                .contains("more than one structural parent")
+                    }),
+                    "missing second-parent authority diagnostic for:\n{source}\n{lean:#?}"
+                );
+            }
+            if source.contains("cyclic:") {
+                assert!(
+                    lean.iter().any(|diagnostic| diagnostic
+                        .message
+                        .contains("attachment forms an ownership cycle")),
+                    "missing cyclic authority diagnostic for:\n{source}\n{lean:#?}"
+                );
+            }
+            if source.contains("escaped:") {
+                assert!(
+                    lean.iter().any(|diagnostic| {
+                        diagnostic.message.contains("escapes its owner")
+                            || diagnostic.message.contains("beyond its owner lifetime")
+                    }),
+                    "missing escaped authority diagnostic for:\n{source}\n{lean:#?}"
+                );
+            }
+            if source.contains("FUNCTION bad_out_then") {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message.starts_with("`THEN` requires")),
+                    "OUT parameter incorrectly received the VALUE-parameter temporal exemption:\n{lean:#?}"
+                );
+            }
+            if source.contains("FUNCTION drain_value_then") || source.contains("bad_drain_state") {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message.starts_with("`THEN` requires")),
+                    "DRAIN incorrectly inherited a read-only temporal exemption:\n{lean:#?}"
+                );
+            }
+            if source.contains("FUNCTION probe_value_mode")
+                || source.contains("FUNCTION probe_child_value_mode")
+                || source.contains("FUNCTION probe_out_mode")
+                || source.contains("FUNCTION probe_nested_out_mode")
+            {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message
+                            == "`WHILE` requires a continuous selector"),
+                    "exact parameter/output actual modes were not projected into WHILE for:\n{source}\n{lean:#?}"
+                );
+            }
+            if source.contains("FUNCTION probe_out_then_mode") {
+                assert!(
+                    lean.iter()
+                        .all(|diagnostic| !diagnostic.message.starts_with("`THEN` requires")),
+                    "a forwarded OUT pulse was not accepted by THEN:\n{lean:#?}"
+                );
+            }
+            if source.contains("Field/current") {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message
+                            == "`WHILE` requires a continuous selector"),
+                    "Field projection lost its pulse mode before WHILE:\n{lean:#?}"
+                );
+                assert!(
+                    lean.iter()
+                        .all(|diagnostic| !diagnostic.message.starts_with("`THEN` requires")),
+                    "Field projection lost its pulse mode before THEN:\n{lean:#?}"
+                );
+            }
+            if source.contains("record: [flag: tick]") {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message.starts_with("`THEN` requires")),
+                    "LATEST statefulness used a raw rather than exact first-branch mode:\n{lean:#?}"
+                );
+            }
+            if source.contains("accepted_spread:") || source.contains("accepted_spread_override:") {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message
+                            == "`WHILE` requires a continuous selector"),
+                    "record spread projection lost its exact pulse mode:\n{lean:#?}"
+                );
+            }
+            if source.contains("bad_spread_override:")
+                || source.contains("bad_multi_spread_override:")
+                || source.contains("accepted_named_steady:")
+            {
+                assert!(
+                    lean.iter()
+                        .all(|diagnostic| diagnostic.message
+                            != "`WHILE` requires a continuous selector"),
+                    "later record spread did not override an earlier pulse field for:\n{source}\n{lean:#?}"
+                );
+            }
+            if source.contains("rejected_named_pulse:") {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message
+                            == "`WHILE` requires a continuous selector"),
+                    "later named spread lost its pulse provider:\n{source}\n{lean:#?}"
+                );
+            }
+            if source.contains("FUNCTION stateful_record") {
+                assert!(
+                    lean.iter()
+                        .all(|diagnostic| !diagnostic.message.starts_with("`THEN` requires")),
+                    "record-field HOLD transition was not recognized as stateful:\n{lean:#?}"
+                );
+            }
+            if source.contains("bad: mixed |> THEN") {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message.starts_with("`THEN` requires")),
+                    "event-first LATEST incorrectly received the state-transition exemption:\n{lean:#?}"
+                );
+            }
+            if source.contains("Number/round") {
+                assert!(
+                    lean.iter().any(|diagnostic| diagnostic.message
+                        == "`Number/round` argument `to` must be a strictly positive exact Number"),
+                    "invalid builtin shape suppressed builtin-domain diagnostics:\n{lean:#?}"
+                );
+            }
+            if source.contains("value:\n    tick\n    |> WHILE") {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message
+                            == "`WHILE` requires a continuous selector"),
+                    "WHILE mode validation was skipped without a callable row:\n{lean:#?}"
+                );
+            }
+            if source.contains("mixed:\n    LATEST") && source.contains("|> WHILE") {
+                assert!(
+                    lean.iter()
+                        .all(|diagnostic| diagnostic.message
+                            != "`WHILE` requires a continuous selector"),
+                    "continuous mixed LATEST received a false WHILE diagnostic:\n{lean:#?}"
+                );
+            }
+            if source.contains("response: missing") {
+                assert!(
+                    lean.iter().any(|diagnostic| diagnostic.message
+                        == "host port `http.response` references missing output root `missing`"),
+                    "missing host output root lost its source diagnostic:\n{lean:#?}"
+                );
+            }
+            if source == "value: Node[...1]\n" {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message
+                            == "record spread expects a record value"),
+                    "tagged-object spread value was skipped by diagnostic replay:\n{lean:#?}"
+                );
+            }
+            if source == "value: Node[...[same: 1, same: 2]]\n" {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message
+                            == "duplicate explicit record field `same`"),
+                    "tagged-object spread hid nested record diagnostics:\n{lean:#?}"
+                );
+            }
+            if source.contains("PASS: [...1]") {
+                assert!(
+                    lean.iter()
+                        .any(|diagnostic| diagnostic.message
+                            == "record spread expects a record value"),
+                    "explicit PASS child diagnostics were skipped:\n{lean:#?}"
+                );
+            }
+            if source == "document: [\n    root:\n]\n" {
+                assert!(
+                    lean.iter()
+                        .all(|diagnostic| !diagnostic.message.contains("render slot `root`")),
+                    "valueless render slot received a false type diagnostic:\n{lean:#?}"
+                );
+            }
+            if source == "outputs: [\n    pending:\n]\n" {
+                assert!(
+                    lean.iter().all(|diagnostic| diagnostic.message
+                        != "`outputs` must declare at least one named output root"),
+                    "valueless output root was dropped from stable facts:\n{lean:#?}"
+                );
+            }
+            assert_eq!(state.project_diagnostic_facts_requests.request_count(), 1);
+            assert_eq!(state.owner_construction_abi_requests.request_count(), 0);
+            assert_eq!(state.checked_owner_shard_requests.request_count(), 0);
+            assert_eq!(
+                state
+                    .checked_owner_project_assembly_requests
+                    .request_count(),
+                0
+            );
+
+            let (_, assembly, _, _, _) = parse_project_snapshot(state).unwrap_or_else(|error| {
+                panic!("checked assembly failed for:\n{source}\n{error:?}")
+            });
+            assert_eq!(
+                lean,
+                assembly.diagnostics(),
+                "construction-independent diagnostic facts differ for:\n{source}"
+            );
+            if source.contains("response: missing") {
+                assert_eq!(
+                    assembly.fields().lowering_metadata.host_port_table,
+                    boon_checked::HostPortTable::default(),
+                    "diagnosed host-port relocation must fail safely to the retained default"
+                );
+            }
+            let legacy = crate::check_diagnostics_source(
+                crate::CompilerCheckRequest::source_units("RUN.bn", &units, role),
+            )
+            .unwrap();
+            let mut owner_oracle = normalized_invalid_oracle(&lean);
+            if source.contains("FUNCTION probe_out_mode")
+                || source.contains("FUNCTION probe_nested_out_mode")
+                || source.contains("Field/current")
+            {
+                // The retained walker validates a function body before later
+                // call sites have populated its reverse OUT graph. The
+                // project-wide owner authority intentionally closes that
+                // order-dependent hole and diagnoses the event-valued row.
+                owner_oracle.remove(&(0, "`WHILE` requires a continuous selector".to_owned()));
+            }
+            let mut legacy_oracle =
+                normalized_invalid_oracle(&normalized_complete_diagnostics(&legacy));
+            if source.contains("Field/current(extra: 0)") {
+                // Exact owner call planning retains the resolved ABI target
+                // while reporting the bad entry. The retiring checked lowerer
+                // instead fails its canonical-schema projection.
+                owner_oracle.remove(&(
+                    0,
+                    "unexpected call entry `Field/current`.`extra`".to_owned(),
+                ));
+                legacy_oracle.remove(&(
+                    0,
+                    "`Field/current` has no authoritative canonical argument schema for CheckedProgram lowering"
+                        .to_owned(),
+                ));
+            }
+            if source.contains("FUNCTION recurse_child") {
+                // The retained checker loses this BLOCK-local declaration at
+                // the child-owner boundary. Exact inherited lexical capture
+                // keeps it local while preserving the recursion diagnostic.
+                legacy_oracle.remove(&(0, "unknown identifier `next`".to_owned()));
+            }
+            assert_eq!(
+                owner_oracle, legacy_oracle,
+                "owner diagnostics differ from the normalized independent assembled checker for:\n{source}"
+            );
+            if let Some(program) = &legacy.output.program {
+                assert_eq!(
+                    assembly.fields().order_chains,
+                    program.order_chains,
+                    "stable project order facts relocate differently from the independent checked oracle for:\n{source}"
+                );
+            }
+        }
+
+        let units = vec![
+            CompilerSourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: concat!("value: helper\n", "missing: typo\n",).to_owned(),
+            },
+            CompilerSourceUnit {
+                path: "support/invalid.bn".to_owned(),
+                source: concat!(
+                    "FUNCTION helper() {\n",
+                    "    1\n",
+                    "}\n",
+                    "duplicate: [item: 1, item: 2, copy: item]\n",
+                    "passed: PASSED.store\n",
+                )
+                .to_owned(),
+            },
+        ];
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(CompilerProject::new(
+                "RUN.bn",
+                units.clone(),
+                TargetProfile::SoftwareDefault,
+                ProgramRole::Server,
+                ApplicationIdentity::compiler_default(),
+            ))
+            .unwrap();
+        let revision = session.revision(project).unwrap();
+        let token = CancellationToken::new();
+        let public_lean = session
+            .request(project, revision, CompileIntent::Diagnostics, &token)
+            .unwrap()
+            .diagnostics()
+            .unwrap()
+            .diagnostics()
+            .to_vec();
+        assert!(
+            public_lean.iter().any(|diagnostic| {
+                diagnostic.message
+                    == "function `helper` must be called with parentheses: `helper()`"
+            }),
+            "multi-unit diagnostics: {public_lean:#?}"
+        );
+        assert!(
+            public_lean
+                .iter()
+                .any(|diagnostic| diagnostic.message == "unknown identifier `typo`"),
+            "multi-unit diagnostics: {public_lean:#?}"
+        );
+        {
+            let state = session.projects.get(&project).unwrap();
+            assert_eq!(state.project_diagnostic_facts_requests.request_count(), 1);
+            assert_eq!(state.owner_construction_abi_requests.request_count(), 0);
+            assert_eq!(state.checked_owner_shard_requests.request_count(), 0);
+            assert_eq!(
+                state
+                    .checked_owner_project_assembly_requests
+                    .request_count(),
+                0
+            );
+        }
+        let state = session.projects.get_mut(&project).unwrap();
+        let (_, aggregate, _, _, _) = parse_project_diagnostics_snapshot(state).unwrap();
+        assert_eq!(public_lean, aggregate.diagnostics());
+        let (_, assembly, _, _, _) = parse_project_snapshot(state).unwrap();
+        assert_eq!(public_lean, assembly.diagnostics());
+        let legacy = crate::check_diagnostics_source(crate::CompilerCheckRequest::source_units(
+            "RUN.bn",
+            &units,
+            ProgramRole::Server,
+        ))
+        .unwrap();
+        assert_eq!(
+            normalized_invalid_oracle(&public_lean),
+            normalized_invalid_oracle(&normalized_complete_diagnostics(&legacy)),
+            "multi-unit owner diagnostics differ from the normalized independent assembled checker"
+        );
+    }
+
+    #[test]
+    fn editor_report_presents_each_shared_render_failure_once() {
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(CompilerProject::new(
+                "RUN.bn",
+                vec![CompilerSourceUnit {
+                    path: "RUN.bn".to_owned(),
+                    source: "document: [\n    root: 1\n]\n".to_owned(),
+                }],
+                TargetProfile::SoftwareDefault,
+                ProgramRole::Client,
+                ApplicationIdentity::compiler_default(),
+            ))
+            .unwrap();
+        let revision = session.revision(project).unwrap();
+        let token = CancellationToken::new();
+        let public = session
+            .request(project, revision, CompileIntent::Diagnostics, &token)
+            .unwrap()
+            .diagnostics()
+            .unwrap()
+            .diagnostics()
+            .to_vec();
+        let editor_result = session
+            .request(project, revision, CompileIntent::EditorDiagnostics, &token)
+            .unwrap();
+        let editor = editor_result.editor_diagnostics().unwrap();
+        let slot_diagnostics = editor
+            .output
+            .report
+            .render_slot_table
+            .slots
+            .iter()
+            .flat_map(|slot| slot.diagnostics.iter().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(slot_diagnostics.len(), 1);
+        assert!(editor.output.report.diagnostics.is_empty());
+        assert_eq!(public, slot_diagnostics);
+        assert_eq!(editor.profile.diagnostic_count, 1);
+    }
+
+    #[test]
+    fn public_diagnostics_stays_lean_and_editor_rows_are_explicitly_demanded() {
         let mut session = CompilerSession::new();
         let project = session.open_project(project("value: 1")).unwrap();
         let revision = session.revision(project).unwrap();
         let token = CancellationToken::new();
-        let diagnostics = session
-            .request(project, revision, CompileIntent::Diagnostics, &token)
-            .unwrap();
-        assert!(
-            !diagnostics
-                .diagnostics()
-                .unwrap()
-                .output
-                .report
-                .has_errors()
-        );
-        let diagnostics_output = &diagnostics.diagnostics().unwrap().output;
-        assert!(diagnostics_output.program.is_none());
-        assert!(diagnostics_output.construction.is_some());
+        {
+            let result = session
+                .request(project, revision, CompileIntent::Diagnostics, &token)
+                .unwrap();
+            let diagnostics = result.diagnostics().unwrap();
+            assert!(!diagnostics.has_errors());
+            assert!(diagnostics.full_document_typecheck_coverage());
+        }
+        {
+            let state = session.projects.get(&project).unwrap();
+            assert_eq!(state.owner_construction_abi_requests.request_count(), 0);
+            assert_eq!(state.checked_owner_shard_requests.request_count(), 0);
+            assert_eq!(
+                state
+                    .checked_owner_project_assembly_requests
+                    .request_count(),
+                0
+            );
+        }
+        {
+            let result = session
+                .request(project, revision, CompileIntent::EditorDiagnostics, &token)
+                .unwrap();
+            let output = &result.editor_diagnostics().unwrap().output;
+            assert!(output.program.is_none());
+            assert!(output.construction.is_some());
+        }
         let first_plan = session
             .request(project, revision, CompileIntent::VerifiedPreview, &token)
             .unwrap()
@@ -5970,12 +7736,15 @@ mod tests {
         let second_stats = session.frontend_request_stats(project).unwrap();
         // Counts include the callable-only ABI/resolution/scope SCC split in
         // addition to declaration-surface/lexical-plan, exact interface
-        // provider, inference/construction ABI, and checked-owner requests.
+        // provider and owner-inference requests. Public diagnostics deliberately
+        // stop before construction ABI and checked-owner requests.
         // All 25 callable-scope requests are reused by this literal-only warm
         // edit; the edited owner's ordinary dependency cone remains local.
+        // The project diagnostic-facts request executes once per revision and
+        // changes when its exact owner-body input changes.
         assert_eq!(
             (first_request_counts, request_counts(second_stats)),
-            ((100, 100, 0, 0, 100), (200, 116, 84, 8, 108))
+            ((93, 93, 0, 0, 93), (186, 109, 77, 8, 101))
         );
 
         let mut isolated = CompilerSession::new();
@@ -6990,6 +8759,75 @@ mod tests {
     }
 
     #[test]
+    fn scoped_value_lookup_must_consume_the_authored_reference() {
+        let source = concat!(
+            "store: [events: [press: SOURCE]]\n",
+            "theme_options: [\n",
+            "    mode: Light |> HOLD state {\n",
+            "        store.events.press |> THEN {\n",
+            "            state |> WHEN { Light => Dark, Dark => Light }\n",
+            "        }\n",
+            "    }\n",
+            "]\n",
+        );
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project(source)).unwrap();
+        let (_, diagnostics, _, _, _) =
+            parse_project_diagnostics_snapshot(session.projects.get_mut(&project).unwrap())
+                .unwrap();
+        assert!(diagnostics.diagnostics().is_empty());
+
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let hold = unit
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(
+                            |segment| segment.names == ["mode", "state"]
+                        )
+                )
+            })
+            .unwrap();
+        let summary = session
+            .owner_constraint_summary(project, &hold)
+            .unwrap()
+            .unwrap();
+        let resolution = summary
+            .symbol_resolutions
+            .iter()
+            .find(|resolution| {
+                resolution
+                    .reference()
+                    .parts
+                    .first()
+                    .is_some_and(|part| part == "store")
+            })
+            .expect("the HOLD body must retain its exact store read");
+        let OwnerSymbolResolution::Resolved {
+            owner, projection, ..
+        } = resolution
+        else {
+            panic!("the store read must resolve to a project value: {resolution:#?}");
+        };
+        assert!(
+            matches!(
+                owner,
+                StableCheckOwnerKey::Item(owner)
+                    if owner.item_route.segments().first().is_some_and(
+                        |segment| segment.names.first().is_some_and(|name| name == "store")
+                    )
+            ),
+            "the sibling read resolved through the enclosing theme_options value: {owner:?}"
+        );
+        assert_ne!(projection.first().map(String::as_str), Some("store"));
+    }
+
+    #[test]
     fn source_payload_has_one_exact_owner_inference_lookup() {
         let mut session = CompilerSession::new();
         let project = session
@@ -7388,13 +9226,13 @@ mod tests {
         // The callable-only ABI, resolution, scope topology/SCC, and provider
         // families are included here. An exported callable change reexecutes
         // its exact scope cone and backdates unchanged projections; the body-
-        // only edit reuses 141 of 170 demanded requests and changes only 16.
+        // only edit reuses 141 of 172 demanded requests and changes only 18.
         // The exact child-boundary lexical projection adds five executions to
-        // the exported-interface cone while leaving that body-only cone
-        // unchanged.
+        // the exported-interface cone. The project diagnostic-facts request
+        // adds one exact execution/change to both cones.
         assert_eq!(
             (interface_delta, body_delta),
-            ((170, 87, 83, 42, 45), (170, 29, 141, 13, 16))
+            ((172, 89, 83, 42, 47), (172, 31, 141, 13, 18))
         );
     }
 
@@ -7438,19 +9276,17 @@ mod tests {
                 UnitUpdate::new(edit_path, edited_source.clone()),
             )
             .unwrap();
-        let warm_diagnostics = warm
+        let warm_result = warm
             .request(
                 warm_project,
                 edited_revision,
                 CompileIntent::Diagnostics,
                 &CancellationToken::new(),
             )
-            .unwrap()
-            .diagnostics()
-            .unwrap()
-            .output
-            .report
-            .clone();
+            .unwrap();
+        let warm_diagnostics = warm_result.diagnostics().unwrap();
+        let warm_fingerprint = warm_diagnostics.fingerprint_v1();
+        let warm_diagnostics = warm_diagnostics.diagnostics().to_vec();
 
         let mut edited_units = units;
         edited_units
@@ -7461,25 +9297,24 @@ mod tests {
         let mut clean = CompilerSession::new();
         let clean_project = clean.open_project(project_for(edited_units)).unwrap();
         let clean_revision = clean.revision(clean_project).unwrap();
-        let clean_diagnostics = clean
+        let clean_result = clean
             .request(
                 clean_project,
                 clean_revision,
                 CompileIntent::Diagnostics,
                 &CancellationToken::new(),
             )
-            .unwrap()
-            .diagnostics()
-            .unwrap()
-            .output
-            .report
-            .clone();
+            .unwrap();
+        let clean_diagnostics = clean_result.diagnostics().unwrap();
+        let clean_fingerprint = clean_diagnostics.fingerprint_v1();
+        let clean_diagnostics = clean_diagnostics.diagnostics().to_vec();
 
         assert_eq!(warm_diagnostics, clean_diagnostics);
+        assert_eq!(warm_fingerprint, clean_fingerprint);
         assert!(
-            !warm_diagnostics.has_errors(),
+            warm_diagnostics.is_empty(),
             "text-only TodoMVC edit produced diagnostics: {:#?}",
-            warm_diagnostics.diagnostics,
+            warm_diagnostics,
         );
     }
 

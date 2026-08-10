@@ -1743,6 +1743,78 @@ result: helper(input: store.title)
     }
 
     #[test]
+    fn child_public_result_can_use_an_exact_grandchild_endpoint() {
+        let project = project(
+            "app/RUN.bn",
+            concat!(
+                "container: BLOCK {\n",
+                "    child:\n",
+                "        grand: 1\n",
+                "}\n",
+            ),
+        );
+        let container = owner_named(&project, "container");
+        let child_owner = owner_named(&project, "child");
+        let grand = owner_named(&project, "grand");
+        let syntax = project_owner_syntax_input(project.owner_view(&container).unwrap()).unwrap();
+        let child = syntax.child_owners.first().expect("direct child boundary");
+        assert_eq!(child.owner, child_owner);
+        assert_eq!(child.boundary_expression, None);
+        let crate::OwnerChildResultPlacementInput::ExpressionEdge { edge } =
+            &child.result_placement
+        else {
+            panic!("grandchild-owned public result must retain an exact edge");
+        };
+        assert_eq!(edge.owner, container);
+        assert_eq!(edge.child_owner, grand);
+        assert_eq!(
+            child.result_expression.as_ref(),
+            Some(&edge.child_expression)
+        );
+        assert!(syntax.external_expressions.iter().any(|external| {
+            external.owner == edge.child_owner && external.expression == edge.child_expression
+        }));
+
+        let (block_index, bindings, result) = syntax
+            .expressions
+            .iter()
+            .enumerate()
+            .find_map(|(index, expression)| match &expression.kind {
+                AstExprKind::Block { bindings, result } => Some((index, bindings, result)),
+                _ => None,
+            })
+            .expect("container BLOCK expression");
+        assert_eq!(edge.expression, syntax.expressions[block_index].stable_key);
+        assert_eq!(edge.segment.role, StableExpressionChildRole::BlockResult);
+        assert_eq!(edge.segment.label, None);
+        assert_eq!(edge.segment.matching_sibling_reverse_ordinal, 0);
+        let [binding] = bindings.as_slice() else {
+            panic!("container BLOCK must retain one binding");
+        };
+        assert_eq!(binding.name, "child");
+        assert!(matches!(
+            binding.declaration,
+            AstBlockBindingDeclaration::Child { child: 0 }
+        ));
+        assert_eq!(*result, Some(binding.value));
+        let external = syntax
+            .external_expression(binding.value)
+            .expect("BLOCK child value is external");
+        assert_eq!(external.owner, grand);
+        assert_eq!(external.expression, edge.child_expression);
+
+        let graph = OwnerSyntaxGraph::build(&syntax).expect("exact grandchild endpoint is valid");
+        let expected = OwnerExpressionRef::Child {
+            owner: edge.child_owner.clone(),
+            expression: edge.child_expression.clone(),
+        };
+        assert_eq!(
+            graph.expression_inputs(OwnerExpressionId(block_index as u32)),
+            Some([expected.clone(), expected].as_slice())
+        );
+    }
+
+    #[test]
     fn graph_rejects_a_result_edge_forged_to_an_unrelated_child_expression() {
         let project = project(
             "app/RUN.bn",

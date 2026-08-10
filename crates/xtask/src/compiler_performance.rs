@@ -10,10 +10,10 @@ use crate::report_v2::{
     unix_time_ms,
 };
 
-const REPORT_FORMAT_VERSION: u16 = 5;
-const PRODUCER_FORMAT_VERSION: u16 = 4;
+const REPORT_FORMAT_VERSION: u16 = 6;
+const PRODUCER_FORMAT_VERSION: u16 = 5;
 const BUDGET_FORMAT_VERSION: u16 = 2;
-const REPORT_CONTRACT: &str = "boon-compiler-performance-v4";
+const REPORT_CONTRACT: &str = "boon-compiler-performance-v5";
 const DEFAULT_BUDGET: &str = "budgets/compiler.toml";
 const PRODUCER_PATH: &str = "target/release/boon_cli";
 const MAX_BUDGET_BYTES: u64 = 64 * 1024;
@@ -242,7 +242,7 @@ struct FixtureReport {
     peak_rss_mib_max: u64,
     expected_machine_plan_sha256: String,
     observed_source_bundle_digests: Vec<String>,
-    observed_checked_result_sha256: Vec<String>,
+    observed_diagnostics_fingerprint_v1: Vec<String>,
     status: ReportStatus,
     modes: Vec<ModeReport>,
 }
@@ -264,7 +264,7 @@ struct MetricReport {
     scored_samples: Vec<Sample>,
     cache_hit_count: u64,
     observed_source_bundle_digests: Vec<String>,
-    observed_checked_result_sha256: Vec<String>,
+    observed_diagnostics_fingerprint_v1: Vec<String>,
     observed_plan_sha256: Vec<String>,
     elapsed_ms: MillisSummary,
     peak_rss_kib: RssSummary,
@@ -283,7 +283,7 @@ struct Sample {
     elapsed_ms: f64,
     peak_rss_kib: u64,
     source_bundle_digest_v1: String,
-    checked_result_sha256: Option<String>,
+    diagnostics_fingerprint_v1: Option<String>,
     diagnostic_count: usize,
     full_document_typecheck_coverage: Option<bool>,
     plan_sha256: Option<String>,
@@ -429,7 +429,7 @@ struct MetricEvaluation {
     peak_rss_budget_pass: bool,
     cache_disabled_pass: bool,
     source_digest_pass: bool,
-    checked_result_digest_pass: bool,
+    diagnostics_fingerprint_pass: bool,
     machine_plan_hash_pass: bool,
 }
 
@@ -438,7 +438,7 @@ struct CollectedSamples {
     scored: Vec<Sample>,
     cache_hit_count: u64,
     source_digests: BTreeSet<String>,
-    checked_result_hashes: BTreeSet<String>,
+    diagnostics_fingerprints: BTreeSet<String>,
     plan_hashes: BTreeSet<String>,
 }
 
@@ -637,16 +637,16 @@ fn collect_fixture(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let observed_checked_result_sha256 = modes
+    let observed_diagnostics_fingerprint_v1 = modes
         .iter()
-        .flat_map(|mode| mode.diagnostics.observed_checked_result_sha256.iter())
+        .flat_map(|mode| mode.diagnostics.observed_diagnostics_fingerprint_v1.iter())
         .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
     let status = if modes.iter().all(|mode| mode.status == ReportStatus::Pass)
         && observed_source_bundle_digests.len() == 1
-        && observed_checked_result_sha256.len() == 1
+        && observed_diagnostics_fingerprint_v1.len() == 1
     {
         ReportStatus::Pass
     } else {
@@ -662,7 +662,7 @@ fn collect_fixture(
         peak_rss_mib_max: budget.peak_rss_mib_max,
         expected_machine_plan_sha256: budget.machine_plan_sha256.clone(),
         observed_source_bundle_digests,
-        observed_checked_result_sha256,
+        observed_diagnostics_fingerprint_v1,
         status,
         modes,
     })
@@ -842,16 +842,18 @@ fn validate_sample_shape(sample: &Sample, intent: SampleIntent) -> ToolResult<()
         &sample.source_bundle_digest_v1,
         "sample SourceBundleDigestV1",
     )?;
-    match (intent, sample.checked_result_sha256.as_deref()) {
+    match (intent, sample.diagnostics_fingerprint_v1.as_deref()) {
         (SampleIntent::Diagnostics, Some(digest)) => {
-            validate_sha256(digest, "sample checked-result SHA-256")?;
+            validate_sha256(digest, "sample diagnostics-fingerprint SHA-256")?;
         }
         (SampleIntent::Diagnostics, None) => {
-            return Err("diagnostics sample omitted its checked-result hash".into());
+            return Err("diagnostics sample omitted its diagnostics-fingerprint hash".into());
         }
         (SampleIntent::Verified, None) => {}
         (SampleIntent::Verified, Some(_)) => {
-            return Err("verified sample unexpectedly emitted a checked-result hash".into());
+            return Err(
+                "verified sample unexpectedly emitted a diagnostics-fingerprint hash".into(),
+            );
         }
     }
     match (intent, &sample.plan_sha256) {
@@ -961,10 +963,10 @@ fn absorb_sample(collected: &mut CollectedSamples, sample: &Sample) {
     collected
         .source_digests
         .insert(sample.source_bundle_digest_v1.clone());
-    if let Some(checked_result_sha256) = &sample.checked_result_sha256 {
+    if let Some(diagnostics_fingerprint_v1) = &sample.diagnostics_fingerprint_v1 {
         collected
-            .checked_result_hashes
-            .insert(checked_result_sha256.clone());
+            .diagnostics_fingerprints
+            .insert(diagnostics_fingerprint_v1.clone());
     }
     if let Some(plan_sha256) = &sample.plan_sha256 {
         collected.plan_hashes.insert(plan_sha256.clone());
@@ -995,8 +997,8 @@ fn metric_report(
     let work = summarize_work(&collected.scored);
     let phase_ms = summarize_phases(&collected.scored);
     let observed_source_bundle_digests = collected.source_digests.into_iter().collect::<Vec<_>>();
-    let observed_checked_result_sha256 = collected
-        .checked_result_hashes
+    let observed_diagnostics_fingerprint_v1 = collected
+        .diagnostics_fingerprints
         .into_iter()
         .collect::<Vec<_>>();
     let observed_plan_sha256 = collected.plan_hashes.into_iter().collect::<Vec<_>>();
@@ -1006,7 +1008,7 @@ fn metric_report(
         peak_rss_kib,
         collected.cache_hit_count,
         &observed_source_bundle_digests,
-        &observed_checked_result_sha256,
+        &observed_diagnostics_fingerprint_v1,
         &observed_plan_sha256,
         budget,
     );
@@ -1016,7 +1018,7 @@ fn metric_report(
         scored_samples: collected.scored,
         cache_hit_count: collected.cache_hit_count,
         observed_source_bundle_digests,
-        observed_checked_result_sha256,
+        observed_diagnostics_fingerprint_v1,
         observed_plan_sha256,
         elapsed_ms,
         peak_rss_kib,
@@ -1033,7 +1035,7 @@ fn evaluate_metric(
     peak_rss_kib: RssSummary,
     cache_hit_count: u64,
     source_digests: &[String],
-    checked_result_hashes: &[String],
+    diagnostics_fingerprints: &[String],
     plan_hashes: &[String],
     budget: &FixtureBudget,
 ) -> MetricEvaluation {
@@ -1048,14 +1050,14 @@ fn evaluate_metric(
         && source_digests
             .first()
             .is_some_and(|digest| validate_sha256(digest, "SourceBundleDigestV1").is_ok());
-    let checked_result_digest_pass = match intent {
+    let diagnostics_fingerprint_pass = match intent {
         SampleIntent::Diagnostics => {
-            checked_result_hashes.len() == 1
-                && checked_result_hashes
-                    .first()
-                    .is_some_and(|digest| validate_sha256(digest, "checked-result SHA-256").is_ok())
+            diagnostics_fingerprints.len() == 1
+                && diagnostics_fingerprints.first().is_some_and(|digest| {
+                    validate_sha256(digest, "diagnostics-fingerprint SHA-256").is_ok()
+                })
         }
-        SampleIntent::Verified => checked_result_hashes.is_empty(),
+        SampleIntent::Verified => diagnostics_fingerprints.is_empty(),
     };
     let machine_plan_hash_pass = match intent {
         SampleIntent::Diagnostics => plan_hashes.is_empty(),
@@ -1069,7 +1071,7 @@ fn evaluate_metric(
         && peak_rss_budget_pass
         && cache_disabled_pass
         && source_digest_pass
-        && checked_result_digest_pass
+        && diagnostics_fingerprint_pass
         && machine_plan_hash_pass;
     MetricEvaluation {
         status: if pass {
@@ -1081,7 +1083,7 @@ fn evaluate_metric(
         peak_rss_budget_pass,
         cache_disabled_pass,
         source_digest_pass,
-        checked_result_digest_pass,
+        diagnostics_fingerprint_pass,
         machine_plan_hash_pass,
     }
 }
@@ -1132,7 +1134,7 @@ fn cold_phase_acceptance(fixtures: &[FixtureReport], intent: SampleIntent) -> Co
         fixture.modes.iter().all(|mode| {
             let evaluation = &metric_for_intent(mode, intent).evaluation;
             match intent {
-                SampleIntent::Diagnostics => evaluation.checked_result_digest_pass,
+                SampleIntent::Diagnostics => evaluation.diagnostics_fingerprint_pass,
                 SampleIntent::Verified => evaluation.machine_plan_hash_pass,
             }
         })
@@ -1208,7 +1210,7 @@ fn cross_mode_result_parity(fixture: &FixtureReport, intent: SampleIntent) -> bo
         .flat_map(|mode| {
             let metric = metric_for_intent(mode, intent);
             match intent {
-                SampleIntent::Diagnostics => metric.observed_checked_result_sha256.iter(),
+                SampleIntent::Diagnostics => metric.observed_diagnostics_fingerprint_v1.iter(),
                 SampleIntent::Verified => metric.observed_plan_sha256.iter(),
             }
         })
@@ -1411,17 +1413,17 @@ fn validate_fixture_report(
         )
         .into());
     }
-    let observed_checked_results = report
+    let observed_diagnostics_fingerprints = report
         .modes
         .iter()
-        .flat_map(|mode| mode.diagnostics.observed_checked_result_sha256.iter())
+        .flat_map(|mode| mode.diagnostics.observed_diagnostics_fingerprint_v1.iter())
         .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    if report.observed_checked_result_sha256 != observed_checked_results {
+    if report.observed_diagnostics_fingerprint_v1 != observed_diagnostics_fingerprints {
         return Err(format!(
-            "compiler performance fixture {} checked-result summary is inconsistent",
+            "compiler performance fixture {} diagnostics-fingerprint summary is inconsistent",
             budget.id
         )
         .into());
@@ -1431,7 +1433,7 @@ fn validate_fixture_report(
         .iter()
         .all(|mode| mode.status == ReportStatus::Pass)
         && observed.len() == 1
-        && observed_checked_results.len() == 1
+        && observed_diagnostics_fingerprints.len() == 1
     {
         ReportStatus::Pass
     } else {
@@ -1508,7 +1510,7 @@ fn validate_metric_report(
         .into());
     }
     if !strict_sorted_unique_sha256(&report.observed_source_bundle_digests)
-        || !strict_sorted_unique_sha256(&report.observed_checked_result_sha256)
+        || !strict_sorted_unique_sha256(&report.observed_diagnostics_fingerprint_v1)
         || !strict_sorted_unique_sha256(&report.observed_plan_sha256)
     {
         return Err(format!(
@@ -1523,7 +1525,7 @@ fn validate_metric_report(
         rss,
         report.cache_hit_count,
         &report.observed_source_bundle_digests,
-        &report.observed_checked_result_sha256,
+        &report.observed_diagnostics_fingerprint_v1,
         &report.observed_plan_sha256,
         budget,
     );

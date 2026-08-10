@@ -7,7 +7,8 @@ use crate::{
 use boon_checked::{
     CheckedCallContextKind, CheckedCallableKind, CheckedEffectSummary,
     CheckedExternalDeclarationIdentityV1, CheckedIntrinsicV1, CheckedParameterKind,
-    CheckedParameterRequirement, ExternalTypeEnvironment, FlowType, ProgramRole, Type,
+    CheckedParameterRequirement, ExternalTypeEnvironment, FlowType, ObjectShape,
+    OwnerAbiDeclarationKey, OwnerAbiDeclarationKind, ProgramRole, Type,
 };
 use boon_parser::ProjectSyntaxSnapshot;
 use boon_syntax::StableCheckOwnerKey;
@@ -16,23 +17,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-const OWNER_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] = b"boon.owner-abi-environment.v1\0";
-const OWNER_CALLABLE_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] = b"boon.owner-callable-abi-environment.v1\0";
-const OWNER_CALLABLE_ABI_LOOKUP_DOMAIN_V2: &[u8] = b"boon.owner-callable-abi-lookup.v2\0";
+const OWNER_ABI_ENVIRONMENT_DOMAIN_V2: &[u8] = b"boon.owner-abi-environment.v2\0";
+const OWNER_CALLABLE_ABI_ENVIRONMENT_DOMAIN_V2: &[u8] = b"boon.owner-callable-abi-environment.v2\0";
+const OWNER_CALLABLE_ABI_LOOKUP_DOMAIN_V3: &[u8] = b"boon.owner-callable-abi-lookup.v3\0";
 const OWNER_VALUE_ABI_LOOKUP_DOMAIN_V1: &[u8] = b"boon.owner-value-abi-lookup.v1\0";
 const OWNER_SOURCE_PAYLOAD_ABI_LOOKUP_DOMAIN_V1: &[u8] =
     b"boon.owner-source-payload-abi-lookup.v1\0";
 const OWNER_SOURCE_PAYLOAD_ABI_TYPE_DOMAIN_V1: &[u8] = b"boon.owner-source-payload-abi-type.v1\0";
 const OWNER_PARAMETER_REQUIREMENT_LOOKUP_DOMAIN_V1: &[u8] =
     b"boon.owner-parameter-requirement-lookup.v1\0";
-const OWNER_CONSTRUCTION_CALLABLE_ABI_LOOKUP_DOMAIN_V1: &[u8] =
-    b"boon.owner-construction-callable-abi-lookup.v1\0";
+const OWNER_CONSTRUCTION_CALLABLE_ABI_LOOKUP_DOMAIN_V2: &[u8] =
+    b"boon.owner-construction-callable-abi-lookup.v2\0";
 const OWNER_CONSTRUCTION_VALUE_ABI_LOOKUP_DOMAIN_V1: &[u8] =
     b"boon.owner-construction-value-abi-lookup.v1\0";
-const OWNER_CONSTRUCTION_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] =
-    b"boon.owner-construction-abi-environment.v1\0";
-const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V5: &[u8] =
-    b"boon.owner-inference-abi-environment.v5\0";
+const OWNER_CONSTRUCTION_ABI_ENVIRONMENT_DOMAIN_V2: &[u8] =
+    b"boon.owner-construction-abi-environment.v2\0";
+const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V6: &[u8] =
+    b"boon.owner-inference-abi-environment.v6\0";
+const OWNER_CHECKED_ABI_CALLABLE_KEY_DOMAIN_V2: &[u8] = b"boon.owner-checked-abi-callable.v2\0";
+const OWNER_CHECKED_ABI_VALUE_KEY_DOMAIN_V1: &[u8] = b"boon.owner-checked-abi-value.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerAbiEnvironmentError {
@@ -102,6 +105,89 @@ pub struct OwnerAbiCallContextContract {
     pub flow_type: FlowType,
 }
 
+/// Semantic result construction required by inference consumers.
+///
+/// Most authoritative callables expose the fixed result carried by their
+/// ABI. Render constructors are different: their returned render record also
+/// contains the exact supplied named inputs (`element`, `style`, `label`, and
+/// so on). Keeping this operation in the inference ABI prevents callers from
+/// collapsing those fields to the constructor's kind-only base record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerAbiResultSpecialization {
+    Fixed,
+    RenderConstructor,
+}
+
+pub(crate) fn specialize_owner_abi_result_type(
+    base: &Type,
+    specialization: OwnerAbiResultSpecialization,
+    supplied_fields: impl IntoIterator<Item = (String, Type)>,
+) -> Type {
+    if specialization == OwnerAbiResultSpecialization::Fixed {
+        return base.clone();
+    }
+    let mut fields = supplied_fields.into_iter().collect::<Vec<_>>();
+    if let Type::Object(base) = base {
+        fields.extend(
+            base.ordered_fields()
+                .into_iter()
+                .map(|(name, ty)| (name.clone(), ty.clone())),
+        );
+        return Type::object(ObjectShape::from_ordered_fields(fields, base.open));
+    }
+    base.clone()
+}
+
+/// Stable checked-row identity shared by shard construction and compatibility
+/// relocation. Keeping this projection here prevents those two stages from
+/// silently assigning different identities when the callable ABI evolves.
+pub(crate) fn owner_abi_callable_declaration_key(
+    contract: &OwnerAbiCallableContract,
+) -> Result<OwnerAbiDeclarationKey, OwnerAbiEnvironmentError> {
+    let contract_fingerprint_v1 =
+        boon_contract::canonical_serde_hash_v1(OWNER_CHECKED_ABI_CALLABLE_KEY_DOMAIN_V2, contract)
+            .map_err(|error| {
+                OwnerAbiEnvironmentError::new(format!(
+                    "cannot fingerprint owner ABI callable: {error}"
+                ))
+            })?;
+    let kind = match contract.kind {
+        CheckedCallableKind::Builtin => OwnerAbiDeclarationKind::BuiltinCallable,
+        CheckedCallableKind::External => OwnerAbiDeclarationKind::ExternalCallable,
+        CheckedCallableKind::User => {
+            return Err(OwnerAbiEnvironmentError::new(
+                "construction ABI cannot contain a user callable",
+            ));
+        }
+    };
+    Ok(OwnerAbiDeclarationKey {
+        role: contract.role,
+        kind,
+        contract_fingerprint_v1,
+        external_identity: contract.external_identity,
+    })
+}
+
+pub(crate) fn owner_abi_value_declaration_key(
+    role: ProgramRole,
+    contract: &OwnerAbiValueContract,
+) -> Result<OwnerAbiDeclarationKey, OwnerAbiEnvironmentError> {
+    let contract_fingerprint_v1 =
+        boon_contract::canonical_serde_hash_v1(OWNER_CHECKED_ABI_VALUE_KEY_DOMAIN_V1, contract)
+            .map_err(|error| {
+                OwnerAbiEnvironmentError::new(format!(
+                    "cannot fingerprint owner ABI value: {error}"
+                ))
+            })?;
+    Ok(OwnerAbiDeclarationKey {
+        role,
+        kind: OwnerAbiDeclarationKind::ExternalValue,
+        contract_fingerprint_v1,
+        external_identity: contract.external_identity,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OwnerAbiContextualOperation {
@@ -163,6 +249,7 @@ pub struct OwnerAbiCallableContract {
     pub parameters: Box<[OwnerAbiParameterContract]>,
     pub contexts: Box<[OwnerAbiCallContextContract]>,
     pub result: FlowType,
+    pub result_specialization: OwnerAbiResultSpecialization,
     pub role: ProgramRole,
     pub effect: CheckedEffectSummary,
     pub contextual_operation: Option<OwnerAbiContextualOperation>,
@@ -234,6 +321,7 @@ pub struct OwnerInferenceCallableContract {
     pub parameters: Box<[OwnerInferenceParameterContract]>,
     pub contexts: Box<[OwnerInferenceCallContextContract]>,
     pub result: FlowType,
+    pub result_specialization: OwnerAbiResultSpecialization,
     pub effect: CheckedEffectSummary,
 }
 
@@ -255,6 +343,7 @@ impl From<&OwnerAbiCallableContract> for OwnerInferenceCallableContract {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             result: contract.result.clone(),
+            result_specialization: contract.result_specialization,
             effect: contract.effect,
         }
     }
@@ -409,7 +498,7 @@ impl OwnerConstructionCallableAbiLookup {
             )));
         }
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_CONSTRUCTION_CALLABLE_ABI_LOOKUP_DOMAIN_V1,
+            OWNER_CONSTRUCTION_CALLABLE_ABI_LOOKUP_DOMAIN_V2,
             &(&canonical_name, &outcome),
         )
         .map_err(|error| {
@@ -593,7 +682,7 @@ impl OwnerConstructionAbiEnvironment {
         }
         let value_lookups = values.into_values().collect::<Vec<_>>();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_CONSTRUCTION_ABI_ENVIRONMENT_DOMAIN_V1,
+            OWNER_CONSTRUCTION_ABI_ENVIRONMENT_DOMAIN_V2,
             &(&owner, role, &callable_lookups, &value_lookups),
         )
         .map_err(|error| {
@@ -749,7 +838,7 @@ impl OwnerCallableAbiLookup {
             )));
         }
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_CALLABLE_ABI_LOOKUP_DOMAIN_V2,
+            OWNER_CALLABLE_ABI_LOOKUP_DOMAIN_V3,
             &(&canonical_name, &outcome),
         )
         .map_err(|error| {
@@ -1148,7 +1237,7 @@ impl OwnerInferenceAbiEnvironment {
         }
         let parameter_requirement_lookups = requirements_by_key.into_values().collect::<Vec<_>>();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V5,
+            OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V6,
             &(
                 &subjects,
                 &lookups,
@@ -1476,7 +1565,7 @@ impl OwnerAbiEnvironment {
         &self,
     ) -> Result<OwnerCallableAbiEnvironment, OwnerAbiEnvironmentError> {
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_CALLABLE_ABI_ENVIRONMENT_DOMAIN_V1,
+            OWNER_CALLABLE_ABI_ENVIRONMENT_DOMAIN_V2,
             &(
                 self.role,
                 self.active_render_root,
@@ -1711,6 +1800,11 @@ fn callable_contract(
     let contextual_operation = contextual_builtin
         .map(|kind| contextual_operation(&name, kind, &parameters))
         .transpose()?;
+    let result_specialization = if boon_checked::is_registered_render_constructor(&name) {
+        OwnerAbiResultSpecialization::RenderConstructor
+    } else {
+        OwnerAbiResultSpecialization::Fixed
+    };
     Ok(OwnerAbiCallableContract {
         intrinsic: checked_intrinsic_v1(kind, &name),
         name,
@@ -1719,6 +1813,7 @@ fn callable_contract(
         parameters: parameters.into_boxed_slice(),
         contexts: contexts.into_boxed_slice(),
         result,
+        result_specialization,
         role,
         effect,
         contextual_operation,
@@ -2021,7 +2116,7 @@ pub fn project_owner_abi_environment(
         require_resolved_external_identities: external_types.require_resolved_identities,
     };
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_ABI_ENVIRONMENT_DOMAIN_V1,
+        OWNER_ABI_ENVIRONMENT_DOMAIN_V2,
         &(
             role,
             active_render_root,

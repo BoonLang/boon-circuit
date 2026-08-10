@@ -125,6 +125,18 @@ pub(crate) struct TypeCheckWorkSample {
     pub(crate) diagnostic_replay_hits: u64,
     pub(crate) diagnostic_replay_misses: u64,
     pub(crate) diagnostic_replay_unique_expressions: u64,
+    pub(crate) owner_statements: u64,
+    pub(crate) owner_expressions: u64,
+    pub(crate) owner_local_constraints: u64,
+    pub(crate) owner_interface_imports: u64,
+    pub(crate) owner_interface_plan_direct_owners: u64,
+    pub(crate) owner_interface_plan_required_owners: u64,
+    pub(crate) owner_interface_plan_provider_sccs: u64,
+    pub(crate) owner_interface_plan_result_transfers: u64,
+    pub(crate) owner_interface_plan_transfer_nodes: u64,
+    pub(crate) owner_interface_plan_transfer_edges: u64,
+    pub(crate) owner_calls: u64,
+    pub(crate) owner_unification_steps: u64,
 }
 
 impl TypeCheckWorkSample {
@@ -156,6 +168,16 @@ pub(crate) struct WorkSample {
 
 impl WorkSample {
     pub(crate) fn has_complete_frontend_work(self) -> bool {
+        let legacy_typecheck_work = self.typecheck.inference_invocations > 0
+            && self.typecheck.inference_expression_visits > 0
+            && self.typecheck.diagnostic_flow_install_attempts > 0
+            && self.typecheck.diagnostic_replay_requests > 0
+            && self.typecheck.inference_calls_are_accounted()
+            && self.typecheck.diagnostic_replay_is_accounted();
+        let owner_typecheck_work = self.typecheck.owner_statements > 0
+            && self.typecheck.owner_expressions > 0
+            && self.typecheck.owner_local_constraints > 0
+            && self.typecheck.owner_unification_steps > 0;
         self.source_units > 0
             && self
                 .parse
@@ -168,12 +190,7 @@ impl WorkSample {
             && self.parse.statement_visits > 0
             && self.parse.expression_visits > 0
             && self.parse.validation_visits > 0
-            && self.typecheck.inference_invocations > 0
-            && self.typecheck.inference_expression_visits > 0
-            && self.typecheck.diagnostic_flow_install_attempts > 0
-            && self.typecheck.diagnostic_replay_requests > 0
-            && self.typecheck.inference_calls_are_accounted()
-            && self.typecheck.diagnostic_replay_is_accounted()
+            && (legacy_typecheck_work || owner_typecheck_work)
     }
 
     pub(crate) fn has_cold_complete_frontend_work(self) -> bool {

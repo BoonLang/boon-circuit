@@ -1153,10 +1153,13 @@ pub fn project_owner_source_map(
     view: UnitOwnerSyntaxView<'_>,
 ) -> Result<OwnerSourceMap, OwnerSyntaxProjectionError> {
     let owner = view.stable_key();
-    let expression_lines = view
-        .expressions()
-        .map(|expression| (expression.id, expression.line))
-        .collect::<BTreeMap<_, _>>();
+    let physical_line = |start: usize, label: &str| {
+        view.physical_line_for_byte(start).ok_or_else(|| {
+            OwnerSyntaxProjectionError::new(format!(
+                "owner {owner:?} {label} start {start} is outside the parsed line table"
+            ))
+        })
+    };
     let mut anchors = Vec::new();
     let mut statements = Vec::with_capacity(view.statement_ids().len());
     for (statement, (local, syntax)) in view
@@ -1175,7 +1178,7 @@ pub fn project_owner_source_map(
                     local.as_usize()
                 ))
             })?,
-            line: checked_u64(syntax.line, "statement line")?,
+            line: checked_u64(physical_line(syntax.start, "statement")?, "statement line")?,
             start: checked_u64(syntax.start, "statement start")?,
             end: checked_u64(syntax.end, "statement end")?,
         });
@@ -1186,7 +1189,10 @@ pub fn project_owner_source_map(
                     role: OwnerSourceAnchorRole::FunctionParameter {
                         ordinal: checked_u32(parameter.ordinal, "function parameter ordinal")?,
                     },
-                    line: checked_u64(syntax.line, "function parameter line")?,
+                    line: checked_u64(
+                        physical_line(parameter.start, "function parameter")?,
+                        "function parameter line",
+                    )?,
                     start: checked_u64(parameter.start, "function parameter start")?,
                     end: checked_u64(parameter.end, "function parameter end")?,
                 });
@@ -1200,7 +1206,10 @@ pub fn project_owner_source_map(
         };
         expressions.push(OwnerExpressionSource {
             expression,
-            line: checked_u64(syntax.line, "expression line")?,
+            line: checked_u64(
+                physical_line(syntax.start, "expression")?,
+                "expression line",
+            )?,
             start: checked_u64(syntax.start, "expression start")?,
             end: checked_u64(syntax.end, "expression end")?,
         });
@@ -1225,7 +1234,7 @@ pub fn project_owner_source_map(
                         OwnerSourceAnchorRole::CallArgument {
                             ordinal: checked_u32(ordinal, "call argument ordinal")?,
                         },
-                        syntax.line,
+                        physical_line(argument.start, "call argument")?,
                         argument.start,
                         argument.end,
                     )?;
@@ -1233,10 +1242,7 @@ pub fn project_owner_source_map(
                 if let Some(pass) = pass {
                     push_anchor(
                         OwnerSourceAnchorRole::CallPass,
-                        expression_lines
-                            .get(&pass.value)
-                            .copied()
-                            .unwrap_or(syntax.line),
+                        physical_line(pass.start, "call PASS")?,
                         pass.start,
                         pass.end,
                     )?;
@@ -1248,7 +1254,7 @@ pub fn project_owner_source_map(
                         OwnerSourceAnchorRole::PipeArgument {
                             ordinal: checked_u32(ordinal, "pipe argument ordinal")?,
                         },
-                        syntax.line,
+                        physical_line(argument.start, "pipe argument")?,
                         argument.start,
                         argument.end,
                     )?;
@@ -1256,10 +1262,7 @@ pub fn project_owner_source_map(
                 if let Some(pass) = pass {
                     push_anchor(
                         OwnerSourceAnchorRole::PipePass,
-                        expression_lines
-                            .get(&pass.value)
-                            .copied()
-                            .unwrap_or(syntax.line),
+                        physical_line(pass.start, "pipe PASS")?,
                         pass.start,
                         pass.end,
                     )?;
@@ -1271,7 +1274,7 @@ pub fn project_owner_source_map(
                         OwnerSourceAnchorRole::RecordField {
                             ordinal: checked_u32(ordinal, "record field ordinal")?,
                         },
-                        syntax.line,
+                        physical_line(field.start, "record field")?,
                         field.start,
                         field.end,
                     )?;
@@ -1283,7 +1286,7 @@ pub fn project_owner_source_map(
                         OwnerSourceAnchorRole::BlockBinding {
                             ordinal: checked_u32(ordinal, "block binding ordinal")?,
                         },
-                        syntax.line,
+                        physical_line(binding.start, "BLOCK binding")?,
                         binding.start,
                         binding.end,
                     )?;
@@ -1448,13 +1451,38 @@ mod tests {
 
     #[test]
     fn owner_source_map_retains_exact_diagnostic_subspans() {
-        let unit = link(
-            parse_project_source_unit(
-                "app/RUN.bn",
-                "FUNCTION helper(input) {\n    input\n}\nFUNCTION subject(input, output: OUT) {\n    BLOCK {\n        record: [value: input]\n        helper(input: record, PASS: [theme: input])\n    }\n}\n",
-            )
-            .unwrap(),
+        let source = concat!(
+            "FUNCTION helper(input, output: OUT) {\n",
+            "    input\n",
+            "}\n",
+            "FUNCTION subject(\n",
+            "    input\n",
+            "    output: OUT\n",
+            ") {\n",
+            "    BLOCK {\n",
+            "        record: [\n",
+            "            value:\n",
+            "                input\n",
+            "        ]\n",
+            "        called:\n",
+            "            helper(\n",
+            "                input:\n",
+            "                    record\n",
+            "                PASS:\n",
+            "                    [theme: input]\n",
+            "            )\n",
+            "        piped:\n",
+            "            input\n",
+            "            |> helper(\n",
+            "                output\n",
+            "                PASS:\n",
+            "                    [theme: input]\n",
+            "            )\n",
+            "        piped\n",
+            "    }\n",
+            "}\n",
         );
+        let unit = link(parse_project_source_unit("app/RUN.bn", source).unwrap());
         let owner = owner_named(&unit, "subject");
         let source_map =
             project_owner_source_map(unit.owner_view_for_key(&owner).unwrap()).unwrap();
@@ -1467,14 +1495,32 @@ mod tests {
         assert!(roles.contains(&OwnerSourceAnchorRole::FunctionParameter { ordinal: 1 }));
         assert!(roles.contains(&OwnerSourceAnchorRole::CallArgument { ordinal: 0 }));
         assert!(roles.contains(&OwnerSourceAnchorRole::CallPass));
+        assert!(roles.contains(&OwnerSourceAnchorRole::PipeArgument { ordinal: 0 }));
+        assert!(roles.contains(&OwnerSourceAnchorRole::PipePass));
         assert!(roles.contains(&OwnerSourceAnchorRole::RecordField { ordinal: 0 }));
         assert!(roles.contains(&OwnerSourceAnchorRole::BlockBinding { ordinal: 0 }));
-        assert!(
-            source_map
-                .anchors
+        assert_eq!(source_map.path(), "app/RUN.bn");
+        let physical_line = |start: u64| {
+            1 + source.as_bytes()[..usize::try_from(start).unwrap()]
                 .iter()
-                .all(|anchor| anchor.start < anchor.end)
-        );
+                .filter(|byte| **byte == b'\n')
+                .count() as u64
+        };
+        for statement in source_map.statements() {
+            assert!(statement.start < statement.end);
+            assert!(usize::try_from(statement.end).unwrap() <= source.len());
+            assert_eq!(statement.line, physical_line(statement.start));
+        }
+        for expression in source_map.expressions() {
+            assert!(expression.start < expression.end);
+            assert!(usize::try_from(expression.end).unwrap() <= source.len());
+            assert_eq!(expression.line, physical_line(expression.start));
+        }
+        for anchor in &source_map.anchors {
+            assert!(anchor.start < anchor.end);
+            assert!(usize::try_from(anchor.end).unwrap() <= source.len());
+            assert_eq!(anchor.line, physical_line(anchor.start));
+        }
         assert!(
             source_map
                 .anchors

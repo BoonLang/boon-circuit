@@ -9,12 +9,13 @@ use crate::{
     CheckedOwnerShard, OwnerAbiCallableContract, OwnerAbiContextualOperation,
     OwnerAbiEnvironmentError, OwnerAbiEvaluationScope, OwnerAbiValueContract,
     OwnerConstructionAbiEnvironment, OwnerConstructionCallableAbiLookupOutcome,
-    OwnerConstructionValueAbiLookupOutcome, OwnerDiagnosticTemplate, OwnerSourceAnchorRole,
-    OwnerSourceAnchorSite, OwnerSourceMap,
+    OwnerConstructionValueAbiLookupOutcome, OwnerSourceAnchorRole, OwnerSourceAnchorSite,
+    OwnerSourceMap, ProjectDiagnosticFacts, owner_abi_callable_declaration_key,
+    owner_abi_value_declaration_key,
 };
 use boon_checked::*;
 use boon_parser::ProjectSyntaxSnapshot;
-use boon_syntax::{StableCheckOwnerKey, StableExpressionKey, StableStatementKey};
+use boon_syntax::{AstStatement, StableCheckOwnerKey, StableExpressionKey, StableStatementKey};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -115,6 +116,7 @@ struct CompatibilityLayout<'a> {
     owners: BTreeMap<StableCheckOwnerKey, OwnerDenseLayout>,
     statement_by_key: BTreeMap<StableStatementKey, CheckedStatementId>,
     expression_by_key: BTreeMap<StableExpressionKey, CheckedExprId>,
+    call_by_key: BTreeMap<(StableCheckOwnerKey, StableExpressionKey), CheckedCallId>,
     owner_root_statement: BTreeMap<StableCheckOwnerKey, CheckedStatementId>,
     owner_public_declaration: BTreeMap<StableCheckOwnerKey, DeclId>,
     owner_parameter_declaration: BTreeMap<(StableCheckOwnerKey, u32), DeclId>,
@@ -135,52 +137,6 @@ fn checked_u32(value: usize, context: &str) -> Result<u32, OwnerCompatibilityAss
 fn checked_usize(value: u64, context: &str) -> Result<usize, OwnerCompatibilityAssemblyError> {
     usize::try_from(value)
         .map_err(|_| OwnerCompatibilityAssemblyError::new(format!("{context} exceeds usize")))
-}
-
-fn callable_key(
-    contract: &OwnerAbiCallableContract,
-) -> Result<OwnerAbiDeclarationKey, OwnerCompatibilityAssemblyError> {
-    let contract_fingerprint_v1 =
-        boon_contract::canonical_serde_hash_v1(b"boon.owner-checked-abi-callable.v1\0", contract)
-            .map_err(|error| {
-            OwnerCompatibilityAssemblyError::new(format!(
-                "cannot fingerprint owner ABI callable: {error}"
-            ))
-        })?;
-    let kind = match contract.kind {
-        CheckedCallableKind::Builtin => OwnerAbiDeclarationKind::BuiltinCallable,
-        CheckedCallableKind::External => OwnerAbiDeclarationKind::ExternalCallable,
-        CheckedCallableKind::User => {
-            return Err(OwnerCompatibilityAssemblyError::new(
-                "construction ABI cannot contain a user callable",
-            ));
-        }
-    };
-    Ok(OwnerAbiDeclarationKey {
-        role: contract.role,
-        kind,
-        contract_fingerprint_v1,
-        external_identity: contract.external_identity,
-    })
-}
-
-fn value_key(
-    role: ProgramRole,
-    contract: &OwnerAbiValueContract,
-) -> Result<OwnerAbiDeclarationKey, OwnerCompatibilityAssemblyError> {
-    let contract_fingerprint_v1 =
-        boon_contract::canonical_serde_hash_v1(b"boon.owner-checked-abi-value.v1\0", contract)
-            .map_err(|error| {
-                OwnerCompatibilityAssemblyError::new(format!(
-                    "cannot fingerprint owner ABI value: {error}"
-                ))
-            })?;
-    Ok(OwnerAbiDeclarationKey {
-        role,
-        kind: OwnerAbiDeclarationKind::ExternalValue,
-        contract_fingerprint_v1,
-        external_identity: contract.external_identity,
-    })
 }
 
 fn allocate_decl(next: &mut u32) -> Result<DeclId, OwnerCompatibilityAssemblyError> {
@@ -264,7 +220,7 @@ impl<'a> CompatibilityLayout<'a> {
                 else {
                     continue;
                 };
-                let key = callable_key(contract)?;
+                let key = owner_abi_callable_declaration_key(contract)?;
                 let entry = AbiCallableEntry {
                     name: lookup.canonical_name().to_owned(),
                     key,
@@ -288,7 +244,7 @@ impl<'a> CompatibilityLayout<'a> {
                 else {
                     continue;
                 };
-                let key = value_key(abi.role(), contract)?;
+                let key = owner_abi_value_declaration_key(abi.role(), contract)?;
                 let entry = AbiValueEntry {
                     path: lookup.canonical_path().to_owned(),
                     key,
@@ -356,6 +312,7 @@ impl<'a> CompatibilityLayout<'a> {
             owners: BTreeMap::new(),
             statement_by_key,
             expression_by_key,
+            call_by_key: BTreeMap::new(),
             owner_root_statement: BTreeMap::new(),
             owner_public_declaration: BTreeMap::new(),
             owner_parameter_declaration: BTreeMap::new(),
@@ -553,12 +510,20 @@ impl<'a> CompatibilityLayout<'a> {
         }
         calls.sort_by(|left, right| (left.0, &left.1, left.2).cmp(&(right.0, &right.1, right.2)));
         for (index, (_, owner, local)) in calls.into_iter().enumerate() {
+            let row = &self.shards[&owner].rows().calls[local.0 as usize];
+            let stable_key = row.stable_key.clone();
             let dense = &mut self.owners.get_mut(&owner).unwrap().calls;
             dense.resize(
                 self.shards[&owner].rows().calls.len(),
                 CheckedCallId(u32::MAX),
             );
-            dense[local.0 as usize] = CheckedCallId(checked_u32(index, "call identity")?);
+            let id = CheckedCallId(checked_u32(index, "call identity")?);
+            dense[local.0 as usize] = id;
+            if self.call_by_key.insert((owner, stable_key), id).is_some() {
+                return Err(OwnerCompatibilityAssemblyError::new(
+                    "checked owner assembly repeats one stable call identity",
+                ));
+            }
         }
 
         let mut next_source = 0u32;
@@ -693,6 +658,35 @@ impl CompatibilityLayout<'_> {
                     "owner {owner:?} has no dense call {}",
                     call.0
                 ))
+            })
+    }
+
+    fn stable_expression(
+        &self,
+        expression: &crate::ProjectOrderExpressionFact,
+    ) -> Result<CheckedExprId, OwnerCompatibilityAssemblyError> {
+        self.expression_by_key
+            .get(&expression.expression)
+            .copied()
+            .filter(|_| self.shards.contains_key(&expression.owner))
+            .ok_or_else(|| {
+                OwnerCompatibilityAssemblyError::new(
+                    "project order fact references a missing stable expression",
+                )
+            })
+    }
+
+    fn stable_call(
+        &self,
+        call: &crate::ProjectOrderExpressionFact,
+    ) -> Result<CheckedCallId, OwnerCompatibilityAssemblyError> {
+        self.call_by_key
+            .get(&(call.owner.clone(), call.expression.clone()))
+            .copied()
+            .ok_or_else(|| {
+                OwnerCompatibilityAssemblyError::new(
+                    "project order fact references a missing stable call",
+                )
             })
     }
 
@@ -1235,95 +1229,6 @@ impl CompatibilityLayout<'_> {
                 .start_byte
                 .checked_add(end)
                 .ok_or_else(|| OwnerCompatibilityAssemblyError::new("global end overflow"))?,
-        })
-    }
-
-    fn diagnostic(
-        &self,
-        owner: &StableCheckOwnerKey,
-        diagnostic: &OwnerDiagnosticTemplate,
-    ) -> Result<TypeDiagnostic, OwnerCompatibilityAssemblyError> {
-        let site = match (&diagnostic.site, diagnostic.role) {
-            (OwnerSourceAnchorSite::Statement { statement }, None) => {
-                let source = self
-                    .source_map(owner)?
-                    .statements()
-                    .get(*statement as usize)
-                    .ok_or_else(|| {
-                        OwnerCompatibilityAssemblyError::new(
-                            "diagnostic references missing owner statement",
-                        )
-                    })?;
-                OwnerSourceSite::Statement {
-                    statement: source.stable_key.clone(),
-                }
-            }
-            (OwnerSourceAnchorSite::Expression { expression }, None) => {
-                OwnerSourceSite::Expression {
-                    expression: expression.clone(),
-                }
-            }
-            (OwnerSourceAnchorSite::Statement { statement }, Some(role)) => {
-                let source = self
-                    .source_map(owner)?
-                    .statements()
-                    .get(*statement as usize)
-                    .ok_or_else(|| {
-                        OwnerCompatibilityAssemblyError::new(
-                            "diagnostic anchor references missing owner statement",
-                        )
-                    })?;
-                match role {
-                    OwnerSourceAnchorRole::FunctionParameter { ordinal } => {
-                        OwnerSourceSite::FunctionParameter {
-                            statement: source.stable_key.clone(),
-                            ordinal,
-                        }
-                    }
-                    _ => {
-                        return Err(OwnerCompatibilityAssemblyError::new(
-                            "statement diagnostic uses an expression-only anchor role",
-                        ));
-                    }
-                }
-            }
-            (OwnerSourceAnchorSite::Expression { expression }, Some(role)) => match role {
-                OwnerSourceAnchorRole::CallArgument { ordinal } => OwnerSourceSite::CallArgument {
-                    expression: expression.clone(),
-                    ordinal,
-                },
-                OwnerSourceAnchorRole::CallPass => OwnerSourceSite::CallPass {
-                    expression: expression.clone(),
-                },
-                OwnerSourceAnchorRole::PipeArgument { ordinal } => OwnerSourceSite::PipeArgument {
-                    expression: expression.clone(),
-                    ordinal,
-                },
-                OwnerSourceAnchorRole::PipePass => OwnerSourceSite::PipePass {
-                    expression: expression.clone(),
-                },
-                OwnerSourceAnchorRole::RecordField { ordinal } => OwnerSourceSite::RecordField {
-                    expression: expression.clone(),
-                    ordinal,
-                },
-                OwnerSourceAnchorRole::BlockBinding { ordinal } => OwnerSourceSite::BlockBinding {
-                    expression: expression.clone(),
-                    ordinal,
-                },
-                OwnerSourceAnchorRole::FunctionParameter { .. } => {
-                    return Err(OwnerCompatibilityAssemblyError::new(
-                        "expression diagnostic uses a statement-only anchor role",
-                    ));
-                }
-            },
-        };
-        let span = self.source_span(owner, &site)?;
-        Ok(TypeDiagnostic {
-            severity: diagnostic.severity,
-            line: span.line,
-            start: span.start,
-            end: span.end,
-            message: diagnostic.message.clone(),
         })
     }
 
@@ -1963,87 +1868,55 @@ fn owner_named_value_type_table(
     Ok(table)
 }
 
+fn syntax_statement_by_stable_key<'a>(
+    syntax: &'a crate::TypecheckSyntaxProgram,
+    project: &ProjectSyntaxSnapshot,
+    key: &StableStatementKey,
+) -> Option<&'a AstStatement> {
+    fn find<'a>(
+        statements: &'a [AstStatement],
+        project: &ProjectSyntaxSnapshot,
+        key: &StableStatementKey,
+    ) -> Option<&'a AstStatement> {
+        for statement in statements {
+            if project.stable_statement_key(statement.id).as_ref() == Some(key) {
+                return Some(statement);
+            }
+            if let Some(found) = find(&statement.children, project, key) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    syntax
+        .root_statement_units()
+        .find_map(|statements| find(statements, project, key))
+}
+
 fn owner_output_root_types(
     syntax: &crate::TypecheckSyntaxProgram,
+    project: &ProjectSyntaxSnapshot,
+    facts: &ProjectDiagnosticFacts,
     fields: &CheckedProgramFields,
-) -> (Vec<OutputRootTypeEntry>, Vec<TypeDiagnostic>) {
-    let mut diagnostics = Vec::new();
-    let containers = syntax
-        .statements()
-        .iter()
-        .filter(|statement| {
-            matches!(&statement.kind, boon_syntax::AstStatementKind::Field { name } if name == "outputs")
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if containers.len() > 1 {
-        diagnostics.push(syntax.diagnostic_for_statement(
-            containers.get(1),
-            "Boon source may declare only one top-level `outputs` registry".to_owned(),
-        ));
-    }
-    let Some(container) = containers.first() else {
-        return (Vec::new(), diagnostics);
-    };
+) -> Result<Vec<OutputRootTypeEntry>, OwnerCompatibilityAssemblyError> {
     let lookup = crate::CheckedProgramLookup::new(fields);
-    let mut entries = Vec::new();
-    let mut names = BTreeSet::new();
-    for child in &container.children {
-        if let boon_syntax::AstStatementKind::Hold {
-            field: Some(name), ..
-        }
-        | boon_syntax::AstStatementKind::Source {
-            field: Some(name), ..
-        } = &child.kind
-        {
-            diagnostics.push(syntax.diagnostic_for_statement(
-                Some(child),
-                format!(
-                    "output root `{name}` declares SOURCE or HOLD authority; outputs must be reconstructed from existing current values"
-                ),
-            ));
-            continue;
-        }
-        let name = match &child.kind {
-            boon_syntax::AstStatementKind::Field { name }
-            | boon_syntax::AstStatementKind::List {
-                field: Some(name), ..
-            } => name,
-            _ => {
-                if !crate::statement_is_empty_delimiter(child, syntax.expressions()) {
-                    diagnostics.push(syntax.diagnostic_for_statement(
-                        Some(child),
-                        "`outputs` accepts only named output fields".to_owned(),
-                    ));
-                }
-                continue;
-            }
-        };
-        if !names.insert(name.clone()) {
-            diagnostics.push(
-                syntax.diagnostic_for_statement(
-                    Some(child),
-                    format!("duplicate output root `{name}`"),
-                ),
-            );
-            continue;
-        }
-        if crate::statement_contains_output_authority(child) {
-            diagnostics.push(syntax.diagnostic_for_statement(
-                Some(child),
-                format!(
-                    "output root `{name}` declares SOURCE or HOLD authority; outputs must be reconstructed from existing current values"
-                ),
-            ));
-        }
-        let statement_id = syntax.checked_statement_id(child.id);
-        let Some(checked_statement) = lookup.unique_statement(statement_id) else {
-            diagnostics.push(syntax.diagnostic_for_statement(
-                Some(child),
-                format!("output root `{name}` has no exact checked statement"),
-            ));
-            continue;
-        };
+    let mut entries = Vec::with_capacity(facts.output_roots().len());
+    for fact in facts.output_roots() {
+        let source =
+            syntax_statement_by_stable_key(syntax, project, &fact.statement).ok_or_else(|| {
+                OwnerCompatibilityAssemblyError::new(format!(
+                    "output root `{}` has no stable syntax statement",
+                    fact.name
+                ))
+            })?;
+        let statement_id = syntax.checked_statement_id(source.id);
+        let checked_statement = lookup.unique_statement(statement_id).ok_or_else(|| {
+            OwnerCompatibilityAssemblyError::new(format!(
+                "output root `{}` has no exact checked statement",
+                fact.name
+            ))
+        })?;
         let declaration = match checked_statement.kind {
             CheckedStatementKind::Field { declaration }
             | CheckedStatementKind::List {
@@ -2051,11 +1924,10 @@ fn owner_output_root_types(
                 ..
             } => declaration,
             _ => {
-                diagnostics.push(syntax.diagnostic_for_statement(
-                    Some(child),
-                    format!("output root `{name}` has no exact checked declaration identity"),
-                ));
-                continue;
+                return Err(OwnerCompatibilityAssemblyError::new(format!(
+                    "output root `{}` has no exact checked declaration identity",
+                    fact.name
+                )));
             }
         };
         let ty = checked_statement
@@ -2068,167 +1940,165 @@ fn owner_output_root_types(
                 )
             })
             .unwrap_or(Type::Unknown);
-        if !crate::host_output_type_is_closed(&ty) {
-            diagnostics.push(syntax.diagnostic_for_statement(
-                Some(child),
-                format!(
-                    "output root `{name}` must have a closed scalar, record, or list host-value type; found {}",
-                    crate::boon_facing_type_label(&ty)
-                ),
-            ));
+        if ty != fact.ty {
+            return Err(OwnerCompatibilityAssemblyError::new(format!(
+                "output root `{}` checked type differs from its project diagnostic fact",
+                fact.name
+            )));
         }
         entries.push(OutputRootTypeEntry {
-            name: name.clone(),
+            name: fact.name.clone(),
             declaration,
             statement: statement_id,
             value: checked_statement.value,
             ty,
         });
     }
-    if entries.is_empty() {
-        diagnostics.push(syntax.diagnostic_for_statement(
-            Some(container),
-            "`outputs` must declare at least one named output root".to_owned(),
-        ));
-    }
     entries.sort_by(|left, right| left.name.cmp(&right.name));
-    (entries, diagnostics)
+    Ok(entries)
 }
 
 fn owner_render_slot_table(
     syntax: &crate::TypecheckSyntaxProgram,
+    project: &ProjectSyntaxSnapshot,
+    facts: &ProjectDiagnosticFacts,
     fields: &CheckedProgramFields,
-) -> (RenderSlotTable, Vec<TypeDiagnostic>) {
-    let registry = crate::RenderContractRegistry::default();
-    let mut slots = Vec::new();
-    let mut diagnostics = Vec::new();
-    for statement in fields
-        .statements
-        .iter()
-        .filter(|statement| statement.value_use == CheckedValueUse::RenderSlot)
-    {
-        let Some(syntax_id) = syntax.statement_id_for_slot(statement.id.0 as usize) else {
-            diagnostics.push(TypeDiagnostic {
-                severity: DiagnosticSeverity::Error,
-                line: statement.span.line,
-                start: statement.span.start,
-                end: statement.span.end,
-                message: "render slot has no exact syntax statement".to_owned(),
-            });
-            continue;
-        };
-        let Some(source) = syntax.statements().get(syntax_id) else {
-            diagnostics.push(TypeDiagnostic {
-                severity: DiagnosticSeverity::Error,
-                line: statement.span.line,
-                start: statement.span.start,
-                end: statement.span.end,
-                message: "render slot syntax statement is missing".to_owned(),
-            });
-            continue;
-        };
-        let slot_name = crate::statement_field(source)
-            .map(str::to_owned)
-            .unwrap_or_else(|| "items".to_owned());
-        let expected_contract = registry.slot_contract(&slot_name).to_owned();
+) -> Result<RenderSlotTable, OwnerCompatibilityAssemblyError> {
+    let mut slots = Vec::with_capacity(facts.render_slots().len());
+    for fact in facts.render_slots() {
+        let source =
+            syntax_statement_by_stable_key(syntax, project, &fact.statement).ok_or_else(|| {
+                OwnerCompatibilityAssemblyError::new("render slot has no exact syntax statement")
+            })?;
+        let statement_id = syntax.checked_statement_id(source.id);
+        let statement = fields
+            .statements
+            .get(statement_id.0 as usize)
+            .filter(|statement| statement.id == statement_id)
+            .ok_or_else(|| {
+                OwnerCompatibilityAssemblyError::new("render slot checked statement is missing")
+            })?;
+        if statement.value_use != CheckedValueUse::RenderSlot {
+            return Err(OwnerCompatibilityAssemblyError::new(
+                "project render fact points to a non-render checked statement",
+            ));
+        }
         let value_expr_id = statement.value.map(|value| value.0 as usize);
         let actual_type = statement
             .value
             .and_then(|value| fields.expressions.get(value.0 as usize))
             .map(|expression| expression.flow_type.ty.clone())
             .unwrap_or_else(|| {
-                if matches!(slot_name.as_str(), "items" | "children") {
+                if matches!(fact.slot_name.as_str(), "items" | "children") {
                     Type::List(Type::shared(crate::open_object_type()))
                 } else {
                     crate::open_object_type()
                 }
             });
-        let mut slot_diagnostics = Vec::new();
-        if !registry.slot_accepts_type(&slot_name, &actual_type) {
-            let span = statement
-                .value
-                .and_then(|value| fields.expressions.get(value.0 as usize))
-                .map_or(statement.span, |expression| expression.span);
-            slot_diagnostics.push(TypeDiagnostic {
-                severity: DiagnosticSeverity::Error,
-                line: span.line,
-                start: span.start,
-                end: span.end,
-                message: if crate::type_contains_absence(&actual_type) {
-                    "`SKIP` cannot be used as a render value".to_owned()
-                } else {
-                    crate::render_slot_type_error(&slot_name, &actual_type)
-                },
-            });
+        if actual_type != fact.actual_type {
+            return Err(OwnerCompatibilityAssemblyError::new(format!(
+                "render slot `{}` checked type differs from its project diagnostic fact",
+                fact.slot_name
+            )));
         }
-        diagnostics.extend(slot_diagnostics.iter().cloned());
         slots.push(RenderSlot {
             slot_statement_id: statement.id.0 as usize,
-            slot_name,
-            expected_contract,
+            slot_name: fact.slot_name.clone(),
+            expected_contract: fact.expected_contract.clone(),
             value_expr_id,
             actual_type,
-            diagnostics: slot_diagnostics,
+            diagnostics: fact.diagnostics.to_vec(),
         });
     }
     slots.sort_by_key(|slot| slot.slot_statement_id);
-    (RenderSlotTable { slots }, diagnostics)
+    Ok(RenderSlotTable { slots })
 }
 
 fn owner_host_port_table(
-    syntax: &crate::TypecheckSyntaxProgram,
+    facts: &ProjectDiagnosticFacts,
     fields: &CheckedProgramFields,
     outputs: &[OutputRootTypeEntry],
-) -> (HostPortTable, Vec<TypeDiagnostic>) {
-    let source_paths = fields
-        .sources
-        .iter()
-        .filter_map(|source| fields.semantic_path(&source.path))
-        .collect::<BTreeSet<_>>();
-    let source_lookup = crate::SourcePayloadPathLookup::new(&source_paths);
-    let (host_syntax, mut diagnostics) = crate::host_port_table(syntax, &source_lookup);
-    let table = match crate::resolve_checked_host_port_table(&host_syntax, fields, outputs) {
-        Ok(table) => table,
-        Err(error) => {
-            diagnostics.push(crate::diagnostic_at_line(1, error));
-            HostPortTable::default()
+) -> Result<HostPortTable, OwnerCompatibilityAssemblyError> {
+    let table = crate::resolve_checked_host_port_table(facts.host_ports(), fields, outputs);
+    crate::validate_checked_host_port_source_payload_types(fields, facts.host_ports()).map_err(
+        |error| {
+            OwnerCompatibilityAssemblyError::new(format!(
+                "checked host source payload differs from project diagnostic facts: {error}"
+            ))
+        },
+    )?;
+    reconcile_owner_host_port_resolution(facts.host_port_resolution_error(), table)
+}
+
+fn reconcile_owner_host_port_resolution(
+    expected_error: Option<&str>,
+    actual: Result<HostPortTable, String>,
+) -> Result<HostPortTable, OwnerCompatibilityAssemblyError> {
+    match (expected_error, actual) {
+        (None, Ok(table)) => Ok(table),
+        (Some(expected), Err(actual)) if expected == actual => Ok(HostPortTable::default()),
+        (None, Err(actual)) => Err(OwnerCompatibilityAssemblyError::new(format!(
+            "checked host-port relocation unexpectedly failed: {actual}"
+        ))),
+        (Some(expected), Err(actual)) => Err(OwnerCompatibilityAssemblyError::new(format!(
+            "checked host-port relocation failed differently from project diagnostic facts\nexpected: {expected}\nfound: {actual}"
+        ))),
+        (Some(expected), Ok(_)) => Err(OwnerCompatibilityAssemblyError::new(format!(
+            "checked host-port rows unexpectedly became relocatable; project diagnostic facts recorded: {expected}"
+        ))),
+    }
+}
+
+fn owner_order_chains(
+    facts: &ProjectDiagnosticFacts,
+    layout: &CompatibilityLayout<'_>,
+) -> Result<Vec<CheckedCallOrderChain>, OwnerCompatibilityAssemblyError> {
+    let mut chains = Vec::with_capacity(facts.order().chains().len());
+    let mut seen = BTreeSet::new();
+    for fact in facts.order().chains() {
+        let call = layout.stable_call(&fact.call)?;
+        if !seen.insert(call) {
+            return Err(OwnerCompatibilityAssemblyError::new(
+                "project order facts repeat one checked call",
+            ));
         }
-    };
-    if let Err(error) = crate::validate_checked_host_port_source_payload_types(fields, &host_syntax)
-    {
-        diagnostics.push(crate::diagnostic_at_line(1, error));
-    }
-    if let Some(http) = &host_syntax.http
-        && let Some(output) = outputs
+        let keys = fact
+            .keys
             .iter()
-            .find(|output| output.name == http.response_output)
-        && !crate::http_response_type_is_valid(&output.ty)
-    {
-        diagnostics.push(crate::diagnostic_at_line(
-            http.line,
-            format!(
-                "host port `http.response` output `{}` must be exactly `{{ status: Number, body: Bytes }}` or `{{ status: Number, headers: List<{{ name: Text, value: Text|Bytes }}>, body: Bytes }}`; found {}",
-                output.name,
-                crate::boon_facing_type_label(&output.ty)
-            ),
-        ));
+            .map(|key| {
+                Ok(CheckedOrderKey {
+                    call_path: key
+                        .call_path
+                        .iter()
+                        .map(|call| layout.stable_call(call))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    key: layout.stable_expression(&key.key)?,
+                    direction: match &key.direction {
+                        crate::ProjectOrderDirectionFact::Ascending => {
+                            CheckedOrderDirection::Ascending
+                        }
+                        crate::ProjectOrderDirectionFact::Descending => {
+                            CheckedOrderDirection::Descending
+                        }
+                        crate::ProjectOrderDirectionFact::Dynamic { expression } => {
+                            CheckedOrderDirection::Dynamic {
+                                expression: layout.stable_expression(expression)?,
+                            }
+                        }
+                    },
+                    key_type: key.key_type.clone(),
+                    pure: key.pure,
+                    total: key.total,
+                })
+            })
+            .collect::<Result<Vec<_>, OwnerCompatibilityAssemblyError>>()?;
+        chains.push(CheckedCallOrderChain {
+            call,
+            chain: CheckedOrderChain { keys },
+        });
     }
-    if let Some(websocket) = &host_syntax.websocket
-        && let Some(output) = outputs
-            .iter()
-            .find(|output| output.name == websocket.actions_output)
-        && !crate::websocket_actions_type_is_valid(&output.ty)
-    {
-        diagnostics.push(crate::diagnostic_at_line(
-            websocket.line,
-            format!(
-                "host port `websocket.actions` output `{}` must be a list of closed generic WebSocket action envelopes; found {}",
-                output.name,
-                crate::boon_facing_type_label(&output.ty)
-            ),
-        ));
-    }
-    (table, diagnostics)
+    chains.sort_by_key(|chain| chain.call);
+    Ok(chains)
 }
 
 fn canonicalize_owner_diagnostics(diagnostics: &mut Vec<TypeDiagnostic>) {
@@ -2263,6 +2133,8 @@ pub fn assemble_checked_owner_project<'a>(
     project: &'a ProjectSyntaxSnapshot,
     role: ProgramRole,
     external_types: ExternalTypeEnvironment,
+    project_diagnostic_facts: &ProjectDiagnosticFacts,
+    diagnostics_aggregate: &crate::OwnerDiagnosticsAggregate,
     shards: impl IntoIterator<Item = &'a CheckedOwnerShard>,
     source_maps: impl IntoIterator<Item = &'a OwnerSourceMap>,
     construction_abis: impl IntoIterator<Item = &'a OwnerConstructionAbiEnvironment>,
@@ -2270,6 +2142,23 @@ pub fn assemble_checked_owner_project<'a>(
     if external_types.current_role != role {
         return Err(OwnerCompatibilityAssemblyError::new(
             "checked owner assembly role does not match its external type environment",
+        ));
+    }
+    if project_diagnostic_facts.source_bundle_digest_v1() != project.source_bundle_digest_v1() {
+        return Err(OwnerCompatibilityAssemblyError::new(
+            "checked owner assembly project diagnostic facts have a different source bundle",
+        ));
+    }
+    if diagnostics_aggregate.source_bundle_digest_v1() != project.source_bundle_digest_v1() {
+        return Err(OwnerCompatibilityAssemblyError::new(
+            "checked owner assembly diagnostics aggregate has a different source bundle",
+        ));
+    }
+    if diagnostics_aggregate.project_facts_fingerprint_v1()
+        != project_diagnostic_facts.fingerprint_v1()
+    {
+        return Err(OwnerCompatibilityAssemblyError::new(
+            "checked owner assembly diagnostics aggregate was produced from different project diagnostic facts",
         ));
     }
     let trace = std::env::var_os("BOON_OWNER_COMPAT_TRACE").is_some();
@@ -2300,11 +2189,13 @@ pub fn assemble_checked_owner_project<'a>(
     // basis instead; every semantic row, source position, ABI contract, role,
     // and source revision is covered by one of these compact fingerprints.
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        b"boon.checked-owner-project-assembly-basis.v2\0",
+        b"boon.checked-owner-project-assembly-basis.v5\0",
         &(
             project.source_bundle_digest_v1(),
             role,
             &external_types,
+            project_diagnostic_facts.fingerprint_v1(),
+            diagnostics_aggregate.fingerprint_v1(),
             &shard_fingerprints,
             &source_map_fingerprints,
             &construction_abi_fingerprints,
@@ -2504,7 +2395,7 @@ pub fn assemble_checked_owner_project<'a>(
     let mut call_result_paths = Vec::new();
     let mut pattern_bindings = Vec::new();
     let mut occurrences = Vec::new();
-    let mut diagnostics = Vec::new();
+    let mut diagnostics = diagnostics_aggregate.diagnostics().to_vec();
 
     for (owner, shard) in &layout.shards {
         let dense = layout.owner_layout(owner)?;
@@ -2837,13 +2728,6 @@ pub fn assemble_checked_owner_project<'a>(
                 })
                 .collect::<Result<Vec<_>, OwnerCompatibilityAssemblyError>>()?,
         );
-        diagnostics.extend(
-            shard
-                .diagnostic_templates()
-                .iter()
-                .map(|diagnostic| layout.diagnostic(owner, diagnostic))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
         debug_assert_eq!(dense.statements.len(), shard.rows().statements.len());
     }
     trace_compat_phase(
@@ -2964,9 +2848,7 @@ pub fn assemble_checked_owner_project<'a>(
         &mut phase_started,
         fields.sources.len(),
     );
-    let (order_chains, order_diagnostics) = crate::derive_checked_order_chains(&fields);
-    fields.order_chains = order_chains;
-    diagnostics.extend(order_diagnostics);
+    fields.order_chains = owner_order_chains(project_diagnostic_facts, &layout)?;
     trace_compat_phase(
         trace,
         "order-chains",
@@ -3007,26 +2889,20 @@ pub fn assemble_checked_owner_project<'a>(
         &mut phase_started,
         source_payload_shape_table.len() + function_type_table.entries.len(),
     );
-    let named_value_type_table = match owner_named_value_type_table(&syntax, &fields) {
-        Ok(table) => table,
-        Err(error) => {
-            diagnostics.push(crate::diagnostic_at_line(1, error));
-            NamedValueTypeTable::default()
-        }
-    };
+    let named_value_type_table = owner_named_value_type_table(&syntax, &fields)
+        .map_err(OwnerCompatibilityAssemblyError::new)?;
     trace_compat_phase(
         trace,
         "named-value-table",
         &mut phase_started,
         named_value_type_table.entries.len(),
     );
-    let (output_root_types, output_diagnostics) = owner_output_root_types(&syntax, &fields);
-    diagnostics.extend(output_diagnostics);
-    let (render_slot_table, render_diagnostics) = owner_render_slot_table(&syntax, &fields);
-    diagnostics.extend(render_diagnostics);
-    let (host_port_table, host_diagnostics) =
-        owner_host_port_table(&syntax, &fields, &output_root_types);
-    diagnostics.extend(host_diagnostics);
+    let output_root_types =
+        owner_output_root_types(&syntax, project, project_diagnostic_facts, &fields)?;
+    let render_slot_table =
+        owner_render_slot_table(&syntax, project, project_diagnostic_facts, &fields)?;
+    let host_port_table =
+        owner_host_port_table(project_diagnostic_facts, &fields, &output_root_types)?;
     trace_compat_phase(
         trace,
         "output-render-host-tables",
@@ -3034,7 +2910,7 @@ pub fn assemble_checked_owner_project<'a>(
         output_root_types.len(),
     );
     let lookup = crate::CheckedProgramLookup::new(&fields);
-    if let Err(error) = crate::validate_structural_lowering_metadata(
+    crate::validate_structural_lowering_metadata(
         &fields,
         &lookup,
         &source_payload_shape_table,
@@ -3042,9 +2918,8 @@ pub fn assemble_checked_owner_project<'a>(
         &named_value_type_table,
         &output_root_types,
         &host_port_table,
-    ) {
-        diagnostics.push(crate::diagnostic_at_line(1, error));
-    }
+    )
+    .map_err(OwnerCompatibilityAssemblyError::new)?;
     trace_compat_phase(
         trace,
         "structural-validation",
@@ -3086,4 +2961,27 @@ pub fn assemble_checked_owner_project<'a>(
         diagnostics,
         fingerprint_v1,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_port_resolution_reconciliation_is_exact() {
+        assert!(reconcile_owner_host_port_resolution(None, Ok(HostPortTable::default())).is_ok());
+        assert!(
+            reconcile_owner_host_port_resolution(Some("missing"), Err("missing".to_owned()))
+                .is_ok()
+        );
+        assert!(
+            reconcile_owner_host_port_resolution(Some("missing"), Err("different".to_owned()))
+                .is_err()
+        );
+        assert!(
+            reconcile_owner_host_port_resolution(Some("missing"), Ok(HostPortTable::default()))
+                .is_err()
+        );
+        assert!(reconcile_owner_host_port_resolution(None, Err("missing".to_owned())).is_err());
+    }
 }

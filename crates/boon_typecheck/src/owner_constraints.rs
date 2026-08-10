@@ -21,19 +21,19 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-const OWNER_CONSTRAINT_SEED_DOMAIN_V4: &[u8] = b"boon.owner-constraint-seed.v4\0";
+const OWNER_CONSTRAINT_SEED_DOMAIN_V5: &[u8] = b"boon.owner-constraint-seed.v5\0";
 const OWNER_CONSTRAINT_TOPOLOGY_DOMAIN_V2: &[u8] = b"boon.owner-constraint-topology.v2\0";
 const OWNER_DECLARATION_SURFACE_DOMAIN_V1: &[u8] = b"boon.owner-declaration-surface.v1\0";
-const OWNER_LEXICAL_PLAN_DOMAIN_V3: &[u8] = b"boon.owner-lexical-plan.v3\0";
-const OWNER_LEXICAL_READS_DOMAIN_V3: &[u8] = b"boon.owner-lexical-reads.v3\0";
+const OWNER_LEXICAL_PLAN_DOMAIN_V4: &[u8] = b"boon.owner-lexical-plan.v4\0";
+const OWNER_LEXICAL_READS_DOMAIN_V4: &[u8] = b"boon.owner-lexical-reads.v4\0";
 const OWNER_LEXICAL_BOUNDARY_BINDINGS_DOMAIN_V1: &[u8] =
     b"boon.owner-lexical-boundary-bindings.v1\0";
 const OWNER_LEXICAL_CONTAINMENT_DOMAIN_V2: &[u8] = b"boon.owner-lexical-containment.v2\0";
 const OWNER_SIGNATURE_REGION_INDEX_DOMAIN_V2: &[u8] = b"boon.owner-signature-region-index.v2\0";
-const OWNER_RESOLVED_CONSTRAINT_SUMMARY_DOMAIN_V2: &[u8] =
-    b"boon.owner-resolved-constraint-summary.v2\0";
-const OWNER_RESOLVED_CONSTRAINT_TOPOLOGY_DOMAIN_V2: &[u8] =
-    b"boon.owner-resolved-constraint-topology.v2\0";
+const OWNER_RESOLVED_CONSTRAINT_SUMMARY_DOMAIN_V3: &[u8] =
+    b"boon.owner-resolved-constraint-summary.v3\0";
+const OWNER_RESOLVED_CONSTRAINT_TOPOLOGY_DOMAIN_V3: &[u8] =
+    b"boon.owner-resolved-constraint-topology.v3\0";
 const OWNER_INTERFACE_COMPONENT_DOMAIN_V2: &[u8] = b"boon.owner-interface-component.v2\0";
 const OWNER_INTERFACE_SCC_DOMAIN_V2: &[u8] = b"boon.owner-interface-scc.v2\0";
 const OWNER_INTERFACE_TOPOLOGY_DOMAIN_V2: &[u8] = b"boon.owner-interface-topology.v2\0";
@@ -1790,7 +1790,7 @@ fn resolve_owner_constraint_seed_with_effective_resolutions_impl(
         .into_iter()
         .collect::<Vec<_>>();
     let topology_fingerprint_v1 = fingerprint(
-        OWNER_RESOLVED_CONSTRAINT_TOPOLOGY_DOMAIN_V2,
+        OWNER_RESOLVED_CONSTRAINT_TOPOLOGY_DOMAIN_V3,
         &(
             stable_check_owner_key_fingerprint_v1(&seed.owner),
             seed.topology_fingerprint_v1(),
@@ -1798,7 +1798,7 @@ fn resolve_owner_constraint_seed_with_effective_resolutions_impl(
         ),
     )?;
     let fingerprint_v1 = fingerprint(
-        OWNER_RESOLVED_CONSTRAINT_SUMMARY_DOMAIN_V2,
+        OWNER_RESOLVED_CONSTRAINT_SUMMARY_DOMAIN_V3,
         &(
             stable_check_owner_key_fingerprint_v1(&seed.owner),
             seed.fingerprint_v1(),
@@ -2903,6 +2903,29 @@ pub fn project_owner_lexical_plan(
             },
         )?;
     }
+    for (index, statement) in input.statements.iter().enumerate() {
+        let AstStatementKind::Hold {
+            name: Some(name), ..
+        } = &statement.kind
+        else {
+            continue;
+        };
+        let Some(scope) = statement_body_scopes[index] else {
+            continue;
+        };
+        // A HOLD's authored state name is an alias for the state declaration,
+        // visible only within the update body. It must not fall through to
+        // project-symbol lookup merely because the public statement is named
+        // by its containing field.
+        insert_lexical_declaration(
+            &mut declarations,
+            scope,
+            name.clone(),
+            OwnerLexicalDeclarationTarget::Statement {
+                statement: statement.id,
+            },
+        )?;
+    }
     if let Some(statement) = input.statements.first()
         && let AstStatementKind::Function { parameters, .. } = &statement.kind
         && let Some(scope) = statement_body_scopes.first().copied().flatten()
@@ -3166,7 +3189,7 @@ pub fn project_owner_lexical_plan(
     let external_candidates = external_candidates.into_iter().collect::<Vec<_>>();
     let syntax_fingerprint_v1 = input.fingerprint_v1();
     let reads_fingerprint_v1 = fingerprint(
-        OWNER_LEXICAL_READS_DOMAIN_V3,
+        OWNER_LEXICAL_READS_DOMAIN_V4,
         &(stable_check_owner_key_fingerprint_v1(&input.owner), &reads),
     )?;
     let signature_region_fingerprint_v1 = fingerprint(
@@ -3189,7 +3212,7 @@ pub fn project_owner_lexical_plan(
         fingerprint_v1: signature_region_fingerprint_v1,
     });
     let fingerprint_v1 = fingerprint(
-        OWNER_LEXICAL_PLAN_DOMAIN_V3,
+        OWNER_LEXICAL_PLAN_DOMAIN_V4,
         &(
             stable_check_owner_key_fingerprint_v1(&input.owner),
             syntax_fingerprint_v1,
@@ -4257,7 +4280,7 @@ pub fn project_owner_constraint_seed_with_lexical_plan(
         ),
     )?;
     let fingerprint_v1 = fingerprint(
-        OWNER_CONSTRAINT_SEED_DOMAIN_V4,
+        OWNER_CONSTRAINT_SEED_DOMAIN_V5,
         &(
             stable_check_owner_key_fingerprint_v1(&input.owner),
             lexical_plan.reads_fingerprint_v1(),
@@ -4394,6 +4417,42 @@ mod tests {
     }
 
     #[test]
+    fn lexical_plan_binds_hold_state_name_inside_the_update_body() {
+        let unit = link(concat!(
+            "FUNCTION toggle() {\n",
+            "    mode: Light |> HOLD state {\n",
+            "        state |> WHEN { Light => Dark, Dark => Light }\n",
+            "    }\n",
+            "    mode\n",
+            "}\n",
+        ));
+        let owner = owner_named(&unit, "toggle");
+        let syntax = project_owner_syntax_input(unit.owner_view_for_key(&owner).unwrap()).unwrap();
+        let plan = project_owner_lexical_plan(&syntax).unwrap();
+
+        let state_read = syntax
+            .expressions
+            .iter()
+            .zip(plan.reads())
+            .find_map(|(expression, read)| {
+                matches!(&expression.kind, AstExprKind::Identifier(name) if name == "state")
+                    .then_some(read)
+            })
+            .and_then(Option::as_ref)
+            .expect("HOLD body must contain the state read");
+        assert!(matches!(
+            state_read.target,
+            OwnerLexicalDeclarationTarget::Statement { .. }
+        ));
+        assert!(
+            plan.external_candidates()
+                .iter()
+                .all(|reference| reference.parts.as_ref() != ["state"]),
+            "the HOLD state alias must not become a project-symbol candidate"
+        );
+    }
+
+    #[test]
     fn wide_block_children_share_one_authored_binding_environment() {
         let unit = link(concat!(
             "container: BLOCK {\n",
@@ -4438,6 +4497,56 @@ mod tests {
             changed.fingerprint_v1(),
             children[0].bindings.fingerprint_v1(),
             "binding content changes must invalidate the shared environment identity",
+        );
+    }
+
+    #[test]
+    fn nested_function_boundary_resets_inherited_lexical_bindings() {
+        let unit = link(concat!(
+            "container: BLOCK {\n",
+            "    outer: 1\n",
+            "    FUNCTION helper() { outer }\n",
+            "}\n",
+        ));
+        let container = owner_named(&unit, "container");
+        let container_syntax =
+            project_owner_syntax_input(unit.owner_view_for_key(&container).unwrap()).unwrap();
+        let container_plan = project_owner_lexical_plan(&container_syntax).unwrap();
+        let helper = container_plan
+            .signature_regions()
+            .containment()
+            .children
+            .iter()
+            .find(|child| {
+                matches!(
+                    &child.owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| {
+                            segment.names.as_ref() == ["helper"]
+                        })
+                )
+            })
+            .expect("nested FUNCTION boundary");
+        assert!(!helper.inherits_lexical_environment());
+        assert_eq!(helper.bindings.len(), 0);
+
+        let helper_syntax =
+            project_owner_syntax_input(unit.owner_view_for_key(&helper.owner).unwrap()).unwrap();
+        let helper_plan = project_owner_lexical_plan(&helper_syntax).unwrap();
+        assert!(
+            helper_syntax
+                .expressions
+                .iter()
+                .zip(helper_plan.reads())
+                .filter(|(expression, _)| {
+                    matches!(&expression.kind, AstExprKind::Identifier(name) if name == "outer")
+                })
+                .all(|(_, read)| {
+                    !matches!(
+                        read.as_ref().map(|read| &read.target),
+                        Some(OwnerLexicalDeclarationTarget::Imported { .. })
+                    )
+                })
         );
     }
 

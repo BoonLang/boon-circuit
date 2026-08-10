@@ -169,6 +169,58 @@ pub struct CheckedDiagnosticsProfile {
     pub total_ms: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CompilerDiagnosticsProfile {
+    pub source_unit_count: usize,
+    pub owner_count: usize,
+    /// Raw parser-arena expressions, including unreachable parser-internal rows.
+    pub expression_count: usize,
+    /// Reachable semantic expressions covered by owner body inference.
+    pub checked_expression_count: usize,
+    pub call_count: usize,
+    pub diagnostic_count: usize,
+    pub parse_work: ParseWorkCounters,
+    pub owner_work: boon_typecheck::OwnerBodyInferenceWork,
+    pub parse_ms: f64,
+    pub typecheck_ms: f64,
+    pub total_ms: f64,
+}
+
+/// Complete construction-independent diagnostics for one compiler-session
+/// revision. This artifact proves exact owner coverage without pretending that
+/// checked rows, editor tables, or an executable construction were requested.
+pub struct CompilerDiagnostics {
+    pub syntax: ProjectSyntaxSnapshot,
+    diagnostics: Box<[boon_checked::TypeDiagnostic]>,
+    full_document_typecheck_coverage: bool,
+    fingerprint_v1: [u8; 32],
+    pub profile: CompilerDiagnosticsProfile,
+}
+
+impl CompilerDiagnostics {
+    pub fn diagnostics(&self) -> &[boon_checked::TypeDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub fn has_errors(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == boon_checked::DiagnosticSeverity::Error)
+    }
+
+    pub const fn full_document_typecheck_coverage(&self) -> bool {
+        self.full_document_typecheck_coverage
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+
+    pub fn source_bundle_digest_v1(&self) -> boon_contract::SourceBundleDigestV1 {
+        self.syntax.source_bundle_digest_v1()
+    }
+}
+
 pub enum CheckedSourceSyntax {
     Assembled(ParsedProgram),
     UnitNative(ProjectSyntaxSnapshot),
@@ -769,6 +821,46 @@ pub(crate) fn checked_source_from_owner_assembly(
     builtin_signature_coverage.extend(syntax.functions().iter().cloned());
     builtin_signature_coverage.sort();
     builtin_signature_coverage.dedup();
+    // Project facts intentionally retain render-slot failures both in the
+    // complete flat diagnostic aggregate and on the render slot that owns
+    // their editor presentation. A checked report historically exposes slot
+    // failures through the slot table, so remove those exact rows from its
+    // flat channel instead of counting and presenting one fact twice.
+    let render_diagnostics = metadata
+        .render_slot_table
+        .slots
+        .iter()
+        .flat_map(|slot| &slot.diagnostics)
+        .map(|diagnostic| {
+            (
+                match diagnostic.severity {
+                    boon_checked::DiagnosticSeverity::Error => 0u8,
+                    boon_checked::DiagnosticSeverity::Warning => 1u8,
+                },
+                diagnostic.line,
+                diagnostic.start,
+                diagnostic.end,
+                diagnostic.message.clone(),
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let report_diagnostics = assembly
+        .diagnostics()
+        .iter()
+        .filter(|diagnostic| {
+            !render_diagnostics.contains(&(
+                match diagnostic.severity {
+                    boon_checked::DiagnosticSeverity::Error => 0u8,
+                    boon_checked::DiagnosticSeverity::Warning => 1u8,
+                },
+                diagnostic.line,
+                diagnostic.start,
+                diagnostic.end,
+                diagnostic.message.clone(),
+            ))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let report = boon_checked::TypeCheckReport {
         expression_count: syntax.expression_count(),
         checked_expression_count: fields.expressions.len(),
@@ -793,7 +885,7 @@ pub(crate) fn checked_source_from_owner_assembly(
         resolved_constant_table: boon_checked::ResolvedConstantTable::default(),
         render_slot_table: metadata.render_slot_table.clone(),
         constraints: Vec::new(),
-        diagnostics: assembly.diagnostics().to_vec(),
+        diagnostics: report_diagnostics,
     };
     let construction = (!report.has_errors()).then(|| {
         // SAFETY: `assemble_checked_owner_project` accepts only complete,
@@ -837,6 +929,54 @@ pub(crate) fn checked_source_from_owner_assembly(
             total_ms: parse_ms + typecheck_ms,
         },
     }
+}
+
+pub(crate) fn compiler_diagnostics_from_owner_aggregate(
+    syntax: ProjectSyntaxSnapshot,
+    aggregate: &boon_typecheck::OwnerDiagnosticsAggregate,
+    parse_work: ParseWorkCounters,
+    parse_ms: f64,
+    typecheck_ms: f64,
+) -> CompilerResult<CompilerDiagnostics> {
+    let source_bundle_digest_v1 = syntax.source_bundle_digest_v1();
+    if aggregate.source_bundle_digest_v1() != source_bundle_digest_v1 {
+        return Err("compiler diagnostics aggregate has a different source bundle".into());
+    }
+    let owner_count = usize::try_from(aggregate.owner_count())
+        .map_err(|_| "compiler diagnostics owner count exceeds usize")?;
+    let checked_expression_count = usize::try_from(aggregate.expression_count())
+        .map_err(|_| "compiler diagnostics expression count exceeds usize")?;
+    let call_count = usize::try_from(aggregate.call_count())
+        .map_err(|_| "compiler diagnostics call count exceeds usize")?;
+    let full_document_typecheck_coverage =
+        checked_expression_count == syntax.check_expression_count();
+    if !full_document_typecheck_coverage {
+        return Err(format!(
+            "compiler diagnostics owner coverage has {checked_expression_count} expressions for {} reachable syntax expressions",
+            syntax.check_expression_count(),
+        )
+        .into());
+    }
+    let diagnostics = aggregate.diagnostics().to_vec().into_boxed_slice();
+    Ok(CompilerDiagnostics {
+        profile: CompilerDiagnosticsProfile {
+            source_unit_count: syntax.units().len(),
+            owner_count,
+            expression_count: syntax.expression_count(),
+            checked_expression_count,
+            call_count,
+            diagnostic_count: diagnostics.len(),
+            parse_work,
+            owner_work: aggregate.work(),
+            parse_ms,
+            typecheck_ms,
+            total_ms: parse_ms + typecheck_ms,
+        },
+        syntax,
+        diagnostics,
+        full_document_typecheck_coverage,
+        fingerprint_v1: aggregate.fingerprint_v1(),
+    })
 }
 
 fn check_parsed_source_with_ownership(

@@ -1,7 +1,7 @@
 use boon_compiler::{
     CancellationToken, CheckedCompileRequest, CompileIntent, CompilerCheckRequest, CompilerProject,
-    CompilerSession, UnitUpdate, check_diagnostics_source, check_runtime_source,
-    compiler_source_project_for_path, finish_checked_sealed_machine_plan,
+    CompilerSession, UnitUpdate, check_runtime_source, compiler_source_project_for_path,
+    finish_checked_sealed_machine_plan,
 };
 use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile};
 use serde::Serialize;
@@ -14,7 +14,7 @@ use crate::{
     CompilerAllocationCounters, compiler_allocation_counters, reset_compiler_allocation_counters,
 };
 
-const FORMAT_VERSION: u16 = 4;
+const FORMAT_VERSION: u16 = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -177,7 +177,7 @@ struct Sample {
     elapsed_ms: f64,
     peak_rss_kib: u64,
     source_bundle_digest_v1: String,
-    checked_result_sha256: Option<String>,
+    diagnostics_fingerprint_v1: Option<String>,
     diagnostic_count: usize,
     full_document_typecheck_coverage: Option<bool>,
     plan_sha256: Option<String>,
@@ -265,6 +265,18 @@ struct TypeCheckWorkSample {
     diagnostic_replay_hits: u64,
     diagnostic_replay_misses: u64,
     diagnostic_replay_unique_expressions: u64,
+    owner_statements: u64,
+    owner_expressions: u64,
+    owner_local_constraints: u64,
+    owner_interface_imports: u64,
+    owner_interface_plan_direct_owners: u64,
+    owner_interface_plan_required_owners: u64,
+    owner_interface_plan_provider_sccs: u64,
+    owner_interface_plan_result_transfers: u64,
+    owner_interface_plan_transfer_nodes: u64,
+    owner_interface_plan_transfer_edges: u64,
+    owner_calls: u64,
+    owner_unification_steps: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -346,6 +358,28 @@ macro_rules! typecheck_work_sample {
             diagnostic_replay_hits: work.diagnostic_replay_hits,
             diagnostic_replay_misses: work.diagnostic_replay_misses,
             diagnostic_replay_unique_expressions: work.diagnostic_replay_unique_expressions,
+            ..TypeCheckWorkSample::default()
+        }
+    }};
+}
+
+macro_rules! owner_work_sample {
+    ($work:expr) => {{
+        let work = $work;
+        TypeCheckWorkSample {
+            owner_statements: work.statements,
+            owner_expressions: work.expressions,
+            owner_local_constraints: work.local_constraints,
+            owner_interface_imports: work.interface_imports,
+            owner_interface_plan_direct_owners: work.interface_plan_direct_owners,
+            owner_interface_plan_required_owners: work.interface_plan_required_owners,
+            owner_interface_plan_provider_sccs: work.interface_plan_provider_sccs,
+            owner_interface_plan_result_transfers: work.interface_plan_result_transfers,
+            owner_interface_plan_transfer_nodes: work.interface_plan_transfer_nodes,
+            owner_interface_plan_transfer_edges: work.interface_plan_transfer_edges,
+            owner_calls: work.calls,
+            owner_unification_steps: work.unification_steps,
+            ..TypeCheckWorkSample::default()
         }
     }};
 }
@@ -578,20 +612,20 @@ fn warm_session_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>
             diagnostics_work,
             diagnostics_phase,
         ) = {
-            let checked = diagnostics_result
+            let diagnostics = diagnostics_result
                 .diagnostics()
-                .ok_or("warm diagnostics request returned no checked result")?;
-            if checked.output.report.has_errors() {
+                .ok_or("warm diagnostics request returned no diagnostics result")?;
+            if diagnostics.has_errors() {
                 return Err(format!(
                     "warm edit revision {} produced {} diagnostic(s)",
-                    revision.0, checked.profile.diagnostic_count
+                    revision.0, diagnostics.profile.diagnostic_count
                 )
                 .into());
             }
-            let (work, phase) = checked_work_and_phase(checked)?;
+            let (work, phase) = diagnostics_work_and_phase(diagnostics);
             (
-                checked.profile.diagnostic_count,
-                checked.output.report.full_document_typecheck_coverage,
+                diagnostics.profile.diagnostic_count,
+                diagnostics.full_document_typecheck_coverage(),
                 work,
                 phase,
             )
@@ -877,23 +911,18 @@ fn synthetic_scaling_sample(args: &[String]) -> Result<(), Box<dyn std::error::E
     let peak_rss_kib = peak_rss_kib();
     let (source_bundle_digest_v1, plan_sha256, work, phase) = match intent {
         SampleIntent::Diagnostics => {
-            let checked = result
+            let diagnostics = result
                 .diagnostics()
-                .ok_or("synthetic diagnostics returned no checked result")?;
-            if checked.output.report.has_errors() {
+                .ok_or("synthetic diagnostics returned no diagnostics result")?;
+            if diagnostics.has_errors() {
                 return Err(format!(
                     "synthetic {dimension}/{size} produced {} diagnostic(s)",
-                    checked.profile.diagnostic_count
+                    diagnostics.profile.diagnostic_count
                 )
                 .into());
             }
-            let source_digest = checked
-                .output
-                .checked_program_fields()
-                .ok_or("synthetic diagnostics produced no checked construction")?
-                .source_bundle_digest_v1
-                .to_string();
-            let (work, phase) = checked_work_and_phase(checked)?;
+            let source_digest = diagnostics.source_bundle_digest_v1().to_string();
+            let (work, phase) = diagnostics_work_and_phase(diagnostics);
             (source_digest, None, work, phase)
         }
         SampleIntent::Verified => {
@@ -1029,29 +1058,25 @@ fn synthetic_units_sha256(units: &[boon_compiler::CompilerSourceUnit]) -> String
     hex_digest(hasher.finalize())
 }
 
-fn checked_work_and_phase(
-    checked: &boon_compiler::CheckedSourceFromSource,
-) -> Result<(WorkSample, PhaseSample), Box<dyn std::error::Error>> {
-    let program = checked
-        .output
-        .checked_program_fields()
-        .ok_or("checked measurement result has no checked construction")?;
-    Ok((
+fn diagnostics_work_and_phase(
+    diagnostics: &boon_compiler::CompilerDiagnostics,
+) -> (WorkSample, PhaseSample) {
+    (
         WorkSample {
-            source_units: checked.profile.source_unit_count,
-            parsed_expressions: checked.profile.expression_count,
-            checked_expressions: checked.output.report.checked_expression_count,
-            checked_calls: program.calls.len(),
-            parse: parser_work_sample!(checked.profile.parse_work),
-            typecheck: typecheck_work_sample!(checked.profile.typecheck_work),
+            source_units: diagnostics.profile.source_unit_count,
+            parsed_expressions: diagnostics.profile.expression_count,
+            checked_expressions: diagnostics.profile.checked_expression_count,
+            checked_calls: diagnostics.profile.call_count,
+            parse: parser_work_sample!(diagnostics.profile.parse_work),
+            typecheck: owner_work_sample!(diagnostics.profile.owner_work),
             ..WorkSample::default()
         },
         PhaseSample {
-            parse_ms: checked.profile.parse_ms,
-            typecheck_ms: checked.profile.typecheck_ms,
+            parse_ms: diagnostics.profile.parse_ms,
+            typecheck_ms: diagnostics.profile.typecheck_ms,
             ..PhaseSample::default()
         },
-    ))
+    )
 }
 
 fn compiled_work_and_phase(
@@ -1117,50 +1142,7 @@ fn required_usize_option(
 }
 
 fn diagnostics_sample(source: &Path) -> Result<Sample, Box<dyn std::error::Error>> {
-    reset_compiler_allocation_counters();
-    let observation_started_unix_us = unix_time_us()?;
-    let started = Instant::now();
-    let checked = check_diagnostics_source(CompilerCheckRequest::source_path(
-        source,
-        ProgramRole::Client,
-    ))?;
-    let elapsed_ms = duration_ms(started.elapsed());
-    let allocations = compiler_allocation_counters().into();
-    let compiler_artifact_ready_unix_us = unix_time_us()?;
-    let compiler_peak_rss_kib = peak_rss_kib();
-    let program = checked
-        .output
-        .checked_program_fields()
-        .ok_or("valid performance fixture produced no checked construction")?;
-    if checked.output.report.has_errors() {
-        return Err(format!(
-            "performance fixture produced {} diagnostic(s)",
-            checked.profile.diagnostic_count
-        )
-        .into());
-    }
-    let checked_result_sha256 = checked_result_sha256(&checked)?;
-    Ok(Sample {
-        producer_pid: std::process::id(),
-        observation_started_unix_us,
-        compiler_artifact_ready_unix_us,
-        elapsed_ms,
-        peak_rss_kib: compiler_peak_rss_kib,
-        source_bundle_digest_v1: program.source_bundle_digest_v1.to_string(),
-        checked_result_sha256: Some(checked_result_sha256),
-        diagnostic_count: checked.profile.diagnostic_count,
-        full_document_typecheck_coverage: Some(
-            checked.output.report.full_document_typecheck_coverage,
-        ),
-        plan_sha256: None,
-        allocations,
-        work: checked_work_and_phase(&checked)?.0,
-        phase: PhaseSample {
-            parse_ms: checked.profile.parse_ms,
-            typecheck_ms: checked.profile.typecheck_ms,
-            ..PhaseSample::default()
-        },
-    })
+    session_diagnostics_sample(source)
 }
 
 fn session_diagnostics_sample(source: &Path) -> Result<Sample, Box<dyn std::error::Error>> {
@@ -1183,45 +1165,35 @@ fn session_diagnostics_sample(source: &Path) -> Result<Sample, Box<dyn std::erro
         CompileIntent::Diagnostics,
         &CancellationToken::new(),
     )?;
-    let checked = result
+    let diagnostics = result
         .diagnostics()
-        .ok_or("diagnostics session request returned no checked result")?;
+        .ok_or("diagnostics session request returned no diagnostics result")?;
     let elapsed_ms = duration_ms(started.elapsed());
     let allocations = compiler_allocation_counters().into();
     let compiler_artifact_ready_unix_us = unix_time_us()?;
     let compiler_peak_rss_kib = peak_rss_kib();
-    let program = checked
-        .output
-        .checked_program_fields()
-        .ok_or("valid performance fixture produced no checked construction")?;
-    if checked.output.report.has_errors() {
+    if diagnostics.has_errors() {
         return Err(format!(
             "performance fixture produced {} diagnostic(s)",
-            checked.profile.diagnostic_count
+            diagnostics.profile.diagnostic_count
         )
         .into());
     }
-    let checked_result_sha256 = checked_result_sha256(checked)?;
+    let (work, phase) = diagnostics_work_and_phase(diagnostics);
     Ok(Sample {
         producer_pid: std::process::id(),
         observation_started_unix_us,
         compiler_artifact_ready_unix_us,
         elapsed_ms,
         peak_rss_kib: compiler_peak_rss_kib,
-        source_bundle_digest_v1: program.source_bundle_digest_v1.to_string(),
-        checked_result_sha256: Some(checked_result_sha256),
-        diagnostic_count: checked.profile.diagnostic_count,
-        full_document_typecheck_coverage: Some(
-            checked.output.report.full_document_typecheck_coverage,
-        ),
+        source_bundle_digest_v1: diagnostics.source_bundle_digest_v1().to_string(),
+        diagnostics_fingerprint_v1: Some(hex_digest(diagnostics.fingerprint_v1())),
+        diagnostic_count: diagnostics.profile.diagnostic_count,
+        full_document_typecheck_coverage: Some(diagnostics.full_document_typecheck_coverage()),
         plan_sha256: None,
         allocations,
-        work: checked_work_and_phase(checked)?.0,
-        phase: PhaseSample {
-            parse_ms: checked.profile.parse_ms,
-            typecheck_ms: checked.profile.typecheck_ms,
-            ..PhaseSample::default()
-        },
+        work,
+        phase,
     })
 }
 
@@ -1311,7 +1283,7 @@ fn compiled_sample(
         elapsed_ms,
         peak_rss_kib: compiler_peak_rss_kib,
         source_bundle_digest_v1: compiled.source_bundle_digest_v1.to_string(),
-        checked_result_sha256: None,
+        diagnostics_fingerprint_v1: None,
         diagnostic_count: 0,
         full_document_typecheck_coverage: None,
         plan_sha256: Some(plan_sha256),
@@ -1329,21 +1301,6 @@ fn compiled_sample(
             serialization_ms,
         },
     })
-}
-
-fn checked_result_sha256(
-    checked: &boon_compiler::CheckedSourceFromSource,
-) -> Result<String, serde_json::Error> {
-    let mut hasher = Sha256Writer::default();
-    serde_json::to_writer(
-        &mut hasher,
-        &(
-            checked.syntax.source_bundle_digest_v1(),
-            checked.output.checked_program_fields(),
-            &checked.output.report,
-        ),
-    )?;
-    Ok(hex_digest(hasher.finish()))
 }
 
 #[derive(Default)]

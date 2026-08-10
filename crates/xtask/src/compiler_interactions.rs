@@ -10,10 +10,10 @@ use crate::report_v2::{
     unix_time_ms,
 };
 
-const FORMAT_VERSION: u16 = 3;
-const PRODUCER_FORMAT_VERSION: u16 = 4;
+const FORMAT_VERSION: u16 = 4;
+const PRODUCER_FORMAT_VERSION: u16 = 5;
 const BUDGET_FORMAT_VERSION: u16 = 2;
-const REPORT_CONTRACT: &str = "boon-compiler-interactions-v2";
+const REPORT_CONTRACT: &str = "boon-compiler-interactions-v3";
 const DEFAULT_BUDGET: &str = "budgets/compiler.toml";
 const PRODUCER_PATH: &str = "target/release/boon_cli";
 const MAX_BUDGET_BYTES: u64 = 64 * 1024;

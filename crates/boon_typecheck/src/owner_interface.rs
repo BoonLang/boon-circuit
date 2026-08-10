@@ -22,11 +22,11 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V3: &[u8] = b"boon.owner-interface-scc-result.v3\0";
+const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V4: &[u8] = b"boon.owner-interface-scc-result.v4\0";
 const OWNER_INTERFACE_SCC_KEY_DOMAIN_V1: &[u8] = b"boon.owner-interface-scc-key.v1\0";
-const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V4: &[u8] =
-    b"boon.owner-interface-scc-currentness.v4\0";
-const OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V2: &[u8] = b"boon.owner-body-interface-import.v2\0";
+const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V5: &[u8] =
+    b"boon.owner-interface-scc-currentness.v5\0";
+const OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V3: &[u8] = b"boon.owner-body-interface-import.v3\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerInterfaceParameter {
@@ -93,6 +93,7 @@ pub struct OwnerResultAbiContract {
     pub kind: boon_checked::CheckedCallableKind,
     pub parameters: Box<[OwnerResultAbiParameterContract]>,
     pub result: FlowType,
+    pub result_specialization: crate::OwnerAbiResultSpecialization,
 }
 
 impl From<&crate::OwnerInferenceCallableContract> for OwnerResultAbiContract {
@@ -111,6 +112,7 @@ impl From<&crate::OwnerInferenceCallableContract> for OwnerResultAbiContract {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             result: contract.result.clone(),
+            result_specialization: contract.result_specialization,
         }
     }
 }
@@ -330,7 +332,7 @@ impl OwnerInterfaceSccCurrentnessReceipt {
         }
         let result_fingerprint_v1 = result.fingerprint_v1();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V4,
+            OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V5,
             &(&basis, result_fingerprint_v1),
         )
         .map_err(|error| {
@@ -779,6 +781,17 @@ impl TypeUnifier {
         match (left, right) {
             (Type::Var(left), Type::Var(right)) => self.union(left, right),
             (Type::Var(variable), ty) | (ty, Type::Var(variable)) => self.bind_var(variable, ty),
+            (Type::Union(members), ty) | (ty, Type::Union(members)) => {
+                // A flow join may retain an unresolved branch beside already
+                // concrete alternatives. A later equality/ABI requirement
+                // constrains every branch, so propagate it into the holes
+                // instead of leaving `VALUE | True | False` generic forever.
+                // Concrete mismatches remain untouched here and are reported
+                // by the exact assignability validator.
+                for member in members.iter() {
+                    self.unify(member.clone(), ty.clone());
+                }
+            }
             (Type::Object(left), Type::Object(right)) => {
                 for (name, left_ty) in &left.fields {
                     if let Some(right_ty) = right.fields.get(name) {
@@ -1141,6 +1154,7 @@ pub(crate) fn refine_owner_pattern_narrowings(
 
 #[derive(Clone)]
 struct InstantiatedInterfaceParameter {
+    name: String,
     ordinal: u32,
     ty: Type,
     mode: FlowMode,
@@ -1423,23 +1437,26 @@ fn initialize_lexical_declaration_variables(
                 ) {
                     continue;
                 }
-                let expression = state
-                    .seed
-                    .statement_values
-                    .iter()
-                    .find_map(|(candidate, expression)| {
-                        (candidate == statement).then_some(*expression)
-                    })
-                    .ok_or_else(|| {
-                        OwnerConstraintSeedError::new(format!(
-                            "interface value declaration references valueless statement {statement}"
-                        ))
-                    })?;
-                expression_boundary_variable(state, expression, unifier).ok_or_else(|| {
-                    OwnerConstraintSeedError::new(
-                        "interface statement value is outside its expression namespace",
-                    )
-                })?
+                let expression =
+                    state
+                        .seed
+                        .statement_values
+                        .iter()
+                        .find_map(|(candidate, expression)| {
+                            (candidate == statement).then_some(*expression)
+                        });
+                if let Some(expression) = expression {
+                    expression_boundary_variable(state, expression, unifier).ok_or_else(|| {
+                        OwnerConstraintSeedError::new(
+                            "interface statement value is outside its expression namespace",
+                        )
+                    })?
+                } else {
+                    // Valueless authored fields remain real declarations with
+                    // an Unknown continuous surface. They are required by
+                    // render/output metadata even when no read demands them.
+                    unifier.fresh()
+                }
             }
             OwnerLexicalDeclarationTarget::RecordField {
                 object, ordinal, ..
@@ -1758,26 +1775,25 @@ fn lexical_declaration_mode(
                 })?;
             match local {
                 OwnerLexicalDeclarationTarget::Statement { statement } => {
-                    let expression = state
-                        .seed
-                        .statement_values
-                        .iter()
-                        .find_map(|(candidate, expression)| {
-                            (candidate == statement).then_some(*expression as usize)
-                        })
-                        .ok_or_else(|| {
-                            OwnerConstraintSeedError::new(
-                                "interface lexical statement has no value expression",
-                            )
-                        })?;
-                    Ok(Some(
+                    let expression =
                         state
-                            .modes
-                            .get(expression)
-                            .copied()
-                            .flatten()
-                            .unwrap_or(FlowMode::Continuous),
-                    ))
+                            .seed
+                            .statement_values
+                            .iter()
+                            .find_map(|(candidate, expression)| {
+                                (candidate == statement).then_some(*expression as usize)
+                            });
+                    Ok(Some(expression.map_or(
+                        FlowMode::Continuous,
+                        |expression| {
+                            state
+                                .modes
+                                .get(expression)
+                                .copied()
+                                .flatten()
+                                .unwrap_or(FlowMode::Continuous)
+                        },
+                    )))
                 }
                 OwnerLexicalDeclarationTarget::RecordField {
                     object,
@@ -3923,6 +3939,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 parameters,
                 call_contexts,
                 result,
+                result_specialization,
                 result_flush,
                 result_mode,
                 context,
@@ -3934,6 +3951,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         .parameters
                         .iter()
                         .map(|parameter| InstantiatedInterfaceParameter {
+                            name: parameter.name.clone(),
                             ordinal: parameter.ordinal,
                             ty: instantiate_type(
                                 &unifier.resolve(&Type::Var(parameter.variable)),
@@ -3974,6 +3992,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         parameters,
                         Vec::new(),
                         result,
+                        crate::OwnerAbiResultSpecialization::Fixed,
                         result_flush,
                         result_mode,
                         Some(context),
@@ -3985,6 +4004,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         .parameters
                         .iter()
                         .map(|parameter| InstantiatedInterfaceParameter {
+                            name: parameter.name.clone(),
                             ordinal: parameter.ordinal,
                             ty: instantiate_type(
                                 &parameter.flow_type.ty,
@@ -4012,6 +4032,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         parameters,
                         Vec::new(),
                         result,
+                        crate::OwnerAbiResultSpecialization::Fixed,
                         result_flush,
                         callee.result.mode,
                         context,
@@ -4023,6 +4044,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         Vec::new(),
                         Vec::new(),
                         Type::Unknown,
+                        crate::OwnerAbiResultSpecialization::Fixed,
                         Type::Absent,
                         FlowMode::Continuous,
                         None,
@@ -4036,6 +4058,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                     .iter()
                     .enumerate()
                     .map(|(ordinal, parameter)| InstantiatedInterfaceParameter {
+                        name: parameter.name.clone(),
                         ordinal: ordinal as u32,
                         ty: instantiate_type(
                             &parameter.flow_type.ty,
@@ -4072,6 +4095,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                     parameters,
                     call_contexts,
                     result,
+                    signature.result_specialization,
                     Type::Absent,
                     signature.result.mode,
                     None,
@@ -4083,6 +4107,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                     Vec::new(),
                     Vec::new(),
                     Type::Unknown,
+                    crate::OwnerAbiResultSpecialization::Fixed,
                     Type::Absent,
                     FlowMode::Continuous,
                     None,
@@ -4106,6 +4131,20 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 && (has_explicit_pass || context.is_none() || caller_context.is_some());
 
             let call_variable = caller.expressions[call.expression];
+            let result = crate::specialize_owner_abi_result_type(
+                &result,
+                result_specialization,
+                signature_call.matched_inputs.iter().filter_map(|planned| {
+                    let parameter = parameters
+                        .binary_search_by_key(&planned.formal_ordinal, |parameter| {
+                            parameter.ordinal
+                        })
+                        .ok()
+                        .and_then(|index| parameters.get(index))?;
+                    let input = expression_variable(caller, planned.expression)?;
+                    Some((parameter.name.clone(), Type::Var(input)))
+                }),
+            );
             if call_valid
                 && !has_explicit_pass
                 && let Some(context) = &context
@@ -4450,7 +4489,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
             fingerprint_v1: [0; 32],
         };
         interface.fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V2,
+            OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V3,
             &interface,
         )
         .map_err(|error| {
@@ -4462,7 +4501,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
     }
     work.unification_steps = unifier.steps;
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_INTERFACE_SCC_RESULT_DOMAIN_V3,
+        OWNER_INTERFACE_SCC_RESULT_DOMAIN_V4,
         &(&scc.key, &interfaces, next_alpha),
     )
     .map_err(|error| {
@@ -4904,6 +4943,29 @@ mod tests {
                 transformed
             ));
         }
+    }
+
+    #[test]
+    fn union_equality_constrains_unresolved_flow_branches() {
+        let mut unifier = TypeUnifier::default();
+        let unresolved = unifier.fresh();
+        let boolean = Type::VariantSet(boon_checked::SharedVariantSet::new(vec![
+            Variant::Tag("False".to_owned()),
+            Variant::Tag("True".to_owned()),
+        ]));
+        let joined = boon_checked::canonical_union_type(vec![
+            Type::Var(unresolved),
+            Type::VariantSet(boon_checked::SharedVariantSet::new(vec![Variant::Tag(
+                "False".to_owned(),
+            )])),
+            Type::VariantSet(boon_checked::SharedVariantSet::new(vec![Variant::Tag(
+                "True".to_owned(),
+            )])),
+        ]);
+
+        unifier.unify(joined, boolean.clone());
+
+        assert_eq!(unifier.resolve(&Type::Var(unresolved)), boolean);
     }
 
     #[test]

@@ -35,12 +35,12 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-const OWNER_BODY_INFERENCE_DOMAIN_V5: &[u8] = b"boon.owner-body-inference.v5\0";
-const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V3: &[u8] = b"boon.owner-body-inference-content.v3\0";
-const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V5: &[u8] =
-    b"boon.owner-body-inference-currentness.v5\0";
+const OWNER_BODY_INFERENCE_DOMAIN_V7: &[u8] = b"boon.owner-body-inference.v7\0";
+const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V5: &[u8] = b"boon.owner-body-inference-content.v5\0";
+const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V7: &[u8] =
+    b"boon.owner-body-inference-currentness.v7\0";
 const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V3: &[u8] = b"boon.owner-body-interface-plan.v3\0";
-const OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V2: &[u8] = b"boon.owner-diagnostics-aggregate.v2\0";
+const OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V8: &[u8] = b"boon.owner-diagnostics-aggregate.v8\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerBodyInferenceError {
@@ -432,6 +432,11 @@ pub enum InferredOwnerCallableTarget {
 pub struct InferredOwnerCallInput {
     pub role: OwnerConstraintEdgeRole,
     pub expression: OwnerInferenceExpressionRef,
+    /// Exact source type captured before this consumer's contract can widen
+    /// shared inference roots. Diagnostics and semantic projections use this
+    /// fact instead of attempting to reconstruct a pre-call type from the
+    /// finalized expression row.
+    pub actual_type: Type,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -483,6 +488,41 @@ pub struct OwnerBodyInferenceWork {
     pub interface_plan_transfer_edges: u64,
     pub calls: u64,
     pub unification_steps: u64,
+}
+
+impl OwnerBodyInferenceWork {
+    fn accumulate(&mut self, other: Self) {
+        self.statements = self.statements.saturating_add(other.statements);
+        self.expressions = self.expressions.saturating_add(other.expressions);
+        self.local_constraints = self
+            .local_constraints
+            .saturating_add(other.local_constraints);
+        self.interface_imports = self
+            .interface_imports
+            .saturating_add(other.interface_imports);
+        self.interface_plan_direct_owners = self
+            .interface_plan_direct_owners
+            .saturating_add(other.interface_plan_direct_owners);
+        self.interface_plan_required_owners = self
+            .interface_plan_required_owners
+            .saturating_add(other.interface_plan_required_owners);
+        self.interface_plan_provider_sccs = self
+            .interface_plan_provider_sccs
+            .saturating_add(other.interface_plan_provider_sccs);
+        self.interface_plan_result_transfers = self
+            .interface_plan_result_transfers
+            .saturating_add(other.interface_plan_result_transfers);
+        self.interface_plan_transfer_nodes = self
+            .interface_plan_transfer_nodes
+            .saturating_add(other.interface_plan_transfer_nodes);
+        self.interface_plan_transfer_edges = self
+            .interface_plan_transfer_edges
+            .saturating_add(other.interface_plan_transfer_edges);
+        self.calls = self.calls.saturating_add(other.calls);
+        self.unification_steps = self
+            .unification_steps
+            .saturating_add(other.unification_steps);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -579,7 +619,7 @@ impl OwnerBodyInferenceCurrentnessReceipt {
         }
         let result_fingerprint_v1 = result.fingerprint_v1();
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V5,
+            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V7,
             &(&basis, &interface_imports, result_fingerprint_v1),
         )?;
         Ok(Self {
@@ -719,9 +759,11 @@ pub fn materialize_owner_diagnostics(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerDiagnosticsAggregate {
     source_bundle_digest_v1: SourceBundleDigestV1,
+    project_facts_fingerprint_v1: [u8; 32],
     owner_count: u32,
     expression_count: u32,
     call_count: u32,
+    work: OwnerBodyInferenceWork,
     diagnostics: Box<[TypeDiagnostic]>,
     fingerprint_v1: [u8; 32],
 }
@@ -729,6 +771,10 @@ pub struct OwnerDiagnosticsAggregate {
 impl OwnerDiagnosticsAggregate {
     pub const fn source_bundle_digest_v1(&self) -> SourceBundleDigestV1 {
         self.source_bundle_digest_v1
+    }
+
+    pub const fn project_facts_fingerprint_v1(&self) -> [u8; 32] {
+        self.project_facts_fingerprint_v1
     }
 
     pub const fn owner_count(&self) -> u32 {
@@ -743,6 +789,10 @@ impl OwnerDiagnosticsAggregate {
         self.call_count
     }
 
+    pub const fn work(&self) -> OwnerBodyInferenceWork {
+        self.work
+    }
+
     pub fn diagnostics(&self) -> &[TypeDiagnostic] {
         &self.diagnostics
     }
@@ -752,7 +802,7 @@ impl OwnerDiagnosticsAggregate {
     }
 }
 
-fn canonicalize_diagnostics(diagnostics: &mut Vec<TypeDiagnostic>) {
+pub(crate) fn canonicalize_diagnostics(diagnostics: &mut Vec<TypeDiagnostic>) {
     diagnostics.sort_by(|left, right| {
         let severity = |severity| match severity {
             DiagnosticSeverity::Error => 0u8,
@@ -778,11 +828,17 @@ fn canonicalize_diagnostics(diagnostics: &mut Vec<TypeDiagnostic>) {
 
 pub fn aggregate_owner_diagnostics<'a>(
     project: &ProjectSyntaxSnapshot,
+    project_facts: &crate::ProjectDiagnosticFacts,
     expected_owners: impl IntoIterator<Item = &'a StableCheckOwnerKey>,
     bodies: impl IntoIterator<Item = &'a OwnerBodyInferenceShard>,
     source_maps: impl IntoIterator<Item = &'a OwnerSourceMap>,
 ) -> Result<OwnerDiagnosticsAggregate, OwnerBodyInferenceError> {
     let source_bundle_digest_v1 = project.source_bundle_digest_v1();
+    if project_facts.source_bundle_digest_v1() != source_bundle_digest_v1 {
+        return Err(OwnerBodyInferenceError::new(
+            "owner diagnostics aggregate project facts have a different source bundle",
+        ));
+    }
     let expected_owners = expected_owners
         .into_iter()
         .cloned()
@@ -827,6 +883,7 @@ pub fn aggregate_owner_diagnostics<'a>(
     let mut diagnostics = Vec::new();
     let mut expression_count = 0usize;
     let mut call_count = 0usize;
+    let mut work = OwnerBodyInferenceWork::default();
     let mut basis = Vec::with_capacity(expected_owners.len());
     for owner in &expected_owners {
         let body = bodies_by_owner[owner];
@@ -870,28 +927,35 @@ pub fn aggregate_owner_diagnostics<'a>(
         call_count = call_count
             .checked_add(body.calls.len())
             .ok_or_else(|| OwnerBodyInferenceError::new("owner diagnostics call count overflow"))?;
+        work.accumulate(body.work);
         basis.push((owner, body.fingerprint_v1(), source_map.fingerprint_v2()));
     }
+    diagnostics.extend(project_facts.diagnostics().iter().cloned());
     canonicalize_diagnostics(&mut diagnostics);
     let owner_count = checked_u32(expected_owners.len(), "owner diagnostics owner count")?;
     let expression_count = checked_u32(expression_count, "owner diagnostics expression count")?;
     let call_count = checked_u32(call_count, "owner diagnostics call count")?;
+    let project_facts_fingerprint_v1 = project_facts.fingerprint_v1();
     let fingerprint_v1 = fingerprint(
-        OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V2,
+        OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V8,
         &(
             source_bundle_digest_v1,
             &basis,
+            project_facts_fingerprint_v1,
             owner_count,
             expression_count,
             call_count,
+            work,
             &diagnostics,
         ),
     )?;
     Ok(OwnerDiagnosticsAggregate {
         source_bundle_digest_v1,
+        project_facts_fingerprint_v1,
         owner_count,
         expression_count,
         call_count,
+        work,
         diagnostics: diagnostics.into_boxed_slice(),
         fingerprint_v1,
     })
@@ -1052,24 +1116,21 @@ fn planned_lexical_read_variables(
             ), None),
             OwnerEffectiveLexicalTarget::Static {
                 target: OwnerLexicalDeclarationTarget::Statement { statement },
-            } => (match statement_variables.get(statement).copied() {
-                Some(variable) => Some(variable),
-                None
-                    if syntax
-                        .statements
-                        .get(*statement as usize)
-                        .is_some_and(|statement| {
-                            matches!(statement.kind, AstStatementKind::Function { .. })
-                        }) =>
-                {
+            } => {
+                let statement_row = syntax.statements.get(*statement as usize).ok_or_else(|| {
+                    OwnerBodyInferenceError::new(format!(
+                        "owner body lexical plan references missing statement {statement}"
+                    ))
+                })?;
+                let root = if matches!(statement_row.kind, AstStatementKind::Function { .. }) {
                     None
-                }
-                None => {
-                    return Err(OwnerBodyInferenceError::new(format!(
-                        "owner body lexical plan references valueless statement {statement}"
-                    )));
-                }
-            }, None),
+                } else {
+                    Some(*statement_variables
+                        .entry(*statement)
+                        .or_insert_with(|| unifier.fresh()))
+                };
+                (root, None)
+            }
             OwnerEffectiveLexicalTarget::Static {
                 target:
                     OwnerLexicalDeclarationTarget::RecordField {
@@ -2380,6 +2441,7 @@ fn bind_local_constraints(
 
 #[derive(Clone)]
 struct InstantiatedCallParameter {
+    name: String,
     ordinal: u32,
     flow_type: FlowType,
 }
@@ -2397,6 +2459,7 @@ struct InstantiatedCallSignature {
     parameters: Vec<InstantiatedCallParameter>,
     contexts: Vec<InstantiatedCallContext>,
     result: FlowType,
+    result_specialization: crate::OwnerAbiResultSpecialization,
     result_flush_type: Option<Type>,
     context: Option<Type>,
     effect: CheckedEffectSummary,
@@ -3174,6 +3237,15 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             actuals.insert(parameter.ordinal, actual);
         }
         let mut ty = apply_checked_type_substitution_lookup(&contract.result.ty, &instantiation);
+        ty = crate::specialize_owner_abi_result_type(
+            &ty,
+            contract.result_specialization,
+            contract.parameters.iter().filter_map(|parameter| {
+                actuals
+                    .get(&parameter.ordinal)
+                    .map(|actual| (parameter.name.clone(), actual.flow_type.ty.clone()))
+            }),
+        );
         let named_type = |name: &str| {
             abi_actual_by_name(contract, &actuals, name).map(|value| value.flow_type.ty.clone())
         };
@@ -3341,6 +3413,7 @@ fn instantiate_call_signature(
                 .parameters
                 .iter()
                 .map(|parameter| InstantiatedCallParameter {
+                    name: parameter.name.clone(),
                     ordinal: parameter.ordinal,
                     flow_type: FlowType {
                         mode: parameter.flow_type.mode,
@@ -3353,6 +3426,7 @@ fn instantiate_call_signature(
                 mode: interface.result.mode,
                 ty: instantiate_type(&interface.result.ty, unifier, &mut variables),
             },
+            result_specialization: crate::OwnerAbiResultSpecialization::Fixed,
             result_flush_type: interface
                 .result_flush_type
                 .as_ref()
@@ -3375,6 +3449,7 @@ fn instantiate_call_signature(
             .parameters
             .iter()
             .map(|parameter| InstantiatedCallParameter {
+                name: parameter.name.clone(),
                 ordinal: parameter.ordinal,
                 flow_type: FlowType {
                     mode: parameter.flow_type.mode,
@@ -3405,6 +3480,7 @@ fn instantiate_call_signature(
                 mode: signature.result.mode,
                 ty: instantiate_type(&signature.result.ty, unifier, &mut variables),
             },
+            result_specialization: signature.result_specialization,
             result_flush_type: None,
             context: None,
             effect: signature.effect,
@@ -3699,6 +3775,7 @@ fn bind_calls(
                 parameters,
                 contexts,
                 result,
+                result_specialization,
                 result_flush_type,
                 context,
                 effect,
@@ -3709,6 +3786,7 @@ fn bind_calls(
                     signature.parameters,
                     signature.contexts,
                     signature.result,
+                    signature.result_specialization,
                     signature.result_flush_type,
                     signature.context,
                     signature.effect,
@@ -3768,6 +3846,7 @@ fn bind_calls(
                             mode: FlowMode::Continuous,
                             ty: Type::Unknown,
                         },
+                        crate::OwnerAbiResultSpecialization::Fixed,
                         None,
                         None,
                         CheckedEffectSummary::default(),
@@ -3806,6 +3885,30 @@ fn bind_calls(
                 );
                 valid = false;
             }
+            let result = FlowType {
+                mode: result.mode,
+                ty: crate::specialize_owner_abi_result_type(
+                    &result.ty,
+                    result_specialization,
+                    signature_call
+                        .into_iter()
+                        .flat_map(|call| &call.matched_inputs)
+                        .filter_map(|planned| {
+                            let parameter = parameters
+                                .binary_search_by_key(&planned.formal_ordinal, |parameter| {
+                                    parameter.ordinal
+                                })
+                                .ok()
+                                .and_then(|index| parameters.get(index))?;
+                            let input = expression_variable(
+                                expressions,
+                                external_expressions,
+                                planned.expression,
+                            )?;
+                            Some((parameter.name.clone(), Type::Var(input)))
+                        }),
+                ),
+            };
             if valid && let Some(field) = call.function.strip_prefix("Field/") {
                 if let Some(input) = signature_call.and_then(|call| {
                     call.matched_inputs
@@ -5304,6 +5407,7 @@ fn evaluate_owner_body_impl<'a>(
     let inferred_calls = call_drafts
         .into_iter()
         .map(|draft| {
+            let actual_inputs = &draft.actual_inputs;
             Ok(InferredOwnerCall {
                 expression: draft.plan.stable_expression,
                 function: draft.plan.function,
@@ -5317,6 +5421,13 @@ fn evaluate_owner_body_impl<'a>(
                         Ok(InferredOwnerCallInput {
                             role,
                             expression: inferred_expression_ref(syntax, expression)?,
+                            actual_type: alpha_normalize_type(
+                                &unifier.resolve(
+                                    actual_inputs.get(&expression).unwrap_or(&Type::Unknown),
+                                ),
+                                &mut alpha_variables,
+                                &mut next_alpha,
+                            ),
                         })
                     })
                     .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
@@ -5368,7 +5479,7 @@ fn evaluate_owner_body_impl<'a>(
     let relocations = collect_relocations(seed, summary, &signature_lexical_plan);
 
     let local_content_digest_v1 = fingerprint(
-        OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V3,
+        OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V5,
         &(
             &inferred_statements,
             &inferred_children,
@@ -5393,7 +5504,7 @@ fn evaluate_owner_body_impl<'a>(
     // The construction receipt already commits every semantic row, diagnostic,
     // effect, and row count above. Bind the stable owner to that compact seal
     // instead of serializing the same rich body a second time.
-    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V5, &(&seed.owner, &receipt))?;
+    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V7, &(&seed.owner, &receipt))?;
     work.unification_steps = unifier.steps();
     let result = Arc::new(OwnerBodyInferenceShard {
         owner: seed.owner.clone(),

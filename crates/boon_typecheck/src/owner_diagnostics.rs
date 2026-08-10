@@ -1816,15 +1816,8 @@ impl<'a> ProjectFactIndex<'a> {
 
     fn diagnostic_call_facts(
         &self,
-    ) -> Result<
-        (
-            Vec<(usize, crate::OwnerDiagnosticCallFact)>,
-            Vec<(String, String)>,
-        ),
-        ProjectDiagnosticFactsError,
-    > {
+    ) -> Result<Vec<(usize, crate::OwnerDiagnosticCallFact)>, ProjectDiagnosticFactsError> {
         let mut calls = Vec::with_capacity(self.all_calls.len());
-        let mut user_call_edges = Vec::new();
         for (owner, view) in &self.owners {
             for call in &view.replay.calls {
                 let stable = StableOrderExpression {
@@ -1836,34 +1829,11 @@ impl<'a> ProjectFactIndex<'a> {
                         "owner diagnostic call has no exact project syntax identity",
                     )
                 })?;
-                if let crate::OwnerDiagnosticCallDisposition::User {
-                    owner: callee_owner,
-                } = &call.diagnostic.disposition
-                {
-                    let caller = self
-                        .callable_owner(&stable.owner)
-                        .and_then(|owner| self.owners.get(owner))
-                        .and_then(|view| view.replay.function_name.clone());
-                    let callee = self
-                        .owners
-                        .get(callee_owner)
-                        .and_then(|view| view.replay.function_name.clone())
-                        .ok_or_else(|| {
-                            ProjectDiagnosticFactsError::new(
-                                "valid owner call target has no exact function declaration",
-                            )
-                        })?;
-                    if let Some(caller) = caller {
-                        user_call_edges.push((caller, callee));
-                    }
-                }
                 calls.push((expression, call.diagnostic.clone()));
             }
         }
         calls.sort_unstable_by_key(|(expression, _)| *expression);
-        user_call_edges.sort();
-        user_call_edges.dedup();
-        Ok((calls, user_call_edges))
+        Ok(calls)
     }
 
     fn diagnostic_reads(
@@ -2568,6 +2538,448 @@ fn unique_by_owner<'a, T>(
         }
     }
     Ok(result)
+}
+
+fn syntax_expression_span(
+    index: &ProjectFactIndex<'_>,
+    expression: &boon_syntax::AstExpr,
+) -> Result<TypeDiagnosticSpan, ProjectDiagnosticFactsError> {
+    if let (Some(owner), Some(stable)) = (
+        index
+            .project
+            .stable_check_owner_for_expression(expression.id),
+        index.project.stable_expression_key(expression.id),
+    ) && let Some(span) = index.expression_spans.get(&StableOrderExpression {
+        owner,
+        expression: stable,
+    }) {
+        return Ok(*span);
+    }
+
+    let line = index
+        .project
+        .global_line(expression.id, expression.line)
+        .ok_or_else(|| {
+            ProjectDiagnosticFactsError::new(
+                "project diagnostic expression has no source-unit line projection",
+            )
+        })?;
+    let start = index
+        .project
+        .global_byte(expression.id, expression.start)
+        .ok_or_else(|| {
+            ProjectDiagnosticFactsError::new(
+                "project diagnostic expression has no source-unit start projection",
+            )
+        })?;
+    let end = index
+        .project
+        .global_byte(expression.id, expression.end)
+        .ok_or_else(|| {
+            ProjectDiagnosticFactsError::new(
+                "project diagnostic expression has no source-unit end projection",
+            )
+        })?;
+    Ok(TypeDiagnosticSpan { line, start, end })
+}
+
+fn syntax_expression_diagnostic(
+    index: &ProjectFactIndex<'_>,
+    expression: &boon_syntax::AstExpr,
+    message: String,
+) -> Result<TypeDiagnostic, ProjectDiagnosticFactsError> {
+    let span = syntax_expression_span(index, expression)?;
+    Ok(TypeDiagnostic {
+        severity: DiagnosticSeverity::Error,
+        line: span.line,
+        start: span.start,
+        end: span.end,
+        message,
+    })
+}
+
+/// Source-shape diagnostics whose authority is the parser plus exact source
+/// maps. These checks intentionally precede the remaining flow-based replay:
+/// they neither need nor may construct a checked-program database.
+fn source_shape_diagnostics(
+    index: &ProjectFactIndex<'_>,
+) -> Result<Vec<TypeDiagnostic>, ProjectDiagnosticFactsError> {
+    let expressions = index.project.expressions();
+    let byte_items = expressions
+        .iter()
+        .filter_map(|expression| match &expression.kind {
+            AstExprKind::BytesLiteral { items, .. } => Some(items.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut diagnostics = Vec::new();
+    for expression in expressions.iter() {
+        if let Some(raw_input) = crate::checked_pipeline_raw_input(expression) {
+            let message = match expression.linked_input {
+                Some(linked_input) if expressions.get(linked_input).is_none() => Some(format!(
+                    "pipeline expression references missing linked input expression {linked_input}"
+                )),
+                None if expressions
+                    .get(raw_input)
+                    .is_some_and(crate::expr_is_pipe_placeholder) =>
+                {
+                    Some("pipeline continuation is missing its exact linked input".to_owned())
+                }
+                None if expressions.get(raw_input).is_none() => Some(format!(
+                    "pipeline expression references missing direct input expression {raw_input}"
+                )),
+                _ => None,
+            };
+            if let Some(message) = message {
+                diagnostics.push(syntax_expression_diagnostic(index, expression, message)?);
+            }
+        }
+
+        let bits = match &expression.kind {
+            AstExprKind::BitsLiteral {
+                width,
+                radix,
+                digits,
+            }
+            | AstExprKind::MatchArm {
+                pattern:
+                    boon_syntax::AstMatchPattern::Bits {
+                        width,
+                        radix,
+                        digits,
+                    },
+                ..
+            } => Some((*width, *radix, digits.as_str())),
+            _ => None,
+        };
+        if let Some((width, radix, digits)) = bits
+            && let Err(error) = Bits::parse_encoded(width, radix, digits)
+        {
+            diagnostics.push(syntax_expression_diagnostic(
+                index,
+                expression,
+                error.to_string(),
+            )?);
+        }
+
+        let number = match &expression.kind {
+            AstExprKind::Number(value) => Some(value.as_str()),
+            AstExprKind::MatchArm {
+                pattern: boon_syntax::AstMatchPattern::Number { value },
+                ..
+            } => Some(value.as_str()),
+            _ => None,
+        };
+        if let Some(literal) = number
+            && let Err(error) = ExactNumber::parse_strict(literal, None)
+        {
+            diagnostics.push(syntax_expression_diagnostic(
+                index,
+                expression,
+                format!("invalid exact Number literal `{literal}`: {error}"),
+            )?);
+        }
+
+        if matches!(expression.kind, AstExprKind::ByteLiteral { .. })
+            && !byte_items.contains(&expression.id)
+        {
+            diagnostics.push(syntax_expression_diagnostic(
+                index,
+                expression,
+                "byte literals are only valid as direct BYTES constructor items".to_owned(),
+            )?);
+        }
+    }
+    Ok(diagnostics)
+}
+
+fn recursive_function_diagnostics(
+    index: &ProjectFactIndex<'_>,
+) -> Result<Vec<TypeDiagnostic>, ProjectDiagnosticFactsError> {
+    fn visit(
+        owner: &StableCheckOwnerKey,
+        graph: &BTreeMap<StableCheckOwnerKey, BTreeSet<StableCheckOwnerKey>>,
+        names: &BTreeMap<StableCheckOwnerKey, String>,
+        spans: &BTreeMap<StableCheckOwnerKey, TypeDiagnosticSpan>,
+        visited: &mut BTreeSet<StableCheckOwnerKey>,
+        active: &mut Vec<StableCheckOwnerKey>,
+        reported: &mut BTreeSet<StableCheckOwnerKey>,
+        diagnostics: &mut Vec<TypeDiagnostic>,
+    ) -> Result<(), ProjectDiagnosticFactsError> {
+        if let Some(position) = active.iter().position(|candidate| candidate == owner) {
+            let cycle = active[position..]
+                .iter()
+                .cloned()
+                .chain(std::iter::once(owner.clone()))
+                .collect::<Vec<_>>();
+            let labels = cycle
+                .iter()
+                .map(|member| {
+                    names.get(member).cloned().ok_or_else(|| {
+                        ProjectDiagnosticFactsError::new(
+                            "recursive owner call target has no function name",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            for member in &cycle[..cycle.len().saturating_sub(1)] {
+                if !reported.insert(member.clone()) {
+                    continue;
+                }
+                let name = names.get(member).ok_or_else(|| {
+                    ProjectDiagnosticFactsError::new(
+                        "recursive owner function has no declaration name",
+                    )
+                })?;
+                let span = spans.get(member).copied().ok_or_else(|| {
+                    ProjectDiagnosticFactsError::new(
+                        "recursive owner function has no declaration source span",
+                    )
+                })?;
+                diagnostics.push(TypeDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    line: span.line,
+                    start: span.start,
+                    end: span.end,
+                    message: format!(
+                        "`FUNCTION {name}` is recursive; recursive functions are not supported by v1 type inference: {}",
+                        labels.join(" -> ")
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        if !visited.insert(owner.clone()) {
+            return Ok(());
+        }
+        active.push(owner.clone());
+        for callee in graph.get(owner).into_iter().flatten() {
+            visit(
+                callee,
+                graph,
+                names,
+                spans,
+                visited,
+                active,
+                reported,
+                diagnostics,
+            )?;
+        }
+        active.pop();
+        Ok(())
+    }
+
+    let mut names = BTreeMap::new();
+    let mut spans = BTreeMap::new();
+    for (owner, view) in &index.owners {
+        let Some(name) = &view.replay.function_name else {
+            continue;
+        };
+        let statement = view
+            .syntax
+            .statements
+            .iter()
+            .find(|statement| matches!(statement.kind, AstStatementKind::Function { .. }))
+            .ok_or_else(|| {
+                ProjectDiagnosticFactsError::new(
+                    "diagnostic function owner has no function declaration statement",
+                )
+            })?;
+        names.insert(owner.clone(), name.clone());
+        spans.insert(owner.clone(), index.statement_span(&statement.stable_key)?);
+    }
+
+    let mut graph = names
+        .keys()
+        .cloned()
+        .map(|owner| (owner, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    for (owner, view) in &index.owners {
+        let Some(caller) = index.callable_owner(owner).cloned() else {
+            continue;
+        };
+        for call in &view.replay.calls {
+            let crate::OwnerDiagnosticCallDisposition::User { owner: callee } =
+                &call.diagnostic.disposition
+            else {
+                continue;
+            };
+            if !names.contains_key(callee) {
+                return Err(ProjectDiagnosticFactsError::new(
+                    "valid owner call target has no exact function declaration",
+                ));
+            }
+            graph
+                .entry(caller.clone())
+                .or_default()
+                .insert(callee.clone());
+        }
+    }
+
+    let mut visited = BTreeSet::new();
+    let mut active = Vec::new();
+    let mut reported = BTreeSet::new();
+    let mut diagnostics = Vec::new();
+    for owner in graph.keys() {
+        visit(
+            owner,
+            &graph,
+            &names,
+            &spans,
+            &mut visited,
+            &mut active,
+            &mut reported,
+            &mut diagnostics,
+        )?;
+    }
+    Ok(diagnostics)
+}
+
+fn stable_syntax_expression(
+    index: &ProjectFactIndex<'_>,
+    expression: usize,
+) -> Option<StableOrderExpression> {
+    Some(StableOrderExpression {
+        owner: index
+            .project
+            .stable_check_owner_for_expression(expression)?,
+        expression: index.project.stable_expression_key(expression)?,
+    })
+}
+
+fn host_effect_diagnostics(
+    index: &ProjectFactIndex<'_>,
+) -> Result<Vec<TypeDiagnostic>, ProjectDiagnosticFactsError> {
+    let program = TypecheckSyntaxProgram::UnitNative(index.project.clone());
+    let expressions = index.project.expressions();
+    let mut diagnostics = Vec::new();
+    for expression in expressions.iter() {
+        let (operation, inline_args, direct_call) = match &expression.kind {
+            AstExprKind::Call { function, args, .. } => (function, args.as_slice(), true),
+            AstExprKind::Pipe { op, args, .. } => (op, args.as_slice(), false),
+            _ => continue,
+        };
+        let Some(signature) = crate::host_effect_signature(operation) else {
+            continue;
+        };
+        let Some(stable_call) = stable_syntax_expression(index, expression.id) else {
+            continue;
+        };
+        let Some(call) = index.all_calls.get(&stable_call).copied() else {
+            continue;
+        };
+        if !matches!(
+            &call.diagnostic.disposition,
+            crate::OwnerDiagnosticCallDisposition::Abi {
+                kind: CheckedCallableKind::Builtin
+            }
+        ) {
+            continue;
+        }
+        if !direct_call {
+            diagnostics.push(syntax_expression_diagnostic(
+                index,
+                expression,
+                format!(
+                    "typed host effect `{operation}` must use direct named-call syntax, not a pipeline"
+                ),
+            )?);
+            continue;
+        }
+
+        let arguments = crate::named_call_argument_exprs(&program, expression.id, inline_args);
+        let mut actual = BTreeMap::<&str, usize>::new();
+        for (name, value) in &arguments {
+            if actual.insert(name.as_str(), *value).is_some() {
+                let value = expressions.get(*value).ok_or_else(|| {
+                    ProjectDiagnosticFactsError::new(
+                        "typed host effect argument references a missing expression",
+                    )
+                })?;
+                diagnostics.push(syntax_expression_diagnostic(
+                    index,
+                    value,
+                    format!("typed host effect `{operation}` repeats argument `{name}`"),
+                )?);
+            }
+        }
+        for argument in inline_args
+            .iter()
+            .filter(|argument| argument.is_bare_binding())
+        {
+            let value = expressions.get(argument.value).ok_or_else(|| {
+                ProjectDiagnosticFactsError::new(
+                    "typed host effect bare argument references a missing expression",
+                )
+            })?;
+            diagnostics.push(syntax_expression_diagnostic(
+                index,
+                value,
+                format!("typed host effect `{operation}` requires named arguments"),
+            )?);
+        }
+
+        let expected = signature
+            .intent_fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<BTreeSet<_>>();
+        for name in actual.keys().filter(|name| !expected.contains(**name)) {
+            diagnostics.push(syntax_expression_diagnostic(
+                index,
+                expression,
+                format!("typed host effect `{operation}` has no argument `{name}`"),
+            )?);
+        }
+        for (name, value) in &arguments {
+            let Some(expected_field) = signature
+                .intent_fields
+                .iter()
+                .find(|field| field.name == *name)
+            else {
+                continue;
+            };
+            let value_expression = expressions.get(*value).ok_or_else(|| {
+                ProjectDiagnosticFactsError::new(
+                    "typed host effect argument references a missing expression",
+                )
+            })?;
+            let actual_type = stable_syntax_expression(index, *value)
+                .and_then(|stable| {
+                    call.inputs
+                        .iter()
+                        .find(|input| input.input == stable)
+                        .map(|input| input.actual_type.clone())
+                })
+                .unwrap_or(Type::Unknown);
+            if !crate::type_is_assignable_to(&actual_type, &expected_field.ty) {
+                diagnostics.push(syntax_expression_diagnostic(
+                    index,
+                    value_expression,
+                    format!(
+                        "`{operation}` argument `{name}` has incompatible type\nexpected: {}\nfound: {}",
+                        crate::boon_facing_type_label(&expected_field.ty),
+                        crate::boon_facing_type_label(&actual_type)
+                    ),
+                )?);
+            }
+        }
+        for name in signature
+            .intent_fields
+            .iter()
+            .filter(|field| field.default.is_none() && !actual.contains_key(field.name.as_str()))
+            .map(|field| field.name.as_str())
+        {
+            diagnostics.push(syntax_expression_diagnostic(
+                index,
+                expression,
+                format!("typed host effect `{operation}` is missing required argument `{name}`"),
+            )?);
+        }
+    }
+    Ok(diagnostics)
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -6796,8 +7208,11 @@ pub fn project_diagnostic_facts<'a>(
         source_maps,
     )?;
     let mut diagnostics = Vec::new();
+    diagnostics.extend(source_shape_diagnostics(&index)?);
+    diagnostics.extend(recursive_function_diagnostics(&index)?);
+    diagnostics.extend(host_effect_diagnostics(&index)?);
     let exact_call_input_types = index.exact_call_input_types()?;
-    let (diagnostic_calls, user_call_edges) = index.diagnostic_call_facts()?;
+    let diagnostic_calls = index.diagnostic_call_facts()?;
     let diagnostic_reads = index.diagnostic_reads()?;
     let (diagnostic_expression_owners, diagnostic_function_owners) =
         index.diagnostic_owner_rows()?;
@@ -6834,7 +7249,6 @@ pub fn project_diagnostic_facts<'a>(
         &call_input_types,
         &diagnostic_calls,
         &diagnostic_reads,
-        &user_call_edges,
         &diagnostic_expression_owners,
         &diagnostic_function_owners,
         &deferred_style_base_types,

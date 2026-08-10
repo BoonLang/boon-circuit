@@ -7565,6 +7565,10 @@ mod tests {
             ),
             (
                 ProgramRole::Server,
+                "value: Random/bytes(byte_count: \"invalid\")\n",
+            ),
+            (
+                ProgramRole::Server,
                 concat!(
                     "tick: SOURCE\n",
                     "value:\n",
@@ -7913,7 +7917,14 @@ mod tests {
             ),
         ];
 
-        for (role, source) in fixtures {
+        let over_budget_number = format!(
+            "value: {}\n",
+            "9".repeat(boon_data::MAX_NUMBER_PARSED_DIGITS + 1)
+        );
+        for (role, source) in fixtures.into_iter().chain(std::iter::once((
+            ProgramRole::Server,
+            over_budget_number.as_str(),
+        ))) {
             let units = vec![CompilerSourceUnit {
                 path: "RUN.bn".to_owned(),
                 source: source.to_owned(),
@@ -7937,6 +7948,9 @@ mod tests {
             let deferred_style_message =
                 "style field `width` must be a number, `Fill` tag, or `Auto` tag";
             if source.contains("TEXT { invalid }")
+                && (source.contains("sized_box")
+                    || source.contains("styled_alias")
+                    || source.contains("styled_call_alias"))
                 && !source.contains("styled_alias(first: TEXT { invalid }, second: 24)")
                 && !source.contains("styled_call_alias(first: TEXT { invalid }, second: 24)")
             {
@@ -8108,6 +8122,23 @@ mod tests {
                     lean.iter().any(|diagnostic| diagnostic.message
                         == "`Number/round` argument `to` must be a strictly positive exact Number"),
                     "invalid builtin shape suppressed builtin-domain diagnostics:\n{lean:#?}"
+                );
+            }
+            if source.contains("Random/bytes") {
+                assert!(
+                    lean.iter().any(|diagnostic| diagnostic.message.starts_with(
+                        "`Random/bytes` argument `byte_count` has incompatible type\nexpected: NUMBER\nfound:"
+                    )),
+                    "typed host-effect argument diagnostics were not projected from owner facts:\n{lean:#?}"
+                );
+            }
+            if source == over_budget_number {
+                assert!(
+                    lean.iter().any(|diagnostic| diagnostic
+                        .message
+                        .contains("invalid exact Number literal")
+                        && diagnostic.message.contains("digit budget")),
+                    "invalid exact Number source diagnostics were not projected:\n{lean:#?}"
                 );
             }
             if source.contains("value:\n    tick\n    |> WHILE") {

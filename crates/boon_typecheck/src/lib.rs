@@ -2768,7 +2768,7 @@ impl CheckedProgramDatabase {
         }
     }
 
-    fn validate_exact_number_literals(&mut self) {
+    fn project_exact_number_literals(&mut self, diagnostics: bool) {
         for expression in self.program.expressions() {
             let literal = match &expression.kind {
                 AstExprKind::Number(value) => Some(value.as_str()),
@@ -2785,12 +2785,23 @@ impl CheckedProgramDatabase {
                 Ok(value) => {
                     self.exact_number_literals.insert(expression.id, value);
                 }
-                Err(error) => self.diagnostics.push(self.diagnostic_for_expr(
-                    expression.id,
-                    format!("invalid exact Number literal `{literal}`: {error}"),
-                )),
+                Err(error) if diagnostics => {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        expression.id,
+                        format!("invalid exact Number literal `{literal}`: {error}"),
+                    ));
+                }
+                Err(_) => {}
             }
         }
+    }
+
+    fn index_exact_number_literals(&mut self) {
+        self.project_exact_number_literals(false);
+    }
+
+    fn validate_exact_number_literals(&mut self) {
+        self.project_exact_number_literals(true);
     }
 
     fn checked_match_pattern(
@@ -19552,7 +19563,6 @@ pub(crate) fn project_owner_flow_diagnostics(
     call_input_types: &[(usize, usize, Type)],
     calls: &[(usize, OwnerDiagnosticCallFact)],
     reads: &[(usize, OwnerEffectiveLexicalReadPlan)],
-    user_call_edges: &[(String, String)],
     expression_owners: &[(usize, boon_syntax::StableCheckOwnerKey)],
     function_owners: &[boon_syntax::StableCheckOwnerKey],
     deferred_style_base_types: &[(usize, Type)],
@@ -19572,7 +19582,6 @@ pub(crate) fn project_owner_flow_diagnostics(
         call_input_types,
         calls,
         reads,
-        user_call_edges,
         expression_owners,
         function_owners,
         deferred_style_base_types,
@@ -19580,14 +19589,9 @@ pub(crate) fn project_owner_flow_diagnostics(
         expression_spans,
         statement_spans,
     );
-    checker.validate_exact_pipeline_inputs();
-    checker.validate_exact_number_literals();
-    checker.validate_bits_literals();
-    checker.check_byte_literal_contexts();
-    checker.check_recursive_functions();
+    checker.index_exact_number_literals();
     checker.project_checked_statement_diagnostics();
     checker.validate_owner_deferred_style_constraints();
-    checker.check_host_effect_calls();
     let accounted = checker
         .diagnostic_lookup_hits
         .saturating_add(checker.diagnostic_lookup_misses);
@@ -20824,7 +20828,6 @@ impl CheckedProgramDatabase {
         call_input_types: &[(usize, usize, Type)],
         calls: &[(usize, OwnerDiagnosticCallFact)],
         reads: &[(usize, OwnerEffectiveLexicalReadPlan)],
-        user_call_edges: &[(String, String)],
         expression_owners: &[(usize, boon_syntax::StableCheckOwnerKey)],
         function_owners: &[boon_syntax::StableCheckOwnerKey],
         deferred_style_base_types: &[(usize, Type)],
@@ -20957,14 +20960,6 @@ impl CheckedProgramDatabase {
         );
 
         self.source_payload_types = source_payload_types.iter().cloned().collect();
-        self.function_call_graph.clear();
-        for (caller, callee) in user_call_edges {
-            self.function_call_graph
-                .entry(caller.clone())
-                .or_default()
-                .insert(callee.clone());
-        }
-
         self.checked_flow_install_count = expression_flows.len();
         self.checked_flow_duplicate_ids = 0;
         self.checked_flow_out_of_range_ids = 0;

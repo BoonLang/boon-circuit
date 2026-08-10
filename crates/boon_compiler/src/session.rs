@@ -1332,7 +1332,7 @@ impl RequestFamily for OwnerDiagnosticReplayFactsEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerDiagnosticReplayFactsEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts-evaluation.v1";
+    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts-evaluation.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1349,7 +1349,7 @@ impl RequestFamily for OwnerDiagnosticReplayFactsRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerDiagnosticReplayFacts>;
 
-    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts.v1";
+    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1434,7 +1434,7 @@ impl RequestFamily for ProjectDiagnosticFactsRequest {
     type Key = ProjectDiagnosticFactsKey;
     type Value = Arc<ProjectDiagnosticFacts>;
 
-    const NAME: &'static str = "boon.compiler.project-diagnostic-facts.v10";
+    const NAME: &'static str = "boon.compiler.project-diagnostic-facts.v11";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -5210,7 +5210,7 @@ fn evaluate_owner_diagnostic_replay_facts_requests(
     owners: &[StableCheckOwnerKey],
 ) -> CompilerResult<()> {
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-diagnostic-replay-facts-evaluation-dependencies.v1\0",
+        b"boon.compiler.owner-diagnostic-replay-facts-evaluation-dependencies.v2\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -5269,7 +5269,7 @@ fn evaluate_owner_diagnostic_replay_facts_requests(
     }
 
     let result_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-diagnostic-replay-facts-result-projection-dependencies.v1\0",
+        b"boon.compiler.owner-diagnostic-replay-facts-result-projection-dependencies.v2\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -5317,7 +5317,7 @@ fn evaluate_project_diagnostic_facts_request(
         .collect::<Vec<_>>();
     let source_digest = project.source_bundle_digest_v1().to_string();
     let input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.project-diagnostic-facts-dependencies.v10\0",
+        b"boon.compiler.project-diagnostic-facts-dependencies.v11\0",
         std::iter::once(source_digest.as_bytes())
             .chain(std::iter::once(program_role_request_tag(
                 state.source.program_role,
@@ -5341,7 +5341,6 @@ fn evaluate_project_diagnostic_facts_request(
                 let mut lexical_plans = Vec::with_capacity(owners.len());
                 let mut summaries = Vec::with_capacity(owners.len());
                 let mut interfaces = Vec::with_capacity(owners.len());
-                let mut bodies = Vec::with_capacity(owners.len());
                 let mut replay_evaluations = Vec::with_capacity(owners.len());
                 let mut replay_facts = Vec::with_capacity(owners.len());
                 let mut inference_abis = Vec::with_capacity(owners.len());
@@ -5384,11 +5383,6 @@ fn evaluate_project_diagnostic_facts_request(
                             "project diagnostics interface SCC has no owner {owner:?}"
                         ))
                     })?);
-                    bodies.push(Arc::clone(state.owner_body_inference_requests.require(
-                        &state.syntax_evaluator,
-                        &mut ticket,
-                        owner,
-                    )?));
                     replay_evaluations.push(Arc::clone(
                         state
                             .owner_diagnostic_replay_facts_evaluation_requests
@@ -5422,7 +5416,6 @@ fn evaluate_project_diagnostic_facts_request(
                     lexical_plans.iter().map(Arc::as_ref),
                     summaries.iter().map(Arc::as_ref),
                     interfaces.iter(),
-                    bodies.iter().map(Arc::as_ref),
                     replay_evaluations.iter().map(Arc::as_ref),
                     replay_facts.iter().map(Arc::as_ref),
                     owners.iter().zip(inference_abis.iter().map(Arc::as_ref)),

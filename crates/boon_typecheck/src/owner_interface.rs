@@ -3697,7 +3697,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         let item = unifier.fresh();
                         for input in &expression.inputs {
                             if let Some(input) = expression_variable(state, input.expression) {
-                                unifier.unify(Type::Var(item), Type::Var(input));
+                                unifier.bind_flow_result(item, Type::Var(input));
                             }
                         }
                         unifier.bind_var(variable, Type::List(Type::shared(Type::Var(item))));
@@ -3706,7 +3706,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         let item = unifier.fresh();
                         for input in &expression.inputs {
                             if let Some(input) = expression_variable(state, input.expression) {
-                                unifier.unify(Type::Var(item), Type::Var(input));
+                                unifier.bind_flow_result(item, Type::Var(input));
                             }
                         }
                         unifier.bind_var(variable, Type::Set(Type::shared(Type::Var(item))));

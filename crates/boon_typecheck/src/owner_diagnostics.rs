@@ -27,8 +27,8 @@ use boon_contract::SourceBundleDigestV1;
 use boon_data::{Bits, ExactNumber};
 use boon_parser::ProjectSyntaxSnapshot;
 use boon_syntax::{
-    AstExprKind, AstParameterKind, AstStatementKind, SourceUnitId, StableCheckOwnerKey,
-    StableExpressionKey, StableStatementKey,
+    AstExprKind, AstParameterKind, AstStatementKind, BytesSizeSyntax, SourceUnitId,
+    StableCheckOwnerKey, StableExpressionKey, StableStatementKey,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1233,7 +1233,6 @@ struct ProjectFactIndex<'a> {
     owners: BTreeMap<StableCheckOwnerKey, OwnerFactView<'a>>,
     statements: BTreeMap<StableStatementKey, (StableCheckOwnerKey, u32)>,
     expressions: BTreeMap<StableOrderExpression, u32>,
-    syntax_statements: BTreeMap<StableStatementKey, usize>,
     syntax_expressions: BTreeMap<StableOrderExpression, usize>,
     statement_spans: BTreeMap<StableStatementKey, TypeDiagnosticSpan>,
     expression_spans: BTreeMap<StableOrderExpression, TypeDiagnosticSpan>,
@@ -1574,7 +1573,6 @@ impl<'a> ProjectFactIndex<'a> {
             owners,
             statements,
             expressions,
-            syntax_statements,
             syntax_expressions,
             statement_spans,
             expression_spans,
@@ -1779,116 +1777,6 @@ impl<'a> ProjectFactIndex<'a> {
         self.calls.get(expression).copied()
     }
 
-    fn exact_call_input_types(
-        &self,
-    ) -> Result<
-        BTreeMap<(StableOrderExpression, StableOrderExpression), Type>,
-        ProjectDiagnosticFactsError,
-    > {
-        let mut exact_call_input_types = BTreeMap::new();
-        for (owner, view) in &self.owners {
-            for call in &view.replay.calls {
-                let call_expression = StableOrderExpression {
-                    owner: owner.clone(),
-                    expression: call.expression.clone(),
-                };
-                for input in &call.inputs {
-                    match exact_call_input_types
-                        .entry((call_expression.clone(), input.input.clone()))
-                    {
-                        std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert(input.actual_type.clone());
-                        }
-                        std::collections::btree_map::Entry::Occupied(entry)
-                            if entry.get() != &input.actual_type =>
-                        {
-                            return Err(ProjectDiagnosticFactsError::new(
-                                "owner call input has conflicting pre-consumer types",
-                            ));
-                        }
-                        std::collections::btree_map::Entry::Occupied(_) => {}
-                    }
-                }
-            }
-        }
-        Ok(exact_call_input_types)
-    }
-
-    fn diagnostic_call_facts(
-        &self,
-    ) -> Result<Vec<(usize, crate::OwnerDiagnosticCallFact)>, ProjectDiagnosticFactsError> {
-        let mut calls = Vec::with_capacity(self.all_calls.len());
-        for (owner, view) in &self.owners {
-            for call in &view.replay.calls {
-                let stable = StableOrderExpression {
-                    owner: owner.clone(),
-                    expression: call.expression.clone(),
-                };
-                let expression = *self.syntax_expressions.get(&stable).ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "owner diagnostic call has no exact project syntax identity",
-                    )
-                })?;
-                calls.push((expression, call.diagnostic.clone()));
-            }
-        }
-        calls.sort_unstable_by_key(|(expression, _)| *expression);
-        Ok(calls)
-    }
-
-    fn diagnostic_reads(
-        &self,
-    ) -> Result<Vec<(usize, crate::OwnerEffectiveLexicalReadPlan)>, ProjectDiagnosticFactsError>
-    {
-        let mut reads = Vec::new();
-        for (owner, view) in &self.owners {
-            for read in &view.replay.reads {
-                let stable = StableOrderExpression {
-                    owner: owner.clone(),
-                    expression: read.expression.clone(),
-                };
-                let expression = *self.syntax_expressions.get(&stable).ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "owner diagnostic read has no exact project syntax identity",
-                    )
-                })?;
-                reads.push((expression, read.read.clone()));
-            }
-        }
-        reads.sort_unstable_by_key(|(expression, _)| *expression);
-        Ok(reads)
-    }
-
-    fn diagnostic_owner_rows(
-        &self,
-    ) -> Result<
-        (Vec<(usize, StableCheckOwnerKey)>, Vec<StableCheckOwnerKey>),
-        ProjectDiagnosticFactsError,
-    > {
-        let mut expression_owners = Vec::with_capacity(self.expressions.len());
-        for stable in self.expressions.keys() {
-            let expression = *self.syntax_expressions.get(stable).ok_or_else(|| {
-                ProjectDiagnosticFactsError::new(
-                    "owner diagnostic expression has no exact project syntax identity",
-                )
-            })?;
-            expression_owners.push((
-                expression,
-                self.callable_owner(&stable.owner)
-                    .cloned()
-                    .unwrap_or_else(|| stable.owner.clone()),
-            ));
-        }
-        expression_owners.sort_unstable_by_key(|(expression, _)| *expression);
-        let mut function_owners = self
-            .owners
-            .iter()
-            .filter_map(|(owner, view)| view.replay.function_name.is_some().then(|| owner.clone()))
-            .collect::<Vec<_>>();
-        function_owners.sort();
-        Ok((expression_owners, function_owners))
-    }
-
     fn deferred_style_stable_origin(
         &self,
         target: &OwnerLexicalTargetRef,
@@ -2087,124 +1975,6 @@ impl<'a> ProjectFactIndex<'a> {
             })
             .collect::<Result<BTreeMap<_, _>, ProjectDiagnosticFactsError>>()?;
         Ok(substitute_checked_type(&ty, &call_local_variables))
-    }
-
-    fn deferred_style_base_types(&self) -> Result<Vec<(usize, Type)>, ProjectDiagnosticFactsError> {
-        let mut types = Vec::new();
-        for stable in self.expressions.keys() {
-            let Some((owner, ordinal, projection)) =
-                self.deferred_style_parameter_origin(stable, &[], &mut BTreeSet::new())
-            else {
-                continue;
-            };
-            let ty = self.deferred_style_parameter_type(&owner, ordinal, &projection)?;
-            let expression = *self.syntax_expressions.get(stable).ok_or_else(|| {
-                ProjectDiagnosticFactsError::new(
-                    "owner diagnostic parameter read has no project syntax identity",
-                )
-            })?;
-            types.push((expression, ty));
-        }
-        types.sort_unstable_by_key(|(expression, _)| *expression);
-        Ok(types)
-    }
-
-    fn owner_flow_diagnostic_inputs(
-        &self,
-        exact_modes: &BTreeMap<StableOrderExpression, FlowMode>,
-    ) -> Result<
-        (Vec<(usize, FlowType, Option<Type>)>, Vec<(usize, usize)>),
-        ProjectDiagnosticFactsError,
-    > {
-        let mut expression_flows = Vec::with_capacity(self.expressions.len());
-        for (owner, view) in &self.owners {
-            for inferred in &view.replay.expression_flows {
-                let stable = StableOrderExpression {
-                    owner: owner.clone(),
-                    expression: inferred.expression.clone(),
-                };
-                let syntax_id = *self.syntax_expressions.get(&stable).ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "owner inferred expression has no exact project syntax identity",
-                    )
-                })?;
-                expression_flows.push((
-                    syntax_id,
-                    FlowType {
-                        mode: exact_modes
-                            .get(&stable)
-                            .copied()
-                            .unwrap_or(inferred.flow_type.mode),
-                        ty: inferred.flow_type.ty.clone(),
-                    },
-                    inferred.flush_type.clone(),
-                ));
-            }
-        }
-        expression_flows.sort_unstable_by_key(|(expression, _, _)| *expression);
-
-        let mut statement_values = Vec::new();
-        for view in self.owners.values() {
-            for row in &view.replay.statement_values {
-                let statement_id =
-                    *self.syntax_statements.get(&row.statement).ok_or_else(|| {
-                        ProjectDiagnosticFactsError::new(
-                            "owner inferred statement has no exact project syntax identity",
-                        )
-                    })?;
-                let expression_id = *self.syntax_expressions.get(&row.value).ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "owner statement value has no exact project syntax identity",
-                    )
-                })?;
-                statement_values.push((statement_id, expression_id));
-            }
-        }
-        statement_values.sort_unstable();
-        Ok((expression_flows, statement_values))
-    }
-
-    fn diagnostic_source_spans(
-        &self,
-    ) -> Result<
-        (
-            Vec<(usize, usize, usize, usize)>,
-            Vec<(usize, usize, usize, usize)>,
-        ),
-        ProjectDiagnosticFactsError,
-    > {
-        let mut expression_spans = Vec::with_capacity(self.expressions.len());
-        let mut statement_spans = Vec::with_capacity(self.statements.len());
-        for (stable, span) in &self.expression_spans {
-            let syntax_id = *self.syntax_expressions.get(stable).ok_or_else(|| {
-                ProjectDiagnosticFactsError::new(
-                    "owner source-map expression has no exact project syntax identity",
-                )
-            })?;
-            expression_spans.push((syntax_id, span.line, span.start, span.end));
-        }
-        for (stable, span) in &self.statement_spans {
-            let syntax_id = *self.syntax_statements.get(stable).ok_or_else(|| {
-                ProjectDiagnosticFactsError::new(
-                    "owner source-map statement has no exact project syntax identity",
-                )
-            })?;
-            statement_spans.push((syntax_id, span.line, span.start, span.end));
-        }
-        expression_spans.sort_unstable_by_key(|row| row.0);
-        statement_spans.sort_unstable_by_key(|row| row.0);
-        if expression_spans
-            .windows(2)
-            .any(|rows| rows[0].0 == rows[1].0)
-            || statement_spans
-                .windows(2)
-                .any(|rows| rows[0].0 == rows[1].0)
-        {
-            return Err(ProjectDiagnosticFactsError::new(
-                "owner source maps contain duplicate packed syntax identities",
-            ));
-        }
-        Ok((expression_spans, statement_spans))
     }
 
     fn effective_read(
@@ -2695,6 +2465,218 @@ fn source_shape_diagnostics(
     Ok(diagnostics)
 }
 
+fn expression_structure_diagnostics(
+    index: &ProjectFactIndex<'_>,
+) -> Result<Vec<TypeDiagnostic>, ProjectDiagnosticFactsError> {
+    let program = TypecheckSyntaxProgram::UnitNative(index.project.clone());
+    let expressions = index.project.expressions();
+    let mut diagnostics = Vec::new();
+    for expression in expressions.iter() {
+        match &expression.kind {
+            AstExprKind::BytesLiteral { size, items } => {
+                let fixed_size = !matches!(size, BytesSizeSyntax::Dynamic);
+                let mut known_len = 0usize;
+                let mut all_fixed = true;
+                for item in items {
+                    let item_type = project_style_expression_type(index, *item);
+                    match &item_type {
+                        Type::Bytes(boon_checked::BytesType::Fixed(len)) => {
+                            known_len = known_len.saturating_add(*len);
+                        }
+                        Type::Bytes(boon_checked::BytesType::Dynamic) => {
+                            all_fixed = false;
+                            if fixed_size {
+                                let item = expressions.get(*item).ok_or_else(|| {
+                                    ProjectDiagnosticFactsError::new(
+                                        "BYTES item references a missing syntax expression",
+                                    )
+                                })?;
+                                diagnostics.push(syntax_expression_diagnostic(
+                                    index,
+                                    item,
+                                    "fixed BYTES constructors cannot contain dynamic BYTES"
+                                        .to_owned(),
+                                )?);
+                            }
+                        }
+                        Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. } => {
+                            all_fixed = false;
+                        }
+                        other => {
+                            all_fixed = false;
+                            let item = expressions.get(*item).ok_or_else(|| {
+                                ProjectDiagnosticFactsError::new(
+                                    "BYTES item references a missing syntax expression",
+                                )
+                            })?;
+                            diagnostics.push(syntax_expression_diagnostic(
+                                index,
+                                item,
+                                format!(
+                                    "BYTES constructor items must be byte literals or BYTES values, found {}; use Text/to_bytes for explicit TEXT/BYTES conversion",
+                                    crate::boon_facing_type_label(other)
+                                ),
+                            )?);
+                        }
+                    }
+                }
+                match size {
+                    BytesSizeSyntax::Dynamic => {}
+                    BytesSizeSyntax::Infer if !all_fixed => {
+                        diagnostics.push(syntax_expression_diagnostic(
+                            index,
+                            expression,
+                            "BYTES[__] length cannot be inferred from dynamic or unknown content"
+                                .to_owned(),
+                        )?);
+                    }
+                    BytesSizeSyntax::Fixed(expected)
+                        if !items.is_empty() && all_fixed && known_len != *expected =>
+                    {
+                        diagnostics.push(syntax_expression_diagnostic(
+                            index,
+                            expression,
+                            format!(
+                                "BYTES[{expected}] contains {known_len} byte(s); fixed BYTES length must match exactly"
+                            ),
+                        )?);
+                    }
+                    BytesSizeSyntax::Infer | BytesSizeSyntax::Fixed(_) => {}
+                }
+            }
+            AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
+                let mut explicit_fields = BTreeSet::new();
+                for field in fields {
+                    if field.spread {
+                        let ty = project_style_expression_type(index, field.value);
+                        if !crate::type_is_record_spreadable(&ty) {
+                            let value = expressions.get(field.value).ok_or_else(|| {
+                                ProjectDiagnosticFactsError::new(
+                                    "record spread references a missing syntax expression",
+                                )
+                            })?;
+                            diagnostics.push(syntax_expression_diagnostic(
+                                index,
+                                value,
+                                "record spread expects a record value".to_owned(),
+                            )?);
+                        }
+                    } else if !explicit_fields.insert(field.name.as_str()) {
+                        let value = expressions.get(field.value).ok_or_else(|| {
+                            ProjectDiagnosticFactsError::new(
+                                "record field references a missing syntax expression",
+                            )
+                        })?;
+                        diagnostics.push(syntax_expression_diagnostic(
+                            index,
+                            value,
+                            format!("duplicate explicit record field `{}`", field.name),
+                        )?);
+                    }
+                }
+                if let AstExprKind::TaggedObject { tag, .. } = &expression.kind
+                    && tag == "Oklch"
+                {
+                    let fields_by_name = fields
+                        .iter()
+                        .filter(|field| !field.spread)
+                        .map(|field| {
+                            (
+                                field.name.as_str(),
+                                project_style_expression_type(index, field.value),
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    if !fields_by_name.contains_key("lightness") {
+                        diagnostics.push(syntax_expression_diagnostic(
+                            index,
+                            expression,
+                            "tagged object `Oklch[...]` is missing field `lightness`".to_owned(),
+                        )?);
+                    }
+                    for field in fields.iter().filter(|field| {
+                        matches!(field.name.as_str(), "lightness" | "chroma" | "hue")
+                    }) {
+                        if !matches!(
+                            fields_by_name.get(field.name.as_str()),
+                            Some(Type::Number | Type::Unknown)
+                        ) {
+                            let value = expressions.get(field.value).ok_or_else(|| {
+                                ProjectDiagnosticFactsError::new(
+                                    "tagged color field references a missing syntax expression",
+                                )
+                            })?;
+                            diagnostics.push(syntax_expression_diagnostic(
+                                index,
+                                value,
+                                format!(
+                                    "tagged object `Oklch[...]` field `{}` must be a number",
+                                    field.name
+                                ),
+                            )?);
+                        }
+                    }
+                }
+            }
+            AstExprKind::MapEntry { key, .. } => {
+                let key_type = project_style_expression_type(index, *key);
+                if !crate::type_is_map_key_safe(&key_type) && key_type != Type::Unknown {
+                    diagnostics.push(syntax_expression_diagnostic(
+                        index,
+                        expression,
+                        format!(
+                            "MAP keys must be closed canonical NUMBER, TEXT, BYTES, BITS, Tag, or object data; found {key_type:?}"
+                        ),
+                    )?);
+                }
+            }
+            AstExprKind::MapLiteral { entries } => {
+                let mut static_keys = BTreeSet::new();
+                for entry in entries {
+                    let Some(AstExprKind::MapEntry { key, .. }) =
+                        expressions.get(*entry).map(|entry| &entry.kind)
+                    else {
+                        continue;
+                    };
+                    let Some(key_value) = crate::static_key_value(&program, *key) else {
+                        continue;
+                    };
+                    if !static_keys.insert(key_value) {
+                        let key = expressions.get(*key).ok_or_else(|| {
+                            ProjectDiagnosticFactsError::new(
+                                "MAP key references a missing syntax expression",
+                            )
+                        })?;
+                        diagnostics.push(syntax_expression_diagnostic(
+                            index,
+                            key,
+                            crate::DUPLICATE_MAP_KEY_DIAGNOSTIC.to_owned(),
+                        )?);
+                    }
+                }
+            }
+            AstExprKind::SetLiteral { items } => {
+                let item_type = items
+                    .iter()
+                    .map(|item| project_style_expression_type(index, *item))
+                    .reduce(|existing, extra| crate::widen_structural_type(&existing, &extra))
+                    .unwrap_or(Type::Unknown);
+                if !crate::type_is_map_key_safe(&item_type) && item_type != Type::Unknown {
+                    diagnostics.push(syntax_expression_diagnostic(
+                        index,
+                        expression,
+                        format!(
+                            "SET items must be closed canonical NUMBER, TEXT, BYTES, BITS, Tag, or object data; found {item_type:?}"
+                        ),
+                    )?);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(diagnostics)
+}
+
 fn recursive_function_diagnostics(
     index: &ProjectFactIndex<'_>,
 ) -> Result<Vec<TypeDiagnostic>, ProjectDiagnosticFactsError> {
@@ -2851,6 +2833,7 @@ fn stable_syntax_expression(
 
 fn host_effect_diagnostics(
     index: &ProjectFactIndex<'_>,
+    exact_types: &mut ProjectFlowTypeAnalyzer<'_, '_>,
 ) -> Result<Vec<TypeDiagnostic>, ProjectDiagnosticFactsError> {
     let program = TypecheckSyntaxProgram::UnitNative(index.project.clone());
     let expressions = index.project.expressions();
@@ -2946,14 +2929,7 @@ fn host_effect_diagnostics(
                     "typed host effect argument references a missing expression",
                 )
             })?;
-            let actual_type = stable_syntax_expression(index, *value)
-                .and_then(|stable| {
-                    call.inputs
-                        .iter()
-                        .find(|input| input.input == stable)
-                        .map(|input| input.actual_type.clone())
-                })
-                .unwrap_or(Type::Unknown);
+            let actual_type = owner_call_actual_type(index, exact_types, call, *value);
             if !crate::type_is_assignable_to(&actual_type, &expected_field.ty) {
                 diagnostics.push(syntax_expression_diagnostic(
                     index,
@@ -2980,6 +2956,1333 @@ fn host_effect_diagnostics(
         }
     }
     Ok(diagnostics)
+}
+
+fn owner_call_actual_type(
+    index: &ProjectFactIndex<'_>,
+    exact_types: &mut ProjectFlowTypeAnalyzer<'_, '_>,
+    call: &OwnerDiagnosticStableCallFact,
+    expression: usize,
+) -> Type {
+    let stable = stable_syntax_expression(index, expression);
+    let inferred = stable
+        .as_ref()
+        .and_then(|stable| {
+            call.inputs
+                .iter()
+                .find(|input| input.input == *stable)
+                .map(|input| input.actual_type.clone())
+        })
+        .unwrap_or(Type::Unknown);
+    let actual = stable
+        .map(|stable| exact_types.expression_type(&stable))
+        .filter(|exact| !matches!(exact, Type::Unknown | Type::UnresolvedShape { .. }))
+        .unwrap_or(inferred);
+    fn has_unresolved_type(ty: &Type) -> bool {
+        match ty {
+            Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_) => true,
+            Type::Object(shape) => shape.open || shape.fields.values().any(has_unresolved_type),
+            Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+                boon_checked::Variant::Tag(_) => false,
+                boon_checked::Variant::Tagged { fields, .. } => {
+                    fields.fields.values().any(has_unresolved_type)
+                }
+            }),
+            Type::List(item) | Type::Set(item) => has_unresolved_type(item),
+            Type::Map { key, value } => has_unresolved_type(key) || has_unresolved_type(value),
+            Type::Function { args, result } => {
+                args.iter().any(has_unresolved_type) || has_unresolved_type(&result.ty)
+            }
+            Type::Union(members) => members.iter().any(has_unresolved_type),
+            Type::Text
+            | Type::Number
+            | Type::Bytes(_)
+            | Type::Bits { .. }
+            | Type::Absent
+            | Type::RenderContract => false,
+        }
+    }
+    if has_unresolved_type(&actual) {
+        Type::Unknown
+    } else {
+        actual
+    }
+}
+
+fn builtin_call_diagnostics(
+    index: &ProjectFactIndex<'_>,
+    abi: &OwnerAbiEnvironment,
+    exact_types: &mut ProjectFlowTypeAnalyzer<'_, '_>,
+) -> Result<Vec<TypeDiagnostic>, ProjectDiagnosticFactsError> {
+    fn incompatible(
+        index: &ProjectFactIndex<'_>,
+        expression: usize,
+        message: String,
+        diagnostics: &mut Vec<TypeDiagnostic>,
+    ) -> Result<(), ProjectDiagnosticFactsError> {
+        let expression = index.project.expressions().get(expression).ok_or_else(|| {
+            ProjectDiagnosticFactsError::new(
+                "builtin diagnostic references a missing syntax expression",
+            )
+        })?;
+        diagnostics.push(syntax_expression_diagnostic(index, expression, message)?);
+        Ok(())
+    }
+
+    fn true_false(
+        index: &ProjectFactIndex<'_>,
+        call_expression: &boon_syntax::AstExpr,
+        operator: &str,
+        actual: &Type,
+        diagnostics: &mut Vec<TypeDiagnostic>,
+    ) -> Result<(), ProjectDiagnosticFactsError> {
+        if crate::type_accepts_true_false_or_unresolved(actual) {
+            return Ok(());
+        }
+        diagnostics.push(syntax_expression_diagnostic(
+            index,
+            call_expression,
+            format!(
+                "`{operator}` expects `True` or `False` Tags\nexpected: True | False\nfound: {}",
+                crate::boon_facing_type_label(actual)
+            ),
+        )?);
+        Ok(())
+    }
+
+    let program = TypecheckSyntaxProgram::UnitNative(index.project.clone());
+    let expressions = index.project.expressions();
+    let mut diagnostics = Vec::new();
+    for expression in expressions.iter() {
+        let (function, arguments, pipe_input) = match &expression.kind {
+            AstExprKind::Call { function, args, .. } => (function.as_str(), args.as_slice(), None),
+            AstExprKind::Pipe {
+                input, op, args, ..
+            } => (
+                op.as_str(),
+                args.as_slice(),
+                Some(crate::pipeline_source_expr_id(
+                    program.statements(),
+                    expression.id,
+                    *input,
+                    program.expressions(),
+                )),
+            ),
+            _ => continue,
+        };
+        let Some(stable) = stable_syntax_expression(index, expression.id) else {
+            continue;
+        };
+        let Some(call) = index.all_calls.get(&stable).copied() else {
+            continue;
+        };
+        if !matches!(
+            call.diagnostic.disposition,
+            crate::OwnerDiagnosticCallDisposition::Abi {
+                kind: CheckedCallableKind::Builtin
+            }
+        ) {
+            continue;
+        }
+        if crate::host_effect_signature(function).is_some() {
+            continue;
+        }
+        if crate::session_info_intrinsic_type(function).is_some() {
+            if !crate::session_info_intrinsic_allowed(function, abi.role) {
+                diagnostics.push(syntax_expression_diagnostic(
+                    index,
+                    expression,
+                    crate::session_info_role_diagnostic(function, abi.role),
+                )?);
+            }
+            if let Some(input) = pipe_input {
+                incompatible(
+                    index,
+                    input,
+                    format!("`{function}` does not accept a pipe input"),
+                    &mut diagnostics,
+                )?;
+            }
+            for argument in arguments {
+                incompatible(
+                    index,
+                    argument.value,
+                    format!("`{function}` does not accept arguments"),
+                    &mut diagnostics,
+                )?;
+            }
+            continue;
+        }
+
+        if let Some(input) = pipe_input
+            && !expressions
+                .get(input)
+                .is_some_and(crate::expr_is_pipe_placeholder)
+        {
+            let actual = owner_call_actual_type(index, exact_types, call, input);
+            if let Some(expected_label) = crate::builtin_pipe_input_custom_expected_label(function)
+            {
+                if !crate::builtin_pipe_input_custom_accepts(function, &actual) {
+                    incompatible(
+                        index,
+                        input,
+                        format!(
+                            "`{function}` pipe input has incompatible type\nexpected: {expected_label}\nfound: {}",
+                            crate::boon_facing_type_label(&actual)
+                        ),
+                        &mut diagnostics,
+                    )?;
+                }
+            } else if let Some(expected) = crate::pipe_input_expected_type(function)
+                && !crate::type_is_assignable_to(&actual, &expected)
+            {
+                incompatible(
+                    index,
+                    input,
+                    format!(
+                        "`{function}` pipe input has incompatible type\nexpected: {}\nfound: {}",
+                        crate::boon_facing_type_label(&expected),
+                        crate::boon_facing_type_label(&actual)
+                    ),
+                    &mut diagnostics,
+                )?;
+            }
+        }
+
+        let piped = pipe_input.is_some();
+        for argument in arguments {
+            let name = argument.named_name();
+            if is_registered_render_constructor(function)
+                && name
+                    .is_some_and(|name| !crate::render_arg_should_validate_directly(function, name))
+            {
+                continue;
+            }
+            if function == "Bool/toggle" && name == Some("when") {
+                continue;
+            }
+            let actual = owner_call_actual_type(index, exact_types, call, argument.value);
+            if let Some(expected_label) =
+                crate::builtin_argument_custom_expected_label(function, name, piped)
+            {
+                if !crate::builtin_argument_custom_accepts(function, name, &actual, piped) {
+                    let label = name.unwrap_or("argument");
+                    incompatible(
+                        index,
+                        argument.value,
+                        format!(
+                            "`{function}` argument `{label}` has incompatible type\nexpected: {expected_label}\nfound: {}",
+                            crate::boon_facing_type_label(&actual)
+                        ),
+                        &mut diagnostics,
+                    )?;
+                }
+            } else if let Some(expected) =
+                crate::builtin_argument_expected_type(function, name, piped)
+                && !crate::type_is_assignable_to(&actual, &expected)
+            {
+                let label = name.unwrap_or("argument");
+                incompatible(
+                    index,
+                    argument.value,
+                    format!(
+                        "`{function}` argument `{label}` has incompatible type\nexpected: {}\nfound: {}",
+                        crate::boon_facing_type_label(&expected),
+                        crate::boon_facing_type_label(&actual)
+                    ),
+                    &mut diagnostics,
+                )?;
+            }
+        }
+
+        if matches!(function, "Bool/not" | "Bool/toggle") {
+            if let Some(input) = pipe_input.or_else(|| arguments.first().map(|arg| arg.value)) {
+                let actual = owner_call_actual_type(index, exact_types, call, input);
+                true_false(index, expression, function, &actual, &mut diagnostics)?;
+            }
+        } else if matches!(function, "Bool/and" | "Bool/or") {
+            if let Some(input) = pipe_input {
+                let actual = owner_call_actual_type(index, exact_types, call, input);
+                true_false(index, expression, function, &actual, &mut diagnostics)?;
+            }
+            for argument in arguments {
+                let actual = owner_call_actual_type(index, exact_types, call, argument.value);
+                true_false(index, expression, function, &actual, &mut diagnostics)?;
+            }
+        }
+
+        if function == "Number/round"
+            && let Some(quantum_expression) = arguments
+                .iter()
+                .find(|argument| argument.named_name() == Some("to"))
+                .map(|argument| argument.value)
+            && let Some(quantum) = crate::static_exact_number_expr(&program, quantum_expression)
+            && !quantum.is_positive()
+        {
+            incompatible(
+                index,
+                quantum_expression,
+                "`Number/round` argument `to` must be a strictly positive exact Number".to_owned(),
+                &mut diagnostics,
+            )?;
+        }
+    }
+    Ok(diagnostics)
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProjectDeferredStyleConstraint {
+    expression: StableOrderExpression,
+    field_name: String,
+    expectation: crate::DeferredStyleExpectation,
+}
+
+fn project_style_expression_type(index: &ProjectFactIndex<'_>, expression: usize) -> Type {
+    stable_syntax_expression(index, expression)
+        .and_then(|stable| index.order_expression(&stable))
+        .map(|(_, _, _, inferred)| inferred.flow_type.ty.clone())
+        .unwrap_or(Type::Unknown)
+}
+
+fn project_style_diagnostic(
+    index: &ProjectFactIndex<'_>,
+    expression: usize,
+    message: String,
+    diagnostics: &mut Vec<TypeDiagnostic>,
+) -> Result<(), ProjectDiagnosticFactsError> {
+    let expression = index.project.expressions().get(expression).ok_or_else(|| {
+        ProjectDiagnosticFactsError::new("style diagnostic references a missing syntax expression")
+    })?;
+    diagnostics.push(syntax_expression_diagnostic(index, expression, message)?);
+    Ok(())
+}
+
+fn project_style_color_field(
+    index: &ProjectFactIndex<'_>,
+    field_name: &str,
+    expression: usize,
+    constraints: &mut Vec<ProjectDeferredStyleConstraint>,
+    diagnostics: &mut Vec<TypeDiagnostic>,
+) -> Result<(), ProjectDiagnosticFactsError> {
+    let ty = project_style_expression_type(index, expression);
+    if crate::style_type_requires_instantiation(&ty) {
+        let expression = stable_syntax_expression(index, expression).ok_or_else(|| {
+            ProjectDiagnosticFactsError::new(
+                "deferred style color has no exact stable expression identity",
+            )
+        })?;
+        constraints.push(ProjectDeferredStyleConstraint {
+            expression,
+            field_name: field_name.to_owned(),
+            expectation: crate::DeferredStyleExpectation::Color,
+        });
+    } else if !crate::style_color_accepts_type(&ty) {
+        project_style_diagnostic(
+            index,
+            expression,
+            format!(
+                "style field `{field_name}` must be `Oklch[...]` or CSS hex text, found `{}`",
+                crate::boon_facing_type_label(&ty)
+            ),
+            diagnostics,
+        )?;
+    }
+    Ok(())
+}
+
+fn project_style_nested_object(
+    index: &ProjectFactIndex<'_>,
+    expression: usize,
+    empty_tag: Option<&str>,
+    mut check_field: impl FnMut(
+        &boon_syntax::AstRecordField,
+        &mut Vec<ProjectDeferredStyleConstraint>,
+        &mut Vec<TypeDiagnostic>,
+    ) -> Result<(), ProjectDiagnosticFactsError>,
+    constraints: &mut Vec<ProjectDeferredStyleConstraint>,
+    diagnostics: &mut Vec<TypeDiagnostic>,
+) -> Result<(), ProjectDiagnosticFactsError> {
+    let Some(expression_row) = index.project.expressions().get(expression) else {
+        return Err(ProjectDiagnosticFactsError::new(
+            "nested style field references a missing syntax expression",
+        ));
+    };
+    let AstExprKind::Object(fields) = &expression_row.kind else {
+        let ty = project_style_expression_type(index, expression);
+        if !crate::style_nested_object_accepts_type(&ty, empty_tag) {
+            project_style_diagnostic(
+                index,
+                expression,
+                "style nested field must be an object".to_owned(),
+                diagnostics,
+            )?;
+        }
+        return Ok(());
+    };
+    for field in fields {
+        check_field(field, constraints, diagnostics)?;
+    }
+    Ok(())
+}
+
+fn project_style_field_value(
+    index: &ProjectFactIndex<'_>,
+    field_name: &str,
+    expression: usize,
+    constraints: &mut Vec<ProjectDeferredStyleConstraint>,
+    diagnostics: &mut Vec<TypeDiagnostic>,
+) -> Result<(), ProjectDiagnosticFactsError> {
+    if crate::is_deleted_public_style_field(field_name) {
+        project_style_diagnostic(
+            index,
+            expression,
+            format!("style field `{field_name}` is not public Boon API"),
+            diagnostics,
+        )?;
+        return Ok(());
+    }
+    match field_name {
+        "width" | "height" | "padding" | "gap" => {
+            let ty = project_style_expression_type(index, expression);
+            if crate::style_type_requires_instantiation(&ty) {
+                let expression = stable_syntax_expression(index, expression).ok_or_else(|| {
+                    ProjectDiagnosticFactsError::new(
+                        "deferred style dimension has no exact stable expression identity",
+                    )
+                })?;
+                constraints.push(ProjectDeferredStyleConstraint {
+                    expression,
+                    field_name: field_name.to_owned(),
+                    expectation: crate::DeferredStyleExpectation::Dimension,
+                });
+            } else if !crate::style_dimension_accepts_type(&ty) {
+                project_style_diagnostic(
+                    index,
+                    expression,
+                    format!(
+                        "style field `{field_name}` must be a number, `Fill` tag, or `Auto` tag"
+                    ),
+                    diagnostics,
+                )?;
+            }
+        }
+        "font" => {
+            project_style_nested_object(
+                index,
+                expression,
+                None,
+                |field, constraints, diagnostics| match field.name.as_str() {
+                    "size" => {
+                        let ty = project_style_expression_type(index, field.value);
+                        if crate::style_type_requires_instantiation(&ty) {
+                            let expression = stable_syntax_expression(index, field.value)
+                                .ok_or_else(|| {
+                                    ProjectDiagnosticFactsError::new(
+                                        "deferred font size has no exact stable expression identity",
+                                    )
+                                })?;
+                            constraints.push(ProjectDeferredStyleConstraint {
+                                expression,
+                                field_name: "font.size".to_owned(),
+                                expectation: crate::DeferredStyleExpectation::Number,
+                            });
+                        } else if !matches!(ty, Type::Number) {
+                            project_style_diagnostic(
+                                index,
+                                field.value,
+                                "style field `font.size` must be a number".to_owned(),
+                                diagnostics,
+                            )?;
+                        }
+                        Ok(())
+                    }
+                    "color" => project_style_color_field(
+                        index,
+                        "font.color",
+                        field.value,
+                        constraints,
+                        diagnostics,
+                    ),
+                    _ => Ok(()),
+                },
+                constraints,
+                diagnostics,
+            )?;
+        }
+        "background" | "border" | "outline" | "borders" => {
+            let prefix = field_name.to_owned();
+            let empty_tag = (field_name == "outline").then_some("NoOutline");
+            project_style_nested_object(
+                index,
+                expression,
+                empty_tag,
+                |field, constraints, diagnostics| {
+                    if field.name == "color" {
+                        project_style_color_field(
+                            index,
+                            &format!("{prefix}.color"),
+                            field.value,
+                            constraints,
+                            diagnostics,
+                        )?;
+                    }
+                    Ok(())
+                },
+                constraints,
+                diagnostics,
+            )?;
+        }
+        "color" => {
+            project_style_color_field(index, "color", expression, constraints, diagnostics)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn project_style_expression(
+    index: &ProjectFactIndex<'_>,
+    expression: usize,
+    constraints: &mut Vec<ProjectDeferredStyleConstraint>,
+    diagnostics: &mut Vec<TypeDiagnostic>,
+) -> Result<(), ProjectDiagnosticFactsError> {
+    let Some(expression_row) = index.project.expressions().get(expression) else {
+        return Err(ProjectDiagnosticFactsError::new(
+            "style value references a missing syntax expression",
+        ));
+    };
+    if matches!(
+        expression_row.kind,
+        AstExprKind::ListLiteral { .. } | AstExprKind::Delimiter
+    ) {
+        return Ok(());
+    }
+    let is_scalar_literal = matches!(
+        expression_row.kind,
+        AstExprKind::StringLiteral(_)
+            | AstExprKind::TextLiteral(_)
+            | AstExprKind::Number(_)
+            | AstExprKind::Tag(_)
+    );
+    let AstExprKind::Object(fields) = &expression_row.kind else {
+        if is_scalar_literal {
+            let ty = project_style_expression_type(index, expression);
+            if !crate::is_open_object_type(&ty) {
+                project_style_diagnostic(
+                    index,
+                    expression,
+                    "style must be an object".to_owned(),
+                    diagnostics,
+                )?;
+            }
+        }
+        return Ok(());
+    };
+    for field in fields {
+        project_style_field_value(index, &field.name, field.value, constraints, diagnostics)?;
+    }
+    Ok(())
+}
+
+fn project_style_statement(
+    index: &ProjectFactIndex<'_>,
+    statement: &boon_syntax::AstStatement,
+    constraints: &mut Vec<ProjectDeferredStyleConstraint>,
+    diagnostics: &mut Vec<TypeDiagnostic>,
+) -> Result<(), ProjectDiagnosticFactsError> {
+    if let Some(expression) = statement.expr {
+        project_style_expression(index, expression, constraints, diagnostics)?;
+    }
+    for child in &statement.children {
+        let Some(field) = crate::statement_field(child) else {
+            continue;
+        };
+        let program = TypecheckSyntaxProgram::UnitNative(index.project.clone());
+        if let Some(value) = crate::direct_statement_value_expr_id(child, program.expressions()) {
+            project_style_field_value(index, field, value, constraints, diagnostics)?;
+        } else {
+            project_style_statement(index, child, constraints, diagnostics)?;
+        }
+    }
+    Ok(())
+}
+
+fn deferred_style_diagnostic_message(
+    constraint: &ProjectDeferredStyleConstraint,
+    ty: &Type,
+) -> String {
+    match constraint.expectation {
+        crate::DeferredStyleExpectation::Dimension => format!(
+            "style field `{}` must be a number, `Fill` tag, or `Auto` tag",
+            constraint.field_name
+        ),
+        crate::DeferredStyleExpectation::Number => {
+            format!("style field `{}` must be a number", constraint.field_name)
+        }
+        crate::DeferredStyleExpectation::Color => format!(
+            "style field `{}` must be `Oklch[...]` or CSS hex text, found `{}`",
+            constraint.field_name,
+            crate::boon_facing_type_label(ty)
+        ),
+    }
+}
+
+fn style_diagnostics(
+    index: &ProjectFactIndex<'_>,
+) -> Result<Vec<TypeDiagnostic>, ProjectDiagnosticFactsError> {
+    fn collect_statement(
+        index: &ProjectFactIndex<'_>,
+        statement: &boon_syntax::AstStatement,
+        constraints: &mut Vec<ProjectDeferredStyleConstraint>,
+        diagnostics: &mut Vec<TypeDiagnostic>,
+    ) -> Result<(), ProjectDiagnosticFactsError> {
+        let program = TypecheckSyntaxProgram::UnitNative(index.project.clone());
+        if let Some(expression) = statement.expr
+            && crate::render_constructor_for_expr(expression, program.expressions()).is_some()
+        {
+            for child in &statement.children {
+                if crate::statement_field(child) == Some("style") {
+                    project_style_statement(index, child, constraints, diagnostics)?;
+                }
+            }
+        }
+        for child in &statement.children {
+            collect_statement(index, child, constraints, diagnostics)?;
+        }
+        Ok(())
+    }
+
+    fn validate_owner(
+        owner: &StableCheckOwnerKey,
+        substitutions: &BTreeMap<boon_checked::TypeVar, Type>,
+        constraints_by_owner: &BTreeMap<
+            StableCheckOwnerKey,
+            Vec<(ProjectDeferredStyleConstraint, Type, TypeDiagnosticSpan)>,
+        >,
+        diagnostics: &mut Vec<TypeDiagnostic>,
+    ) {
+        for (constraint, base, span) in constraints_by_owner.get(owner).into_iter().flatten() {
+            let ty = substitute_checked_type(base, substitutions);
+            if crate::style_type_requires_instantiation(&ty)
+                || crate::deferred_style_expectation_accepts(constraint.expectation, &ty)
+            {
+                continue;
+            }
+            diagnostics.push(TypeDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                line: span.line,
+                start: span.start,
+                end: span.end,
+                message: deferred_style_diagnostic_message(constraint, &ty),
+            });
+        }
+    }
+
+    fn visit_call(
+        call_expression: &StableOrderExpression,
+        inherited: &BTreeMap<boon_checked::TypeVar, Type>,
+        calls: &BTreeMap<StableOrderExpression, &OwnerDiagnosticStableCallFact>,
+        calls_by_owner: &BTreeMap<StableCheckOwnerKey, Vec<StableOrderExpression>>,
+        constraints_by_owner: &BTreeMap<
+            StableCheckOwnerKey,
+            Vec<(ProjectDeferredStyleConstraint, Type, TypeDiagnosticSpan)>,
+        >,
+        active: &mut BTreeSet<StableCheckOwnerKey>,
+        diagnostics: &mut Vec<TypeDiagnostic>,
+    ) {
+        let Some(call) = calls.get(call_expression) else {
+            return;
+        };
+        let crate::OwnerDiagnosticCallDisposition::User { owner } = &call.diagnostic.disposition
+        else {
+            return;
+        };
+        let substitutions = crate::compose_checked_type_substitutions(
+            inherited,
+            &call.diagnostic.type_substitutions,
+        );
+        validate_owner(owner, &substitutions, constraints_by_owner, diagnostics);
+        if !active.insert(owner.clone()) {
+            return;
+        }
+        for nested in calls_by_owner.get(owner).into_iter().flatten() {
+            visit_call(
+                nested,
+                &substitutions,
+                calls,
+                calls_by_owner,
+                constraints_by_owner,
+                active,
+                diagnostics,
+            );
+        }
+        active.remove(owner);
+    }
+
+    let mut constraints = Vec::new();
+    let mut diagnostics = Vec::new();
+    let program = TypecheckSyntaxProgram::UnitNative(index.project.clone());
+    for statement in program.statements() {
+        collect_statement(index, statement, &mut constraints, &mut diagnostics)?;
+    }
+    for expression in index.project.expressions().iter() {
+        let (function, arguments) = match &expression.kind {
+            AstExprKind::Call { function, args, .. }
+            | AstExprKind::Pipe {
+                op: function, args, ..
+            } => (function, args.as_slice()),
+            _ => continue,
+        };
+        if !is_registered_render_constructor(function) {
+            continue;
+        }
+        let Some(stable) = stable_syntax_expression(index, expression.id) else {
+            continue;
+        };
+        if !matches!(
+            index
+                .all_calls
+                .get(&stable)
+                .map(|call| &call.diagnostic.disposition),
+            Some(crate::OwnerDiagnosticCallDisposition::Abi {
+                kind: CheckedCallableKind::Builtin
+            })
+        ) {
+            continue;
+        }
+        for argument in arguments
+            .iter()
+            .filter(|argument| argument.named_name() == Some("style"))
+        {
+            project_style_expression(index, argument.value, &mut constraints, &mut diagnostics)?;
+        }
+    }
+
+    constraints.sort();
+    constraints.dedup();
+    let function_owners = index
+        .owners
+        .iter()
+        .filter_map(|(owner, view)| view.replay.function_name.is_some().then(|| owner.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut constraints_by_owner = BTreeMap::<
+        StableCheckOwnerKey,
+        Vec<(ProjectDeferredStyleConstraint, Type, TypeDiagnosticSpan)>,
+    >::new();
+    for constraint in constraints {
+        let owner = index
+            .callable_owner(&constraint.expression.owner)
+            .cloned()
+            .unwrap_or_else(|| constraint.expression.owner.clone());
+        let base = if let Some((parameter_owner, ordinal, projection)) =
+            index.deferred_style_parameter_origin(&constraint.expression, &[], &mut BTreeSet::new())
+        {
+            index.deferred_style_parameter_type(&parameter_owner, ordinal, &projection)?
+        } else {
+            index
+                .order_expression(&constraint.expression)
+                .map(|(_, _, _, inferred)| inferred.flow_type.ty.clone())
+                .ok_or_else(|| {
+                    ProjectDiagnosticFactsError::new(
+                        "deferred style constraint has no inferred expression type",
+                    )
+                })?
+        };
+        let span = index.expression_span(&constraint.expression)?;
+        constraints_by_owner
+            .entry(owner)
+            .or_default()
+            .push((constraint, base, span));
+    }
+    for owner in constraints_by_owner
+        .keys()
+        .filter(|owner| !function_owners.contains(*owner))
+    {
+        validate_owner(
+            owner,
+            &BTreeMap::new(),
+            &constraints_by_owner,
+            &mut diagnostics,
+        );
+    }
+    let mut calls_by_owner = BTreeMap::<StableCheckOwnerKey, Vec<StableOrderExpression>>::new();
+    for call in index.all_calls.keys() {
+        let owner = index
+            .callable_owner(&call.owner)
+            .cloned()
+            .unwrap_or_else(|| call.owner.clone());
+        calls_by_owner.entry(owner).or_default().push(call.clone());
+    }
+    for call in index.all_calls.keys() {
+        let owner = index
+            .callable_owner(&call.owner)
+            .cloned()
+            .unwrap_or_else(|| call.owner.clone());
+        if function_owners.contains(&owner) {
+            continue;
+        }
+        visit_call(
+            call,
+            &BTreeMap::new(),
+            &index.all_calls,
+            &calls_by_owner,
+            &constraints_by_owner,
+            &mut BTreeSet::new(),
+            &mut diagnostics,
+        );
+    }
+    diagnostics.sort_by(|left, right| {
+        (left.line, left.start, left.end, left.message.as_str()).cmp(&(
+            right.line,
+            right.start,
+            right.end,
+            right.message.as_str(),
+        ))
+    });
+    diagnostics.dedup();
+    Ok(diagnostics)
+}
+
+/// Construction-independent source-flow type projection. Reusable owner
+/// interfaces intentionally retain generic or demand-shaped fallbacks; source
+/// diagnostics need the exact HOLD/branch/declaration value at the authored
+/// use site without constructing checked rows.
+struct ProjectFlowTypeAnalyzer<'index, 'project> {
+    index: &'index ProjectFactIndex<'project>,
+    program: TypecheckSyntaxProgram,
+    navigation: ProjectOrderAnalyzer<'index, 'project>,
+    cache: BTreeMap<StableOrderExpression, Type>,
+    active: BTreeSet<StableOrderExpression>,
+}
+
+impl<'index, 'project> ProjectFlowTypeAnalyzer<'index, 'project> {
+    fn new(index: &'index ProjectFactIndex<'project>) -> Self {
+        Self {
+            index,
+            program: TypecheckSyntaxProgram::UnitNative(index.project.clone()),
+            navigation: ProjectOrderAnalyzer::new(index),
+            cache: BTreeMap::new(),
+            active: BTreeSet::new(),
+        }
+    }
+
+    fn expression_ref(
+        &self,
+        owner: &StableCheckOwnerKey,
+        reference: usize,
+    ) -> Option<StableOrderExpression> {
+        self.index
+            .stable_expression_ref(owner, u32::try_from(reference).ok()?)
+    }
+
+    fn projected_type(ty: &Type, projection: &[String]) -> Option<Type> {
+        let Some((field, rest)) = projection.split_first() else {
+            return Some(ty.clone());
+        };
+        match ty {
+            Type::Object(shape) => shape
+                .fields
+                .get(field)
+                .and_then(|field| Self::projected_type(field, rest))
+                .or_else(|| shape.open.then(crate::open_object_type)),
+            Type::VariantSet(variants) => variants
+                .iter()
+                .filter_map(|variant| match variant {
+                    boon_checked::Variant::Tagged { fields, .. } => fields.fields.get(field),
+                    boon_checked::Variant::Tag(_) => None,
+                })
+                .filter_map(|field| Self::projected_type(field, rest))
+                .reduce(|left, right| boon_checked::widen_structural_type(&left, &right)),
+            Type::Union(members) => members
+                .iter()
+                .filter_map(|member| Self::projected_type(member, projection))
+                .reduce(|left, right| boon_checked::canonical_union_type(vec![left, right])),
+            Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_) => Some(ty.clone()),
+            Type::Text
+            | Type::Number
+            | Type::Bytes(_)
+            | Type::Bits { .. }
+            | Type::Absent
+            | Type::RenderContract
+            | Type::List(_)
+            | Type::Set(_)
+            | Type::Map { .. }
+            | Type::Function { .. } => None,
+        }
+    }
+
+    fn project(ty: Type, projection: &[String], fallback: Type) -> Type {
+        Self::projected_type(&ty, projection).unwrap_or(fallback)
+    }
+
+    fn merged_expression_types(
+        &mut self,
+        owner: &StableCheckOwnerKey,
+        references: &[usize],
+        skip_absent: bool,
+    ) -> Option<Type> {
+        let expressions = references
+            .iter()
+            .filter_map(|reference| self.expression_ref(owner, *reference))
+            .collect::<Vec<_>>();
+        expressions
+            .iter()
+            .map(|expression| self.expression_type(expression))
+            .filter(|ty| !skip_absent || !matches!(ty, Type::Absent))
+            .reduce(|left, right| boon_checked::widen_structural_type(&left, &right))
+    }
+
+    fn list_item_type(ty: &Type) -> Option<Type> {
+        match ty {
+            Type::List(item) => Some(item.as_ref().clone()),
+            Type::Union(members) => members
+                .iter()
+                .filter_map(Self::list_item_type)
+                .reduce(|left, right| boon_checked::widen_structural_type(&left, &right)),
+            _ => None,
+        }
+    }
+
+    fn call_input_type(&mut self, expression: &StableOrderExpression, name: &str) -> Option<Type> {
+        let input = self.navigation.call_input(expression, name)?;
+        Some(self.expression_type(&input))
+    }
+
+    fn call_type(&mut self, expression: &StableOrderExpression, fallback: Type) -> Type {
+        let function = self
+            .index
+            .all_calls
+            .get(expression)
+            .map(|call| call.function.clone());
+        match function.as_deref() {
+            Some("List/find") => {
+                let list = self.call_input_type(expression, "list");
+                list.and_then(|list| Self::list_item_type(&list))
+                    .map(|item| {
+                        Type::VariantSet(
+                            vec![
+                                boon_checked::Variant::Tagged {
+                                    tag: "Found".to_owned(),
+                                    fields: boon_checked::ObjectShape::from_ordered_fields(
+                                        [("value".to_owned(), item)],
+                                        false,
+                                    ),
+                                },
+                                boon_checked::Variant::Tag("NotFound".to_owned()),
+                            ]
+                            .into(),
+                        )
+                    })
+                    .unwrap_or(fallback)
+            }
+            Some("List/map") => self
+                .call_input_type(expression, "new")
+                .map(|item| Type::List(Type::shared(item)))
+                .unwrap_or(fallback),
+            Some("List/filter" | "List/retain" | "List/remove" | "List/take" | "List/page") => {
+                self.call_input_type(expression, "list").unwrap_or(fallback)
+            }
+            _ => fallback,
+        }
+    }
+
+    fn local_target_value(
+        &self,
+        owner: &StableCheckOwnerKey,
+        target: &OwnerLexicalDeclarationTarget,
+    ) -> Option<StableOrderExpression> {
+        match target {
+            OwnerLexicalDeclarationTarget::Statement { statement } => {
+                self.index.statement_value_ref(owner, *statement)
+            }
+            OwnerLexicalDeclarationTarget::RecordField {
+                object, ordinal, ..
+            } => self
+                .index
+                .stable_expression_ref(owner, *object)
+                .and_then(|object| self.navigation.record_field_value(&object, *ordinal)),
+            OwnerLexicalDeclarationTarget::Imported { target } => self
+                .navigation
+                .stable_target_value(target, &[])
+                .map(|(value, _)| value),
+            OwnerLexicalDeclarationTarget::Parameter { .. }
+            | OwnerLexicalDeclarationTarget::PatternBinding { .. }
+            | OwnerLexicalDeclarationTarget::Passed
+            | OwnerLexicalDeclarationTarget::Ambiguous { .. } => None,
+        }
+    }
+
+    fn pattern_binding_type(
+        &mut self,
+        owner: &StableCheckOwnerKey,
+        arm: &StableExpressionKey,
+        name: &str,
+    ) -> Option<Type> {
+        let arm = StableOrderExpression {
+            owner: owner.clone(),
+            expression: arm.clone(),
+        };
+        let (_, _, syntax, _) = self.index.order_expression(&arm)?;
+        let selector = self
+            .index
+            .stable_expression_ref(owner, syntax.pattern_selector?)?;
+        let pattern = match &syntax.kind {
+            AstExprKind::MatchArm { pattern, .. } => pattern.clone(),
+            _ => return None,
+        };
+        let selector = self.expression_type(&selector);
+        match pattern {
+            boon_syntax::AstMatchPattern::Binding { name: binding } if binding == name => {
+                Some(selector)
+            }
+            boon_syntax::AstMatchPattern::Tag { name: tag, fields }
+                if fields.iter().any(|field| field == name) =>
+            {
+                fn field_type(ty: &Type, tag: &str, field: &str) -> Option<Type> {
+                    match ty {
+                        Type::VariantSet(variants) => variants
+                            .iter()
+                            .filter_map(|variant| match variant {
+                                boon_checked::Variant::Tagged {
+                                    tag: candidate,
+                                    fields,
+                                } if candidate == tag => fields.fields.get(field).cloned(),
+                                _ => None,
+                            })
+                            .reduce(|left, right| {
+                                boon_checked::widen_structural_type(&left, &right)
+                            }),
+                        Type::Union(members) => members
+                            .iter()
+                            .filter_map(|member| field_type(member, tag, field))
+                            .reduce(|left, right| {
+                                boon_checked::canonical_union_type(vec![left, right])
+                            }),
+                        _ => None,
+                    }
+                }
+                field_type(&selector, &tag, name)
+            }
+            _ => None,
+        }
+    }
+
+    fn stable_pattern_binding_type(&mut self, target: &OwnerLexicalTargetRef) -> Option<Type> {
+        let OwnerLexicalTargetRef::Declaration {
+            owner,
+            declaration: OwnerDeclarationStableKey::PatternBinding { selector, name, .. },
+            ..
+        } = target
+        else {
+            return None;
+        };
+        self.pattern_binding_type(owner, selector, name)
+    }
+
+    fn read_type(&mut self, expression: &StableOrderExpression, fallback: Type) -> Type {
+        if let Some(read) = self.index.effective_read(expression) {
+            let binding = match &read.target {
+                OwnerEffectiveLexicalTarget::Static {
+                    target: OwnerLexicalDeclarationTarget::PatternBinding { arm, name },
+                } => self
+                    .index
+                    .owners
+                    .get(&expression.owner)
+                    .and_then(|view| view.syntax.expressions.get(*arm as usize))
+                    .map(|arm| arm.stable_key.clone())
+                    .and_then(|arm| self.pattern_binding_type(&expression.owner, &arm, name)),
+                OwnerEffectiveLexicalTarget::Static {
+                    target: OwnerLexicalDeclarationTarget::Imported { target },
+                }
+                | OwnerEffectiveLexicalTarget::Imported { target } => {
+                    self.stable_pattern_binding_type(target)
+                }
+                _ => None,
+            };
+            if let Some(binding) = binding {
+                return Self::project(binding, &read.projection, fallback);
+            }
+            let value = match &read.target {
+                OwnerEffectiveLexicalTarget::Static { target } => {
+                    self.local_target_value(&expression.owner, target)
+                }
+                OwnerEffectiveLexicalTarget::Imported { target } => self
+                    .navigation
+                    .stable_target_value(target, &[])
+                    .map(|(value, _)| value),
+                OwnerEffectiveLexicalTarget::FreshOut { .. }
+                | OwnerEffectiveLexicalTarget::CallContext { .. }
+                | OwnerEffectiveLexicalTarget::InvalidBareBinding { .. }
+                | OwnerEffectiveLexicalTarget::Ambiguous { .. } => None,
+            };
+            if let Some(value) = value
+                && &value != expression
+            {
+                let ty = self.expression_type(&value);
+                return Self::project(ty, &read.projection, fallback);
+            }
+            return fallback;
+        }
+        match self.index.value_resolutions.get(expression).copied() {
+            Some(crate::OwnerSymbolResolution::Resolved {
+                owner, projection, ..
+            }) => self
+                .index
+                .public_result(owner)
+                .filter(|value| value != expression)
+                .map(|value| {
+                    let ty = self.expression_type(&value);
+                    Self::project(ty, projection, fallback.clone())
+                })
+                .unwrap_or(fallback),
+            Some(crate::OwnerSymbolResolution::Authoritative { .. })
+            | Some(crate::OwnerSymbolResolution::Unresolved { .. })
+            | Some(crate::OwnerSymbolResolution::CallableAsValue { .. })
+            | Some(crate::OwnerSymbolResolution::Ambiguous { .. })
+            | None => fallback,
+        }
+    }
+
+    fn expression_type(&mut self, expression: &StableOrderExpression) -> Type {
+        if let Some(ty) = self.cache.get(expression) {
+            return ty.clone();
+        }
+        let fallback = self
+            .index
+            .order_expression(expression)
+            .map(|(_, _, _, inferred)| inferred.flow_type.ty.clone())
+            .unwrap_or(Type::Unknown);
+        if !self.active.insert(expression.clone()) {
+            return fallback;
+        }
+        let syntax = self
+            .index
+            .order_expression(expression)
+            .map(|(_, _, syntax, _)| syntax.clone());
+        let ty = if let Some(syntax) = syntax {
+            match &syntax.kind {
+                AstExprKind::StringLiteral(_)
+                | AstExprKind::TextLiteral(_)
+                | AstExprKind::TextTemplate { .. } => Type::Text,
+                AstExprKind::Number(_) => Type::Number,
+                AstExprKind::ByteLiteral { .. } => Type::Bytes(boon_checked::BytesType::Fixed(1)),
+                AstExprKind::BitsLiteral { width, .. } => Type::Bits { width: *width },
+                AstExprKind::BytesLiteral { size, .. } => Type::Bytes(match size {
+                    BytesSizeSyntax::Fixed(size) => boon_checked::BytesType::Fixed(*size),
+                    BytesSizeSyntax::Dynamic | BytesSizeSyntax::Infer => {
+                        boon_checked::BytesType::Dynamic
+                    }
+                }),
+                AstExprKind::Tag(tag) if tag == "SKIP" => Type::Absent,
+                AstExprKind::Tag(tag) => {
+                    Type::VariantSet(vec![boon_checked::Variant::Tag(tag.clone())].into())
+                }
+                AstExprKind::Flush { .. } => Type::Absent,
+                AstExprKind::Identifier(_) | AstExprKind::Path(_) | AstExprKind::Drain { .. } => {
+                    self.read_type(expression, fallback.clone())
+                }
+                AstExprKind::TaggedObject { tag, fields }
+                    if fields.iter().all(|field| !field.spread) =>
+                {
+                    Type::VariantSet(
+                        vec![boon_checked::Variant::Tagged {
+                            tag: tag.clone(),
+                            fields: boon_checked::ObjectShape::from_ordered_fields::<
+                                boon_checked::SharedObjectShape,
+                            >(
+                                fields.iter().filter_map(|field| {
+                                    self.expression_ref(&expression.owner, field.value).map(
+                                        |value| (field.name.clone(), self.expression_type(&value)),
+                                    )
+                                }),
+                                false,
+                            ),
+                        }]
+                        .into(),
+                    )
+                }
+                AstExprKind::Object(fields) if fields.iter().all(|field| !field.spread) => {
+                    Type::object(boon_checked::ObjectShape::from_ordered_fields(
+                        fields.iter().filter_map(|field| {
+                            self.expression_ref(&expression.owner, field.value)
+                                .map(|value| (field.name.clone(), self.expression_type(&value)))
+                        }),
+                        false,
+                    ))
+                }
+                AstExprKind::ListLiteral { items, .. } => Type::List(Type::shared(
+                    self.merged_expression_types(&expression.owner, items, false)
+                        .unwrap_or_else(crate::open_object_type),
+                )),
+                AstExprKind::SetLiteral { items } => Type::Set(Type::shared(
+                    self.merged_expression_types(&expression.owner, items, false)
+                        .unwrap_or(Type::Unknown),
+                )),
+                AstExprKind::MapEntry { key, value } => {
+                    let key = self
+                        .expression_ref(&expression.owner, *key)
+                        .map(|key| self.expression_type(&key))
+                        .unwrap_or(Type::Unknown);
+                    let value = self
+                        .expression_ref(&expression.owner, *value)
+                        .map(|value| self.expression_type(&value))
+                        .unwrap_or(Type::Unknown);
+                    Type::object(boon_checked::ObjectShape::from_ordered_fields(
+                        [("key".to_owned(), key), ("value".to_owned(), value)],
+                        false,
+                    ))
+                }
+                AstExprKind::MapLiteral { entries } => {
+                    let mut keys = Vec::new();
+                    let mut values = Vec::new();
+                    let entries = entries
+                        .iter()
+                        .filter_map(|entry| self.expression_ref(&expression.owner, *entry))
+                        .collect::<Vec<_>>();
+                    for entry in entries {
+                        if let Type::Object(shape) = self.expression_type(&entry) {
+                            if let Some(key) = shape.fields.get("key") {
+                                keys.push(key.clone());
+                            }
+                            if let Some(value) = shape.fields.get("value") {
+                                values.push(value.clone());
+                            }
+                        }
+                    }
+                    Type::Map {
+                        key: Box::new(
+                            keys.into_iter()
+                                .reduce(|left, right| {
+                                    boon_checked::widen_structural_type(&left, &right)
+                                })
+                                .unwrap_or(Type::Unknown),
+                        ),
+                        value: Box::new(
+                            values
+                                .into_iter()
+                                .reduce(|left, right| {
+                                    boon_checked::widen_structural_type(&left, &right)
+                                })
+                                .unwrap_or(Type::Unknown),
+                        ),
+                    }
+                }
+                AstExprKind::Infix { op, .. } => {
+                    if crate::infix_returns_bool(op) {
+                        crate::true_false_type()
+                    } else {
+                        Type::Number
+                    }
+                }
+                AstExprKind::MatchArm {
+                    output: Some(output),
+                    ..
+                }
+                | AstExprKind::Block {
+                    result: Some(output),
+                    ..
+                }
+                | AstExprKind::Then {
+                    output: Some(output),
+                    ..
+                } => self
+                    .expression_ref(&expression.owner, *output)
+                    .map(|output| self.expression_type(&output))
+                    .unwrap_or(fallback.clone()),
+                AstExprKind::Then {
+                    input,
+                    output: None,
+                }
+                | AstExprKind::Draining { input } => self
+                    .expression_ref(
+                        &expression.owner,
+                        syntax
+                            .linked_input
+                            .map(|input| input as usize)
+                            .unwrap_or(*input),
+                    )
+                    .map(|input| self.expression_type(&input))
+                    .unwrap_or(fallback.clone()),
+                AstExprKind::When { arms, .. } => self
+                    .merged_expression_types(&expression.owner, arms, false)
+                    .unwrap_or(fallback.clone()),
+                AstExprKind::Pipe { op, arms, .. } if op == "WHILE" => self
+                    .merged_expression_types(&expression.owner, arms, false)
+                    .unwrap_or(fallback.clone()),
+                AstExprKind::Latest { branches } => self
+                    .merged_expression_types(&expression.owner, branches, true)
+                    .unwrap_or(fallback.clone()),
+                AstExprKind::Hold { initial, .. } => {
+                    let mut ty = self
+                        .expression_ref(
+                            &expression.owner,
+                            syntax
+                                .linked_input
+                                .map(|input| input as usize)
+                                .unwrap_or(*initial),
+                        )
+                        .map(|initial| self.expression_type(&initial))
+                        .unwrap_or(Type::Unknown);
+                    if let Some(syntax_expression) = self.index.syntax_expressions.get(expression) {
+                        for update in crate::hold_update_exprs_for_expr(
+                            self.program.statements(),
+                            *syntax_expression,
+                            self.program.expressions(),
+                        )
+                        .into_iter()
+                        .filter_map(|update| stable_syntax_expression(self.index, update))
+                        {
+                            let update = self.expression_type(&update);
+                            if !matches!(update, Type::Absent) {
+                                ty = crate::widen_checked_hold_type(&ty, &update);
+                            }
+                        }
+                    }
+                    ty
+                }
+                AstExprKind::Call { .. } | AstExprKind::Pipe { .. } => {
+                    if let AstExprKind::Pipe { input, op, .. } = &syntax.kind
+                        && let Some(field) = op.strip_prefix("Field/")
+                    {
+                        self.expression_ref(
+                            &expression.owner,
+                            syntax
+                                .linked_input
+                                .map(|input| input as usize)
+                                .unwrap_or(*input),
+                        )
+                        .map(|input| {
+                            let input = self.expression_type(&input);
+                            Self::projected_type(&input, &[field.to_owned()])
+                                .unwrap_or(Type::Unknown)
+                        })
+                        .unwrap_or(Type::Unknown)
+                    } else {
+                        let fallback = self
+                            .index
+                            .all_calls
+                            .get(expression)
+                            .map(|call| call.result.ty.clone())
+                            .unwrap_or(fallback.clone());
+                        self.call_type(expression, fallback)
+                    }
+                }
+                AstExprKind::MatchArm { output: None, .. }
+                | AstExprKind::Block { result: None, .. } => Type::Absent,
+                AstExprKind::Source
+                | AstExprKind::Delimiter
+                | AstExprKind::Unknown(_)
+                | AstExprKind::Arrow { .. }
+                | AstExprKind::Object(_)
+                | AstExprKind::TaggedObject { .. } => fallback.clone(),
+            }
+        } else {
+            fallback.clone()
+        };
+        self.active.remove(expression);
+        self.cache.insert(expression.clone(), ty.clone());
+        ty
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -3489,6 +4792,12 @@ impl<'index, 'project> ProjectFlowModeAnalyzer<'index, 'project> {
         if projection.is_empty() && call.function == "List/map" {
             return self
                 .navigation
+                .call_input(expression, "new")
+                .map(|new| self.expression_mode(&new, frames));
+        }
+        if projection.is_empty() && call.function == "List/latest" {
+            return self
+                .navigation
                 .call_input(expression, "list")
                 .map(|list| self.expression_mode(&list, frames));
         }
@@ -3883,6 +5192,29 @@ fn temporal_diagnostics(
             ));
         };
         match &syntax.kind {
+            AstExprKind::Pipe { input, op, .. } if op == "WHILE" => {
+                let reference = syntax.linked_input.unwrap_or(*input as u32);
+                let Some(input) = index.stable_expression_ref(&expression.owner, reference) else {
+                    continue;
+                };
+                let Some((_, _, _, inferred)) = index.order_expression(&input) else {
+                    continue;
+                };
+                let mode = exact_modes
+                    .get(&input)
+                    .copied()
+                    .unwrap_or(inferred.flow_type.mode);
+                if !matches!(mode, FlowMode::Continuous) {
+                    let span = index.expression_span(&input)?;
+                    diagnostics.push(TypeDiagnostic {
+                        severity: DiagnosticSeverity::Error,
+                        line: span.line,
+                        start: span.start,
+                        end: span.end,
+                        message: "`WHILE` requires a continuous selector".to_owned(),
+                    });
+                }
+            }
             AstExprKind::Then { input, .. } => {
                 let reference = syntax.linked_input.unwrap_or(*input as u32);
                 let Some(input) = index.stable_expression_ref(&expression.owner, reference) else {
@@ -3936,6 +5268,7 @@ fn temporal_diagnostics(
 
 fn match_pattern_diagnostics(
     index: &ProjectFactIndex<'_>,
+    exact_types: &mut ProjectFlowTypeAnalyzer<'_, '_>,
 ) -> Result<Vec<TypeDiagnostic>, ProjectDiagnosticFactsError> {
     let mut diagnostics = Vec::new();
     for expression in index.expressions.keys() {
@@ -3955,10 +5288,7 @@ fn match_pattern_diagnostics(
         let Some(selector) = index.stable_expression_ref(&expression.owner, input) else {
             continue;
         };
-        let Some((_, _, _, selector_expression)) = index.order_expression(&selector) else {
-            continue;
-        };
-        let selector_type = &selector_expression.flow_type.ty;
+        let selector_type = exact_types.expression_type(&selector);
         for arm in arms {
             let Some(arm) = index.stable_expression_ref(&expression.owner, *arm as u32) else {
                 continue;
@@ -3972,7 +5302,7 @@ fn match_pattern_diagnostics(
             let Some(pattern) = crate::checked_match_pattern_from_ast(pattern) else {
                 continue;
             };
-            if crate::checked_match_pattern_compatibility(&pattern, selector_type) != Some(false) {
+            if crate::checked_match_pattern_compatibility(&pattern, &selector_type) != Some(false) {
                 continue;
             }
             let span = index.expression_span(&arm)?;
@@ -3981,7 +5311,10 @@ fn match_pattern_diagnostics(
                 line: span.line,
                 start: span.start,
                 end: span.end,
-                message: crate::incompatible_checked_match_pattern_message(&pattern, selector_type),
+                message: crate::incompatible_checked_match_pattern_message(
+                    &pattern,
+                    &selector_type,
+                ),
             });
         }
     }
@@ -7209,55 +8542,15 @@ pub fn project_diagnostic_facts<'a>(
     )?;
     let mut diagnostics = Vec::new();
     diagnostics.extend(source_shape_diagnostics(&index)?);
+    diagnostics.extend(expression_structure_diagnostics(&index)?);
     diagnostics.extend(recursive_function_diagnostics(&index)?);
-    diagnostics.extend(host_effect_diagnostics(&index)?);
-    let exact_call_input_types = index.exact_call_input_types()?;
-    let diagnostic_calls = index.diagnostic_call_facts()?;
-    let diagnostic_reads = index.diagnostic_reads()?;
-    let (diagnostic_expression_owners, diagnostic_function_owners) =
-        index.diagnostic_owner_rows()?;
-    let deferred_style_base_types = index.deferred_style_base_types()?;
-    let source_payload_types = abi
-        .source_payloads
-        .iter()
-        .map(|payload| (payload.canonical_path.clone(), payload.payload_type.clone()))
-        .collect::<Vec<_>>();
+    let mut exact_types = ProjectFlowTypeAnalyzer::new(&index);
+    diagnostics.extend(host_effect_diagnostics(&index, &mut exact_types)?);
+    diagnostics.extend(builtin_call_diagnostics(&index, abi, &mut exact_types)?);
+    diagnostics.extend(style_diagnostics(&index)?);
     let exact_modes = ProjectFlowModeAnalyzer::new(&index, abi, output_flow).all_modes();
-    let (expression_flows, statement_values) = index.owner_flow_diagnostic_inputs(&exact_modes)?;
-    let (expression_spans, statement_spans) = index.diagnostic_source_spans()?;
-    let call_input_types = exact_call_input_types
-        .into_iter()
-        .map(|((call, input), ty)| {
-            let call = *index.syntax_expressions.get(&call).ok_or_else(|| {
-                ProjectDiagnosticFactsError::new(
-                    "owner diagnostic call has no exact project syntax identity",
-                )
-            })?;
-            let input = *index.syntax_expressions.get(&input).ok_or_else(|| {
-                ProjectDiagnosticFactsError::new(
-                    "owner diagnostic call input has no exact project syntax identity",
-                )
-            })?;
-            Ok((call, input, ty))
-        })
-        .collect::<Result<Vec<_>, ProjectDiagnosticFactsError>>()?;
-    diagnostics.extend(crate::project_owner_flow_diagnostics(
-        project,
-        abi,
-        &expression_flows,
-        &statement_values,
-        &call_input_types,
-        &diagnostic_calls,
-        &diagnostic_reads,
-        &diagnostic_expression_owners,
-        &diagnostic_function_owners,
-        &deferred_style_base_types,
-        &source_payload_types,
-        &expression_spans,
-        &statement_spans,
-    ));
     diagnostics.extend(temporal_diagnostics(&index, &exact_modes)?);
-    diagnostics.extend(match_pattern_diagnostics(&index)?);
+    diagnostics.extend(match_pattern_diagnostics(&index, &mut exact_types)?);
     diagnostics.extend(duplicate_function_diagnostics(&index)?);
     diagnostics.extend(collection_authority_diagnostics(&index)?);
     diagnostics.extend(output_flow_diagnostics(&index, output_flow)?);

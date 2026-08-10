@@ -4481,6 +4481,7 @@ fn signature_dynamic_expression_index(
 
 fn bind_calls(
     calls: Vec<BodyCallPlan>,
+    seed: &OwnerConstraintSeed,
     signature_lexical_plan: &OwnerSignatureLexicalPlan,
     signature_dynamic_expressions: &[bool],
     signature_declaration_variables: &BTreeMap<OwnerSignatureDeclarationTarget, TypeVar>,
@@ -4802,7 +4803,45 @@ fn bind_calls(
             } else {
                 None
             };
-            modes[call.expression] = flow_mode_join(modes[call.expression], Some(result.mode));
+            let result_mode = if valid {
+                let input_mode = |name: &str| {
+                    let formal = parameters.iter().find(|parameter| parameter.name == name)?;
+                    let expression = signature_call?
+                        .matched_inputs
+                        .iter()
+                        .find(|input| input.formal_ordinal == formal.ordinal)?
+                        .expression;
+                    let index = expression as usize;
+                    if index < expressions.len() {
+                        modes.get(index).copied().flatten()
+                    } else {
+                        seed.external_expressions
+                            .get(index.checked_sub(expressions.len())?)
+                            .and_then(|external| interfaces.get(&external.owner))
+                            .map(|interface| interface.result.mode)
+                    }
+                };
+                if call.function == "List/map" {
+                    input_mode("new").unwrap_or(result.mode)
+                } else if call.function == "List/latest" {
+                    input_mode("list").unwrap_or(result.mode)
+                } else if matches!(&target, InferredOwnerCallableTarget::Authoritative)
+                    && abi
+                        .callable(&call.function)
+                        .is_some_and(|contract| contract.kind == CheckedCallableKind::External)
+                {
+                    signature_call
+                        .into_iter()
+                        .flat_map(|call| &call.matched_inputs)
+                        .filter_map(|input| modes.get(input.expression as usize).copied().flatten())
+                        .fold(result.mode, crate::merge_flow_modes)
+                } else {
+                    result.mode
+                }
+            } else {
+                result.mode
+            };
+            modes[call.expression] = flow_mode_join(modes[call.expression], Some(result_mode));
             if valid {
                 direct_effects[call.expression] =
                     merge_effects(direct_effects[call.expression], effect);
@@ -6017,6 +6056,7 @@ fn evaluate_owner_body_impl(
         own_interface.declaration_kind == Some(crate::OwnerDeclarationKind::Function);
     let mut call_drafts = bind_calls(
         calls,
+        seed,
         &signature_lexical_plan,
         &signature_dynamic_expressions,
         &signature_declaration_variables,

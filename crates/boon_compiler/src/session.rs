@@ -34,15 +34,16 @@ use boon_typecheck::{
     OwnerInterfaceTopology, OwnerInterfaceTransferModule, OwnerLexicalPlan,
     OwnerParameterRequirementKey, OwnerParameterRequirementLookup, OwnerReferenceKind,
     OwnerSourceMap, OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution,
-    OwnerSyntaxInput, OwnerValueAbiLookup, ProjectDiagnosticFacts, aggregate_owner_diagnostics,
-    assemble_checked_owner_project, build_checked_owner_shard, build_owner_callable_scope_topology,
-    build_owner_interface_topology, evaluate_owner_body_with_signature_plan,
-    evaluate_owner_callable_scope_scc, evaluate_owner_interface_scc_with_signature_scopes,
-    owner_interface_transfer_dependency_owners, project_diagnostic_facts,
-    project_owner_abi_environment, project_owner_callable_resolution_plan,
-    project_owner_constraint_seed_with_lexical_plan, project_owner_declaration_surface,
-    project_owner_interface_transfer_module, project_owner_lexical_plan, project_owner_source_map,
-    project_owner_syntax_input, resolve_owner_constraint_seed_with_signature_plan,
+    OwnerSyntaxInput, OwnerValueAbiLookup, ProjectDiagnosticFacts, SourceUnitOwnerDiagnostics,
+    aggregate_source_unit_owner_diagnostics, assemble_checked_owner_project,
+    build_checked_owner_shard, build_owner_callable_scope_topology, build_owner_interface_topology,
+    evaluate_owner_body_with_signature_plan, evaluate_owner_callable_scope_scc,
+    evaluate_owner_interface_scc_with_signature_scopes, owner_interface_transfer_dependency_owners,
+    project_diagnostic_facts, project_owner_abi_environment,
+    project_owner_callable_resolution_plan, project_owner_constraint_seed_with_lexical_plan,
+    project_owner_declaration_surface, project_owner_interface_transfer_module,
+    project_owner_lexical_plan, project_owner_source_map, project_owner_syntax_input,
+    project_source_unit_owner_diagnostics, resolve_owner_constraint_seed_with_signature_plan,
     stable_check_owner_key_fingerprint_v1,
 };
 use serde::Serialize;
@@ -291,6 +292,7 @@ struct ProjectState {
         TypedRequestTable<OwnerBodyInferenceEvaluationRequest>,
     owner_body_inference_requests: TypedRequestTable<OwnerBodyInferenceRequest>,
     project_diagnostic_facts_requests: TypedRequestTable<ProjectDiagnosticFactsRequest>,
+    source_unit_owner_diagnostics_requests: TypedRequestTable<SourceUnitOwnerDiagnosticsRequest>,
     owner_diagnostics_aggregate_requests: TypedRequestTable<OwnerDiagnosticsAggregateRequest>,
     checked_owner_shard_requests: TypedRequestTable<CheckedOwnerShardRequest>,
     checked_owner_project_assembly_requests: TypedRequestTable<CheckedOwnerProjectAssemblyRequest>,
@@ -1340,13 +1342,32 @@ impl RequestFamily for CheckedOwnerShardRequest {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct OwnerDiagnosticsAggregateKey;
 
+struct SourceUnitOwnerDiagnosticsRequest;
+
+impl RequestFamily for SourceUnitOwnerDiagnosticsRequest {
+    type Key = SourceUnitId;
+    type Value = Arc<SourceUnitOwnerDiagnostics>;
+
+    const NAME: &'static str = "boon.compiler.source-unit-owner-diagnostics.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        source_unit_key_fingerprint(b"boon.compiler.source-unit-owner-diagnostics-key.v1\0", key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
 struct OwnerDiagnosticsAggregateRequest;
 
 impl RequestFamily for OwnerDiagnosticsAggregateRequest {
     type Key = OwnerDiagnosticsAggregateKey;
     type Value = Arc<OwnerDiagnosticsAggregate>;
 
-    const NAME: &'static str = "boon.compiler.owner-diagnostics-aggregate.v8";
+    const NAME: &'static str = "boon.compiler.owner-diagnostics-aggregate.v9";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -1469,6 +1490,7 @@ impl CompilerSession {
                 owner_body_inference_evaluation_requests: TypedRequestTable::new(),
                 owner_body_inference_requests: TypedRequestTable::new(),
                 project_diagnostic_facts_requests: TypedRequestTable::new(),
+                source_unit_owner_diagnostics_requests: TypedRequestTable::new(),
                 owner_diagnostics_aggregate_requests: TypedRequestTable::new(),
                 checked_owner_shard_requests: TypedRequestTable::new(),
                 checked_owner_project_assembly_requests: TypedRequestTable::new(),
@@ -1818,6 +1840,11 @@ impl CompilerSession {
             .owner_body_inference_requests
             .retain(&mut state.syntax_evaluator, |owner| {
                 surviving_sources.contains(owner.source_unit_id())
+            })?;
+        state
+            .source_unit_owner_diagnostics_requests
+            .retain(&mut state.syntax_evaluator, |source_unit_id| {
+                surviving_sources.contains(source_unit_id)
             })?;
         state
             .checked_owner_shard_requests
@@ -2582,6 +2609,10 @@ fn evaluate_owner_body_requests(
     let mut trace = OwnerRequestTrace::new();
     let mut owners = Vec::new();
     let mut live_owners = BTreeSet::new();
+    let live_source_units = linked_units
+        .iter()
+        .map(|unit| unit.source_unit_id.clone())
+        .collect::<BTreeSet<_>>();
     for unit in linked_units {
         for owner in unit.stable_check_owner_keys() {
             if !live_owners.insert(owner.clone()) {
@@ -2659,6 +2690,11 @@ fn evaluate_owner_body_requests(
         .owner_body_inference_requests
         .retain(&mut state.syntax_evaluator, |owner| {
             live_owners.contains(owner)
+        })?;
+    state
+        .source_unit_owner_diagnostics_requests
+        .retain(&mut state.syntax_evaluator, |source_unit_id| {
+            live_source_units.contains(source_unit_id)
         })?;
 
     let owner_input = RequestInputFingerprint(request_fingerprint(
@@ -5217,21 +5253,118 @@ fn evaluate_project_diagnostic_facts_request(
     }
 }
 
+fn evaluate_source_unit_owner_diagnostics_requests(
+    state: &mut ProjectState,
+    project: &ProjectSyntaxSnapshot,
+) -> CompilerResult<()> {
+    let mut owners_by_unit = BTreeMap::<SourceUnitId, Vec<StableCheckOwnerKey>>::new();
+    for owner in project.stable_check_owner_keys() {
+        owners_by_unit
+            .entry(owner.source_unit_id().clone())
+            .or_default()
+            .push(owner);
+    }
+    let expected_units = project
+        .source_layouts()
+        .iter()
+        .map(|layout| layout.source_unit_id.clone())
+        .collect::<BTreeSet<_>>();
+    if owners_by_unit.keys().ne(expected_units.iter()) {
+        return Err(session_error(
+            "source-unit owner diagnostics coverage differs from the project source layout",
+        ));
+    }
+    state
+        .source_unit_owner_diagnostics_requests
+        .retain(&mut state.syntax_evaluator, |source_unit_id| {
+            expected_units.contains(source_unit_id)
+        })?;
+
+    for (source_unit_id, owners) in owners_by_unit {
+        let owner_fingerprints = owners
+            .iter()
+            .map(stable_check_owner_key_fingerprint_v1)
+            .collect::<Vec<_>>();
+        let input = RequestInputFingerprint(request_fingerprint(
+            b"boon.compiler.source-unit-owner-diagnostics-dependencies.v1\0",
+            owner_fingerprints.iter().map(<[u8; 32]>::as_slice),
+        ));
+        match state.source_unit_owner_diagnostics_requests.begin(
+            &mut state.syntax_evaluator,
+            source_unit_id.clone(),
+            input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let projection = (|| -> CompilerResult<_> {
+                    let mut body_evaluations = Vec::with_capacity(owners.len());
+                    let mut source_maps = Vec::with_capacity(owners.len());
+                    for owner in &owners {
+                        body_evaluations.push(Arc::clone(
+                            state.owner_body_inference_evaluation_requests.require(
+                                &state.syntax_evaluator,
+                                &mut ticket,
+                                owner,
+                            )?,
+                        ));
+                        source_maps.push(Arc::clone(state.owner_source_map_requests.require(
+                            &state.syntax_evaluator,
+                            &mut ticket,
+                            owner,
+                        )?));
+                    }
+                    Ok(Arc::new(project_source_unit_owner_diagnostics(
+                        &source_unit_id,
+                        owners.iter(),
+                        body_evaluations
+                            .iter()
+                            .map(|evaluation| evaluation.result.as_ref()),
+                        source_maps.iter().map(Arc::as_ref),
+                    )?))
+                })();
+                let projection = match projection {
+                    Ok(projection) => projection,
+                    Err(error) => {
+                        state.source_unit_owner_diagnostics_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.source_unit_owner_diagnostics_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    projection,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn evaluate_owner_diagnostics_aggregate_request(
     state: &mut ProjectState,
     project: &ProjectSyntaxSnapshot,
 ) -> CompilerResult<()> {
     evaluate_project_diagnostic_facts_request(state, project)?;
-    let owners = project.stable_check_owner_keys().collect::<Vec<_>>();
-    let owner_fingerprints = owners
+    evaluate_source_unit_owner_diagnostics_requests(state, project)?;
+    let unit_fingerprints = project
+        .source_layouts()
         .iter()
-        .map(stable_check_owner_key_fingerprint_v1)
+        .map(|layout| {
+            source_unit_key_fingerprint(
+                b"boon.compiler.owner-diagnostics-aggregate-unit.v1\0",
+                &layout.source_unit_id,
+            )
+        })
         .collect::<Vec<_>>();
     let source_digest = project.source_bundle_digest_v1().to_string();
     let input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-diagnostics-aggregate-dependencies.v8\0",
+        b"boon.compiler.owner-diagnostics-aggregate-dependencies.v9\0",
         std::iter::once(source_digest.as_bytes())
-            .chain(owner_fingerprints.iter().map(<[u8; 32]>::as_slice)),
+            .chain(unit_fingerprints.iter().map(<[u8; 32]>::as_slice)),
     ));
     let key = OwnerDiagnosticsAggregateKey;
     match state.owner_diagnostics_aggregate_requests.begin(
@@ -5247,30 +5380,20 @@ fn evaluate_owner_diagnostics_aggregate_request(
                     &mut ticket,
                     &ProjectDiagnosticFactsKey,
                 )?);
-                let mut body_evaluations = Vec::with_capacity(owners.len());
-                let mut source_maps = Vec::with_capacity(owners.len());
-                for owner in &owners {
-                    body_evaluations.push(Arc::clone(
-                        state.owner_body_inference_evaluation_requests.require(
+                let mut projections = Vec::with_capacity(project.source_layouts().len());
+                for layout in project.source_layouts() {
+                    projections.push(Arc::clone(
+                        state.source_unit_owner_diagnostics_requests.require(
                             &state.syntax_evaluator,
                             &mut ticket,
-                            owner,
+                            &layout.source_unit_id,
                         )?,
                     ));
-                    source_maps.push(Arc::clone(state.owner_source_map_requests.require(
-                        &state.syntax_evaluator,
-                        &mut ticket,
-                        owner,
-                    )?));
                 }
-                Ok(Arc::new(aggregate_owner_diagnostics(
+                Ok(Arc::new(aggregate_source_unit_owner_diagnostics(
                     project,
                     &project_facts,
-                    owners.iter(),
-                    body_evaluations
-                        .iter()
-                        .map(|evaluation| evaluation.result.as_ref()),
-                    source_maps.iter().map(Arc::as_ref),
+                    projections.iter().map(Arc::as_ref),
                 )?))
             })();
             let aggregate = match aggregate {
@@ -5911,6 +6034,97 @@ mod tests {
             })
             .collect::<BTreeSet<_>>();
         assert_eq!(paths, BTreeSet::from(["RUN.bn", "Second.bn"]));
+    }
+
+    #[test]
+    fn source_unit_owner_diagnostics_reuse_before_project_layout_relocation() {
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(CompilerProject::new(
+                "RUN.bn",
+                vec![
+                    CompilerSourceUnit {
+                        path: "RUN.bn".to_owned(),
+                        source: "value: 1\n".to_owned(),
+                    },
+                    CompilerSourceUnit {
+                        path: "Second.bn".to_owned(),
+                        source: "value: mystery(input: 1)\n".to_owned(),
+                    },
+                ],
+                TargetProfile::SoftwareDefault,
+                ProgramRole::Server,
+                ApplicationIdentity::compiler_default(),
+            ))
+            .unwrap();
+        let second_id = SourceUnitId::from_path("Second.bn").unwrap();
+        let first_revision = session.revision(project).unwrap();
+        let first_result = session
+            .request(
+                project,
+                first_revision,
+                CompileIntent::Diagnostics,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let first_diagnostic = first_result
+            .diagnostics()
+            .unwrap()
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.message == "unknown function `mystery`")
+            .cloned()
+            .unwrap();
+        let first_projection = {
+            let state = session.projects.get(&project).unwrap();
+            Arc::clone(
+                state
+                    .source_unit_owner_diagnostics_requests
+                    .current_value(&state.syntax_evaluator, &second_id)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(first_projection.diagnostics().len(), 1);
+
+        let second_revision = session
+            .apply_update(project, UnitUpdate::new("RUN.bn", "\nvalue: 1\n"))
+            .unwrap();
+        let second_result = session
+            .request(
+                project,
+                second_revision,
+                CompileIntent::Diagnostics,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let second_diagnostic = second_result
+            .diagnostics()
+            .unwrap()
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.message == "unknown function `mystery`")
+            .cloned()
+            .unwrap();
+        let second_projection = {
+            let state = session.projects.get(&project).unwrap();
+            Arc::clone(
+                state
+                    .source_unit_owner_diagnostics_requests
+                    .current_value(&state.syntax_evaluator, &second_id)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+
+        assert!(Arc::ptr_eq(&first_projection, &second_projection));
+        assert_eq!(
+            first_projection.diagnostics(),
+            second_projection.diagnostics()
+        );
+        assert_eq!(second_diagnostic.line, first_diagnostic.line + 1);
+        assert_eq!(second_diagnostic.start, first_diagnostic.start + 1);
+        assert_eq!(second_diagnostic.end, first_diagnostic.end + 1);
     }
 
     #[test]
@@ -7827,10 +8041,12 @@ mod tests {
         // are reused by this literal-only warm edit; the edited owner's
         // ordinary dependency cone remains local.
         // The project diagnostic-facts request executes once per revision and
-        // changes when its exact owner-body input changes.
+        // changes when its exact owner-body input changes. Each source unit
+        // also owns one local diagnostic-presentation request; the unchanged
+        // unit reuses its projection on the warm edit.
         assert_eq!(
             (first_request_counts, request_counts(second_stats)),
-            ((97, 97, 0, 0, 97), (194, 113, 81, 8, 105))
+            ((99, 99, 0, 0, 99), (198, 116, 82, 8, 108))
         );
 
         let mut isolated = CompilerSession::new();
@@ -9654,13 +9870,15 @@ mod tests {
         // The callable-only ABI, resolution, scope topology/SCC, and provider
         // families are included here. An exported callable change reexecutes
         // its exact scope cone and backdates unchanged projections; the body-
-        // only edit reuses 147 of 179 demanded requests and changes only 19.
+        // only edit reuses 149 of 182 demanded requests and changes only 20.
         // The exact child-boundary lexical projection adds five executions to
         // the exported-interface cone. The project diagnostic-facts request
-        // adds one exact execution/change to both cones.
+        // adds one exact execution/change to both cones. Three source-unit
+        // presentation requests add one changed/reexecuted unit and two reused
+        // units to each cone.
         assert_eq!(
             (interface_delta, body_delta),
-            ((179, 90, 89, 42, 48), (179, 32, 147, 13, 19))
+            ((182, 91, 91, 42, 49), (182, 33, 149, 13, 20))
         );
     }
 

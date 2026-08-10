@@ -28,7 +28,8 @@ use boon_contract::SourceBundleDigestV1;
 use boon_data::{ExactNumber, MAX_BITS_WIDTH};
 use boon_parser::ProjectSyntaxSnapshot;
 use boon_syntax::{
-    AstExprKind, AstStatementKind, StableCheckOwnerKey, StableExpressionKey, StableStatementKey,
+    AstExprKind, AstStatementKind, SourceUnitId, StableCheckOwnerKey, StableExpressionKey,
+    StableStatementKey,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -43,6 +44,7 @@ const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V8: &[u8] =
 const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V4: &[u8] = b"boon.owner-body-interface-plan.v4\0";
 const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V1: &[u8] =
     b"boon.owner-interface-transfer-module.v1\0";
+const SOURCE_UNIT_OWNER_DIAGNOSTICS_DOMAIN_V1: &[u8] = b"boon.source-unit-owner-diagnostics.v1\0";
 const OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V8: &[u8] = b"boon.owner-diagnostics-aggregate.v8\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -987,6 +989,166 @@ pub fn materialize_owner_diagnostics(
         .collect()
 }
 
+type SourceUnitOwnerDiagnosticBasis = (StableCheckOwnerKey, [u8; 32], [u8; 32]);
+
+/// Unit-local presentation of span-free owner diagnostic templates.
+///
+/// Rows keep physical lines and byte offsets local to one source unit. The
+/// project receipt is solely responsible for applying project layout offsets,
+/// so an edit in an earlier source unit cannot force unaffected units to
+/// rematerialize their owner diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceUnitOwnerDiagnostics {
+    source_unit_id: SourceUnitId,
+    basis: Box<[SourceUnitOwnerDiagnosticBasis]>,
+    owner_count: u32,
+    expression_count: u32,
+    call_count: u32,
+    work: OwnerBodyInferenceWork,
+    diagnostics: Box<[TypeDiagnostic]>,
+    fingerprint_v1: [u8; 32],
+}
+
+impl SourceUnitOwnerDiagnostics {
+    pub const fn source_unit_id(&self) -> &SourceUnitId {
+        &self.source_unit_id
+    }
+
+    pub const fn owner_count(&self) -> u32 {
+        self.owner_count
+    }
+
+    pub const fn expression_count(&self) -> u32 {
+        self.expression_count
+    }
+
+    pub const fn call_count(&self) -> u32 {
+        self.call_count
+    }
+
+    pub const fn work(&self) -> OwnerBodyInferenceWork {
+        self.work
+    }
+
+    pub fn diagnostics(&self) -> &[TypeDiagnostic] {
+        &self.diagnostics
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+}
+
+pub fn project_source_unit_owner_diagnostics<'a>(
+    source_unit_id: &SourceUnitId,
+    expected_owners: impl IntoIterator<Item = &'a StableCheckOwnerKey>,
+    bodies: impl IntoIterator<Item = &'a OwnerBodyInferenceShard>,
+    source_maps: impl IntoIterator<Item = &'a OwnerSourceMap>,
+) -> Result<SourceUnitOwnerDiagnostics, OwnerBodyInferenceError> {
+    let expected_owners = expected_owners
+        .into_iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if expected_owners
+        .iter()
+        .any(|owner| owner.source_unit_id() != source_unit_id)
+    {
+        return Err(OwnerBodyInferenceError::new(
+            "source-unit owner diagnostics received an owner from another source unit",
+        ));
+    }
+    let mut bodies_by_owner = BTreeMap::new();
+    for body in bodies {
+        if bodies_by_owner.insert(body.owner().clone(), body).is_some() {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "source-unit owner diagnostics received duplicate body {:?}",
+                body.owner()
+            )));
+        }
+    }
+    let mut source_maps_by_owner = BTreeMap::new();
+    for source_map in source_maps {
+        if source_maps_by_owner
+            .insert(source_map.owner().clone(), source_map)
+            .is_some()
+        {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "source-unit owner diagnostics received duplicate source map {:?}",
+                source_map.owner()
+            )));
+        }
+    }
+    if bodies_by_owner.keys().ne(expected_owners.iter()) {
+        return Err(OwnerBodyInferenceError::new(
+            "source-unit owner diagnostics body coverage differs from the expected owner set",
+        ));
+    }
+    if source_maps_by_owner.keys().ne(expected_owners.iter()) {
+        return Err(OwnerBodyInferenceError::new(
+            "source-unit owner diagnostics source-map coverage differs from the expected owner set",
+        ));
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut expression_count = 0usize;
+    let mut call_count = 0usize;
+    let mut work = OwnerBodyInferenceWork::default();
+    let mut basis = Vec::with_capacity(expected_owners.len());
+    for owner in &expected_owners {
+        let body = bodies_by_owner[owner];
+        let source_map = source_maps_by_owner[owner];
+        diagnostics.extend(materialize_owner_diagnostics(body, source_map)?);
+        expression_count = expression_count
+            .checked_add(body.expressions.len())
+            .ok_or_else(|| {
+                OwnerBodyInferenceError::new(
+                    "source-unit owner diagnostics expression count overflow",
+                )
+            })?;
+        call_count = call_count.checked_add(body.calls.len()).ok_or_else(|| {
+            OwnerBodyInferenceError::new("source-unit owner diagnostics call count overflow")
+        })?;
+        work.accumulate(body.work);
+        basis.push((
+            owner.clone(),
+            body.fingerprint_v1(),
+            source_map.fingerprint_v2(),
+        ));
+    }
+    canonicalize_diagnostics(&mut diagnostics);
+    let owner_count = checked_u32(
+        expected_owners.len(),
+        "source-unit owner diagnostics owner count",
+    )?;
+    let expression_count = checked_u32(
+        expression_count,
+        "source-unit owner diagnostics expression count",
+    )?;
+    let call_count = checked_u32(call_count, "source-unit owner diagnostics call count")?;
+    let fingerprint_v1 = fingerprint(
+        SOURCE_UNIT_OWNER_DIAGNOSTICS_DOMAIN_V1,
+        &(
+            source_unit_id,
+            &basis,
+            owner_count,
+            expression_count,
+            call_count,
+            work,
+            &diagnostics,
+        ),
+    )?;
+    Ok(SourceUnitOwnerDiagnostics {
+        source_unit_id: source_unit_id.clone(),
+        basis: basis.into_boxed_slice(),
+        owner_count,
+        expression_count,
+        call_count,
+        work,
+        diagnostics: diagnostics.into_boxed_slice(),
+        fingerprint_v1,
+    })
+}
+
 /// Partial source-bound owner diagnostics projected directly from immutable
 /// owner inference results.
 ///
@@ -1072,12 +1234,6 @@ pub fn aggregate_owner_diagnostics<'a>(
     bodies: impl IntoIterator<Item = &'a OwnerBodyInferenceShard>,
     source_maps: impl IntoIterator<Item = &'a OwnerSourceMap>,
 ) -> Result<OwnerDiagnosticsAggregate, OwnerBodyInferenceError> {
-    let source_bundle_digest_v1 = project.source_bundle_digest_v1();
-    if project_facts.source_bundle_digest_v1() != source_bundle_digest_v1 {
-        return Err(OwnerBodyInferenceError::new(
-            "owner diagnostics aggregate project facts have a different source bundle",
-        ));
-    }
     let expected_owners = expected_owners
         .into_iter()
         .cloned()
@@ -1118,25 +1274,80 @@ pub fn aggregate_owner_diagnostics<'a>(
             "owner diagnostics aggregate source-map coverage differs from the project owner set",
         ));
     }
+    let mut owners_by_unit = BTreeMap::<SourceUnitId, Vec<StableCheckOwnerKey>>::new();
+    for owner in expected_owners {
+        owners_by_unit
+            .entry(owner.source_unit_id().clone())
+            .or_default()
+            .push(owner);
+    }
+    let projections = owners_by_unit
+        .iter()
+        .map(|(source_unit_id, owners)| {
+            project_source_unit_owner_diagnostics(
+                source_unit_id,
+                owners,
+                owners.iter().map(|owner| bodies_by_owner[owner]),
+                owners.iter().map(|owner| source_maps_by_owner[owner]),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    aggregate_source_unit_owner_diagnostics(project, project_facts, projections.iter())
+}
+
+pub fn aggregate_source_unit_owner_diagnostics<'a>(
+    project: &ProjectSyntaxSnapshot,
+    project_facts: &crate::ProjectDiagnosticFacts,
+    projections: impl IntoIterator<Item = &'a SourceUnitOwnerDiagnostics>,
+) -> Result<OwnerDiagnosticsAggregate, OwnerBodyInferenceError> {
+    let source_bundle_digest_v1 = project.source_bundle_digest_v1();
+    if project_facts.source_bundle_digest_v1() != source_bundle_digest_v1 {
+        return Err(OwnerBodyInferenceError::new(
+            "owner diagnostics aggregate project facts have a different source bundle",
+        ));
+    }
+    let mut projections_by_unit = BTreeMap::new();
+    for projection in projections {
+        if projections_by_unit
+            .insert(projection.source_unit_id().clone(), projection)
+            .is_some()
+        {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "owner diagnostics aggregate received duplicate unit {:?}",
+                projection.source_unit_id()
+            )));
+        }
+    }
+    let expected_units = project
+        .source_layouts()
+        .iter()
+        .map(|layout| layout.source_unit_id.clone())
+        .collect::<BTreeSet<_>>();
+    if projections_by_unit.keys().ne(expected_units.iter()) {
+        return Err(OwnerBodyInferenceError::new(
+            "owner diagnostics aggregate unit coverage differs from the project source layout",
+        ));
+    }
 
     let mut diagnostics = Vec::new();
-    let mut expression_count = 0usize;
-    let mut call_count = 0usize;
+    let mut basis = Vec::new();
+    let mut reported_owner_count = 0u32;
+    let mut expression_count = 0u32;
+    let mut call_count = 0u32;
     let mut work = OwnerBodyInferenceWork::default();
-    let mut basis = Vec::with_capacity(expected_owners.len());
-    for owner in &expected_owners {
-        let body = bodies_by_owner[owner];
-        let source_map = source_maps_by_owner[owner];
-        let layout = project
-            .source_layouts()
+    for layout in project.source_layouts() {
+        let projection = projections_by_unit[&layout.source_unit_id];
+        if projection
+            .basis
             .iter()
-            .find(|layout| &layout.source_unit_id == owner.source_unit_id())
-            .ok_or_else(|| {
-                OwnerBodyInferenceError::new(format!(
-                    "owner diagnostics aggregate has no project source layout for {owner:?}"
-                ))
-            })?;
-        for mut diagnostic in materialize_owner_diagnostics(body, source_map)? {
+            .any(|(owner, _, _)| owner.source_unit_id() != &layout.source_unit_id)
+        {
+            return Err(OwnerBodyInferenceError::new(
+                "owner diagnostics aggregate unit projection contains a foreign owner",
+            ));
+        }
+        for diagnostic in projection.diagnostics() {
+            let mut diagnostic = diagnostic.clone();
             diagnostic.line = layout
                 .start_line
                 .checked_add(diagnostic.line.saturating_sub(1))
@@ -1158,22 +1369,47 @@ pub fn aggregate_owner_diagnostics<'a>(
                 })?;
             diagnostics.push(diagnostic);
         }
+        basis.extend(projection.basis.iter().cloned());
+        reported_owner_count = reported_owner_count
+            .checked_add(projection.owner_count())
+            .ok_or_else(|| {
+                OwnerBodyInferenceError::new("owner diagnostics owner count overflow")
+            })?;
         expression_count = expression_count
-            .checked_add(body.expressions.len())
+            .checked_add(projection.expression_count())
             .ok_or_else(|| {
                 OwnerBodyInferenceError::new("owner diagnostics expression count overflow")
             })?;
         call_count = call_count
-            .checked_add(body.calls.len())
+            .checked_add(projection.call_count())
             .ok_or_else(|| OwnerBodyInferenceError::new("owner diagnostics call count overflow"))?;
-        work.accumulate(body.work);
-        basis.push((owner, body.fingerprint_v1(), source_map.fingerprint_v2()));
+        work.accumulate(projection.work());
     }
+    basis.sort_by(|left, right| left.0.cmp(&right.0));
+    if basis.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(OwnerBodyInferenceError::new(
+            "owner diagnostics aggregate received duplicate owner basis rows",
+        ));
+    }
+    let expected_owners = project.stable_check_owner_keys().collect::<BTreeSet<_>>();
+    if basis
+        .iter()
+        .map(|(owner, _, _)| owner)
+        .ne(expected_owners.iter())
+    {
+        return Err(OwnerBodyInferenceError::new(
+            "owner diagnostics aggregate owner coverage differs from the project owner set",
+        ));
+    }
+
     diagnostics.extend(project_facts.diagnostics().iter().cloned());
     canonicalize_diagnostics(&mut diagnostics);
-    let owner_count = checked_u32(expected_owners.len(), "owner diagnostics owner count")?;
-    let expression_count = checked_u32(expression_count, "owner diagnostics expression count")?;
-    let call_count = checked_u32(call_count, "owner diagnostics call count")?;
+    let owner_count = checked_u32(basis.len(), "owner diagnostics owner count")?;
+    if reported_owner_count != owner_count {
+        return Err(OwnerBodyInferenceError::new(
+            "owner diagnostics aggregate unit owner counts differ from their basis rows",
+        ));
+    }
     let project_facts_fingerprint_v1 = project_facts.fingerprint_v1();
     let fingerprint_v1 = fingerprint(
         OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V8,

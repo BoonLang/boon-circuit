@@ -6352,8 +6352,6 @@ mod tests {
             &summary,
             &inference_abi,
             &interface_plan,
-            &interface,
-            imported,
             callable_scopes[&owner].lexical_plan(),
         )
         .unwrap();
@@ -6432,8 +6430,6 @@ mod tests {
             &summary,
             &base.inference_abi,
             &interface_plan,
-            &interface,
-            [],
             &signature_plan,
         )
         .unwrap();

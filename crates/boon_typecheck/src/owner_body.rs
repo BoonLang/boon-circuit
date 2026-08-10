@@ -8,14 +8,15 @@ use crate::{
     OwnerAbiEvaluationScope, OwnerCallableLexicalSignature, OwnerCollectionKind,
     OwnerConstraintEdgeRole, OwnerConstraintNodeKind, OwnerConstraintSeed, OwnerConstraintSummary,
     OwnerEffectiveLexicalTarget, OwnerInferenceAbiEnvironment, OwnerInterfaceEvaluationScope,
-    OwnerInterfaceSccKey, OwnerInterfaceSccResult, OwnerLexicalDeclarationTarget, OwnerLexicalPlan,
-    OwnerParameterKind, OwnerPublicInterface, OwnerReferenceKind, OwnerResultAbiContract,
-    OwnerResultCallTarget, OwnerResultExpressionRef, OwnerResultTransfer, OwnerResultTransferNode,
-    OwnerSignatureCallLexicalError, OwnerSignatureCallPlan, OwnerSignatureDeclarationTarget,
-    OwnerSignatureLexicalPlan, OwnerSignatureMatchedInputSource, OwnerSignaturePassSource,
-    OwnerSourceAnchorRole, OwnerSourceAnchorSite, OwnerSourceMap, OwnerSymbolResolution,
-    OwnerSyntaxInput, OwnerValueAbiForbiddenReason, OwnerValueAbiLookupOutcome,
-    infix_requires_number_operands, infix_returns_bool, project_owner_signature_lexical_plan,
+    OwnerInterfaceScc, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
+    OwnerLexicalDeclarationTarget, OwnerLexicalPlan, OwnerParameterKind, OwnerPublicInterface,
+    OwnerReferenceKind, OwnerResultAbiContract, OwnerResultCallTarget, OwnerResultExpressionRef,
+    OwnerResultTransfer, OwnerResultTransferNode, OwnerSignatureCallLexicalError,
+    OwnerSignatureCallPlan, OwnerSignatureDeclarationTarget, OwnerSignatureLexicalPlan,
+    OwnerSignatureMatchedInputSource, OwnerSignaturePassSource, OwnerSourceAnchorRole,
+    OwnerSourceAnchorSite, OwnerSourceMap, OwnerSymbolResolution, OwnerSyntaxInput,
+    OwnerValueAbiForbiddenReason, OwnerValueAbiLookupOutcome, infix_requires_number_operands,
+    infix_returns_bool, project_owner_signature_lexical_plan,
 };
 use boon_checked::{
     BytesType, CheckedCallableKind, CheckedEffectSummary, CheckedParameterKind,
@@ -37,9 +38,11 @@ use std::sync::Arc;
 
 const OWNER_BODY_INFERENCE_DOMAIN_V7: &[u8] = b"boon.owner-body-inference.v7\0";
 const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V5: &[u8] = b"boon.owner-body-inference-content.v5\0";
-const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V7: &[u8] =
-    b"boon.owner-body-inference-currentness.v7\0";
-const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V3: &[u8] = b"boon.owner-body-interface-plan.v3\0";
+const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V8: &[u8] =
+    b"boon.owner-body-inference-currentness.v8\0";
+const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V4: &[u8] = b"boon.owner-body-interface-plan.v4\0";
+const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V1: &[u8] =
+    b"boon.owner-interface-transfer-module.v1\0";
 const OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V8: &[u8] = b"boon.owner-diagnostics-aggregate.v8\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,11 +66,248 @@ impl fmt::Display for OwnerBodyInferenceError {
 
 impl Error for OwnerBodyInferenceError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerInterfaceTransferRoute {
+    Own,
+    Dependency(u32),
+}
+
+/// Shared result-specialization module for one interface SCC.
+///
+/// Modules retain only direct dependency modules. The dependency graph is a
+/// DAG, so bodies can specialize nested user-call results without copying the
+/// complete transitive interface closure into every owner evaluation.
+#[derive(Clone)]
+pub struct OwnerInterfaceTransferModule {
+    key: OwnerInterfaceSccKey,
+    result: Arc<OwnerInterfaceSccResult>,
+    dependencies: Box<[Arc<OwnerInterfaceTransferModule>]>,
+    routes: BTreeMap<StableCheckOwnerKey, OwnerInterfaceTransferRoute>,
+    fingerprint_v1: [u8; 32],
+}
+
+impl fmt::Debug for OwnerInterfaceTransferModule {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnerInterfaceTransferModule")
+            .field("key", &self.key)
+            .field(
+                "dependencies",
+                &self
+                    .dependencies
+                    .iter()
+                    .map(|dependency| &dependency.key)
+                    .collect::<Vec<_>>(),
+            )
+            .field("fingerprint_v1", &self.fingerprint_v1)
+            .finish()
+    }
+}
+
+impl PartialEq for OwnerInterfaceTransferModule {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.fingerprint_v1 == other.fingerprint_v1
+    }
+}
+
+impl Eq for OwnerInterfaceTransferModule {}
+
+impl OwnerInterfaceTransferModule {
+    pub fn key(&self) -> &OwnerInterfaceSccKey {
+        &self.key
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+
+    fn result(&self) -> &OwnerInterfaceSccResult {
+        &self.result
+    }
+
+    fn resolve_owner(
+        &self,
+        owner: &StableCheckOwnerKey,
+    ) -> Option<(&OwnerInterfaceTransferModule, &OwnerPublicInterface)> {
+        match self.routes.get(owner)? {
+            OwnerInterfaceTransferRoute::Own => Some((self, self.result.owner(owner)?)),
+            OwnerInterfaceTransferRoute::Dependency(index) => {
+                let dependency = self.dependencies.get(*index as usize)?;
+                Some((dependency, dependency.result.owner(owner)?))
+            }
+        }
+    }
+}
+
+fn seal_owner_interface_transfer_module(
+    result: Arc<OwnerInterfaceSccResult>,
+    expected_dependencies: &[OwnerInterfaceSccKey],
+    dependencies: impl IntoIterator<Item = Arc<OwnerInterfaceTransferModule>>,
+) -> Result<OwnerInterfaceTransferModule, OwnerBodyInferenceError> {
+    let mut dependencies = dependencies
+        .into_iter()
+        .map(|dependency| (dependency.key.clone(), dependency))
+        .collect::<BTreeMap<_, _>>();
+    if dependencies.len() != expected_dependencies.len()
+        || dependencies.keys().ne(expected_dependencies.iter())
+    {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "interface transfer module {:?} received the wrong direct dependencies",
+            result.key
+        )));
+    }
+    let dependencies = expected_dependencies
+        .iter()
+        .map(|key| {
+            dependencies.remove(key).ok_or_else(|| {
+                OwnerBodyInferenceError::new(format!(
+                    "interface transfer module {:?} lost dependency {key:?}",
+                    result.key
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_boxed_slice();
+    let mut routes = BTreeMap::new();
+    for owner in &result.key.members {
+        if routes
+            .insert(owner.clone(), OwnerInterfaceTransferRoute::Own)
+            .is_some()
+        {
+            return Err(OwnerBodyInferenceError::new(
+                "interface transfer module has duplicate own member",
+            ));
+        }
+    }
+    for (index, dependency) in dependencies.iter().enumerate() {
+        let index = u32::try_from(index).map_err(|_| {
+            OwnerBodyInferenceError::new(
+                "interface transfer module dependency count exceeds the u32 bound",
+            )
+        })?;
+        for owner in &dependency.key.members {
+            if routes
+                .insert(
+                    owner.clone(),
+                    OwnerInterfaceTransferRoute::Dependency(index),
+                )
+                .is_some()
+            {
+                return Err(OwnerBodyInferenceError::new(format!(
+                    "interface transfer module {:?} has overlapping dependency member {owner:?}",
+                    result.key
+                )));
+            }
+        }
+    }
+    let mut used_dependencies = BTreeSet::new();
+    for interface in &result.owners {
+        for dependency in owner_result_transfer_dependencies(&interface.result_transfer) {
+            match routes.get(&dependency) {
+                Some(OwnerInterfaceTransferRoute::Own) => {}
+                Some(OwnerInterfaceTransferRoute::Dependency(index)) => {
+                    used_dependencies.insert(*index);
+                }
+                None => {
+                    return Err(OwnerBodyInferenceError::new(format!(
+                        "interface transfer for {:?} references non-direct dependency {dependency:?}",
+                        interface.owner
+                    )));
+                }
+            }
+        }
+    }
+    if used_dependencies.len() != dependencies.len() {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "interface transfer module {:?} received an unused dependency",
+            result.key
+        )));
+    }
+    let dependency_fingerprints = dependencies
+        .iter()
+        .map(|dependency| (&dependency.key, dependency.fingerprint_v1))
+        .collect::<Vec<_>>();
+    let fingerprint_v1 = fingerprint(
+        OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V1,
+        &(
+            &result.key,
+            result.fingerprint_v1(),
+            dependency_fingerprints,
+        ),
+    )?;
+    Ok(OwnerInterfaceTransferModule {
+        key: result.key.clone(),
+        result,
+        dependencies,
+        routes,
+        fingerprint_v1,
+    })
+}
+
+pub fn project_owner_interface_transfer_module(
+    scc: &OwnerInterfaceScc,
+    result: Arc<OwnerInterfaceSccResult>,
+    dependencies: impl IntoIterator<Item = Arc<OwnerInterfaceTransferModule>>,
+) -> Result<OwnerInterfaceTransferModule, OwnerBodyInferenceError> {
+    if result.key != scc.key {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "interface transfer module expected {:?}, got {:?}",
+            scc.key, result.key
+        )));
+    }
+    let topology_dependencies = scc.dependencies.iter().collect::<BTreeSet<_>>();
+    let mut dependencies_by_key = BTreeMap::new();
+    for dependency in dependencies {
+        match dependencies_by_key.entry(dependency.key.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(dependency);
+            }
+            std::collections::btree_map::Entry::Occupied(entry)
+                if entry.get().fingerprint_v1() == dependency.fingerprint_v1() => {}
+            std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(OwnerBodyInferenceError::new(format!(
+                    "interface transfer module {:?} received conflicting versions of one dependency",
+                    scc.key
+                )));
+            }
+        }
+    }
+    if dependencies_by_key
+        .keys()
+        .any(|dependency| !topology_dependencies.contains(dependency))
+    {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "interface transfer module {:?} received a dependency outside its interface topology",
+            scc.key
+        )));
+    }
+    let dependency_keys = dependencies_by_key.keys().cloned().collect::<Vec<_>>();
+    let dependencies = dependencies_by_key.into_values().collect::<Vec<_>>();
+    seal_owner_interface_transfer_module(result, &dependency_keys, dependencies)
+}
+
+pub fn owner_interface_transfer_dependency_owners(
+    result: &OwnerInterfaceSccResult,
+) -> Box<[StableCheckOwnerKey]> {
+    result
+        .owners
+        .iter()
+        .flat_map(|interface| owner_result_transfer_dependencies(&interface.result_transfer))
+        .filter(|owner| result.key.members.binary_search(owner).is_err())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerBodyInterfaceSccPlan {
     #[serde(skip)]
     key: OwnerInterfaceSccKey,
+    #[serde(skip)]
+    module: Arc<OwnerInterfaceTransferModule>,
     key_fingerprint_v1: [u8; 32],
+    module_fingerprint_v1: [u8; 32],
     /// Sorted exact member indices in `key.members` used by this body.
     /// Stable owner keys remain owned once by the SCC key instead of being
     /// copied into every importing body plan.
@@ -98,9 +338,9 @@ pub struct OwnerBodyInterfacePlanWork {
 
 /// Exact immutable public-interface demand for one owner body.
 ///
-/// The plan is discovered once from direct syntax imports and transitive
-/// public result-transfer slices. Body inference consumes this sealed result;
-/// it does not rediscover the closure from the supplied SCC values.
+/// The plan is discovered once from direct syntax imports. Each provider is a
+/// shared transfer module whose dependency DAG owns transitive result
+/// specialization, so individual bodies never flatten that closure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerBodyInterfacePlan {
     owner: StableCheckOwnerKey,
@@ -144,14 +384,14 @@ impl OwnerBodyInterfacePlan {
 ///
 /// Callers ask for [`next_required_owner`](Self::next_required_owner), require
 /// that owner's current provider SCC through their request graph, and feed the
-/// result to [`provide_interface_scc`](Self::provide_interface_scc). This keeps
-/// dependency discovery in the typechecker while allowing the evaluator to
-/// record exact dynamic request edges.
+/// result to [`provide_interface_module`](Self::provide_interface_module).
+/// This keeps direct dependency discovery in the typechecker while allowing
+/// the evaluator to record exact dynamic request edges.
 pub struct OwnerBodyInterfacePlanner {
     owner: StableCheckOwnerKey,
     required: BTreeSet<StableCheckOwnerKey>,
     pending: VecDeque<StableCheckOwnerKey>,
-    provider_sccs: Vec<(OwnerInterfaceSccKey, [u8; 32])>,
+    provider_sccs: Vec<Arc<OwnerInterfaceTransferModule>>,
     providers: BTreeMap<StableCheckOwnerKey, usize>,
     work: OwnerBodyInterfacePlanWork,
 }
@@ -186,26 +426,25 @@ impl OwnerBodyInterfacePlanner {
         self.pending.front()
     }
 
-    pub fn provide_interface_scc(
+    pub fn provide_interface_module(
         &mut self,
-        result: &OwnerInterfaceSccResult,
+        module: Arc<OwnerInterfaceTransferModule>,
     ) -> Result<(), OwnerBodyInferenceError> {
         let owner = self.pending.pop_front().ok_or_else(|| {
-            OwnerBodyInferenceError::new("owner body interface planner received an extra SCC")
+            OwnerBodyInferenceError::new("owner body interface planner received an extra module")
         })?;
-        let interface = result.owner(&owner).ok_or_else(|| {
+        let interface = module.result().owner(&owner).ok_or_else(|| {
             OwnerBodyInferenceError::new(format!(
                 "owner body interface planner expected provider for {owner:?}, got {:?}",
-                result.key
+                module.key()
             ))
         })?;
         let provider = self
             .provider_sccs
             .iter()
-            .position(|(key, _)| key == &result.key)
+            .position(|candidate| candidate.key() == module.key())
             .unwrap_or_else(|| {
-                self.provider_sccs
-                    .push((result.key.clone(), result.key_fingerprint_v1()));
+                self.provider_sccs.push(Arc::clone(&module));
                 self.provider_sccs.len() - 1
             });
         if self.providers.insert(owner.clone(), provider).is_some() {
@@ -225,11 +464,6 @@ impl OwnerBodyInterfacePlanner {
                     .map(|node| node.inputs.len() as u64 + u64::from(node.call_target.is_some()))
                     .sum::<u64>(),
             );
-        }
-        for dependency in owner_result_transfer_dependencies(&interface.result_transfer) {
-            if self.required.insert(dependency.clone()) {
-                self.pending.push_back(dependency);
-            }
         }
         Ok(())
     }
@@ -258,10 +492,12 @@ impl OwnerBodyInterfacePlanner {
         let seal_scc = |provider: usize,
                         referenced_owners: Vec<StableCheckOwnerKey>|
          -> Result<OwnerBodyInterfaceSccPlan, OwnerBodyInferenceError> {
-            let (key, key_fingerprint_v1) =
-                provider_sccs.get(provider).cloned().ok_or_else(|| {
-                    OwnerBodyInferenceError::new("owner body interface plan lost a provider SCC")
-                })?;
+            let module = provider_sccs.get(provider).cloned().ok_or_else(|| {
+                OwnerBodyInferenceError::new("owner body interface plan lost a provider SCC")
+            })?;
+            let key = module.key().clone();
+            let key_fingerprint_v1 = module.result().key_fingerprint_v1();
+            let module_fingerprint_v1 = module.fingerprint_v1();
             let referenced_members = referenced_owners
                 .iter()
                 .map(|owner| {
@@ -284,7 +520,9 @@ impl OwnerBodyInterfacePlanner {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(OwnerBodyInterfaceSccPlan {
                 key,
+                module,
                 key_fingerprint_v1,
+                module_fingerprint_v1,
                 referenced_members: referenced_members.into_boxed_slice(),
             })
         };
@@ -298,7 +536,7 @@ impl OwnerBodyInterfacePlanner {
         self.work.required_owners = self.required.len() as u64;
         self.work.provider_sccs = imports.len() as u64 + 1;
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INTERFACE_PLAN_DOMAIN_V3,
+            OWNER_BODY_INTERFACE_PLAN_DOMAIN_V4,
             &(&self.owner, &own_scc, &imports),
         )?;
         Ok(OwnerBodyInterfacePlan {
@@ -371,6 +609,7 @@ pub struct FrozenOwnerInterfaceSccRef {
     pub key: OwnerInterfaceSccKey,
     pub key_fingerprint_v1: [u8; 32],
     pub result_fingerprint_v1: [u8; 32],
+    pub transfer_module_fingerprint_v1: [u8; 32],
     pub type_variable_count: u32,
     pub referenced_members: Box<[u32]>,
 }
@@ -619,7 +858,7 @@ impl OwnerBodyInferenceCurrentnessReceipt {
         }
         let result_fingerprint_v1 = result.fingerprint_v1();
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V7,
+            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V8,
             &(&basis, &interface_imports, result_fingerprint_v1),
         )?;
         Ok(Self {
@@ -1787,11 +2026,11 @@ pub fn plan_owner_body_interfaces<'a>(
     summary: &OwnerConstraintSummary,
     available_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<OwnerBodyInterfacePlan, OwnerBodyInferenceError> {
-    let mut provider_by_owner = BTreeMap::new();
-    let mut result_by_key = BTreeMap::new();
+    let mut provider_by_owner = BTreeMap::<StableCheckOwnerKey, OwnerInterfaceSccKey>::new();
+    let mut result_by_key = BTreeMap::<OwnerInterfaceSccKey, Arc<OwnerInterfaceSccResult>>::new();
     for result in available_sccs {
-        if let Some(previous) = result_by_key.insert(result.key.clone(), result)
-            && previous != result
+        if let Some(previous) = result_by_key.insert(result.key.clone(), Arc::new(result.clone()))
+            && previous.as_ref() != result
         {
             return Err(OwnerBodyInferenceError::new(format!(
                 "owner body interface planning received conflicting SCC {:?}",
@@ -1799,8 +2038,9 @@ pub fn plan_owner_body_interfaces<'a>(
             )));
         }
         for interface in &result.owners {
-            if let Some(previous) = provider_by_owner.insert(interface.owner.clone(), result)
-                && previous.key != result.key
+            if let Some(previous) =
+                provider_by_owner.insert(interface.owner.clone(), result.key.clone())
+                && previous != result.key
             {
                 return Err(OwnerBodyInferenceError::new(format!(
                     "owner body interface planning received multiple providers for {:?}",
@@ -1809,24 +2049,77 @@ pub fn plan_owner_body_interfaces<'a>(
             }
         }
     }
+    let mut dependencies_by_key = BTreeMap::new();
+    for (key, result) in &result_by_key {
+        let mut dependencies = BTreeSet::new();
+        for interface in &result.owners {
+            for owner in owner_result_transfer_dependencies(&interface.result_transfer) {
+                let dependency = provider_by_owner.get(&owner).ok_or_else(|| {
+                    OwnerBodyInferenceError::new(format!(
+                        "owner body interface planning is missing transfer dependency {owner:?}"
+                    ))
+                })?;
+                if dependency != key {
+                    dependencies.insert(dependency.clone());
+                }
+            }
+        }
+        dependencies_by_key.insert(key.clone(), dependencies.into_iter().collect::<Vec<_>>());
+    }
+    let mut modules = BTreeMap::<OwnerInterfaceSccKey, Arc<OwnerInterfaceTransferModule>>::new();
+    while modules.len() != result_by_key.len() {
+        let mut progress = false;
+        for (key, result) in &result_by_key {
+            if modules.contains_key(key) {
+                continue;
+            }
+            let dependency_keys = &dependencies_by_key[key];
+            if dependency_keys
+                .iter()
+                .any(|dependency| !modules.contains_key(dependency))
+            {
+                continue;
+            }
+            let dependencies = dependency_keys
+                .iter()
+                .map(|dependency| Arc::clone(&modules[dependency]))
+                .collect::<Vec<_>>();
+            let module = seal_owner_interface_transfer_module(
+                Arc::clone(result),
+                dependency_keys,
+                dependencies,
+            )?;
+            modules.insert(key.clone(), Arc::new(module));
+            progress = true;
+        }
+        if !progress {
+            return Err(OwnerBodyInferenceError::new(
+                "owner body interface transfer modules contain a dependency cycle",
+            ));
+        }
+    }
     let mut planner = OwnerBodyInterfacePlanner::new(seed, summary)?;
     while let Some(owner) = planner.next_required_owner().cloned() {
-        let result = provider_by_owner.get(&owner).copied().ok_or_else(|| {
+        let provider = provider_by_owner.get(&owner).ok_or_else(|| {
             OwnerBodyInferenceError::new(format!(
                 "owner body interface planning {:?} is missing required interface {owner:?}",
                 seed.owner
             ))
         })?;
-        planner.provide_interface_scc(result)?;
+        planner.provide_interface_module(Arc::clone(&modules[provider]))?;
     }
     planner.finish()
 }
 
 fn frozen_scc_ref(
-    result: &OwnerInterfaceSccResult,
     plan: &OwnerBodyInterfaceSccPlan,
 ) -> Result<FrozenOwnerInterfaceSccRef, OwnerBodyInferenceError> {
-    if result.key != plan.key || result.key_fingerprint_v1() != plan.key_fingerprint_v1 {
+    let module = plan.module.as_ref();
+    let result = module.result();
+    if result.key != plan.key
+        || result.key_fingerprint_v1() != plan.key_fingerprint_v1
+        || module.fingerprint_v1() != plan.module_fingerprint_v1
+    {
         return Err(OwnerBodyInferenceError::new(format!(
             "owner body interface plan expected SCC {:?}, got {:?}",
             plan.key, result.key
@@ -1856,6 +2149,7 @@ fn frozen_scc_ref(
         key: result.key.clone(),
         key_fingerprint_v1: result.key_fingerprint_v1(),
         result_fingerprint_v1: result.fingerprint_v1(),
+        transfer_module_fingerprint_v1: module.fingerprint_v1(),
         type_variable_count: result.type_variable_count,
         referenced_members: plan.referenced_members.clone(),
     })
@@ -2498,18 +2792,18 @@ struct EvaluatedOwnerResult {
 }
 
 struct OwnerResultTransferEvaluator<'a, 'unifier> {
-    interfaces: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerPublicInterface>,
+    providers: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerInterfaceTransferModule>,
     unifier: &'unifier mut TypeUnifier,
     active_owners: BTreeSet<StableCheckOwnerKey>,
 }
 
 impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
     fn new(
-        interfaces: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerPublicInterface>,
+        providers: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerInterfaceTransferModule>,
         unifier: &'unifier mut TypeUnifier,
     ) -> Self {
         Self {
-            interfaces,
+            providers,
             unifier,
             active_owners: BTreeSet::new(),
         }
@@ -2521,7 +2815,18 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         arguments: &BTreeMap<u32, EvaluatedResultValue>,
         context: Option<&EvaluatedResultValue>,
     ) -> Option<EvaluatedOwnerResult> {
-        let interface = *self.interfaces.get(owner)?;
+        let module = *self.providers.get(owner)?;
+        self.evaluate_owner_in_module(module, owner, arguments, context)
+    }
+
+    fn evaluate_owner_in_module(
+        &mut self,
+        module: &OwnerInterfaceTransferModule,
+        owner: &StableCheckOwnerKey,
+        arguments: &BTreeMap<u32, EvaluatedResultValue>,
+        context: Option<&EvaluatedResultValue>,
+    ) -> Option<EvaluatedOwnerResult> {
+        let (_, interface) = module.resolve_owner(owner)?;
         // Interface type variables live in an SCC-local alpha namespace. Give
         // every invocation its own variables in the caller's unifier so raw
         // TypeVar ordinals from unrelated SCCs can never alias each other or
@@ -2629,6 +2934,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 })
             }
             OwnerResultTransfer::Expression { root, nodes } => self.evaluate_expression_ref(
+                module,
                 root,
                 nodes,
                 arguments,
@@ -2675,6 +2981,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
     #[allow(clippy::too_many_arguments)]
     fn evaluate_expression_ref(
         &mut self,
+        module: &OwnerInterfaceTransferModule,
         reference: &OwnerResultExpressionRef,
         nodes: &[OwnerResultTransferNode],
         arguments: &BTreeMap<u32, EvaluatedResultValue>,
@@ -2685,7 +2992,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
     ) -> Option<EvaluatedResultValue> {
         match reference {
             OwnerResultExpressionRef::Child { owner, .. } => {
-                let interface = *self.interfaces.get(owner)?;
+                let (_, interface) = module.resolve_owner(owner)?;
                 Some(EvaluatedResultValue {
                     flow_type: interface.result.clone(),
                     parameter_derived: false,
@@ -2701,8 +3008,9 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 if !active.insert(expression.clone()) {
                     return transfer_fallback(node, fallbacks);
                 }
-                let value =
-                    self.evaluate_node(node, nodes, arguments, context, fallbacks, lexical, active);
+                let value = self.evaluate_node(
+                    module, node, nodes, arguments, context, fallbacks, lexical, active,
+                );
                 active.remove(expression);
                 value
             }
@@ -2712,6 +3020,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
     #[allow(clippy::too_many_arguments)]
     fn evaluate_node(
         &mut self,
+        module: &OwnerInterfaceTransferModule,
         node: &OwnerResultTransferNode,
         nodes: &[OwnerResultTransferNode],
         arguments: &BTreeMap<u32, EvaluatedResultValue>,
@@ -2725,7 +3034,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                         lexical: &BTreeMap<String, EvaluatedResultValue>,
                         active: &mut BTreeSet<StableExpressionKey>| {
             evaluator.evaluate_expression_ref(
-                reference, nodes, arguments, context, fallbacks, lexical, active,
+                module, reference, nodes, arguments, context, fallbacks, lexical, active,
             )
         };
         let fallback = transfer_fallback(node, fallbacks)?;
@@ -2780,9 +3089,10 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         }
 
         match &node.kind {
-            OwnerConstraintNodeKind::Call { .. } | OwnerConstraintNodeKind::Pipe { .. } => {
-                self.evaluate_call_node(node, nodes, arguments, context, fallbacks, lexical, active)
-            }
+            OwnerConstraintNodeKind::Call { .. } | OwnerConstraintNodeKind::Pipe { .. } => self
+                .evaluate_call_node(
+                    module, node, nodes, arguments, context, fallbacks, lexical, active,
+                ),
             OwnerConstraintNodeKind::Infix { operation } => {
                 let left = node
                     .inputs
@@ -2845,9 +3155,9 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     static_number: None,
                 })
             }
-            OwnerConstraintNodeKind::When => {
-                self.evaluate_when_node(node, nodes, arguments, context, fallbacks, lexical, active)
-            }
+            OwnerConstraintNodeKind::When => self.evaluate_when_node(
+                module, node, nodes, arguments, context, fallbacks, lexical, active,
+            ),
             OwnerConstraintNodeKind::MatchArm { .. } | OwnerConstraintNodeKind::Arrow { .. } => {
                 let output = node.inputs.iter().find(|input| {
                     matches!(
@@ -3028,6 +3338,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
     #[allow(clippy::too_many_arguments)]
     fn evaluate_when_node(
         &mut self,
+        module: &OwnerInterfaceTransferModule,
         node: &OwnerResultTransferNode,
         nodes: &[OwnerResultTransferNode],
         arguments: &BTreeMap<u32, EvaluatedResultValue>,
@@ -3041,6 +3352,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             .iter()
             .find(|input| matches!(input.role, OwnerConstraintEdgeRole::WhenInput))?;
         let selector = self.evaluate_expression_ref(
+            module,
             &selector.expression,
             nodes,
             arguments,
@@ -3083,6 +3395,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 continue;
             };
             if let Some(output) = self.evaluate_expression_ref(
+                module,
                 &output.expression,
                 nodes,
                 arguments,
@@ -3127,6 +3440,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
     #[allow(clippy::too_many_arguments)]
     fn evaluate_call_node(
         &mut self,
+        module: &OwnerInterfaceTransferModule,
         node: &OwnerResultTransferNode,
         nodes: &[OwnerResultTransferNode],
         arguments: &BTreeMap<u32, EvaluatedResultValue>,
@@ -3138,13 +3452,14 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         let fallback = transfer_fallback(node, fallbacks)?;
         match node.call_target.as_ref()? {
             OwnerResultCallTarget::Owner { owner } => {
-                self.interfaces.get(owner)?;
+                let (callee_module, _) = module.resolve_owner(owner)?;
                 let mut actuals = BTreeMap::new();
                 for input in &node.inputs {
                     let Some(formal_ordinal) = input.formal_ordinal else {
                         continue;
                     };
                     let value = self.evaluate_expression_ref(
+                        module,
                         &input.expression,
                         nodes,
                         arguments,
@@ -3161,6 +3476,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     .find(|input| input.explicit_pass)
                     .and_then(|input| {
                         self.evaluate_expression_ref(
+                            module,
                             &input.expression,
                             nodes,
                             arguments,
@@ -3170,15 +3486,21 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                             active,
                         )
                     });
-                self.evaluate_owner(owner, &actuals, explicit_context.as_ref().or(context))
-                    .map(|result| result.value)
-                    .or(Some(fallback))
+                self.evaluate_owner_in_module(
+                    callee_module,
+                    owner,
+                    &actuals,
+                    explicit_context.as_ref().or(context),
+                )
+                .map(|result| result.value)
+                .or(Some(fallback))
             }
             OwnerResultCallTarget::Abi {
                 canonical_name,
                 contract,
             } => self
                 .evaluate_abi_call(
+                    module,
                     node,
                     canonical_name,
                     contract,
@@ -3199,6 +3521,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
     #[allow(clippy::too_many_arguments)]
     fn evaluate_abi_call(
         &mut self,
+        module: &OwnerInterfaceTransferModule,
         node: &OwnerResultTransferNode,
         function: &str,
         contract: &OwnerResultAbiContract,
@@ -3221,6 +3544,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 .ok()
                 .and_then(|index| contract.parameters.get(index))?;
             let actual = self.evaluate_expression_ref(
+                module,
                 &input.expression,
                 nodes,
                 arguments,
@@ -4223,6 +4547,7 @@ fn refine_owner_call_at(
     syntax: &OwnerSyntaxInput,
     seed: &OwnerConstraintSeed,
     interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
+    providers: &BTreeMap<StableCheckOwnerKey, &OwnerInterfaceTransferModule>,
     unifier: &mut TypeUnifier,
     expressions: &[TypeVar],
     external_expressions: &[TypeVar],
@@ -4254,6 +4579,7 @@ fn refine_owner_call_at(
                 syntax,
                 seed,
                 interfaces,
+                providers,
                 unifier,
                 expressions,
                 external_expressions,
@@ -4309,7 +4635,7 @@ fn refine_owner_call_at(
         static_number: None,
     });
     let evaluated = {
-        let mut evaluator = OwnerResultTransferEvaluator::new(interfaces, unifier);
+        let mut evaluator = OwnerResultTransferEvaluator::new(providers, unifier);
         evaluator.evaluate_owner(
             target_owner,
             &arguments,
@@ -4337,6 +4663,7 @@ fn refine_owner_call_transfers(
     syntax: &OwnerSyntaxInput,
     seed: &OwnerConstraintSeed,
     interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
+    providers: &BTreeMap<StableCheckOwnerKey, &OwnerInterfaceTransferModule>,
     unifier: &mut TypeUnifier,
     expressions: &[TypeVar],
     external_expressions: &[TypeVar],
@@ -4358,6 +4685,7 @@ fn refine_owner_call_transfers(
             syntax,
             seed,
             interfaces,
+            providers,
             unifier,
             expressions,
             external_expressions,
@@ -4698,17 +5026,15 @@ fn validate_inputs(
 /// This function never descends another owner body and never allocates a
 /// project-global checked identity. The caller must provide exactly the own,
 /// child-value, value-read, and callable interfaces named by the resolved
-/// owner inputs plus the exact transitive dependencies of their public result
-/// transfer slices, as sealed by `interface_plan`.
-pub fn evaluate_owner_body<'a>(
+/// owner inputs. Shared transfer modules retain the exact transitive result
+/// dependencies without flattening them into every body evaluation.
+pub fn evaluate_owner_body(
     syntax: &OwnerSyntaxInput,
     lexical_plan: &OwnerLexicalPlan,
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     abi: &OwnerInferenceAbiEnvironment,
     interface_plan: &OwnerBodyInterfacePlan,
-    own_scc: &'a OwnerInterfaceSccResult,
-    imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<OwnerBodyInferenceEvaluation, OwnerBodyInferenceError> {
     evaluate_owner_body_impl(
         syntax,
@@ -4717,21 +5043,17 @@ pub fn evaluate_owner_body<'a>(
         summary,
         abi,
         interface_plan,
-        own_scc,
-        imported_sccs,
         None,
     )
 }
 
-pub fn evaluate_owner_body_with_signature_plan<'a>(
+pub fn evaluate_owner_body_with_signature_plan(
     syntax: &OwnerSyntaxInput,
     lexical_plan: &OwnerLexicalPlan,
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     abi: &OwnerInferenceAbiEnvironment,
     interface_plan: &OwnerBodyInterfacePlan,
-    own_scc: &'a OwnerInterfaceSccResult,
-    imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
     signature_lexical_plan: &OwnerSignatureLexicalPlan,
 ) -> Result<OwnerBodyInferenceEvaluation, OwnerBodyInferenceError> {
     evaluate_owner_body_impl(
@@ -4741,23 +5063,20 @@ pub fn evaluate_owner_body_with_signature_plan<'a>(
         summary,
         abi,
         interface_plan,
-        own_scc,
-        imported_sccs,
         Some(signature_lexical_plan),
     )
 }
 
-fn evaluate_owner_body_impl<'a>(
+fn evaluate_owner_body_impl(
     syntax: &OwnerSyntaxInput,
     lexical_plan: &OwnerLexicalPlan,
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     abi: &OwnerInferenceAbiEnvironment,
     interface_plan: &OwnerBodyInterfacePlan,
-    own_scc: &'a OwnerInterfaceSccResult,
-    imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
     supplied_signature_lexical_plan: Option<&OwnerSignatureLexicalPlan>,
 ) -> Result<OwnerBodyInferenceEvaluation, OwnerBodyInferenceError> {
+    let own_scc = interface_plan.own_scc().module.result();
     validate_inputs(syntax, lexical_plan, seed, summary, own_scc)?;
     if interface_plan.owner() != &seed.owner {
         return Err(OwnerBodyInferenceError::new(
@@ -4831,34 +5150,13 @@ fn evaluate_owner_body_impl<'a>(
             "owner body inference ABI does not match its exact parameter requirement lookup set",
         ));
     }
-    let mut supplied_results = BTreeMap::new();
-    for result in std::iter::once(own_scc).chain(imported_sccs) {
-        if supplied_results
-            .insert(result.key.clone(), result)
-            .is_some()
-        {
-            return Err(OwnerBodyInferenceError::new(format!(
-                "owner body inference received duplicate interface SCC {:?}",
-                result.key
-            )));
-        }
-    }
-    let planned_keys = interface_plan
-        .sccs()
-        .map(|scc| scc.key.clone())
-        .collect::<BTreeSet<_>>();
-    if supplied_results.keys().cloned().collect::<BTreeSet<_>>() != planned_keys {
-        return Err(OwnerBodyInferenceError::new(format!(
-            "owner body inference {:?} did not receive its exact planned interface SCCs",
-            seed.owner
-        )));
-    }
     let mut interfaces = BTreeMap::new();
     let mut providers = BTreeMap::new();
     let mut frozen_results = Vec::new();
     for planned_scc in interface_plan.sccs() {
-        let result = supplied_results[&planned_scc.key];
-        let frozen = frozen_scc_ref(result, planned_scc)?;
+        let module = planned_scc.module.as_ref();
+        let result = module.result();
+        let frozen = frozen_scc_ref(planned_scc)?;
         for member in &frozen.referenced_members {
             let owner = frozen.key.members.get(*member as usize).ok_or_else(|| {
                 OwnerBodyInferenceError::new(format!(
@@ -4873,7 +5171,7 @@ fn evaluate_owner_body_impl<'a>(
                 ))
             })?;
             insert_interface(&mut interfaces, interface)?;
-            if providers.insert(owner.clone(), result).is_some() {
+            if providers.insert(owner.clone(), module).is_some() {
                 return Err(OwnerBodyInferenceError::new(format!(
                     "owner body inference received multiple provider SCCs for {owner:?}"
                 )));
@@ -5300,6 +5598,7 @@ fn evaluate_owner_body_impl<'a>(
         syntax,
         seed,
         &interfaces,
+        &providers,
         &mut unifier,
         &expressions,
         &external_expressions,
@@ -5319,6 +5618,7 @@ fn evaluate_owner_body_impl<'a>(
         syntax,
         seed,
         &interfaces,
+        &providers,
         &mut unifier,
         &expressions,
         &external_expressions,
@@ -5549,17 +5849,8 @@ pub fn infer_owner_body<'a>(
         summary,
         std::iter::once(own_scc).chain(imported_sccs.iter().copied()),
     )?;
-    evaluate_owner_body(
-        syntax,
-        lexical_plan,
-        seed,
-        summary,
-        abi,
-        &interface_plan,
-        own_scc,
-        imported_sccs,
-    )
-    .map(|evaluation| Arc::unwrap_or_clone(evaluation.result))
+    evaluate_owner_body(syntax, lexical_plan, seed, summary, abi, &interface_plan)
+        .map(|evaluation| Arc::unwrap_or_clone(evaluation.result))
 }
 
 #[cfg(test)]

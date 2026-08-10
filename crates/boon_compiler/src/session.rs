@@ -31,16 +31,17 @@ use boon_typecheck::{
     OwnerConstructionValueAbiLookup, OwnerDeclarationKind, OwnerDeclarationSurface,
     OwnerDiagnosticsAggregate, OwnerInferenceAbiEnvironment, OwnerInterfaceScc,
     OwnerInterfaceSccEvaluation, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
-    OwnerInterfaceTopology, OwnerLexicalPlan, OwnerParameterRequirementKey,
-    OwnerParameterRequirementLookup, OwnerReferenceKind, OwnerSourceMap,
-    OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput,
-    OwnerValueAbiLookup, ProjectDiagnosticFacts, aggregate_owner_diagnostics,
+    OwnerInterfaceTopology, OwnerInterfaceTransferModule, OwnerLexicalPlan,
+    OwnerParameterRequirementKey, OwnerParameterRequirementLookup, OwnerReferenceKind,
+    OwnerSourceMap, OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution,
+    OwnerSyntaxInput, OwnerValueAbiLookup, ProjectDiagnosticFacts, aggregate_owner_diagnostics,
     assemble_checked_owner_project, build_checked_owner_shard, build_owner_callable_scope_topology,
     build_owner_interface_topology, evaluate_owner_body_with_signature_plan,
     evaluate_owner_callable_scope_scc, evaluate_owner_interface_scc_with_signature_scopes,
-    project_diagnostic_facts, project_owner_abi_environment,
-    project_owner_callable_resolution_plan, project_owner_constraint_seed_with_lexical_plan,
-    project_owner_declaration_surface, project_owner_lexical_plan, project_owner_source_map,
+    owner_interface_transfer_dependency_owners, project_diagnostic_facts,
+    project_owner_abi_environment, project_owner_callable_resolution_plan,
+    project_owner_constraint_seed_with_lexical_plan, project_owner_declaration_surface,
+    project_owner_interface_transfer_module, project_owner_lexical_plan, project_owner_source_map,
     project_owner_syntax_input, resolve_owner_constraint_seed_with_signature_plan,
     stable_check_owner_key_fingerprint_v1,
 };
@@ -283,6 +284,8 @@ struct ProjectState {
     owner_interface_scc_plan_requests: TypedRequestTable<OwnerInterfaceSccPlanRequest>,
     owner_interface_scc_evaluation_requests: TypedRequestTable<OwnerInterfaceSccEvaluationRequest>,
     owner_interface_scc_requests: TypedRequestTable<OwnerInterfaceSccRequest>,
+    owner_interface_transfer_module_requests:
+        TypedRequestTable<OwnerInterfaceTransferModuleRequest>,
     owner_interface_provider_requests: TypedRequestTable<OwnerInterfaceProviderRequest>,
     owner_body_inference_evaluation_requests:
         TypedRequestTable<OwnerBodyInferenceEvaluationRequest>,
@@ -1222,6 +1225,25 @@ impl RequestFamily for OwnerInterfaceSccRequest {
     }
 }
 
+struct OwnerInterfaceTransferModuleRequest;
+
+impl RequestFamily for OwnerInterfaceTransferModuleRequest {
+    type Key = OwnerInterfaceSccKey;
+    type Value = Arc<OwnerInterfaceTransferModule>;
+
+    const NAME: &'static str = "boon.compiler.owner-interface-transfer-module.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        OwnerInterfaceSccPlanRequest::key_fingerprint(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
 /// Per-owner projection of the current interface topology.
 ///
 /// Its input is the exact SCC key, so an unrelated topology change can
@@ -1264,7 +1286,7 @@ impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v8";
+    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v9";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1442,6 +1464,7 @@ impl CompilerSession {
                 owner_interface_scc_plan_requests: TypedRequestTable::new(),
                 owner_interface_scc_evaluation_requests: TypedRequestTable::new(),
                 owner_interface_scc_requests: TypedRequestTable::new(),
+                owner_interface_transfer_module_requests: TypedRequestTable::new(),
                 owner_interface_provider_requests: TypedRequestTable::new(),
                 owner_body_inference_evaluation_requests: TypedRequestTable::new(),
                 owner_body_inference_requests: TypedRequestTable::new(),
@@ -4495,6 +4518,9 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
     state
         .owner_interface_scc_requests
         .retain(&mut state.syntax_evaluator, |key| live_keys.contains(key))?;
+    state
+        .owner_interface_transfer_module_requests
+        .retain(&mut state.syntax_evaluator, |key| live_keys.contains(key))?;
 
     let live_owners = topology
         .sccs
@@ -4590,6 +4616,10 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
     ));
     let result_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.owner-interface-scc-result-projection-dependencies.v3\0",
+        std::iter::empty(),
+    ));
+    let transfer_module_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-interface-transfer-module-dependencies.v1\0",
         std::iter::empty(),
     ));
     for expected in &topology.sccs {
@@ -4770,8 +4800,84 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                 )?;
             }
         }
+        match state.owner_interface_transfer_module_requests.begin(
+            &mut state.syntax_evaluator,
+            expected.key.clone(),
+            transfer_module_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let module = (|| -> CompilerResult<_> {
+                    let plan = Arc::clone(state.owner_interface_scc_plan_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &expected.key,
+                    )?);
+                    let result = Arc::clone(state.owner_interface_scc_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &expected.key,
+                    )?);
+                    let mut dependencies = BTreeMap::new();
+                    for dependency_owner in owner_interface_transfer_dependency_owners(&result) {
+                        let provider =
+                            Arc::clone(state.owner_interface_provider_requests.require(
+                                &state.syntax_evaluator,
+                                &mut ticket,
+                                &dependency_owner,
+                            )?);
+                        if provider.key() == &expected.key {
+                            return Err(session_error(format!(
+                                "interface transfer module {:?} classified own member {dependency_owner:?} as an external dependency",
+                                expected.key
+                            )));
+                        }
+                        let dependency =
+                            Arc::clone(state.owner_interface_transfer_module_requests.require(
+                                &state.syntax_evaluator,
+                                &mut ticket,
+                                provider.key(),
+                            )?);
+                        if let Some(previous) =
+                            dependencies.insert(provider.key().clone(), Arc::clone(&dependency))
+                            && previous.fingerprint_v1() != dependency.fingerprint_v1()
+                        {
+                            return Err(session_error(format!(
+                                "interface transfer module {:?} observed conflicting dependency versions for {:?}",
+                                expected.key,
+                                provider.key()
+                            )));
+                        }
+                    }
+                    Ok(Arc::new(project_owner_interface_transfer_module(
+                        &plan,
+                        result,
+                        dependencies.into_values(),
+                    )?))
+                })();
+                let module = match module {
+                    Ok(module) => module,
+                    Err(error) => {
+                        state.owner_interface_transfer_module_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_interface_transfer_module_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    module,
+                )?;
+            }
+        }
     }
-    trace.checkpoint("interface-scc-results", topology.sccs.len());
+    trace.checkpoint(
+        "interface-scc-results-and-transfer-modules",
+        topology.sccs.len(),
+    );
     evaluate_owner_body_inference_requests(state, &topology)
 }
 
@@ -4786,7 +4892,7 @@ fn evaluate_owner_body_inference_requests(
         .flat_map(|scc| scc.key.members.iter().cloned())
         .collect::<Vec<_>>();
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-body-inference-evaluation-dependencies.v8\0",
+        b"boon.compiler.owner-body-inference-evaluation-dependencies.v9\0",
         std::iter::empty(),
     ));
     let mut planning_ms = 0.0;
@@ -4833,7 +4939,7 @@ fn evaluate_owner_body_inference_requests(
                     )?);
                     let planning_started = Instant::now();
                     let mut planner = OwnerBodyInterfacePlanner::new(&seed, &summary)?;
-                    let mut interface_results = BTreeMap::new();
+                    let mut interface_modules = BTreeMap::new();
                     while let Some(required_owner) = planner.next_required_owner().cloned() {
                         let provider =
                             Arc::clone(state.owner_interface_provider_requests.require(
@@ -4841,42 +4947,23 @@ fn evaluate_owner_body_inference_requests(
                                 &mut ticket,
                                 &required_owner,
                             )?);
-                        let result = if let Some(result) = interface_results.get(provider.key()) {
-                            Arc::clone(result)
+                        let module = if let Some(module) = interface_modules.get(provider.key()) {
+                            Arc::clone(module)
                         } else {
-                            let result = Arc::clone(state.owner_interface_scc_requests.require(
-                                &state.syntax_evaluator,
-                                &mut ticket,
-                                provider.key(),
-                            )?);
-                            interface_results.insert(provider.key().clone(), Arc::clone(&result));
-                            result
+                            let module = Arc::clone(
+                                state.owner_interface_transfer_module_requests.require(
+                                    &state.syntax_evaluator,
+                                    &mut ticket,
+                                    provider.key(),
+                                )?,
+                            );
+                            interface_modules.insert(provider.key().clone(), Arc::clone(&module));
+                            module
                         };
-                        planner.provide_interface_scc(&result)?;
+                        planner.provide_interface_module(module)?;
                     }
                     let interface_plan = planner.finish()?;
                     owner_planning_ms = planning_started.elapsed().as_secs_f64() * 1_000.0;
-                    let own_scc = Arc::clone(
-                        interface_results
-                            .get(interface_plan.own_scc().key())
-                            .ok_or_else(|| {
-                                session_error(format!(
-                                    "owner body inference {owner:?} has no planned own SCC result"
-                                ))
-                            })?,
-                    );
-                    let imports = interface_plan
-                        .imports()
-                        .iter()
-                        .map(|planned| {
-                            interface_results.get(planned.key()).cloned().ok_or_else(|| {
-                                session_error(format!(
-                                    "owner body inference {owner:?} has no planned import SCC result {:?}",
-                                    planned.key()
-                                ))
-                            })
-                        })
-                        .collect::<CompilerResult<Vec<_>>>()?;
                     let callable_scope_provider =
                         Arc::clone(state.owner_callable_scope_provider_requests.require(
                             &state.syntax_evaluator,
@@ -4905,8 +4992,6 @@ fn evaluate_owner_body_inference_requests(
                         &summary,
                         &abi,
                         &interface_plan,
-                        &own_scc,
-                        imports.iter().map(Arc::as_ref),
                         signature_lexical_plan,
                     )?;
                     let solve_ms = solve_started.elapsed().as_secs_f64() * 1_000.0;
@@ -7738,13 +7823,14 @@ mod tests {
         // addition to declaration-surface/lexical-plan, exact interface
         // provider and owner-inference requests. Public diagnostics deliberately
         // stop before construction ABI and checked-owner requests.
-        // All 25 callable-scope requests are reused by this literal-only warm
-        // edit; the edited owner's ordinary dependency cone remains local.
+        // All callable-scope and unchanged interface-transfer module requests
+        // are reused by this literal-only warm edit; the edited owner's
+        // ordinary dependency cone remains local.
         // The project diagnostic-facts request executes once per revision and
         // changes when its exact owner-body input changes.
         assert_eq!(
             (first_request_counts, request_counts(second_stats)),
-            ((93, 93, 0, 0, 93), (186, 109, 77, 8, 101))
+            ((97, 97, 0, 0, 97), (194, 113, 81, 8, 105))
         );
 
         let mut isolated = CompilerSession::new();
@@ -9061,7 +9147,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_body_request_freezes_transitive_result_transfer_interfaces() {
+    fn owner_body_request_shares_transitive_result_transfer_modules() {
         let source = concat!(
             "FUNCTION leaf() {\n",
             "    PASSED.store.count\n",
@@ -9091,7 +9177,6 @@ mod tests {
         };
         let value = owner_named("value");
         let inherited = owner_named("inherited");
-        let leaf = owner_named("leaf");
         let body = session
             .owner_body_inference(project, &value)
             .unwrap()
@@ -9114,10 +9199,353 @@ mod tests {
             .map(|interface| interface.owner.clone())
             .collect::<BTreeSet<_>>();
 
-        assert_eq!(imported, BTreeSet::from([value, inherited, leaf]));
-        assert_eq!(body.work.interface_plan_required_owners, 3);
-        assert_eq!(body.work.interface_plan_result_transfers, 3);
+        assert_eq!(imported, BTreeSet::from([value, inherited]));
+        assert_eq!(body.work.interface_plan_required_owners, 2);
+        assert_eq!(body.work.interface_plan_result_transfers, 2);
         assert_eq!(body.calls[0].result.ty, boon_checked::Type::Number);
+    }
+
+    #[test]
+    fn unused_value_dependencies_do_not_invalidate_transfer_modules_or_callers() {
+        let before = concat!(
+            "source: 1\n",
+            "FUNCTION identity(input) {\n",
+            "    ignored: source\n",
+            "    input\n",
+            "}\n",
+            "value: identity(input: 7)\n",
+        );
+        let after = before.replacen("source: 1", "source: TEXT { changed }", 1);
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project(before)).unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let owner_named = |name: &str| {
+            unit.stable_check_owner_keys()
+                .find(|owner| {
+                    matches!(
+                        owner,
+                        StableCheckOwnerKey::Item(owner)
+                            if owner.item_route.segments().last().is_some_and(|segment| segment.names == [name])
+                    )
+                })
+                .unwrap()
+        };
+        let identity = owner_named("identity");
+        let value = owner_named("value");
+        let first_identity_body = session
+            .owner_body_inference(project, &identity)
+            .unwrap()
+            .unwrap();
+        let first_value_body = session
+            .owner_body_inference(project, &value)
+            .unwrap()
+            .unwrap();
+        let first_module = {
+            let state = session.projects.get(&project).unwrap();
+            let provider = state
+                .owner_interface_provider_requests
+                .current_value(&state.syntax_evaluator, &identity)
+                .unwrap()
+                .unwrap();
+            Arc::clone(
+                state
+                    .owner_interface_transfer_module_requests
+                    .current_value(&state.syntax_evaluator, provider.key())
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+
+        session
+            .apply_update(project, UnitUpdate::new("RUN.bn", after))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+
+        let second_identity_body = session
+            .owner_body_inference(project, &identity)
+            .unwrap()
+            .unwrap();
+        let second_value_body = session
+            .owner_body_inference(project, &value)
+            .unwrap()
+            .unwrap();
+        let second_module = {
+            let state = session.projects.get(&project).unwrap();
+            let provider = state
+                .owner_interface_provider_requests
+                .current_value(&state.syntax_evaluator, &identity)
+                .unwrap()
+                .unwrap();
+            Arc::clone(
+                state
+                    .owner_interface_transfer_module_requests
+                    .current_value(&state.syntax_evaluator, provider.key())
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+
+        assert!(!Arc::ptr_eq(&first_identity_body, &second_identity_body));
+        assert!(Arc::ptr_eq(&first_module, &second_module));
+        assert!(Arc::ptr_eq(&first_value_body, &second_value_body));
+        assert_eq!(
+            second_value_body.calls[0].result.ty,
+            boon_checked::Type::Number
+        );
+    }
+
+    #[test]
+    fn transitive_transfer_changes_invalidate_callers_behind_equal_interfaces() {
+        let before = concat!(
+            "FUNCTION leaf(kind) {\n",
+            "    kind |> WHEN {\n",
+            "        A => 1\n",
+            "        __ => TEXT { other }\n",
+            "    }\n",
+            "}\n",
+            "FUNCTION inherited(kind) {\n",
+            "    leaf(kind: kind)\n",
+            "}\n",
+            "value: inherited(kind: A)\n",
+        );
+        let after = concat!(
+            "FUNCTION leaf(kind) {\n",
+            "    kind |> WHEN {\n",
+            "        A => TEXT { other }\n",
+            "        __ => 1\n",
+            "    }\n",
+            "}\n",
+            "FUNCTION inherited(kind) {\n",
+            "    leaf(kind: kind)\n",
+            "}\n",
+            "value: inherited(kind: A)\n",
+        );
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project(before)).unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let owner_named = |name: &str| {
+            unit.stable_check_owner_keys()
+                .find(|owner| {
+                    matches!(
+                        owner,
+                        StableCheckOwnerKey::Item(owner)
+                            if owner.item_route.segments().last().is_some_and(|segment| segment.names == [name])
+                    )
+                })
+                .unwrap()
+        };
+        let leaf = owner_named("leaf");
+        let inherited = owner_named("inherited");
+        let value = owner_named("value");
+        let first_leaf_interface = session
+            .owner_interface_result(project, &leaf)
+            .unwrap()
+            .unwrap();
+        let first_inherited_interface = session
+            .owner_interface_result(project, &inherited)
+            .unwrap()
+            .unwrap();
+        let first_value_body = session
+            .owner_body_inference(project, &value)
+            .unwrap()
+            .unwrap();
+        let (first_leaf_module, first_inherited_module) = {
+            let state = session.projects.get(&project).unwrap();
+            let module = |owner: &StableCheckOwnerKey| {
+                let provider = state
+                    .owner_interface_provider_requests
+                    .current_value(&state.syntax_evaluator, owner)
+                    .unwrap()
+                    .unwrap();
+                Arc::clone(
+                    state
+                        .owner_interface_transfer_module_requests
+                        .current_value(&state.syntax_evaluator, provider.key())
+                        .unwrap()
+                        .unwrap(),
+                )
+            };
+            (module(&leaf), module(&inherited))
+        };
+        assert_eq!(
+            first_value_body.calls[0].result.ty,
+            boon_checked::Type::Number
+        );
+
+        session
+            .apply_update(project, UnitUpdate::new("RUN.bn", after))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+
+        let second_leaf_interface = session
+            .owner_interface_result(project, &leaf)
+            .unwrap()
+            .unwrap();
+        let second_inherited_interface = session
+            .owner_interface_result(project, &inherited)
+            .unwrap()
+            .unwrap();
+        let second_value_body = session
+            .owner_body_inference(project, &value)
+            .unwrap()
+            .unwrap();
+        let (second_leaf_module, second_inherited_module) = {
+            let state = session.projects.get(&project).unwrap();
+            let module = |owner: &StableCheckOwnerKey| {
+                let provider = state
+                    .owner_interface_provider_requests
+                    .current_value(&state.syntax_evaluator, owner)
+                    .unwrap()
+                    .unwrap();
+                Arc::clone(
+                    state
+                        .owner_interface_transfer_module_requests
+                        .current_value(&state.syntax_evaluator, provider.key())
+                        .unwrap()
+                        .unwrap(),
+                )
+            };
+            (module(&leaf), module(&inherited))
+        };
+
+        assert!(!Arc::ptr_eq(&first_leaf_interface, &second_leaf_interface));
+        assert!(Arc::ptr_eq(
+            &first_inherited_interface,
+            &second_inherited_interface
+        ));
+        assert!(!Arc::ptr_eq(&first_leaf_module, &second_leaf_module));
+        assert!(!Arc::ptr_eq(
+            &first_inherited_module,
+            &second_inherited_module
+        ));
+        assert!(!Arc::ptr_eq(&first_value_body, &second_value_body));
+        assert_eq!(
+            second_value_body.calls[0].result.ty,
+            boon_checked::Type::Text
+        );
+    }
+
+    #[test]
+    fn transfer_module_dependencies_are_canonical_exact_and_fail_closed() {
+        let source = concat!(
+            "other: 1\n",
+            "foreign: 2\n",
+            "FUNCTION identity(input) {\n",
+            "    input\n",
+            "}\n",
+            "FUNCTION wrapper(input) {\n",
+            "    ignored: other\n",
+            "    identity(input: input)\n",
+            "}\n",
+            "value: wrapper(input: 7)\n",
+        );
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project(source)).unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let owner_named = |name: &str| {
+            unit.stable_check_owner_keys()
+                .find(|owner| {
+                    matches!(
+                        owner,
+                        StableCheckOwnerKey::Item(owner)
+                            if owner.item_route.segments().last().is_some_and(|segment| segment.names == [name])
+                    )
+                })
+                .unwrap()
+        };
+        let other = owner_named("other");
+        let foreign = owner_named("foreign");
+        let identity = owner_named("identity");
+        let wrapper = owner_named("wrapper");
+        let state = session.projects.get(&project).unwrap();
+        let provider_key = |owner: &StableCheckOwnerKey| {
+            state
+                .owner_interface_provider_requests
+                .current_value(&state.syntax_evaluator, owner)
+                .unwrap()
+                .unwrap()
+                .key()
+                .clone()
+        };
+        let wrapper_key = provider_key(&wrapper);
+        let identity_key = provider_key(&identity);
+        let other_key = provider_key(&other);
+        let foreign_key = provider_key(&foreign);
+        let module = |key: &OwnerInterfaceSccKey| {
+            Arc::clone(
+                state
+                    .owner_interface_transfer_module_requests
+                    .current_value(&state.syntax_evaluator, key)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        let wrapper_plan = Arc::clone(
+            state
+                .owner_interface_scc_plan_requests
+                .current_value(&state.syntax_evaluator, &wrapper_key)
+                .unwrap()
+                .unwrap(),
+        );
+        let wrapper_result = Arc::clone(
+            state
+                .owner_interface_scc_requests
+                .current_value(&state.syntax_evaluator, &wrapper_key)
+                .unwrap()
+                .unwrap(),
+        );
+        let production = module(&wrapper_key);
+        let identity_module = module(&identity_key);
+        let other_module = module(&other_key);
+        let foreign_module = module(&foreign_key);
+        assert_eq!(
+            owner_interface_transfer_dependency_owners(&wrapper_result),
+            Box::from([identity.clone()])
+        );
+
+        let canonical = project_owner_interface_transfer_module(
+            &wrapper_plan,
+            Arc::clone(&wrapper_result),
+            [Arc::clone(&identity_module), Arc::clone(&identity_module)],
+        )
+        .unwrap();
+        assert_eq!(canonical.fingerprint_v1(), production.fingerprint_v1());
+        assert!(
+            project_owner_interface_transfer_module(
+                &wrapper_plan,
+                Arc::clone(&wrapper_result),
+                [],
+            )
+            .is_err()
+        );
+        assert!(
+            project_owner_interface_transfer_module(
+                &wrapper_plan,
+                Arc::clone(&wrapper_result),
+                [identity_module, other_module],
+            )
+            .is_err()
+        );
+        assert!(
+            project_owner_interface_transfer_module(
+                &wrapper_plan,
+                wrapper_result,
+                [foreign_module],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -9226,13 +9654,13 @@ mod tests {
         // The callable-only ABI, resolution, scope topology/SCC, and provider
         // families are included here. An exported callable change reexecutes
         // its exact scope cone and backdates unchanged projections; the body-
-        // only edit reuses 141 of 172 demanded requests and changes only 18.
+        // only edit reuses 147 of 179 demanded requests and changes only 19.
         // The exact child-boundary lexical projection adds five executions to
         // the exported-interface cone. The project diagnostic-facts request
         // adds one exact execution/change to both cones.
         assert_eq!(
             (interface_delta, body_delta),
-            ((172, 89, 83, 42, 47), (172, 31, 141, 13, 18))
+            ((179, 90, 89, 42, 48), (179, 32, 147, 13, 19))
         );
     }
 

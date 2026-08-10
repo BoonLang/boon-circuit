@@ -4496,7 +4496,7 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
                 *bindings = block_bindings;
             }
             if result.is_none() {
-                *result = structural_child_result;
+                *result = child_result;
             }
         }
         AstExprKind::Object(fields) => {
@@ -12123,6 +12123,56 @@ value:
             "nested block pipeline linked to {:?}",
             parsed.expressions[linked].kind,
         );
+        let block = parsed
+            .expressions
+            .iter()
+            .find(|expression| matches!(expression.kind, AstExprKind::Block { .. }))
+            .expect("nested BLOCK expression");
+        let AstExprKind::Block { result, .. } = &block.kind else {
+            unreachable!();
+        };
+        assert_eq!(*result, Some(is_not_empty.id));
+    }
+
+    #[test]
+    fn pipeline_after_a_closed_block_stays_outside_the_block_result() {
+        let parsed = parse_ast(
+            "outer-block-pipeline.bn",
+            r#"
+value:
+    BLOCK {
+        items: LIST { 6 }
+        items
+    }
+    |> List/is_not_empty()
+"#,
+        )
+        .unwrap();
+        let block = parsed
+            .expressions
+            .iter()
+            .find(|expression| matches!(expression.kind, AstExprKind::Block { .. }))
+            .expect("closed BLOCK expression");
+        let AstExprKind::Block { result, .. } = &block.kind else {
+            unreachable!();
+        };
+        let result = result.expect("closed BLOCK result");
+        assert!(matches!(
+            &parsed.expressions[result].kind,
+            AstExprKind::Identifier(name) if name == "items"
+        ));
+        let outer = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(
+                    &expression.kind,
+                    AstExprKind::Pipe { op, .. } if op == "List/is_not_empty"
+                )
+            })
+            .expect("outer List/is_not_empty expression");
+        assert_eq!(outer.linked_input, Some(block.id));
+        assert_ne!(outer.id, result);
     }
 
     #[test]

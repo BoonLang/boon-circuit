@@ -878,6 +878,9 @@ impl ReactiveReachabilityIndex {
                                 expression.id
                             )));
                         }
+                        None if builder.is_detached_context_free_local_read_copy(expression) => {
+                            continue;
+                        }
                         None => builder.resolve_decl_binding(*target, expression, bindings)?,
                     };
                     Self::insert_reverse_edges(
@@ -1070,6 +1073,7 @@ struct ReactiveBuilder<'a> {
     resources: &'a SemanticResourceGraphV1,
     out_net: &'a ResolvedOutGraph,
     reachable_expressions: BTreeSet<SemanticExprId>,
+    reachable_local_checked_expressions: BTreeSet<CheckedExprId>,
     local_values: BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
     parameter_inputs: BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
     external_event_identities: BTreeSet<CheckedExternalDeclarationIdentityV1>,
@@ -1083,6 +1087,15 @@ impl<'a> ReactiveBuilder<'a> {
         external_event_identities: BTreeSet<CheckedExternalDeclarationIdentityV1>,
     ) -> Result<Self, SemanticReactiveError> {
         let reachable_expressions = reachable_reactive_expressions(execution)?;
+        let reachable_local_checked_expressions = execution
+            .expressions
+            .iter()
+            .filter(|expression| {
+                reachable_expressions.contains(&expression.id)
+                    && matches!(expression.kind, SemanticExpressionKind::LocalRead { .. })
+            })
+            .map(|expression| expression.checked_expr_id)
+            .collect();
         let mut local_values = BTreeMap::new();
         for expression in &execution.expressions {
             if let SemanticExpressionKind::Block { bindings, .. } = &expression.kind {
@@ -1140,6 +1153,7 @@ impl<'a> ReactiveBuilder<'a> {
             resources,
             out_net,
             reachable_expressions,
+            reachable_local_checked_expressions,
             local_values,
             parameter_inputs,
             external_event_identities,
@@ -2384,6 +2398,13 @@ impl<'a> ReactiveBuilder<'a> {
             .collect())
     }
 
+    fn is_detached_context_free_local_read_copy(&self, expression: &SemanticExpression) -> bool {
+        !self.reachable_expressions.contains(&expression.id)
+            && self
+                .reachable_local_checked_expressions
+                .contains(&expression.checked_expr_id)
+    }
+
     fn build_reads(
         &self,
         bindings: &[SemanticBindingV1],
@@ -2416,17 +2437,7 @@ impl<'a> ReactiveBuilder<'a> {
                         let binding = match self.resolve_decl_binding(*target, expression, bindings)
                         {
                             Ok(binding) => binding,
-                            Err(_)
-                                if !self.reachable_expressions.contains(&expression.id)
-                                    && self.execution.expressions.iter().any(|candidate| {
-                                        candidate.checked_expr_id == expression.checked_expr_id
-                                            && self.reachable_expressions.contains(&candidate.id)
-                                            && matches!(
-                                                candidate.kind,
-                                                SemanticExpressionKind::LocalRead { .. }
-                                            )
-                                    }) =>
-                            {
+                            Err(_) if self.is_detached_context_free_local_read_copy(expression) => {
                                 // Context-free checked statement copies are retained for
                                 // diagnostics, but only the structurally reachable BLOCK
                                 // occurrence owns a lexical value frame.

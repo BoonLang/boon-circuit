@@ -1,9 +1,10 @@
 use boon_checked::CheckedValueUse;
 use boon_parser::UnitOwnerSyntaxView;
 use boon_syntax::{
-    AstBlockBinding, AstCallArg, AstExprKind, AstParameter, AstPassContext, AstRecordField,
-    AstStatementKind, AstTextSegment, StableCheckOwnerKey, StableExpressionKey, StableOwnerKey,
-    StableStatementKey, UnitItemKind, UnitLocalStatementId,
+    AstBlockBinding, AstBlockBindingDeclaration, AstCallArg, AstExprKind, AstParameter,
+    AstPassContext, AstRecordField, AstStatementKind, AstTextSegment, StableCheckOwnerKey,
+    StableExpressionKey, StableExpressionRouteSegment, StableOwnerKey, StableStatementKey,
+    UnitItemKind, UnitLocalStatementId,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -13,7 +14,7 @@ use std::fmt;
 use std::io::{self, Write};
 
 const OWNER_KEY_FINGERPRINT_DOMAIN_V1: &[u8] = b"boon.check-owner-key.v1\0";
-const OWNER_SYNTAX_FINGERPRINT_DOMAIN_V1: &[u8] = b"boon.owner-syntax-input.v1\0";
+const OWNER_SYNTAX_FINGERPRINT_DOMAIN_V2: &[u8] = b"boon.owner-syntax-input.v2\0";
 const OWNER_SOURCE_MAP_FINGERPRINT_DOMAIN_V2: &[u8] = b"boon.owner-source-map.v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,9 +85,36 @@ pub struct OwnerChildInput {
     pub owner: StableCheckOwnerKey,
     pub parent: Option<u32>,
     pub child_index: u32,
+    /// Stable identity of the authored expression at the direct owner
+    /// boundary. This can differ from `result_expression` when the child's
+    /// public value is supplied by a deeper descendant owner.
+    pub boundary_expression: Option<StableExpressionKey>,
     /// Stable identity of the child's public result at this boundary. A
     /// function declaration has no value in its containing statement lane.
     pub result_expression: Option<StableExpressionKey>,
+    /// Exact placement of the public result in the containing owner. Keeping
+    /// statement-lane and expression-edge placement distinct prevents a lost
+    /// structural edge from silently falling back to a broader lexical scope.
+    pub result_placement: OwnerChildResultPlacementInput,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerExpressionParentEdgeInput {
+    pub child_owner: StableCheckOwnerKey,
+    pub child_expression: StableExpressionKey,
+    pub owner: StableCheckOwnerKey,
+    pub expression: StableExpressionKey,
+    pub segment: StableExpressionRouteSegment,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnerChildResultPlacementInput {
+    Valueless,
+    StatementLane,
+    ExpressionEdge {
+        edge: OwnerExpressionParentEdgeInput,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -413,7 +441,10 @@ impl<'a> ExpressionProjection<'a> {
     }
 }
 
-fn is_descendant_owner(parent: &StableCheckOwnerKey, candidate: &StableCheckOwnerKey) -> bool {
+pub(crate) fn is_descendant_owner(
+    parent: &StableCheckOwnerKey,
+    candidate: &StableCheckOwnerKey,
+) -> bool {
     if parent.source_unit_id() != candidate.source_unit_id() {
         return false;
     }
@@ -466,15 +497,29 @@ fn normalize_record_field(
 fn normalize_block_binding(
     binding: &mut AstBlockBinding,
     statements: &BTreeMap<usize, u32>,
+    child_statements: &BTreeMap<usize, u32>,
     expressions: &mut ExpressionProjection<'_>,
 ) -> Result<(), OwnerSyntaxProjectionError> {
-    binding.statement = usize::try_from(*statements.get(&binding.statement).ok_or_else(|| {
-        OwnerSyntaxProjectionError::new(format!(
-            "owner {:?} block binding references statement {} outside its shard",
-            expressions.owner, binding.statement
-        ))
-    })?)
-    .expect("u32 owner statement id fits usize");
+    let AstBlockBindingDeclaration::Local { statement } = binding.declaration else {
+        return Err(OwnerSyntaxProjectionError::new(format!(
+            "owner {:?} received a pre-normalized child BLOCK declaration",
+            expressions.owner
+        )));
+    };
+    binding.declaration = if let Some(statement) = statements.get(&statement) {
+        AstBlockBindingDeclaration::Local {
+            statement: usize::try_from(*statement).expect("u32 owner statement id fits usize"),
+        }
+    } else if let Some(child) = child_statements.get(&statement) {
+        AstBlockBindingDeclaration::Child {
+            child: usize::try_from(*child).expect("u32 owner child id fits usize"),
+        }
+    } else {
+        return Err(OwnerSyntaxProjectionError::new(format!(
+            "owner {:?} block binding references statement {statement} outside its local and direct-child shards",
+            expressions.owner
+        )));
+    };
     expressions.remap(&mut binding.value, "block binding value")?;
     binding.start = 0;
     binding.end = 0;
@@ -485,6 +530,7 @@ fn normalize_expression_kind(
     kind: &mut AstExprKind,
     linked_input: Option<u32>,
     statements: &BTreeMap<usize, u32>,
+    child_statements: &BTreeMap<usize, u32>,
     expressions: &mut ExpressionProjection<'_>,
 ) -> Result<(), OwnerSyntaxProjectionError> {
     match kind {
@@ -559,7 +605,7 @@ fn normalize_expression_kind(
         }
         AstExprKind::Block { bindings, result } => {
             for binding in bindings {
-                normalize_block_binding(binding, statements, expressions)?;
+                normalize_block_binding(binding, statements, child_statements, expressions)?;
             }
             expressions.remap_optional(result, "block result")?;
         }
@@ -885,6 +931,21 @@ pub fn project_owner_syntax_input(
             )));
         }
     }
+    let mut child_statements = BTreeMap::<usize, u32>::new();
+    for (child, boundary) in view.child_owners().iter().enumerate() {
+        let child = checked_u32(child, "owner child count")?;
+        let statement = view.child_owner_statement_id(boundary).ok_or_else(|| {
+            OwnerSyntaxProjectionError::new(format!(
+                "owner {owner:?} child {:?} has no authored statement",
+                boundary.route
+            ))
+        })?;
+        if child_statements.insert(statement, child).is_some() {
+            return Err(OwnerSyntaxProjectionError::new(format!(
+                "owner {owner:?} has duplicate child statement identity {statement}"
+            )));
+        }
+    }
 
     let mut expression_by_syntax = BTreeMap::<usize, u32>::new();
     for (dense, expression) in view.expressions().enumerate() {
@@ -980,6 +1041,7 @@ pub fn project_owner_syntax_input(
             &mut kind,
             linked_input,
             &statement_by_syntax,
+            &child_statements,
             &mut expression_projection,
         )?;
         expressions.push(OwnerExpressionInput {
@@ -1007,8 +1069,8 @@ pub fn project_owner_syntax_input(
             })
             .transpose()?;
         let child_owner = child_owner_key(&owner, boundary.route.clone());
-        let result_expression = view
-            .child_owner_result_expression(boundary)
+        let child_result = view.child_owner_result_expression(boundary);
+        let result_expression = child_result
             .map(|expression| {
                 // The containing owner consumes the child's frozen public
                 // result just like any other descendant expression. Intern it
@@ -1023,17 +1085,50 @@ pub fn project_owner_syntax_input(
                     })
             })
             .transpose()?;
+        let boundary_expression = view.child_owner_boundary_expression(boundary);
+        let result_placement = match child_result {
+            None => OwnerChildResultPlacementInput::Valueless,
+            Some(_) if parent.is_none() => OwnerChildResultPlacementInput::StatementLane,
+            Some(expression) => view
+                .stable_expression_boundary_parent_edge_for_syntax(expression)
+                .map(
+                    |(child_owner, child_expression, owner, expression, segment)| {
+                        OwnerChildResultPlacementInput::ExpressionEdge {
+                            edge: OwnerExpressionParentEdgeInput {
+                                child_owner,
+                                child_expression,
+                                owner,
+                                expression,
+                                segment,
+                            },
+                        }
+                    },
+                )
+                .unwrap_or(OwnerChildResultPlacementInput::StatementLane),
+        };
+        let boundary_expression = boundary_expression
+            .map(|expression| {
+                view.stable_expression_key_for_syntax(expression)
+                    .ok_or_else(|| {
+                        OwnerSyntaxProjectionError::new(format!(
+                            "owner {owner:?} child {child_owner:?} has no stable boundary expression"
+                        ))
+                    })
+            })
+            .transpose()?;
         child_owners.push(OwnerChildInput {
             owner: child_owner,
             parent,
             child_index: checked_u32(boundary.child_index(), "child-owner position")?,
+            boundary_expression,
             result_expression,
+            result_placement,
         });
     }
     let external_expressions = expression_projection.into_external_expressions();
 
     let fingerprint_v1 = fingerprint_serialized(
-        OWNER_SYNTAX_FINGERPRINT_DOMAIN_V1,
+        OWNER_SYNTAX_FINGERPRINT_DOMAIN_V2,
         &(
             &owner,
             &containing_scope,
@@ -1385,6 +1480,173 @@ mod tests {
                 .anchors
                 .windows(2)
                 .all(|pair| { (&pair[0].site, pair[0].role) < (&pair[1].site, pair[1].role) })
+        );
+    }
+
+    #[test]
+    fn block_binding_retains_exact_child_declaration_and_parent_edge() {
+        let unit = link(
+            parse_project_source_unit(
+                "app/RUN.bn",
+                "container: BLOCK {\n    child: [value: 1]\n    child\n}\n",
+            )
+            .unwrap(),
+        );
+        let container = owner_named(&unit, "container");
+        let child = owner_named(&unit, "child");
+        let input =
+            project_owner_syntax_input(unit.owner_view_for_key(&container).unwrap()).unwrap();
+
+        assert_eq!(input.child_owners.len(), 1);
+        assert_eq!(input.child_owners[0].owner, child);
+        let block = input
+            .expressions
+            .iter()
+            .find(|expression| matches!(&expression.kind, AstExprKind::Block { .. }))
+            .expect("container BLOCK expression");
+        let AstExprKind::Block { bindings, .. } = &block.kind else {
+            unreachable!();
+        };
+        let binding = bindings
+            .iter()
+            .find(|binding| binding.name == "child")
+            .expect("child BLOCK binding");
+        assert_eq!(
+            binding.declaration,
+            AstBlockBindingDeclaration::Child { child: 0 }
+        );
+        let external = input
+            .external_expression(binding.value)
+            .expect("child public result reference");
+        assert_eq!(external.owner, child);
+        assert_eq!(
+            input.child_owners[0].result_expression.as_ref(),
+            Some(&external.expression)
+        );
+
+        let OwnerChildResultPlacementInput::ExpressionEdge { edge } =
+            &input.child_owners[0].result_placement
+        else {
+            panic!("child result must have an expression edge");
+        };
+        assert_eq!(edge.owner, container);
+        assert_eq!(edge.expression, block.stable_key);
+        assert_eq!(
+            edge.segment.role,
+            boon_syntax::StableExpressionChildRole::BlockBinding
+        );
+        assert_eq!(edge.segment.label.as_deref(), Some("child"));
+        assert_eq!(edge.segment.matching_sibling_reverse_ordinal, 0);
+    }
+
+    #[test]
+    fn nested_functions_are_valueless_in_enclosing_block_and_list_structure() {
+        let unit = link(
+            parse_project_source_unit(
+                "app/RUN.bn",
+                concat!(
+                    "container: BLOCK {\n",
+                    "    FUNCTION helper_block() { 1 }\n",
+                    "}\n",
+                    "items: LIST {\n",
+                    "    FUNCTION helper_list() { 2 }\n",
+                    "}\n",
+                ),
+            )
+            .unwrap(),
+        );
+
+        let container = owner_named(&unit, "container");
+        let container =
+            project_owner_syntax_input(unit.owner_view_for_key(&container).unwrap()).unwrap();
+        let helper = container
+            .child_owners
+            .iter()
+            .find(|child| {
+                matches!(
+                    &child.owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| {
+                            segment.names.as_ref() == ["helper_block"]
+                        })
+                )
+            })
+            .expect("nested block function boundary");
+        assert_eq!(helper.result_expression, None);
+        assert_eq!(
+            helper.result_placement,
+            OwnerChildResultPlacementInput::Valueless
+        );
+        let block = container
+            .expressions
+            .iter()
+            .find_map(|expression| match &expression.kind {
+                AstExprKind::Block { bindings, result } => Some((bindings, result)),
+                _ => None,
+            })
+            .expect("container BLOCK");
+        assert!(block.0.is_empty());
+        assert_eq!(*block.1, None);
+
+        let items = owner_named(&unit, "items");
+        let items = project_owner_syntax_input(unit.owner_view_for_key(&items).unwrap()).unwrap();
+        let helper = items
+            .child_owners
+            .iter()
+            .find(|child| {
+                matches!(
+                    &child.owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| {
+                            segment.names.as_ref() == ["helper_list"]
+                        })
+                )
+            })
+            .expect("nested list function boundary");
+        assert_eq!(helper.result_expression, None);
+        assert_eq!(
+            helper.result_placement,
+            OwnerChildResultPlacementInput::Valueless
+        );
+        let list = items
+            .expressions
+            .iter()
+            .find_map(|expression| match &expression.kind {
+                AstExprKind::ListLiteral { items, .. } => Some(items),
+                _ => None,
+            })
+            .expect("items LIST");
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn child_parent_edge_is_derived_from_the_public_pipeline_result() {
+        let unit = link(
+            parse_project_source_unit(
+                "app/RUN.bn",
+                concat!(
+                    "container: BLOCK {\n",
+                    "    child:\n",
+                    "        TEXT { hello }\n",
+                    "        |> Text/trim()\n",
+                    "    child\n",
+                    "}\n",
+                ),
+            )
+            .unwrap(),
+        );
+        let container = owner_named(&unit, "container");
+        let input =
+            project_owner_syntax_input(unit.owner_view_for_key(&container).unwrap()).unwrap();
+        let child = input.child_owners.first().expect("pipeline child boundary");
+        assert_ne!(child.boundary_expression, child.result_expression);
+        let OwnerChildResultPlacementInput::ExpressionEdge { edge } = &child.result_placement
+        else {
+            panic!("pipeline child result must retain an expression edge");
+        };
+        assert!(
+            child.boundary_expression.as_ref() == Some(&edge.child_expression)
+                || child.result_expression.as_ref() == Some(&edge.child_expression)
         );
     }
 

@@ -1,5 +1,6 @@
 use boon_contract::{SourceBundleDigestV1, SourceBundleError, normalize_source_path};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -736,22 +737,38 @@ pub struct UnitStatementLocator {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UnitChildOwnerBoundary {
     pub route: StableItemRoute,
+    statement: UnitLocalStatementId,
     parent: Option<UnitLocalStatementId>,
     child_index: u32,
+    boundary_expression: Option<UnitLocalExpressionId>,
+    result_expression: Option<UnitLocalExpressionId>,
 }
 
 impl UnitChildOwnerBoundary {
     #[doc(hidden)]
     pub fn __parser_new(
         route: StableItemRoute,
+        statement: UnitLocalStatementId,
         parent: Option<UnitLocalStatementId>,
         child_index: usize,
+        boundary_expression: Option<UnitLocalExpressionId>,
+        result_expression: Option<UnitLocalExpressionId>,
     ) -> Option<Self> {
         Some(Self {
             route,
+            statement,
             parent,
             child_index: u32::try_from(child_index).ok()?,
+            boundary_expression,
+            result_expression,
         })
+    }
+
+    /// Unit-local id of the authored statement that starts the child owner.
+    ///
+    /// This is parser lookup metadata only. Stable consumers use [`Self::route`].
+    pub const fn statement(&self) -> UnitLocalStatementId {
+        self.statement
     }
 
     pub const fn parent(&self) -> Option<UnitLocalStatementId> {
@@ -760,6 +777,44 @@ impl UnitChildOwnerBoundary {
 
     pub const fn child_index(&self) -> usize {
         self.child_index as usize
+    }
+
+    pub const fn boundary_expression(&self) -> Option<UnitLocalExpressionId> {
+        self.boundary_expression
+    }
+
+    pub const fn result_expression(&self) -> Option<UnitLocalExpressionId> {
+        self.result_expression
+    }
+}
+
+/// Exact structural expression edge retained by the parser owner index.
+///
+/// Both columns are required: the unit-local parent id supports constant-time
+/// syntax lookup, while `segment` is the stable child role used to reconstruct
+/// an owner-independent parent edge. Keeping them in one row prevents the two
+/// columns from drifting out of alignment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnitExpressionParentEdge {
+    parent: UnitLocalExpressionId,
+    segment: StableExpressionRouteSegment,
+}
+
+impl UnitExpressionParentEdge {
+    #[doc(hidden)]
+    pub fn __parser_new(
+        parent: UnitLocalExpressionId,
+        segment: StableExpressionRouteSegment,
+    ) -> Self {
+        Self { parent, segment }
+    }
+
+    pub const fn parent(&self) -> UnitLocalExpressionId {
+        self.parent
+    }
+
+    pub const fn segment(&self) -> &StableExpressionRouteSegment {
+        &self.segment
     }
 }
 
@@ -805,11 +860,12 @@ pub struct UnitOwnerIndexEntry {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UnitOwnerIndex {
     entries: Box<[UnitOwnerIndexEntry]>,
+    item_entry_by_route: BTreeMap<StableItemRoute, usize>,
     statement_locators: Box<[UnitStatementLocator]>,
     statement_routes: Box<[StableStatementRoute]>,
     statement_owners: Box<[UnitCheckOwnerSlot]>,
     expression_owners: Box<[UnitCheckOwnerSlot]>,
-    expression_parents: Box<[Option<UnitLocalExpressionId>]>,
+    expression_parents: Box<[Option<UnitExpressionParentEdge>]>,
 }
 
 impl UnitOwnerIndex {
@@ -820,10 +876,20 @@ impl UnitOwnerIndex {
         statement_routes: Vec<StableStatementRoute>,
         statement_owners: Vec<UnitCheckOwnerSlot>,
         expression_owners: Vec<UnitCheckOwnerSlot>,
-        expression_parents: Vec<Option<UnitLocalExpressionId>>,
+        expression_parents: Vec<Option<UnitExpressionParentEdge>>,
     ) -> Self {
+        let item_entry_by_route = entries
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(index, entry)| match &entry.route {
+                UnitOwnerRoute::Item(route) => Some((route.clone(), index)),
+                UnitOwnerRoute::UnitRoot => None,
+            })
+            .collect();
         Self {
             entries: entries.into_boxed_slice(),
+            item_entry_by_route,
             statement_locators: statement_locators.into_boxed_slice(),
             statement_routes: statement_routes.into_boxed_slice(),
             statement_owners: statement_owners.into_boxed_slice(),
@@ -840,12 +906,9 @@ impl UnitOwnerIndex {
         match route {
             UnitOwnerRoute::UnitRoot => self.entries.first(),
             UnitOwnerRoute::Item(route) => self
-                .entries
-                .iter()
-                .skip(1)
-                .find(|entry| {
-                    matches!(&entry.route, UnitOwnerRoute::Item(candidate) if candidate == route)
-                }),
+                .item_entry_by_route
+                .get(route)
+                .and_then(|index| self.entries.get(*index)),
         }
     }
 
@@ -894,8 +957,17 @@ impl UnitOwnerIndex {
     ) -> Option<UnitLocalExpressionId> {
         self.expression_parents
             .get(expression.as_usize())
-            .copied()
-            .flatten()
+            .and_then(Option::as_ref)
+            .map(UnitExpressionParentEdge::parent)
+    }
+
+    pub fn expression_parent_edge(
+        &self,
+        expression: UnitLocalExpressionId,
+    ) -> Option<&UnitExpressionParentEdge> {
+        self.expression_parents
+            .get(expression.as_usize())
+            .and_then(Option::as_ref)
     }
 }
 
@@ -1601,10 +1673,25 @@ pub struct AstPassContext {
     pub final_clause: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AstBlockBindingDeclaration {
+    /// Raw parser statement id, or the normalized dense statement row when
+    /// the declaration remains inside the consuming owner.
+    Local { statement: usize },
+    /// Dense row in `OwnerSyntaxInput::child_owners` when the declaration is
+    /// the public value of an independently checked child owner.
+    ///
+    /// Raw parser artifacts never contain this variant. It exists so an owner
+    /// projection cannot confuse a child owner with a local statement or hide
+    /// that distinction behind a magic integer sentinel.
+    Child { child: usize },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AstBlockBinding {
     pub name: String,
-    pub statement: usize,
+    pub declaration: AstBlockBindingDeclaration,
     pub value: usize,
     pub start: usize,
     pub end: usize,

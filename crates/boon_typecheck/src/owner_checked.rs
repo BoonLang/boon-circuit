@@ -5,15 +5,18 @@ use boon_checked::{
     OwnerExpressionRef, OwnerRelocationSpan, OwnerRelocationTarget, OwnerStatementChild,
     OwnerStatementId,
 };
-use boon_syntax::{AstExprKind, AstStatementKind, StableCheckOwnerKey, StableExpressionKey};
+use boon_syntax::{
+    AstBlockBindingDeclaration, AstExprKind, AstStatementKind, StableCheckOwnerKey,
+    StableExpressionChildRole, StableExpressionKey, StableExpressionRouteSegment,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
 const OWNER_CHECKED_STABLE_ROW_DOMAIN_V1: &[u8] = b"boon.owner-checked-stable-row.v1\0";
-const OWNER_CHECKED_ROW_PAYLOAD_DOMAIN_V1: &[u8] = b"boon.owner-checked-row-payload.v1\0";
-const OWNER_CHECKED_LOCAL_CONTENT_DOMAIN_V1: &[u8] = b"boon.owner-checked-local-content.v1\0";
+const OWNER_CHECKED_ROW_PAYLOAD_DOMAIN_V2: &[u8] = b"boon.owner-checked-row-payload.v2\0";
+const OWNER_CHECKED_LOCAL_CONTENT_DOMAIN_V2: &[u8] = b"boon.owner-checked-local-content.v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerCheckedReceiptError {
@@ -85,7 +88,7 @@ impl OwnerCheckedReceiptSink {
         })?;
         let canonical_stable_key = self.hash_scratch.clone();
         let payload_digest_v1 = boon_contract::canonical_serde_hash_v1_with_buffer(
-            OWNER_CHECKED_ROW_PAYLOAD_DOMAIN_V1,
+            OWNER_CHECKED_ROW_PAYLOAD_DOMAIN_V2,
             &(domain, normalized_payload),
             &mut self.hash_scratch,
         )
@@ -169,7 +172,7 @@ impl OwnerCheckedReceiptSink {
         let relocation_count =
             checked_receipt_u32(relocations.len(), "owner checked relocation count")?;
         let local_content_digest_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_CHECKED_LOCAL_CONTENT_DOMAIN_V1,
+            OWNER_CHECKED_LOCAL_CONTENT_DOMAIN_V2,
             &(&domain_counts, &row_receipts, &relocations),
         )
         .map_err(|error| {
@@ -260,7 +263,7 @@ pub fn validate_owner_checked_receipts(
         ));
     }
     let local_content_digest_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_CHECKED_LOCAL_CONTENT_DOMAIN_V1,
+        OWNER_CHECKED_LOCAL_CONTENT_DOMAIN_V2,
         &(
             &domain_counts,
             &receipts.row_receipts,
@@ -340,6 +343,50 @@ impl OwnerSyntaxGraph {
     pub fn build(syntax: &OwnerSyntaxInput) -> Result<Self, OwnerSyntaxGraphError> {
         validate_expression_table(syntax)?;
 
+        let external_pairs = syntax
+            .external_expressions
+            .iter()
+            .map(|external| (external.owner.clone(), external.expression.clone()))
+            .collect::<BTreeSet<_>>();
+        let mut observed_external_owners =
+            BTreeMap::<StableExpressionKey, BTreeSet<StableCheckOwnerKey>>::new();
+        let mut canonical_parent_edges = BTreeMap::<
+            (
+                StableExpressionKey,
+                StableCheckOwnerKey,
+                StableExpressionKey,
+            ),
+            StableExpressionRouteSegment,
+        >::new();
+        for parent in &syntax.expressions {
+            // The parser registers child edges in reverse and keeps the first
+            // parent for a reused expression. Mirror that canonical choice in
+            // one shared pass so every child boundary is an indexed lookup.
+            for (reference, segment) in boon_parser::stable_expression_child_edges(
+                &parent.kind,
+                parent.linked_input.map(|input| input as usize),
+            )
+            .into_iter()
+            .rev()
+            {
+                let Ok(reference) = u32::try_from(reference) else {
+                    continue;
+                };
+                let Ok(OwnerExpressionRef::Child { owner, expression }) =
+                    expression_reference(syntax, reference)
+                else {
+                    continue;
+                };
+                observed_external_owners
+                    .entry(expression.clone())
+                    .or_default()
+                    .insert(owner.clone());
+                canonical_parent_edges
+                    .entry((parent.stable_key.clone(), owner, expression))
+                    .or_insert(segment);
+            }
+        }
+
         let mut attachments =
             BTreeMap::<Option<OwnerStatementId>, Vec<(u32, OwnerStatementChild)>>::new();
         let mut stable_statements = BTreeSet::new();
@@ -393,6 +440,134 @@ impl OwnerSyntaxGraph {
                     "owner {:?} child {:?} has missing parent {}",
                     syntax.owner, child.owner, parent.0
                 )));
+            }
+            for expression in [
+                child.boundary_expression.as_ref(),
+                child.result_expression.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if &expression.source_unit_id != syntax.owner.source_unit_id() {
+                    return Err(OwnerSyntaxGraphError::new(format!(
+                        "owner {:?} child {:?} has a foreign stable expression identity",
+                        syntax.owner, child.owner
+                    )));
+                }
+            }
+            match (&child.result_expression, &child.result_placement) {
+                (None, crate::OwnerChildResultPlacementInput::Valueless) => {}
+                (None, _) => {
+                    return Err(OwnerSyntaxGraphError::new(format!(
+                        "owner {:?} child {:?} has a result placement without a public result",
+                        syntax.owner, child.owner
+                    )));
+                }
+                (Some(_), crate::OwnerChildResultPlacementInput::Valueless) => {
+                    return Err(OwnerSyntaxGraphError::new(format!(
+                        "owner {:?} child {:?} has a public result marked valueless",
+                        syntax.owner, child.owner
+                    )));
+                }
+                (Some(result), crate::OwnerChildResultPlacementInput::ExpressionEdge { edge }) => {
+                    if edge.child_expression.source_unit_id != *edge.child_owner.source_unit_id()
+                        || edge.expression.source_unit_id != *edge.owner.source_unit_id()
+                    {
+                        return Err(OwnerSyntaxGraphError::new(format!(
+                            "owner {:?} child {:?} result edge mixes source units",
+                            syntax.owner, child.owner
+                        )));
+                    }
+                    if &edge.child_expression != result
+                        && child.boundary_expression.as_ref() != Some(&edge.child_expression)
+                    {
+                        return Err(OwnerSyntaxGraphError::new(format!(
+                            "owner {:?} child {:?} has a result edge for neither its authored boundary nor its public result",
+                            syntax.owner, child.owner
+                        )));
+                    }
+                    if edge.owner != syntax.owner {
+                        return Err(OwnerSyntaxGraphError::new(format!(
+                            "owner {:?} child {:?} has a result parent in another owner: {:?}",
+                            syntax.owner, child.owner, edge.owner
+                        )));
+                    }
+                    if !syntax
+                        .expressions
+                        .iter()
+                        .any(|expression| expression.stable_key == edge.expression)
+                    {
+                        return Err(OwnerSyntaxGraphError::new(format!(
+                            "owner {:?} child {:?} has a missing stable result parent expression",
+                            syntax.owner, child.owner
+                        )));
+                    }
+                    if !(edge.child_owner == child.owner
+                        || crate::owner_syntax::is_descendant_owner(
+                            &child.owner,
+                            &edge.child_owner,
+                        ))
+                    {
+                        return Err(OwnerSyntaxGraphError::new(format!(
+                            "owner {:?} child {:?} has a forged result endpoint",
+                            syntax.owner, child.owner
+                        )));
+                    }
+                    if !external_pairs
+                        .contains(&(edge.child_owner.clone(), edge.child_expression.clone()))
+                    {
+                        return Err(OwnerSyntaxGraphError::new(format!(
+                            "owner {:?} child {:?} result edge has no exact external endpoint",
+                            syntax.owner, child.owner
+                        )));
+                    }
+                    let canonical = canonical_parent_edges.get(&(
+                        edge.expression.clone(),
+                        edge.child_owner.clone(),
+                        edge.child_expression.clone(),
+                    ));
+                    if canonical != Some(&edge.segment) {
+                        return Err(OwnerSyntaxGraphError::new(format!(
+                            "owner {:?} child {:?} result edge does not match its canonical parent role",
+                            syntax.owner, child.owner
+                        )));
+                    }
+                }
+                (Some(result), crate::OwnerChildResultPlacementInput::StatementLane) => {
+                    let result_providers = syntax
+                        .external_expressions
+                        .iter()
+                        .filter(|external| {
+                            external.expression == *result
+                                && (external.owner == child.owner
+                                    || crate::owner_syntax::is_descendant_owner(
+                                        &child.owner,
+                                        &external.owner,
+                                    ))
+                        })
+                        .count();
+                    if result_providers != 1 {
+                        return Err(OwnerSyntaxGraphError::new(format!(
+                            "owner {:?} child {:?} statement-lane result has {result_providers} exact providers",
+                            syntax.owner, child.owner
+                        )));
+                    }
+                    let observed_by_expression = [Some(result), child.boundary_expression.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|expression| observed_external_owners.get(expression))
+                        .flatten()
+                        .any(|owner| {
+                            owner == &child.owner
+                                || crate::owner_syntax::is_descendant_owner(&child.owner, owner)
+                        });
+                    if observed_by_expression {
+                        return Err(OwnerSyntaxGraphError::new(format!(
+                            "owner {:?} child {:?} lost an expression-edge placement",
+                            syntax.owner, child.owner
+                        )));
+                    }
+                }
             }
             attachments.entry(parent).or_default().push((
                 child.child_index,
@@ -535,10 +710,30 @@ impl OwnerSyntaxGraph {
             .child_owners
             .iter()
             .find(|child| &child.owner == owner)
-            .and_then(|child| child.result_expression.clone())
-            .map(|expression| OwnerExpressionRef::Child {
-                owner: owner.clone(),
-                expression,
+            .and_then(|child| match &child.result_placement {
+                crate::OwnerChildResultPlacementInput::ExpressionEdge { edge } => {
+                    Some(OwnerExpressionRef::Child {
+                        owner: edge.child_owner.clone(),
+                        expression: edge.child_expression.clone(),
+                    })
+                }
+                crate::OwnerChildResultPlacementInput::StatementLane => {
+                    let result = child.result_expression.as_ref()?;
+                    let mut matches = syntax.external_expressions.iter().filter(|external| {
+                        &external.expression == result
+                            && (external.owner == child.owner
+                                || crate::owner_syntax::is_descendant_owner(
+                                    &child.owner,
+                                    &external.owner,
+                                ))
+                    });
+                    let exact = matches.next()?;
+                    matches.next().is_none().then(|| OwnerExpressionRef::Child {
+                        owner: exact.owner.clone(),
+                        expression: exact.expression.clone(),
+                    })
+                }
+                crate::OwnerChildResultPlacementInput::Valueless => None,
             })
     }
 
@@ -974,6 +1169,27 @@ fn expression_reference(
 }
 
 fn validate_expression_table(syntax: &OwnerSyntaxInput) -> Result<(), OwnerSyntaxGraphError> {
+    let mut external = BTreeSet::new();
+    for expression in &syntax.external_expressions {
+        if expression.owner.source_unit_id() != syntax.owner.source_unit_id() {
+            return Err(OwnerSyntaxGraphError::new(format!(
+                "owner {:?} external expression belongs to another source unit: {:?}",
+                syntax.owner, expression.owner
+            )));
+        }
+        if &expression.expression.source_unit_id != expression.owner.source_unit_id() {
+            return Err(OwnerSyntaxGraphError::new(format!(
+                "owner {:?} external expression has a foreign stable source unit: {:?}",
+                syntax.owner, expression.expression
+            )));
+        }
+        if !external.insert((expression.owner.clone(), expression.expression.clone())) {
+            return Err(OwnerSyntaxGraphError::new(format!(
+                "owner {:?} has duplicate external expression {:?}",
+                syntax.owner, expression.expression
+            )));
+        }
+    }
     let mut stable_expressions = BTreeSet::new();
     for (index, expression) in syntax.expressions.iter().enumerate() {
         if expression.stable_key.source_unit_id != *syntax.owner.source_unit_id() {
@@ -998,29 +1214,88 @@ fn validate_expression_table(syntax: &OwnerSyntaxInput) -> Result<(), OwnerSynta
             let _ = expression_reference(syntax, selector)?;
         }
         if let AstExprKind::Block { bindings, .. } = &expression.kind {
-            for binding in bindings {
-                if binding.statement >= syntax.statements.len() {
-                    return Err(OwnerSyntaxGraphError::new(format!(
-                        "owner {:?} expression {index} block binding references missing statement {}",
-                        syntax.owner, binding.statement
-                    )));
+            let mut later_by_name = BTreeMap::<&str, usize>::new();
+            let mut reverse_ordinals = vec![0usize; bindings.len()];
+            for (binding_index, binding) in bindings.iter().enumerate().rev() {
+                let later = later_by_name.entry(binding.name.as_str()).or_default();
+                reverse_ordinals[binding_index] = *later;
+                *later += 1;
+            }
+            for (binding_index, binding) in bindings.iter().enumerate() {
+                match binding.declaration {
+                    AstBlockBindingDeclaration::Local { statement } => {
+                        if statement >= syntax.statements.len() {
+                            return Err(OwnerSyntaxGraphError::new(format!(
+                                "owner {:?} expression {index} block binding references missing local statement {statement}",
+                                syntax.owner
+                            )));
+                        }
+                    }
+                    AstBlockBindingDeclaration::Child { child } => {
+                        let child = syntax.child_owners.get(child).ok_or_else(|| {
+                            OwnerSyntaxGraphError::new(format!(
+                                "owner {:?} expression {index} block binding references missing child row {child}",
+                                syntax.owner
+                            ))
+                        })?;
+                        let _result = child.result_expression.as_ref().ok_or_else(|| {
+                            OwnerSyntaxGraphError::new(format!(
+                                "owner {:?} expression {index} block binding targets valueless child {:?}",
+                                syntax.owner, child.owner
+                            ))
+                        })?;
+                        match expression_reference(
+                            syntax,
+                            checked_u32(binding.value, "owner block binding value")?,
+                        )? {
+                            OwnerExpressionRef::Child {
+                                owner,
+                                expression: value,
+                            } if matches!(
+                                &child.result_placement,
+                                crate::OwnerChildResultPlacementInput::ExpressionEdge { edge }
+                                    if edge.child_owner == owner
+                                        && edge.child_expression == value
+                            ) => {}
+                            _ => {
+                                return Err(OwnerSyntaxGraphError::new(format!(
+                                    "owner {:?} expression {index} block binding does not consume child {:?}'s exact public result",
+                                    syntax.owner, child.owner
+                                )));
+                            }
+                        }
+                        let crate::OwnerChildResultPlacementInput::ExpressionEdge { edge } =
+                            &child.result_placement
+                        else {
+                            return Err(OwnerSyntaxGraphError::new(format!(
+                                "owner {:?} expression {index} block binding child {:?} has no exact parent edge",
+                                syntax.owner, child.owner
+                            )));
+                        };
+                        let reverse_ordinal = reverse_ordinals[binding_index];
+                        let binding_edge = edge.segment.role
+                            == StableExpressionChildRole::BlockBinding
+                            && edge.segment.label.as_deref() == Some(binding.name.as_str())
+                            && edge.segment.matching_sibling_reverse_ordinal == reverse_ordinal;
+                        let result_alias_edge = edge.segment.role
+                            == StableExpressionChildRole::BlockResult
+                            && matches!(
+                                &expression.kind,
+                                AstExprKind::Block { result, .. }
+                                    if result.is_some_and(|result| result == binding.value)
+                            );
+                        if edge.owner != syntax.owner
+                            || edge.expression != expression.stable_key
+                            || !(binding_edge || result_alias_edge)
+                        {
+                            return Err(OwnerSyntaxGraphError::new(format!(
+                                "owner {:?} expression {index} block binding child {:?} has a mismatched stable parent edge",
+                                syntax.owner, child.owner
+                            )));
+                        }
+                    }
                 }
             }
-        }
-    }
-    let mut external = BTreeSet::new();
-    for expression in &syntax.external_expressions {
-        if expression.owner.source_unit_id() != syntax.owner.source_unit_id() {
-            return Err(OwnerSyntaxGraphError::new(format!(
-                "owner {:?} external expression belongs to another source unit: {:?}",
-                syntax.owner, expression.owner
-            )));
-        }
-        if !external.insert((expression.owner.clone(), expression.expression.clone())) {
-            return Err(OwnerSyntaxGraphError::new(format!(
-                "owner {:?} has duplicate external expression {:?}",
-                syntax.owner, expression.expression
-            )));
         }
     }
     Ok(())
@@ -1313,6 +1588,21 @@ mod tests {
         ProjectSyntaxSnapshot::from_unit_snapshots(path, vec![Arc::new(unit)]).unwrap()
     }
 
+    fn owner_named(project: &ProjectSyntaxSnapshot, name: &str) -> StableCheckOwnerKey {
+        project
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| {
+                            segment.names.iter().any(|candidate| candidate == name)
+                        })
+                )
+            })
+            .unwrap_or_else(|| panic!("project has no owner named {name}"))
+    }
+
     fn owner_graphs(
         project: &ProjectSyntaxSnapshot,
     ) -> BTreeMap<StableCheckOwnerKey, (OwnerSyntaxInput, OwnerSyntaxGraph)> {
@@ -1417,6 +1707,217 @@ result: helper(input: store.title)
                 "child weaving differs for {stable_key:?}"
             );
         }
+    }
+
+    #[test]
+    fn block_only_child_can_be_both_the_binding_and_the_result() {
+        let project = project(
+            "app/RUN.bn",
+            "container: BLOCK {\n    child: [value: 1]\n}\n",
+        );
+        let graphs = owner_graphs(&project);
+        let (syntax, _) = graphs
+            .iter()
+            .find_map(|(owner, value)| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| {
+                            segment.names.as_ref() == ["container"]
+                        })
+                )
+                .then_some(value)
+            })
+            .expect("container owner graph");
+        let child = syntax.child_owners.first().expect("child owner boundary");
+        let crate::OwnerChildResultPlacementInput::ExpressionEdge { edge } =
+            &child.result_placement
+        else {
+            panic!("BLOCK child result must retain its exact structural edge");
+        };
+        assert!(matches!(
+            edge.segment.role,
+            StableExpressionChildRole::BlockBinding | StableExpressionChildRole::BlockResult
+        ));
+        assert!(child.result_expression.is_some());
+    }
+
+    #[test]
+    fn graph_rejects_a_result_edge_forged_to_an_unrelated_child_expression() {
+        let project = project(
+            "app/RUN.bn",
+            concat!(
+                "container: BLOCK {\n",
+                "    child:\n",
+                "        TEXT { hello }\n",
+                "        |> Text/trim()\n",
+                "        |> Text/trim()\n",
+                "    child\n",
+                "}\n",
+            ),
+        );
+        let mut syntax = project
+            .stable_check_owner_keys()
+            .find_map(|owner| {
+                let input =
+                    project_owner_syntax_input(project.owner_view(&owner).unwrap()).unwrap();
+                matches!(
+                    &owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| {
+                            segment.names.as_ref() == ["container"]
+                        })
+                )
+                .then_some(input)
+            })
+            .expect("container owner syntax");
+        let child = syntax.child_owners.first().expect("pipeline child");
+        let child_syntax = project_owner_syntax_input(project.owner_view(&child.owner).unwrap())
+            .expect("child owner syntax");
+        let unrelated = child_syntax
+            .expressions
+            .iter()
+            .map(|expression| &expression.stable_key)
+            .find(|expression| {
+                Some(*expression) != child.boundary_expression.as_ref()
+                    && Some(*expression) != child.result_expression.as_ref()
+            })
+            .cloned()
+            .expect("pipeline child has an intermediate expression");
+        let child_owner = child.owner.clone();
+        let compact = syntax.expressions.len() + syntax.external_expressions.len();
+        let mut external = syntax.external_expressions.to_vec();
+        external.push(crate::OwnerExternalExpressionInput {
+            owner: child_owner,
+            expression: unrelated.clone(),
+            exact_enclosing_capture: false,
+        });
+        syntax.external_expressions = external.into_boxed_slice();
+        let binding = syntax
+            .expressions
+            .iter_mut()
+            .find_map(|expression| match &mut expression.kind {
+                AstExprKind::Block { bindings, .. } => {
+                    bindings.iter_mut().find(|binding| binding.name == "child")
+                }
+                _ => None,
+            })
+            .expect("child BLOCK binding");
+        binding.value = compact;
+        let crate::OwnerChildResultPlacementInput::ExpressionEdge { edge } =
+            &mut syntax.child_owners[0].result_placement
+        else {
+            panic!("pipeline child has an expression edge");
+        };
+        edge.child_expression = unrelated;
+
+        let error = OwnerSyntaxGraph::build(&syntax).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("neither its authored boundary nor its public result")
+        );
+    }
+
+    #[test]
+    fn graph_rejects_a_result_edge_with_a_forged_descendant_owner() {
+        let project = project(
+            "app/RUN.bn",
+            concat!(
+                "container: [\n",
+                "    child: BLOCK {\n",
+                "        grand: 1\n",
+                "        2\n",
+                "    }\n",
+                "]\n",
+            ),
+        );
+        let container = owner_named(&project, "container");
+        let grand = owner_named(&project, "grand");
+        let mut syntax =
+            project_owner_syntax_input(project.owner_view(&container).unwrap()).unwrap();
+        let crate::OwnerChildResultPlacementInput::ExpressionEdge { edge } =
+            &mut syntax.child_owners[0].result_placement
+        else {
+            panic!("child value must retain an exact edge");
+        };
+        edge.child_owner = grand;
+
+        let error = OwnerSyntaxGraph::build(&syntax).unwrap_err();
+        assert!(
+            error.to_string().contains("no exact external endpoint"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn graph_rejects_a_forged_result_edge_role() {
+        let project = project("app/RUN.bn", "container: [\n    child: 1\n]\n");
+        let container = owner_named(&project, "container");
+        let mut syntax =
+            project_owner_syntax_input(project.owner_view(&container).unwrap()).unwrap();
+        let crate::OwnerChildResultPlacementInput::ExpressionEdge { edge } =
+            &mut syntax.child_owners[0].result_placement
+        else {
+            panic!("child value must retain an exact edge");
+        };
+        edge.segment.role = StableExpressionChildRole::BlockBinding;
+
+        let error = OwnerSyntaxGraph::build(&syntax).unwrap_err();
+        assert!(
+            error.to_string().contains("canonical parent role"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn graph_rejects_downgrading_a_pipeline_boundary_edge_to_statement_lane() {
+        let project = project(
+            "app/RUN.bn",
+            concat!(
+                "container: [\n",
+                "    child:\n",
+                "        TEXT { hello }\n",
+                "        |> Text/trim()\n",
+                "]\n",
+            ),
+        );
+        let container = owner_named(&project, "container");
+        let mut syntax =
+            project_owner_syntax_input(project.owner_view(&container).unwrap()).unwrap();
+        assert_ne!(
+            syntax.child_owners[0].boundary_expression,
+            syntax.child_owners[0].result_expression
+        );
+        syntax.child_owners[0].result_placement =
+            crate::OwnerChildResultPlacementInput::StatementLane;
+
+        let error = OwnerSyntaxGraph::build(&syntax).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("lost an expression-edge placement"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn graph_rejects_a_foreign_external_expression_key() {
+        let project = project(
+            "app/RUN.bn",
+            "container: BLOCK {\n    child: 1\n    child\n}\n",
+        );
+        let container = owner_named(&project, "container");
+        let mut syntax =
+            project_owner_syntax_input(project.owner_view(&container).unwrap()).unwrap();
+        syntax.external_expressions[0].expression.source_unit_id =
+            boon_syntax::SourceUnitId::from_path("other/FOREIGN.bn").unwrap();
+
+        let error = OwnerSyntaxGraph::build(&syntax).unwrap_err();
+        assert!(
+            error.to_string().contains("foreign stable source unit"),
+            "{error}"
+        );
     }
 
     #[test]

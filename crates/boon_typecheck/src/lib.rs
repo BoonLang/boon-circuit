@@ -28,10 +28,11 @@ use boon_parser::{
     ProjectSyntaxSnapshot,
 };
 use boon_syntax::{
-    __parser_pack_syntax_node_id, __parser_unpack_syntax_node_id, AstCallArg, AstCallArgKind,
-    AstDrainPath, AstExpr, AstExprKind, AstMatchPattern, AstParameter, AstParameterKind,
-    AstPassContext, AstRecordField, AstStatement, AstStatementKind, AstTextSegment,
-    BytesSizeSyntax, ParserItem, SharedAstExpressions, StableOccurrenceKey, SyntaxUnitNamespace,
+    __parser_pack_syntax_node_id, __parser_unpack_syntax_node_id, AstBlockBindingDeclaration,
+    AstCallArg, AstCallArgKind, AstDrainPath, AstExpr, AstExprKind, AstMatchPattern, AstParameter,
+    AstParameterKind, AstPassContext, AstRecordField, AstStatement, AstStatementKind,
+    AstTextSegment, BytesSizeSyntax, ParserItem, SharedAstExpressions, StableOccurrenceKey,
+    SyntaxUnitNamespace,
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -13843,8 +13844,12 @@ impl CheckedProgramDatabase {
                 bindings: bindings
                     .iter()
                     .filter_map(|binding| {
+                        let AstBlockBindingDeclaration::Local { statement } = binding.declaration
+                        else {
+                            return None;
+                        };
                         Some(CheckedBlockBinding {
-                            declaration: *self.statement_declarations.get(&binding.statement)?,
+                            declaration: *self.statement_declarations.get(&statement)?,
                             value: id(binding.value),
                             span: self.program.checked_span(
                                 expr.id,

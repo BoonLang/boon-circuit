@@ -19,9 +19,9 @@ use crate::{
 };
 use boon_checked::{
     BytesType, CheckedCallableKind, CheckedEffectSummary, CheckedParameterKind,
-    CheckedTypeSubstitution, DiagnosticSeverity, FlowMode, FlowType, ObjectShape, Type,
-    TypeDiagnostic, TypeVar, Variant, apply_checked_type_substitution_lookup,
-    specialize_checked_call_result, widen_structural_type,
+    CheckedTypeSubstitution, DiagnosticSeverity, FlowMode, FlowType, ObjectShape,
+    OwnerLexicalTargetRef, Type, TypeDiagnostic, TypeVar, Variant,
+    apply_checked_type_substitution_lookup, specialize_checked_call_result, widen_structural_type,
 };
 use boon_contract::SourceBundleDigestV1;
 use boon_data::{ExactNumber, MAX_BITS_WIDTH};
@@ -35,12 +35,12 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-const OWNER_BODY_INFERENCE_DOMAIN_V4: &[u8] = b"boon.owner-body-inference.v4\0";
-const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V2: &[u8] = b"boon.owner-body-inference-content.v2\0";
-const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V3: &[u8] =
-    b"boon.owner-body-inference-currentness.v3\0";
-const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V1: &[u8] = b"boon.owner-body-interface-plan.v1\0";
-const OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V1: &[u8] = b"boon.owner-diagnostics-aggregate.v1\0";
+const OWNER_BODY_INFERENCE_DOMAIN_V5: &[u8] = b"boon.owner-body-inference.v5\0";
+const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V3: &[u8] = b"boon.owner-body-inference-content.v3\0";
+const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V4: &[u8] =
+    b"boon.owner-body-inference-currentness.v4\0";
+const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V2: &[u8] = b"boon.owner-body-interface-plan.v2\0";
+const OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V2: &[u8] = b"boon.owner-diagnostics-aggregate.v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerBodyInferenceError {
@@ -293,7 +293,7 @@ impl OwnerBodyInterfacePlanner {
         self.work.required_owners = self.required.len() as u64;
         self.work.provider_sccs = imports.len() as u64 + 1;
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INTERFACE_PLAN_DOMAIN_V1,
+            OWNER_BODY_INTERFACE_PLAN_DOMAIN_V2,
             &(&self.owner, &own_scc, &imports),
         )?;
         Ok(OwnerBodyInterfacePlan {
@@ -567,7 +567,7 @@ impl OwnerBodyInferenceCurrentnessReceipt {
         }
         let result_fingerprint_v1 = result.fingerprint_v1();
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V3,
+            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V4,
             &(&basis, &interface_imports, result_fingerprint_v1),
         )?;
         Ok(Self {
@@ -865,7 +865,7 @@ pub fn aggregate_owner_diagnostics<'a>(
     let expression_count = checked_u32(expression_count, "owner diagnostics expression count")?;
     let call_count = checked_u32(call_count, "owner diagnostics call count")?;
     let fingerprint_v1 = fingerprint(
-        OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V1,
+        OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V2,
         &(
             source_bundle_digest_v1,
             &basis,
@@ -937,6 +937,7 @@ fn body_expression_boundary_variable(
 enum PlannedLexicalRead {
     Unplanned,
     Bound(TypeVar),
+    Imported { root: TypeVar, mode: FlowMode },
     Dynamic,
     Reserved,
 }
@@ -951,6 +952,7 @@ fn planned_lexical_read_variables(
     external_expression_flushes: &[TypeVar],
     parameter_variables: &BTreeMap<u32, TypeVar>,
     signature_declaration_variables: &BTreeMap<OwnerSignatureDeclarationTarget, TypeVar>,
+    lexical_capture_variables: &BTreeMap<OwnerLexicalTargetRef, (TypeVar, FlowMode)>,
     context: Option<TypeVar>,
     unifier: &mut TypeUnifier,
 ) -> Result<Vec<PlannedLexicalRead>, OwnerBodyInferenceError> {
@@ -1026,19 +1028,19 @@ fn planned_lexical_read_variables(
             reads.push(PlannedLexicalRead::Unplanned);
             continue;
         };
-        let root = match &read.target {
+        let (root, imported_mode) = match &read.target {
             OwnerEffectiveLexicalTarget::Static {
                 target: OwnerLexicalDeclarationTarget::Parameter { ordinal },
-            } => Some(
+            } => (Some(
                 parameter_variables.get(ordinal).copied().ok_or_else(|| {
                     OwnerBodyInferenceError::new(format!(
                         "owner body lexical plan references missing parameter {ordinal}"
                     ))
                 })?,
-            ),
+            ), None),
             OwnerEffectiveLexicalTarget::Static {
                 target: OwnerLexicalDeclarationTarget::Statement { statement },
-            } => match statement_variables.get(statement).copied() {
+            } => (match statement_variables.get(statement).copied() {
                 Some(variable) => Some(variable),
                 None
                     if syntax
@@ -1055,13 +1057,13 @@ fn planned_lexical_read_variables(
                         "owner body lexical plan references valueless statement {statement}"
                     )));
                 }
-            },
+            }, None),
             OwnerEffectiveLexicalTarget::Static {
                 target:
                     OwnerLexicalDeclarationTarget::RecordField {
                         object, ordinal, ..
                     },
-            } => Some(
+            } => (Some(
                 record_field_variables
                     .get(&(*object, *ordinal))
                     .copied()
@@ -1070,40 +1072,46 @@ fn planned_lexical_read_variables(
                         "owner body lexical plan references missing record field {object}:{ordinal}"
                     ))
                     })?,
-            ),
+            ), None),
             OwnerEffectiveLexicalTarget::Static {
                 target: OwnerLexicalDeclarationTarget::Passed,
-            } => syntax
+            } => (syntax
                 .statements
                 .iter()
                 .any(|statement| matches!(statement.kind, AstStatementKind::Function { .. }))
                 .then_some(context)
-                .flatten(),
+                .flatten(), None),
             OwnerEffectiveLexicalTarget::FreshOut {
                 call,
                 formal_ordinal,
-            } => signature_declaration_variables
+            } => (signature_declaration_variables
                 .get(&OwnerSignatureDeclarationTarget::FreshOut {
                     call: call.clone(),
                     formal_ordinal: *formal_ordinal,
                 })
-                .copied(),
+                .copied(), None),
             OwnerEffectiveLexicalTarget::CallContext {
                 call,
                 context_ordinal,
-            } => signature_declaration_variables
+            } => (signature_declaration_variables
                 .get(&OwnerSignatureDeclarationTarget::CallContext {
                     call: call.clone(),
                     context_ordinal: *context_ordinal,
                 })
-                .copied(),
+                .copied(), None),
+            OwnerEffectiveLexicalTarget::Imported { target } => lexical_capture_variables
+                .get(target)
+                .map_or((None, None), |(variable, mode)| {
+                    (Some(*variable), Some(*mode))
+                }),
             OwnerEffectiveLexicalTarget::Static {
                 target:
                     OwnerLexicalDeclarationTarget::PatternBinding { .. }
+                    | OwnerLexicalDeclarationTarget::Imported { .. }
                     | OwnerLexicalDeclarationTarget::Ambiguous { .. },
             }
             | OwnerEffectiveLexicalTarget::InvalidBareBinding { .. }
-            | OwnerEffectiveLexicalTarget::Ambiguous { .. } => None,
+            | OwnerEffectiveLexicalTarget::Ambiguous { .. } => (None, None),
         };
         // Defer projection binding until the ordinary lexical-read branch.
         // Branch-local selector narrowing owns its projection independently
@@ -1117,6 +1125,8 @@ fn planned_lexical_read_variables(
             if dynamic {
                 let _ = root;
                 PlannedLexicalRead::Dynamic
+            } else if let Some(mode) = imported_mode {
+                PlannedLexicalRead::Imported { root, mode }
             } else {
                 PlannedLexicalRead::Bound(root)
             }
@@ -1403,6 +1413,25 @@ fn push_lexical_read_diagnostics(
                     ),
                 )
             }),
+            OwnerEffectiveLexicalTarget::Imported {
+                target:
+                    OwnerLexicalTargetRef::Declaration {
+                        capability: boon_checked::OwnerLexicalDeclarationCapability::CallableOnly,
+                        ..
+                    },
+            } => {
+                let function = match &expression.kind {
+                    OwnerConstraintNodeKind::Reference { parts }
+                    | OwnerConstraintNodeKind::Drain { parts } => parts.join("/"),
+                    _ => String::new(),
+                };
+                Some((
+                    "function_must_be_called",
+                    format!(
+                        "function `{function}` must be called with parentheses: `{function}()`"
+                    ),
+                ))
+            }
             OwnerEffectiveLexicalTarget::Static {
                 target: OwnerLexicalDeclarationTarget::Ambiguous { name },
             }
@@ -1787,6 +1816,46 @@ fn signature_read_preserves_base_target(
     )
 }
 
+fn exact_pattern_local_expressions(
+    seed: &OwnerConstraintSeed,
+    signature_lexical_plan: &OwnerSignatureLexicalPlan,
+) -> BTreeSet<u32> {
+    let mut expressions = BTreeSet::new();
+    for arm in &seed.expressions {
+        let selector = arm.inputs.iter().find_map(|input| {
+            matches!(input.role, OwnerConstraintEdgeRole::MatchSelector).then_some(input.expression)
+        });
+        for input in &arm.inputs {
+            match &input.role {
+                OwnerConstraintEdgeRole::MatchBinding { .. }
+                    if signature_read_preserves_base_target(
+                        seed,
+                        signature_lexical_plan,
+                        input.expression,
+                    ) =>
+                {
+                    expressions.insert(input.expression);
+                }
+                OwnerConstraintEdgeRole::MatchNarrowedSelector { projection }
+                    if selector.is_some_and(|selector| {
+                        signature_narrowed_selector_read_matches(
+                            seed,
+                            signature_lexical_plan,
+                            selector,
+                            projection,
+                            input.expression,
+                        )
+                    }) =>
+                {
+                    expressions.insert(input.expression);
+                }
+                _ => {}
+            }
+        }
+    }
+    expressions
+}
+
 fn signature_narrowed_selector_read_matches(
     seed: &OwnerConstraintSeed,
     signature_lexical_plan: &OwnerSignatureLexicalPlan,
@@ -1812,25 +1881,13 @@ fn bind_local_constraints(
     expressions: &[TypeVar],
     external_expressions: &[TypeVar],
     planned_lexical_reads: &[PlannedLexicalRead],
+    pattern_local_expressions: &BTreeSet<u32>,
     modes: &mut [Option<FlowMode>],
     direct_effects: &mut [CheckedEffectSummary],
     calls: &mut Vec<BodyCallPlan>,
     pattern_narrowings: &mut Vec<OwnerPatternNarrowing>,
     work: &mut OwnerBodyInferenceWork,
 ) {
-    let arm_local_expressions = seed
-        .expressions
-        .iter()
-        .flat_map(|expression| &expression.inputs)
-        .filter_map(|input| {
-            matches!(
-                input.role,
-                OwnerConstraintEdgeRole::MatchBinding { .. }
-                    | OwnerConstraintEdgeRole::MatchNarrowedSelector { .. }
-            )
-            .then_some(input.expression)
-        })
-        .collect::<BTreeSet<_>>();
     let resolved = summary
         .resolved_references
         .iter()
@@ -1881,13 +1938,7 @@ fn bind_local_constraints(
             }
             OwnerConstraintNodeKind::Reference { parts }
             | OwnerConstraintNodeKind::Drain { parts } => {
-                if arm_local_expressions.contains(&(index as u32))
-                    && signature_read_preserves_base_target(
-                        seed,
-                        signature_lexical_plan,
-                        index as u32,
-                    )
-                {
+                if pattern_local_expressions.contains(&(index as u32)) {
                     // The owning match arm binds this occurrence against an
                     // arm-local pattern value below.
                 } else if let PlannedLexicalRead::Bound(root) = planned_lexical_reads[index] {
@@ -1899,6 +1950,17 @@ fn bind_local_constraints(
                         .expect("bound lexical root must have a read plan");
                     let local = bind_projection(unifier, root, &read.projection);
                     unifier.unify(Type::Var(variable), Type::Var(local));
+                } else if let PlannedLexicalRead::Imported {
+                    root,
+                    mode: imported_mode,
+                } = planned_lexical_reads[index]
+                {
+                    let read = signature_lexical_plan.reads()[index]
+                        .as_ref()
+                        .expect("imported lexical root must have a read plan");
+                    let local = bind_projection(unifier, root, &read.projection);
+                    unifier.unify(Type::Var(variable), Type::Var(local));
+                    mode = Some(imported_mode);
                 } else if matches!(planned_lexical_reads[index], PlannedLexicalRead::Reserved) {
                     // Ambiguous/PASSED-without-context reads are still planned
                     // locals and must not fall through to project symbols.
@@ -3535,6 +3597,7 @@ fn signature_declaration_target(
             context_ordinal: *context_ordinal,
         }),
         OwnerEffectiveLexicalTarget::Static { .. }
+        | OwnerEffectiveLexicalTarget::Imported { .. }
         | OwnerEffectiveLexicalTarget::InvalidBareBinding { .. }
         | OwnerEffectiveLexicalTarget::Ambiguous { .. } => None,
     }
@@ -4756,7 +4819,8 @@ fn evaluate_owner_body_impl<'a>(
         })?
     };
     if supplied_signature_lexical_plan.is_some()
-        && !summary.matches_effective_references(signature_lexical_plan.external_candidates())
+        && (!summary.matches_signature_plan(&signature_lexical_plan)
+            || !summary.matches_effective_references(signature_lexical_plan.external_candidates()))
     {
         return Err(OwnerBodyInferenceError::new(format!(
             "owner body inference {:?} received a summary from another effective lexical plan",
@@ -4919,6 +4983,44 @@ fn evaluate_owner_body_impl<'a>(
         unifier.bind_var(variable, ty);
         variable
     });
+    let expected_lexical_captures = signature_lexical_plan
+        .imported_captures()
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let actual_lexical_captures = own_interface
+        .lexical_captures
+        .iter()
+        .map(|capture| capture.target.clone())
+        .collect::<BTreeSet<_>>();
+    if actual_lexical_captures != expected_lexical_captures
+        || actual_lexical_captures.len() != own_interface.lexical_captures.len()
+    {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "owner body inference {:?} received stale or duplicate lexical captures",
+            seed.owner
+        )));
+    }
+    let mut lexical_capture_variables = BTreeMap::new();
+    for capture in &own_interface.lexical_captures {
+        let variable = unifier.fresh();
+        let ty = instantiate_type(&capture.flow_type.ty, &mut unifier, &mut own_variables);
+        unifier.bind_var(variable, ty);
+        lexical_capture_variables
+            .insert(capture.target.clone(), (variable, capture.flow_type.mode));
+    }
+    let imported_context = lexical_capture_variables
+        .iter()
+        .filter_map(|(target, (variable, _))| {
+            matches!(target, OwnerLexicalTargetRef::ContextFormal { .. }).then_some(*variable)
+        })
+        .collect::<Vec<_>>();
+    if imported_context.len() > 1 || (context.is_some() && !imported_context.is_empty()) {
+        return Err(OwnerBodyInferenceError::new(
+            "owner body has conflicting local and imported PASSED context formals",
+        ));
+    }
+    let effective_context = context.or(imported_context.first().copied());
     let own_result = instantiate_type(&own_interface.result.ty, &mut unifier, &mut own_variables);
     let mut signature_declaration_variables = BTreeMap::new();
     for declaration in signature_lexical_plan.declarations() {
@@ -4942,7 +5044,8 @@ fn evaluate_owner_body_impl<'a>(
         &external_expression_flushes,
         &own_parameter_variables_by_ordinal,
         &signature_declaration_variables,
-        context,
+        &lexical_capture_variables,
+        effective_context,
         &mut unifier,
     )?;
 
@@ -4950,6 +5053,7 @@ fn evaluate_owner_body_impl<'a>(
     let mut direct_effects = vec![CheckedEffectSummary::default(); expressions.len()];
     let mut calls = Vec::new();
     let mut pattern_narrowings = Vec::new();
+    let pattern_local_expressions = exact_pattern_local_expressions(seed, &signature_lexical_plan);
     bind_local_constraints(
         seed,
         summary,
@@ -4959,6 +5063,7 @@ fn evaluate_owner_body_impl<'a>(
         &expressions,
         &external_expressions,
         &planned_lexical_reads,
+        &pattern_local_expressions,
         &mut modes,
         &mut direct_effects,
         &mut calls,
@@ -5008,19 +5113,6 @@ fn evaluate_owner_body_impl<'a>(
     push_invalid_syntax_diagnostics(seed, &mut diagnostics);
     push_lexical_read_diagnostics(syntax, seed, &signature_lexical_plan, &mut diagnostics);
     push_external_value_diagnostics(summary, &signature_lexical_plan, abi, &mut diagnostics);
-    let arm_local_expressions = seed
-        .expressions
-        .iter()
-        .flat_map(|expression| &expression.inputs)
-        .filter_map(|input| {
-            matches!(
-                input.role,
-                OwnerConstraintEdgeRole::MatchBinding { .. }
-                    | OwnerConstraintEdgeRole::MatchNarrowedSelector { .. }
-            )
-            .then_some(input.expression as usize)
-        })
-        .collect::<BTreeSet<_>>();
     let mut signature_read_expressions =
         BTreeMap::<OwnerSignatureDeclarationTarget, Vec<usize>>::new();
     for (index, read) in signature_lexical_plan.reads().iter().enumerate() {
@@ -5042,7 +5134,7 @@ fn evaluate_owner_body_impl<'a>(
             _ => None,
         };
         if let Some(target) = target
-            && !arm_local_expressions.contains(&index)
+            && !pattern_local_expressions.contains(&(index as u32))
         {
             signature_read_expressions
                 .entry(target)
@@ -5068,7 +5160,7 @@ fn evaluate_owner_body_impl<'a>(
         &mut modes,
         &mut direct_effects,
         abi,
-        caller_is_callable && context.is_some(),
+        effective_context.is_some(),
         caller_is_callable,
         &mut diagnostics,
         &mut work,
@@ -5081,7 +5173,7 @@ fn evaluate_owner_body_impl<'a>(
         &mut unifier,
         &expressions,
         &external_expressions,
-        context,
+        effective_context,
         &mut modes,
     );
     bind_staged_dynamic_call_inputs(
@@ -5100,7 +5192,7 @@ fn evaluate_owner_body_impl<'a>(
         &mut unifier,
         &expressions,
         &external_expressions,
-        context,
+        effective_context,
         &mut modes,
     );
     refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
@@ -5111,7 +5203,7 @@ fn evaluate_owner_body_impl<'a>(
         &mut unifier,
         &expressions,
         &external_expressions,
-        context,
+        effective_context,
         &mut diagnostics,
     );
 
@@ -5129,7 +5221,7 @@ fn evaluate_owner_body_impl<'a>(
         &mut alpha_variables,
         &mut next_alpha,
     );
-    if let Some(context) = context {
+    if let Some(context) = effective_context {
         let _ = alpha_normalize_type(
             &unifier.resolve(&Type::Var(context)),
             &mut alpha_variables,
@@ -5249,7 +5341,7 @@ fn evaluate_owner_body_impl<'a>(
     let relocations = collect_relocations(seed, summary, &signature_lexical_plan);
 
     let local_content_digest_v1 = fingerprint(
-        OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V2,
+        OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V3,
         &(
             &inferred_statements,
             &inferred_children,
@@ -5274,7 +5366,7 @@ fn evaluate_owner_body_impl<'a>(
     // The construction receipt already commits every semantic row, diagnostic,
     // effect, and row count above. Bind the stable owner to that compact seal
     // instead of serializing the same rich body a second time.
-    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V4, &(&seed.owner, &receipt))?;
+    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V5, &(&seed.owner, &receipt))?;
     work.unification_steps = unifier.steps();
     let result = Arc::new(OwnerBodyInferenceShard {
         owner: seed.owner.clone(),

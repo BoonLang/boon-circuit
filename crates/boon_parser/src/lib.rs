@@ -4,20 +4,20 @@ use boon_contract::{
 #[cfg(test)]
 use boon_syntax::ProgramRoleRoot;
 use boon_syntax::{
-    __parser_pack_syntax_node_id, __parser_unpack_syntax_node_id, AstBlockBinding, AstCallArg,
-    AstCallArgKind, AstDrainPath, AstExpr, AstExprKind, AstMatchPattern, AstParameter,
-    AstParameterKind, AstPassContext, AstProgram, AstRecordField, AstStatement, AstStatementKind,
-    AstTextSegment, AstToken, AstTokenKind, BytesSizeSyntax, DocumentAst,
-    LANGUAGE_FEATURE_REGISTRY, LanguageFeatureParseExpectation, LanguageFeatureStage,
+    __parser_pack_syntax_node_id, __parser_unpack_syntax_node_id, AstBlockBinding,
+    AstBlockBindingDeclaration, AstCallArg, AstCallArgKind, AstDrainPath, AstExpr, AstExprKind,
+    AstMatchPattern, AstParameter, AstParameterKind, AstPassContext, AstProgram, AstRecordField,
+    AstStatement, AstStatementKind, AstTextSegment, AstToken, AstTokenKind, BytesSizeSyntax,
+    DocumentAst, LANGUAGE_FEATURE_REGISTRY, LanguageFeatureParseExpectation, LanguageFeatureStage,
     ParsedProgramFields, ParsedSourceFile, ParsedSourceUnitFields, ParserItem, ParserLine,
     ProgramKind, SourceUnitId, StableCheckOwnerKey, StableDefinitionKey, StableExpressionChildRole,
     StableExpressionKey, StableExpressionRouteSegment, StableItemRoute, StableItemRouteSegment,
     StableOccurrenceKey, StableOccurrenceRoute, StableOwnerKey, StableStatementKey,
     StableStatementKind, StableStatementRoute, StableStatementRouteSegment, SyntaxUnitNamespace,
-    UnitCheckOwnerSlot, UnitChildOwnerBoundary, UnitItemIndex, UnitItemIndexEntry, UnitItemKind,
-    UnitItemParameter, UnitLocalExpressionId, UnitLocalStatementId, UnitOwnerIndex,
-    UnitOwnerIndexEntry, UnitOwnerRoute, UnitStatementLocator, is_program_role_root,
-    is_reserved_standard_root,
+    UnitCheckOwnerSlot, UnitChildOwnerBoundary, UnitExpressionParentEdge, UnitItemIndex,
+    UnitItemIndexEntry, UnitItemKind, UnitItemParameter, UnitLocalExpressionId,
+    UnitLocalStatementId, UnitOwnerIndex, UnitOwnerIndexEntry, UnitOwnerRoute,
+    UnitStatementLocator, is_program_role_root, is_reserved_standard_root,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -386,6 +386,26 @@ impl<'a> UnitOwnerSyntaxView<'a> {
             .map(|boundary| &boundary.route)
     }
 
+    /// Return the syntax id of the authored statement that starts a direct
+    /// child owner. The id follows this view's raw or packed namespace and is
+    /// intended only for normalizing references retained inside the AST.
+    pub fn child_owner_statement_id(&self, boundary: &UnitChildOwnerBoundary) -> Option<usize> {
+        self.syntax_id(boundary.statement().as_usize())
+    }
+
+    /// Return the expression whose structural parent edge crosses from this
+    /// owner into the direct child owner. This is intentionally the child
+    /// statement's authored expression, not its potentially deeper public
+    /// result expression.
+    pub fn child_owner_boundary_expression(
+        &self,
+        boundary: &UnitChildOwnerBoundary,
+    ) -> Option<usize> {
+        boundary
+            .boundary_expression()
+            .and_then(|expression| self.syntax_id(expression.as_usize()))
+    }
+
     /// Return the exact public value expression exported by a child-owner
     /// boundary, when that child is a value-bearing item.
     ///
@@ -396,16 +416,9 @@ impl<'a> UnitOwnerSyntaxView<'a> {
         &self,
         boundary: &UnitChildOwnerBoundary,
     ) -> Option<usize> {
-        if boundary.route.segments().last()?.kind == UnitItemKind::Function {
-            return None;
-        }
-        let entry = self
-            .fields
-            .owner_index
-            .entry(&UnitOwnerRoute::Item(boundary.route.clone()))?;
-        let public = *entry.statements.first()?;
-        let statement = unit_statement_by_local_id(self.fields, public, 0)?;
-        statement_value_expression(statement, &self.fields.ast.expressions)
+        boundary
+            .result_expression()
+            .and_then(|expression| self.syntax_id(expression.as_usize()))
     }
 
     pub fn statement_ids(&self) -> &'a [UnitLocalStatementId] {
@@ -460,6 +473,76 @@ impl<'a> UnitOwnerSyntaxView<'a> {
         self.stable_expression_key_local(expression)
     }
 
+    /// Return the exact stable parent edge of any expression in this source
+    /// unit. The parent can belong to this view even when `expression_id`
+    /// belongs to a direct child owner; this is the structural fact required
+    /// to place a child public result in the parent's lexical expression scope.
+    pub fn stable_expression_parent_edge_for_syntax(
+        &self,
+        expression_id: usize,
+    ) -> Option<(
+        StableCheckOwnerKey,
+        StableExpressionKey,
+        StableExpressionRouteSegment,
+    )> {
+        let expression = self.local_expression_id(expression_id)?;
+        let edge = self.fields.owner_index.expression_parent_edge(expression)?;
+        let parent = edge.parent();
+        Some((
+            stable_check_owner_key_for_slot(
+                &self.fields.source_unit_id,
+                &self.fields.item_index,
+                self.fields.owner_index.expression_owner(parent)?,
+            )?,
+            self.stable_expression_key_local(parent)?,
+            edge.segment().clone(),
+        ))
+    }
+
+    /// Return the structural expression edge that crosses from a descendant
+    /// owner into this view. A direct child owner's public value may itself be
+    /// owned by a deeper descendant, so the immediate parent edge is not
+    /// necessarily the containment boundary.
+    pub fn stable_expression_boundary_parent_edge_for_syntax(
+        &self,
+        expression_id: usize,
+    ) -> Option<(
+        StableCheckOwnerKey,
+        StableExpressionKey,
+        StableCheckOwnerKey,
+        StableExpressionKey,
+        StableExpressionRouteSegment,
+    )> {
+        let expected_owner = self.stable_key();
+        let mut expression = self.local_expression_id(expression_id)?;
+        for _ in 0..self.fields.ast.expressions.len() {
+            let edge = self.fields.owner_index.expression_parent_edge(expression)?;
+            let parent = edge.parent();
+            let child_owner = stable_check_owner_key_for_slot(
+                &self.fields.source_unit_id,
+                &self.fields.item_index,
+                self.fields.owner_index.expression_owner(expression)?,
+            )?;
+            let child_expression = self.stable_expression_key_local(expression)?;
+            let owner = stable_check_owner_key_for_slot(
+                &self.fields.source_unit_id,
+                &self.fields.item_index,
+                self.fields.owner_index.expression_owner(parent)?,
+            )?;
+            if owner == expected_owner {
+                return Some((
+                    child_owner,
+                    child_expression,
+                    owner,
+                    self.stable_expression_key_local(parent)?,
+                    edge.segment().clone(),
+                ));
+            }
+            expression = parent;
+        }
+        None
+    }
+
     /// Returns the stable check owner for any expression in this source unit.
     pub fn stable_check_owner_for_syntax_expression(
         &self,
@@ -506,6 +589,12 @@ impl<'a> UnitOwnerSyntaxView<'a> {
             None => expression_id,
         };
         UnitLocalExpressionId::__parser_new(local)
+    }
+
+    fn syntax_id(&self, local: usize) -> Option<usize> {
+        self.namespace.map_or(Some(local), |namespace| {
+            __parser_pack_syntax_node_id(namespace, local)
+        })
     }
 
     pub fn statements(&self) -> impl Iterator<Item = &'a AstStatement> + 'a {
@@ -807,7 +896,14 @@ fn pack_source_unit_syntax_ids(
             }
             AstExprKind::Block { bindings, result } => {
                 for binding in bindings {
-                    binding.statement = pack(path, namespace, binding.statement)?;
+                    let AstBlockBindingDeclaration::Local { statement } = &mut binding.declaration
+                    else {
+                        return Err(parsed_source_unit_invariant_error(
+                            path,
+                            "raw source-unit BLOCK binding contains an owner-normalized child declaration",
+                        ));
+                    };
+                    *statement = pack(path, namespace, *statement)?;
                     pack_expression_reference(path, namespace, &mut binding.value)?;
                 }
                 if let Some(result) = result {
@@ -2719,7 +2815,13 @@ impl SourceUnitAstRebase<'_> {
             }
             AstExprKind::Block { bindings, result } => {
                 for binding in bindings {
-                    self.statement_id(&mut binding.statement, "block binding statement")?;
+                    let AstBlockBindingDeclaration::Local { statement } = &mut binding.declaration
+                    else {
+                        return Err(self.fail(
+                            "raw BLOCK binding contains an owner-normalized child declaration",
+                        ));
+                    };
+                    self.statement_id(statement, "block binding statement")?;
                     self.expression_id(&mut binding.value, "block binding value")?;
                     self.span(&mut binding.start, &mut binding.end, "block binding")?;
                 }
@@ -4288,7 +4390,9 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
             let name = statement_binding_name(child)?.to_owned();
             Some(AstBlockBinding {
                 name,
-                statement: child.id,
+                declaration: AstBlockBindingDeclaration::Local {
+                    statement: child.id,
+                },
                 value: statement_value_expression(child, expressions)?,
                 start: child.start,
                 end: child.end,
@@ -4525,6 +4629,12 @@ fn statement_sequence_values(statements: &[AstStatement], expressions: &[AstExpr
 }
 
 fn statement_value_expression(statement: &AstStatement, expressions: &[AstExpr]) -> Option<usize> {
+    // A function declaration owns an executable body but contributes no value
+    // at its declaration site. Never let its body tail leak into an enclosing
+    // BLOCK/LIST or statement sequence as an implicit structural result.
+    if matches!(statement.kind, AstStatementKind::Function { .. }) {
+        return None;
+    }
     if statement
         .expr
         .and_then(|expr_id| expressions.get(expr_id))
@@ -8371,8 +8481,13 @@ fn stable_statement_identity(statement: &AstStatement) -> (StableStatementKind, 
     }
 }
 
-fn stable_expression_child_edges(
-    expression: &AstExpr,
+/// Canonical stable child roles for one normalized expression kind.
+///
+/// Parser indexing and downstream artifact validation share this projection so
+/// role labels and reverse ordinals cannot drift into two structural truths.
+pub fn stable_expression_child_edges(
+    kind: &AstExprKind,
+    linked_input: Option<usize>,
 ) -> Vec<(usize, StableExpressionRouteSegment)> {
     fn fixed(
         edges: &mut Vec<(usize, StableExpressionRouteSegment)>,
@@ -8440,7 +8555,7 @@ fn stable_expression_child_edges(
     }
 
     let mut edges = Vec::new();
-    match &expression.kind {
+    match kind {
         AstExprKind::TextTemplate { segments } => indexed(
             &mut edges,
             StableExpressionChildRole::TextDynamic,
@@ -8488,7 +8603,7 @@ fn stable_expression_child_edges(
         } => {
             fixed(
                 &mut edges,
-                expression.linked_input.unwrap_or(*input),
+                linked_input.unwrap_or(*input),
                 StableExpressionChildRole::PipeInput,
             );
             labeled(
@@ -8513,12 +8628,12 @@ fn stable_expression_child_edges(
         }
         AstExprKind::Draining { input } => fixed(
             &mut edges,
-            expression.linked_input.unwrap_or(*input),
+            linked_input.unwrap_or(*input),
             StableExpressionChildRole::DrainingInput,
         ),
         AstExprKind::Hold { initial, .. } => fixed(
             &mut edges,
-            expression.linked_input.unwrap_or(*initial),
+            linked_input.unwrap_or(*initial),
             StableExpressionChildRole::HoldInitial,
         ),
         AstExprKind::Latest { branches } => indexed(
@@ -8529,7 +8644,7 @@ fn stable_expression_child_edges(
         AstExprKind::When { input, arms } => {
             fixed(
                 &mut edges,
-                expression.linked_input.unwrap_or(*input),
+                linked_input.unwrap_or(*input),
                 StableExpressionChildRole::WhenInput,
             );
             indexed(
@@ -8541,7 +8656,7 @@ fn stable_expression_child_edges(
         AstExprKind::Then { input, output } => {
             fixed(
                 &mut edges,
-                expression.linked_input.unwrap_or(*input),
+                linked_input.unwrap_or(*input),
                 StableExpressionChildRole::ThenInput,
             );
             if let Some(output) = output {
@@ -8551,7 +8666,7 @@ fn stable_expression_child_edges(
         AstExprKind::Infix { left, right, .. } => {
             fixed(
                 &mut edges,
-                expression.linked_input.unwrap_or(*left),
+                linked_input.unwrap_or(*left),
                 StableExpressionChildRole::InfixLeft,
             );
             fixed(&mut edges, *right, StableExpressionChildRole::InfixRight);
@@ -8956,7 +9071,7 @@ fn build_unit_expression_identities(
                     format!("expression parent {parent} is absent"),
                 )
             })?;
-            let children = stable_expression_child_edges(expression);
+            let children = stable_expression_child_edges(&expression.kind, expression.linked_input);
             for (child, segment) in children.into_iter().rev() {
                 let child_parent = parents.get_mut(child).ok_or_else(|| {
                     parsed_source_unit_invariant_error(
@@ -9048,39 +9163,74 @@ fn build_unit_expression_identities(
                     .get_mut(&(kind, names.clone()))
                     .expect("statement identity was counted");
                 *count -= 1;
-                let (statement_owner, statement_owner_slot, statement_route) =
-                    if let Some((item_route, item_slot)) = self.item_routes.get(&statement.id) {
-                        let parent_entry = owner_slot.owner_entry_index().ok_or_else(|| {
-                            parsed_source_unit_invariant_error(
-                                self.path,
-                                "nested item has no parent owner entry",
-                            )
-                        })?;
-                        let boundary = UnitChildOwnerBoundary::__parser_new(
-                            item_route.clone(),
-                            parent_statement,
-                            child_index,
+                let (statement_owner, statement_owner_slot, statement_route) = if let Some((
+                    item_route,
+                    item_slot,
+                )) =
+                    self.item_routes.get(&statement.id)
+                {
+                    let parent_entry = owner_slot.owner_entry_index().ok_or_else(|| {
+                        parsed_source_unit_invariant_error(
+                            self.path,
+                            "nested item has no parent owner entry",
                         )
-                        .ok_or_else(|| {
-                            parsed_source_unit_invariant_error(
-                                self.path,
-                                format!(
-                                    "child owner at statement {} exceeds the unit-local bound",
-                                    statement.id
-                                ),
-                            )
-                        })?;
-                        self.owner_child_owners[parent_entry].push(boundary);
-                        (Some(item_route.clone()), *item_slot, Vec::new())
-                    } else {
-                        let mut route = parent_route.to_vec();
-                        route.push(StableStatementRouteSegment {
-                            kind,
-                            names,
-                            matching_sibling_reverse_ordinal: *count,
-                        });
-                        (owner.clone(), owner_slot, route)
-                    };
+                    })?;
+                    let boundary_expression = statement
+                            .expr
+                            .map(|expression| {
+                                UnitLocalExpressionId::__parser_new(expression).ok_or_else(|| {
+                                    parsed_source_unit_invariant_error(
+                                        self.path,
+                                        format!(
+                                            "child owner boundary expression {expression} exceeds the unit-local bound"
+                                        ),
+                                    )
+                                })
+                            })
+                            .transpose()?;
+                    let result_expression = statement_value_expression(
+                            statement,
+                            &self.ast.expressions,
+                        )
+                        .map(|expression| {
+                            UnitLocalExpressionId::__parser_new(expression).ok_or_else(|| {
+                                parsed_source_unit_invariant_error(
+                                    self.path,
+                                    format!(
+                                        "child owner result expression {expression} exceeds the unit-local bound"
+                                    ),
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    let boundary = UnitChildOwnerBoundary::__parser_new(
+                        item_route.clone(),
+                        local_statement,
+                        parent_statement,
+                        child_index,
+                        boundary_expression,
+                        result_expression,
+                    )
+                    .ok_or_else(|| {
+                        parsed_source_unit_invariant_error(
+                            self.path,
+                            format!(
+                                "child owner at statement {} exceeds the unit-local bound",
+                                statement.id
+                            ),
+                        )
+                    })?;
+                    self.owner_child_owners[parent_entry].push(boundary);
+                    (Some(item_route.clone()), *item_slot, Vec::new())
+                } else {
+                    let mut route = parent_route.to_vec();
+                    route.push(StableStatementRouteSegment {
+                        kind,
+                        names,
+                        matching_sibling_reverse_ordinal: *count,
+                    });
+                    (owner.clone(), owner_slot, route)
+                };
                 let stable_statement_route = StableStatementRoute {
                     owner: statement_owner.clone(),
                     statement_route: statement_route.clone(),
@@ -9219,12 +9369,17 @@ fn build_unit_expression_identities(
             parent
                 .as_ref()
                 .map(|parent| {
-                    UnitLocalExpressionId::__parser_new(parent.expression).ok_or_else(|| {
-                        parsed_source_unit_invariant_error(
-                            path,
-                            "expression parent exceeds the unit-local id bound",
-                        )
-                    })
+                    let expression = UnitLocalExpressionId::__parser_new(parent.expression)
+                        .ok_or_else(|| {
+                            parsed_source_unit_invariant_error(
+                                path,
+                                "expression parent exceeds the unit-local id bound",
+                            )
+                        })?;
+                    Ok(UnitExpressionParentEdge::__parser_new(
+                        expression,
+                        parent.segment.clone(),
+                    ))
                 })
                 .transpose()
         })
@@ -9494,7 +9649,11 @@ mod tests {
                 }
                 AstExprKind::Block { bindings, result } => {
                     for binding in bindings {
-                        assert!(binding.statement < statement_count);
+                        let AstBlockBindingDeclaration::Local { statement } = binding.declaration
+                        else {
+                            panic!("raw parsed BLOCK binding must remain local");
+                        };
+                        assert!(statement < statement_count);
                         expression_id(binding.value, expression_count);
                     }
                     optional_expression_id(*result, expression_count);
@@ -10293,7 +10452,9 @@ document:
                 .expressions
                 .get(expression)
                 .expect("reachable expression is in the parser arena");
-            for (child, _) in stable_expression_child_edges(expression) {
+            for (child, _) in
+                stable_expression_child_edges(&expression.kind, expression.linked_input)
+            {
                 visit_expression(child, parsed, seen);
             }
         }
@@ -10651,7 +10812,11 @@ selected:
         }));
         assert!(assembled.ast.expressions.iter().any(|expression| {
             matches!(&expression.kind, AstExprKind::Block { bindings, .. }
-                if bindings.iter().any(|binding| binding.statement >= base_statement_count))
+            if bindings.iter().any(|binding| matches!(
+                binding.declaration,
+                AstBlockBindingDeclaration::Local { statement }
+                    if statement >= base_statement_count
+            )))
         }));
         assert!(assembled.ast.expressions.iter().any(|expression| {
             matches!(&expression.kind, AstExprKind::Call { args, .. }
@@ -11481,7 +11646,10 @@ rows: LIST {
                 .collect::<Vec<_>>(),
             ["answer", "normalized"]
         );
-        assert!(bindings.iter().all(|binding| binding.statement > 0));
+        assert!(bindings.iter().all(|binding| matches!(
+            binding.declaration,
+            AstBlockBindingDeclaration::Local { statement } if statement > 0
+        )));
         assert!(matches!(
             parsed.expressions[result.expect("BLOCK result")].kind,
             AstExprKind::Identifier(ref name) if name == "answer"

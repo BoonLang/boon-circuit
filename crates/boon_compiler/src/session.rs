@@ -456,7 +456,7 @@ impl RequestFamily for OwnerInputRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerSyntaxInput>;
 
-    const NAME: &'static str = "boon.compiler.owner-input.v1";
+    const NAME: &'static str = "boon.compiler.owner-input.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -515,7 +515,7 @@ impl RequestFamily for OwnerLexicalPlanRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerLexicalPlan>;
 
-    const NAME: &'static str = "boon.compiler.owner-lexical-plan.v2";
+    const NAME: &'static str = "boon.compiler.owner-lexical-plan.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -532,7 +532,7 @@ impl RequestFamily for OwnerConstraintSeedRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerConstraintSeed>;
 
-    const NAME: &'static str = "boon.compiler.owner-constraint-seed.v3";
+    const NAME: &'static str = "boon.compiler.owner-constraint-seed.v4";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -727,7 +727,7 @@ impl RequestFamily for OwnerCallableResolutionRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerCallableResolutionPlan>;
 
-    const NAME: &'static str = "boon.compiler.owner-callable-resolution.v1";
+    const NAME: &'static str = "boon.compiler.owner-callable-resolution.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -749,7 +749,7 @@ impl RequestFamily for ProjectOwnerCallableScopeTopologyRequest {
     type Key = ProjectOwnerCallableScopeTopologyKey;
     type Value = Arc<OwnerCallableScopeTopology>;
 
-    const NAME: &'static str = "boon.compiler.project-owner-callable-scope-topology.v1";
+    const NAME: &'static str = "boon.compiler.project-owner-callable-scope-topology.v2";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -771,7 +771,7 @@ impl RequestFamily for OwnerCallableScopeSccPlanRequest {
     type Key = OwnerCallableScopeSccKey;
     type Value = Arc<OwnerCallableScopeScc>;
 
-    const NAME: &'static str = "boon.compiler.owner-callable-scope-scc-plan.v1";
+    const NAME: &'static str = "boon.compiler.owner-callable-scope-scc-plan.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         let fingerprints = key
@@ -798,7 +798,7 @@ impl RequestFamily for OwnerCallableScopeSccEvaluationRequest {
     type Key = OwnerCallableScopeSccKey;
     type Value = Arc<OwnerCallableScopeSccEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-callable-scope-scc-evaluation.v1";
+    const NAME: &'static str = "boon.compiler.owner-callable-scope-scc-evaluation.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerCallableScopeSccPlanRequest::key_fingerprint(key)
@@ -817,7 +817,7 @@ impl RequestFamily for OwnerCallableScopeSccRequest {
     type Key = OwnerCallableScopeSccKey;
     type Value = Arc<OwnerCallableScopeSccResult>;
 
-    const NAME: &'static str = "boon.compiler.owner-callable-scope-scc-result.v1";
+    const NAME: &'static str = "boon.compiler.owner-callable-scope-scc-result.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerCallableScopeSccPlanRequest::key_fingerprint(key)
@@ -836,7 +836,7 @@ impl RequestFamily for OwnerCallableScopeProviderRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerCallableScopeSccKey>;
 
-    const NAME: &'static str = "boon.compiler.owner-callable-scope-provider.v1";
+    const NAME: &'static str = "boon.compiler.owner-callable-scope-provider.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1091,7 +1091,7 @@ impl RequestFamily for OwnerConstraintRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerConstraintSummary>;
 
-    const NAME: &'static str = "boon.compiler.owner-constraint-summary.v1";
+    const NAME: &'static str = "boon.compiler.owner-constraint-summary.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1113,7 +1113,7 @@ impl RequestFamily for ProjectOwnerInterfaceTopologyRequest {
     type Key = ProjectOwnerInterfaceTopologyKey;
     type Value = Arc<OwnerInterfaceTopology>;
 
-    const NAME: &'static str = "boon.compiler.project-owner-interface-topology.v1";
+    const NAME: &'static str = "boon.compiler.project-owner-interface-topology.v2";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -1135,7 +1135,7 @@ impl RequestFamily for OwnerInterfaceSccPlanRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceScc>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-plan.v1";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-plan.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         let fingerprints = key
@@ -1162,7 +1162,7 @@ impl RequestFamily for OwnerInterfaceSccEvaluationRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceSccEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v3";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v4";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1181,7 +1181,7 @@ impl RequestFamily for OwnerInterfaceSccRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceSccResult>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v2";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1205,7 +1205,7 @@ impl RequestFamily for OwnerInterfaceProviderRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerInterfaceSccKey>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-provider.v1";
+    const NAME: &'static str = "boon.compiler.owner-interface-provider.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1226,7 +1226,7 @@ impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v4";
+    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v5";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1245,7 +1245,7 @@ impl RequestFamily for OwnerBodyInferenceRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceShard>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference.v4";
+    const NAME: &'static str = "boon.compiler.owner-body-inference.v5";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1264,7 +1264,7 @@ impl RequestFamily for CheckedOwnerShardRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<CheckedOwnerShard>;
 
-    const NAME: &'static str = "boon.compiler.checked-owner-shard.v5";
+    const NAME: &'static str = "boon.compiler.checked-owner-shard.v6";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1286,7 +1286,7 @@ impl RequestFamily for OwnerDiagnosticsAggregateRequest {
     type Key = OwnerDiagnosticsAggregateKey;
     type Value = Arc<OwnerDiagnosticsAggregate>;
 
-    const NAME: &'static str = "boon.compiler.owner-diagnostics-aggregate.v1";
+    const NAME: &'static str = "boon.compiler.owner-diagnostics-aggregate.v2";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -1311,7 +1311,7 @@ impl RequestFamily for CheckedOwnerProjectAssemblyRequest {
     type Key = CheckedOwnerProjectAssemblyKey;
     type Value = Arc<CheckedOwnerProjectAssembly>;
 
-    const NAME: &'static str = "boon.compiler.checked-owner-project-assembly.v1";
+    const NAME: &'static str = "boon.compiler.checked-owner-project-assembly.v2";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -2557,7 +2557,7 @@ fn evaluate_owner_body_requests(
         })?;
 
     let owner_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-input-dependencies.v1\0",
+        b"boon.compiler.owner-input-dependencies.v2\0",
         std::iter::empty(),
     ));
     let source_map_input = RequestInputFingerprint(request_fingerprint(
@@ -3556,7 +3556,7 @@ fn evaluate_owner_callable_scope_requests(
     owners: &[StableCheckOwnerKey],
 ) -> CompilerResult<()> {
     let resolution_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-callable-resolution-dependencies.v1\0",
+        b"boon.compiler.owner-callable-resolution-dependencies.v2\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -3667,7 +3667,7 @@ fn evaluate_owner_callable_scope_requests(
 
     let topology_key = ProjectOwnerCallableScopeTopologyKey;
     let topology_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.project-owner-callable-scope-topology-dependencies.v1\0",
+        b"boon.compiler.project-owner-callable-scope-topology-dependencies.v2\0",
         owners
             .iter()
             .map(stable_check_owner_key_fingerprint_v1)
@@ -3763,7 +3763,7 @@ fn evaluate_owner_callable_scope_requests(
     }
 
     let plan_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-callable-scope-scc-plan-dependencies.v1\0",
+        b"boon.compiler.owner-callable-scope-scc-plan-dependencies.v2\0",
         std::iter::empty(),
     ));
     for (index, expected) in topology.sccs.iter().enumerate() {
@@ -3812,11 +3812,11 @@ fn evaluate_owner_callable_scope_requests(
     }
 
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-callable-scope-scc-evaluation-dependencies.v1\0",
+        b"boon.compiler.owner-callable-scope-scc-evaluation-dependencies.v2\0",
         std::iter::empty(),
     ));
     let result_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-callable-scope-scc-result-projection-dependencies.v1\0",
+        b"boon.compiler.owner-callable-scope-scc-result-projection-dependencies.v2\0",
         std::iter::empty(),
     ));
     for expected in &topology.sccs {
@@ -3951,11 +3951,11 @@ fn evaluate_owner_constraint_requests(
 ) -> CompilerResult<()> {
     let mut trace = OwnerRequestTrace::new();
     let projection_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-declaration-and-lexical-dependencies.v2\0",
+        b"boon.compiler.owner-declaration-and-lexical-dependencies.v3\0",
         std::iter::empty(),
     ));
     let seed_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-constraint-seed-dependencies.v3\0",
+        b"boon.compiler.owner-constraint-seed-dependencies.v4\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -4138,7 +4138,7 @@ fn evaluate_owner_constraint_requests(
     trace.checkpoint("inference-abi", owners.len());
 
     let constraint_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-constraint-summary-dependencies.v1\0",
+        b"boon.compiler.owner-constraint-summary-dependencies.v2\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -4317,7 +4317,7 @@ fn evaluate_owner_constraint_requests(
 
     let topology_key = ProjectOwnerInterfaceTopologyKey;
     let topology_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.project-owner-interface-topology-dependencies.v1\0",
+        b"boon.compiler.project-owner-interface-topology-dependencies.v2\0",
         owner_key_fingerprints.iter().map(<[u8; 32]>::as_slice),
     ));
     match state.project_owner_interface_topology_requests.begin(
@@ -4423,7 +4423,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
     trace.checkpoint("interface-providers", live_owners.len());
 
     let plan_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-plan-dependencies.v1\0",
+        b"boon.compiler.owner-interface-scc-plan-dependencies.v2\0",
         std::iter::empty(),
     ));
     for (expected_index, expected) in topology.sccs.iter().enumerate() {
@@ -4475,11 +4475,11 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
     trace.checkpoint("interface-scc-plans", topology.sccs.len());
 
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v3\0",
+        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v4\0",
         std::iter::empty(),
     ));
     let result_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-result-projection-dependencies.v1\0",
+        b"boon.compiler.owner-interface-scc-result-projection-dependencies.v2\0",
         std::iter::empty(),
     ));
     for expected in &topology.sccs {
@@ -4666,7 +4666,7 @@ fn evaluate_owner_body_inference_requests(
         .flat_map(|scc| scc.key.members.iter().cloned())
         .collect::<Vec<_>>();
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-body-inference-evaluation-dependencies.v6\0",
+        b"boon.compiler.owner-body-inference-evaluation-dependencies.v7\0",
         std::iter::empty(),
     ));
     let mut planning_ms = 0.0;
@@ -4841,7 +4841,7 @@ fn evaluate_owner_body_inference_requests(
         result_transfer_edges =
             result_transfer_edges.saturating_add(body_work.interface_plan_transfer_edges);
         let result_input = RequestInputFingerprint(request_fingerprint(
-            b"boon.compiler.owner-body-inference-result-projection-dependencies.v3\0",
+            b"boon.compiler.owner-body-inference-result-projection-dependencies.v4\0",
             std::iter::empty(),
         ));
         match state.owner_body_inference_requests.begin(
@@ -4906,7 +4906,7 @@ fn evaluate_owner_diagnostics_aggregate_request(
         .collect::<Vec<_>>();
     let source_digest = project.source_bundle_digest_v1().to_string();
     let input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-diagnostics-aggregate-dependencies.v1\0",
+        b"boon.compiler.owner-diagnostics-aggregate-dependencies.v2\0",
         std::iter::once(source_digest.as_bytes())
             .chain(owner_fingerprints.iter().map(<[u8; 32]>::as_slice)),
     ));
@@ -5156,7 +5156,7 @@ fn evaluate_checked_owner_shard_requests(
     trace.checkpoint("construction-abi", owners.len());
 
     let shard_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.checked-owner-shard-dependencies.v5\0",
+        b"boon.compiler.checked-owner-shard-dependencies.v6\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -5281,7 +5281,7 @@ fn evaluate_checked_owner_project_assembly_request(
 ) -> CompilerResult<()> {
     let key = CheckedOwnerProjectAssemblyKey;
     let input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.checked-owner-project-assembly-dependencies.v1\0",
+        b"boon.compiler.checked-owner-project-assembly-dependencies.v2\0",
         [program_role_request_tag(state.source.program_role)],
     ));
     match state.checked_owner_project_assembly_requests.begin(

@@ -85,6 +85,46 @@ pub enum OwnerScopeStableKey {
     },
 }
 
+/// Stable scope identity owned by another independently checked syntax owner.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct OwnerStableScopeRef {
+    pub owner: StableCheckOwnerKey,
+    pub scope: OwnerScopeStableKey,
+}
+
+/// Canonical lexical target that can cross an authored owner boundary.
+///
+/// Imports always retain the original provider identity; grandchildren never
+/// form chains of consumer-relative aliases. `forwardable_out` and the exact
+/// repeated/generated output scope are part of the contract because an
+/// ordinary value declaration cannot be used as a named `OUT` target.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnerLexicalDeclarationCapability {
+    Value,
+    Out {
+        evaluation_scope: OwnerStableScopeRef,
+    },
+    CallableOnly,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnerLexicalTargetRef {
+    Declaration {
+        owner: StableCheckOwnerKey,
+        declaration: OwnerDeclarationStableKey,
+        capability: OwnerLexicalDeclarationCapability,
+    },
+    ContextFormal {
+        owner: StableCheckOwnerKey,
+    },
+    Ambiguous {
+        owner: StableCheckOwnerKey,
+        name: String,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnerStatementScopeRole {
@@ -145,6 +185,10 @@ pub enum OwnerDeclarationRef {
     Imported {
         owner: StableCheckOwnerKey,
         member: OwnerInterfaceMemberRef,
+    },
+    ImportedStable {
+        owner: StableCheckOwnerKey,
+        declaration: OwnerDeclarationStableKey,
     },
     Abi {
         canonical_name: String,
@@ -287,7 +331,7 @@ pub struct OwnerRecordField {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerBlockBinding {
-    pub declaration: OwnerDeclarationId,
+    pub declaration: OwnerDeclarationRef,
     pub value: OwnerExpressionRef,
     pub source: OwnerSourceSite,
 }
@@ -767,6 +811,10 @@ pub enum OwnerRelocationTarget {
     Declaration {
         owner: StableCheckOwnerKey,
         member: OwnerInterfaceMemberRef,
+    },
+    StableDeclaration {
+        owner: StableCheckOwnerKey,
+        declaration: OwnerDeclarationStableKey,
     },
     Scope {
         owner: StableCheckOwnerKey,

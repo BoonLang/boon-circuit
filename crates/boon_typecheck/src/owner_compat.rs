@@ -118,6 +118,7 @@ struct CompatibilityLayout<'a> {
     owner_root_statement: BTreeMap<StableCheckOwnerKey, CheckedStatementId>,
     owner_public_declaration: BTreeMap<StableCheckOwnerKey, DeclId>,
     owner_parameter_declaration: BTreeMap<(StableCheckOwnerKey, u32), DeclId>,
+    declaration_by_key: BTreeMap<(StableCheckOwnerKey, OwnerDeclarationStableKey), DeclId>,
     owner_context_formal: BTreeMap<StableCheckOwnerKey, ContextFormalId>,
     scope_by_key: BTreeMap<(StableCheckOwnerKey, OwnerScopeStableKey), LexicalScopeId>,
     source_by_key: BTreeMap<OwnerSourceStableKey, CheckedSourceId>,
@@ -358,6 +359,7 @@ impl<'a> CompatibilityLayout<'a> {
             owner_root_statement: BTreeMap::new(),
             owner_public_declaration: BTreeMap::new(),
             owner_parameter_declaration: BTreeMap::new(),
+            declaration_by_key: BTreeMap::new(),
             owner_context_formal: BTreeMap::new(),
             scope_by_key: BTreeMap::new(),
             source_by_key: BTreeMap::new(),
@@ -484,6 +486,16 @@ impl<'a> CompatibilityLayout<'a> {
                 let slot = &mut dense[row.id.0 as usize];
                 if slot.0 == u32::MAX {
                     *slot = allocate_decl(&mut next_declaration)?;
+                }
+                if self
+                    .declaration_by_key
+                    .insert((owner.clone(), row.stable_key.clone()), *slot)
+                    .is_some()
+                {
+                    return Err(OwnerCompatibilityAssemblyError::new(format!(
+                        "owner {owner:?} repeats stable declaration key {:?}",
+                        row.stable_key
+                    )));
                 }
                 if row.stable_key == OwnerDeclarationStableKey::Public {
                     self.owner_public_declaration.insert(owner.clone(), *slot);
@@ -879,6 +891,15 @@ impl CompatibilityLayout<'_> {
                     ),
                 ),
             },
+            OwnerDeclarationRef::ImportedStable { owner, declaration } => self
+                .declaration_by_key
+                .get(&(owner.clone(), declaration.clone()))
+                .copied()
+                .ok_or_else(|| {
+                    OwnerCompatibilityAssemblyError::new(format!(
+                        "owner {current:?} references missing stable declaration {owner:?} {declaration:?}"
+                    ))
+                }),
             OwnerDeclarationRef::Abi {
                 canonical_name,
                 declaration,
@@ -1463,7 +1484,7 @@ impl CompatibilityLayout<'_> {
                     .iter()
                     .map(|binding| {
                         Ok(CheckedBlockBinding {
-                            declaration: self.local_declaration(owner, binding.declaration)?,
+                            declaration: self.declaration(owner, &binding.declaration)?,
                             value: self.expression(owner, &binding.value)?,
                             span: self.source_span(owner, &binding.source)?,
                         })
@@ -2279,7 +2300,7 @@ pub fn assemble_checked_owner_project<'a>(
     // basis instead; every semantic row, source position, ABI contract, role,
     // and source revision is covered by one of these compact fingerprints.
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        b"boon.checked-owner-project-assembly-basis.v1\0",
+        b"boon.checked-owner-project-assembly-basis.v2\0",
         &(
             project.source_bundle_digest_v1(),
             role,

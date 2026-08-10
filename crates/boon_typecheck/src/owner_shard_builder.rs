@@ -28,7 +28,8 @@ use boon_checked::{
     OwnerContextBinding, OwnerContextFormalId, OwnerContextFormalRef, OwnerContextFormalRow,
     OwnerContextTypeSubstitution, OwnerDeclarationId, OwnerDeclarationRef, OwnerDeclarationRow,
     OwnerDeclarationStableKey, OwnerEvaluationScope, OwnerExpressionId, OwnerExpressionKind,
-    OwnerExpressionRef, OwnerExpressionRow, OwnerInterfaceMemberRef, OwnerListId, OwnerListRow,
+    OwnerExpressionRef, OwnerExpressionRow, OwnerInterfaceMemberRef,
+    OwnerLexicalDeclarationCapability, OwnerLexicalTargetRef, OwnerListId, OwnerListRow,
     OwnerOccurrenceRow, OwnerParameterRow, OwnerPatternBindingRow, OwnerRecordField,
     OwnerRelocationTarget, OwnerResourceBinding, OwnerResourceProjectionSeedRow, OwnerScopeId,
     OwnerScopeRef, OwnerScopeRow, OwnerScopeStableKey, OwnerSemanticPath, OwnerSourceId,
@@ -39,8 +40,8 @@ use boon_checked::{
 };
 use boon_data::{Bits, ExactNumber};
 use boon_syntax::{
-    AstDrainPath, AstExprKind, AstMatchPattern, AstStatementKind, AstTextSegment, BytesSizeSyntax,
-    StableCheckOwnerKey, StableExpressionKey,
+    AstBlockBindingDeclaration, AstDrainPath, AstExprKind, AstMatchPattern, AstStatementKind,
+    AstTextSegment, BytesSizeSyntax, StableCheckOwnerKey, StableExpressionKey,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -48,7 +49,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-const CHECKED_OWNER_SHARD_DOMAIN_V5: &[u8] = b"boon.checked-owner-shard.v5\0";
+const CHECKED_OWNER_SHARD_DOMAIN_V6: &[u8] = b"boon.checked-owner-shard.v6\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CheckedOwnerShardBasis {
@@ -162,7 +163,7 @@ impl CheckedOwnerShard {
             )));
         }
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            CHECKED_OWNER_SHARD_DOMAIN_V5,
+            CHECKED_OWNER_SHARD_DOMAIN_V6,
             &(&self.basis, &self.receipts.construction),
         )
         .map_err(|error| {
@@ -236,6 +237,7 @@ fn validate_inputs(
         ));
     }
     if !body.signature_lexical_plan.matches_base(lexical_plan)
+        || !summary.matches_signature_plan(&body.signature_lexical_plan)
         || body.receipt.signature_lexical_plan_fingerprint_v1
             != body.signature_lexical_plan.fingerprint_v1()
     {
@@ -533,6 +535,7 @@ struct OwnerRowConstruction<'a> {
     parameter_declarations: BTreeMap<u32, OwnerDeclarationId>,
     record_expression_scopes: BTreeMap<OwnerExpressionId, OwnerScopeId>,
     record_field_declarations: BTreeMap<(OwnerExpressionId, u32), OwnerDeclarationId>,
+    statement_by_expression: BTreeMap<u32, OwnerStatementId>,
     statement_scopes: Vec<OwnerScopeRef>,
     statement_body_scopes: BTreeMap<OwnerStatementId, OwnerScopeId>,
     expression_scopes: Vec<OwnerScopeRef>,
@@ -563,18 +566,41 @@ impl<'a> OwnerRowConstruction<'a> {
             ));
         }
         let graph = lexical_plan.graph();
-        let containing_scope = match &syntax.containing_scope {
-            OwnerContainingScopeInput::ProjectRoot => OwnerScopeRef::ProjectRoot,
-            OwnerContainingScopeInput::OwnerStatement { owner, statement } => {
-                OwnerScopeRef::Imported {
-                    owner: owner.clone(),
-                    scope: OwnerScopeStableKey::Statement {
-                        statement: statement.clone(),
-                        role: OwnerStatementScopeRole::Body,
-                    },
-                }
+        let mut statement_by_expression = BTreeMap::new();
+        for (index, statement) in syntax.statements.iter().enumerate() {
+            let Some(expression) = statement.expression else {
+                continue;
+            };
+            let statement = OwnerStatementId(checked_u32(index, "owner statement index")?);
+            if statement_by_expression
+                .insert(expression, statement)
+                .is_some()
+            {
+                return Err(CheckedOwnerBuildError::new(
+                    "checked owner statements repeat one direct expression",
+                ));
             }
-        };
+        }
+        let containing_scope = body
+            .signature_lexical_plan
+            .inherited_environment()
+            .and_then(|environment| environment.boundary_scope.as_ref())
+            .map(|scope| OwnerScopeRef::Imported {
+                owner: scope.owner.clone(),
+                scope: scope.scope.clone(),
+            })
+            .unwrap_or_else(|| match &syntax.containing_scope {
+                OwnerContainingScopeInput::ProjectRoot => OwnerScopeRef::ProjectRoot,
+                OwnerContainingScopeInput::OwnerStatement { owner, statement } => {
+                    OwnerScopeRef::Imported {
+                        owner: owner.clone(),
+                        scope: OwnerScopeStableKey::Statement {
+                            statement: statement.clone(),
+                            role: OwnerStatementScopeRole::Body,
+                        },
+                    }
+                }
+            });
         let mut construction = Self {
             syntax,
             lexical_plan,
@@ -594,6 +620,7 @@ impl<'a> OwnerRowConstruction<'a> {
             parameter_declarations: BTreeMap::new(),
             record_expression_scopes: BTreeMap::new(),
             record_field_declarations: BTreeMap::new(),
+            statement_by_expression,
             statement_scopes: vec![containing_scope; syntax.statements.len()],
             statement_body_scopes: BTreeMap::new(),
             expression_scopes: vec![OwnerScopeRef::ProjectRoot; syntax.expressions.len()],
@@ -780,7 +807,7 @@ impl<'a> OwnerRowConstruction<'a> {
             let kind = if matches!(statement.kind, AstStatementKind::Function { .. }) {
                 CheckedScopeKind::Function
             } else if statement_body_container(self.syntax, statement)
-                .is_some_and(|expression| matches!(expression.kind, AstExprKind::Object(_)))
+                .is_some_and(|(_, expression)| matches!(expression.kind, AstExprKind::Object(_)))
             {
                 CheckedScopeKind::Record
             } else {
@@ -1097,20 +1124,11 @@ impl<'a> OwnerRowConstruction<'a> {
                     &mut assigned,
                 )?;
             }
-            if let Some(container) = statement_body_container(self.syntax, statement)
+            if let Some((container, _)) = statement_body_container(self.syntax, statement)
                 && let Some(body_scope) = self.statement_body_scopes.get(&statement_id).copied()
             {
                 self.assign_expression_tree(
-                    checked_u32(
-                        self.syntax
-                            .expressions
-                            .iter()
-                            .position(|candidate| candidate.stable_key == container.stable_key)
-                            .ok_or_else(|| {
-                                CheckedOwnerBuildError::new("statement body container is missing")
-                            })?,
-                        "owner body container expression",
-                    )?,
+                    checked_u32(container, "owner body container expression")?,
                     local_scope_ref(body_scope),
                     declaration.clone(),
                     true,
@@ -1128,6 +1146,7 @@ impl<'a> OwnerRowConstruction<'a> {
     }
 
     fn prepare_pattern_bindings(&mut self) -> Result<(), CheckedOwnerBuildError> {
+        let lexical_scope_depths = lexical_scope_depths(self.lexical_plan.scopes())?;
         let mut arms = Vec::new();
         for (arm, expression) in self.syntax.expressions.iter().enumerate() {
             let AstExprKind::MatchArm { pattern, output } = &expression.kind else {
@@ -1139,7 +1158,7 @@ impl<'a> OwnerRowConstruction<'a> {
                     expression.stable_key
                 ))
             })?;
-            let mut lexical_scope =
+            let lexical_scope =
                 *self
                     .lexical_plan
                     .expression_scopes()
@@ -1149,30 +1168,13 @@ impl<'a> OwnerRowConstruction<'a> {
                             "owner match arm is missing from the lexical scope projection",
                         )
                     })?;
-            let mut depth = 0usize;
-            let mut seen = BTreeSet::new();
-            loop {
-                if !seen.insert(lexical_scope) {
-                    return Err(CheckedOwnerBuildError::new(
-                        "owner match arm lexical scope ancestry contains a cycle",
-                    ));
-                }
-                let Some(parent) = self
-                    .lexical_plan
-                    .scopes()
-                    .get(lexical_scope as usize)
-                    .ok_or_else(|| {
-                        CheckedOwnerBuildError::new(
-                            "owner match arm lexical scope is outside the scope projection",
-                        )
-                    })?
-                    .parent
-                else {
-                    break;
-                };
-                depth = depth.saturating_add(1);
-                lexical_scope = parent;
-            }
+            let depth = *lexical_scope_depths
+                .get(lexical_scope as usize)
+                .ok_or_else(|| {
+                    CheckedOwnerBuildError::new(
+                        "owner match arm lexical scope is outside the scope projection",
+                    )
+                })?;
             arms.push((depth, arm, selector, pattern.clone(), *output));
         }
         arms.sort_by_key(|(depth, arm, ..)| (*depth, *arm));
@@ -1199,11 +1201,9 @@ impl<'a> OwnerRowConstruction<'a> {
             self.expression_scopes[arm] = local_scope_ref(scope);
 
             let statement = self
-                .syntax
-                .statements
-                .iter()
-                .find(|statement| statement.expression == Some(arm as u32))
-                .map(|statement| OwnerStatementId(statement.id));
+                .statement_by_expression
+                .get(&checked_u32(arm, "owner pattern arm expression")?)
+                .copied();
             let body_scope =
                 statement.and_then(|statement| self.statement_body_scopes.get(&statement).copied());
             if let Some(statement) = statement {
@@ -1726,17 +1726,22 @@ impl<'a> OwnerRowConstruction<'a> {
     fn effective_target_declaration(
         &self,
         target: &OwnerEffectiveLexicalTarget,
-    ) -> Result<OwnerDeclarationId, CheckedOwnerBuildError> {
+    ) -> Result<OwnerDeclarationRef, CheckedOwnerBuildError> {
         let declaration = match target {
             OwnerEffectiveLexicalTarget::Static {
                 target: OwnerLexicalDeclarationTarget::Parameter { ordinal },
-            } => self.parameter_declarations.get(ordinal).copied(),
+            } => self
+                .parameter_declarations
+                .get(ordinal)
+                .copied()
+                .map(local_declaration_ref),
             OwnerEffectiveLexicalTarget::Static {
                 target: OwnerLexicalDeclarationTarget::Statement { statement },
             } => self
                 .statement_declarations
                 .get(&OwnerStatementId(*statement))
-                .copied(),
+                .copied()
+                .map(local_declaration_ref),
             OwnerEffectiveLexicalTarget::Static {
                 target:
                     OwnerLexicalDeclarationTarget::RecordField {
@@ -1745,13 +1750,15 @@ impl<'a> OwnerRowConstruction<'a> {
             } => self
                 .record_field_declarations
                 .get(&(OwnerExpressionId(*object), *ordinal))
-                .copied(),
+                .copied()
+                .map(local_declaration_ref),
             OwnerEffectiveLexicalTarget::Static {
                 target: OwnerLexicalDeclarationTarget::PatternBinding { arm, name },
             } => self
                 .pattern_declarations
                 .get(&(OwnerExpressionId(*arm), name.clone()))
-                .copied(),
+                .copied()
+                .map(local_declaration_ref),
             OwnerEffectiveLexicalTarget::FreshOut {
                 call,
                 formal_ordinal,
@@ -1761,7 +1768,8 @@ impl<'a> OwnerRowConstruction<'a> {
                     call: call.clone(),
                     formal_ordinal: *formal_ordinal,
                 })
-                .copied(),
+                .copied()
+                .map(local_declaration_ref),
             OwnerEffectiveLexicalTarget::CallContext {
                 call,
                 context_ordinal,
@@ -1771,12 +1779,24 @@ impl<'a> OwnerRowConstruction<'a> {
                     call: call.clone(),
                     ordinal: *context_ordinal,
                 })
-                .copied(),
+                .copied()
+                .map(local_declaration_ref),
+            OwnerEffectiveLexicalTarget::Imported {
+                target:
+                    OwnerLexicalTargetRef::Declaration {
+                        owner, declaration, ..
+                    },
+            } => Some(OwnerDeclarationRef::ImportedStable {
+                owner: owner.clone(),
+                declaration: declaration.clone(),
+            }),
             OwnerEffectiveLexicalTarget::Static {
                 target:
                     OwnerLexicalDeclarationTarget::Passed
+                    | OwnerLexicalDeclarationTarget::Imported { .. }
                     | OwnerLexicalDeclarationTarget::Ambiguous { .. },
             }
+            | OwnerEffectiveLexicalTarget::Imported { .. }
             | OwnerEffectiveLexicalTarget::InvalidBareBinding { .. }
             | OwnerEffectiveLexicalTarget::Ambiguous { .. } => None,
         };
@@ -1785,6 +1805,41 @@ impl<'a> OwnerRowConstruction<'a> {
                 "owner signature lexical target {target:?} has no checked declaration"
             ))
         })
+    }
+
+    fn effective_target_is_out(
+        &self,
+        target: &OwnerEffectiveLexicalTarget,
+    ) -> Result<bool, CheckedOwnerBuildError> {
+        match target {
+            OwnerEffectiveLexicalTarget::Imported {
+                target:
+                    OwnerLexicalTargetRef::Declaration {
+                        capability: OwnerLexicalDeclarationCapability::Out { .. },
+                        ..
+                    },
+            }
+            | OwnerEffectiveLexicalTarget::FreshOut { .. } => Ok(true),
+            OwnerEffectiveLexicalTarget::Static {
+                target: OwnerLexicalDeclarationTarget::Parameter { ordinal },
+            } => {
+                let declaration = self
+                    .parameter_declarations
+                    .get(ordinal)
+                    .copied()
+                    .ok_or_else(|| {
+                        CheckedOwnerBuildError::new("owner ForwardOut parameter target is missing")
+                    })?;
+                Ok(self
+                    .declaration_specs
+                    .get(declaration.0 as usize)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|declaration| {
+                        matches!(declaration.kind, CheckedDeclarationKind::OutParameter)
+                    }))
+            }
+            _ => Ok(false),
+        }
     }
 
     fn effective_evaluation_scope(
@@ -1832,7 +1887,18 @@ impl<'a> OwnerRowConstruction<'a> {
                         "owner evaluation scope references an unreserved FreshOut",
                     )
                 }),
+            OwnerEffectiveLexicalTarget::Imported {
+                target:
+                    OwnerLexicalTargetRef::Declaration {
+                        capability: OwnerLexicalDeclarationCapability::Out { evaluation_scope },
+                        ..
+                    },
+            } => Ok(OwnerScopeRef::Imported {
+                owner: evaluation_scope.owner.clone(),
+                scope: evaluation_scope.scope.clone(),
+            }),
             OwnerEffectiveLexicalTarget::Static { .. }
+            | OwnerEffectiveLexicalTarget::Imported { .. }
             | OwnerEffectiveLexicalTarget::CallContext { .. }
             | OwnerEffectiveLexicalTarget::InvalidBareBinding { .. }
             | OwnerEffectiveLexicalTarget::Ambiguous { .. } => Err(CheckedOwnerBuildError::new(
@@ -2238,19 +2304,7 @@ impl<'a> OwnerRowConstruction<'a> {
                         }
                         let target_declaration =
                             self.effective_target_declaration(output_target)?;
-                        let declaration_spec = self
-                            .declaration_specs
-                            .get(target_declaration.0 as usize)
-                            .and_then(Option::as_ref)
-                            .ok_or_else(|| {
-                                CheckedOwnerBuildError::new(
-                                    "owner signature ForwardOut target is undefined",
-                                )
-                            })?;
-                        if !matches!(
-                            declaration_spec.kind,
-                            CheckedDeclarationKind::OutParameter | CheckedDeclarationKind::FreshOut
-                        ) {
+                        if !self.effective_target_is_out(output_target)? {
                             return Err(CheckedOwnerBuildError::new(
                                 "owner signature ForwardOut targets a non-OUT declaration",
                             ));
@@ -2265,14 +2319,14 @@ impl<'a> OwnerRowConstruction<'a> {
                             )
                         })?;
                         self.call_occurrences.push(OwnerOccurrenceRow {
-                            target: local_declaration_ref(target_declaration),
+                            target: target_declaration.clone(),
                             kind: SemanticOccurrenceKind::ForwardOut,
                             source,
                         });
                         entries.push(OwnerCallEntry::ForwardOut {
                             formal: parameter.formal.clone(),
                             name: parameter.name.clone(),
-                            target: local_declaration_ref(target_declaration),
+                            target: target_declaration,
                             target_name: name.clone(),
                         });
                     }
@@ -2355,12 +2409,28 @@ impl<'a> OwnerRowConstruction<'a> {
             let explicit_pass_source = explicit_pass.as_ref().map(|(_, source)| source.clone());
             let context_binding = explicit_pass.map_or_else(
                 || {
-                    if target.requires_pass && self.own_interface.context.is_some() {
-                        OwnerContextBinding::Inherited {
-                            formal: OwnerContextFormalRef::Local {
-                                formal: OwnerContextFormalId(0),
-                            },
-                        }
+                    let inherited = if self.own_interface.context.is_some() {
+                        Some(OwnerContextFormalRef::Local {
+                            formal: OwnerContextFormalId(0),
+                        })
+                    } else {
+                        self.body
+                            .signature_lexical_plan
+                            .imported_captures()
+                            .iter()
+                            .find_map(|target| match target {
+                                OwnerLexicalTargetRef::ContextFormal { owner } => {
+                                    Some(OwnerContextFormalRef::Imported {
+                                        owner: owner.clone(),
+                                    })
+                                }
+                                _ => None,
+                            })
+                    };
+                    if target.requires_pass {
+                        inherited.map_or(OwnerContextBinding::None, |formal| {
+                            OwnerContextBinding::Inherited { formal }
+                        })
                     } else {
                         OwnerContextBinding::None
                     }
@@ -2507,6 +2577,7 @@ impl<'a> OwnerRowConstruction<'a> {
         match declaration {
             OwnerDeclarationRef::Local { declaration } => self.declaration_statement(*declaration),
             OwnerDeclarationRef::Imported { .. }
+            | OwnerDeclarationRef::ImportedStable { .. }
             | OwnerDeclarationRef::Abi { .. }
             | OwnerDeclarationRef::ScopeOwner { .. } => None,
         }
@@ -3235,6 +3306,7 @@ impl<'a> OwnerRowConstruction<'a> {
             let local_declaration = match &declaration {
                 OwnerDeclarationRef::Local { declaration } => Some(*declaration),
                 OwnerDeclarationRef::Imported { .. }
+                | OwnerDeclarationRef::ImportedStable { .. }
                 | OwnerDeclarationRef::Abi { .. }
                 | OwnerDeclarationRef::ScopeOwner { .. } => None,
             };
@@ -3569,6 +3641,17 @@ impl<'a> OwnerRowConstruction<'a> {
                 });
                 json!({"kind": "imported", "owner": owner, "member": member})
             }
+            OwnerDeclarationRef::ImportedStable { owner, declaration } => {
+                relocations.push(OwnerRelocationTarget::StableDeclaration {
+                    owner: owner.clone(),
+                    declaration: declaration.clone(),
+                });
+                json!({
+                    "kind": "imported_stable",
+                    "owner": owner,
+                    "declaration": declaration,
+                })
+            }
             OwnerDeclarationRef::Abi {
                 canonical_name,
                 declaration,
@@ -3850,7 +3933,10 @@ impl<'a> OwnerRowConstruction<'a> {
                 "bindings": bindings
                     .iter()
                     .map(|binding| Ok(json!({
-                        "declaration": self.local_declaration_key(binding.declaration)?,
+                        "declaration": self.normalize_declaration_ref(
+                            &binding.declaration,
+                            relocations,
+                        )?,
                         "value": self.normalize_expression_ref(&binding.value, relocations)?,
                         "source": binding.source,
                     })))
@@ -4982,18 +5068,38 @@ impl<'a> OwnerRowConstruction<'a> {
                     .iter()
                     .enumerate()
                     .map(|(ordinal, binding)| {
-                        let statement = OwnerStatementId(checked_u32(
-                            binding.statement,
-                            "block binding statement",
-                        )?);
+                        let declaration = match binding.declaration {
+                            AstBlockBindingDeclaration::Local { statement } => {
+                                let statement = OwnerStatementId(checked_u32(
+                                    statement,
+                                    "block binding statement",
+                                )?);
+                                OwnerDeclarationRef::Local {
+                                    declaration: *self
+                                        .statement_declarations
+                                        .get(&statement)
+                                        .ok_or_else(|| {
+                                            CheckedOwnerBuildError::new(
+                                                "block binding declaration is missing",
+                                            )
+                                        })?,
+                                }
+                            }
+                            AstBlockBindingDeclaration::Child { child } => {
+                                let child =
+                                    self.syntax.child_owners.get(child).ok_or_else(|| {
+                                        CheckedOwnerBuildError::new(
+                                            "block binding child declaration is missing",
+                                        )
+                                    })?;
+                                OwnerDeclarationRef::ImportedStable {
+                                    owner: child.owner.clone(),
+                                    declaration: OwnerDeclarationStableKey::Public,
+                                }
+                            }
+                        };
                         Ok(OwnerBlockBinding {
-                            declaration: *self.statement_declarations.get(&statement).ok_or_else(
-                                || {
-                                    CheckedOwnerBuildError::new(
-                                        "block binding declaration is missing",
-                                    )
-                                },
-                            )?,
+                            declaration,
                             value: expression_ref(binding.value)?,
                             source: OwnerSourceSite::BlockBinding {
                                 expression: expression.stable_key.clone(),
@@ -5057,12 +5163,34 @@ impl<'a> OwnerRowConstruction<'a> {
         parts: &[String],
         drain: bool,
     ) -> Result<OwnerExpressionKind, CheckedOwnerBuildError> {
+        let planned = self
+            .body
+            .signature_lexical_plan
+            .reads()
+            .get(id.0 as usize)
+            .and_then(Option::as_ref);
         if let Some(fields) = parts.strip_prefix(&["PASSED".to_owned()]) {
-            return Ok(if self.own_interface.context.is_some() {
+            let formal = match planned.map(|read| &read.target) {
+                Some(OwnerEffectiveLexicalTarget::Static {
+                    target: OwnerLexicalDeclarationTarget::Passed,
+                }) if self.own_interface.context.is_some() => Some(OwnerContextFormalRef::Local {
+                    formal: OwnerContextFormalId(0),
+                }),
+                Some(OwnerEffectiveLexicalTarget::Imported {
+                    target: OwnerLexicalTargetRef::ContextFormal { owner },
+                }) => Some(OwnerContextFormalRef::Imported {
+                    owner: owner.clone(),
+                }),
+                _ => None,
+            };
+            return Ok(if let Some(formal) = formal {
+                if planned.is_some_and(|read| read.projection.as_ref() != fields) {
+                    return Err(CheckedOwnerBuildError::new(format!(
+                        "owner signature PASSED projection diverges for read {id:?}"
+                    )));
+                }
                 OwnerExpressionKind::Passed {
-                    formal: OwnerContextFormalRef::Local {
-                        formal: OwnerContextFormalId(0),
-                    },
+                    formal,
                     projection: fields.to_vec(),
                     access: if drain {
                         CheckedPassedAccess::Drain
@@ -5084,25 +5212,44 @@ impl<'a> OwnerRowConstruction<'a> {
             });
         }
         if let Some((root, projection)) = parts.split_first() {
-            let planned = self
-                .body
-                .signature_lexical_plan
-                .reads()
-                .get(id.0 as usize)
-                .and_then(Option::as_ref);
-            let invalid = matches!(
-                planned.map(|read| &read.target),
+            let invalid = match planned.map(|read| &read.target) {
+                Some(OwnerEffectiveLexicalTarget::Static {
+                    target: OwnerLexicalDeclarationTarget::Statement { statement },
+                }) if matches!(
+                    self.syntax
+                        .statements
+                        .get(*statement as usize)
+                        .map(|statement| &statement.kind),
+                    Some(AstStatementKind::Function { .. })
+                ) =>
+                {
+                    Some("function_must_be_called")
+                }
+                Some(OwnerEffectiveLexicalTarget::Imported {
+                    target:
+                        OwnerLexicalTargetRef::Declaration {
+                            capability: OwnerLexicalDeclarationCapability::CallableOnly,
+                            ..
+                        },
+                }) => Some("function_must_be_called"),
                 Some(
                     OwnerEffectiveLexicalTarget::Static {
                         target: OwnerLexicalDeclarationTarget::Ambiguous { .. },
-                    } | OwnerEffectiveLexicalTarget::InvalidBareBinding { .. }
-                        | OwnerEffectiveLexicalTarget::Ambiguous { .. }
-                )
-            );
+                    }
+                    | OwnerEffectiveLexicalTarget::InvalidBareBinding { .. }
+                    | OwnerEffectiveLexicalTarget::Ambiguous { .. }
+                    | OwnerEffectiveLexicalTarget::Imported {
+                        target:
+                            OwnerLexicalTargetRef::ContextFormal { .. }
+                            | OwnerLexicalTargetRef::Ambiguous { .. },
+                    },
+                ) => Some("ambiguous_lexical_read"),
+                _ => None,
+            };
             let lexical = match planned.map(|read| &read.target) {
                 Some(OwnerEffectiveLexicalTarget::Static {
                     target: OwnerLexicalDeclarationTarget::Parameter { ordinal },
-                }) => self
+                }) => Some(self
                     .parameter_declarations
                     .get(ordinal)
                     .copied()
@@ -5110,11 +5257,11 @@ impl<'a> OwnerRowConstruction<'a> {
                         CheckedOwnerBuildError::new(format!(
                             "owner read references missing parameter {ordinal}"
                         ))
-                    })?
-                    .into(),
+                    })
+                    .map(local_declaration_ref)?),
                 Some(OwnerEffectiveLexicalTarget::Static {
                     target: OwnerLexicalDeclarationTarget::Statement { statement },
-                }) => self
+                }) => Some(self
                     .statement_declarations
                     .get(&OwnerStatementId(*statement))
                     .copied()
@@ -5122,14 +5269,14 @@ impl<'a> OwnerRowConstruction<'a> {
                         CheckedOwnerBuildError::new(format!(
                             "owner read references missing statement declaration {statement}"
                         ))
-                    })?
-                    .into(),
+                    })
+                    .map(local_declaration_ref)?),
                 Some(OwnerEffectiveLexicalTarget::Static {
                     target:
                         OwnerLexicalDeclarationTarget::RecordField {
                             object, ordinal, ..
                         },
-                }) => self
+                }) => Some(self
                     .record_field_declarations
                     .get(&(OwnerExpressionId(*object), *ordinal))
                     .copied()
@@ -5137,11 +5284,11 @@ impl<'a> OwnerRowConstruction<'a> {
                         CheckedOwnerBuildError::new(format!(
                             "owner read references missing record field {object}:{ordinal}"
                         ))
-                    })?
-                    .into(),
+                    })
+                    .map(local_declaration_ref)?),
                 Some(OwnerEffectiveLexicalTarget::Static {
                     target: OwnerLexicalDeclarationTarget::PatternBinding { arm, name },
-                }) => self
+                }) => Some(self
                     .pattern_declarations
                     .get(&(OwnerExpressionId(*arm), name.clone()))
                     .copied()
@@ -5149,12 +5296,12 @@ impl<'a> OwnerRowConstruction<'a> {
                         CheckedOwnerBuildError::new(format!(
                             "owner read references missing pattern binding {name:?} in arm {arm}"
                         ))
-                    })?
-                    .into(),
+                    })
+                    .map(local_declaration_ref)?),
                 Some(OwnerEffectiveLexicalTarget::FreshOut {
                     call,
                     formal_ordinal,
-                }) => self
+                }) => Some(self
                     .declaration_ids
                     .get(&OwnerDeclarationStableKey::FreshOut {
                         call: call.clone(),
@@ -5165,12 +5312,12 @@ impl<'a> OwnerRowConstruction<'a> {
                         CheckedOwnerBuildError::new(
                             "owner read references missing planned FreshOut declaration",
                         )
-                    })?
-                    .into(),
+                    })
+                    .map(local_declaration_ref)?),
                 Some(OwnerEffectiveLexicalTarget::CallContext {
                     call,
                     context_ordinal,
-                }) => self
+                }) => Some(self
                     .declaration_ids
                     .get(&OwnerDeclarationStableKey::CallContext {
                         call: call.clone(),
@@ -5181,42 +5328,56 @@ impl<'a> OwnerRowConstruction<'a> {
                         CheckedOwnerBuildError::new(
                             "owner read references missing planned call-context declaration",
                         )
-                    })?
-                    .into(),
+                    })
+                    .map(local_declaration_ref)?),
+                Some(OwnerEffectiveLexicalTarget::Imported {
+                    target:
+                        OwnerLexicalTargetRef::Declaration {
+                            owner,
+                            declaration,
+                            capability:
+                                OwnerLexicalDeclarationCapability::Value
+                                | OwnerLexicalDeclarationCapability::Out { .. },
+                        },
+                }) => Some(OwnerDeclarationRef::ImportedStable {
+                    owner: owner.clone(),
+                    declaration: declaration.clone(),
+                }),
                 Some(
                     OwnerEffectiveLexicalTarget::Static {
                         target:
                             OwnerLexicalDeclarationTarget::Passed
+                            | OwnerLexicalDeclarationTarget::Imported { .. }
                             | OwnerLexicalDeclarationTarget::Ambiguous { .. },
                     }
+                    | OwnerEffectiveLexicalTarget::Imported { .. }
                     | OwnerEffectiveLexicalTarget::InvalidBareBinding { .. }
                     | OwnerEffectiveLexicalTarget::Ambiguous { .. },
                 )
                 | None => None,
             };
+            if let Some(reason) = invalid {
+                return Ok(OwnerExpressionKind::Invalid {
+                    tokens: vec![reason.to_owned(), root.clone()],
+                });
+            }
             if let Some(declaration) = lexical {
                 if planned.is_some_and(|read| read.projection.as_ref() != projection) {
                     return Err(CheckedOwnerBuildError::new(format!(
                         "owner signature lexical projection diverges for read {id:?}"
                     )));
                 }
-                let target = local_declaration_ref(declaration);
                 return Ok(if drain {
                     OwnerExpressionKind::Drain {
-                        target,
+                        target: declaration,
                         projection: projection.to_vec(),
                     }
                 } else {
                     OwnerExpressionKind::Read {
-                        target,
+                        target: declaration,
                         projection: projection.to_vec(),
                         source_seed: None,
                     }
-                });
-            }
-            if invalid {
-                return Ok(OwnerExpressionKind::Invalid {
-                    tokens: vec!["ambiguous_lexical_read".to_owned(), root.clone()],
                 });
             }
         }
@@ -5447,6 +5608,7 @@ fn owner_parameter_ordinal(reference: &OwnerDeclarationRef) -> Option<u32> {
         } => Some(*ordinal),
         OwnerDeclarationRef::Local { .. }
         | OwnerDeclarationRef::Imported { .. }
+        | OwnerDeclarationRef::ImportedStable { .. }
         | OwnerDeclarationRef::Abi { .. }
         | OwnerDeclarationRef::ScopeOwner { .. } => None,
     }
@@ -5553,7 +5715,7 @@ fn expression_source(expression: &crate::OwnerExpressionInput) -> OwnerSourceSit
 fn statement_body_container<'a>(
     syntax: &'a OwnerSyntaxInput,
     statement: &crate::OwnerStatementInput,
-) -> Option<&'a crate::OwnerExpressionInput> {
+) -> Option<(usize, &'a crate::OwnerExpressionInput)> {
     fn is_container(expression: &crate::OwnerExpressionInput) -> bool {
         matches!(
             expression.kind,
@@ -5564,9 +5726,10 @@ fn statement_body_container<'a>(
                 | AstExprKind::SetLiteral { .. }
         )
     }
-    let expression = syntax.expressions.get(statement.expression? as usize)?;
+    let expression_index = statement.expression? as usize;
+    let expression = syntax.expressions.get(expression_index)?;
     if is_container(expression) {
-        return Some(expression);
+        return Some((expression_index, expression));
     }
     let output = match &expression.kind {
         AstExprKind::MatchArm {
@@ -5583,6 +5746,54 @@ fn statement_body_container<'a>(
         .expressions
         .get(output)
         .filter(|output| is_container(output))
+        .map(|expression| (output, expression))
+}
+
+fn lexical_scope_depths(
+    scopes: &[crate::OwnerLexicalScopePlan],
+) -> Result<Vec<usize>, CheckedOwnerBuildError> {
+    let mut depths = vec![None::<usize>; scopes.len()];
+    let mut visiting = vec![false; scopes.len()];
+    for start in 0..scopes.len() {
+        if depths[start].is_some() {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut current = start;
+        loop {
+            if let Some(mut depth) = depths[current] {
+                for scope in path.into_iter().rev() {
+                    depth = depth.saturating_add(1);
+                    depths[scope] = Some(depth);
+                    visiting[scope] = false;
+                }
+                break;
+            }
+            if visiting[current] {
+                return Err(CheckedOwnerBuildError::new(
+                    "owner lexical scope ancestry contains a cycle",
+                ));
+            }
+            visiting[current] = true;
+            path.push(current);
+            let Some(parent) = scopes[current].parent else {
+                let mut depth = 0usize;
+                for scope in path.into_iter().rev() {
+                    depths[scope] = Some(depth);
+                    visiting[scope] = false;
+                    depth = depth.saturating_add(1);
+                }
+                break;
+            };
+            current = usize::try_from(parent)
+                .ok()
+                .filter(|parent| *parent < scopes.len())
+                .ok_or_else(|| {
+                    CheckedOwnerBuildError::new("owner lexical scope references a missing parent")
+                })?;
+        }
+    }
+    Ok(depths.into_iter().map(Option::unwrap).collect())
 }
 
 fn owner_expression_ref(
@@ -5754,7 +5965,7 @@ pub fn build_checked_owner_shard<'a>(
     // relocation. Bind that compact seal to the exact current basis instead of
     // serializing the complete rich row tables for a second time.
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        CHECKED_OWNER_SHARD_DOMAIN_V5,
+        CHECKED_OWNER_SHARD_DOMAIN_V6,
         &(&basis, &receipts.construction),
     )
     .map_err(|error| {
@@ -5777,10 +5988,13 @@ mod tests {
     use super::*;
     use crate::{
         OwnerConstraintEdgeRole, OwnerSignatureCallLexicalError, OwnerSourceAnchorRole,
-        build_owner_interface_topology, evaluate_owner_body, plan_owner_body_interfaces,
-        project_owner_abi_environment, project_owner_constraint_seed_with_lexical_plan,
-        project_owner_lexical_plan, project_owner_syntax_input, resolve_owner_constraint_seed,
-        resolve_owner_constraint_seed_with_resolutions, solve_owner_interface_scc,
+        build_owner_callable_scope_topology, build_owner_interface_topology,
+        evaluate_owner_body_with_signature_plan, evaluate_owner_callable_scope_scc,
+        evaluate_owner_interface_scc_with_signature_scopes, plan_owner_body_interfaces,
+        project_owner_abi_environment, project_owner_callable_resolution_plan,
+        project_owner_constraint_seed_with_lexical_plan, project_owner_lexical_plan,
+        project_owner_syntax_input, resolve_owner_constraint_seed,
+        resolve_owner_constraint_seed_with_signature_plan, solve_owner_interface_scc,
     };
     use boon_checked::{ExternalTypeEnvironment, OwnerAbiMemberRef};
     use boon_parser::{ProjectSyntaxSnapshot, parse_project_source_unit, project_unit_link_keys};
@@ -5850,212 +6064,209 @@ mod tests {
             })
             .cloned()
             .unwrap_or_else(|| panic!("fixture `{name}` has no owner in {owners:#?}"));
-        let syntax = project_owner_syntax_input(unit.owner_view_for_key(&owner).unwrap()).unwrap();
-        let lexical_plan = project_owner_lexical_plan(&syntax).unwrap();
-        let seed = project_owner_constraint_seed_with_lexical_plan(&syntax, &lexical_plan).unwrap();
-        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
         let abi = project_owner_abi_environment(
             &project,
             &ExternalTypeEnvironment::empty(ProgramRole::Client),
         )
         .unwrap();
-        if name == "<list>" || !seed.external_expressions.is_empty() || owners.len() > 1 {
-            let syntaxes = owners
-                .iter()
-                .map(|owner| {
-                    (
-                        owner.clone(),
-                        project_owner_syntax_input(unit.owner_view_for_key(owner).unwrap())
-                            .unwrap(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>();
-            let lexical_plans = syntaxes
-                .iter()
-                .map(|(owner, syntax)| (owner.clone(), project_owner_lexical_plan(syntax).unwrap()))
-                .collect::<BTreeMap<_, _>>();
-            let seeds = syntaxes
-                .iter()
-                .map(|(owner, syntax)| {
-                    (
-                        owner.clone(),
-                        project_owner_constraint_seed_with_lexical_plan(
-                            syntax,
-                            &lexical_plans[owner],
-                        )
+        let syntaxes = owners
+            .iter()
+            .map(|owner| {
+                (
+                    owner.clone(),
+                    project_owner_syntax_input(unit.owner_view_for_key(owner).unwrap()).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let lexical_plans = syntaxes
+            .iter()
+            .map(|(owner, syntax)| (owner.clone(), project_owner_lexical_plan(syntax).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let seeds = syntaxes
+            .iter()
+            .map(|(owner, syntax)| {
+                (
+                    owner.clone(),
+                    project_owner_constraint_seed_with_lexical_plan(syntax, &lexical_plans[owner])
                         .unwrap(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>();
-            let callable_surfaces = seeds
-                .iter()
-                .filter_map(|(owner, seed)| {
-                    seed.declarations
-                        .iter()
-                        .find(|declaration| {
-                            declaration.public && declaration.kind == OwnerDeclarationKind::Function
-                        })
-                        .map(|declaration| (owner, declaration))
-                })
-                .collect::<Vec<_>>();
-            let summaries = seeds
-                .iter()
-                .map(|(owner, seed)| {
-                    let resolved = seed
-                        .references
-                        .iter()
-                        .filter(|reference| reference.kind == OwnerReferenceKind::Callable)
-                        .filter_map(|reference| {
-                            let matches = callable_surfaces
-                                .iter()
-                                .filter(|(_, declaration)| {
-                                    declaration.names.as_ref() == reference.parts.as_ref()
-                                })
-                                .collect::<Vec<_>>();
-                            (matches.len() == 1).then(|| {
-                                let (target, declaration) = matches[0];
-                                crate::ResolvedOwnerSymbolReference {
-                                    reference: reference.clone(),
-                                    owner: (*target).clone(),
-                                    projection: Box::new([]),
-                                    parameters: declaration.parameters.clone(),
-                                }
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    (
-                        owner.clone(),
-                        resolve_owner_constraint_seed(seed, resolved).unwrap(),
-                    )
-                })
-                .collect::<BTreeMap<_, _>>();
-            let topology = build_owner_interface_topology(summaries.values()).unwrap();
-            let mut interface_results = BTreeMap::new();
-            for scc in &topology.sccs {
-                let parameter_requirements = scc
-                    .key
-                    .members
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let callable_surfaces = seeds
+            .iter()
+            .filter_map(|(owner, seed)| {
+                seed.declarations
                     .iter()
-                    .flat_map(|member| {
-                        seeds[member]
-                            .parameter_requirement_keys()
-                            .into_vec()
-                            .into_iter()
-                            .map(|key| {
-                                let (function, parameter) = seeds[member]
-                                    .parameter_requirement_names(key.parameter_ordinal())
-                                    .unwrap();
-                                abi.parameter_requirement_lookup(key, function, parameter)
-                                    .unwrap()
+                    .find(|declaration| {
+                        declaration.public && declaration.kind == OwnerDeclarationKind::Function
+                    })
+                    .map(|declaration| (owner, declaration))
+            })
+            .collect::<Vec<_>>();
+        let base_summaries = seeds
+            .iter()
+            .map(|(owner, seed)| {
+                let resolved = seed
+                    .references
+                    .iter()
+                    .filter(|reference| reference.kind == OwnerReferenceKind::Callable)
+                    .filter_map(|reference| {
+                        let matches = callable_surfaces
+                            .iter()
+                            .filter(|(_, declaration)| {
+                                declaration.names.as_ref() == reference.parts.as_ref()
                             })
+                            .collect::<Vec<_>>();
+                        (matches.len() == 1).then(|| {
+                            let (target, declaration) = matches[0];
+                            crate::ResolvedOwnerSymbolReference {
+                                reference: reference.clone(),
+                                owner: (*target).clone(),
+                                projection: Box::new([]),
+                                parameters: declaration.parameters.clone(),
+                            }
+                        })
                     })
                     .collect::<Vec<_>>();
-                let interface_abi = abi
-                    .complete_inference_environment_with_requirements(
-                        scc.key.members.iter().cloned(),
-                        scc.key.members.iter().flat_map(|member| {
-                            summaries[member].authoritative_abi_names().into_vec()
-                        }),
-                        scc.key.members.iter().flat_map(|member| {
-                            summaries[member].authoritative_value_abi_paths().into_vec()
-                        }),
-                        scc.key
-                            .members
+                (
+                    owner.clone(),
+                    resolve_owner_constraint_seed(seed, resolved).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let callable_plans = seeds
+            .iter()
+            .map(|(owner, seed)| {
+                (
+                    owner.clone(),
+                    project_owner_callable_resolution_plan(
+                        seed,
+                        base_summaries[owner]
+                            .symbol_resolutions
                             .iter()
-                            .flat_map(|member| seeds[member].source_payload_abi_paths().into_vec()),
-                        parameter_requirements,
+                            .filter(|resolution| {
+                                resolution.reference().kind == OwnerReferenceKind::Callable
+                            })
+                            .cloned(),
                     )
-                    .unwrap();
-                let dependencies = scc
-                    .dependencies
-                    .iter()
-                    .map(|dependency| &interface_results[dependency])
-                    .collect::<Vec<_>>();
-                let result = solve_owner_interface_scc(
-                    scc,
-                    &interface_abi,
-                    scc.key.members.iter().map(|member| &seeds[member]),
-                    scc.key.members.iter().map(|member| &summaries[member]),
-                    dependencies,
+                    .unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let callable_topology =
+            build_owner_callable_scope_topology(callable_plans.values()).unwrap();
+        let callable_provider = abi.callable_environment().unwrap();
+        let mut callable_results = BTreeMap::<
+            crate::OwnerCallableScopeSccKey,
+            Arc<crate::OwnerCallableScopeSccResult>,
+        >::new();
+        for scc in &callable_topology.sccs {
+            let callable_abi = callable_provider
+                .inference_environment(
+                    scc.key.members.iter().cloned(),
+                    scc.key.members.iter().flat_map(|member| {
+                        callable_plans[member].authoritative_abi_names().into_vec()
+                    }),
                 )
                 .unwrap();
-                interface_results.insert(scc.key.clone(), result);
-            }
-            let own_scc = topology.scc_for_owner(&owner).unwrap();
-            let interface = interface_results[&own_scc.key].clone();
-            let syntax = syntaxes.get(&owner).unwrap().clone();
-            let lexical_plan = lexical_plans.get(&owner).unwrap().clone();
-            let seed = seeds.get(&owner).unwrap().clone();
-            let summary = summaries.get(&owner).unwrap().clone();
-            let parameter_requirements = seed
-                .parameter_requirement_keys()
-                .into_vec()
-                .into_iter()
-                .map(|key| {
-                    let (function, parameter) = seed
-                        .parameter_requirement_names(key.parameter_ordinal())
-                        .unwrap();
-                    abi.parameter_requirement_lookup(key, function, parameter)
+            let dependencies = scc
+                .dependencies
+                .iter()
+                .map(|dependency| callable_results[dependency].as_ref())
+                .collect::<Vec<_>>();
+            let evaluation = evaluate_owner_callable_scope_scc(
+                scc,
+                scc.key.members.iter().map(|member| &seeds[member]),
+                scc.key.members.iter().map(|member| &callable_plans[member]),
+                &callable_abi,
+                dependencies,
+            )
+            .unwrap();
+            callable_results.insert(scc.key.clone(), evaluation.result);
+        }
+        let callable_scopes = callable_results
+            .values()
+            .flat_map(|result| result.owners.iter())
+            .map(|scope| (scope.owner().clone(), scope))
+            .collect::<BTreeMap<_, _>>();
+        let summaries = seeds
+            .iter()
+            .map(|(owner, seed)| {
+                let plan = callable_scopes[owner].lexical_plan();
+                let resolutions = plan.external_candidates().iter().map(|reference| {
+                    base_summaries[owner]
+                        .symbol_resolutions
+                        .iter()
+                        .find(|resolution| resolution.reference() == reference)
+                        .cloned()
                         .unwrap()
+                });
+                (
+                    owner.clone(),
+                    resolve_owner_constraint_seed_with_signature_plan(seed, plan, resolutions)
+                        .unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let topology = build_owner_interface_topology(summaries.values()).unwrap();
+        let mut interface_results =
+            BTreeMap::<crate::OwnerInterfaceSccKey, Arc<OwnerInterfaceSccResult>>::new();
+        for scc in &topology.sccs {
+            let parameter_requirements = scc
+                .key
+                .members
+                .iter()
+                .flat_map(|member| {
+                    seeds[member]
+                        .parameter_requirement_keys()
+                        .into_vec()
+                        .into_iter()
+                        .map(|key| {
+                            let (function, parameter) = seeds[member]
+                                .parameter_requirement_names(key.parameter_ordinal())
+                                .unwrap();
+                            abi.parameter_requirement_lookup(key, function, parameter)
+                                .unwrap()
+                        })
                 })
                 .collect::<Vec<_>>();
-            let inference_abi = abi
+            let interface_abi = abi
                 .complete_inference_environment_with_requirements(
-                    [seed.owner.clone()],
-                    summary.authoritative_abi_names().into_vec(),
-                    summary.authoritative_value_abi_paths().into_vec(),
-                    seed.source_payload_abi_paths().into_vec(),
+                    scc.key.members.iter().cloned(),
+                    scc.key
+                        .members
+                        .iter()
+                        .flat_map(|member| summaries[member].authoritative_abi_names().into_vec()),
+                    scc.key.members.iter().flat_map(|member| {
+                        summaries[member].authoritative_value_abi_paths().into_vec()
+                    }),
+                    scc.key
+                        .members
+                        .iter()
+                        .flat_map(|member| seeds[member].source_payload_abi_paths().into_vec()),
                     parameter_requirements,
                 )
                 .unwrap();
-            let interface_plan =
-                plan_owner_body_interfaces(&seed, &summary, interface_results.values()).unwrap();
-            let imported = interface_results
-                .values()
-                .filter(|result| {
-                    interface_plan
-                        .imports()
-                        .iter()
-                        .any(|import| import.key() == &result.key)
-                })
-                .collect::<Vec<_>>();
-            let imported_interfaces = imported
+            let dependencies = scc
+                .dependencies
                 .iter()
-                .flat_map(|result| result.owners.iter())
-                .map(|interface| (interface.owner.clone(), interface.clone()))
-                .collect::<BTreeMap<_, _>>();
-            let body_evaluation = evaluate_owner_body(
-                &syntax,
-                &lexical_plan,
-                &seed,
-                &summary,
-                &inference_abi,
-                &interface_plan,
-                &interface,
-                imported,
+                .map(|dependency| interface_results[dependency].as_ref())
+                .collect::<Vec<_>>();
+            let evaluation = evaluate_owner_interface_scc_with_signature_scopes(
+                scc,
+                &interface_abi,
+                scc.key.members.iter().map(|member| &seeds[member]),
+                scc.key.members.iter().map(|member| &summaries[member]),
+                dependencies,
+                scc.key.members.iter().map(|member| callable_scopes[member]),
             )
             .unwrap();
-            let body = Arc::unwrap_or_clone(body_evaluation.result);
-            let construction_abi = abi
-                .construction_environment(
-                    seed.owner.clone(),
-                    summary.authoritative_abi_names().into_vec(),
-                    summary.authoritative_value_abi_paths().into_vec(),
-                )
-                .unwrap();
-            return Fixture {
-                syntax,
-                lexical_plan,
-                seed,
-                summary,
-                inference_abi,
-                construction_abi,
-                interface,
-                imported_interfaces,
-                body,
-                body_currentness: body_evaluation.currentness,
-            };
+            interface_results.insert(scc.key.clone(), evaluation.result);
         }
+        let syntax = syntaxes[&owner].clone();
+        let lexical_plan = lexical_plans[&owner].clone();
+        let seed = seeds[&owner].clone();
+        let summary = summaries[&owner].clone();
         let parameter_requirements = seed
             .parameter_requirement_keys()
             .into_vec()
@@ -6077,17 +6288,30 @@ mod tests {
                 parameter_requirements,
             )
             .unwrap();
-        let topology = build_owner_interface_topology([&summary]).unwrap();
-        let interface = solve_owner_interface_scc(
-            topology.sccs.first().unwrap(),
-            &inference_abi,
-            [&seed],
-            [&summary],
-            [],
+        let own_scc = topology.scc_for_owner(&owner).unwrap();
+        let interface = interface_results[&own_scc.key].clone();
+        let interface_plan = plan_owner_body_interfaces(
+            &seed,
+            &summary,
+            interface_results.values().map(AsRef::as_ref),
         )
         .unwrap();
-        let interface_plan = plan_owner_body_interfaces(&seed, &summary, [&interface]).unwrap();
-        let body_evaluation = evaluate_owner_body(
+        let imported = interface_results
+            .values()
+            .map(AsRef::as_ref)
+            .filter(|result| {
+                interface_plan
+                    .imports()
+                    .iter()
+                    .any(|import| import.key() == &result.key)
+            })
+            .collect::<Vec<_>>();
+        let imported_interfaces = imported
+            .iter()
+            .flat_map(|result| result.owners.iter())
+            .map(|interface| (interface.owner.clone(), interface.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let body_evaluation = evaluate_owner_body_with_signature_plan(
             &syntax,
             &lexical_plan,
             &seed,
@@ -6095,7 +6319,8 @@ mod tests {
             &inference_abi,
             &interface_plan,
             &interface,
-            [],
+            imported,
+            callable_scopes[&owner].lexical_plan(),
         )
         .unwrap();
         let body = Arc::unwrap_or_clone(body_evaluation.result);
@@ -6113,8 +6338,8 @@ mod tests {
             summary,
             inference_abi,
             construction_abi,
-            interface,
-            imported_interfaces: BTreeMap::new(),
+            interface: Arc::unwrap_or_clone(interface),
+            imported_interfaces,
             body,
             body_currentness: body_evaluation.currentness,
         }
@@ -6148,8 +6373,13 @@ mod tests {
     }
 
     fn fixture_with_symbol_resolution(base: Fixture, resolution: OwnerSymbolResolution) -> Fixture {
-        let summary =
-            resolve_owner_constraint_seed_with_resolutions(&base.seed, [resolution]).unwrap();
+        let signature_plan = base.body.signature_lexical_plan.clone();
+        let summary = resolve_owner_constraint_seed_with_signature_plan(
+            &base.seed,
+            &signature_plan,
+            [resolution],
+        )
+        .unwrap();
         let topology = build_owner_interface_topology([&summary]).unwrap();
         let interface = solve_owner_interface_scc(
             topology.sccs.first().unwrap(),
@@ -6161,7 +6391,7 @@ mod tests {
         .unwrap();
         let interface_plan =
             plan_owner_body_interfaces(&base.seed, &summary, [&interface]).unwrap();
-        let body_evaluation = evaluate_owner_body(
+        let body_evaluation = evaluate_owner_body_with_signature_plan(
             &base.syntax,
             &base.lexical_plan,
             &base.seed,
@@ -6170,6 +6400,7 @@ mod tests {
             &interface_plan,
             &interface,
             [],
+            &signature_plan,
         )
         .unwrap();
         Fixture {
@@ -6881,6 +7112,88 @@ mod tests {
     }
 
     #[test]
+    fn broad_outer_narrowing_does_not_hide_a_nested_same_named_fresh_out_read() {
+        let fixture = fixture(
+            concat!(
+                "FUNCTION plus_one(value) {\n",
+                "    value + 1\n",
+                "}\n",
+                "FUNCTION choose() {\n",
+                "    LIST { Found[payload: 1] }\n",
+                "    |> List/find(\n",
+                "        item,\n",
+                "        if: item |> WHEN {\n",
+                "            Found[payload] =>\n",
+                "                LIST { TEXT { wrong } }\n",
+                "                |> List/find(\n",
+                "                    item,\n",
+                "                    if: plus_one(value: item) == 1,\n",
+                "                )\n",
+                "        },\n",
+                "    )\n",
+                "}\n",
+            ),
+            "choose",
+        );
+        assert_eq!(
+            fixture
+                .body
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "user_call_argument_type")
+                .count(),
+            1,
+            "{:#?}",
+            fixture.body.diagnostics
+        );
+
+        let plus_one = fixture
+            .body
+            .signature_lexical_plan
+            .calls()
+            .iter()
+            .find(|call| call.function == "plus_one")
+            .expect("nested plus_one call");
+        let actual = plus_one
+            .matched_inputs
+            .iter()
+            .find(|input| input.formal_name == "value")
+            .expect("plus_one value input");
+        let read = fixture.body.signature_lexical_plan.reads()[actual.expression as usize]
+            .as_ref()
+            .expect("nested item read");
+        let OwnerEffectiveLexicalTarget::FreshOut {
+            call,
+            formal_ordinal,
+        } = &read.target
+        else {
+            panic!("nested item must target its exact FreshOut: {read:#?}");
+        };
+        let rows = rows(&fixture);
+        let expression = &fixture.seed.expressions[actual.expression as usize].expression;
+        let declaration = rows
+            .expressions
+            .iter()
+            .find(|row| &row.stable_key == expression)
+            .and_then(|row| match row.kind {
+                OwnerExpressionKind::Read {
+                    target: OwnerDeclarationRef::Local { declaration },
+                    ..
+                } => Some(declaration),
+                _ => None,
+            })
+            .expect("checked nested item read");
+        assert!(rows.declarations.iter().any(|row| {
+            row.id == declaration
+                && row.stable_key
+                    == OwnerDeclarationStableKey::FreshOut {
+                        call: call.clone(),
+                        formal_ordinal: *formal_ordinal,
+                    }
+        }));
+    }
+
+    #[test]
     fn invalid_call_shapes_emit_diagnostics_without_checked_call_rows() {
         let invalid = fixture("value: Number/to_text(radix: 10, value: 1)\n", "value");
         let (invalid_rows, receipts) = built_rows(&invalid);
@@ -7123,6 +7436,319 @@ mod tests {
             rows.pattern_bindings[0].selector,
             OwnerExpressionRef::Child { .. }
         ));
+    }
+
+    #[test]
+    fn child_owner_reads_the_exact_forward_block_sibling() {
+        let fixture = fixture(
+            concat!(
+                "item: TEXT { global }\n",
+                "container: BLOCK {\n",
+                "    item: 1\n",
+                "    copy: item\n",
+                "    copy\n",
+                "}\n",
+            ),
+            "copy",
+        );
+        let rows = rows(&fixture);
+        assert!(rows.expressions.iter().any(|expression| {
+            matches!(
+                &expression.kind,
+                OwnerExpressionKind::Read {
+                    target: OwnerDeclarationRef::ImportedStable {
+                        declaration: OwnerDeclarationStableKey::Public,
+                        ..
+                    },
+                    projection,
+                    ..
+                } if projection.is_empty()
+            )
+        }));
+    }
+
+    #[test]
+    fn wide_block_signature_children_share_one_effective_binding_environment() {
+        let fixture = fixture(
+            concat!(
+                "container: BLOCK {\n",
+                "    first: 1\n",
+                "    second: 2\n",
+                "    third: 3\n",
+                "    third\n",
+                "}\n",
+            ),
+            "container",
+        );
+        let environments = fixture.body.signature_lexical_plan.child_environments();
+
+        assert!(environments.len() >= 3);
+        assert!(environments[0].bindings.len() >= 3);
+        assert!(environments.iter().skip(1).all(|environment| {
+            crate::OwnerLexicalBoundaryBindings::ptr_eq(
+                &environments[0].bindings,
+                &environment.bindings,
+            )
+        }));
+    }
+
+    #[test]
+    fn child_owner_nearest_nested_block_shadow_wins() {
+        let fixture = fixture(
+            concat!(
+                "container: BLOCK {\n",
+                "    item: 1\n",
+                "    nested: BLOCK {\n",
+                "        item: 2\n",
+                "        copy: item\n",
+                "        copy\n",
+                "    }\n",
+                "    nested\n",
+                "}\n",
+            ),
+            "copy",
+        );
+        let rows = rows(&fixture);
+        assert!(rows.expressions.iter().any(|expression| {
+            matches!(
+                &expression.kind,
+                OwnerExpressionKind::Read {
+                    target: OwnerDeclarationRef::ImportedStable {
+                        owner: StableCheckOwnerKey::Item(owner),
+                        declaration: OwnerDeclarationStableKey::Public,
+                    },
+                    projection,
+                    ..
+                } if projection.is_empty() && owner.item_route.segments().len() == 3
+            )
+        }));
+    }
+
+    #[test]
+    fn child_owner_reads_the_exact_parent_pattern_binding() {
+        let fixture = fixture(
+            concat!(
+                "item: TEXT { global }\n",
+                "value: Found[item: 1]\n",
+                "    |> WHEN {\n",
+                "        Found[item] => BLOCK {\n",
+                "            copy: item\n",
+                "            copy\n",
+                "        }\n",
+                "    }\n",
+            ),
+            "copy",
+        );
+        let rows = rows(&fixture);
+        assert!(rows.expressions.iter().any(|expression| {
+            matches!(
+                expression.kind,
+                OwnerExpressionKind::Read {
+                    target: OwnerDeclarationRef::ImportedStable {
+                        declaration: OwnerDeclarationStableKey::PatternBinding { .. },
+                        ..
+                    },
+                    ref projection,
+                    ..
+                } if projection.is_empty()
+            )
+        }));
+    }
+
+    #[test]
+    fn grandchild_owner_keeps_the_exact_parent_pattern_binding_and_type() {
+        let fixture = fixture(
+            concat!(
+                "value: Found[item: 1]\n",
+                "    |> WHEN {\n",
+                "        Found[item] => BLOCK {\n",
+                "            middle: BLOCK {\n",
+                "                leaf: item\n",
+                "                0\n",
+                "            }\n",
+                "            0\n",
+                "        }\n",
+                "    }\n",
+            ),
+            "leaf",
+        );
+        let rows = rows(&fixture);
+        assert!(rows.expressions.iter().any(|expression| {
+            expression.flow_type.ty == Type::Number
+                && matches!(
+                    expression.kind,
+                    OwnerExpressionKind::Read {
+                        target: OwnerDeclarationRef::ImportedStable {
+                            declaration: OwnerDeclarationStableKey::PatternBinding { .. },
+                            ..
+                        },
+                        ref projection,
+                        ..
+                    } if projection.is_empty()
+                )
+        }));
+    }
+
+    #[test]
+    fn public_reactive_capture_preserves_its_flow_mode() {
+        let fixture = fixture(
+            concat!(
+                "container: BLOCK {\n",
+                "    event: 1 |> THEN { 2 }\n",
+                "    copy: event\n",
+                "    copy\n",
+                "}\n",
+            ),
+            "copy",
+        );
+        let rows = rows(&fixture);
+        assert!(rows.expressions.iter().any(|expression| {
+            expression.flow_type.mode == FlowMode::PresentOrAbsent
+                && matches!(
+                    expression.kind,
+                    OwnerExpressionKind::Read {
+                        target: OwnerDeclarationRef::ImportedStable {
+                            declaration: OwnerDeclarationStableKey::Public,
+                            ..
+                        },
+                        ..
+                    }
+                )
+        }));
+    }
+
+    #[test]
+    fn imported_selector_projection_remains_lazy_until_pattern_narrowing() {
+        let fixture = fixture(
+            concat!(
+                "container: BLOCK {\n",
+                "    choice: Found[value: 1]\n",
+                "    copy: choice |> WHEN { Found[value] => choice.value }\n",
+                "    copy\n",
+                "}\n",
+            ),
+            "copy",
+        );
+        let choice = fixture
+            .interface
+            .owner(&fixture.syntax.owner)
+            .expect("copy interface")
+            .lexical_captures
+            .iter()
+            .find(|capture| {
+                matches!(
+                    &capture.target,
+                    OwnerLexicalTargetRef::Declaration {
+                        declaration: OwnerDeclarationStableKey::Public,
+                        ..
+                    }
+                )
+            })
+            .expect("choice lexical capture");
+        assert!(matches!(
+            &choice.flow_type.ty,
+            Type::VariantSet(variants)
+                if variants.iter().any(|variant| matches!(
+                    variant,
+                    boon_checked::Variant::Tagged { tag, fields }
+                        if tag == "Found"
+                            && fields.fields.get("value") == Some(&Type::Number)
+                            && !fields.open
+                ))
+        ));
+        assert!(rows(&fixture).expressions.iter().any(|expression| {
+            expression.flow_type.ty == Type::Number
+                && matches!(
+                    &expression.kind,
+                    OwnerExpressionKind::Read {
+                        target: OwnerDeclarationRef::ImportedStable {
+                            declaration: OwnerDeclarationStableKey::Public,
+                            ..
+                        },
+                        projection,
+                        ..
+                    } if projection.as_ref() == ["value"]
+                )
+        }));
+    }
+
+    #[test]
+    fn child_owner_ambiguous_block_binding_fails_closed() {
+        let fixture = fixture(
+            concat!(
+                "item: TEXT { global }\n",
+                "container: BLOCK {\n",
+                "    item: 1\n",
+                "    item: 2\n",
+                "    copy: item\n",
+                "    copy\n",
+                "}\n",
+            ),
+            "copy",
+        );
+        let rows = rows(&fixture);
+        assert!(rows.expressions.iter().any(|expression| {
+            matches!(
+                &expression.kind,
+                OwnerExpressionKind::Invalid { tokens }
+                    if tokens.first().is_some_and(|token| token == "ambiguous_lexical_read")
+            )
+        }));
+    }
+
+    #[test]
+    fn child_owner_drain_preserves_the_imported_static_target() {
+        let fixture = fixture(
+            concat!(
+                "container: BLOCK {\n",
+                "    item: 1\n",
+                "    copy: DRAIN { item }\n",
+                "    copy\n",
+                "}\n",
+            ),
+            "copy",
+        );
+        let rows = rows(&fixture);
+        assert!(rows.expressions.iter().any(|expression| {
+            matches!(
+                expression.kind,
+                OwnerExpressionKind::Drain {
+                    target: OwnerDeclarationRef::ImportedStable {
+                        declaration: OwnerDeclarationStableKey::Public,
+                        ..
+                    },
+                    ref projection,
+                } if projection.is_empty()
+            )
+        }));
+    }
+
+    #[test]
+    fn child_owner_keeps_callable_only_bindings_non_readable() {
+        let fixture = fixture(
+            concat!(
+                "container: BLOCK {\n",
+                "    FUNCTION helper() { 1 }\n",
+                "    copy: helper\n",
+                "    copy\n",
+                "}\n",
+            ),
+            "copy",
+        );
+        assert!(
+            fixture
+                .body
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == "function_must_be_called" })
+        );
+        assert!(rows(&fixture).expressions.iter().any(|expression| {
+            matches!(
+                &expression.kind,
+                OwnerExpressionKind::Invalid { tokens }
+                    if tokens.first().is_some_and(|token| token == "function_must_be_called")
+            )
+        }));
     }
 
     #[test]
@@ -7443,8 +8069,11 @@ mod tests {
                     .contains("function `repeat` must be called with parentheses")
         }));
         assert!(rows(&fixture).expressions.iter().any(|expression| {
-            matches!(expression.kind, OwnerExpressionKind::Read { .. })
-                || matches!(expression.kind, OwnerExpressionKind::Invalid { .. })
+            matches!(
+                &expression.kind,
+                OwnerExpressionKind::Invalid { tokens }
+                    if tokens.first().is_some_and(|token| token == "function_must_be_called")
+            )
         }));
     }
 

@@ -85,6 +85,7 @@ pub struct OwnerInterfaceTransferModule {
     result: Arc<OwnerInterfaceSccResult>,
     dependencies: Box<[Arc<OwnerInterfaceTransferModule>]>,
     routes: BTreeMap<StableCheckOwnerKey, OwnerInterfaceTransferRoute>,
+    constant_results: BTreeMap<StableCheckOwnerKey, EvaluatedResultValue>,
     fingerprint_v1: [u8; 32],
 }
 
@@ -139,6 +140,68 @@ impl OwnerInterfaceTransferModule {
             }
         }
     }
+
+    fn constant_result(&self, owner: &StableCheckOwnerKey) -> Option<&EvaluatedResultValue> {
+        match self.routes.get(owner)? {
+            OwnerInterfaceTransferRoute::Own => self.constant_results.get(owner),
+            OwnerInterfaceTransferRoute::Dependency(index) => self
+                .dependencies
+                .get(*index as usize)?
+                .constant_result(owner),
+        }
+    }
+}
+
+fn owner_result_transfer_is_invocation_invariant(interface: &OwnerPublicInterface) -> bool {
+    let OwnerResultTransfer::Expression { nodes, .. } = &interface.result_transfer else {
+        return false;
+    };
+    if nodes.iter().any(|node| node.parameter_read.is_some()) {
+        return false;
+    }
+    let mut input_variables = BTreeSet::new();
+    for parameter in &interface.parameters {
+        crate::collect_type_vars(&parameter.flow_type.ty, &mut input_variables);
+    }
+    if let Some(context) = &interface.context {
+        crate::collect_type_vars(&context.flow_type.ty, &mut input_variables);
+    }
+    let mut transfer_variables = BTreeSet::new();
+    crate::collect_type_vars(&interface.result.ty, &mut transfer_variables);
+    if let Some(flush_type) = &interface.result_flush_type {
+        crate::collect_type_vars(flush_type, &mut transfer_variables);
+    }
+    for node in nodes {
+        crate::collect_type_vars(&node.flow_type.ty, &mut transfer_variables);
+    }
+    input_variables.is_disjoint(&transfer_variables)
+}
+
+fn precompute_owner_interface_transfer_constants(module: &mut OwnerInterfaceTransferModule) {
+    let candidates = module
+        .result
+        .owners
+        .iter()
+        .filter(|interface| owner_result_transfer_is_invocation_invariant(interface))
+        .map(|interface| interface.owner.clone())
+        .collect::<Vec<_>>();
+    let mut constants = BTreeMap::new();
+    for owner in candidates {
+        let mut unifier = TypeUnifier::default();
+        let providers = BTreeMap::new();
+        let mut evaluator = OwnerResultTransferEvaluator::new(&providers, &mut unifier);
+        let Some(result) =
+            evaluator.evaluate_owner_in_module(module, &owner, &BTreeMap::new(), None)
+        else {
+            continue;
+        };
+        let mut variables = BTreeSet::new();
+        crate::collect_type_vars(&result.value.flow_type.ty, &mut variables);
+        if variables.is_empty() {
+            constants.insert(owner, result.value);
+        }
+    }
+    module.constant_results = constants;
 }
 
 fn seal_owner_interface_transfer_module(
@@ -237,13 +300,16 @@ fn seal_owner_interface_transfer_module(
             dependency_fingerprints,
         ),
     )?;
-    Ok(OwnerInterfaceTransferModule {
+    let mut module = OwnerInterfaceTransferModule {
         key: result.key.clone(),
         result,
         dependencies,
         routes,
+        constant_results: BTreeMap::new(),
         fingerprint_v1,
-    })
+    };
+    precompute_owner_interface_transfer_constants(&mut module);
+    Ok(module)
 }
 
 pub fn project_owner_interface_transfer_module(
@@ -3330,46 +3396,50 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 owned_variables: Vec::new(),
             });
         }
-        let evaluated = match &interface.result_transfer {
-            OwnerResultTransfer::Principal => None,
-            OwnerResultTransfer::Parameter { read } => {
-                arguments.get(&read.parameter_ordinal).and_then(|actual| {
-                    let ty = if read.projection.is_empty() {
-                        Some(actual.flow_type.ty.clone())
-                    } else {
-                        crate::type_for_nested_path(&actual.flow_type.ty, &read.projection)
-                    }?;
-                    Some(EvaluatedResultValue {
-                        flow_type: FlowType {
-                            mode: actual.flow_type.mode,
-                            ty,
-                        },
-                        parameter_derived: true,
-                        syntax_selected: actual.syntax_selected,
-                        static_number: read
-                            .projection
-                            .is_empty()
-                            .then(|| actual.static_number.clone())
-                            .flatten(),
+        let evaluated = if let Some(value) = module.constant_result(owner) {
+            Some(value.clone())
+        } else {
+            match &interface.result_transfer {
+                OwnerResultTransfer::Principal => None,
+                OwnerResultTransfer::Parameter { read } => {
+                    arguments.get(&read.parameter_ordinal).and_then(|actual| {
+                        let ty = if read.projection.is_empty() {
+                            Some(actual.flow_type.ty.clone())
+                        } else {
+                            crate::type_for_nested_path(&actual.flow_type.ty, &read.projection)
+                        }?;
+                        Some(EvaluatedResultValue {
+                            flow_type: FlowType {
+                                mode: actual.flow_type.mode,
+                                ty,
+                            },
+                            parameter_derived: true,
+                            syntax_selected: actual.syntax_selected,
+                            static_number: read
+                                .projection
+                                .is_empty()
+                                .then(|| actual.static_number.clone())
+                                .flatten(),
+                        })
                     })
-                })
-            }
-            OwnerResultTransfer::Expression { root, nodes } => {
-                // Allocate the complete interface alpha namespace up front,
-                // but instantiate node fallback types only if the selected
-                // transfer walk reaches them. Concrete WHEN arms commonly
-                // leave most of a large result-transfer graph untouched.
-                let mut fallbacks = OwnerResultTransferFallbacks::new(variables, substitutions);
-                self.evaluate_expression_ref(
-                    module,
-                    root,
-                    nodes,
-                    arguments,
-                    context,
-                    &mut fallbacks,
-                    &BTreeMap::new(),
-                    &mut BTreeSet::new(),
-                )
+                }
+                OwnerResultTransfer::Expression { root, nodes } => {
+                    // Allocate the complete interface alpha namespace up front,
+                    // but instantiate node fallback types only if the selected
+                    // transfer walk reaches them. Concrete WHEN arms commonly
+                    // leave most of a large result-transfer graph untouched.
+                    let mut fallbacks = OwnerResultTransferFallbacks::new(variables, substitutions);
+                    self.evaluate_expression_ref(
+                        module,
+                        root,
+                        nodes,
+                        arguments,
+                        context,
+                        &mut fallbacks,
+                        &BTreeMap::new(),
+                        &mut BTreeSet::new(),
+                    )
+                }
             }
         };
         self.active_owners.remove(owner);
@@ -6637,6 +6707,79 @@ mod tests {
         assert!(replayed.value.parameter_derived);
         assert!(replayed.value.syntax_selected);
         assert_eq!(replayed.value.static_number, Some(ExactNumber::from_i64(7)));
+    }
+
+    #[test]
+    fn transfer_modules_precompute_only_occurrence_invariant_results() {
+        let unit = link(concat!(
+            "FUNCTION label(ignored) {\n",
+            "    TEXT { fixed }\n",
+            "}\n",
+            "FUNCTION identity(input) {\n",
+            "    input\n",
+            "}\n",
+            "value: [label: label(ignored: 1), identity: identity(input: 1)]\n",
+        ));
+        let label_owner = owner_named(&unit, "label");
+        let identity_owner = owner_named(&unit, "identity");
+        let value_owner = owner_named(&unit, "value");
+        let (_, _, label_seed) = inputs(&unit, &label_owner);
+        let (_, _, identity_seed) = inputs(&unit, &identity_owner);
+        let (_, _, value_seed) = inputs(&unit, &value_owner);
+        let label_summary = resolve_owner_constraint_seed(&label_seed, []).unwrap();
+        let identity_summary = resolve_owner_constraint_seed(&identity_seed, []).unwrap();
+        let value_summary = resolve_owner_constraint_seed(&value_seed, []).unwrap();
+        let results = solve(
+            &[label_seed.clone(), identity_seed.clone(), value_seed],
+            &[
+                label_summary.clone(),
+                identity_summary.clone(),
+                value_summary,
+            ],
+        );
+        let label_plan = plan_owner_body_interfaces(&label_seed, &label_summary, &results).unwrap();
+        let label = label_plan
+            .own_scc
+            .module
+            .constant_result(&label_owner)
+            .expect("constant Text transfer must be compiled once by its module");
+        assert_eq!(label.flow_type.ty, Type::Text);
+        assert_eq!(label.static_number, None);
+        let providers = BTreeMap::from([(label_owner.clone(), label_plan.own_scc.module.as_ref())]);
+        let arguments = BTreeMap::from([(
+            0,
+            EvaluatedResultValue {
+                flow_type: FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: Type::Number,
+                },
+                parameter_derived: false,
+                syntax_selected: false,
+                static_number: Some(ExactNumber::from_i64(1)),
+            },
+        )]);
+        let mut unifier = TypeUnifier::default();
+        let mut evaluator = OwnerResultTransferEvaluator::new(&providers, &mut unifier);
+        let evaluated = evaluator
+            .evaluate_owner(&label_owner, &arguments, None)
+            .expect("constant result must retain occurrence metadata");
+        assert_eq!(evaluated.value.flow_type.ty, Type::Text);
+        assert!(
+            evaluated
+                .type_substitutions
+                .iter()
+                .any(|(_, value)| value == &Type::Number)
+        );
+        let identity_plan =
+            plan_owner_body_interfaces(&identity_seed, &identity_summary, &results).unwrap();
+        assert!(
+            identity_plan
+                .own_scc
+                .module
+                .constant_result(&identity_owner)
+                .is_none(),
+            "parameter-dependent transfers must remain occurrence-local"
+        );
     }
 
     #[test]

@@ -8,16 +8,15 @@
 use crate::{
     HostPortSyntaxTable, OwnerAbiEnvironment, OwnerBodyInferenceShard, OwnerConstraintSummary,
     OwnerContainingScopeInput, OwnerEffectiveLexicalTarget, OwnerExpressionRef,
-    OwnerInferenceAbiEnvironment, OwnerInferenceExpressionId, OwnerInferenceExpressionRef,
-    OwnerLexicalAccess, OwnerLexicalDeclarationTarget, OwnerLexicalPlan,
-    OwnerSignatureOutputBindingPlan, OwnerSourceAnchorRole, OwnerSourceAnchorSite, OwnerSourceMap,
-    OwnerStatementId, OwnerSyntaxGraph, OwnerSyntaxInput, RenderContractRegistry,
-    SourcePayloadPathLookup, TypecheckSyntaxProgram, canonicalize_diagnostics, diagnostic_at_line,
-    host_port_payload_types, host_port_table, http_response_type_is_valid, open_object_type,
-    render_slot_type_error, statement_contains_output_authority, statement_is_empty_delimiter,
-    substitute_checked_type, type_contains_absence, type_for_nested_path,
-    type_is_deferred_order_key, type_is_orderable_key, type_may_be_ordered_list,
-    union_structural_type, websocket_actions_type_is_valid,
+    OwnerInferenceAbiEnvironment, OwnerInferenceExpressionRef, OwnerLexicalAccess,
+    OwnerLexicalDeclarationTarget, OwnerLexicalPlan, OwnerSignatureOutputBindingPlan,
+    OwnerSourceAnchorRole, OwnerSourceAnchorSite, OwnerSourceMap, OwnerStatementId,
+    OwnerSyntaxGraph, OwnerSyntaxInput, RenderContractRegistry, SourcePayloadPathLookup,
+    TypecheckSyntaxProgram, canonicalize_diagnostics, diagnostic_at_line, host_port_payload_types,
+    host_port_table, http_response_type_is_valid, open_object_type, render_slot_type_error,
+    statement_contains_output_authority, statement_is_empty_delimiter, substitute_checked_type,
+    type_contains_absence, type_for_nested_path, type_is_deferred_order_key, type_is_orderable_key,
+    type_may_be_ordered_list, union_structural_type, websocket_actions_type_is_valid,
 };
 use boon_checked::{
     CheckedCallableKind, CheckedEffectSummary, CheckedValueUse, DiagnosticSeverity, FlowMode,
@@ -38,9 +37,9 @@ use std::fmt;
 use std::sync::Arc;
 
 const PROJECT_DIAGNOSTIC_FACTS_DOMAIN_V10: &[u8] = b"boon.project-diagnostic-facts.v10\0";
-const OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V3: &[u8] = b"boon.owner-diagnostic-replay-facts.v3\0";
-const OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V3: &[u8] =
-    b"boon.owner-diagnostic-replay-currentness.v3\0";
+const OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V4: &[u8] = b"boon.owner-diagnostic-replay-facts.v4\0";
+const OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V4: &[u8] =
+    b"boon.owner-diagnostic-replay-currentness.v4\0";
 const PROJECT_OUTPUT_FLOW_FACTS_DOMAIN_V1: &[u8] = b"boon.project-output-flow-facts.v1\0";
 const SOURCE_UNIT_PROJECT_DIAGNOSTICS_DOMAIN_V1: &[u8] =
     b"boon.source-unit-project-diagnostics.v1\0";
@@ -504,19 +503,35 @@ struct OwnerDiagnosticStableExpressionFlow {
     expression: StableExpressionKey,
     flow_type: FlowType,
     flush_type: Option<Type>,
+    direct_effect: CheckedEffectSummary,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct OwnerDiagnosticStableCallDispositionFact {
-    expression: StableExpressionKey,
-    fact: crate::OwnerDiagnosticCallFact,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct OwnerDiagnosticStableCallInputFact {
-    call: StableExpressionKey,
+struct OwnerDiagnosticStableCallActualFact {
     input: ProjectOrderExpressionFact,
     actual_type: Type,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerDiagnosticStableMatchedInputFact {
+    formal_ordinal: u32,
+    formal_name: String,
+    formal_kind: crate::OwnerParameterKind,
+    expression: ProjectOrderExpressionFact,
+    from_pipe: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerDiagnosticStableCallFact {
+    expression: StableExpressionKey,
+    function: String,
+    target: crate::InferredOwnerCallableTarget,
+    inputs: Box<[OwnerDiagnosticStableCallActualFact]>,
+    valid: bool,
+    result: FlowType,
+    diagnostic: crate::OwnerDiagnosticCallFact,
+    matched_inputs: Box<[OwnerDiagnosticStableMatchedInputFact]>,
+    explicit_pass: Option<ProjectOrderExpressionFact>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -575,8 +590,7 @@ pub struct OwnerDiagnosticReplayFacts {
     function_name: Option<String>,
     expression_flows: Box<[OwnerDiagnosticStableExpressionFlow]>,
     statement_values: Box<[OwnerDiagnosticStableStatementValue]>,
-    call_inputs: Box<[OwnerDiagnosticStableCallInputFact]>,
-    call_dispositions: Box<[OwnerDiagnosticStableCallDispositionFact]>,
+    calls: Box<[OwnerDiagnosticStableCallFact]>,
     reads: Box<[OwnerDiagnosticStableReadFact]>,
     output_declarations: Box<[OwnerDiagnosticOutputDeclarationFact]>,
     output_calls: Box<[OwnerDiagnosticOutputCallFact]>,
@@ -660,6 +674,17 @@ impl OwnerDiagnosticReplayFactsEvaluation {
         self.currentness
             .matches_inputs(syntax, lexical_plan, body, abi)
             && self.currentness.result_fingerprint_v1 == self.result.fingerprint_v1()
+    }
+
+    fn matches_project_inputs(
+        &self,
+        syntax: &OwnerSyntaxInput,
+        lexical_plan: &OwnerLexicalPlan,
+        summary: &OwnerConstraintSummary,
+        abi: &OwnerInferenceAbiEnvironment,
+    ) -> bool {
+        self.matches_inputs(syntax, lexical_plan, &self.body, abi)
+            && summary.matches_signature_plan(&self.body.signature_lexical_plan)
     }
 }
 
@@ -822,8 +847,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         });
     }
 
-    let mut call_dispositions = Vec::with_capacity(body.calls.len());
-    let mut call_inputs = Vec::new();
+    let mut calls = Vec::with_capacity(body.calls.len());
     let mut output_calls = Vec::new();
     for call in &body.calls {
         let Some(expression_index) = stable_expressions.get(&call.expression).copied() else {
@@ -861,30 +885,28 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
                 ));
             }
         };
-        let fact = crate::OwnerDiagnosticCallFact {
+        let diagnostic = crate::OwnerDiagnosticCallFact {
             disposition,
             effect: call.effect,
             type_substitutions: call.type_substitutions.clone(),
         };
-        call_dispositions.push(OwnerDiagnosticStableCallDispositionFact {
-            expression: call.expression.clone(),
-            fact: fact.clone(),
-        });
-        for input in &call.inputs {
-            let stable_input = owner_diagnostic_stable_expression(syntax, &input.expression)
-                .ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "owner diagnostic replay call input has no exact stable expression",
-                    )
-                })?;
-            call_inputs.push(OwnerDiagnosticStableCallInputFact {
-                call: call.expression.clone(),
-                input: stable_input,
-                actual_type: input.actual_type.clone(),
-            });
-        }
-
-        if call.valid {
+        let inputs = call
+            .inputs
+            .iter()
+            .map(|input| {
+                let stable_input = owner_diagnostic_stable_expression(syntax, &input.expression)
+                    .ok_or_else(|| {
+                        ProjectDiagnosticFactsError::new(
+                            "owner diagnostic replay call input has no exact stable expression",
+                        )
+                    })?;
+                Ok(OwnerDiagnosticStableCallActualFact {
+                    input: stable_input,
+                    actual_type: input.actual_type.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, ProjectDiagnosticFactsError>>()?;
+        let plan = if call.valid {
             let plan = body
                 .signature_lexical_plan
                 .call(expression_index)
@@ -901,7 +923,53 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
                     "valid owner diagnostic replay call differs from its signature lexical row",
                 ));
             }
-            let target = match &fact.disposition {
+            Some(plan)
+        } else {
+            None
+        };
+        let matched_inputs = plan
+            .into_iter()
+            .flat_map(|plan| plan.matched_inputs.iter())
+            .map(|input| {
+                let expression = owner_diagnostic_stable_dense_expression(syntax, input.expression)
+                    .ok_or_else(|| {
+                        ProjectDiagnosticFactsError::new(
+                            "valid owner diagnostic replay matched input has no stable expression",
+                        )
+                    })?;
+                Ok(OwnerDiagnosticStableMatchedInputFact {
+                    formal_ordinal: input.formal_ordinal,
+                    formal_name: input.formal_name.clone(),
+                    formal_kind: input.formal_kind,
+                    expression,
+                    from_pipe: input.from_pipe,
+                })
+            })
+            .collect::<Result<Vec<_>, ProjectDiagnosticFactsError>>()?;
+        let explicit_pass = plan
+            .and_then(|plan| plan.explicit_pass.as_ref())
+            .map(|pass| {
+                owner_diagnostic_stable_dense_expression(syntax, pass.expression).ok_or_else(|| {
+                    ProjectDiagnosticFactsError::new(
+                        "valid owner diagnostic replay PASS has no stable expression",
+                    )
+                })
+            })
+            .transpose()?;
+        calls.push(OwnerDiagnosticStableCallFact {
+            expression: call.expression.clone(),
+            function: call.function.clone(),
+            target: call.target.clone(),
+            inputs: inputs.into_boxed_slice(),
+            valid: call.valid,
+            result: call.result.clone(),
+            diagnostic: diagnostic.clone(),
+            matched_inputs: matched_inputs.into_boxed_slice(),
+            explicit_pass,
+        });
+
+        if let Some(plan) = plan {
+            let target = match &diagnostic.disposition {
                 crate::OwnerDiagnosticCallDisposition::User { owner } => {
                     OwnerDiagnosticOutputCallTargetFact::Owner {
                         owner: owner.clone(),
@@ -978,8 +1046,8 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
             });
         }
     }
-    call_dispositions.sort_by(|left, right| left.expression.cmp(&right.expression));
-    if call_dispositions
+    calls.sort_by(|left, right| left.expression.cmp(&right.expression));
+    if calls
         .windows(2)
         .any(|rows| rows[0].expression == rows[1].expression)
     {
@@ -987,18 +1055,6 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
             "owner diagnostic replay contains duplicate call expressions",
         ));
     }
-    call_inputs.sort_by(|left, right| (&left.call, &left.input).cmp(&(&right.call, &right.input)));
-    for rows in call_inputs.windows(2) {
-        if rows[0].call == rows[1].call
-            && rows[0].input == rows[1].input
-            && rows[0].actual_type != rows[1].actual_type
-        {
-            return Err(ProjectDiagnosticFactsError::new(
-                "owner diagnostic replay call input has conflicting pre-consumer types",
-            ));
-        }
-    }
-    call_inputs.dedup();
     output_declarations.sort_by(|left, right| left.target.cmp(&right.target));
     if output_declarations
         .windows(2)
@@ -1032,6 +1088,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
             expression: expression.stable_key.clone(),
             flow_type: expression.flow_type.clone(),
             flush_type: expression.flush_type.clone(),
+            direct_effect: expression.direct_effect,
         })
         .collect::<Vec<_>>();
     let mut reads = body
@@ -1063,15 +1120,14 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         });
     let containing_scope = syntax.containing_scope.clone();
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V3,
+        OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V4,
         &(
             &syntax.owner,
             &containing_scope,
             &function_name,
             &expression_flows,
             &statement_values,
-            &call_inputs,
-            &call_dispositions,
+            &calls,
             &reads,
             &output_declarations,
             &output_calls,
@@ -1088,8 +1144,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         function_name,
         expression_flows: expression_flows.into_boxed_slice(),
         statement_values: statement_values.into_boxed_slice(),
-        call_inputs: call_inputs.into_boxed_slice(),
-        call_dispositions: call_dispositions.into_boxed_slice(),
+        calls: calls.into_boxed_slice(),
         reads: reads.into_boxed_slice(),
         output_declarations: output_declarations.into_boxed_slice(),
         output_calls: output_calls.into_boxed_slice(),
@@ -1129,7 +1184,7 @@ pub fn evaluate_owner_diagnostic_replay_facts(
     )?);
     let result_fingerprint_v1 = result.fingerprint_v1();
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V3,
+        OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V4,
         &(&basis, result_fingerprint_v1),
     )
     .map_err(|error| {
@@ -1152,7 +1207,6 @@ struct OwnerFactView<'a> {
     syntax: &'a OwnerSyntaxInput,
     graph: &'a OwnerSyntaxGraph,
     interface: &'a crate::OwnerPublicInterface,
-    body: &'a OwnerBodyInferenceShard,
     replay: &'a OwnerDiagnosticReplayFacts,
     source_map: &'a OwnerSourceMap,
 }
@@ -1183,8 +1237,8 @@ struct ProjectFactIndex<'a> {
     syntax_expressions: BTreeMap<StableOrderExpression, usize>,
     statement_spans: BTreeMap<StableStatementKey, TypeDiagnosticSpan>,
     expression_spans: BTreeMap<StableOrderExpression, TypeDiagnosticSpan>,
-    calls: BTreeMap<StableOrderExpression, &'a crate::InferredOwnerCall>,
-    all_calls: BTreeMap<StableOrderExpression, &'a crate::InferredOwnerCall>,
+    calls: BTreeMap<StableOrderExpression, &'a OwnerDiagnosticStableCallFact>,
+    all_calls: BTreeMap<StableOrderExpression, &'a OwnerDiagnosticStableCallFact>,
     value_resolutions: BTreeMap<StableOrderExpression, &'a crate::OwnerSymbolResolution>,
     value_actuals_by_parameter: BTreeMap<(StableCheckOwnerKey, u32), Vec<StableOrderExpression>>,
     callable_owner_by_owner: BTreeMap<StableCheckOwnerKey, Option<StableCheckOwnerKey>>,
@@ -1359,7 +1413,6 @@ impl<'a> ProjectFactIndex<'a> {
             let interface = interfaces[owner];
             let replay_evaluation = replay_evaluations[owner];
             let replay = replay_facts[owner];
-            let body = replay_evaluation.body.as_ref();
             let inference_abi = inference_abis[owner];
             let source_map = source_maps[owner];
             let (layout_start_line, layout_start_byte) = source_layouts
@@ -1375,68 +1428,45 @@ impl<'a> ProjectFactIndex<'a> {
                     "project diagnostic lexical plan does not match syntax for {owner:?}"
                 )));
             }
-            if body.owner != *owner || !body.signature_lexical_plan.matches_base(lexical_plan) {
-                return Err(ProjectDiagnosticFactsError::new(format!(
-                    "project diagnostic body does not match the lexical plan for {owner:?}"
-                )));
-            }
             if replay.owner != *owner || replay.containing_scope != syntax.containing_scope {
                 return Err(ProjectDiagnosticFactsError::new(format!(
                     "project diagnostic replay facts do not match owner inputs for {owner:?}"
                 )));
             }
-            if !replay_evaluation.matches_inputs(syntax, lexical_plan, body, inference_abi)
-                || replay_evaluation.currentness.result_fingerprint_v1 != replay.fingerprint_v1()
+            if !replay_evaluation.matches_project_inputs(
+                syntax,
+                lexical_plan,
+                summary,
+                inference_abi,
+            ) || replay_evaluation.currentness.result_fingerprint_v1 != replay.fingerprint_v1()
             {
                 return Err(ProjectDiagnosticFactsError::new(format!(
                     "project diagnostic replay currentness does not match owner inputs for {owner:?}"
                 )));
             }
-            if !summary.matches_signature_plan(&body.signature_lexical_plan) {
+            if replay.expression_flows.len() != syntax.expressions.len() {
                 return Err(ProjectDiagnosticFactsError::new(format!(
-                    "project diagnostic constraint summary does not match the signature plan for {owner:?}"
+                    "project diagnostic replay expression coverage differs from syntax for {owner:?}"
                 )));
             }
-            if body.statements.len() != syntax.statements.len()
-                || body.expressions.len() != syntax.expressions.len()
-            {
-                return Err(ProjectDiagnosticFactsError::new(format!(
-                    "project diagnostic body row coverage differs from syntax for {owner:?}"
-                )));
-            }
-            for (index, (statement, input)) in
-                body.statements.iter().zip(&syntax.statements).enumerate()
-            {
-                if statement.id.0 as usize != index
-                    || input.id as usize != index
-                    || statement.stable_key != input.stable_key
-                    || statement.kind != input.kind
-                    || statement.expression.map(|expression| expression.0) != input.expression
-                {
+            for (index, input) in syntax.statements.iter().enumerate() {
+                if input.id as usize != index {
                     return Err(ProjectDiagnosticFactsError::new(format!(
-                        "project diagnostic statement row differs from syntax for {owner:?}"
+                        "project diagnostic syntax statement index is not dense for {owner:?}"
                     )));
                 }
             }
-            for (index, (expression, input)) in
-                body.expressions.iter().zip(&syntax.expressions).enumerate()
-            {
-                if expression.id.0 as usize != index
-                    || expression.stable_key != input.stable_key
-                    || expression.kind != input.kind
-                {
+            for (flow, input) in replay.expression_flows.iter().zip(&syntax.expressions) {
+                if flow.expression != input.stable_key {
                     return Err(ProjectDiagnosticFactsError::new(format!(
-                        "project diagnostic expression row differs from syntax for {owner:?}"
+                        "project diagnostic replay expression row differs from syntax for {owner:?}"
                     )));
                 }
             }
             let graph = lexical_plan.graph();
-            for statement in &body.statements {
+            for statement in &syntax.statements {
                 if statements
-                    .insert(
-                        statement.stable_key.clone(),
-                        (owner.clone(), statement.id.0),
-                    )
+                    .insert(statement.stable_key.clone(), (owner.clone(), statement.id))
                     .is_some()
                 {
                     return Err(ProjectDiagnosticFactsError::new(
@@ -1444,14 +1474,18 @@ impl<'a> ProjectFactIndex<'a> {
                     ));
                 }
             }
-            for expression in &body.expressions {
+            for (index, expression) in syntax.expressions.iter().enumerate() {
                 if expressions
                     .insert(
                         StableOrderExpression {
                             owner: owner.clone(),
                             expression: expression.stable_key.clone(),
                         },
-                        expression.id.0,
+                        u32::try_from(index).map_err(|_| {
+                            ProjectDiagnosticFactsError::new(
+                                "project diagnostic owner expression count exceeds u32",
+                            )
+                        })?,
                     )
                     .is_some()
                 {
@@ -1495,7 +1529,7 @@ impl<'a> ProjectFactIndex<'a> {
                     ));
                 }
             }
-            for call in &body.calls {
+            for call in &replay.calls {
                 let expression = StableOrderExpression {
                     owner: owner.clone(),
                     expression: call.expression.clone(),
@@ -1530,7 +1564,6 @@ impl<'a> ProjectFactIndex<'a> {
                     syntax,
                     graph,
                     interface,
-                    body,
                     replay,
                     source_map,
                 },
@@ -1623,46 +1656,24 @@ impl<'a> ProjectFactIndex<'a> {
 
     fn index_parameter_actuals(&mut self) -> Result<(), ProjectDiagnosticFactsError> {
         let mut values = BTreeMap::<(StableCheckOwnerKey, u32), Vec<StableOrderExpression>>::new();
-        for (call_expression, call) in &self.calls {
+        for call in self.calls.values() {
             let crate::InferredOwnerCallableTarget::Owner { owner: callee } = &call.target else {
                 continue;
             };
-            let (view, expression, _, _) =
-                self.order_expression(call_expression).ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "valid owner call has no exact diagnostic expression row",
-                    )
-                })?;
-            let plan = view
-                .body
-                .signature_lexical_plan
-                .call(expression)
-                .ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "valid owner call has no exact signature lexical row",
-                    )
-                })?;
-            if !plan.valid {
+            if !call.valid {
                 return Err(ProjectDiagnosticFactsError::new(
-                    "valid owner call has an invalid signature lexical row",
+                    "valid owner call index contains an invalid replay row",
                 ));
             }
-            for input in plan
+            for input in call
                 .matched_inputs
                 .iter()
                 .filter(|input| input.formal_kind == crate::OwnerParameterKind::Value)
             {
-                let actual = self
-                    .stable_expression_ref(&call_expression.owner, input.expression)
-                    .ok_or_else(|| {
-                        ProjectDiagnosticFactsError::new(
-                            "valid owner call value input has no exact expression",
-                        )
-                    })?;
                 values
                     .entry((callee.clone(), input.formal_ordinal))
                     .or_default()
-                    .push(actual);
+                    .push(input.expression.clone());
             }
         }
         self.value_actuals_by_parameter = values;
@@ -1678,17 +1689,23 @@ impl<'a> ProjectFactIndex<'a> {
         &self,
         owner: &StableCheckOwnerKey,
         expression: &OwnerExpressionRef,
-    ) -> Option<(&crate::InferredOwnerExpression, &OwnerSourceMap)> {
+    ) -> Option<(&OwnerDiagnosticStableExpressionFlow, &OwnerSourceMap)> {
         match expression {
             OwnerExpressionRef::Local { expression } => {
                 let view = self.owners.get(owner)?;
-                let value = view.body.expressions.get(expression.0 as usize)?;
-                (value.id == OwnerInferenceExpressionId(expression.0))
-                    .then_some((value, view.source_map))
+                let value = view.replay.expression_flows.get(expression.0 as usize)?;
+                let syntax = view.syntax.expressions.get(expression.0 as usize)?;
+                (value.expression == syntax.stable_key).then_some((value, view.source_map))
             }
             OwnerExpressionRef::Child { owner, expression } => {
                 let view = self.owners.get(owner)?;
-                Some((view.body.expression(expression)?, view.source_map))
+                let stable = StableOrderExpression {
+                    owner: owner.clone(),
+                    expression: expression.clone(),
+                };
+                let index = *self.expressions.get(&stable)? as usize;
+                let value = view.replay.expression_flows.get(index)?;
+                (value.expression == *expression).then_some((value, view.source_map))
             }
         }
     }
@@ -1723,13 +1740,13 @@ impl<'a> ProjectFactIndex<'a> {
         &OwnerFactView<'a>,
         usize,
         &crate::OwnerExpressionInput,
-        &crate::InferredOwnerExpression,
+        &OwnerDiagnosticStableExpressionFlow,
     )> {
         let view = self.owners.get(&expression.owner)?;
         let index = *self.expressions.get(expression)? as usize;
         let syntax = view.syntax.expressions.get(index)?;
-        let inferred = view.body.expressions.get(index)?;
-        (syntax.stable_key == expression.expression && inferred.stable_key == expression.expression)
+        let inferred = view.replay.expression_flows.get(index)?;
+        (syntax.stable_key == expression.expression && inferred.expression == expression.expression)
             .then_some((view, index, syntax, inferred))
     }
 
@@ -1758,7 +1775,7 @@ impl<'a> ProjectFactIndex<'a> {
         })
     }
 
-    fn call(&self, expression: &StableOrderExpression) -> Option<&crate::InferredOwnerCall> {
+    fn call(&self, expression: &StableOrderExpression) -> Option<&OwnerDiagnosticStableCallFact> {
         self.calls.get(expression).copied()
     }
 
@@ -1770,23 +1787,27 @@ impl<'a> ProjectFactIndex<'a> {
     > {
         let mut exact_call_input_types = BTreeMap::new();
         for (owner, view) in &self.owners {
-            for input in &view.replay.call_inputs {
+            for call in &view.replay.calls {
                 let call_expression = StableOrderExpression {
                     owner: owner.clone(),
-                    expression: input.call.clone(),
+                    expression: call.expression.clone(),
                 };
-                match exact_call_input_types.entry((call_expression, input.input.clone())) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(input.actual_type.clone());
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry)
-                        if entry.get() != &input.actual_type =>
+                for input in &call.inputs {
+                    match exact_call_input_types
+                        .entry((call_expression.clone(), input.input.clone()))
                     {
-                        return Err(ProjectDiagnosticFactsError::new(
-                            "owner call input has conflicting pre-consumer types",
-                        ));
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(input.actual_type.clone());
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry)
+                            if entry.get() != &input.actual_type =>
+                        {
+                            return Err(ProjectDiagnosticFactsError::new(
+                                "owner call input has conflicting pre-consumer types",
+                            ));
+                        }
+                        std::collections::btree_map::Entry::Occupied(_) => {}
                     }
-                    std::collections::btree_map::Entry::Occupied(_) => {}
                 }
             }
         }
@@ -1805,7 +1826,7 @@ impl<'a> ProjectFactIndex<'a> {
         let mut calls = Vec::with_capacity(self.all_calls.len());
         let mut user_call_edges = Vec::new();
         for (owner, view) in &self.owners {
-            for call in &view.replay.call_dispositions {
+            for call in &view.replay.calls {
                 let stable = StableOrderExpression {
                     owner: owner.clone(),
                     expression: call.expression.clone(),
@@ -1817,7 +1838,7 @@ impl<'a> ProjectFactIndex<'a> {
                 })?;
                 if let crate::OwnerDiagnosticCallDisposition::User {
                     owner: callee_owner,
-                } = &call.fact.disposition
+                } = &call.diagnostic.disposition
                 {
                     let caller = self
                         .callable_owner(&stable.owner)
@@ -1836,7 +1857,7 @@ impl<'a> ProjectFactIndex<'a> {
                         user_call_edges.push((caller, callee));
                     }
                 }
-                calls.push((expression, call.fact.clone()));
+                calls.push((expression, call.diagnostic.clone()));
             }
         }
         calls.sort_unstable_by_key(|(expression, _)| *expression);
@@ -2016,18 +2037,14 @@ impl<'a> ProjectFactIndex<'a> {
             if &origin_owner != callee {
                 None
             } else {
-                let (view, local, _, _) = self.order_expression(expression)?;
-                let plan = view.body.signature_lexical_plan.call(local)?;
-                let actual = plan
+                let actual = call
                     .matched_inputs
                     .iter()
                     .find(|input| {
                         input.formal_kind == crate::OwnerParameterKind::Value
                             && input.formal_ordinal == ordinal
                     })
-                    .and_then(|input| {
-                        self.stable_expression_ref(&expression.owner, input.expression)
-                    })?;
+                    .map(|input| input.expression.clone())?;
                 self.deferred_style_parameter_origin(&actual, &projection, active)
             }
         } else if let Some(crate::OwnerSymbolResolution::Resolved {
@@ -2224,14 +2241,13 @@ impl<'a> ProjectFactIndex<'a> {
         &self,
         expression: &StableOrderExpression,
     ) -> Option<&crate::OwnerEffectiveLexicalReadPlan> {
-        let local = *self.expressions.get(expression)? as usize;
-        self.owners
-            .get(&expression.owner)?
-            .body
-            .signature_lexical_plan
-            .reads()
-            .get(local)?
-            .as_ref()
+        let replay = self.owners.get(&expression.owner)?.replay;
+        replay
+            .reads
+            .binary_search_by(|row| row.expression.cmp(&expression.expression))
+            .ok()
+            .and_then(|index| replay.reads.get(index))
+            .map(|row| &row.read)
     }
 
     fn expression_is_parameter_read(&self, expression: &StableOrderExpression) -> bool {
@@ -2311,8 +2327,8 @@ impl<'a> ProjectFactIndex<'a> {
             OwnerDeclarationStableKey::Public => self
                 .owners
                 .get(owner)
-                .and_then(|view| view.body.statements.first())
-                .map(|statement| statement.id.0),
+                .and_then(|view| view.syntax.statements.first())
+                .map(|statement| statement.id),
             OwnerDeclarationStableKey::Statement { statement } => self
                 .statements
                 .get(statement)
@@ -2451,10 +2467,10 @@ impl<'a> ProjectFactIndex<'a> {
 
     fn public_result(&self, owner: &StableCheckOwnerKey) -> Option<StableOrderExpression> {
         let view = self.owners.get(owner)?;
-        let root = view.body.statements.first()?;
+        let root = view.syntax.statements.first()?;
         let value = view
             .graph
-            .statement(OwnerStatementId(root.id.0))?
+            .statement(OwnerStatementId(root.id))?
             .canonical_value
             .as_ref()?;
         match value {
@@ -2528,10 +2544,10 @@ impl<'a> ProjectFactIndex<'a> {
             })?;
         let span = self.expression_span(&StableOrderExpression {
             owner: source_map.owner().clone(),
-            expression: expression.stable_key.clone(),
+            expression: expression.expression.clone(),
         })?;
         Ok(Some((
-            expression.stable_key.clone(),
+            expression.expression.clone(),
             expression.flow_type.clone(),
             expression.flush_type.clone(),
             span,
@@ -2930,8 +2946,8 @@ impl<'index, 'project> ProjectFlowModeAnalyzer<'index, 'project> {
         extra_projection: &[String],
         frames: &[ProjectOrderFrame],
     ) -> Option<FlowMode> {
-        let (view, index, _, inferred) = self.index.order_expression(expression)?;
-        if let Some(read) = view.body.signature_lexical_plan.reads()[index].as_ref() {
+        let (_, _, _, inferred) = self.index.order_expression(expression)?;
+        if let Some(read) = self.index.effective_read(expression) {
             let projection = read
                 .projection
                 .iter()
@@ -3266,7 +3282,7 @@ impl<'index, 'project> ProjectFlowModeAnalyzer<'index, 'project> {
         let mode = self
             .index
             .order_expression(expression)
-            .and_then(|(view, index, syntax, _)| match &syntax.kind {
+            .and_then(|(_, _, syntax, _)| match &syntax.kind {
                 AstExprKind::ListLiteral { items, .. } => {
                     Self::merge(items.iter().filter_map(|item| {
                         self.expression_ref(&expression.owner, *item)
@@ -3302,8 +3318,7 @@ impl<'index, 'project> ProjectFlowModeAnalyzer<'index, 'project> {
                     }))
                 }
                 AstExprKind::Identifier(_) | AstExprKind::Path(_) | AstExprKind::Drain { .. } => {
-                    let Some(read) = view.body.signature_lexical_plan.reads()[index].as_ref()
-                    else {
+                    let Some(read) = self.index.effective_read(expression) else {
                         let crate::OwnerSymbolResolution::Resolved {
                             owner,
                             projection: resolved_projection,
@@ -3977,51 +3992,35 @@ impl<'index, 'project> ProjectAuthorityAnalyzer<'index, 'project> {
         expression: &StableOrderExpression,
         name: &str,
     ) -> Option<StableOrderExpression> {
-        let (view, index, _, _) = self.index.order_expression(expression)?;
-        let plan = view.body.signature_lexical_plan.call(index)?;
-        let input = plan
+        let call = self.index.call(expression)?;
+        let input = call
             .matched_inputs
             .iter()
             .find(|input| input.formal_name == name)?;
-        self.index
-            .stable_expression_ref(&expression.owner, input.expression)
+        Some(input.expression.clone())
     }
 
     fn pipe_input(&self, expression: &StableOrderExpression) -> Option<StableOrderExpression> {
-        let (view, index, _, _) = self.index.order_expression(expression)?;
-        let plan = view.body.signature_lexical_plan.call(index)?;
-        let input = plan.matched_inputs.iter().find(|input| input.from_pipe)?;
-        self.index
-            .stable_expression_ref(&expression.owner, input.expression)
+        let call = self.index.call(expression)?;
+        call.matched_inputs
+            .iter()
+            .find(|input| input.from_pipe)
+            .map(|input| input.expression.clone())
     }
 
     fn call_value_inputs(
         &self,
         expression: &StableOrderExpression,
     ) -> Result<Vec<(u32, StableOrderExpression)>, ProjectDiagnosticFactsError> {
-        let Some((view, index, _, _)) = self.index.order_expression(expression) else {
+        let Some(call) = self.index.call(expression) else {
             return Err(ProjectDiagnosticFactsError::new(
-                "collection authority call has no exact owner expression",
+                "valid collection authority call has no exact replay row",
             ));
         };
-        let Some(plan) = view.body.signature_lexical_plan.call(index) else {
-            return Err(ProjectDiagnosticFactsError::new(
-                "valid collection authority call has no exact signature plan",
-            ));
-        };
-        plan.matched_inputs
+        call.matched_inputs
             .iter()
             .filter(|input| input.formal_kind == crate::OwnerParameterKind::Value)
-            .map(|input| {
-                self.index
-                    .stable_expression_ref(&expression.owner, input.expression)
-                    .map(|expression| (input.formal_ordinal, expression))
-                    .ok_or_else(|| {
-                        ProjectDiagnosticFactsError::new(
-                            "collection authority call input has no stable expression",
-                        )
-                    })
-            })
+            .map(|input| Ok((input.formal_ordinal, input.expression.clone())))
             .collect()
     }
 
@@ -5276,8 +5275,7 @@ impl<'index, 'project> ProjectOrderAnalyzer<'index, 'project> {
         expression: &StableOrderExpression,
         frames: &[ProjectOrderFrame],
     ) -> Option<(StableOrderExpression, usize, bool)> {
-        let (view, index, _, _) = self.index.order_expression(expression)?;
-        if let Some(read) = view.body.signature_lexical_plan.reads()[index].as_ref() {
+        if let Some(read) = self.index.effective_read(expression) {
             let projection_is_empty = read.projection.is_empty();
             let value = match &read.target {
                 crate::OwnerEffectiveLexicalTarget::Static { target } => match target {
@@ -5341,14 +5339,12 @@ impl<'index, 'project> ProjectOrderAnalyzer<'index, 'project> {
         call_expression: &StableOrderExpression,
         name: &str,
     ) -> Option<StableOrderExpression> {
-        let (view, index, _, _) = self.index.order_expression(call_expression)?;
-        let plan = view.body.signature_lexical_plan.call(index)?;
-        let input = plan
+        let call = self.index.call(call_expression)?;
+        let input = call
             .matched_inputs
             .iter()
             .find(|input| input.formal_name == name)?;
-        self.index
-            .stable_expression_ref(&call_expression.owner, input.expression)
+        Some(input.expression.clone())
     }
 
     fn call_frame(
@@ -5356,17 +5352,12 @@ impl<'index, 'project> ProjectOrderAnalyzer<'index, 'project> {
         call_expression: &StableOrderExpression,
         target: &StableCheckOwnerKey,
     ) -> Option<ProjectOrderFrame> {
-        let (view, index, _, _) = self.index.order_expression(call_expression)?;
-        let plan = view.body.signature_lexical_plan.call(index)?;
-        let bindings = plan
+        let call = self.index.call(call_expression)?;
+        let bindings = call
             .matched_inputs
             .iter()
             .filter(|input| input.formal_kind == crate::OwnerParameterKind::Value)
-            .filter_map(|input| {
-                self.index
-                    .stable_expression_ref(&call_expression.owner, input.expression)
-                    .map(|value| (input.formal_ordinal, value))
-            })
+            .map(|input| (input.formal_ordinal, input.expression.clone()))
             .collect();
         Some(ProjectOrderFrame {
             callable_owner: target.clone(),
@@ -5811,7 +5802,7 @@ impl<'index, 'project> ProjectOrderAnalyzer<'index, 'project> {
         if !active.insert((expression.clone(), frame_path.clone())) {
             return None;
         }
-        let Some((_, index, syntax, _)) = self.index.order_expression(expression) else {
+        let Some((_, _, syntax, _)) = self.index.order_expression(expression) else {
             active.remove(&(expression.clone(), frame_path));
             return None;
         };
@@ -5877,27 +5868,19 @@ impl<'index, 'project> ProjectOrderAnalyzer<'index, 'project> {
                             self.semantic_expression(&result, &nested, active)
                         }
                         crate::InferredOwnerCallableTarget::Authoritative => {
-                            let (view, _, _, _) = self.index.order_expression(expression)?;
-                            let plan = view.body.signature_lexical_plan.call(index)?;
                             let mut inputs = Vec::new();
-                            for input in plan.matched_inputs.iter().filter(|input| {
+                            for input in call.matched_inputs.iter().filter(|input| {
                                 input.formal_kind == crate::OwnerParameterKind::Value
                             }) {
-                                let value = self
-                                    .index
-                                    .stable_expression_ref(&expression.owner, input.expression)?;
                                 inputs.push((
                                     input.formal_name.clone(),
-                                    self.semantic_expression(&value, frames, active)?,
+                                    self.semantic_expression(&input.expression, frames, active)?,
                                 ));
                             }
-                            if let Some(pass) = &plan.explicit_pass {
-                                let value = self
-                                    .index
-                                    .stable_expression_ref(&expression.owner, pass.expression)?;
+                            if let Some(pass) = &call.explicit_pass {
                                 inputs.push((
                                     "PASS".to_owned(),
-                                    self.semantic_expression(&value, frames, active)?,
+                                    self.semantic_expression(pass, frames, active)?,
                                 ));
                             }
                             Some(ProjectOrderSemanticExpression::Call {
@@ -6028,11 +6011,15 @@ impl<'index, 'project> ProjectOrderAnalyzer<'index, 'project> {
             .map(|(_, _, _, expression)| expression.flow_type.ty.clone())
             .unwrap_or(Type::Unknown);
         if let Some(call) = self.index.call(call_expression) {
-            key_type = apply_checked_type_substitutions(&key_type, &call.type_substitutions);
+            key_type =
+                apply_checked_type_substitutions(&key_type, &call.diagnostic.type_substitutions);
         }
         for frame in frames.iter().rev() {
             if let Some(call) = self.index.call(&frame.call) {
-                key_type = apply_checked_type_substitutions(&key_type, &call.type_substitutions);
+                key_type = apply_checked_type_substitutions(
+                    &key_type,
+                    &call.diagnostic.type_substitutions,
+                );
             }
         }
         let (direction, semantic_direction) = self.order_direction(call_expression, frames);
@@ -6112,7 +6099,7 @@ impl<'index, 'project> ProjectOrderAnalyzer<'index, 'project> {
         if !active.insert((expression.clone(), frame_path.clone())) {
             return true;
         }
-        let Some((view, _, syntax, _)) = self.index.order_expression(expression) else {
+        let Some((_, _, syntax, _)) = self.index.order_expression(expression) else {
             return false;
         };
         let total = match &syntax.kind {
@@ -6149,32 +6136,13 @@ impl<'index, 'project> ProjectOrderAnalyzer<'index, 'project> {
                     self.expression_is_total(&result, &nested, active)
                 } else {
                     !crate::order_key_call_is_error_capable(&call.function)
-                        && view
-                            .body
-                            .signature_lexical_plan
-                            .call(
-                                *self
-                                    .index
-                                    .expressions
-                                    .get(expression)
-                                    .expect("order call belongs to indexed owner expression")
-                                    as usize,
-                            )
-                            .is_some_and(|plan| {
-                                plan.matched_inputs.iter().all(|input| {
-                                    self.index
-                                        .stable_expression_ref(&expression.owner, input.expression)
-                                        .is_some_and(|input| {
-                                            self.expression_is_total(&input, frames, active)
-                                        })
-                                }) && plan.explicit_pass.as_ref().is_none_or(|pass| {
-                                    self.index
-                                        .stable_expression_ref(&expression.owner, pass.expression)
-                                        .is_some_and(|pass| {
-                                            self.expression_is_total(&pass, frames, active)
-                                        })
-                                })
-                            })
+                        && call.matched_inputs.iter().all(|input| {
+                            self.expression_is_total(&input.expression, frames, active)
+                        })
+                        && call
+                            .explicit_pass
+                            .as_ref()
+                            .is_none_or(|pass| self.expression_is_total(pass, frames, active))
                 }
             }
             AstExprKind::Infix { left, op, right } => {
@@ -6292,20 +6260,14 @@ impl<'index, 'project> ProjectOrderAnalyzer<'index, 'project> {
         if matches!(
             &syntax.kind,
             AstExprKind::Call { .. } | AstExprKind::Pipe { .. }
-        ) && let Some(plan) = view.body.signature_lexical_plan.call(index)
+        ) && let Some(call) = self.index.call(expression)
         {
-            let pure = plan
+            let pure = call
                 .matched_inputs
                 .iter()
                 .filter(|input| input.formal_kind == crate::OwnerParameterKind::Value)
-                .filter_map(|input| {
-                    self.index
-                        .stable_expression_ref(&expression.owner, input.expression)
-                })
-                .chain(plan.explicit_pass.as_ref().and_then(|pass| {
-                    self.index
-                        .stable_expression_ref(&expression.owner, pass.expression)
-                }))
+                .map(|input| input.expression.clone())
+                .chain(call.explicit_pass.iter().cloned())
                 .all(|child| self.expression_is_pure(&child, frames, active));
             active.remove(&(expression.clone(), frame_path));
             return pure;

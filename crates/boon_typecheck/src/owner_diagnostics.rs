@@ -678,6 +678,8 @@ struct ProjectFactIndex<'a> {
     expressions: BTreeMap<StableOrderExpression, u32>,
     syntax_statements: BTreeMap<StableStatementKey, usize>,
     syntax_expressions: BTreeMap<StableOrderExpression, usize>,
+    statement_spans: BTreeMap<StableStatementKey, TypeDiagnosticSpan>,
+    expression_spans: BTreeMap<StableOrderExpression, TypeDiagnosticSpan>,
     calls: BTreeMap<StableOrderExpression, &'a crate::InferredOwnerCall>,
     all_calls: BTreeMap<StableOrderExpression, &'a crate::InferredOwnerCall>,
     value_resolutions: BTreeMap<StableOrderExpression, &'a crate::OwnerSymbolResolution>,
@@ -836,6 +838,23 @@ impl<'a> ProjectFactIndex<'a> {
         let mut owners = BTreeMap::new();
         let mut statements = BTreeMap::new();
         let mut expressions = BTreeMap::new();
+        let source_layouts = project
+            .source_layouts()
+            .iter()
+            .map(|layout| {
+                (
+                    &layout.source_unit_id,
+                    (layout.start_line, layout.start_byte),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if source_layouts.len() != project.source_layouts().len() {
+            return Err(ProjectDiagnosticFactsError::new(
+                "project diagnostic facts received duplicate source-unit layouts",
+            ));
+        }
+        let mut statement_spans = BTreeMap::new();
+        let mut expression_spans = BTreeMap::new();
         let mut calls = BTreeMap::new();
         let mut all_calls = BTreeMap::new();
         let mut value_resolutions = BTreeMap::new();
@@ -849,6 +868,14 @@ impl<'a> ProjectFactIndex<'a> {
             let replay = replay_facts[owner];
             let inference_abi = inference_abis[owner];
             let source_map = source_maps[owner];
+            let (layout_start_line, layout_start_byte) = source_layouts
+                .get(owner.source_unit_id())
+                .copied()
+                .ok_or_else(|| {
+                    ProjectDiagnosticFactsError::new(
+                        "project diagnostic owner has no source-unit layout",
+                    )
+                })?;
             if !lexical_plan.matches_input(syntax) {
                 return Err(ProjectDiagnosticFactsError::new(format!(
                     "project diagnostic lexical plan does not match syntax for {owner:?}"
@@ -939,6 +966,41 @@ impl<'a> ProjectFactIndex<'a> {
                     ));
                 }
             }
+            for source in source_map.statements() {
+                let span = global_local_span_from_offsets(
+                    layout_start_line,
+                    layout_start_byte,
+                    source.line,
+                    source.start,
+                    source.end,
+                )?;
+                if statement_spans
+                    .insert(source.stable_key.clone(), span)
+                    .is_some()
+                {
+                    return Err(ProjectDiagnosticFactsError::new(
+                        "project diagnostic facts received duplicate statement source span",
+                    ));
+                }
+            }
+            for source in source_map.expressions() {
+                let stable = StableOrderExpression {
+                    owner: owner.clone(),
+                    expression: source.expression.clone(),
+                };
+                let span = global_local_span_from_offsets(
+                    layout_start_line,
+                    layout_start_byte,
+                    source.line,
+                    source.start,
+                    source.end,
+                )?;
+                if expression_spans.insert(stable, span).is_some() {
+                    return Err(ProjectDiagnosticFactsError::new(
+                        "project diagnostic facts received duplicate expression source span",
+                    ));
+                }
+            }
             for call in &body.calls {
                 let expression = StableOrderExpression {
                     owner: owner.clone(),
@@ -987,6 +1049,8 @@ impl<'a> ProjectFactIndex<'a> {
             expressions,
             syntax_statements,
             syntax_expressions,
+            statement_spans,
+            expression_spans,
             calls,
             all_calls,
             value_resolutions,
@@ -1173,6 +1237,31 @@ impl<'a> ProjectFactIndex<'a> {
         let inferred = view.body.expressions.get(index)?;
         (syntax.stable_key == expression.expression && inferred.stable_key == expression.expression)
             .then_some((view, index, syntax, inferred))
+    }
+
+    fn expression_span(
+        &self,
+        expression: &StableOrderExpression,
+    ) -> Result<TypeDiagnosticSpan, ProjectDiagnosticFactsError> {
+        self.expression_spans
+            .get(expression)
+            .copied()
+            .ok_or_else(|| {
+                ProjectDiagnosticFactsError::new(
+                    "project diagnostic expression has no exact indexed source span",
+                )
+            })
+    }
+
+    fn statement_span(
+        &self,
+        statement: &StableStatementKey,
+    ) -> Result<TypeDiagnosticSpan, ProjectDiagnosticFactsError> {
+        self.statement_spans.get(statement).copied().ok_or_else(|| {
+            ProjectDiagnosticFactsError::new(
+                "project diagnostic statement has no exact indexed source span",
+            )
+        })
     }
 
     fn call(&self, expression: &StableOrderExpression) -> Option<&crate::InferredOwnerCall> {
@@ -1623,45 +1712,21 @@ impl<'a> ProjectFactIndex<'a> {
     > {
         let mut expression_spans = Vec::with_capacity(self.expressions.len());
         let mut statement_spans = Vec::with_capacity(self.statements.len());
-        for (owner, view) in &self.owners {
-            for source in view.source_map.expressions() {
-                let stable = StableOrderExpression {
-                    owner: owner.clone(),
-                    expression: source.expression.clone(),
-                };
-                let syntax_id = *self.syntax_expressions.get(&stable).ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "owner source-map expression has no exact project syntax identity",
-                    )
-                })?;
-                let span = global_local_span(
-                    self.project,
-                    view.source_map,
-                    source.line,
-                    source.start,
-                    source.end,
-                )?;
-                expression_spans.push((syntax_id, span.line, span.start, span.end));
-            }
-            for source in view.source_map.statements() {
-                let syntax_id =
-                    *self
-                        .syntax_statements
-                        .get(&source.stable_key)
-                        .ok_or_else(|| {
-                            ProjectDiagnosticFactsError::new(
-                                "owner source-map statement has no exact project syntax identity",
-                            )
-                        })?;
-                let span = global_local_span(
-                    self.project,
-                    view.source_map,
-                    source.line,
-                    source.start,
-                    source.end,
-                )?;
-                statement_spans.push((syntax_id, span.line, span.start, span.end));
-            }
+        for (stable, span) in &self.expression_spans {
+            let syntax_id = *self.syntax_expressions.get(stable).ok_or_else(|| {
+                ProjectDiagnosticFactsError::new(
+                    "owner source-map expression has no exact project syntax identity",
+                )
+            })?;
+            expression_spans.push((syntax_id, span.line, span.start, span.end));
+        }
+        for (stable, span) in &self.statement_spans {
+            let syntax_id = *self.syntax_statements.get(stable).ok_or_else(|| {
+                ProjectDiagnosticFactsError::new(
+                    "owner source-map statement has no exact project syntax identity",
+                )
+            })?;
+            statement_spans.push((syntax_id, span.line, span.start, span.end));
         }
         expression_spans.sort_unstable_by_key(|row| row.0);
         statement_spans.sort_unstable_by_key(|row| row.0);
@@ -1985,7 +2050,10 @@ impl<'a> ProjectFactIndex<'a> {
                     "project diagnostic statement value has no inferred expression",
                 )
             })?;
-        let span = global_expression_span(self.project, source_map, &expression.stable_key)?;
+        let span = self.expression_span(&StableOrderExpression {
+            owner: source_map.owner().clone(),
+            expression: expression.stable_key.clone(),
+        })?;
         Ok(Some((
             expression.stable_key.clone(),
             expression.flow_type.clone(),
@@ -3058,7 +3126,7 @@ fn temporal_diagnostics(
 ) -> Result<Vec<TypeDiagnostic>, ProjectDiagnosticFactsError> {
     let mut diagnostics = Vec::new();
     for expression in index.expressions.keys() {
-        let Some((view, _, syntax, _)) = index.order_expression(expression) else {
+        let Some((_, _, syntax, _)) = index.order_expression(expression) else {
             return Err(ProjectDiagnosticFactsError::new(
                 "temporal diagnostic expression is missing from its owner body",
             ));
@@ -3069,7 +3137,7 @@ fn temporal_diagnostics(
                 let Some(input) = index.stable_expression_ref(&expression.owner, reference) else {
                     continue;
                 };
-                let Some((input_view, _, _, inferred)) = index.order_expression(&input) else {
+                let Some((_, _, _, inferred)) = index.order_expression(&input) else {
                     continue;
                 };
                 let flow_type = FlowType {
@@ -3087,11 +3155,7 @@ fn temporal_diagnostics(
                     && !matches!(flow_type.ty, Type::Unknown)
                     && !crate::is_open_object_type(&flow_type.ty)
                 {
-                    let span = global_expression_span(
-                        index.project,
-                        input_view.source_map,
-                        &input.expression,
-                    )?;
+                    let span = index.expression_span(&input)?;
                     diagnostics.push(TypeDiagnostic {
                         severity: DiagnosticSeverity::Error,
                         line: span.line,
@@ -3102,8 +3166,7 @@ fn temporal_diagnostics(
                 }
             }
             AstExprKind::Latest { branches } if branches.len() == 1 => {
-                let span =
-                    global_expression_span(index.project, view.source_map, &expression.expression)?;
+                let span = index.expression_span(expression)?;
                 diagnostics.push(TypeDiagnostic {
                     severity: DiagnosticSeverity::Error,
                     line: span.line,
@@ -3149,7 +3212,7 @@ fn match_pattern_diagnostics(
             let Some(arm) = index.stable_expression_ref(&expression.owner, *arm as u32) else {
                 continue;
             };
-            let Some((view, _, arm_syntax, _)) = index.order_expression(&arm) else {
+            let Some((_, _, arm_syntax, _)) = index.order_expression(&arm) else {
                 continue;
             };
             let AstExprKind::MatchArm { pattern, .. } = &arm_syntax.kind else {
@@ -3161,7 +3224,7 @@ fn match_pattern_diagnostics(
             if crate::checked_match_pattern_compatibility(&pattern, selector_type) != Some(false) {
                 continue;
             }
-            let span = global_expression_span(index.project, view.source_map, &arm.expression)?;
+            let span = index.expression_span(&arm)?;
             diagnostics.push(TypeDiagnostic {
                 severity: DiagnosticSeverity::Error,
                 line: span.line,
@@ -3183,8 +3246,7 @@ fn duplicate_function_diagnostics(
             let AstStatementKind::Function { name, .. } = &statement.kind else {
                 continue;
             };
-            let span =
-                global_statement_span(index.project, view.source_map, &statement.stable_key)?;
+            let span = index.statement_span(&statement.stable_key)?;
             declarations.push((span.start, name.clone(), span));
         }
     }
@@ -3211,35 +3273,25 @@ struct TypeDiagnosticSpan {
     end: usize,
 }
 
-fn global_local_span(
-    project: &ProjectSyntaxSnapshot,
-    source_map: &OwnerSourceMap,
+fn global_local_span_from_offsets(
+    layout_start_line: usize,
+    layout_start_byte: usize,
     source_line: u64,
     source_start: u64,
     source_end: u64,
 ) -> Result<TypeDiagnosticSpan, ProjectDiagnosticFactsError> {
-    let layout = project
-        .source_layouts()
-        .iter()
-        .find(|layout| &layout.source_unit_id == source_map.owner().source_unit_id())
-        .ok_or_else(|| {
-            ProjectDiagnosticFactsError::new("project diagnostic has no source-unit layout")
-        })?;
     let source_line = usize::try_from(source_line)
         .map_err(|_| ProjectDiagnosticFactsError::new("diagnostic line exceeds usize"))?;
-    let line = layout
-        .start_line
+    let line = layout_start_line
         .checked_add(source_line.saturating_sub(1))
         .ok_or_else(|| ProjectDiagnosticFactsError::new("diagnostic line overflow"))?;
-    let start = layout
-        .start_byte
+    let start = layout_start_byte
         .checked_add(
             usize::try_from(source_start)
                 .map_err(|_| ProjectDiagnosticFactsError::new("diagnostic start exceeds usize"))?,
         )
         .ok_or_else(|| ProjectDiagnosticFactsError::new("diagnostic start overflow"))?;
-    let end = layout
-        .start_byte
+    let end = layout_start_byte
         .checked_add(
             usize::try_from(source_end)
                 .map_err(|_| ProjectDiagnosticFactsError::new("diagnostic end exceeds usize"))?,
@@ -3251,40 +3303,6 @@ fn global_local_span(
         ));
     }
     Ok(TypeDiagnosticSpan { line, start, end })
-}
-
-fn global_expression_span(
-    project: &ProjectSyntaxSnapshot,
-    source_map: &OwnerSourceMap,
-    expression: &StableExpressionKey,
-) -> Result<TypeDiagnosticSpan, ProjectDiagnosticFactsError> {
-    let source = source_map
-        .expressions()
-        .iter()
-        .find(|source| &source.expression == expression)
-        .ok_or_else(|| {
-            ProjectDiagnosticFactsError::new(
-                "project diagnostic expression has no exact source-map row",
-            )
-        })?;
-    global_local_span(project, source_map, source.line, source.start, source.end)
-}
-
-fn global_statement_span(
-    project: &ProjectSyntaxSnapshot,
-    source_map: &OwnerSourceMap,
-    statement: &StableStatementKey,
-) -> Result<TypeDiagnosticSpan, ProjectDiagnosticFactsError> {
-    let source = source_map
-        .statements()
-        .iter()
-        .find(|source| &source.stable_key == statement)
-        .ok_or_else(|| {
-            ProjectDiagnosticFactsError::new(
-                "project diagnostic statement has no exact source-map row",
-            )
-        })?;
-    global_local_span(project, source_map, source.line, source.start, source.end)
 }
 
 fn global_anchor_span(
@@ -4031,13 +4049,12 @@ impl<'index, 'project> ProjectAuthorityAnalyzer<'index, 'project> {
         expression: &StableOrderExpression,
         message: String,
     ) -> Result<TypeDiagnostic, ProjectDiagnosticFactsError> {
-        let view = self.index.owners.get(&expression.owner).ok_or_else(|| {
+        self.index.owners.get(&expression.owner).ok_or_else(|| {
             ProjectDiagnosticFactsError::new(
                 "collection authority diagnostic expression has no owner",
             )
         })?;
-        let span =
-            global_expression_span(self.index.project, view.source_map, &expression.expression)?;
+        let span = self.index.expression_span(expression)?;
         Ok(TypeDiagnostic {
             severity: DiagnosticSeverity::Error,
             line: span.line,
@@ -4473,11 +4490,10 @@ fn output_producer_facts(
                         )
                     })?;
                 if let OwnerSignatureOutputBindingPlan::Fresh { name, .. } = output {
-                    let span = global_expression_span(
-                        index.project,
-                        view.source_map,
-                        &call.stable_expression,
-                    )?;
+                    let span = index.expression_span(&StableOrderExpression {
+                        owner: owner.clone(),
+                        expression: call.stable_expression.clone(),
+                    })?;
                     outputs
                         .entry(target.clone())
                         .or_insert_with(|| ProjectOutputInfo {
@@ -5886,10 +5902,10 @@ impl<'index, 'project> ProjectOrderAnalyzer<'index, 'project> {
         &self,
         expression: &StableOrderExpression,
     ) -> Result<TypeDiagnosticSpan, ProjectDiagnosticFactsError> {
-        let view = self.index.owners.get(&expression.owner).ok_or_else(|| {
+        self.index.owners.get(&expression.owner).ok_or_else(|| {
             ProjectDiagnosticFactsError::new("order diagnostic expression has no owner")
         })?;
-        global_expression_span(self.index.project, view.source_map, &expression.expression)
+        self.index.expression_span(expression)
     }
 }
 

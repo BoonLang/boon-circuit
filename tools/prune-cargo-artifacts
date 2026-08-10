@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: tools/prune-cargo-artifacts [--apply]
+
+Audit the workspace's rebuildable Cargo artifacts. With --apply, remove only
+the known Cargo build directories while preserving target/reports and all
+other project-owned diagnostics, profiles, fixtures, and logs.
+EOF
+}
+
+apply=false
+case "${1:-}" in
+    "") ;;
+    --apply) apply=true ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
+
+tool_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+workspace_root="$(CDPATH= cd -- "$tool_dir/.." && pwd)"
+target_root="$workspace_root/target"
+
+if [[ ! -d "$target_root" || -L "$target_root" ]]; then
+    printf 'Expected an ordinary target directory at %s\n' "$target_root" >&2
+    exit 1
+fi
+
+target_root="$(realpath -e -- "$target_root")"
+artifact_dirs=(
+    "$target_root/debug"
+    "$target_root/release"
+    "$target_root/wasm32-unknown-unknown"
+    "$target_root/tmp"
+    "$target_root/cargo-timings"
+)
+
+printf 'Workspace target usage: '
+du -sh -- "$target_root" | cut -f1
+
+found=false
+for artifact_dir in "${artifact_dirs[@]}"; do
+    if [[ -e "$artifact_dir" ]]; then
+        found=true
+        du -sh -- "$artifact_dir"
+    fi
+done
+
+if [[ "$found" == false ]]; then
+    printf 'No standard Cargo artifact directories are present.\n'
+fi
+
+if [[ "$apply" == false ]]; then
+    printf 'Audit only. Re-run with --apply to remove the listed directories.\n'
+    exit 0
+fi
+
+if pgrep -x cargo >/dev/null || pgrep -x rustc >/dev/null; then
+    printf 'Refusing to prune while Cargo or rustc is running.\n' >&2
+    exit 1
+fi
+
+for artifact_dir in "${artifact_dirs[@]}"; do
+    if [[ ! -e "$artifact_dir" ]]; then
+        continue
+    fi
+    if [[ -L "$artifact_dir" || ! -d "$artifact_dir" ]]; then
+        printf 'Refusing unexpected artifact path: %s\n' "$artifact_dir" >&2
+        exit 1
+    fi
+    resolved="$(realpath -e -- "$artifact_dir")"
+    case "$resolved" in
+        "$target_root/debug"|\
+        "$target_root/release"|\
+        "$target_root/wasm32-unknown-unknown"|\
+        "$target_root/tmp"|\
+        "$target_root/cargo-timings") ;;
+        *)
+            printf 'Refusing path outside the exact artifact allowlist: %s\n' "$resolved" >&2
+            exit 1
+            ;;
+    esac
+    printf 'Removing rebuildable Cargo artifacts: %s\n' "$resolved"
+    find "$resolved" -xdev -depth -delete
+done
+
+printf 'Remaining workspace target usage: '
+du -sh -- "$target_root" | cut -f1
+printf 'Preserved project artifacts under %s, including target/reports.\n' "$target_root"

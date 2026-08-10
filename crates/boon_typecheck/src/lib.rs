@@ -59,7 +59,7 @@ enum DiagnosticAuthority {
     Owner,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) enum OwnerDiagnosticCallDisposition {
     User {
         owner: boon_syntax::StableCheckOwnerKey,
@@ -70,7 +70,7 @@ pub(crate) enum OwnerDiagnosticCallDisposition {
     Invalid,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct OwnerDiagnosticCallFact {
     pub disposition: OwnerDiagnosticCallDisposition,
     pub effect: CheckedEffectSummary,

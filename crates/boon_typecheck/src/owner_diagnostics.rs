@@ -1233,7 +1233,8 @@ struct ProjectFactIndex<'a> {
     owners: BTreeMap<StableCheckOwnerKey, OwnerFactView<'a>>,
     statements: BTreeMap<StableStatementKey, (StableCheckOwnerKey, u32)>,
     expressions: BTreeMap<StableOrderExpression, u32>,
-    syntax_expressions: BTreeMap<StableOrderExpression, usize>,
+    syntax_expression_order: Box<[StableOrderExpression]>,
+    hold_syntax_expressions: BTreeMap<StableOrderExpression, usize>,
     statement_spans: BTreeMap<StableStatementKey, TypeDiagnosticSpan>,
     expression_spans: BTreeMap<StableOrderExpression, TypeDiagnosticSpan>,
     calls: BTreeMap<StableOrderExpression, &'a OwnerDiagnosticStableCallFact>,
@@ -1262,21 +1263,8 @@ impl<'a> ProjectFactIndex<'a> {
             .into_iter()
             .cloned()
             .collect::<BTreeSet<_>>();
-        let mut syntax_statements = BTreeMap::new();
-        for slot in 0..project.statement_count() {
-            let statement = project.statement_id_for_slot(slot).ok_or_else(|| {
-                ProjectDiagnosticFactsError::new("project statement slot has no syntax identity")
-            })?;
-            let Some(stable) = project.stable_statement_key(statement) else {
-                continue;
-            };
-            if syntax_statements.insert(stable, statement).is_some() {
-                return Err(ProjectDiagnosticFactsError::new(
-                    "project diagnostic facts received duplicate syntax statement identity",
-                ));
-            }
-        }
-        let mut syntax_expressions = BTreeMap::new();
+        let mut syntax_expression_order = Vec::new();
+        let mut hold_syntax_expressions = BTreeMap::new();
         for slot in 0..project.expression_count() {
             let expression = project.expression_id_for_slot(slot).ok_or_else(|| {
                 ProjectDiagnosticFactsError::new("project expression slot has no syntax identity")
@@ -1287,20 +1275,22 @@ impl<'a> ProjectFactIndex<'a> {
             let Some(stable) = project.stable_expression_key(expression) else {
                 continue;
             };
-            if syntax_expressions
-                .insert(
-                    StableOrderExpression {
-                        owner,
-                        expression: stable,
-                    },
-                    expression,
-                )
+            let stable = StableOrderExpression {
+                owner,
+                expression: stable,
+            };
+            if matches!(
+                project.expressions().get(expression).map(|row| &row.kind),
+                Some(AstExprKind::Hold { .. })
+            ) && hold_syntax_expressions
+                .insert(stable.clone(), expression)
                 .is_some()
             {
                 return Err(ProjectDiagnosticFactsError::new(
-                    "project diagnostic facts received duplicate syntax expression identity",
+                    "project diagnostic facts received duplicate HOLD syntax expression identity",
                 ));
             }
+            syntax_expression_order.push(stable);
         }
         let syntax_inputs = unique_by_owner(
             syntax_inputs
@@ -1341,41 +1331,26 @@ impl<'a> ProjectFactIndex<'a> {
                 .map(|source_map| (source_map.owner(), source_map)),
             "source map",
         )?;
-        for (label, actual) in [
-            (
-                "syntax input",
-                syntax_inputs.keys().cloned().collect::<BTreeSet<_>>(),
-            ),
-            (
-                "public interface",
-                interfaces.keys().cloned().collect::<BTreeSet<_>>(),
-            ),
+        for (label, exact) in [
+            ("syntax input", syntax_inputs.keys().eq(expected.iter())),
+            ("public interface", interfaces.keys().eq(expected.iter())),
             (
                 "diagnostic replay facts",
-                replay_facts.keys().cloned().collect::<BTreeSet<_>>(),
+                replay_facts.keys().eq(expected.iter()),
             ),
             (
                 "diagnostic replay evaluation",
-                replay_evaluations.keys().cloned().collect::<BTreeSet<_>>(),
+                replay_evaluations.keys().eq(expected.iter()),
             ),
             (
                 "diagnostic inference ABI",
-                inference_abis.keys().cloned().collect::<BTreeSet<_>>(),
+                inference_abis.keys().eq(expected.iter()),
             ),
-            (
-                "constraint summary",
-                summaries.keys().cloned().collect::<BTreeSet<_>>(),
-            ),
-            (
-                "lexical plan",
-                lexical_plans.keys().cloned().collect::<BTreeSet<_>>(),
-            ),
-            (
-                "source map",
-                source_maps.keys().cloned().collect::<BTreeSet<_>>(),
-            ),
+            ("constraint summary", summaries.keys().eq(expected.iter())),
+            ("lexical plan", lexical_plans.keys().eq(expected.iter())),
+            ("source map", source_maps.keys().eq(expected.iter())),
         ] {
-            if actual != expected {
+            if !exact {
                 return Err(ProjectDiagnosticFactsError::new(format!(
                     "project diagnostic facts {label} coverage differs from the project owner set"
                 )));
@@ -1568,12 +1543,42 @@ impl<'a> ProjectFactIndex<'a> {
                 },
             );
         }
+        let mut syntax_statement_count = 0_usize;
+        for slot in 0..project.statement_count() {
+            let statement = project.statement_id_for_slot(slot).ok_or_else(|| {
+                ProjectDiagnosticFactsError::new("project statement slot has no syntax identity")
+            })?;
+            let Some(stable) = project.stable_statement_key(statement) else {
+                continue;
+            };
+            syntax_statement_count = syntax_statement_count.saturating_add(1);
+            if !statements.contains_key(&stable) {
+                return Err(ProjectDiagnosticFactsError::new(
+                    "project syntax statement identity is absent from owner facts",
+                ));
+            }
+        }
+        if syntax_statement_count != statements.len() {
+            return Err(ProjectDiagnosticFactsError::new(
+                "project syntax statement coverage differs from owner facts",
+            ));
+        }
+        if syntax_expression_order.len() != expressions.len()
+            || syntax_expression_order
+                .iter()
+                .any(|expression| !expressions.contains_key(expression))
+        {
+            return Err(ProjectDiagnosticFactsError::new(
+                "project syntax expression coverage differs from owner facts",
+            ));
+        }
         let mut result = Self {
             project,
             owners,
             statements,
             expressions,
-            syntax_expressions,
+            syntax_expression_order: syntax_expression_order.into_boxed_slice(),
+            hold_syntax_expressions,
             statement_spans,
             expression_spans,
             calls,
@@ -4223,7 +4228,9 @@ impl<'index, 'project> ProjectFlowTypeAnalyzer<'index, 'project> {
                         )
                         .map(|initial| self.expression_type(&initial))
                         .unwrap_or(Type::Unknown);
-                    if let Some(syntax_expression) = self.index.syntax_expressions.get(expression) {
+                    if let Some(syntax_expression) =
+                        self.index.hold_syntax_expressions.get(expression)
+                    {
                         for update in crate::hold_update_exprs_for_expr(
                             self.program.statements(),
                             *syntax_expression,
@@ -6248,14 +6255,7 @@ fn collection_authority_diagnostics(
         BTreeMap::<ProjectAuthorityOriginKey, BTreeSet<ProjectAuthorityParentSite>>::new();
     let mut graph =
         BTreeMap::<ProjectAuthorityOriginKey, BTreeSet<ProjectAuthorityOriginKey>>::new();
-    let mut expressions = index
-        .syntax_expressions
-        .iter()
-        .map(|(expression, syntax_id)| (*syntax_id, expression.clone()))
-        .collect::<Vec<_>>();
-    expressions.sort_by_key(|(syntax_id, _)| *syntax_id);
-
-    for (_, expression) in expressions {
+    for expression in index.syntax_expression_order.iter().cloned() {
         let Some((_, _, syntax, _)) = index.order_expression(&expression) else {
             return Err(ProjectDiagnosticFactsError::new(
                 "collection authority syntax expression has no owner row",

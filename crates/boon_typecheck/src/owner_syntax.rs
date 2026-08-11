@@ -13,7 +13,7 @@ use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
 
-const OWNER_KEY_FINGERPRINT_DOMAIN_V1: &[u8] = b"boon.check-owner-key.v1\0";
+const OWNER_KEY_FINGERPRINT_DOMAIN_V2: &[u8] = b"boon.check-owner-key.v2\0";
 const OWNER_SYNTAX_FINGERPRINT_DOMAIN_V2: &[u8] = b"boon.owner-syntax-input.v2\0";
 const OWNER_SOURCE_MAP_FINGERPRINT_DOMAIN_V2: &[u8] = b"boon.owner-source-map.v2\0";
 
@@ -271,9 +271,59 @@ fn fingerprint_serialized<T: Serialize>(
     Ok(writer.0.finalize().into())
 }
 
-pub fn stable_check_owner_key_fingerprint_v1(owner: &StableCheckOwnerKey) -> [u8; 32] {
-    fingerprint_serialized(OWNER_KEY_FINGERPRINT_DOMAIN_V1, owner)
-        .expect("stable check-owner keys always serialize to the digest writer")
+fn hash_owner_key_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    let len = u64::try_from(bytes.len()).expect("stable owner identity length exceeds u64");
+    hasher.update(len.to_be_bytes());
+    hasher.update(bytes);
+}
+
+/// Allocation-free stable digest of one structural owner identity.
+///
+/// This deliberately encodes the owned fields rather than routing a hot
+/// request key through generic JSON. Every variable-width component is
+/// length-framed, and enum variants have explicit byte tags.
+pub fn stable_check_owner_key_fingerprint_v2(owner: &StableCheckOwnerKey) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(OWNER_KEY_FINGERPRINT_DOMAIN_V2);
+    match owner {
+        StableCheckOwnerKey::UnitRoot(source_unit_id) => {
+            hasher.update([0]);
+            hash_owner_key_bytes(&mut hasher, source_unit_id.as_str().as_bytes());
+        }
+        StableCheckOwnerKey::Item(owner) => {
+            hasher.update([1]);
+            hash_owner_key_bytes(&mut hasher, owner.source_unit_id.as_str().as_bytes());
+            let segments = owner.item_route.segments();
+            hasher.update(
+                u64::try_from(segments.len())
+                    .expect("stable owner route length exceeds u64")
+                    .to_be_bytes(),
+            );
+            for segment in segments {
+                hasher.update([match segment.kind {
+                    UnitItemKind::Function => 0,
+                    UnitItemKind::Field => 1,
+                    UnitItemKind::Source => 2,
+                    UnitItemKind::Hold => 3,
+                    UnitItemKind::List => 4,
+                }]);
+                hasher.update(
+                    u64::try_from(segment.names.len())
+                        .expect("stable owner segment name count exceeds u64")
+                        .to_be_bytes(),
+                );
+                for name in &segment.names {
+                    hash_owner_key_bytes(&mut hasher, name.as_bytes());
+                }
+                hasher.update(
+                    u64::try_from(segment.matching_sibling_ordinal)
+                        .expect("stable owner sibling ordinal exceeds u64")
+                        .to_be_bytes(),
+                );
+            }
+        }
+    }
+    hasher.finalize().into()
 }
 
 fn checked_u32(value: usize, context: &str) -> Result<u32, OwnerSyntaxProjectionError> {

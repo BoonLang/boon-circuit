@@ -1,6 +1,6 @@
 use crate::{
     OwnerContainingScopeInput, OwnerExpressionInput, OwnerExternalExpressionInput,
-    OwnerSyntaxInput, stable_check_owner_key_fingerprint_v1,
+    OwnerSyntaxInput, stable_check_owner_key_fingerprint_v2,
 };
 use boon_checked::{
     OwnerDeclarationStableKey, OwnerExpressionId, OwnerExpressionRef, OwnerExpressionScopeRole,
@@ -1119,7 +1119,7 @@ pub fn build_owner_interface_topology<'a>(
     for summary in &summaries {
         let projection = builder
             .register(
-                stable_check_owner_key_fingerprint_v1(&summary.owner),
+                stable_check_owner_key_fingerprint_v2(&summary.owner),
                 summary.topology_fingerprint_v1(),
             )
             .map_err(|error| {
@@ -1278,7 +1278,7 @@ pub fn build_owner_interface_topology<'a>(
                     .map(|index| summaries[index])
                     .expect("component member has a registered owner summary");
                 (
-                    stable_check_owner_key_fingerprint_v1(&summary.owner),
+                    stable_check_owner_key_fingerprint_v2(&summary.owner),
                     summary.topology_fingerprint_v1(),
                 )
             })
@@ -1852,7 +1852,7 @@ fn resolve_owner_constraint_seed_with_effective_resolutions_impl(
     let topology_fingerprint_v1 = fingerprint(
         OWNER_RESOLVED_CONSTRAINT_TOPOLOGY_DOMAIN_V3,
         &(
-            stable_check_owner_key_fingerprint_v1(&seed.owner),
+            stable_check_owner_key_fingerprint_v2(&seed.owner),
             seed.topology_fingerprint_v1(),
             &topology_dependencies,
         ),
@@ -1860,7 +1860,7 @@ fn resolve_owner_constraint_seed_with_effective_resolutions_impl(
     let fingerprint_v1 = fingerprint(
         OWNER_RESOLVED_CONSTRAINT_SUMMARY_DOMAIN_V3,
         &(
-            stable_check_owner_key_fingerprint_v1(&seed.owner),
+            stable_check_owner_key_fingerprint_v2(&seed.owner),
             seed.fingerprint_v1(),
             &resolved_references,
             &symbol_resolutions,
@@ -1966,7 +1966,7 @@ pub fn project_owner_declaration_surface(
         .flatten();
     let fingerprint_v1 = fingerprint(
         OWNER_DECLARATION_SURFACE_DOMAIN_V1,
-        &(stable_check_owner_key_fingerprint_v1(&input.owner), &public),
+        &(stable_check_owner_key_fingerprint_v2(&input.owner), &public),
     )?;
     Ok(OwnerDeclarationSurface {
         owner: input.owner.clone(),
@@ -3265,12 +3265,12 @@ pub fn project_owner_lexical_plan(
     let syntax_fingerprint_v1 = input.fingerprint_v1();
     let reads_fingerprint_v1 = fingerprint(
         OWNER_LEXICAL_READS_DOMAIN_V4,
-        &(stable_check_owner_key_fingerprint_v1(&input.owner), &reads),
+        &(stable_check_owner_key_fingerprint_v2(&input.owner), &reads),
     )?;
     let signature_region_fingerprint_v1 = fingerprint(
         OWNER_SIGNATURE_REGION_INDEX_DOMAIN_V2,
         &(
-            stable_check_owner_key_fingerprint_v1(&input.owner),
+            stable_check_owner_key_fingerprint_v2(&input.owner),
             &scopes,
             &stable_scopes,
             &expression_scopes,
@@ -3289,7 +3289,7 @@ pub fn project_owner_lexical_plan(
     let fingerprint_v1 = fingerprint(
         OWNER_LEXICAL_PLAN_DOMAIN_V4,
         &(
-            stable_check_owner_key_fingerprint_v1(&input.owner),
+            stable_check_owner_key_fingerprint_v2(&input.owner),
             syntax_fingerprint_v1,
             &statement_values,
             signature_region_fingerprint_v1,
@@ -4348,7 +4348,7 @@ pub fn project_owner_constraint_seed_with_lexical_plan(
     let topology_fingerprint_v1 = fingerprint(
         OWNER_CONSTRAINT_TOPOLOGY_DOMAIN_V2,
         &(
-            stable_check_owner_key_fingerprint_v1(&input.owner),
+            stable_check_owner_key_fingerprint_v2(&input.owner),
             &declarations,
             &topology_references,
             &external_owners,
@@ -4357,7 +4357,7 @@ pub fn project_owner_constraint_seed_with_lexical_plan(
     let fingerprint_v1 = fingerprint(
         OWNER_CONSTRAINT_SEED_DOMAIN_V5,
         &(
-            stable_check_owner_key_fingerprint_v1(&input.owner),
+            stable_check_owner_key_fingerprint_v2(&input.owner),
             lexical_plan.reads_fingerprint_v1(),
             lexical_plan.signature_regions.fingerprint_v1(),
             &declarations,

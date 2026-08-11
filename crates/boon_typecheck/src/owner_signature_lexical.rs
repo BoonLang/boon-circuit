@@ -4,7 +4,7 @@ use crate::{
     OwnerInterfaceEvaluationScope, OwnerLexicalAccess, OwnerLexicalBoundaryBindings,
     OwnerLexicalContainmentPlan, OwnerLexicalDeclarationTarget, OwnerLexicalPlan,
     OwnerParameterKind, OwnerPublicInterface, OwnerReferenceKind, OwnerSymbolReference,
-    OwnerSymbolResolution, stable_check_owner_key_fingerprint_v1,
+    OwnerSymbolResolution, stable_check_owner_key_fingerprint_v2,
 };
 use boon_checked::{
     CheckedCallContextKind, CheckedCallableKind, CheckedParameterKind, CheckedParameterRequirement,
@@ -990,7 +990,7 @@ pub fn build_owner_callable_scope_topology<'a>(
             .iter()
             .map(|owner| {
                 (
-                    stable_check_owner_key_fingerprint_v1(owner),
+                    stable_check_owner_key_fingerprint_v2(owner),
                     plan_by_owner[owner].fingerprint_v1(),
                 )
             })
@@ -1014,7 +1014,7 @@ pub fn build_owner_callable_scope_topology<'a>(
     for (cluster_index, cluster) in clusters.iter().enumerate() {
         let projection = builder
             .register(
-                stable_check_owner_key_fingerprint_v1(&cluster.root),
+                stable_check_owner_key_fingerprint_v2(&cluster.root),
                 cluster.fingerprint_v1(),
             )
             .map_err(|error| {
@@ -1156,7 +1156,7 @@ pub fn build_owner_callable_scope_topology<'a>(
                     .map(|index| plans[index])
                     .expect("callable scope component member has a plan");
                 (
-                    stable_check_owner_key_fingerprint_v1(owner),
+                    stable_check_owner_key_fingerprint_v2(owner),
                     plan.fingerprint_v1(),
                 )
             })
@@ -3485,7 +3485,7 @@ pub fn project_owner_signature_lexical_scope_plans_with_callable_resolutions<'a>
                 .collect::<Vec<_>>();
             let projection = builder
                 .register(
-                    stable_check_owner_key_fingerprint_v1(root),
+                    stable_check_owner_key_fingerprint_v2(root),
                     fingerprint(
                         OWNER_LEXICAL_CONTAINMENT_CLUSTER_DOMAIN_V1,
                         &(root, &region_fingerprints),

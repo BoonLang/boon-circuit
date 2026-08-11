@@ -49,7 +49,7 @@ use boon_typecheck::{
     project_owner_declaration_surface, project_owner_interface_transfer_module,
     project_owner_lexical_plan, project_owner_source_map, project_owner_syntax_input,
     project_source_unit_owner_diagnostics, resolve_owner_constraint_seed_with_signature_plan,
-    stable_check_owner_key_fingerprint_v1,
+    stable_check_owner_key_fingerprint_v2,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -488,7 +488,7 @@ impl RequestFamily for OwnerInputRequest {
     const NAME: &'static str = "boon.compiler.owner-input.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -507,7 +507,7 @@ impl RequestFamily for OwnerSourceMapRequest {
     const NAME: &'static str = "boon.compiler.owner-source-map.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -528,7 +528,7 @@ impl RequestFamily for OwnerDeclarationSurfaceRequest {
     const NAME: &'static str = "boon.compiler.owner-declaration-surface.v1";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -547,7 +547,7 @@ impl RequestFamily for OwnerLexicalPlanRequest {
     const NAME: &'static str = "boon.compiler.owner-lexical-plan.v4";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -564,7 +564,7 @@ impl RequestFamily for OwnerConstraintSeedRequest {
     const NAME: &'static str = "boon.compiler.owner-constraint-seed.v5";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -699,7 +699,7 @@ impl RequestFamily for OwnerParameterRequirementLookupRequest {
         request_fingerprint(
             b"boon.compiler.owner-parameter-requirement-lookup-key.v1\0",
             [
-                stable_check_owner_key_fingerprint_v1(key.owner()).as_slice(),
+                stable_check_owner_key_fingerprint_v2(key.owner()).as_slice(),
                 key.parameter_ordinal().to_le_bytes().as_slice(),
             ],
         )
@@ -721,7 +721,7 @@ impl RequestFamily for OwnerCallableInferenceAbiRequest {
     const NAME: &'static str = "boon.compiler.owner-callable-inference-abi.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -740,7 +740,7 @@ impl RequestFamily for OwnerInferenceAbiRequest {
     const NAME: &'static str = "boon.compiler.owner-inference-abi.v6";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -759,7 +759,7 @@ impl RequestFamily for OwnerCallableResolutionRequest {
     const NAME: &'static str = "boon.compiler.owner-callable-resolution.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -806,7 +806,7 @@ impl RequestFamily for OwnerCallableScopeSccPlanRequest {
         let fingerprints = key
             .members
             .iter()
-            .map(stable_check_owner_key_fingerprint_v1)
+            .map(stable_check_owner_key_fingerprint_v2)
             .collect::<Vec<_>>();
         request_fingerprint(
             b"boon.compiler.owner-callable-scope-scc-key.v1\0",
@@ -880,7 +880,7 @@ impl RequestFamily for OwnerCallableScopeProviderRequest {
     const NAME: &'static str = "boon.compiler.owner-callable-scope-provider.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -943,7 +943,7 @@ impl RequestFamily for OwnerConstructionAbiRequest {
     const NAME: &'static str = "boon.compiler.owner-construction-abi.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -1115,7 +1115,7 @@ impl RequestFamily for ProjectOwnerSymbolRequest {
             hasher.update((candidates.len() as u64).to_le_bytes());
             for candidate in candidates {
                 hasher.update([candidate.priority]);
-                hasher.update(stable_check_owner_key_fingerprint_v1(&candidate.owner));
+                hasher.update(stable_check_owner_key_fingerprint_v2(&candidate.owner));
                 hasher.update((candidate.parameters.len() as u64).to_le_bytes());
                 for parameter in &candidate.parameters {
                     update_request_fingerprint_part(&mut hasher, parameter.name.as_bytes());
@@ -1140,7 +1140,7 @@ impl RequestFamily for OwnerConstraintRequest {
     const NAME: &'static str = "boon.compiler.owner-constraint-summary.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -1187,7 +1187,7 @@ impl RequestFamily for OwnerInterfaceSccPlanRequest {
         let fingerprints = key
             .members
             .iter()
-            .map(stable_check_owner_key_fingerprint_v1)
+            .map(stable_check_owner_key_fingerprint_v2)
             .collect::<Vec<_>>();
         request_fingerprint(
             b"boon.compiler.owner-interface-scc-plan-key.v1\0",
@@ -1285,7 +1285,7 @@ impl RequestFamily for OwnerInterfaceProviderRequest {
     const NAME: &'static str = "boon.compiler.owner-interface-provider.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -1304,7 +1304,7 @@ impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
     const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v9";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -1323,7 +1323,7 @@ impl RequestFamily for OwnerBodyInferenceRequest {
     const NAME: &'static str = "boon.compiler.owner-body-inference.v7";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -1344,7 +1344,7 @@ impl RequestFamily for OwnerDiagnosticReplayFactsEvaluationRequest {
     const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts-evaluation.v5";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -1361,7 +1361,7 @@ impl RequestFamily for OwnerDiagnosticReplayFactsRequest {
     const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts.v5";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -1380,7 +1380,7 @@ impl RequestFamily for CheckedOwnerShardRequest {
     const NAME: &'static str = "boon.compiler.checked-owner-shard.v8";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v1(key)
+        stable_check_owner_key_fingerprint_v2(key)
     }
 
     fn output_fingerprint(
@@ -3982,7 +3982,7 @@ fn evaluate_owner_callable_scope_requests(
         b"boon.compiler.project-owner-callable-scope-topology-dependencies.v2\0",
         owners
             .iter()
-            .map(stable_check_owner_key_fingerprint_v1)
+            .map(stable_check_owner_key_fingerprint_v2)
             .collect::<Vec<_>>()
             .iter()
             .map(<[u8; 32]>::as_slice),
@@ -4402,7 +4402,7 @@ fn evaluate_owner_constraint_requests(
     let symbol_key = ProjectOwnerSymbolKey;
     let owner_key_fingerprints = owners
         .iter()
-        .map(stable_check_owner_key_fingerprint_v1)
+        .map(stable_check_owner_key_fingerprint_v2)
         .collect::<Vec<_>>();
     let symbol_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.project-owner-symbol-index-dependencies.v3\0",
@@ -5414,7 +5414,7 @@ fn evaluate_project_output_flow_facts_request(
     let owners = project.stable_check_owner_keys().collect::<Vec<_>>();
     let owner_fingerprints = owners
         .iter()
-        .map(stable_check_owner_key_fingerprint_v1)
+        .map(stable_check_owner_key_fingerprint_v2)
         .collect::<Vec<_>>();
     let input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.project-output-flow-facts-dependencies.v2\0",
@@ -5478,7 +5478,7 @@ fn evaluate_project_diagnostic_facts_request(
     let owners = project.stable_check_owner_keys().collect::<Vec<_>>();
     let owner_fingerprints = owners
         .iter()
-        .map(stable_check_owner_key_fingerprint_v1)
+        .map(stable_check_owner_key_fingerprint_v2)
         .collect::<Vec<_>>();
     let source_digest = project.source_bundle_digest_v1().to_string();
     let input = RequestInputFingerprint(request_fingerprint(
@@ -5644,7 +5644,7 @@ fn evaluate_source_unit_owner_diagnostics_requests(
     for (source_unit_id, owners) in owners_by_unit {
         let owner_fingerprints = owners
             .iter()
-            .map(stable_check_owner_key_fingerprint_v1)
+            .map(stable_check_owner_key_fingerprint_v2)
             .collect::<Vec<_>>();
         let input = RequestInputFingerprint(request_fingerprint(
             b"boon.compiler.source-unit-owner-diagnostics-dependencies.v1\0",

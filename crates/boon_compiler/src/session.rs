@@ -1301,7 +1301,7 @@ impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v9";
+    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v10";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -5100,7 +5100,7 @@ fn evaluate_owner_body_inference_requests(
         .flat_map(|scc| scc.key.members.iter().cloned())
         .collect::<Vec<_>>();
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-body-inference-evaluation-dependencies.v9\0",
+        b"boon.compiler.owner-body-inference-evaluation-dependencies.v10\0",
         std::iter::empty(),
     ));
     let mut planning_ms = 0.0;
@@ -10386,7 +10386,7 @@ mod tests {
             .owner_body_inference(project, &value)
             .unwrap()
             .unwrap();
-        let (first_leaf_module, first_inherited_module) = {
+        let (first_leaf_module, first_inherited_module, first_value_evaluation) = {
             let state = session.projects.get(&project).unwrap();
             let module = |owner: &StableCheckOwnerKey| {
                 let provider = state
@@ -10402,7 +10402,17 @@ mod tests {
                         .unwrap(),
                 )
             };
-            (module(&leaf), module(&inherited))
+            (
+                module(&leaf),
+                module(&inherited),
+                Arc::clone(
+                    state
+                        .owner_body_inference_evaluation_requests
+                        .current_value(&state.syntax_evaluator, &value)
+                        .unwrap()
+                        .unwrap(),
+                ),
+            )
         };
         assert_eq!(
             first_value_body.calls[0].result.ty,
@@ -10426,7 +10436,7 @@ mod tests {
             .owner_body_inference(project, &value)
             .unwrap()
             .unwrap();
-        let (second_leaf_module, second_inherited_module) = {
+        let (second_leaf_module, second_inherited_module, second_value_evaluation) = {
             let state = session.projects.get(&project).unwrap();
             let module = |owner: &StableCheckOwnerKey| {
                 let provider = state
@@ -10442,7 +10452,17 @@ mod tests {
                         .unwrap(),
                 )
             };
-            (module(&leaf), module(&inherited))
+            (
+                module(&leaf),
+                module(&inherited),
+                Arc::clone(
+                    state
+                        .owner_body_inference_evaluation_requests
+                        .current_value(&state.syntax_evaluator, &value)
+                        .unwrap()
+                        .unwrap(),
+                ),
+            )
         };
 
         assert!(!Arc::ptr_eq(&first_leaf_interface, &second_leaf_interface));
@@ -10455,6 +10475,20 @@ mod tests {
             &first_inherited_module,
             &second_inherited_module
         ));
+        assert_ne!(
+            first_value_evaluation
+                .currentness
+                .basis()
+                .interface_plan_fingerprint_v1,
+            second_value_evaluation
+                .currentness
+                .basis()
+                .interface_plan_fingerprint_v1,
+        );
+        assert_ne!(
+            first_value_evaluation.currentness.fingerprint_v1(),
+            second_value_evaluation.currentness.fingerprint_v1(),
+        );
         assert!(!Arc::ptr_eq(&first_value_body, &second_value_body));
         assert_eq!(
             second_value_body.calls[0].result.ty,

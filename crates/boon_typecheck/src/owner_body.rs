@@ -40,8 +40,8 @@ use std::sync::Arc;
 
 const OWNER_BODY_INFERENCE_DOMAIN_V7: &[u8] = b"boon.owner-body-inference.v7\0";
 const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V5: &[u8] = b"boon.owner-body-inference-content.v5\0";
-const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V8: &[u8] =
-    b"boon.owner-body-inference-currentness.v8\0";
+const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V9: &[u8] =
+    b"boon.owner-body-inference-currentness.v9\0";
 const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V4: &[u8] = b"boon.owner-body-interface-plan.v4\0";
 const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V1: &[u8] =
     b"boon.owner-interface-transfer-module.v1\0";
@@ -766,6 +766,10 @@ pub struct OwnerBodyInferenceBasis {
     pub summary_fingerprint_v1: [u8; 32],
     pub own_scc: FrozenOwnerInterfaceSccRef,
     pub imports: Box<[FrozenOwnerInterfaceSccRef]>,
+    /// Compact exact seal of the provider modules and referenced members from
+    /// which `own_scc`, `imports`, and the per-interface import table were
+    /// frozen. Rich rows remain available for direct validation.
+    pub interface_plan_fingerprint_v1: [u8; 32],
     pub inference_abi_fingerprint_v1: [u8; 32],
 }
 
@@ -999,9 +1003,23 @@ impl OwnerBodyInferenceCurrentnessReceipt {
             ));
         }
         let result_fingerprint_v1 = result.fingerprint_v1();
+        // Keep the rich basis and per-interface table available to direct
+        // consumers, but seal their already-canonical interface-plan identity.
+        // The plan commits every provider module, exact referenced member, and
+        // result/type-variable surface without serializing that DAG again.
+        let compact_currentness = (
+            basis.syntax_fingerprint_v1,
+            basis.lexical_plan_fingerprint_v1,
+            basis.signature_lexical_plan_fingerprint_v1,
+            basis.seed_fingerprint_v1,
+            basis.summary_fingerprint_v1,
+            basis.inference_abi_fingerprint_v1,
+            basis.interface_plan_fingerprint_v1,
+            result_fingerprint_v1,
+        );
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V8,
-            &(&basis, &interface_imports, result_fingerprint_v1),
+            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V9,
+            &compact_currentness,
         )?;
         Ok(Self {
             basis,
@@ -6089,6 +6107,7 @@ fn evaluate_owner_body_impl(
         summary_fingerprint_v1: summary.fingerprint_v1(),
         own_scc: own_scc_ref,
         imports: frozen_results.into_boxed_slice(),
+        interface_plan_fingerprint_v1: interface_plan.fingerprint_v1(),
         inference_abi_fingerprint_v1,
     };
     let mut work = OwnerBodyInferenceWork {

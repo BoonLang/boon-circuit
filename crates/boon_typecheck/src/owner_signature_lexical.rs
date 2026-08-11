@@ -1557,16 +1557,6 @@ fn signature_inputs_fingerprint_v1(
                 "owner signature inherited environment does not match its child boundary",
             ));
         }
-        let unique_names = environment
-            .bindings
-            .iter()
-            .map(|binding| binding.name.as_str())
-            .collect::<BTreeSet<_>>();
-        if unique_names.len() != environment.bindings.len() {
-            return Err(OwnerSignatureLexicalPlanError::new(
-                "owner signature inherited environment repeats a binding name",
-            ));
-        }
     }
     let resolution_by_expression = callable_resolutions
         .resolutions()
@@ -2035,22 +2025,12 @@ impl<'a> Planner<'a> {
         let bindings = if let Some(bindings) = self.child_binding_cache.get(&binding_cache_key) {
             bindings.clone()
         } else {
-            let mut bindings = self
-                .inherited_bindings
-                .iter()
-                .cloned()
-                .map(|binding| (binding.name.clone(), binding))
-                .collect::<BTreeMap<_, _>>();
-            bindings.extend(
-                boundary
-                    .bindings
-                    .iter()
-                    .cloned()
-                    .map(|binding| (binding.name.clone(), binding)),
-            );
+            let mut overlay = Vec::new();
             for dynamic in active {
-                let nested_authored = bindings
+                let nested_authored = boundary
+                    .bindings
                     .get(&dynamic.name)
+                    .or_else(|| self.inherited_bindings.get(&dynamic.name))
                     .and_then(|binding| binding.declaration_scope.as_ref())
                     .and_then(|scope| {
                         self.seed
@@ -2069,21 +2049,22 @@ impl<'a> Planner<'a> {
                 let Some(target) = self.stable_effective_target(&dynamic.target)? else {
                     continue;
                 };
-                bindings.insert(
-                    dynamic.name.clone(),
-                    crate::OwnerLexicalBoundaryBindingPlan {
-                        name: dynamic.name.clone(),
-                        target,
-                        declaration_scope: None,
-                    },
-                );
+                overlay.push(crate::OwnerLexicalBoundaryBindingPlan {
+                    name: dynamic.name.clone(),
+                    target,
+                    declaration_scope: None,
+                });
             }
-            let bindings = OwnerLexicalBoundaryBindings::try_new(bindings.into_values().collect())
-                .map_err(|error| {
-                    OwnerSignatureLexicalPlanError::new(format!(
-                        "cannot fingerprint signature lexical boundary bindings: {error}"
-                    ))
-                })?;
+            let bindings = OwnerLexicalBoundaryBindings::merge_with_overlay(
+                &self.inherited_bindings,
+                &boundary.bindings,
+                overlay,
+            )
+            .map_err(|error| {
+                OwnerSignatureLexicalPlanError::new(format!(
+                    "cannot fingerprint signature lexical boundary bindings: {error}"
+                ))
+            })?;
             self.child_binding_cache
                 .insert(binding_cache_key, bindings.clone());
             bindings
@@ -2877,13 +2858,13 @@ impl<'a> Planner<'a> {
         // read, so retain that one inherited capability even when the read
         // table itself does not demand it.
         if let Some(environment) = &self.inherited_environment {
-            for binding in environment.bindings.iter() {
-                if matches!(binding.target, OwnerLexicalTargetRef::ContextFormal { .. }) {
-                    imported_capture_sites
-                        .entry(binding.target.clone())
-                        .or_default()
-                        .insert(environment.observation_expression.clone());
-                }
+            if let Some(binding) = environment.bindings.get("PASSED")
+                && matches!(binding.target, OwnerLexicalTargetRef::ContextFormal { .. })
+            {
+                imported_capture_sites
+                    .entry(binding.target.clone())
+                    .or_default()
+                    .insert(environment.observation_expression.clone());
             }
         }
         let imported_captures = imported_capture_sites.keys().cloned().collect::<Vec<_>>();

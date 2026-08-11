@@ -15,7 +15,9 @@ use boon_syntax::{
     AstStatementKind, AstTextSegment, BytesSizeSyntax, StableCheckOwnerKey, StableExpressionKey,
     StableStatementKey, StableStatementKind, UnitItemKind,
 };
+use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -26,8 +28,9 @@ const OWNER_CONSTRAINT_TOPOLOGY_DOMAIN_V2: &[u8] = b"boon.owner-constraint-topol
 const OWNER_DECLARATION_SURFACE_DOMAIN_V1: &[u8] = b"boon.owner-declaration-surface.v1\0";
 const OWNER_LEXICAL_PLAN_DOMAIN_V4: &[u8] = b"boon.owner-lexical-plan.v4\0";
 const OWNER_LEXICAL_READS_DOMAIN_V4: &[u8] = b"boon.owner-lexical-reads.v4\0";
-const OWNER_LEXICAL_BOUNDARY_BINDINGS_DOMAIN_V1: &[u8] =
-    b"boon.owner-lexical-boundary-bindings.v1\0";
+const OWNER_LEXICAL_BOUNDARY_BINDING_DOMAIN_V1: &[u8] = b"boon.owner-lexical-boundary-binding.v1\0";
+const OWNER_LEXICAL_BOUNDARY_BINDINGS_DOMAIN_V2: &[u8] =
+    b"boon.owner-lexical-boundary-bindings.v2\0";
 const OWNER_LEXICAL_CONTAINMENT_DOMAIN_V2: &[u8] = b"boon.owner-lexical-containment.v2\0";
 const OWNER_SIGNATURE_REGION_INDEX_DOMAIN_V2: &[u8] = b"boon.owner-signature-region-index.v2\0";
 const OWNER_RESOLVED_CONSTRAINT_SUMMARY_DOMAIN_V3: &[u8] =
@@ -214,27 +217,83 @@ pub struct OwnerLexicalBoundaryBindingPlan {
 /// set once instead of serializing a wide record's identical environment for
 /// every child boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnerLexicalBoundaryBindingEntry {
+    plan: OwnerLexicalBoundaryBindingPlan,
+    fingerprint_v1: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerLexicalBoundaryBindings {
-    rows: Arc<[OwnerLexicalBoundaryBindingPlan]>,
+    rows: Arc<BTreeMap<Arc<str>, Arc<OwnerLexicalBoundaryBindingEntry>>>,
     fingerprint_v1: [u8; 32],
 }
 
 impl OwnerLexicalBoundaryBindings {
     pub(crate) fn try_new(
         bindings: Vec<OwnerLexicalBoundaryBindingPlan>,
-    ) -> Result<Self, boon_contract::CanonicalEncodingError> {
-        let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_LEXICAL_BOUNDARY_BINDINGS_DOMAIN_V1,
-            &bindings,
-        )?;
+    ) -> Result<Self, OwnerConstraintSeedError> {
+        Self::with_sources(None, None, bindings)
+    }
+
+    pub(crate) fn merge_with_overlay(
+        inherited: &Self,
+        authored: &Self,
+        overlay: Vec<OwnerLexicalBoundaryBindingPlan>,
+    ) -> Result<Self, OwnerConstraintSeedError> {
+        Self::with_sources(Some(inherited), Some(authored), overlay)
+    }
+
+    fn with_overlay(
+        &self,
+        overlay: Vec<OwnerLexicalBoundaryBindingPlan>,
+    ) -> Result<Self, OwnerConstraintSeedError> {
+        Self::with_sources(Some(self), None, overlay)
+    }
+
+    fn with_sources(
+        inherited: Option<&Self>,
+        authored: Option<&Self>,
+        overlay: Vec<OwnerLexicalBoundaryBindingPlan>,
+    ) -> Result<Self, OwnerConstraintSeedError> {
+        let mut rows = inherited
+            .map(|bindings| bindings.rows.as_ref().clone())
+            .unwrap_or_default();
+        if let Some(authored) = authored {
+            rows.extend(
+                authored
+                    .rows
+                    .iter()
+                    .map(|(name, entry)| (Arc::clone(name), Arc::clone(entry))),
+            );
+        }
+        for plan in overlay {
+            let fingerprint_v1 = fingerprint(OWNER_LEXICAL_BOUNDARY_BINDING_DOMAIN_V1, &plan)?;
+            let name = Arc::<str>::from(plan.name.as_str());
+            rows.insert(
+                name,
+                Arc::new(OwnerLexicalBoundaryBindingEntry {
+                    plan,
+                    fingerprint_v1,
+                }),
+            );
+        }
+        let row_count = u64::try_from(rows.len()).map_err(|_| {
+            OwnerConstraintSeedError::new("owner lexical boundary binding count exceeds u64")
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(OWNER_LEXICAL_BOUNDARY_BINDINGS_DOMAIN_V2);
+        hasher.update(row_count.to_be_bytes());
+        for entry in rows.values() {
+            hasher.update(entry.fingerprint_v1);
+        }
         Ok(Self {
-            rows: Arc::from(bindings),
-            fingerprint_v1,
+            rows: Arc::new(rows),
+            fingerprint_v1: hasher.finalize().into(),
         })
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, OwnerLexicalBoundaryBindingPlan> {
-        self.rows.iter()
+    pub fn iter(&self) -> impl Iterator<Item = &OwnerLexicalBoundaryBindingPlan> {
+        self.rows.values().map(|entry| &entry.plan)
     }
 
     pub fn len(&self) -> usize {
@@ -242,10 +301,7 @@ impl OwnerLexicalBoundaryBindings {
     }
 
     pub(crate) fn get(&self, name: &str) -> Option<&OwnerLexicalBoundaryBindingPlan> {
-        self.rows
-            .binary_search_by(|binding| binding.name.as_str().cmp(name))
-            .ok()
-            .and_then(|index| self.rows.get(index))
+        self.rows.get(name).map(|entry| &entry.plan)
     }
 
     pub const fn fingerprint_v1(&self) -> [u8; 32] {
@@ -269,7 +325,11 @@ impl Serialize for OwnerLexicalBoundaryBindings {
     where
         S: Serializer,
     {
-        self.rows.as_ref().serialize(serializer)
+        let mut sequence = serializer.serialize_seq(Some(self.rows.len()))?;
+        for entry in self.rows.values() {
+            sequence.serialize_element(&entry.plan)?;
+        }
+        sequence.end()
     }
 }
 
@@ -2443,6 +2503,60 @@ fn stable_lexical_target(
     Ok(Some(declaration))
 }
 
+fn project_owner_authored_boundary_bindings(
+    scope_id: u32,
+    scopes: &[OwnerLexicalScopePlan],
+    declarations: &[BTreeMap<String, OwnerLexicalDeclarationTarget>],
+    stable_scopes: &[Option<OwnerStableScopeRef>],
+    stable_targets: &BTreeMap<OwnerLexicalDeclarationTarget, OwnerLexicalTargetRef>,
+    bindings_by_scope: &mut BTreeMap<u32, OwnerLexicalBoundaryBindings>,
+) -> Result<OwnerLexicalBoundaryBindings, OwnerConstraintSeedError> {
+    if let Some(bindings) = bindings_by_scope.get(&scope_id) {
+        return Ok(bindings.clone());
+    }
+    let scope = scopes.get(scope_id as usize).ok_or_else(|| {
+        OwnerConstraintSeedError::new(
+            "owner lexical child boundary references a missing declaration scope",
+        )
+    })?;
+    let inherited = if let Some(parent) = scope.parent {
+        project_owner_authored_boundary_bindings(
+            parent,
+            scopes,
+            declarations,
+            stable_scopes,
+            stable_targets,
+            bindings_by_scope,
+        )?
+    } else {
+        OwnerLexicalBoundaryBindings::default()
+    };
+    let declaration_scope = stable_scopes.get(scope_id as usize).cloned().flatten();
+    let overlay = declarations
+        .get(scope_id as usize)
+        .ok_or_else(|| {
+            OwnerConstraintSeedError::new(
+                "owner lexical child boundary references a missing declaration scope",
+            )
+        })?
+        .iter()
+        .map(|(name, target)| {
+            Ok(OwnerLexicalBoundaryBindingPlan {
+                name: name.clone(),
+                target: stable_targets.get(target).cloned().ok_or_else(|| {
+                    OwnerConstraintSeedError::new(
+                        "owner lexical child boundary declaration has no stable target",
+                    )
+                })?,
+                declaration_scope: declaration_scope.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, OwnerConstraintSeedError>>()?;
+    let bindings = inherited.with_overlay(overlay)?;
+    bindings_by_scope.insert(scope_id, bindings.clone());
+    Ok(bindings)
+}
+
 fn project_owner_lexical_containment(
     input: &OwnerSyntaxInput,
     scopes: &[OwnerLexicalScopePlan],
@@ -2462,6 +2576,7 @@ fn project_owner_lexical_containment(
             .entry(external.expression.clone())
             .or_default() += 1;
     }
+    let mut authored_bindings_by_scope = BTreeMap::<u32, OwnerLexicalBoundaryBindings>::new();
     let mut bindings_by_scope = BTreeMap::<u32, OwnerLexicalBoundaryBindings>::new();
     let mut children = Vec::with_capacity(input.child_owners.len());
     for child in &input.child_owners {
@@ -2524,65 +2639,25 @@ fn project_owner_lexical_containment(
             if let Some(bindings) = bindings_by_scope.get(&scope_id) {
                 bindings.clone()
             } else {
-                let mut visible = BTreeMap::new();
-                let mut current = scope_id;
-                loop {
-                    for (name, target) in declarations.get(current as usize).ok_or_else(|| {
-                        OwnerConstraintSeedError::new(
-                            "owner lexical child boundary references a missing declaration scope",
-                        )
-                    })? {
-                        if visible.contains_key(name) {
-                            continue;
-                        }
-                        let target = stable_targets.get(target).cloned().ok_or_else(|| {
-                            OwnerConstraintSeedError::new(
-                                "owner lexical child boundary declaration has no stable target",
-                            )
-                        })?;
-                        visible.insert(
-                            name.clone(),
-                            (
-                                target,
-                                stable_scopes.get(current as usize).cloned().flatten(),
-                            ),
-                        );
-                    }
-                    let Some(parent) = scopes
-                        .get(current as usize)
-                        .ok_or_else(|| {
-                            OwnerConstraintSeedError::new(
-                                "owner lexical child boundary references a missing scope",
-                            )
-                        })?
-                        .parent
-                    else {
-                        break;
-                    };
-                    current = parent;
-                }
+                let authored = project_owner_authored_boundary_bindings(
+                    scope_id,
+                    scopes,
+                    declarations,
+                    stable_scopes,
+                    stable_targets,
+                    &mut authored_bindings_by_scope,
+                )?;
+                let mut overlay = Vec::new();
                 if let Some(passed) = &passed {
                     // PASSED is a language-reserved binding and therefore wins
                     // even if an authored declaration reused the spelling.
-                    visible.insert("PASSED".to_owned(), (passed.clone(), None));
+                    overlay.push(OwnerLexicalBoundaryBindingPlan {
+                        name: "PASSED".to_owned(),
+                        target: passed.clone(),
+                        declaration_scope: None,
+                    });
                 }
-                let bindings = OwnerLexicalBoundaryBindings::try_new(
-                    visible
-                        .into_iter()
-                        .map(|(name, (target, declaration_scope))| {
-                            OwnerLexicalBoundaryBindingPlan {
-                                name,
-                                target,
-                                declaration_scope,
-                            }
-                        })
-                        .collect(),
-                )
-                .map_err(|error| {
-                    OwnerConstraintSeedError::new(format!(
-                        "cannot fingerprint owner lexical boundary bindings: {error}"
-                    ))
-                })?;
+                let bindings = authored.with_overlay(overlay)?;
                 bindings_by_scope.insert(scope_id, bindings.clone());
                 bindings
             }

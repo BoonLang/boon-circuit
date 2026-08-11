@@ -18,7 +18,6 @@ use boon_checked::{
 };
 use boon_syntax::{StableCheckOwnerKey, StableExpressionKey};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -827,102 +826,107 @@ impl TypeUnifier {
         self.changes
     }
 
-    fn hash_resolved_type(&self, ty: &Type, hasher: &mut Sha256, active: &mut BTreeSet<TypeVar>) {
+    fn append_resolved_type_snapshot(
+        &self,
+        ty: &Type,
+        output: &mut Vec<u8>,
+        active: &mut BTreeSet<TypeVar>,
+    ) {
         match ty {
             Type::Var(variable) => {
-                hasher.update([0]);
+                output.push(0);
                 let root = self.root_readonly(*variable);
                 if !active.insert(root) {
-                    hasher.update([0]);
-                    hasher.update(root.0.to_le_bytes());
+                    output.push(0);
+                    output.extend_from_slice(&root.0.to_le_bytes());
                     return;
                 }
                 if let Some(binding) = &self.bindings[root.0 as usize] {
-                    hasher.update([1]);
-                    self.hash_resolved_type(binding, hasher, active);
+                    output.push(1);
+                    self.append_resolved_type_snapshot(binding, output, active);
                 } else {
-                    hasher.update([2]);
-                    hasher.update(root.0.to_le_bytes());
+                    output.push(2);
+                    output.extend_from_slice(&root.0.to_le_bytes());
                 }
                 active.remove(&root);
             }
-            Type::Text => hasher.update([1]),
-            Type::Number => hasher.update([2]),
-            Type::Bytes(BytesType::Dynamic) => hasher.update([3, 0]),
+            Type::Text => output.push(1),
+            Type::Number => output.push(2),
+            Type::Bytes(BytesType::Dynamic) => output.extend_from_slice(&[3, 0]),
             Type::Bytes(BytesType::Fixed(size)) => {
-                hasher.update([3, 1]);
-                hasher.update((*size as u64).to_le_bytes());
+                output.extend_from_slice(&[3, 1]);
+                output.extend_from_slice(&(*size as u64).to_le_bytes());
             }
-            Type::Absent => hasher.update([4]),
+            Type::Absent => output.push(4),
             Type::VariantSet(variants) => {
-                hasher.update([5]);
-                hash_length(hasher, variants.len());
+                output.push(5);
+                append_snapshot_length(output, variants.len());
                 for variant in variants.iter() {
                     match variant {
                         Variant::Tag(tag) => {
-                            hasher.update([0]);
-                            hash_length(hasher, tag.len());
-                            hasher.update(tag.as_bytes());
+                            output.push(0);
+                            append_snapshot_length(output, tag.len());
+                            output.extend_from_slice(tag.as_bytes());
                         }
                         Variant::Tagged { tag, fields } => {
-                            hasher.update([1]);
-                            hash_length(hasher, tag.len());
-                            hasher.update(tag.as_bytes());
-                            hash_object_shape(self, fields, hasher, active);
+                            output.push(1);
+                            append_snapshot_length(output, tag.len());
+                            output.extend_from_slice(tag.as_bytes());
+                            append_object_shape_snapshot(self, fields, output, active);
                         }
                     }
                 }
             }
             Type::Object(shape) => {
-                hasher.update([6]);
-                hash_object_shape(self, shape, hasher, active);
+                output.push(6);
+                append_object_shape_snapshot(self, shape, output, active);
             }
-            Type::RenderContract => hasher.update([7]),
+            Type::RenderContract => output.push(7),
             Type::List(item) => {
-                hasher.update([8]);
-                self.hash_resolved_type(item, hasher, active);
+                output.push(8);
+                self.append_resolved_type_snapshot(item, output, active);
             }
             Type::Function { args, result } => {
-                hasher.update([9]);
-                hash_length(hasher, args.len());
+                output.push(9);
+                append_snapshot_length(output, args.len());
                 for argument in args {
-                    self.hash_resolved_type(argument, hasher, active);
+                    self.append_resolved_type_snapshot(argument, output, active);
                 }
-                hasher.update([flow_mode_tag(result.mode)]);
-                self.hash_resolved_type(&result.ty, hasher, active);
+                output.push(flow_mode_tag(result.mode));
+                self.append_resolved_type_snapshot(&result.ty, output, active);
             }
             Type::UnresolvedShape { reason } => {
-                hasher.update([10]);
-                hash_length(hasher, reason.len());
-                hasher.update(reason.as_bytes());
+                output.push(10);
+                append_snapshot_length(output, reason.len());
+                output.extend_from_slice(reason.as_bytes());
             }
-            Type::Unknown => hasher.update([11]),
+            Type::Unknown => output.push(11),
             Type::Union(members) => {
-                hasher.update([12]);
-                hash_length(hasher, members.len());
+                output.push(12);
+                append_snapshot_length(output, members.len());
                 for member in members {
-                    self.hash_resolved_type(member, hasher, active);
+                    self.append_resolved_type_snapshot(member, output, active);
                 }
             }
             Type::Map { key, value } => {
-                hasher.update([13]);
-                self.hash_resolved_type(key, hasher, active);
-                self.hash_resolved_type(value, hasher, active);
+                output.push(13);
+                self.append_resolved_type_snapshot(key, output, active);
+                self.append_resolved_type_snapshot(value, output, active);
             }
             Type::Set(item) => {
-                hasher.update([14]);
-                self.hash_resolved_type(item, hasher, active);
+                output.push(14);
+                self.append_resolved_type_snapshot(item, output, active);
             }
             Type::Bits { width } => {
-                hasher.update([15]);
-                hasher.update(width.to_le_bytes());
+                output.push(15);
+                output.extend_from_slice(&width.to_le_bytes());
             }
         }
     }
 }
 
-fn hash_length(hasher: &mut Sha256, len: usize) {
-    hasher.update((len as u64).to_le_bytes());
+fn append_snapshot_length(output: &mut Vec<u8>, len: usize) {
+    output.extend_from_slice(&(len as u64).to_le_bytes());
 }
 
 const fn flow_mode_tag(mode: FlowMode) -> u8 {
@@ -934,24 +938,24 @@ const fn flow_mode_tag(mode: FlowMode) -> u8 {
     }
 }
 
-fn hash_object_shape(
+fn append_object_shape_snapshot(
     unifier: &TypeUnifier,
     shape: &ObjectShape,
-    hasher: &mut Sha256,
+    output: &mut Vec<u8>,
     active: &mut BTreeSet<TypeVar>,
 ) {
-    hasher.update((shape.fields.len() as u64).to_le_bytes());
+    append_snapshot_length(output, shape.fields.len());
     for (name, ty) in &shape.fields {
-        hasher.update((name.len() as u64).to_le_bytes());
-        hasher.update(name.as_bytes());
-        unifier.hash_resolved_type(ty, hasher, active);
+        append_snapshot_length(output, name.len());
+        output.extend_from_slice(name.as_bytes());
+        unifier.append_resolved_type_snapshot(ty, output, active);
     }
-    hasher.update((shape.field_order.len() as u64).to_le_bytes());
+    append_snapshot_length(output, shape.field_order.len());
     for name in &shape.field_order {
-        hasher.update((name.len() as u64).to_le_bytes());
-        hasher.update(name.as_bytes());
+        append_snapshot_length(output, name.len());
+        output.extend_from_slice(name.as_bytes());
     }
-    hasher.update([u8::from(shape.open)]);
+    output.push(u8::from(shape.open));
 }
 
 #[derive(Clone)]
@@ -2415,21 +2419,31 @@ fn build_owner_result_transfer(
     })
 }
 
-fn solver_surface_fingerprint(
+/// Write the exact in-process convergence surface.
+///
+/// This is deliberately not an artifact fingerprint: callers retain and
+/// compare the encoded bytes directly, so convergence cannot be hidden by a
+/// digest collision and the fixed-point loop does no cryptographic work.
+fn write_solver_surface_snapshot(
     unifier: &TypeUnifier,
     states: &BTreeMap<StableCheckOwnerKey, OwnerSolveState<'_>>,
-) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"boon.owner-interface-solver-surface.v1\0");
-    hash_length(&mut hasher, states.len());
+    output: &mut Vec<u8>,
+) {
+    output.clear();
+    output.extend_from_slice(b"boon.owner-interface-solver-surface.v1\0");
+    append_snapshot_length(output, states.len());
     let mut active = BTreeSet::new();
     for state in states.values() {
-        hash_length(&mut hasher, state.parameters.len());
+        append_snapshot_length(output, state.parameters.len());
         for parameter in &state.parameters {
-            unifier.hash_resolved_type(&Type::Var(parameter.variable), &mut hasher, &mut active);
+            unifier.append_resolved_type_snapshot(
+                &Type::Var(parameter.variable),
+                output,
+                &mut active,
+            );
         }
         for variable in [state.result, state.result_flush, state.context] {
-            unifier.hash_resolved_type(&Type::Var(variable), &mut hasher, &mut active);
+            unifier.append_resolved_type_snapshot(&Type::Var(variable), output, &mut active);
         }
         for (external, variable) in state
             .seed
@@ -2438,12 +2452,11 @@ fn solver_surface_fingerprint(
             .zip(&state.external_expressions)
             .filter(|(external, _)| external.is_exact_enclosing_capture_for(&state.seed.owner))
         {
-            hash_length(&mut hasher, external.expression.route_digest_v1.len());
-            hasher.update(external.expression.route_digest_v1);
-            unifier.hash_resolved_type(&Type::Var(*variable), &mut hasher, &mut active);
+            append_snapshot_length(output, external.expression.route_digest_v1.len());
+            output.extend_from_slice(&external.expression.route_digest_v1);
+            unifier.append_resolved_type_snapshot(&Type::Var(*variable), output, &mut active);
         }
     }
-    hasher.finalize().into()
 }
 
 pub(crate) fn authoritative_signature(
@@ -3922,9 +3935,23 @@ fn evaluate_owner_interface_scc_impl<'a>(
     // substitution map would incorrectly couple a wrapper's result type to its
     // inherited context leaf.
     let mut call_context_variables = vec![BTreeMap::new(); calls.len()];
-    let mut previous_surface = solver_surface_fingerprint(&unifier, &states);
-    let maximum_rounds = states.len().saturating_add(calls.len()).saturating_add(2);
-    let mut converged = calls.is_empty();
+    let requires_fixed_point = !calls.is_empty()
+        || !pattern_narrowings.is_empty()
+        || !internal_lexical_capture_providers.is_empty()
+        || states
+            .values()
+            .any(|state| !state.lexical_capture_variables.is_empty());
+    let mut previous_surface = Vec::new();
+    if requires_fixed_point {
+        write_solver_surface_snapshot(&unifier, &states, &mut previous_surface);
+    }
+    let mut current_surface = Vec::with_capacity(previous_surface.len());
+    let maximum_rounds = if requires_fixed_point {
+        states.len().saturating_add(calls.len()).saturating_add(2)
+    } else {
+        0
+    };
+    let mut converged = !requires_fixed_point;
     for _round in 0..maximum_rounds {
         work.solve_rounds = work.solve_rounds.saturating_add(1);
         let changes_before = unifier.changes();
@@ -4300,12 +4327,12 @@ fn evaluate_owner_interface_scc_impl<'a>(
             converged = true;
             break;
         }
-        let current_surface = solver_surface_fingerprint(&unifier, &states);
+        write_solver_surface_snapshot(&unifier, &states, &mut current_surface);
         if current_surface == previous_surface && !surface_changed {
             converged = true;
             break;
         }
-        previous_surface = current_surface;
+        std::mem::swap(&mut previous_surface, &mut current_surface);
     }
     if !converged {
         return Err(OwnerConstraintSeedError::new(format!(
@@ -4953,6 +4980,69 @@ mod tests {
     }
 
     #[test]
+    fn resolved_type_snapshot_is_exact_reusable_and_observes_root_binding() {
+        fn snapshot(unifier: &TypeUnifier, ty: &Type) -> Vec<u8> {
+            let mut output = Vec::new();
+            unifier.append_resolved_type_snapshot(ty, &mut output, &mut BTreeSet::new());
+            output
+        }
+
+        let mut unifier = TypeUnifier::default();
+        let unresolved = unifier.fresh();
+        let alias = unifier.fresh();
+        unifier.unify(Type::Var(unresolved), Type::Var(alias));
+        let ty = Type::Function {
+            args: vec![
+                Type::object(ObjectShape {
+                    fields: [
+                        ("value".to_owned(), Type::Var(alias)),
+                        (
+                            "payload".to_owned(),
+                            Type::VariantSet(boon_checked::SharedVariantSet::new(vec![
+                                Variant::Tag("Empty".to_owned()),
+                                Variant::tagged(
+                                    "Found".to_owned(),
+                                    ObjectShape {
+                                        fields: [("item".to_owned(), Type::Text)].into(),
+                                        field_order: vec!["item".to_owned()],
+                                        open: false,
+                                    },
+                                ),
+                            ])),
+                        ),
+                    ]
+                    .into(),
+                    field_order: vec!["value".to_owned(), "payload".to_owned()],
+                    open: true,
+                }),
+                Type::Map {
+                    key: Box::new(Type::Bytes(BytesType::Fixed(8))),
+                    value: Box::new(Type::Set(Type::shared(Type::Bits { width: 16 }))),
+                },
+                Type::RenderContract,
+                Type::Unknown,
+                Type::UnresolvedShape {
+                    reason: "test".to_owned(),
+                },
+            ],
+            result: Box::new(FlowType {
+                mode: FlowMode::PresentOrAbsent,
+                ty: Type::Union(vec![
+                    Type::List(Type::shared(Type::Var(unresolved))),
+                    Type::Absent,
+                ]),
+            }),
+        };
+
+        let unbound = snapshot(&unifier, &ty);
+        assert_eq!(snapshot(&unifier, &ty), unbound);
+        unifier.bind_var(unresolved, Type::Number);
+        let bound = snapshot(&unifier, &ty);
+        assert_ne!(bound, unbound);
+        assert_eq!(snapshot(&unifier, &ty), bound);
+    }
+
+    #[test]
     fn union_equality_constrains_unresolved_flow_branches() {
         let mut unifier = TypeUnifier::default();
         let unresolved = unifier.fresh();
@@ -5157,6 +5247,7 @@ mod tests {
         let seed = seed(&unit, &owner);
         let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
         let results = solve(&[seed], &[summary]);
+        assert_eq!(results[0].work.solve_rounds, 0);
         let interface = results[0].owner(&owner).unwrap();
         assert_eq!(interface.parameters.len(), 1);
         assert_eq!(interface.parameters[0].flow_type.ty, Type::Var(TypeVar(0)));

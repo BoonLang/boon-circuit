@@ -32,6 +32,7 @@ use boon_syntax::{
     StableStatementKey,
 };
 use serde::Serialize;
+use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -177,6 +178,70 @@ fn owner_result_transfer_is_invocation_invariant(interface: &OwnerPublicInterfac
     input_variables.is_disjoint(&transfer_variables)
 }
 
+fn owner_result_transfer_type_variables_are_declared(ty: &Type, declared: &[TypeVar]) -> bool {
+    match ty {
+        Type::Var(variable) => declared.binary_search(variable).is_ok(),
+        Type::Object(shape) => shape
+            .fields
+            .values()
+            .all(|ty| owner_result_transfer_type_variables_are_declared(ty, declared)),
+        Type::List(item) | Type::Set(item) => {
+            owner_result_transfer_type_variables_are_declared(item, declared)
+        }
+        Type::Map { key, value } => {
+            owner_result_transfer_type_variables_are_declared(key, declared)
+                && owner_result_transfer_type_variables_are_declared(value, declared)
+        }
+        Type::Function { args, result } => {
+            args.iter()
+                .all(|ty| owner_result_transfer_type_variables_are_declared(ty, declared))
+                && owner_result_transfer_type_variables_are_declared(&result.ty, declared)
+        }
+        Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
+            Variant::Tag(_) => true,
+            Variant::Tagged { fields, .. } => fields
+                .fields
+                .values()
+                .all(|ty| owner_result_transfer_type_variables_are_declared(ty, declared)),
+        }),
+        Type::Union(members) => members
+            .iter()
+            .all(|ty| owner_result_transfer_type_variables_are_declared(ty, declared)),
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown => true,
+    }
+}
+
+fn owner_result_transfer_interface_variables_are_complete(
+    interface: &OwnerPublicInterface,
+) -> bool {
+    let declared = &interface.type_variables;
+    declared.windows(2).all(|pair| pair[0] < pair[1])
+        && interface.parameters.iter().all(|parameter| {
+            owner_result_transfer_type_variables_are_declared(&parameter.flow_type.ty, declared)
+        })
+        && interface.context.as_ref().is_none_or(|context| {
+            owner_result_transfer_type_variables_are_declared(&context.flow_type.ty, declared)
+        })
+        && owner_result_transfer_type_variables_are_declared(&interface.result.ty, declared)
+        && interface
+            .result_flush_type
+            .as_ref()
+            .is_none_or(|ty| owner_result_transfer_type_variables_are_declared(ty, declared))
+        && match &interface.result_transfer {
+            OwnerResultTransfer::Principal | OwnerResultTransfer::Parameter { .. } => true,
+            OwnerResultTransfer::Expression { nodes, .. } => nodes.iter().all(|node| {
+                owner_result_transfer_type_variables_are_declared(&node.flow_type.ty, declared)
+            }),
+        }
+}
+
 fn precompute_owner_interface_transfer_constants(module: &mut OwnerInterfaceTransferModule) {
     let candidates = module
         .result
@@ -267,6 +332,12 @@ fn seal_owner_interface_transfer_module(
     }
     let mut used_dependencies = BTreeSet::new();
     for interface in &result.owners {
+        if !owner_result_transfer_interface_variables_are_complete(interface) {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "interface transfer for {:?} has an incomplete alpha-variable namespace",
+                interface.owner
+            )));
+        }
         for dependency in owner_result_transfer_dependencies(&interface.result_transfer) {
             match routes.get(&dependency) {
                 Some(OwnerInterfaceTransferRoute::Own) => {}
@@ -3216,10 +3287,148 @@ struct EvaluatedOwnerResult {
 }
 
 struct OwnerResultTransferFallbacks {
-    variables: BTreeMap<TypeVar, TypeVar>,
+    variables: OwnerResultTransferVariables,
     substitutions: BTreeMap<TypeVar, Type>,
-    values: BTreeMap<StableExpressionKey, EvaluatedResultValue>,
 }
+
+struct OwnerResultTransferVariables {
+    entries: Vec<(TypeVar, TypeVar)>,
+}
+
+impl OwnerResultTransferVariables {
+    fn new(
+        variables: &[TypeVar],
+        unifier: &mut TypeUnifier,
+        owned_variables: &mut Vec<TypeVar>,
+    ) -> Self {
+        let entries = variables
+            .iter()
+            .map(|variable| {
+                let instantiated = unifier.fresh();
+                owned_variables.push(instantiated);
+                (*variable, instantiated)
+            })
+            .collect();
+        Self { entries }
+    }
+
+    fn replacement(&self, variable: TypeVar) -> Option<TypeVar> {
+        self.entries
+            .binary_search_by_key(&variable, |(source, _)| *source)
+            .ok()
+            .and_then(|index| self.entries.get(index))
+            .map(|(_, replacement)| *replacement)
+    }
+
+    fn instantiate(&self, ty: &Type) -> Type {
+        if !owner_result_transfer_type_has_variable(ty) {
+            return ty.clone();
+        }
+        match ty {
+            Type::Var(variable) => self
+                .replacement(*variable)
+                .map(Type::Var)
+                .unwrap_or(Type::Var(*variable)),
+            Type::Object(shape) => Type::object(ObjectShape {
+                fields: shape
+                    .fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), self.instantiate(ty)))
+                    .collect(),
+                field_order: shape.field_order.clone(),
+                open: shape.open,
+            }),
+            Type::List(item) => Type::List(Type::shared(self.instantiate(item))),
+            Type::Set(item) => Type::Set(Type::shared(self.instantiate(item))),
+            Type::Map { key, value } => Type::Map {
+                key: Box::new(self.instantiate(key)),
+                value: Box::new(self.instantiate(value)),
+            },
+            Type::Function { args, result } => Type::Function {
+                args: args
+                    .iter()
+                    .map(|argument| self.instantiate(argument))
+                    .collect(),
+                result: Box::new(FlowType {
+                    mode: result.mode,
+                    ty: self.instantiate(&result.ty),
+                }),
+            },
+            Type::VariantSet(variants) => Type::VariantSet(
+                variants
+                    .iter()
+                    .map(|variant| match variant {
+                        Variant::Tag(tag) => Variant::Tag(tag.clone()),
+                        Variant::Tagged { tag, fields } => Variant::Tagged {
+                            tag: tag.clone(),
+                            fields: ObjectShape {
+                                fields: fields
+                                    .fields
+                                    .iter()
+                                    .map(|(name, ty)| (name.clone(), self.instantiate(ty)))
+                                    .collect(),
+                                field_order: fields.field_order.clone(),
+                                open: fields.open,
+                            }
+                            .into(),
+                        },
+                    })
+                    .collect(),
+            ),
+            Type::Union(members) => Type::Union(
+                members
+                    .iter()
+                    .map(|member| self.instantiate(member))
+                    .collect(),
+            ),
+            Type::Text
+            | Type::Number
+            | Type::Bytes(_)
+            | Type::Bits { .. }
+            | Type::Absent
+            | Type::RenderContract
+            | Type::UnresolvedShape { .. }
+            | Type::Unknown => ty.clone(),
+        }
+    }
+}
+
+fn owner_result_transfer_type_has_variable(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => true,
+        Type::Object(shape) => shape
+            .fields
+            .values()
+            .any(owner_result_transfer_type_has_variable),
+        Type::List(item) | Type::Set(item) => owner_result_transfer_type_has_variable(item),
+        Type::Map { key, value } => {
+            owner_result_transfer_type_has_variable(key)
+                || owner_result_transfer_type_has_variable(value)
+        }
+        Type::Function { args, result } => {
+            args.iter().any(owner_result_transfer_type_has_variable)
+                || owner_result_transfer_type_has_variable(&result.ty)
+        }
+        Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+            Variant::Tag(_) => false,
+            Variant::Tagged { fields, .. } => fields
+                .fields
+                .values()
+                .any(owner_result_transfer_type_has_variable),
+        }),
+        Type::Union(members) => members.iter().any(owner_result_transfer_type_has_variable),
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown => false,
+    }
+}
+
+type OwnerResultTransferActiveNodes = SmallVec<[usize; 16]>;
 
 fn reinstantiate_owner_call_transfer(
     cached: &EvaluatedOwnerResult,
@@ -3252,23 +3461,22 @@ fn reinstantiate_owner_call_transfer(
 }
 
 impl OwnerResultTransferFallbacks {
-    fn new(variables: BTreeMap<TypeVar, TypeVar>, substitutions: BTreeMap<TypeVar, Type>) -> Self {
+    fn new(
+        variables: OwnerResultTransferVariables,
+        substitutions: BTreeMap<TypeVar, Type>,
+    ) -> Self {
         Self {
             variables,
             substitutions,
-            values: BTreeMap::new(),
         }
     }
 
     fn resolve(
         &mut self,
         node: &OwnerResultTransferNode,
-        unifier: &mut TypeUnifier,
+        _unifier: &mut TypeUnifier,
     ) -> Option<EvaluatedResultValue> {
-        if let Some(value) = self.values.get(&node.expression) {
-            return Some(value.clone());
-        }
-        let ty = instantiate_type(&node.flow_type.ty, unifier, &mut self.variables);
+        let ty = self.variables.instantiate(&node.flow_type.ty);
         let ty = apply_checked_type_substitution_lookup(&ty, &self.substitutions);
         let value = EvaluatedResultValue {
             flow_type: FlowType {
@@ -3282,7 +3490,6 @@ impl OwnerResultTransferFallbacks {
                 .as_deref()
                 .and_then(|literal| ExactNumber::parse_strict(literal, None).ok()),
         };
-        self.values.insert(node.expression.clone(), value.clone());
         Some(value)
     }
 }
@@ -3291,7 +3498,7 @@ struct OwnerResultTransferEvaluator<'a, 'unifier> {
     providers: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerInterfaceTransferModule>,
     unifier: &'unifier mut TypeUnifier,
     active_owners: BTreeSet<StableCheckOwnerKey>,
-    owned_variables: BTreeSet<TypeVar>,
+    owned_variables: Vec<TypeVar>,
 }
 
 impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
@@ -3303,7 +3510,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             providers,
             unifier,
             active_owners: BTreeSet::new(),
-            owned_variables: BTreeSet::new(),
+            owned_variables: Vec::new(),
         }
     }
 
@@ -3315,9 +3522,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
     ) -> Option<EvaluatedOwnerResult> {
         let module = *self.providers.get(owner)?;
         let mut result = self.evaluate_owner_in_module(module, owner, arguments, context)?;
-        result.owned_variables = std::mem::take(&mut self.owned_variables)
-            .into_iter()
-            .collect();
+        result.owned_variables = std::mem::take(&mut self.owned_variables);
         Some(result)
     }
 
@@ -3333,17 +3538,15 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         // every invocation its own variables in the caller's unifier so raw
         // TypeVar ordinals from unrelated SCCs can never alias each other or
         // the caller's local variables.
-        let mut variables = BTreeMap::new();
-        for variable in &interface.type_variables {
-            let instantiated = self.unifier.fresh();
-            variables.insert(*variable, instantiated);
-            self.owned_variables.insert(instantiated);
-        }
+        let variables = OwnerResultTransferVariables::new(
+            &interface.type_variables,
+            self.unifier,
+            &mut self.owned_variables,
+        );
         let mut substitutions = BTreeMap::new();
         for parameter in &interface.parameters {
             if let Some(actual) = arguments.get(&parameter.ordinal) {
-                let formal =
-                    instantiate_type(&parameter.flow_type.ty, self.unifier, &mut variables);
+                let formal = variables.instantiate(&parameter.flow_type.ty);
                 crate::unify_checked_type_pattern(
                     &formal,
                     &actual.flow_type.ty,
@@ -3352,17 +3555,16 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             }
         }
         if let (Some(formal), Some(actual)) = (&interface.context, context) {
-            let formal = instantiate_type(&formal.flow_type.ty, self.unifier, &mut variables);
+            let formal = variables.instantiate(&formal.flow_type.ty);
             crate::unify_checked_type_pattern(&formal, &actual.flow_type.ty, &mut substitutions);
         }
-        let instantiated_result =
-            instantiate_type(&interface.result.ty, self.unifier, &mut variables);
+        let instantiated_result = variables.instantiate(&interface.result.ty);
         let principal = FlowType {
             mode: interface.result.mode,
             ty: apply_checked_type_substitution_lookup(&instantiated_result, &substitutions),
         };
         let result_flush_type = interface.result_flush_type.as_ref().map(|flush_type| {
-            let flush_type = instantiate_type(flush_type, self.unifier, &mut variables);
+            let flush_type = variables.instantiate(flush_type);
             apply_checked_type_substitution_lookup(&flush_type, &substitutions)
         });
         let mut contextual_type_variables = BTreeSet::new();
@@ -3373,8 +3575,8 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             .type_variables
             .iter()
             .filter_map(|variable| {
-                let instantiated = variables.get(variable)?;
-                substitutions.get(instantiated).map(|value| {
+                let instantiated = variables.replacement(*variable)?;
+                substitutions.get(&instantiated).map(|value| {
                     (
                         *variable,
                         apply_checked_type_substitution_lookup(value, &substitutions),
@@ -3437,7 +3639,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                         context,
                         &mut fallbacks,
                         &BTreeMap::new(),
-                        &mut BTreeSet::new(),
+                        &mut OwnerResultTransferActiveNodes::new(),
                     )
                 }
             }
@@ -3487,7 +3689,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         context: Option<&EvaluatedResultValue>,
         fallbacks: &mut OwnerResultTransferFallbacks,
         lexical: &BTreeMap<String, EvaluatedResultValue>,
-        active: &mut BTreeSet<StableExpressionKey>,
+        active: &mut OwnerResultTransferActiveNodes,
     ) -> Option<EvaluatedResultValue> {
         match reference {
             OwnerResultExpressionRef::Child { owner, .. } => {
@@ -3504,13 +3706,14 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     .binary_search_by(|node| node.expression.cmp(expression))
                     .ok()?;
                 let node = &nodes[index];
-                if !active.insert(expression.clone()) {
+                if active.contains(&index) {
                     return fallbacks.resolve(node, self.unifier);
                 }
+                active.push(index);
                 let value = self.evaluate_node(
                     module, index, nodes, arguments, context, fallbacks, lexical, active,
                 );
-                active.remove(expression);
+                debug_assert_eq!(active.pop(), Some(index));
                 value
             }
         }
@@ -3526,18 +3729,18 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         context: Option<&EvaluatedResultValue>,
         fallbacks: &mut OwnerResultTransferFallbacks,
         lexical: &BTreeMap<String, EvaluatedResultValue>,
-        active: &mut BTreeSet<StableExpressionKey>,
+        active: &mut OwnerResultTransferActiveNodes,
     ) -> Option<EvaluatedResultValue> {
         let node = nodes.get(node_index)?;
-        let fallback = fallbacks.resolve(node, self.unifier)?;
-        let mut evaluate = |evaluator: &mut Self,
-                            reference: &OwnerResultExpressionRef,
-                            lexical: &BTreeMap<String, EvaluatedResultValue>,
-                            active: &mut BTreeSet<StableExpressionKey>| {
-            evaluator.evaluate_expression_ref(
-                module, reference, nodes, arguments, context, fallbacks, lexical, active,
-            )
-        };
+        let mut evaluate =
+            |evaluator: &mut Self,
+             reference: &OwnerResultExpressionRef,
+             lexical: &BTreeMap<String, EvaluatedResultValue>,
+             active: &mut OwnerResultTransferActiveNodes| {
+                evaluator.evaluate_expression_ref(
+                    module, reference, nodes, arguments, context, fallbacks, lexical, active,
+                )
+            };
         if let Some(read) = &node.parameter_read
             && let Some(actual) = arguments.get(&read.parameter_ordinal)
         {
@@ -3591,7 +3794,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         match &node.kind {
             OwnerConstraintNodeKind::Call { .. } | OwnerConstraintNodeKind::Pipe { .. } => self
                 .evaluate_call_node(
-                    module, node, fallback, nodes, arguments, context, fallbacks, lexical, active,
+                    module, node, nodes, arguments, context, fallbacks, lexical, active,
                 ),
             OwnerConstraintNodeKind::Infix { operation } => {
                 let left = node
@@ -3609,6 +3812,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     .as_ref()
                     .zip(right.static_number.as_ref())
                     .and_then(|(left, right)| static_number_infix(left, operation, right));
+                let fallback = fallbacks.resolve(node, self.unifier)?;
                 Some(EvaluatedResultValue {
                     static_number,
                     parameter_derived: left.parameter_derived || right.parameter_derived,
@@ -3665,10 +3869,11 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                         OwnerConstraintEdgeRole::MatchOutput | OwnerConstraintEdgeRole::ArrowOutput
                     )
                 });
-                output.map_or_else(
-                    || Some(fallback),
-                    |output| evaluate(self, &output.expression, lexical, active),
-                )
+                if let Some(output) = output {
+                    evaluate(self, &output.expression, lexical, active)
+                } else {
+                    fallbacks.resolve(node, self.unifier)
+                }
             }
             OwnerConstraintNodeKind::Block => {
                 let mut lexical = lexical.clone();
@@ -3692,7 +3897,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     value.syntax_selected |= syntax_selected;
                     Some(value)
                 } else {
-                    Some(fallback)
+                    fallbacks.resolve(node, self.unifier)
                 }
             }
             OwnerConstraintNodeKind::Collection { collection, .. } => {
@@ -3725,7 +3930,9 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                             .reduce(|left, right| widen_structural_type(&left, &right))
                             .unwrap_or(Type::Unknown),
                     )),
-                    OwnerCollectionKind::Bytes | OwnerCollectionKind::Map => fallback.flow_type.ty,
+                    OwnerCollectionKind::Bytes | OwnerCollectionKind::Map => {
+                        fallbacks.resolve(node, self.unifier)?.flow_type.ty
+                    }
                 };
                 Some(EvaluatedResultValue {
                     flow_type: FlowType {
@@ -3748,8 +3955,11 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     .iter()
                     .filter(|value| !matches!(value.flow_type.ty, Type::Absent))
                     .map(|value| value.flow_type.ty.clone())
-                    .reduce(|left, right| widen_structural_type(&left, &right))
-                    .unwrap_or_else(|| fallback.flow_type.ty.clone());
+                    .reduce(|left, right| widen_structural_type(&left, &right));
+                let ty = match ty {
+                    Some(ty) => ty,
+                    None => fallbacks.resolve(node, self.unifier)?.flow_type.ty,
+                };
                 Some(EvaluatedResultValue {
                     flow_type: FlowType {
                         mode: crate::latest_flow_mode(
@@ -3773,7 +3983,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     }
                     value
                 })
-                .or(Some(fallback)),
+                .or_else(|| fallbacks.resolve(node, self.unifier)),
             OwnerConstraintNodeKind::Then => {
                 let value = node
                     .inputs
@@ -3817,21 +4027,26 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     static_number: None,
                 })
             }
-            OwnerConstraintNodeKind::Source => Some(EvaluatedResultValue {
-                flow_type: FlowType {
-                    mode: FlowMode::PresentOrAbsent,
-                    ty: fallback.flow_type.ty,
-                },
-                ..fallback
-            }),
+            OwnerConstraintNodeKind::Source => {
+                let fallback = fallbacks.resolve(node, self.unifier)?;
+                Some(EvaluatedResultValue {
+                    flow_type: FlowType {
+                        mode: FlowMode::PresentOrAbsent,
+                        ty: fallback.flow_type.ty,
+                    },
+                    ..fallback
+                })
+            }
             OwnerConstraintNodeKind::Tag { name } if name == "SKIP" => Some(EvaluatedResultValue {
                 flow_type: FlowType {
                     mode: FlowMode::Absent,
                     ty: Type::Absent,
                 },
-                ..fallback
+                parameter_derived: false,
+                syntax_selected: false,
+                static_number: None,
             }),
-            _ => Some(fallback),
+            _ => fallbacks.resolve(node, self.unifier),
         }
     }
 
@@ -3845,7 +4060,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         context: Option<&EvaluatedResultValue>,
         fallbacks: &mut OwnerResultTransferFallbacks,
         lexical: &BTreeMap<String, EvaluatedResultValue>,
-        active: &mut BTreeSet<StableExpressionKey>,
+        active: &mut OwnerResultTransferActiveNodes,
     ) -> Option<EvaluatedResultValue> {
         let selector = node
             .inputs
@@ -3942,13 +4157,12 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         &mut self,
         module: &OwnerInterfaceTransferModule,
         node: &OwnerResultTransferNode,
-        fallback: EvaluatedResultValue,
         nodes: &[OwnerResultTransferNode],
         arguments: &BTreeMap<u32, EvaluatedResultValue>,
         context: Option<&EvaluatedResultValue>,
         fallbacks: &mut OwnerResultTransferFallbacks,
         lexical: &BTreeMap<String, EvaluatedResultValue>,
-        active: &mut BTreeSet<StableExpressionKey>,
+        active: &mut OwnerResultTransferActiveNodes,
     ) -> Option<EvaluatedResultValue> {
         match node.call_target.as_ref()? {
             OwnerResultCallTarget::Owner { owner } => {
@@ -3993,7 +4207,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     explicit_context.as_ref().or(context),
                 )
                 .map(|result| result.value)
-                .or(Some(fallback))
+                .or_else(|| fallbacks.resolve(node, self.unifier))
             }
             OwnerResultCallTarget::Abi {
                 canonical_name,
@@ -4011,9 +4225,9 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     lexical,
                     active,
                 )
-                .or(Some(fallback)),
+                .or_else(|| fallbacks.resolve(node, self.unifier)),
             OwnerResultCallTarget::Unresolved | OwnerResultCallTarget::Ambiguous { .. } => {
-                Some(fallback)
+                fallbacks.resolve(node, self.unifier)
             }
         }
     }
@@ -4030,7 +4244,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         context: Option<&EvaluatedResultValue>,
         fallbacks: &mut OwnerResultTransferFallbacks,
         lexical: &BTreeMap<String, EvaluatedResultValue>,
-        active: &mut BTreeSet<StableExpressionKey>,
+        active: &mut OwnerResultTransferActiveNodes,
     ) -> Option<EvaluatedResultValue> {
         let mut actuals = BTreeMap::new();
         let mut instantiation = BTreeMap::new();
@@ -6971,7 +7185,7 @@ mod tests {
     }
 
     #[test]
-    fn result_transfer_fallbacks_materialize_only_demanded_nodes() {
+    fn result_transfer_fallbacks_reuse_the_invocation_alpha_namespace() {
         let unit = link(concat!(
             "FUNCTION choose(kind) {\n",
             "    kind |> WHEN {\n",
@@ -6994,18 +7208,18 @@ mod tests {
         assert!(nodes.len() > 1);
 
         let mut unifier = TypeUnifier::default();
-        let variables = interface
-            .type_variables
-            .iter()
-            .map(|variable| (*variable, unifier.fresh()))
-            .collect();
+        let mut owned_variables = Vec::new();
+        let variables = OwnerResultTransferVariables::new(
+            &interface.type_variables,
+            &mut unifier,
+            &mut owned_variables,
+        );
         let mut fallbacks = OwnerResultTransferFallbacks::new(variables, BTreeMap::new());
         let demanded = &nodes[0];
-        fallbacks.resolve(demanded, &mut unifier).unwrap();
-        fallbacks.resolve(demanded, &mut unifier).unwrap();
+        let first = fallbacks.resolve(demanded, &mut unifier).unwrap();
+        let second = fallbacks.resolve(demanded, &mut unifier).unwrap();
 
-        assert_eq!(fallbacks.values.len(), 1);
-        assert!(fallbacks.values.contains_key(&demanded.expression));
+        assert!(first == second);
     }
 
     #[test]

@@ -1341,7 +1341,7 @@ impl RequestFamily for OwnerDiagnosticReplayFactsEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerDiagnosticReplayFactsEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts-evaluation.v4";
+    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts-evaluation.v5";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -1358,7 +1358,7 @@ impl RequestFamily for OwnerDiagnosticReplayFactsRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerDiagnosticReplayFacts>;
 
-    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts.v4";
+    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts.v5";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -5311,7 +5311,7 @@ fn evaluate_owner_diagnostic_replay_facts_requests(
     owners: &[StableCheckOwnerKey],
 ) -> CompilerResult<()> {
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-diagnostic-replay-facts-evaluation-dependencies.v4\0",
+        b"boon.compiler.owner-diagnostic-replay-facts-evaluation-dependencies.v5\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -5370,7 +5370,7 @@ fn evaluate_owner_diagnostic_replay_facts_requests(
     }
 
     let result_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-diagnostic-replay-facts-result-projection-dependencies.v4\0",
+        b"boon.compiler.owner-diagnostic-replay-facts-result-projection-dependencies.v5\0",
         std::iter::empty(),
     ));
     for owner in owners {

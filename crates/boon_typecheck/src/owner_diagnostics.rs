@@ -30,16 +30,17 @@ use boon_syntax::{
     AstExprKind, AstParameterKind, AstStatementKind, BytesSizeSyntax, SourceUnitId,
     StableCheckOwnerKey, StableExpressionKey, StableStatementKey,
 };
-use serde::Serialize;
+use serde::ser::SerializeSeq;
+use serde::{Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
 const PROJECT_DIAGNOSTIC_FACTS_DOMAIN_V10: &[u8] = b"boon.project-diagnostic-facts.v10\0";
-const OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V4: &[u8] = b"boon.owner-diagnostic-replay-facts.v4\0";
-const OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V4: &[u8] =
-    b"boon.owner-diagnostic-replay-currentness.v4\0";
+const OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V5: &[u8] = b"boon.owner-diagnostic-replay-facts.v5\0";
+const OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V5: &[u8] =
+    b"boon.owner-diagnostic-replay-currentness.v5\0";
 const PROJECT_OUTPUT_FLOW_FACTS_DOMAIN_V1: &[u8] = b"boon.project-output-flow-facts.v1\0";
 const SOURCE_UNIT_PROJECT_DIAGNOSTICS_DOMAIN_V1: &[u8] =
     b"boon.source-unit-project-diagnostics.v1\0";
@@ -498,12 +499,26 @@ struct OwnerDiagnosticStableStatementValue {
     value: ProjectOrderExpressionFact,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct OwnerDiagnosticStableExpressionFlow {
-    expression: StableExpressionKey,
-    flow_type: FlowType,
-    flush_type: Option<Type>,
-    direct_effect: CheckedEffectSummary,
+struct OwnerDiagnosticExpressionFlowRows<'a> {
+    expressions: &'a [crate::InferredOwnerExpression],
+}
+
+impl Serialize for OwnerDiagnosticExpressionFlowRows<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.expressions.len()))?;
+        for expression in self.expressions {
+            sequence.serialize_element(&(
+                &expression.stable_key,
+                &expression.flow_type,
+                &expression.flush_type,
+                expression.direct_effect,
+            ))?;
+        }
+        sequence.end()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -534,10 +549,25 @@ struct OwnerDiagnosticStableCallFact {
     explicit_pass: Option<ProjectOrderExpressionFact>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct OwnerDiagnosticStableReadFact {
-    expression: StableExpressionKey,
-    read: crate::OwnerEffectiveLexicalReadPlan,
+struct OwnerDiagnosticReadRows<'a> {
+    expressions: &'a [crate::InferredOwnerExpression],
+    reads: &'a [Option<crate::OwnerEffectiveLexicalReadPlan>],
+}
+
+impl Serialize for OwnerDiagnosticReadRows<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let row_count = self.reads.iter().filter(|read| read.is_some()).count();
+        let mut sequence = serializer.serialize_seq(Some(row_count))?;
+        for (expression, read) in self.expressions.iter().zip(self.reads) {
+            if let Some(read) = read {
+                sequence.serialize_element(&(&expression.stable_key, read))?;
+            }
+        }
+        sequence.end()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -583,15 +613,18 @@ struct OwnerDiagnosticOutputCallFact {
 }
 
 /// Stable, span-free replay inputs projected once for one owner.
+///
+/// Expression-flow and effective-read rows stay on the paired current body
+/// evaluation. `fingerprint_v1` commits their complete normalized projection,
+/// so a backdated fact can consume a newer body only when those omitted rows
+/// are semantically identical.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerDiagnosticReplayFacts {
     owner: StableCheckOwnerKey,
     containing_scope: OwnerContainingScopeInput,
     function_name: Option<String>,
-    expression_flows: Box<[OwnerDiagnosticStableExpressionFlow]>,
     statement_values: Box<[OwnerDiagnosticStableStatementValue]>,
     calls: Box<[OwnerDiagnosticStableCallFact]>,
-    reads: Box<[OwnerDiagnosticStableReadFact]>,
     output_declarations: Box<[OwnerDiagnosticOutputDeclarationFact]>,
     output_calls: Box<[OwnerDiagnosticOutputCallFact]>,
     fingerprint_v1: [u8; 32],
@@ -1081,36 +1114,13 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         )));
     }
 
-    let expression_flows = body
-        .expressions
-        .iter()
-        .map(|expression| OwnerDiagnosticStableExpressionFlow {
-            expression: expression.stable_key.clone(),
-            flow_type: expression.flow_type.clone(),
-            flush_type: expression.flush_type.clone(),
-            direct_effect: expression.direct_effect,
-        })
-        .collect::<Vec<_>>();
-    let mut reads = body
-        .expressions
-        .iter()
-        .zip(body.signature_lexical_plan.reads())
-        .filter_map(|(expression, read)| {
-            read.as_ref().map(|read| OwnerDiagnosticStableReadFact {
-                expression: expression.stable_key.clone(),
-                read: read.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
-    reads.sort_by(|left, right| left.expression.cmp(&right.expression));
-    if reads
-        .windows(2)
-        .any(|rows| rows[0].expression == rows[1].expression)
-    {
-        return Err(ProjectDiagnosticFactsError::new(
-            "owner diagnostic replay contains duplicate effective read expressions",
-        ));
-    }
+    let expression_flows = OwnerDiagnosticExpressionFlowRows {
+        expressions: &body.expressions,
+    };
+    let reads = OwnerDiagnosticReadRows {
+        expressions: &body.expressions,
+        reads: body.signature_lexical_plan.reads(),
+    };
     let function_name = body
         .statements
         .first()
@@ -1120,7 +1130,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         });
     let containing_scope = syntax.containing_scope.clone();
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V4,
+        OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V5,
         &(
             &syntax.owner,
             &containing_scope,
@@ -1142,10 +1152,8 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         owner: syntax.owner.clone(),
         containing_scope,
         function_name,
-        expression_flows: expression_flows.into_boxed_slice(),
         statement_values: statement_values.into_boxed_slice(),
         calls: calls.into_boxed_slice(),
-        reads: reads.into_boxed_slice(),
         output_declarations: output_declarations.into_boxed_slice(),
         output_calls: output_calls.into_boxed_slice(),
         fingerprint_v1,
@@ -1184,7 +1192,7 @@ pub fn evaluate_owner_diagnostic_replay_facts(
     )?);
     let result_fingerprint_v1 = result.fingerprint_v1();
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V4,
+        OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V5,
         &(&basis, result_fingerprint_v1),
     )
     .map_err(|error| {
@@ -1207,6 +1215,7 @@ struct OwnerFactView<'a> {
     syntax: &'a OwnerSyntaxInput,
     graph: &'a OwnerSyntaxGraph,
     interface: &'a crate::OwnerPublicInterface,
+    body: &'a OwnerBodyInferenceShard,
     replay: &'a OwnerDiagnosticReplayFacts,
     source_map: &'a OwnerSourceMap,
 }
@@ -1418,7 +1427,8 @@ impl<'a> ProjectFactIndex<'a> {
                     "project diagnostic replay currentness does not match owner inputs for {owner:?}"
                 )));
             }
-            if replay.expression_flows.len() != syntax.expressions.len() {
+            let body = replay_evaluation.body.as_ref();
+            if body.expressions.len() != syntax.expressions.len() {
                 return Err(ProjectDiagnosticFactsError::new(format!(
                     "project diagnostic replay expression coverage differs from syntax for {owner:?}"
                 )));
@@ -1430,8 +1440,8 @@ impl<'a> ProjectFactIndex<'a> {
                     )));
                 }
             }
-            for (flow, input) in replay.expression_flows.iter().zip(&syntax.expressions) {
-                if flow.expression != input.stable_key {
+            for (flow, input) in body.expressions.iter().zip(&syntax.expressions) {
+                if flow.stable_key != input.stable_key {
                     return Err(ProjectDiagnosticFactsError::new(format!(
                         "project diagnostic replay expression row differs from syntax for {owner:?}"
                     )));
@@ -1538,6 +1548,7 @@ impl<'a> ProjectFactIndex<'a> {
                     syntax,
                     graph,
                     interface,
+                    body,
                     replay,
                     source_map,
                 },
@@ -1692,13 +1703,13 @@ impl<'a> ProjectFactIndex<'a> {
         &self,
         owner: &StableCheckOwnerKey,
         expression: &OwnerExpressionRef,
-    ) -> Option<(&OwnerDiagnosticStableExpressionFlow, &OwnerSourceMap)> {
+    ) -> Option<(&crate::InferredOwnerExpression, &OwnerSourceMap)> {
         match expression {
             OwnerExpressionRef::Local { expression } => {
                 let view = self.owners.get(owner)?;
-                let value = view.replay.expression_flows.get(expression.0 as usize)?;
+                let value = view.body.expressions.get(expression.0 as usize)?;
                 let syntax = view.syntax.expressions.get(expression.0 as usize)?;
-                (value.expression == syntax.stable_key).then_some((value, view.source_map))
+                (value.stable_key == syntax.stable_key).then_some((value, view.source_map))
             }
             OwnerExpressionRef::Child { owner, expression } => {
                 let view = self.owners.get(owner)?;
@@ -1707,8 +1718,8 @@ impl<'a> ProjectFactIndex<'a> {
                     expression: expression.clone(),
                 };
                 let index = *self.expressions.get(&stable)? as usize;
-                let value = view.replay.expression_flows.get(index)?;
-                (value.expression == *expression).then_some((value, view.source_map))
+                let value = view.body.expressions.get(index)?;
+                (value.stable_key == *expression).then_some((value, view.source_map))
             }
         }
     }
@@ -1743,13 +1754,13 @@ impl<'a> ProjectFactIndex<'a> {
         &OwnerFactView<'a>,
         usize,
         &crate::OwnerExpressionInput,
-        &OwnerDiagnosticStableExpressionFlow,
+        &crate::InferredOwnerExpression,
     )> {
         let view = self.owners.get(&expression.owner)?;
         let index = *self.expressions.get(expression)? as usize;
         let syntax = view.syntax.expressions.get(index)?;
-        let inferred = view.replay.expression_flows.get(index)?;
-        (syntax.stable_key == expression.expression && inferred.expression == expression.expression)
+        let inferred = view.body.expressions.get(index)?;
+        (syntax.stable_key == expression.expression && inferred.stable_key == expression.expression)
             .then_some((view, index, syntax, inferred))
     }
 
@@ -1986,13 +1997,17 @@ impl<'a> ProjectFactIndex<'a> {
         &self,
         expression: &StableOrderExpression,
     ) -> Option<&crate::OwnerEffectiveLexicalReadPlan> {
-        let replay = self.owners.get(&expression.owner)?.replay;
-        replay
-            .reads
-            .binary_search_by(|row| row.expression.cmp(&expression.expression))
-            .ok()
-            .and_then(|index| replay.reads.get(index))
-            .map(|row| &row.read)
+        let view = self.owners.get(&expression.owner)?;
+        let index = *self.expressions.get(expression)? as usize;
+        let inferred = view.body.expressions.get(index)?;
+        if inferred.stable_key != expression.expression {
+            return None;
+        }
+        view.body
+            .signature_lexical_plan
+            .reads()
+            .get(index)?
+            .as_ref()
     }
 
     fn expression_is_parameter_read(&self, expression: &StableOrderExpression) -> bool {
@@ -2289,10 +2304,10 @@ impl<'a> ProjectFactIndex<'a> {
             })?;
         let span = self.expression_span(&StableOrderExpression {
             owner: source_map.owner().clone(),
-            expression: expression.expression.clone(),
+            expression: expression.stable_key.clone(),
         })?;
         Ok(Some((
-            expression.expression.clone(),
+            expression.stable_key.clone(),
             expression.flow_type.clone(),
             expression.flush_type.clone(),
             span,

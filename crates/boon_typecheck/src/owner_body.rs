@@ -75,6 +75,46 @@ enum OwnerInterfaceTransferRoute {
     Dependency(u32),
 }
 
+/// Dense, module-sealed route used only by the result-transfer interpreter.
+/// Stable owners remain the serialized/public identity; the module resolves
+/// them once instead of comparing full routes at every nested call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedOwnerInterfaceTransferRoute {
+    Own(u32),
+    Dependency { dependency: u32, owner: u32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedOwnerResultExpressionRef {
+    Local(u32),
+    Child(PreparedOwnerInterfaceTransferRoute),
+}
+
+#[derive(Clone)]
+struct PreparedOwnerResultTransferNode {
+    input_start: u32,
+    input_len: u32,
+    call_owner: Option<PreparedOwnerInterfaceTransferRoute>,
+}
+
+#[derive(Clone)]
+struct PreparedOwnerResultTransfer {
+    root: Option<PreparedOwnerResultExpressionRef>,
+    nodes: Box<[PreparedOwnerResultTransferNode]>,
+    inputs: Box<[PreparedOwnerResultExpressionRef]>,
+}
+
+impl PreparedOwnerResultTransfer {
+    fn node_inputs(
+        &self,
+        node: &PreparedOwnerResultTransferNode,
+    ) -> Option<&[PreparedOwnerResultExpressionRef]> {
+        let start = node.input_start as usize;
+        let end = start.checked_add(node.input_len as usize)?;
+        self.inputs.get(start..end)
+    }
+}
+
 /// Shared result-specialization module for one interface SCC.
 ///
 /// Modules retain only direct dependency modules. The dependency graph is a
@@ -86,7 +126,8 @@ pub struct OwnerInterfaceTransferModule {
     result: Arc<OwnerInterfaceSccResult>,
     dependencies: Box<[Arc<OwnerInterfaceTransferModule>]>,
     routes: BTreeMap<StableCheckOwnerKey, OwnerInterfaceTransferRoute>,
-    constant_results: BTreeMap<StableCheckOwnerKey, EvaluatedResultValue>,
+    prepared: Box<[PreparedOwnerResultTransfer]>,
+    constant_results: Box<[Option<EvaluatedResultValue>]>,
     fingerprint_v1: [u8; 32],
 }
 
@@ -129,28 +170,188 @@ impl OwnerInterfaceTransferModule {
         &self.result
     }
 
-    fn resolve_owner(
+    fn prepared_route(
         &self,
         owner: &StableCheckOwnerKey,
-    ) -> Option<(&OwnerInterfaceTransferModule, &OwnerPublicInterface)> {
+    ) -> Option<PreparedOwnerInterfaceTransferRoute> {
         match self.routes.get(owner)? {
-            OwnerInterfaceTransferRoute::Own => Some((self, self.result.owner(owner)?)),
-            OwnerInterfaceTransferRoute::Dependency(index) => {
-                let dependency = self.dependencies.get(*index as usize)?;
-                Some((dependency, dependency.result.owner(owner)?))
+            OwnerInterfaceTransferRoute::Own => {
+                let owner = self.result.key.members.binary_search(owner).ok()?;
+                Some(PreparedOwnerInterfaceTransferRoute::Own(
+                    u32::try_from(owner).ok()?,
+                ))
+            }
+            OwnerInterfaceTransferRoute::Dependency(dependency) => {
+                let module = self.dependencies.get(*dependency as usize)?;
+                let owner = module.result.key.members.binary_search(owner).ok()?;
+                Some(PreparedOwnerInterfaceTransferRoute::Dependency {
+                    dependency: *dependency,
+                    owner: u32::try_from(owner).ok()?,
+                })
             }
         }
     }
 
+    fn resolve_prepared_owner(
+        &self,
+        route: PreparedOwnerInterfaceTransferRoute,
+    ) -> Option<(
+        &OwnerInterfaceTransferModule,
+        usize,
+        &OwnerPublicInterface,
+        &PreparedOwnerResultTransfer,
+    )> {
+        let (module, owner) = match route {
+            PreparedOwnerInterfaceTransferRoute::Own(owner) => (self, owner as usize),
+            PreparedOwnerInterfaceTransferRoute::Dependency { dependency, owner } => (
+                self.dependencies.get(dependency as usize)?.as_ref(),
+                owner as usize,
+            ),
+        };
+        Some((
+            module,
+            owner,
+            module.result.owners.get(owner)?,
+            module.prepared.get(owner)?,
+        ))
+    }
+
+    fn own_prepared_owner(
+        &self,
+        owner: &StableCheckOwnerKey,
+    ) -> Option<(usize, &OwnerPublicInterface, &PreparedOwnerResultTransfer)> {
+        let owner = self.result.key.members.binary_search(owner).ok()?;
+        Some((
+            owner,
+            self.result.owners.get(owner)?,
+            self.prepared.get(owner)?,
+        ))
+    }
+
+    fn constant_result_at(&self, owner: usize) -> Option<&EvaluatedResultValue> {
+        self.constant_results.get(owner)?.as_ref()
+    }
+
+    #[cfg(test)]
     fn constant_result(&self, owner: &StableCheckOwnerKey) -> Option<&EvaluatedResultValue> {
-        match self.routes.get(owner)? {
-            OwnerInterfaceTransferRoute::Own => self.constant_results.get(owner),
-            OwnerInterfaceTransferRoute::Dependency(index) => self
-                .dependencies
-                .get(*index as usize)?
-                .constant_result(owner),
+        let route = self.prepared_route(owner)?;
+        let (module, owner, _, _) = self.resolve_prepared_owner(route)?;
+        module.constant_result_at(owner)
+    }
+}
+
+fn prepare_owner_result_expression_ref(
+    module: &OwnerInterfaceTransferModule,
+    local_nodes: &BTreeMap<StableExpressionKey, u32>,
+    reference: &OwnerResultExpressionRef,
+) -> Result<PreparedOwnerResultExpressionRef, OwnerBodyInferenceError> {
+    match reference {
+        OwnerResultExpressionRef::Local { expression } => local_nodes
+            .get(expression)
+            .copied()
+            .map(PreparedOwnerResultExpressionRef::Local)
+            .ok_or_else(|| {
+                OwnerBodyInferenceError::new(format!(
+                    "owner result transfer references missing local expression {expression:?}"
+                ))
+            }),
+        OwnerResultExpressionRef::Child { owner, .. } => module
+            .prepared_route(owner)
+            .map(PreparedOwnerResultExpressionRef::Child)
+            .ok_or_else(|| {
+                OwnerBodyInferenceError::new(format!(
+                    "owner result transfer references missing child owner {owner:?}"
+                ))
+            }),
+    }
+}
+
+fn prepare_owner_result_transfer(
+    module: &OwnerInterfaceTransferModule,
+    interface: &OwnerPublicInterface,
+) -> Result<PreparedOwnerResultTransfer, OwnerBodyInferenceError> {
+    let OwnerResultTransfer::Expression { root, nodes } = &interface.result_transfer else {
+        return Ok(PreparedOwnerResultTransfer {
+            root: None,
+            nodes: Box::new([]),
+            inputs: Box::new([]),
+        });
+    };
+    let mut local_nodes = BTreeMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let index = u32::try_from(index).map_err(|_| {
+            OwnerBodyInferenceError::new("owner result transfer node count exceeds u32")
+        })?;
+        if local_nodes.insert(node.expression.clone(), index).is_some() {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "owner result transfer for {:?} repeats a local expression",
+                interface.owner
+            )));
         }
     }
+    let root = Some(prepare_owner_result_expression_ref(
+        module,
+        &local_nodes,
+        root,
+    )?);
+    let mut prepared_inputs = Vec::new();
+    let nodes = nodes
+        .iter()
+        .map(|node| {
+            let input_start = u32::try_from(prepared_inputs.len()).map_err(|_| {
+                OwnerBodyInferenceError::new("owner result transfer input count exceeds u32")
+            })?;
+            for input in &node.inputs {
+                prepared_inputs.push(prepare_owner_result_expression_ref(
+                    module,
+                    &local_nodes,
+                    &input.expression,
+                )?);
+            }
+            let input_len = u32::try_from(node.inputs.len()).map_err(|_| {
+                OwnerBodyInferenceError::new("owner result transfer node input count exceeds u32")
+            })?;
+            let call_owner = match &node.call_target {
+                Some(OwnerResultCallTarget::Owner { owner }) => {
+                    Some(module.prepared_route(owner).ok_or_else(|| {
+                        OwnerBodyInferenceError::new(format!(
+                            "owner result transfer for {:?} calls missing owner {owner:?}",
+                            interface.owner
+                        ))
+                    })?)
+                }
+                Some(
+                    OwnerResultCallTarget::Abi { .. }
+                    | OwnerResultCallTarget::Unresolved
+                    | OwnerResultCallTarget::Ambiguous { .. },
+                )
+                | None => None,
+            };
+            Ok(PreparedOwnerResultTransferNode {
+                input_start,
+                input_len,
+                call_owner,
+            })
+        })
+        .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
+        .into_boxed_slice();
+    Ok(PreparedOwnerResultTransfer {
+        root,
+        nodes,
+        inputs: prepared_inputs.into_boxed_slice(),
+    })
+}
+
+fn prepare_owner_result_transfers(
+    module: &OwnerInterfaceTransferModule,
+) -> Result<Box<[PreparedOwnerResultTransfer]>, OwnerBodyInferenceError> {
+    module
+        .result
+        .owners
+        .iter()
+        .map(|interface| prepare_owner_result_transfer(module, interface))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
 }
 
 fn owner_result_transfer_is_invocation_invariant(interface: &OwnerPublicInterface) -> bool {
@@ -247,17 +448,18 @@ fn precompute_owner_interface_transfer_constants(module: &mut OwnerInterfaceTran
         .result
         .owners
         .iter()
-        .filter(|interface| owner_result_transfer_is_invocation_invariant(interface))
-        .map(|interface| interface.owner.clone())
+        .enumerate()
+        .filter(|(_, interface)| owner_result_transfer_is_invocation_invariant(interface))
+        .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    let mut constants = BTreeMap::new();
+    let mut constants = vec![None; module.result.owners.len()];
     for owner in candidates {
         let mut unifier = TypeUnifier::default();
         let providers = BTreeMap::new();
         let mut evaluator = OwnerResultTransferEvaluator::new(&providers, &mut unifier);
         let Some(result) = evaluator.evaluate_owner_in_module(
             module,
-            &owner,
+            owner,
             &OwnerResultTransferArguments::default(),
             None,
         ) else {
@@ -266,10 +468,10 @@ fn precompute_owner_interface_transfer_constants(module: &mut OwnerInterfaceTran
         let mut variables = BTreeSet::new();
         crate::collect_type_vars(&result.value.flow_type.ty, &mut variables);
         if variables.is_empty() {
-            constants.insert(owner, result.value);
+            constants[owner] = Some(result.value);
         }
     }
-    module.constant_results = constants;
+    module.constant_results = constants.into_boxed_slice();
 }
 
 fn seal_owner_interface_transfer_module(
@@ -277,6 +479,17 @@ fn seal_owner_interface_transfer_module(
     expected_dependencies: &[OwnerInterfaceSccKey],
     dependencies: impl IntoIterator<Item = Arc<OwnerInterfaceTransferModule>>,
 ) -> Result<OwnerInterfaceTransferModule, OwnerBodyInferenceError> {
+    if result
+        .owners
+        .iter()
+        .map(|interface| &interface.owner)
+        .ne(result.key.members.iter())
+    {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "interface transfer module {:?} has a non-canonical member table",
+            result.key
+        )));
+    }
     let mut dependencies = dependencies
         .into_iter()
         .map(|dependency| (dependency.key.clone(), dependency))
@@ -379,9 +592,11 @@ fn seal_owner_interface_transfer_module(
         result,
         dependencies,
         routes,
-        constant_results: BTreeMap::new(),
+        prepared: Box::new([]),
+        constant_results: Box::new([]),
         fingerprint_v1,
     };
+    module.prepared = prepare_owner_result_transfers(&module)?;
     precompute_owner_interface_transfer_constants(&mut module);
     Ok(module)
 }
@@ -3584,6 +3799,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         context: Option<&EvaluatedResultValue>,
     ) -> Option<EvaluatedOwnerResult> {
         let module = *self.providers.get(owner)?;
+        let (owner, _, _) = module.own_prepared_owner(owner)?;
         let mut result = self.evaluate_owner_in_module(module, owner, arguments, context)?;
         result.owned_variables = std::mem::take(&mut self.owned_variables);
         Some(result)
@@ -3592,11 +3808,12 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
     fn evaluate_owner_in_module(
         &mut self,
         module: &OwnerInterfaceTransferModule,
-        owner: &StableCheckOwnerKey,
+        owner: usize,
         arguments: &OwnerResultTransferArguments,
         context: Option<&EvaluatedResultValue>,
     ) -> Option<EvaluatedOwnerResult> {
-        let (_, interface) = module.resolve_owner(owner)?;
+        let interface = module.result.owners.get(owner)?;
+        let prepared = module.prepared.get(owner)?;
         // Interface type variables live in an SCC-local alpha namespace. Give
         // every invocation its own variables in the caller's unifier so raw
         // TypeVar ordinals from unrelated SCCs can never alias each other or
@@ -3648,7 +3865,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             })
             .collect::<Vec<_>>();
 
-        if !self.active_owners.insert(owner.clone()) {
+        if !self.active_owners.insert(interface.owner.clone()) {
             return Some(EvaluatedOwnerResult {
                 value: EvaluatedResultValue {
                     flow_type: principal,
@@ -3661,7 +3878,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 owned_variables: Vec::new(),
             });
         }
-        let evaluated = if let Some(value) = module.constant_result(owner) {
+        let evaluated = if let Some(value) = module.constant_result_at(owner) {
             Some(value.clone())
         } else {
             match &interface.result_transfer {
@@ -3688,16 +3905,18 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                         })
                     })
                 }
-                OwnerResultTransfer::Expression { root, nodes } => {
+                OwnerResultTransfer::Expression { root: _, nodes } => {
                     // Allocate the complete interface alpha namespace up front,
                     // but instantiate node fallback types only if the selected
                     // transfer walk reaches them. Concrete WHEN arms commonly
                     // leave most of a large result-transfer graph untouched.
                     let mut fallbacks = OwnerResultTransferFallbacks::new(variables, substitutions);
+                    let root = prepared.root?;
                     self.evaluate_expression_ref(
                         module,
                         root,
                         nodes,
+                        prepared,
                         arguments,
                         context,
                         &mut fallbacks,
@@ -3707,7 +3926,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 }
             }
         };
-        self.active_owners.remove(owner);
+        self.active_owners.remove(&interface.owner);
 
         let mut value = if let Some(mut evaluated) = evaluated {
             let selected = evaluated.syntax_selected
@@ -3746,8 +3965,9 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
     fn evaluate_expression_ref(
         &mut self,
         module: &OwnerInterfaceTransferModule,
-        reference: &OwnerResultExpressionRef,
+        reference: PreparedOwnerResultExpressionRef,
         nodes: &[OwnerResultTransferNode],
+        prepared: &PreparedOwnerResultTransfer,
         arguments: &OwnerResultTransferArguments,
         context: Option<&EvaluatedResultValue>,
         fallbacks: &mut OwnerResultTransferFallbacks,
@@ -3755,8 +3975,8 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         active: &mut OwnerResultTransferActiveNodes,
     ) -> Option<EvaluatedResultValue> {
         match reference {
-            OwnerResultExpressionRef::Child { owner, .. } => {
-                let (_, interface) = module.resolve_owner(owner)?;
+            PreparedOwnerResultExpressionRef::Child(route) => {
+                let (_, _, interface, _) = module.resolve_prepared_owner(route)?;
                 Some(EvaluatedResultValue {
                     flow_type: interface.result.clone(),
                     parameter_derived: false,
@@ -3764,17 +3984,15 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     static_number: None,
                 })
             }
-            OwnerResultExpressionRef::Local { expression } => {
-                let index = nodes
-                    .binary_search_by(|node| node.expression.cmp(expression))
-                    .ok()?;
+            PreparedOwnerResultExpressionRef::Local(expression) => {
+                let index = expression as usize;
                 let node = &nodes[index];
                 if active.contains(&index) {
                     return fallbacks.resolve(node, self.unifier);
                 }
                 active.push(index);
                 let value = self.evaluate_node(
-                    module, index, nodes, arguments, context, fallbacks, lexical, active,
+                    module, index, nodes, prepared, arguments, context, fallbacks, lexical, active,
                 );
                 debug_assert_eq!(active.pop(), Some(index));
                 value
@@ -3788,6 +4006,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         module: &OwnerInterfaceTransferModule,
         node_index: usize,
         nodes: &[OwnerResultTransferNode],
+        prepared: &PreparedOwnerResultTransfer,
         arguments: &OwnerResultTransferArguments,
         context: Option<&EvaluatedResultValue>,
         fallbacks: &mut OwnerResultTransferFallbacks,
@@ -3795,13 +4014,19 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         active: &mut OwnerResultTransferActiveNodes,
     ) -> Option<EvaluatedResultValue> {
         let node = nodes.get(node_index)?;
+        let prepared_node = prepared.nodes.get(node_index)?;
+        let prepared_inputs = prepared.node_inputs(prepared_node)?;
+        if prepared_inputs.len() != node.inputs.len() {
+            return None;
+        }
         let mut evaluate =
             |evaluator: &mut Self,
-             reference: &OwnerResultExpressionRef,
+             reference: PreparedOwnerResultExpressionRef,
              lexical: &BTreeMap<String, EvaluatedResultValue>,
              active: &mut OwnerResultTransferActiveNodes| {
                 evaluator.evaluate_expression_ref(
-                    module, reference, nodes, arguments, context, fallbacks, lexical, active,
+                    module, reference, nodes, prepared, arguments, context, fallbacks, lexical,
+                    active,
                 )
             };
         if let Some(read) = &node.parameter_read
@@ -3857,19 +4082,30 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         match &node.kind {
             OwnerConstraintNodeKind::Call { .. } | OwnerConstraintNodeKind::Pipe { .. } => self
                 .evaluate_call_node(
-                    module, node, nodes, arguments, context, fallbacks, lexical, active,
+                    module,
+                    node,
+                    prepared_node,
+                    nodes,
+                    prepared,
+                    arguments,
+                    context,
+                    fallbacks,
+                    lexical,
+                    active,
                 ),
             OwnerConstraintNodeKind::Infix { operation } => {
                 let left = node
                     .inputs
                     .iter()
-                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::InfixLeft))
-                    .and_then(|input| evaluate(self, &input.expression, lexical, active))?;
+                    .zip(prepared_inputs)
+                    .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::InfixLeft))
+                    .and_then(|(_, expression)| evaluate(self, *expression, lexical, active))?;
                 let right = node
                     .inputs
                     .iter()
-                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::InfixRight))
-                    .and_then(|input| evaluate(self, &input.expression, lexical, active))?;
+                    .zip(prepared_inputs)
+                    .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::InfixRight))
+                    .and_then(|(_, expression)| evaluate(self, *expression, lexical, active))?;
                 let static_number = left
                     .static_number
                     .as_ref()
@@ -3887,7 +4123,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 let mut fields = Vec::new();
                 let mut parameter_derived = false;
                 let mut syntax_selected = false;
-                for input in &node.inputs {
+                for (input, expression) in node.inputs.iter().zip(prepared_inputs) {
                     let OwnerConstraintEdgeRole::RecordField {
                         name,
                         spread: false,
@@ -3895,7 +4131,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     else {
                         continue;
                     };
-                    let value = evaluate(self, &input.expression, lexical, active)?;
+                    let value = evaluate(self, *expression, lexical, active)?;
                     parameter_derived |= value.parameter_derived;
                     syntax_selected |= value.syntax_selected;
                     fields.push((name.clone(), value.flow_type.ty));
@@ -3923,17 +4159,26 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 })
             }
             OwnerConstraintNodeKind::When => self.evaluate_when_node(
-                module, node, nodes, arguments, context, fallbacks, lexical, active,
+                module,
+                node,
+                prepared_node,
+                nodes,
+                prepared,
+                arguments,
+                context,
+                fallbacks,
+                lexical,
+                active,
             ),
             OwnerConstraintNodeKind::MatchArm { .. } | OwnerConstraintNodeKind::Arrow { .. } => {
-                let output = node.inputs.iter().find(|input| {
+                let output = node.inputs.iter().zip(prepared_inputs).find(|(input, _)| {
                     matches!(
                         input.role,
                         OwnerConstraintEdgeRole::MatchOutput | OwnerConstraintEdgeRole::ArrowOutput
                     )
                 });
-                if let Some(output) = output {
-                    evaluate(self, &output.expression, lexical, active)
+                if let Some((_, output)) = output {
+                    evaluate(self, *output, lexical, active)
                 } else {
                     fallbacks.resolve(node, self.unifier)
                 }
@@ -3942,20 +4187,20 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 let mut lexical = lexical.clone();
                 let mut parameter_derived = false;
                 let mut syntax_selected = false;
-                for input in &node.inputs {
+                for (input, expression) in node.inputs.iter().zip(prepared_inputs) {
                     if let OwnerConstraintEdgeRole::BlockBinding { name } = &input.role {
-                        let value = evaluate(self, &input.expression, &lexical, active)?;
+                        let value = evaluate(self, *expression, &lexical, active)?;
                         parameter_derived |= value.parameter_derived;
                         syntax_selected |= value.syntax_selected;
                         lexical.insert(name.clone(), value);
                     }
                 }
-                if let Some(result) = node
-                    .inputs
-                    .iter()
-                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::BlockResult))
+                if let Some(result) =
+                    node.inputs.iter().zip(prepared_inputs).find(|(input, _)| {
+                        matches!(input.role, OwnerConstraintEdgeRole::BlockResult)
+                    })
                 {
-                    let mut value = evaluate(self, &result.expression, &lexical, active)?;
+                    let mut value = evaluate(self, *result.1, &lexical, active)?;
                     value.parameter_derived |= parameter_derived;
                     value.syntax_selected |= syntax_selected;
                     Some(value)
@@ -3967,14 +4212,15 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 let values = node
                     .inputs
                     .iter()
-                    .filter(|input| {
+                    .zip(prepared_inputs)
+                    .filter(|(input, _)| {
                         matches!(
                             input.role,
                             OwnerConstraintEdgeRole::CollectionItem
                                 | OwnerConstraintEdgeRole::MapEntry
                         )
                     })
-                    .map(|input| evaluate(self, &input.expression, lexical, active))
+                    .map(|(_, expression)| evaluate(self, *expression, lexical, active))
                     .collect::<Option<Vec<_>>>()?;
                 let parameter_derived = values.iter().any(|value| value.parameter_derived);
                 let syntax_selected = values.iter().any(|value| value.syntax_selected);
@@ -4011,8 +4257,11 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 let values = node
                     .inputs
                     .iter()
-                    .filter(|input| matches!(input.role, OwnerConstraintEdgeRole::LatestBranch))
-                    .map(|input| evaluate(self, &input.expression, lexical, active))
+                    .zip(prepared_inputs)
+                    .filter(|(input, _)| {
+                        matches!(input.role, OwnerConstraintEdgeRole::LatestBranch)
+                    })
+                    .map(|(_, expression)| evaluate(self, *expression, lexical, active))
                     .collect::<Option<Vec<_>>>()?;
                 let ty = values
                     .iter()
@@ -4039,7 +4288,8 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             OwnerConstraintNodeKind::Draining | OwnerConstraintNodeKind::Hold { .. } => node
                 .inputs
                 .first()
-                .and_then(|input| evaluate(self, &input.expression, lexical, active))
+                .zip(prepared_inputs.first())
+                .and_then(|(_, expression)| evaluate(self, *expression, lexical, active))
                 .map(|mut value| {
                     if matches!(node.kind, OwnerConstraintNodeKind::Hold { .. }) {
                         value.flow_type.mode = FlowMode::Continuous;
@@ -4051,13 +4301,14 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 let value = node
                     .inputs
                     .iter()
-                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::ThenOutput))
+                    .zip(prepared_inputs)
+                    .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::ThenOutput))
                     .or_else(|| {
-                        node.inputs
-                            .iter()
-                            .find(|input| matches!(input.role, OwnerConstraintEdgeRole::ThenInput))
+                        node.inputs.iter().zip(prepared_inputs).find(|(input, _)| {
+                            matches!(input.role, OwnerConstraintEdgeRole::ThenInput)
+                        })
                     })
-                    .and_then(|input| evaluate(self, &input.expression, lexical, active));
+                    .and_then(|(_, expression)| evaluate(self, *expression, lexical, active));
                 value.map(|mut value| {
                     value.flow_type.mode = FlowMode::PresentOrAbsent;
                     value
@@ -4067,13 +4318,15 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 let key = node
                     .inputs
                     .iter()
-                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::MapKey))
-                    .and_then(|input| evaluate(self, &input.expression, lexical, active))?;
+                    .zip(prepared_inputs)
+                    .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::MapKey))
+                    .and_then(|(_, expression)| evaluate(self, *expression, lexical, active))?;
                 let value = node
                     .inputs
                     .iter()
-                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::MapValue))
-                    .and_then(|input| evaluate(self, &input.expression, lexical, active))?;
+                    .zip(prepared_inputs)
+                    .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::MapValue))
+                    .and_then(|(_, expression)| evaluate(self, *expression, lexical, active))?;
                 Some(EvaluatedResultValue {
                     flow_type: FlowType {
                         mode: FlowMode::Continuous,
@@ -4118,21 +4371,29 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         &mut self,
         module: &OwnerInterfaceTransferModule,
         node: &OwnerResultTransferNode,
+        prepared_node: &PreparedOwnerResultTransferNode,
         nodes: &[OwnerResultTransferNode],
+        prepared: &PreparedOwnerResultTransfer,
         arguments: &OwnerResultTransferArguments,
         context: Option<&EvaluatedResultValue>,
         fallbacks: &mut OwnerResultTransferFallbacks,
         lexical: &BTreeMap<String, EvaluatedResultValue>,
         active: &mut OwnerResultTransferActiveNodes,
     ) -> Option<EvaluatedResultValue> {
+        let prepared_inputs = prepared.node_inputs(prepared_node)?;
+        if prepared_inputs.len() != node.inputs.len() {
+            return None;
+        }
         let selector = node
             .inputs
             .iter()
-            .find(|input| matches!(input.role, OwnerConstraintEdgeRole::WhenInput))?;
+            .zip(prepared_inputs)
+            .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::WhenInput))?;
         let selector = self.evaluate_expression_ref(
             module,
-            &selector.expression,
+            *selector.1,
             nodes,
+            prepared,
             arguments,
             context,
             fallbacks,
@@ -4145,15 +4406,18 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         for arm in node
             .inputs
             .iter()
-            .filter(|input| matches!(input.role, OwnerConstraintEdgeRole::WhenArm))
+            .zip(prepared_inputs)
+            .filter(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::WhenArm))
         {
-            let OwnerResultExpressionRef::Local { expression } = &arm.expression else {
+            let PreparedOwnerResultExpressionRef::Local(expression) = *arm.1 else {
                 continue;
             };
-            let arm = nodes
-                .binary_search_by(|node| node.expression.cmp(expression))
-                .ok()
-                .and_then(|index| nodes.get(index))?;
+            let arm = nodes.get(expression as usize)?;
+            let prepared_arm = prepared.nodes.get(expression as usize)?;
+            let prepared_arm_inputs = prepared.node_inputs(prepared_arm)?;
+            if prepared_arm_inputs.len() != arm.inputs.len() {
+                return None;
+            }
             let pattern = match &arm.kind {
                 OwnerConstraintNodeKind::MatchArm { pattern }
                 | OwnerConstraintNodeKind::Arrow { pattern } => pattern,
@@ -4164,18 +4428,24 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             }
             let mut arm_lexical = lexical.clone();
             extend_owner_pattern_bindings(&mut arm_lexical, &selector, pattern);
-            let Some(output) = arm.inputs.iter().find(|input| {
-                matches!(
-                    input.role,
-                    OwnerConstraintEdgeRole::MatchOutput | OwnerConstraintEdgeRole::ArrowOutput
-                )
-            }) else {
+            let Some(output) = arm
+                .inputs
+                .iter()
+                .zip(prepared_arm_inputs)
+                .find(|(input, _)| {
+                    matches!(
+                        input.role,
+                        OwnerConstraintEdgeRole::MatchOutput | OwnerConstraintEdgeRole::ArrowOutput
+                    )
+                })
+            else {
                 continue;
             };
             if let Some(output) = self.evaluate_expression_ref(
                 module,
-                &output.expression,
+                *output.1,
                 nodes,
+                prepared,
                 arguments,
                 context,
                 fallbacks,
@@ -4220,25 +4490,33 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         &mut self,
         module: &OwnerInterfaceTransferModule,
         node: &OwnerResultTransferNode,
+        prepared_node: &PreparedOwnerResultTransferNode,
         nodes: &[OwnerResultTransferNode],
+        prepared: &PreparedOwnerResultTransfer,
         arguments: &OwnerResultTransferArguments,
         context: Option<&EvaluatedResultValue>,
         fallbacks: &mut OwnerResultTransferFallbacks,
         lexical: &BTreeMap<String, EvaluatedResultValue>,
         active: &mut OwnerResultTransferActiveNodes,
     ) -> Option<EvaluatedResultValue> {
+        let prepared_inputs = prepared.node_inputs(prepared_node)?;
+        if prepared_inputs.len() != node.inputs.len() {
+            return None;
+        }
         match node.call_target.as_ref()? {
-            OwnerResultCallTarget::Owner { owner } => {
-                let (callee_module, _) = module.resolve_owner(owner)?;
+            OwnerResultCallTarget::Owner { .. } => {
+                let (callee_module, callee_owner, _, _) =
+                    module.resolve_prepared_owner(prepared_node.call_owner?)?;
                 let mut actuals = OwnerResultTransferArguments::default();
-                for input in &node.inputs {
+                for (input, expression) in node.inputs.iter().zip(prepared_inputs) {
                     let Some(formal_ordinal) = input.formal_ordinal else {
                         continue;
                     };
                     let value = self.evaluate_expression_ref(
                         module,
-                        &input.expression,
+                        *expression,
                         nodes,
+                        prepared,
                         arguments,
                         context,
                         fallbacks,
@@ -4250,12 +4528,14 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 let explicit_context = node
                     .inputs
                     .iter()
-                    .find(|input| input.explicit_pass)
-                    .and_then(|input| {
+                    .zip(prepared_inputs)
+                    .find(|(input, _)| input.explicit_pass)
+                    .and_then(|(_, expression)| {
                         self.evaluate_expression_ref(
                             module,
-                            &input.expression,
+                            *expression,
                             nodes,
+                            prepared,
                             arguments,
                             context,
                             fallbacks,
@@ -4265,7 +4545,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     });
                 self.evaluate_owner_in_module(
                     callee_module,
-                    owner,
+                    callee_owner,
                     &actuals,
                     explicit_context.as_ref().or(context),
                 )
@@ -4281,7 +4561,9 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     node,
                     canonical_name,
                     contract,
+                    prepared_node,
                     nodes,
+                    prepared,
                     arguments,
                     context,
                     fallbacks,
@@ -4302,16 +4584,22 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         node: &OwnerResultTransferNode,
         function: &str,
         contract: &OwnerResultAbiContract,
+        prepared_node: &PreparedOwnerResultTransferNode,
         nodes: &[OwnerResultTransferNode],
+        prepared: &PreparedOwnerResultTransfer,
         arguments: &OwnerResultTransferArguments,
         context: Option<&EvaluatedResultValue>,
         fallbacks: &mut OwnerResultTransferFallbacks,
         lexical: &BTreeMap<String, EvaluatedResultValue>,
         active: &mut OwnerResultTransferActiveNodes,
     ) -> Option<EvaluatedResultValue> {
+        let prepared_inputs = prepared.node_inputs(prepared_node)?;
+        if prepared_inputs.len() != node.inputs.len() {
+            return None;
+        }
         let mut actuals = OwnerResultTransferArguments::default();
         let mut instantiation = crate::InlineTypeSubstitutions::default();
-        for input in &node.inputs {
+        for (input, expression) in node.inputs.iter().zip(prepared_inputs) {
             let Some(formal_ordinal) = input.formal_ordinal else {
                 continue;
             };
@@ -4322,8 +4610,9 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 .and_then(|index| contract.parameters.get(index))?;
             let actual = self.evaluate_expression_ref(
                 module,
-                &input.expression,
+                *expression,
                 nodes,
+                prepared,
                 arguments,
                 context,
                 fallbacks,
@@ -7261,7 +7550,7 @@ mod tests {
         let choose = owner_named(&unit, "choose");
         let (_, _, seed) = inputs(&unit, &choose);
         let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
-        let interfaces = solve(&[seed], &[summary]);
+        let interfaces = solve(&[seed.clone()], &[summary.clone()]);
         let interface = interfaces
             .iter()
             .find_map(|result| result.owner(&choose))
@@ -7270,6 +7559,44 @@ mod tests {
             panic!("choose must publish an expression result transfer");
         };
         assert!(nodes.len() > 1);
+
+        let plan = plan_owner_body_interfaces(&seed, &summary, &interfaces).unwrap();
+        let module = plan.own_scc.module.as_ref();
+        let (_, _, prepared) = module.own_prepared_owner(&choose).unwrap();
+        assert_eq!(prepared.nodes.len(), nodes.len());
+        assert_eq!(
+            prepared.inputs.len(),
+            nodes.iter().map(|node| node.inputs.len()).sum::<usize>()
+        );
+        let local_nodes = nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.expression.clone(), index as u32))
+            .collect::<BTreeMap<_, _>>();
+        for (node, prepared_node) in nodes.iter().zip(&prepared.nodes) {
+            let prepared_inputs = prepared.node_inputs(prepared_node).unwrap();
+            assert_eq!(prepared_inputs.len(), node.inputs.len());
+            for (input, prepared_input) in node.inputs.iter().zip(prepared_inputs) {
+                let OwnerResultExpressionRef::Local { expression } = &input.expression else {
+                    panic!("callable transfer input unexpectedly crosses an owner boundary");
+                };
+                assert_eq!(
+                    *prepared_input,
+                    PreparedOwnerResultExpressionRef::Local(local_nodes[expression])
+                );
+            }
+        }
+        let mut forged = interface.clone();
+        let OwnerResultTransfer::Expression { root, nodes } = &interface.result_transfer else {
+            unreachable!();
+        };
+        let mut duplicate_nodes = nodes.to_vec();
+        duplicate_nodes.push(nodes[0].clone());
+        forged.result_transfer = OwnerResultTransfer::Expression {
+            root: root.clone(),
+            nodes: duplicate_nodes.into_boxed_slice(),
+        };
+        assert!(prepare_owner_result_transfer(module, &forged).is_err());
 
         let mut unifier = TypeUnifier::default();
         let mut owned_variables = Vec::new();

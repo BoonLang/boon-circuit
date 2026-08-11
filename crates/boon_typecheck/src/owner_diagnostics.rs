@@ -5168,8 +5168,10 @@ impl<'index, 'project> ProjectFlowModeAnalyzer<'index, 'project> {
         mode
     }
 
-    fn all_modes(mut self) -> BTreeMap<StableOrderExpression, FlowMode> {
-        let expressions = self.index.expressions.keys().cloned().collect::<Vec<_>>();
+    fn modes_for(
+        mut self,
+        expressions: impl IntoIterator<Item = StableOrderExpression>,
+    ) -> BTreeMap<StableOrderExpression, FlowMode> {
         expressions
             .into_iter()
             .map(|expression| {
@@ -5178,6 +5180,35 @@ impl<'index, 'project> ProjectFlowModeAnalyzer<'index, 'project> {
             })
             .collect()
     }
+}
+
+fn temporal_mode_roots(
+    index: &ProjectFactIndex<'_>,
+) -> Result<Vec<StableOrderExpression>, ProjectDiagnosticFactsError> {
+    let mut roots = BTreeSet::new();
+    for expression in index.expressions.keys() {
+        let Some((_, _, syntax, _)) = index.order_expression(expression) else {
+            return Err(ProjectDiagnosticFactsError::new(
+                "temporal mode root is missing from its owner body",
+            ));
+        };
+        let reference = match &syntax.kind {
+            AstExprKind::Pipe { input, op, .. } if op == "WHILE" => {
+                Some(syntax.linked_input.unwrap_or(*input as u32))
+            }
+            AstExprKind::Then { input, .. } => Some(syntax.linked_input.unwrap_or(*input as u32)),
+            AstExprKind::Latest { branches } => branches
+                .first()
+                .and_then(|branch| u32::try_from(*branch).ok()),
+            _ => None,
+        };
+        if let Some(reference) = reference
+            && let Some(root) = index.stable_expression_ref(&expression.owner, reference)
+        {
+            roots.insert(root);
+        }
+    }
+    Ok(roots.into_iter().collect())
 }
 
 fn temporal_diagnostics(
@@ -8548,7 +8579,8 @@ pub fn project_diagnostic_facts<'a>(
     diagnostics.extend(host_effect_diagnostics(&index, &mut exact_types)?);
     diagnostics.extend(builtin_call_diagnostics(&index, abi, &mut exact_types)?);
     diagnostics.extend(style_diagnostics(&index)?);
-    let exact_modes = ProjectFlowModeAnalyzer::new(&index, abi, output_flow).all_modes();
+    let exact_modes = ProjectFlowModeAnalyzer::new(&index, abi, output_flow)
+        .modes_for(temporal_mode_roots(&index)?);
     diagnostics.extend(temporal_diagnostics(&index, &exact_modes)?);
     diagnostics.extend(match_pattern_diagnostics(&index, &mut exact_types)?);
     diagnostics.extend(duplicate_function_diagnostics(&index)?);

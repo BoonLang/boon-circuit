@@ -737,7 +737,7 @@ impl RequestFamily for OwnerInferenceAbiRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerInferenceAbiEnvironment>;
 
-    const NAME: &'static str = "boon.compiler.owner-inference-abi.v6";
+    const NAME: &'static str = "boon.compiler.owner-inference-abi.v7";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -940,7 +940,7 @@ impl RequestFamily for OwnerConstructionAbiRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerConstructionAbiEnvironment>;
 
-    const NAME: &'static str = "boon.compiler.owner-construction-abi.v2";
+    const NAME: &'static str = "boon.compiler.owner-construction-abi.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -3745,7 +3745,7 @@ fn evaluate_owner_inference_abi_requests(
     }
 
     let owner_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-inference-abi-dependencies.v6\0",
+        b"boon.compiler.owner-inference-abi-dependencies.v7\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -6006,7 +6006,7 @@ fn evaluate_owner_construction_abi_requests(
     }
 
     let construction_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-construction-abi-dependencies.v2\0",
+        b"boon.compiler.owner-construction-abi-dependencies.v3\0",
         [program_role_request_tag(state.source.program_role)],
     ));
     for owner in owners {

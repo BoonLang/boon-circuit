@@ -6,18 +6,18 @@
 //! deliberately deferred to the non-checking compatibility assembler.
 
 use crate::{
-    InferredOwnerCall, InferredOwnerCallableTarget, OwnerAbiCallableContract,
-    OwnerAbiEvaluationScope, OwnerAbiValueContract, OwnerArgumentKind,
-    OwnerBodyInferenceCurrentnessReceipt, OwnerBodyInferenceShard, OwnerCheckedReceiptSink,
-    OwnerConstraintSeed, OwnerConstraintSummary, OwnerConstructionAbiEnvironment,
-    OwnerContainingScopeInput, OwnerDeclarationKind, OwnerEffectiveLexicalTarget,
-    OwnerInferenceAbiEnvironment, OwnerInterfaceEvaluationScope, OwnerInterfaceSccResult,
-    OwnerLexicalDeclarationTarget, OwnerLexicalPlan, OwnerLexicalScopeOrigin, OwnerParameterKind,
-    OwnerPublicInterface, OwnerReferenceKind, OwnerSignatureCallPlan, OwnerSignatureCallTarget,
-    OwnerSignatureDeclarationKind, OwnerSignatureDeclarationPlan, OwnerSignatureDeclarationTarget,
+    InferredOwnerCall, InferredOwnerCallableTarget, OwnerAbiEvaluationScope, OwnerAbiValueContract,
+    OwnerArgumentKind, OwnerBodyInferenceCurrentnessReceipt, OwnerBodyInferenceShard,
+    OwnerCheckedReceiptSink, OwnerConstraintSeed, OwnerConstraintSummary,
+    OwnerConstructionAbiEnvironment, OwnerContainingScopeInput, OwnerDeclarationKind,
+    OwnerEffectiveLexicalTarget, OwnerInferenceAbiEnvironment, OwnerInterfaceEvaluationScope,
+    OwnerInterfaceSccResult, OwnerLexicalDeclarationTarget, OwnerLexicalPlan,
+    OwnerLexicalScopeOrigin, OwnerParameterKind, OwnerPublicInterface, OwnerReferenceKind,
+    OwnerSignatureCallPlan, OwnerSignatureCallTarget, OwnerSignatureDeclarationKind,
+    OwnerSignatureDeclarationPlan, OwnerSignatureDeclarationTarget,
     OwnerSignatureMatchedInputSource, OwnerSignatureOutputBindingPlan, OwnerSignaturePassSource,
     OwnerSourceAnchorSite, OwnerSymbolResolution, OwnerSyntaxGraph, OwnerSyntaxInput,
-    owner_abi_callable_declaration_key, owner_abi_value_declaration_key,
+    owner_abi_value_declaration_key,
 };
 use boon_checked::{
     CheckedCallContextKind, CheckedCallableKind, CheckedDeclarationKind, CheckedIntrinsicV1,
@@ -1544,13 +1544,24 @@ impl<'a> OwnerRowConstruction<'a> {
                 }))
             }
             InferredOwnerCallableTarget::Authoritative => {
-                let contract = self.abi.callable(&call.function).ok_or_else(|| {
+                let lookup = self.abi.callable_lookup(&call.function).ok_or_else(|| {
                     CheckedOwnerBuildError::new(format!(
                         "authoritative owner call `{}` has no ABI contract",
                         call.function
                     ))
                 })?;
-                let key = abi_callable_key(contract)?;
+                let contract = lookup.contract().ok_or_else(|| {
+                    CheckedOwnerBuildError::new(format!(
+                        "authoritative owner call `{}` has a missing ABI contract",
+                        call.function
+                    ))
+                })?;
+                let key = lookup.declaration_key().ok_or_else(|| {
+                    CheckedOwnerBuildError::new(format!(
+                        "authoritative owner call `{}` has no ABI declaration key",
+                        call.function
+                    ))
+                })?;
                 let callable = OwnerDeclarationRef::Abi {
                     canonical_name: call.function.clone(),
                     declaration: key,
@@ -5672,13 +5683,6 @@ fn owner_parameter_ordinal(reference: &OwnerDeclarationRef) -> Option<u32> {
         | OwnerDeclarationRef::Abi { .. }
         | OwnerDeclarationRef::ScopeOwner { .. } => None,
     }
-}
-
-fn abi_callable_key(
-    contract: &OwnerAbiCallableContract,
-) -> Result<OwnerAbiDeclarationKey, CheckedOwnerBuildError> {
-    owner_abi_callable_declaration_key(contract)
-        .map_err(|error| CheckedOwnerBuildError::new(error.to_string()))
 }
 
 fn abi_value_key(

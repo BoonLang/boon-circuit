@@ -10,8 +10,7 @@ use crate::{
     OwnerAbiEnvironmentError, OwnerAbiEvaluationScope, OwnerAbiValueContract,
     OwnerConstructionAbiEnvironment, OwnerConstructionCallableAbiLookupOutcome,
     OwnerConstructionValueAbiLookupOutcome, OwnerSourceAnchorRole, OwnerSourceAnchorSite,
-    OwnerSourceMap, ProjectDiagnosticFacts, owner_abi_callable_declaration_key,
-    owner_abi_value_declaration_key,
+    OwnerSourceMap, ProjectDiagnosticFacts, owner_abi_value_declaration_key,
 };
 use boon_checked::*;
 use boon_parser::ProjectSyntaxSnapshot;
@@ -220,7 +219,11 @@ impl<'a> CompatibilityLayout<'a> {
                 else {
                     continue;
                 };
-                let key = owner_abi_callable_declaration_key(contract)?;
+                let key = lookup.declaration_key().ok_or_else(|| {
+                    OwnerCompatibilityAssemblyError::new(
+                        "found construction callable ABI has no declaration key",
+                    )
+                })?;
                 let entry = AbiCallableEntry {
                     name: lookup.canonical_name().to_owned(),
                     key,

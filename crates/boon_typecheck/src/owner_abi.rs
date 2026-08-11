@@ -12,7 +12,7 @@ use boon_checked::{
 };
 use boon_parser::ProjectSyntaxSnapshot;
 use boon_syntax::StableCheckOwnerKey;
-use serde::Serialize;
+use serde::{Serialize, Serializer, ser::SerializeSeq};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -30,10 +30,10 @@ const OWNER_CONSTRUCTION_CALLABLE_ABI_LOOKUP_DOMAIN_V2: &[u8] =
     b"boon.owner-construction-callable-abi-lookup.v2\0";
 const OWNER_CONSTRUCTION_VALUE_ABI_LOOKUP_DOMAIN_V1: &[u8] =
     b"boon.owner-construction-value-abi-lookup.v1\0";
-const OWNER_CONSTRUCTION_ABI_ENVIRONMENT_DOMAIN_V2: &[u8] =
-    b"boon.owner-construction-abi-environment.v2\0";
-const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V6: &[u8] =
-    b"boon.owner-inference-abi-environment.v6\0";
+const OWNER_CONSTRUCTION_ABI_ENVIRONMENT_DOMAIN_V3: &[u8] =
+    b"boon.owner-construction-abi-environment.v3\0";
+const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V7: &[u8] =
+    b"boon.owner-inference-abi-environment.v7\0";
 const OWNER_CHECKED_ABI_CALLABLE_KEY_DOMAIN_V2: &[u8] = b"boon.owner-checked-abi-callable.v2\0";
 const OWNER_CHECKED_ABI_VALUE_KEY_DOMAIN_V1: &[u8] = b"boon.owner-checked-abi-value.v1\0";
 
@@ -57,6 +57,38 @@ impl fmt::Display for OwnerAbiEnvironmentError {
 }
 
 impl Error for OwnerAbiEnvironmentError {}
+
+/// Allocation-free canonical sequence of already-sealed ABI lookup rows.
+///
+/// Aggregate environments retain their rich lookup DTOs for exact consumers,
+/// but their own identity composes the leaf fingerprints instead of hashing
+/// the same contract/type payloads again.
+struct OwnerAbiLookupFingerprints<'a, T> {
+    lookups: &'a [T],
+    fingerprint: fn(&T) -> [u8; 32],
+}
+
+impl<'a, T> OwnerAbiLookupFingerprints<'a, T> {
+    const fn new(lookups: &'a [T], fingerprint: fn(&T) -> [u8; 32]) -> Self {
+        Self {
+            lookups,
+            fingerprint,
+        }
+    }
+}
+
+impl<T> Serialize for OwnerAbiLookupFingerprints<'_, T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.lookups.len()))?;
+        for lookup in self.lookups {
+            sequence.serialize_element(&(self.fingerprint)(lookup))?;
+        }
+        sequence.end()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -475,6 +507,9 @@ pub enum OwnerConstructionCallableAbiLookupOutcome {
 pub struct OwnerConstructionCallableAbiLookup {
     canonical_name: String,
     outcome: OwnerConstructionCallableAbiLookupOutcome,
+    /// Stable checked declaration identity derived once with the lookup.
+    #[serde(skip)]
+    declaration_key: Option<OwnerAbiDeclarationKey>,
     #[serde(skip)]
     fingerprint_v1: [u8; 32],
 }
@@ -506,9 +541,16 @@ impl OwnerConstructionCallableAbiLookup {
                 "cannot fingerprint owner construction callable ABI lookup `{canonical_name}`: {error}"
             ))
         })?;
+        let declaration_key = match &outcome {
+            OwnerConstructionCallableAbiLookupOutcome::Found { contract } => {
+                Some(owner_abi_callable_declaration_key(contract)?)
+            }
+            OwnerConstructionCallableAbiLookupOutcome::Missing => None,
+        };
         Ok(Self {
             canonical_name,
             outcome,
+            declaration_key,
             fingerprint_v1,
         })
     }
@@ -543,6 +585,10 @@ impl OwnerConstructionCallableAbiLookup {
             OwnerConstructionCallableAbiLookupOutcome::Found { contract } => Some(contract),
             OwnerConstructionCallableAbiLookupOutcome::Missing => None,
         }
+    }
+
+    pub const fn declaration_key(&self) -> Option<OwnerAbiDeclarationKey> {
+        self.declaration_key
     }
 
     pub const fn fingerprint_v1(&self) -> [u8; 32] {
@@ -682,8 +728,19 @@ impl OwnerConstructionAbiEnvironment {
         }
         let value_lookups = values.into_values().collect::<Vec<_>>();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_CONSTRUCTION_ABI_ENVIRONMENT_DOMAIN_V2,
-            &(&owner, role, &callable_lookups, &value_lookups),
+            OWNER_CONSTRUCTION_ABI_ENVIRONMENT_DOMAIN_V3,
+            &(
+                &owner,
+                role,
+                OwnerAbiLookupFingerprints::new(
+                    &callable_lookups,
+                    OwnerConstructionCallableAbiLookup::fingerprint_v1,
+                ),
+                OwnerAbiLookupFingerprints::new(
+                    &value_lookups,
+                    OwnerConstructionValueAbiLookup::fingerprint_v1,
+                ),
+            ),
         )
         .map_err(|error| {
             OwnerAbiEnvironmentError::new(format!(
@@ -1237,13 +1294,22 @@ impl OwnerInferenceAbiEnvironment {
         }
         let parameter_requirement_lookups = requirements_by_key.into_values().collect::<Vec<_>>();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V6,
+            OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V7,
             &(
                 &subjects,
-                &lookups,
-                &value_lookups,
-                &source_payload_lookups,
-                &parameter_requirement_lookups,
+                OwnerAbiLookupFingerprints::new(&lookups, OwnerCallableAbiLookup::fingerprint_v1),
+                OwnerAbiLookupFingerprints::new(
+                    &value_lookups,
+                    OwnerValueAbiLookup::fingerprint_v1,
+                ),
+                OwnerAbiLookupFingerprints::new(
+                    &source_payload_lookups,
+                    OwnerSourcePayloadAbiLookup::fingerprint_v1,
+                ),
+                OwnerAbiLookupFingerprints::new(
+                    &parameter_requirement_lookups,
+                    OwnerParameterRequirementLookup::fingerprint_v1,
+                ),
             ),
         )
         .map_err(|error| {
@@ -2423,6 +2489,76 @@ mod tests {
             OwnerConstructionCallableAbiLookupOutcome::Missing
         ));
         assert!(before.callable_lookup("Field/unrelated").is_none());
+    }
+
+    #[test]
+    fn aggregate_abi_seals_are_canonical_and_reuse_callable_declaration_keys() {
+        let source = "FUNCTION keep(input) {\n    Number/to_text(value: input)\n}\n";
+        let subject = owner(source, "keep");
+        let provider = project_owner_abi_environment(
+            &project(source),
+            &ExternalTypeEnvironment::empty(ProgramRole::Client),
+        )
+        .unwrap();
+        let callable_provider = provider.callable_environment().unwrap();
+        let inferred_found = callable_provider.lookup("Number/to_text").unwrap();
+        let inferred_missing = callable_provider.lookup("Missing/function").unwrap();
+        let inferred_first = OwnerInferenceAbiEnvironment::from_lookups(
+            [subject.clone(), subject.clone()],
+            [
+                inferred_missing.clone(),
+                inferred_found.clone(),
+                inferred_found.clone(),
+            ],
+        )
+        .unwrap();
+        let inferred_second = OwnerInferenceAbiEnvironment::from_lookups(
+            [subject.clone()],
+            [inferred_found, inferred_missing],
+        )
+        .unwrap();
+        assert_eq!(inferred_first, inferred_second);
+        assert_eq!(
+            inferred_first.fingerprint_v1(),
+            inferred_second.fingerprint_v1()
+        );
+
+        let construction_found = provider
+            .construction_callable_lookup("Number/to_text")
+            .unwrap();
+        let construction_missing = provider
+            .construction_callable_lookup("Missing/function")
+            .unwrap();
+        assert_eq!(
+            construction_found.declaration_key(),
+            Some(
+                owner_abi_callable_declaration_key(construction_found.contract().unwrap()).unwrap()
+            )
+        );
+        assert_eq!(construction_missing.declaration_key(), None);
+        let construction_first = OwnerConstructionAbiEnvironment::new(
+            subject.clone(),
+            ProgramRole::Client,
+            [
+                construction_missing.clone(),
+                construction_found.clone(),
+                construction_found.clone(),
+            ],
+            [],
+        )
+        .unwrap();
+        let construction_second = OwnerConstructionAbiEnvironment::new(
+            subject,
+            ProgramRole::Client,
+            [construction_found, construction_missing],
+            [],
+        )
+        .unwrap();
+        assert_eq!(construction_first, construction_second);
+        assert_eq!(
+            construction_first.fingerprint_v1(),
+            construction_second.fingerprint_v1()
+        );
     }
 
     #[test]

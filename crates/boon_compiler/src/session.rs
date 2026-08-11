@@ -1208,7 +1208,7 @@ impl RequestFamily for OwnerInterfaceSccEvaluationRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceSccEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v5";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v6";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1227,7 +1227,7 @@ impl RequestFamily for OwnerInterfaceSccRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceSccResult>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v4";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v5";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -4812,11 +4812,11 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
     trace.checkpoint("interface-scc-plans", topology.sccs.len());
 
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v5\0",
+        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v6\0",
         std::iter::empty(),
     ));
     let result_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-result-projection-dependencies.v3\0",
+        b"boon.compiler.owner-interface-scc-result-projection-dependencies.v4\0",
         std::iter::empty(),
     ));
     let transfer_module_input = RequestInputFingerprint(request_fingerprint(

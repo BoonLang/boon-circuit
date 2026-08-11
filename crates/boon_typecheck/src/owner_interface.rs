@@ -22,10 +22,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V4: &[u8] = b"boon.owner-interface-scc-result.v4\0";
+const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V5: &[u8] = b"boon.owner-interface-scc-result.v5\0";
 const OWNER_INTERFACE_SCC_KEY_DOMAIN_V1: &[u8] = b"boon.owner-interface-scc-key.v1\0";
-const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V5: &[u8] =
-    b"boon.owner-interface-scc-currentness.v5\0";
+const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V6: &[u8] =
+    b"boon.owner-interface-scc-currentness.v6\0";
 const OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V3: &[u8] = b"boon.owner-body-interface-import.v3\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -332,7 +332,7 @@ impl OwnerInterfaceSccCurrentnessReceipt {
         }
         let result_fingerprint_v1 = result.fingerprint_v1();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V5,
+            OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V6,
             &(&basis, result_fingerprint_v1),
         )
         .map_err(|error| {
@@ -4500,9 +4500,16 @@ fn evaluate_owner_interface_scc_impl<'a>(
         interfaces.push(interface);
     }
     work.unification_steps = unifier.steps;
+    // Every public interface already owns an exact canonical semantic
+    // fingerprint. Aggregate those seals instead of serializing every full
+    // interface a second time at the SCC boundary.
+    let interface_fingerprints = interfaces
+        .iter()
+        .map(OwnerPublicInterface::fingerprint_v1)
+        .collect::<Vec<_>>();
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_INTERFACE_SCC_RESULT_DOMAIN_V4,
-        &(&scc.key, &interfaces, next_alpha),
+        OWNER_INTERFACE_SCC_RESULT_DOMAIN_V5,
+        &(&scc.key, &interface_fingerprints, next_alpha),
     )
     .map_err(|error| {
         OwnerConstraintSeedError::new(format!(

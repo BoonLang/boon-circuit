@@ -911,6 +911,25 @@ Current checkpoints to preserve and audit rather than redo:
   replace the required persistent compiler session or its warm-edit/switch/
   cancellation gates; do not return to tactical type-cache invalidation or
   another manifest-only tweak after the same owner fails twice;
+- preserve checkpoint `c224e96` as the public-interface/compiled-residual
+  ownership cut. It removes public source-shaped result transfers, seals one
+  private residual program per interface component, composes dependency
+  programs, and leaves the regular typecheck/compiler suites green. Its exact
+  ignored NovyWave owner-assembly gate is still red at
+  `selected_signal_defaults`: `formatter` falls back to an open object and
+  `segments` retains a generic list member. A bounded trace localized both
+  losses to the residual compiler's same-component call rule. The relevant
+  functions (`real_selected_signal_row`, `real_signal_segments`,
+  `new_selected_visible_item`, and `new_selected_signal`) are members of the
+  same large SCC, while `compile_call` currently emits a principal-only
+  `RecursiveCall` for every same-component edge. This discards ordinary
+  acyclic call bodies merely because another path makes the component cyclic.
+  The next slice must compile the component call graph with an active-owner
+  stack: inline/hash-cons every acyclic same-SCC call, and emit the principal
+  fallback only for an actual DFS backedge. Add a focused mixed acyclic/cyclic
+  component regression, rerun the one ignored NovyWave gate, and only then
+  remeasure residual dispatch/work. Do not revive the disproven surface-
+  substitution or dependency-constant experiments; neither moved the gate;
 - FjordPulse currently has no basis for weakening the 108-story/340-scenario
   acceptance inventory. Only its two explicitly deferred backup/restore
   automation scenarios may retain that final status.

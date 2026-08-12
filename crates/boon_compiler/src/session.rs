@@ -1256,7 +1256,7 @@ impl RequestFamily for OwnerInterfaceTransferModuleRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceTransferModule>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-transfer-module.v4";
+    const NAME: &'static str = "boon.compiler.owner-interface-transfer-module.v5";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -4830,7 +4830,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
         std::iter::empty(),
     ));
     let transfer_module_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-transfer-module-dependencies.v4\0",
+        b"boon.compiler.owner-interface-transfer-module-dependencies.v5\0",
         std::iter::empty(),
     ));
     for expected in &topology.sccs {

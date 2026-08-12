@@ -48,9 +48,9 @@ const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V7: &[u8] = b"boon.owner-body-inferenc
 const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V12: &[u8] =
     b"boon.owner-body-inference-currentness.v12\0";
 const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V5: &[u8] = b"boon.owner-body-interface-plan.v5\0";
-const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V3: &[u8] =
-    b"boon.owner-interface-transfer-module.v3\0";
-const OWNER_RESIDUAL_PROGRAM_DOMAIN_V1: &[u8] = b"boon.owner-residual-program.v1\0";
+const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V4: &[u8] =
+    b"boon.owner-interface-transfer-module.v4\0";
+const OWNER_RESIDUAL_PROGRAM_DOMAIN_V2: &[u8] = b"boon.owner-residual-program.v2\0";
 const SOURCE_UNIT_OWNER_DIAGNOSTICS_DOMAIN_V1: &[u8] = b"boon.source-unit-owner-diagnostics.v1\0";
 const OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V8: &[u8] = b"boon.owner-diagnostics-aggregate.v8\0";
 
@@ -607,6 +607,7 @@ struct OwnerResidualProgramBuilder<'a> {
     ops: Vec<Option<OwnerResidualOp>>,
     surfaces: BTreeMap<(OwnerResidualFrameId, StableCheckOwnerKey), OwnerResidualOpId>,
     dependency_surface_namespaces: BTreeMap<(OwnerResidualFrameId, u32), OwnerResidualNamespaceId>,
+    active_owners: Vec<usize>,
 }
 
 impl<'a> OwnerResidualProgramBuilder<'a> {
@@ -628,6 +629,7 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
             ops: Vec::new(),
             surfaces: BTreeMap::new(),
             dependency_surface_namespaces: BTreeMap::new(),
+            active_owners: Vec::new(),
         }
     }
 
@@ -1120,12 +1122,15 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
                                     "owner residual recursive call lost target {owner:?}"
                                 ))
                             })?;
-                        let interface = &self.result.owners[owner_index];
-                        let namespace = self.push_namespace(self.residual_type_variable_count)?;
-                        let frame =
-                            self.push_frame(interface, namespace, Some(&actuals), Some(context))?;
-                        OwnerResidualOpKind::RecursiveCall {
-                            root: OwnerResidualRoot::Principal { frame },
+                        let (root, recursive) = self.compile_owner_instance(
+                            owner_index,
+                            Some(&actuals),
+                            Some(context),
+                        )?;
+                        if recursive {
+                            OwnerResidualOpKind::RecursiveCall { root }
+                        } else {
+                            OwnerResidualOpKind::InlinedRoot { root }
                         }
                     }
                     Some(OwnerInterfaceTransferRoute::Dependency(dependency)) => {
@@ -1429,6 +1434,68 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
         })
     }
 
+    fn compile_owner_instance(
+        &mut self,
+        owner: usize,
+        argument_inputs: Option<&BTreeMap<u32, OwnerResidualOpId>>,
+        context_input: Option<OwnerResidualFrameInput>,
+    ) -> Result<(OwnerResidualRoot, bool), OwnerBodyInferenceError> {
+        let interface = self.result.owners.get(owner).ok_or_else(|| {
+            OwnerBodyInferenceError::new("owner residual program lost its public interface")
+        })?;
+        let draft = self.drafts.get(owner).ok_or_else(|| {
+            OwnerBodyInferenceError::new("owner residual program lost its unsealed draft")
+        })?;
+        let namespace = self.push_namespace(self.residual_type_variable_count)?;
+        let frame = self.push_frame(interface, namespace, argument_inputs, context_input)?;
+        if self.active_owners.contains(&owner) {
+            return Ok((OwnerResidualRoot::Principal { frame }, true));
+        }
+
+        self.active_owners.push(owner);
+        let root = (|| -> Result<OwnerResidualRoot, OwnerBodyInferenceError> {
+            Ok(match draft {
+                OwnerResidualDraft::Principal => OwnerResidualRoot::Principal { frame },
+                OwnerResidualDraft::Parameter { read } => OwnerResidualRoot::Parameter {
+                    frame,
+                    read: read.clone(),
+                },
+                OwnerResidualDraft::Expression { root, nodes } => {
+                    let mut local_ops = BTreeMap::new();
+                    for node in nodes {
+                        let op = self.reserve_op()?;
+                        if local_ops.insert(node.expression.clone(), op).is_some() {
+                            return Err(OwnerBodyInferenceError::new(format!(
+                                "owner residual for {:?} repeats a local expression",
+                                interface.owner
+                            )));
+                        }
+                    }
+                    let source_nodes = nodes
+                        .iter()
+                        .map(|node| (node.expression.clone(), node))
+                        .collect::<BTreeMap<_, _>>();
+                    for node in nodes {
+                        let op = local_ops[&node.expression] as usize;
+                        let compiled = self.compile_node(frame, node, &source_nodes, &local_ops)?;
+                        if self.ops[op].replace(compiled).is_some() {
+                            return Err(OwnerBodyInferenceError::new(
+                                "owner residual compiler filled one op twice",
+                            ));
+                        }
+                    }
+                    OwnerResidualRoot::Value {
+                        frame,
+                        op: self.compile_reference(frame, &local_ops, root)?,
+                    }
+                }
+            })
+        })();
+        let active = self.active_owners.pop();
+        debug_assert_eq!(active, Some(owner));
+        root.map(|root| (root, false))
+    }
+
     fn compile_owner(
         mut self,
         owner: usize,
@@ -1439,44 +1506,13 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
         let draft = self.drafts.get(owner).ok_or_else(|| {
             OwnerBodyInferenceError::new("owner residual program lost its unsealed draft")
         })?;
-        let namespace = self.push_namespace(self.residual_type_variable_count)?;
-        let frame = self.push_frame(interface, namespace, None, None)?;
-        let root = match draft {
-            OwnerResidualDraft::Principal => OwnerResidualRoot::Principal { frame },
-            OwnerResidualDraft::Parameter { read } => OwnerResidualRoot::Parameter {
-                frame,
-                read: read.clone(),
-            },
-            OwnerResidualDraft::Expression { root, nodes } => {
-                let mut local_ops = BTreeMap::new();
-                for node in nodes {
-                    let op = self.reserve_op()?;
-                    if local_ops.insert(node.expression.clone(), op).is_some() {
-                        return Err(OwnerBodyInferenceError::new(format!(
-                            "owner residual for {:?} repeats a local expression",
-                            interface.owner
-                        )));
-                    }
-                }
-                let source_nodes = nodes
-                    .iter()
-                    .map(|node| (node.expression.clone(), node))
-                    .collect::<BTreeMap<_, _>>();
-                for node in nodes {
-                    let op = local_ops[&node.expression] as usize;
-                    let compiled = self.compile_node(frame, node, &source_nodes, &local_ops)?;
-                    if self.ops[op].replace(compiled).is_some() {
-                        return Err(OwnerBodyInferenceError::new(
-                            "owner residual compiler filled one op twice",
-                        ));
-                    }
-                }
-                OwnerResidualRoot::Value {
-                    frame,
-                    op: self.compile_reference(frame, &local_ops, root)?,
-                }
-            }
-        };
+        let invocation_invariant = owner_result_transfer_is_invocation_invariant(interface, draft);
+        let (root, recursive) = self.compile_owner_instance(owner, None, None)?;
+        if recursive {
+            return Err(OwnerBodyInferenceError::new(
+                "owner residual root was already active before compilation",
+            ));
+        }
         let ops = self
             .ops
             .into_iter()
@@ -1495,7 +1531,7 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
             frames: self.frames.into_boxed_slice(),
             ops,
             root,
-            invocation_invariant: owner_result_transfer_is_invocation_invariant(interface, draft),
+            invocation_invariant,
         })
     }
 }
@@ -1526,7 +1562,7 @@ fn compile_owner_residual_program(
         .flat_map(|owner| owner.ops.iter())
         .map(|op| op.kind.edge_count())
         .sum();
-    let fingerprint_v1 = fingerprint(OWNER_RESIDUAL_PROGRAM_DOMAIN_V1, &owners)?;
+    let fingerprint_v1 = fingerprint(OWNER_RESIDUAL_PROGRAM_DOMAIN_V2, &owners)?;
     Ok(OwnerResidualProgram {
         owners,
         op_count,
@@ -1699,7 +1735,7 @@ fn seal_owner_interface_transfer_module(
         &routes,
     )?);
     let fingerprint_v1 = fingerprint(
-        OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V3,
+        OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V4,
         &(
             &result.key,
             result.fingerprint_v1(),
@@ -9464,6 +9500,91 @@ mod tests {
         assert_eq!(
             exact.direct_dependency_keys().collect::<Vec<_>>(),
             [&leaf_key]
+        );
+    }
+
+    #[test]
+    fn residual_linker_inlines_same_scc_calls_until_the_actual_backedge() {
+        let unit = link(concat!(
+            "FUNCTION first(value) {\n",
+            "    second(value: value)\n",
+            "}\n",
+            "FUNCTION second(value) {\n",
+            "    Stop |> WHEN {\n",
+            "        Stop => value\n",
+            "        __ => first(value: value)\n",
+            "    }\n",
+            "}\n",
+            "value: first(value: Ready)\n",
+        ));
+        let first = owner_named(&unit, "first");
+        let second = owner_named(&unit, "second");
+        let owners = unit.stable_check_owner_keys().collect::<Vec<_>>();
+        let inputs = owners
+            .iter()
+            .map(|owner| (owner.clone(), self::inputs(&unit, owner)))
+            .collect::<BTreeMap<_, _>>();
+        let parameters = |owner: &StableCheckOwnerKey| {
+            inputs[owner]
+                .2
+                .declarations
+                .iter()
+                .find(|declaration| declaration.public)
+                .expect("callable declaration")
+                .parameters
+                .clone()
+        };
+        let summaries = owners
+            .iter()
+            .map(|owner| {
+                let seed = &inputs[owner].2;
+                let resolutions = seed.references.iter().filter_map(|reference| {
+                    if reference.kind != OwnerReferenceKind::Callable {
+                        return None;
+                    }
+                    let target = if reference.parts.as_ref() == ["first"] {
+                        &first
+                    } else if reference.parts.as_ref() == ["second"] {
+                        &second
+                    } else {
+                        return None;
+                    };
+                    Some(ResolvedOwnerSymbolReference {
+                        reference: reference.clone(),
+                        owner: target.clone(),
+                        projection: Box::new([]),
+                        parameters: parameters(target),
+                    })
+                });
+                resolve_owner_constraint_seed(seed, resolutions).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let seeds = owners
+            .iter()
+            .map(|owner| inputs[owner].2.clone())
+            .collect::<Vec<_>>();
+        let modules = solve(&seeds, &summaries);
+        let recursive_module = modules
+            .iter()
+            .find(|module| module.owns_owner(&first))
+            .expect("recursive component module");
+        assert!(recursive_module.owns_owner(&second));
+        let first_index = recursive_module.key.members.binary_search(&first).unwrap();
+        let first_program = &recursive_module.program.owners[first_index];
+
+        assert!(
+            first_program
+                .ops
+                .iter()
+                .any(|op| matches!(op.kind, OwnerResidualOpKind::InlinedRoot { .. })),
+            "first -> second is acyclic on the active owner stack and must be composed",
+        );
+        assert!(
+            first_program
+                .ops
+                .iter()
+                .any(|op| matches!(op.kind, OwnerResidualOpKind::RecursiveCall { .. })),
+            "second -> first is the actual active-stack backedge and must use the principal",
         );
     }
 

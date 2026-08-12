@@ -1256,7 +1256,7 @@ impl RequestFamily for OwnerInterfaceTransferModuleRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceTransferModule>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-transfer-module.v5";
+    const NAME: &'static str = "boon.compiler.owner-interface-transfer-module.v6";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)

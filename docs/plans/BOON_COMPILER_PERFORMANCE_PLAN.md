@@ -2054,6 +2054,32 @@ source-shaped interpretation, followed by a span-free owner artifact core and
 deletion of whole-project diagnostic replay. Broad parallelism, caches, hash
 tuning, and unsafe remain behind those single-threaded ownership deletions.
 
+#### 2026-08-13 checkpoint: compact compiled calls close residual-program multiplication
+
+The compiled residual cut is now measured and its remaining storage multiplier
+is removed. The correctness checkpoint `da649a2` proved that ordinary
+same-component calls must evaluate the callee residual until an actual active-
+owner backedge, but its physical composition cloned callee programs into every
+root and call occurrence. A current NovyWave trace made that cost explicit:
+3,358 requested transfer roots expanded to 6,096,178 nodes and 5,987,886 edges,
+with 1,165,800 KiB peak RSS.
+
+Residual call sites now store only a compact same-component or direct-dependency
+route, actual operands, and inherited/explicit context. Each component member
+program is compiled and stored once; evaluation creates a fresh invocation
+alpha frame and selects the principal only when that exact owner is already on
+the active stack. The relocation/remapping copier and embedded frame-input
+links are deleted. On the same single-threaded debug measurement, the 3,358
+roots account for 62,483 nodes and 63,042 edges, peak RSS is 413,688 KiB, and
+elapsed time is 23.287 seconds. Counter is 46.122 ms at 27,172 KiB. The 34-test
+owner-body batch is green, and the ignored NovyWave owner-assembly oracle is
+green in 152.04 seconds instead of 182.99 seconds.
+
+This is a coherent architecture checkpoint, not the plan's Clear End. The next
+owner remains the already-selected span-free owner artifact core and deletion
+of whole-project diagnostic replay. Do not spend the next tranche tuning the
+compact residual evaluator unless a fresh profile makes it dominant again.
+
 The public-root part of the preceding checkpoint is complete. Per-owner replay
 evaluations and source-unit-local owner diagnostic projections now provide
 currentness and relocation foundations, but the rich whole-project

@@ -48,9 +48,9 @@ const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V7: &[u8] = b"boon.owner-body-inferenc
 const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V12: &[u8] =
     b"boon.owner-body-inference-currentness.v12\0";
 const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V5: &[u8] = b"boon.owner-body-interface-plan.v5\0";
-const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V4: &[u8] =
-    b"boon.owner-interface-transfer-module.v4\0";
-const OWNER_RESIDUAL_PROGRAM_DOMAIN_V2: &[u8] = b"boon.owner-residual-program.v2\0";
+const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V5: &[u8] =
+    b"boon.owner-interface-transfer-module.v5\0";
+const OWNER_RESIDUAL_PROGRAM_DOMAIN_V3: &[u8] = b"boon.owner-residual-program.v3\0";
 const SOURCE_UNIT_OWNER_DIAGNOSTICS_DOMAIN_V1: &[u8] = b"boon.source-unit-owner-diagnostics.v1\0";
 const OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V8: &[u8] = b"boon.owner-diagnostics-aggregate.v8\0";
 
@@ -186,26 +186,14 @@ type OwnerResidualFrameId = u32;
 type OwnerResidualNamespaceId = u32;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum OwnerResidualFrameInput {
-    ExternalArgument { ordinal: u32 },
-    ExternalContext,
-    Value { op: OwnerResidualOpId },
-    InheritedContext { frame: OwnerResidualFrameId },
-    Missing,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct OwnerResidualFrameParameter {
     ordinal: u32,
     flow_type: FlowType,
-    input: OwnerResidualFrameInput,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct OwnerResidualFrameContext {
     flow_type: FlowType,
-    input: OwnerResidualFrameInput,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -242,6 +230,20 @@ impl OwnerResidualRoot {
             | Self::Value { frame, .. } => *frame,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum OwnerResidualCompiledCallTarget {
+    Own { owner: u32 },
+    Dependency { dependency: u32, owner: u32 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum OwnerResidualCallContext {
+    Inherited,
+    Explicit { value: OwnerResidualOpId },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -282,11 +284,10 @@ enum OwnerResidualOpKind {
     LexicalRead {
         parts: Box<[String]>,
     },
-    InlinedRoot {
-        root: OwnerResidualRoot,
-    },
-    RecursiveCall {
-        root: OwnerResidualRoot,
+    CompiledCall {
+        target: OwnerResidualCompiledCallTarget,
+        actuals: Box<[OwnerResidualActual]>,
+        context: OwnerResidualCallContext,
     },
     AbiCall {
         canonical_name: String,
@@ -355,7 +356,14 @@ impl OwnerResidualOpKind {
             | Self::LexicalRead { .. }
             | Self::Source
             | Self::Skip => 0,
-            Self::InlinedRoot { .. } | Self::RecursiveCall { .. } => 1,
+            Self::CompiledCall {
+                actuals, context, ..
+            } => 1_u64
+                .saturating_add(actuals.len() as u64)
+                .saturating_add(u64::from(matches!(
+                    context,
+                    OwnerResidualCallContext::Explicit { .. }
+                ))),
             Self::AbiCall { actuals, .. } => actuals.len() as u64,
             Self::Infix { .. } | Self::MapEntry { .. } => 2,
             Self::Record { fields, .. } => fields.len() as u64,
@@ -607,7 +615,6 @@ struct OwnerResidualProgramBuilder<'a> {
     ops: Vec<Option<OwnerResidualOp>>,
     surfaces: BTreeMap<(OwnerResidualFrameId, StableCheckOwnerKey), OwnerResidualOpId>,
     dependency_surface_namespaces: BTreeMap<(OwnerResidualFrameId, u32), OwnerResidualNamespaceId>,
-    active_owners: Vec<usize>,
 }
 
 impl<'a> OwnerResidualProgramBuilder<'a> {
@@ -629,7 +636,6 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
             ops: Vec::new(),
             surfaces: BTreeMap::new(),
             dependency_surface_namespaces: BTreeMap::new(),
-            active_owners: Vec::new(),
         }
     }
 
@@ -646,8 +652,6 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
         &mut self,
         interface: &OwnerPublicInterface,
         namespace: OwnerResidualNamespaceId,
-        argument_inputs: Option<&BTreeMap<u32, OwnerResidualOpId>>,
-        context_input: Option<OwnerResidualFrameInput>,
     ) -> Result<OwnerResidualFrameId, OwnerBodyInferenceError> {
         let frame = checked_u32(self.frames.len(), "owner residual frame count")?;
         let parameters = interface
@@ -656,19 +660,6 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
             .map(|parameter| OwnerResidualFrameParameter {
                 ordinal: parameter.ordinal,
                 flow_type: parameter.flow_type.clone(),
-                input: argument_inputs.map_or(
-                    OwnerResidualFrameInput::ExternalArgument {
-                        ordinal: parameter.ordinal,
-                    },
-                    |inputs| {
-                        inputs
-                            .get(&parameter.ordinal)
-                            .copied()
-                            .map_or(OwnerResidualFrameInput::Missing, |op| {
-                                OwnerResidualFrameInput::Value { op }
-                            })
-                    },
-                ),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -677,7 +668,6 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
             .as_ref()
             .map(|context| OwnerResidualFrameContext {
                 flow_type: context.flow_type.clone(),
-                input: context_input.unwrap_or(OwnerResidualFrameInput::ExternalContext),
             });
         self.frames.push(OwnerResidualFrame {
             namespace,
@@ -795,292 +785,6 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
         }
     }
 
-    fn remap_op(
-        op: OwnerResidualOpId,
-        offset: OwnerResidualOpId,
-    ) -> Result<OwnerResidualOpId, OwnerBodyInferenceError> {
-        op.checked_add(offset)
-            .ok_or_else(|| OwnerBodyInferenceError::new("owner residual op relocation overflowed"))
-    }
-
-    fn remap_frame(
-        frame: OwnerResidualFrameId,
-        offset: OwnerResidualFrameId,
-    ) -> Result<OwnerResidualFrameId, OwnerBodyInferenceError> {
-        frame.checked_add(offset).ok_or_else(|| {
-            OwnerBodyInferenceError::new("owner residual frame relocation overflowed")
-        })
-    }
-
-    fn remap_namespace(
-        namespace: OwnerResidualNamespaceId,
-        offset: OwnerResidualNamespaceId,
-    ) -> Result<OwnerResidualNamespaceId, OwnerBodyInferenceError> {
-        namespace.checked_add(offset).ok_or_else(|| {
-            OwnerBodyInferenceError::new("owner residual namespace relocation overflowed")
-        })
-    }
-
-    fn remap_root(
-        root: &OwnerResidualRoot,
-        op_offset: OwnerResidualOpId,
-        frame_offset: OwnerResidualFrameId,
-    ) -> Result<OwnerResidualRoot, OwnerBodyInferenceError> {
-        Ok(match root {
-            OwnerResidualRoot::Principal { frame } => OwnerResidualRoot::Principal {
-                frame: Self::remap_frame(*frame, frame_offset)?,
-            },
-            OwnerResidualRoot::Parameter { frame, read } => OwnerResidualRoot::Parameter {
-                frame: Self::remap_frame(*frame, frame_offset)?,
-                read: read.clone(),
-            },
-            OwnerResidualRoot::Value { frame, op } => OwnerResidualRoot::Value {
-                frame: Self::remap_frame(*frame, frame_offset)?,
-                op: Self::remap_op(*op, op_offset)?,
-            },
-        })
-    }
-
-    fn remap_input(
-        input: &OwnerResidualFrameInput,
-        op_offset: OwnerResidualOpId,
-        frame_offset: OwnerResidualFrameId,
-    ) -> Result<OwnerResidualFrameInput, OwnerBodyInferenceError> {
-        Ok(match input {
-            OwnerResidualFrameInput::ExternalArgument { ordinal } => {
-                OwnerResidualFrameInput::ExternalArgument { ordinal: *ordinal }
-            }
-            OwnerResidualFrameInput::ExternalContext => OwnerResidualFrameInput::ExternalContext,
-            OwnerResidualFrameInput::Value { op } => OwnerResidualFrameInput::Value {
-                op: Self::remap_op(*op, op_offset)?,
-            },
-            OwnerResidualFrameInput::InheritedContext { frame } => {
-                OwnerResidualFrameInput::InheritedContext {
-                    frame: Self::remap_frame(*frame, frame_offset)?,
-                }
-            }
-            OwnerResidualFrameInput::Missing => OwnerResidualFrameInput::Missing,
-        })
-    }
-
-    fn remap_kind(
-        kind: &OwnerResidualOpKind,
-        op_offset: OwnerResidualOpId,
-        frame_offset: OwnerResidualFrameId,
-        namespace_offset: OwnerResidualNamespaceId,
-    ) -> Result<OwnerResidualOpKind, OwnerBodyInferenceError> {
-        let op = |value| Self::remap_op(value, op_offset);
-        Ok(match kind {
-            OwnerResidualOpKind::Fallback => OwnerResidualOpKind::Fallback,
-            OwnerResidualOpKind::Surface { namespace } => OwnerResidualOpKind::Surface {
-                namespace: Self::remap_namespace(*namespace, namespace_offset)?,
-            },
-            OwnerResidualOpKind::ParameterRead {
-                parameter_ordinal,
-                projection,
-            } => OwnerResidualOpKind::ParameterRead {
-                parameter_ordinal: *parameter_ordinal,
-                projection: projection.clone(),
-            },
-            OwnerResidualOpKind::LexicalRead { parts } => OwnerResidualOpKind::LexicalRead {
-                parts: parts.clone(),
-            },
-            OwnerResidualOpKind::InlinedRoot { root } => OwnerResidualOpKind::InlinedRoot {
-                root: Self::remap_root(root, op_offset, frame_offset)?,
-            },
-            OwnerResidualOpKind::RecursiveCall { root } => OwnerResidualOpKind::RecursiveCall {
-                root: Self::remap_root(root, op_offset, frame_offset)?,
-            },
-            OwnerResidualOpKind::AbiCall {
-                canonical_name,
-                contract,
-                actuals,
-            } => OwnerResidualOpKind::AbiCall {
-                canonical_name: canonical_name.clone(),
-                contract: contract.clone(),
-                actuals: actuals
-                    .iter()
-                    .map(|actual| {
-                        Ok(OwnerResidualActual {
-                            formal_ordinal: actual.formal_ordinal,
-                            value: op(actual.value)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
-                    .into_boxed_slice(),
-            },
-            OwnerResidualOpKind::Infix {
-                operation,
-                left,
-                right,
-            } => OwnerResidualOpKind::Infix {
-                operation: operation.clone(),
-                left: op(*left)?,
-                right: op(*right)?,
-            },
-            OwnerResidualOpKind::Record { tag, fields } => OwnerResidualOpKind::Record {
-                tag: tag.clone(),
-                fields: fields
-                    .iter()
-                    .map(|field| {
-                        Ok(OwnerResidualRecordField {
-                            name: field.name.clone(),
-                            value: op(field.value)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
-                    .into_boxed_slice(),
-            },
-            OwnerResidualOpKind::When { selector, arms } => OwnerResidualOpKind::When {
-                selector: op(*selector)?,
-                arms: arms
-                    .iter()
-                    .map(|arm| {
-                        Ok(OwnerResidualWhenArm {
-                            pattern: arm.pattern.clone(),
-                            output: op(arm.output)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
-                    .into_boxed_slice(),
-            },
-            OwnerResidualOpKind::Forward { output } => OwnerResidualOpKind::Forward {
-                output: output.map(op).transpose()?,
-            },
-            OwnerResidualOpKind::Block { bindings, result } => OwnerResidualOpKind::Block {
-                bindings: bindings
-                    .iter()
-                    .map(|binding| {
-                        Ok(OwnerResidualBlockBinding {
-                            name: binding.name.clone(),
-                            value: op(binding.value)?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
-                    .into_boxed_slice(),
-                result: result.map(op).transpose()?,
-            },
-            OwnerResidualOpKind::Collection { collection, items } => {
-                OwnerResidualOpKind::Collection {
-                    collection: *collection,
-                    items: items
-                        .iter()
-                        .copied()
-                        .map(op)
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_boxed_slice(),
-                }
-            }
-            OwnerResidualOpKind::Latest { branches } => OwnerResidualOpKind::Latest {
-                branches: branches
-                    .iter()
-                    .copied()
-                    .map(op)
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_boxed_slice(),
-            },
-            OwnerResidualOpKind::Draining { input } => OwnerResidualOpKind::Draining {
-                input: input.map(op).transpose()?,
-            },
-            OwnerResidualOpKind::Hold { initial, updates } => OwnerResidualOpKind::Hold {
-                initial: initial.map(op).transpose()?,
-                updates: updates
-                    .iter()
-                    .copied()
-                    .map(op)
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_boxed_slice(),
-            },
-            OwnerResidualOpKind::Then { value } => OwnerResidualOpKind::Then {
-                value: value.map(op).transpose()?,
-            },
-            OwnerResidualOpKind::MapEntry { key, value } => OwnerResidualOpKind::MapEntry {
-                key: key.map(op).transpose()?,
-                value: value.map(op).transpose()?,
-            },
-            OwnerResidualOpKind::Source => OwnerResidualOpKind::Source,
-            OwnerResidualOpKind::Skip => OwnerResidualOpKind::Skip,
-        })
-    }
-
-    fn inline_program(
-        &mut self,
-        source: &OwnerResidualOwnerProgram,
-        actuals: &BTreeMap<u32, OwnerResidualOpId>,
-        context: OwnerResidualFrameInput,
-    ) -> Result<OwnerResidualRoot, OwnerBodyInferenceError> {
-        let namespace_offset =
-            checked_u32(self.namespaces.len(), "owner residual namespace count")?;
-        let frame_offset = checked_u32(self.frames.len(), "owner residual frame count")?;
-        let op_offset = checked_u32(self.ops.len(), "owner residual op count")?;
-        self.namespaces.extend(source.namespaces.iter().copied());
-        let source_root_frame = source.root.frame();
-        for (index, source_frame) in source.frames.iter().enumerate() {
-            let is_root = index == source_root_frame as usize;
-            let parameters = source_frame
-                .parameters
-                .iter()
-                .map(|parameter| {
-                    let input = if is_root {
-                        match parameter.input {
-                            OwnerResidualFrameInput::ExternalArgument { ordinal } => actuals
-                                .get(&ordinal)
-                                .copied()
-                                .map_or(OwnerResidualFrameInput::Missing, |op| {
-                                    OwnerResidualFrameInput::Value { op }
-                                }),
-                            _ => Self::remap_input(&parameter.input, op_offset, frame_offset)?,
-                        }
-                    } else {
-                        Self::remap_input(&parameter.input, op_offset, frame_offset)?
-                    };
-                    Ok(OwnerResidualFrameParameter {
-                        ordinal: parameter.ordinal,
-                        flow_type: parameter.flow_type.clone(),
-                        input,
-                    })
-                })
-                .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
-                .into_boxed_slice();
-            let frame_context = source_frame
-                .context
-                .as_ref()
-                .map(|source_context| {
-                    let input = if is_root
-                        && matches!(
-                            source_context.input,
-                            OwnerResidualFrameInput::ExternalContext
-                        ) {
-                        context.clone()
-                    } else {
-                        Self::remap_input(&source_context.input, op_offset, frame_offset)?
-                    };
-                    Ok(OwnerResidualFrameContext {
-                        flow_type: source_context.flow_type.clone(),
-                        input,
-                    })
-                })
-                .transpose()?;
-            self.frames.push(OwnerResidualFrame {
-                namespace: Self::remap_namespace(source_frame.namespace, namespace_offset)?,
-                parameters,
-                context: frame_context,
-                result: source_frame.result.clone(),
-                result_flush_type: source_frame.result_flush_type.clone(),
-                type_variables: source_frame.type_variables.clone(),
-            });
-        }
-        for source_op in &source.ops {
-            self.ops.push(Some(OwnerResidualOp {
-                frame: Self::remap_frame(source_op.frame, frame_offset)?,
-                fallback: source_op.fallback.clone(),
-                static_number: source_op.static_number.clone(),
-                kind: Self::remap_kind(&source_op.kind, op_offset, frame_offset, namespace_offset)?,
-            }));
-        }
-        Self::remap_root(&source.root, op_offset, frame_offset)
-    }
-
     fn compile_call(
         &mut self,
         frame: OwnerResidualFrameId,
@@ -1111,40 +815,32 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
         match node.call_target.as_ref() {
             Some(OwnerResidualCallTarget::Owner { owner }) => {
                 let context = explicit_context
-                    .map_or(OwnerResidualFrameInput::InheritedContext { frame }, |op| {
-                        OwnerResidualFrameInput::Value { op }
+                    .map_or(OwnerResidualCallContext::Inherited, |value| {
+                        OwnerResidualCallContext::Explicit { value }
                     });
-                let kind = match self.routes.get(owner).copied() {
+                let target = match self.routes.get(owner).copied() {
                     Some(OwnerInterfaceTransferRoute::Own) => {
                         let owner_index =
                             self.result.key.members.binary_search(owner).map_err(|_| {
                                 OwnerBodyInferenceError::new(format!(
-                                    "owner residual recursive call lost target {owner:?}"
+                                    "owner residual call lost same-component target {owner:?}"
                                 ))
                             })?;
-                        let (root, recursive) = self.compile_owner_instance(
-                            owner_index,
-                            Some(&actuals),
-                            Some(context),
-                        )?;
-                        if recursive {
-                            OwnerResidualOpKind::RecursiveCall { root }
-                        } else {
-                            OwnerResidualOpKind::InlinedRoot { root }
+                        OwnerResidualCompiledCallTarget::Own {
+                            owner: checked_u32(
+                                owner_index,
+                                "owner residual same-component owner count",
+                            )?,
                         }
                     }
                     Some(OwnerInterfaceTransferRoute::Dependency(dependency)) => {
-                        let (module, owner_index) = self.dependency_owner(dependency, owner)?;
-                        let source = module.program.owners.get(owner_index).cloned().ok_or_else(
-                            || {
-                                OwnerBodyInferenceError::new(format!(
-                                    "owner residual dependency {:?} has no program for {owner:?}",
-                                    module.key
-                                ))
-                            },
-                        )?;
-                        OwnerResidualOpKind::InlinedRoot {
-                            root: self.inline_program(&source, &actuals, context)?,
+                        let (_, owner_index) = self.dependency_owner(dependency, owner)?;
+                        OwnerResidualCompiledCallTarget::Dependency {
+                            dependency,
+                            owner: checked_u32(
+                                owner_index,
+                                "owner residual dependency owner count",
+                            )?,
                         }
                     }
                     None => {
@@ -1153,7 +849,18 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
                         )));
                     }
                 };
-                Ok(kind)
+                Ok(OwnerResidualOpKind::CompiledCall {
+                    target,
+                    actuals: std::mem::take(&mut actuals)
+                        .into_iter()
+                        .map(|(formal_ordinal, value)| OwnerResidualActual {
+                            formal_ordinal,
+                            value,
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                    context,
+                })
             }
             Some(OwnerResidualCallTarget::Abi {
                 canonical_name,
@@ -1434,12 +1141,10 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
         })
     }
 
-    fn compile_owner_instance(
+    fn compile_owner_root(
         &mut self,
         owner: usize,
-        argument_inputs: Option<&BTreeMap<u32, OwnerResidualOpId>>,
-        context_input: Option<OwnerResidualFrameInput>,
-    ) -> Result<(OwnerResidualRoot, bool), OwnerBodyInferenceError> {
+    ) -> Result<OwnerResidualRoot, OwnerBodyInferenceError> {
         let interface = self.result.owners.get(owner).ok_or_else(|| {
             OwnerBodyInferenceError::new("owner residual program lost its public interface")
         })?;
@@ -1447,53 +1152,43 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
             OwnerBodyInferenceError::new("owner residual program lost its unsealed draft")
         })?;
         let namespace = self.push_namespace(self.residual_type_variable_count)?;
-        let frame = self.push_frame(interface, namespace, argument_inputs, context_input)?;
-        if self.active_owners.contains(&owner) {
-            return Ok((OwnerResidualRoot::Principal { frame }, true));
-        }
-
-        self.active_owners.push(owner);
-        let root = (|| -> Result<OwnerResidualRoot, OwnerBodyInferenceError> {
-            Ok(match draft {
-                OwnerResidualDraft::Principal => OwnerResidualRoot::Principal { frame },
-                OwnerResidualDraft::Parameter { read } => OwnerResidualRoot::Parameter {
-                    frame,
-                    read: read.clone(),
-                },
-                OwnerResidualDraft::Expression { root, nodes } => {
-                    let mut local_ops = BTreeMap::new();
-                    for node in nodes {
-                        let op = self.reserve_op()?;
-                        if local_ops.insert(node.expression.clone(), op).is_some() {
-                            return Err(OwnerBodyInferenceError::new(format!(
-                                "owner residual for {:?} repeats a local expression",
-                                interface.owner
-                            )));
-                        }
-                    }
-                    let source_nodes = nodes
-                        .iter()
-                        .map(|node| (node.expression.clone(), node))
-                        .collect::<BTreeMap<_, _>>();
-                    for node in nodes {
-                        let op = local_ops[&node.expression] as usize;
-                        let compiled = self.compile_node(frame, node, &source_nodes, &local_ops)?;
-                        if self.ops[op].replace(compiled).is_some() {
-                            return Err(OwnerBodyInferenceError::new(
-                                "owner residual compiler filled one op twice",
-                            ));
-                        }
-                    }
-                    OwnerResidualRoot::Value {
-                        frame,
-                        op: self.compile_reference(frame, &local_ops, root)?,
+        let frame = self.push_frame(interface, namespace)?;
+        Ok(match draft {
+            OwnerResidualDraft::Principal => OwnerResidualRoot::Principal { frame },
+            OwnerResidualDraft::Parameter { read } => OwnerResidualRoot::Parameter {
+                frame,
+                read: read.clone(),
+            },
+            OwnerResidualDraft::Expression { root, nodes } => {
+                let mut local_ops = BTreeMap::new();
+                for node in nodes {
+                    let op = self.reserve_op()?;
+                    if local_ops.insert(node.expression.clone(), op).is_some() {
+                        return Err(OwnerBodyInferenceError::new(format!(
+                            "owner residual for {:?} repeats a local expression",
+                            interface.owner
+                        )));
                     }
                 }
-            })
-        })();
-        let active = self.active_owners.pop();
-        debug_assert_eq!(active, Some(owner));
-        root.map(|root| (root, false))
+                let source_nodes = nodes
+                    .iter()
+                    .map(|node| (node.expression.clone(), node))
+                    .collect::<BTreeMap<_, _>>();
+                for node in nodes {
+                    let op = local_ops[&node.expression] as usize;
+                    let compiled = self.compile_node(frame, node, &source_nodes, &local_ops)?;
+                    if self.ops[op].replace(compiled).is_some() {
+                        return Err(OwnerBodyInferenceError::new(
+                            "owner residual compiler filled one op twice",
+                        ));
+                    }
+                }
+                OwnerResidualRoot::Value {
+                    frame,
+                    op: self.compile_reference(frame, &local_ops, root)?,
+                }
+            }
+        })
     }
 
     fn compile_owner(
@@ -1507,12 +1202,7 @@ impl<'a> OwnerResidualProgramBuilder<'a> {
             OwnerBodyInferenceError::new("owner residual program lost its unsealed draft")
         })?;
         let invocation_invariant = owner_result_transfer_is_invocation_invariant(interface, draft);
-        let (root, recursive) = self.compile_owner_instance(owner, None, None)?;
-        if recursive {
-            return Err(OwnerBodyInferenceError::new(
-                "owner residual root was already active before compilation",
-            ));
-        }
+        let root = self.compile_owner_root(owner)?;
         let ops = self
             .ops
             .into_iter()
@@ -1562,7 +1252,7 @@ fn compile_owner_residual_program(
         .flat_map(|owner| owner.ops.iter())
         .map(|op| op.kind.edge_count())
         .sum();
-    let fingerprint_v1 = fingerprint(OWNER_RESIDUAL_PROGRAM_DOMAIN_V2, &owners)?;
+    let fingerprint_v1 = fingerprint(OWNER_RESIDUAL_PROGRAM_DOMAIN_V3, &owners)?;
     Ok(OwnerResidualProgram {
         owners,
         op_count,
@@ -1735,7 +1425,7 @@ fn seal_owner_interface_transfer_module(
         &routes,
     )?);
     let fingerprint_v1 = fingerprint(
-        OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V4,
+        OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V5,
         &(
             &result.key,
             result.fingerprint_v1(),
@@ -4947,10 +4637,12 @@ struct OwnerResidualFrameRuntime {
 }
 
 struct CompiledOwnerResidualProgramEvaluator<'program, 'unifier> {
+    module: Option<&'program OwnerInterfaceTransferModule>,
     program: &'program OwnerResidualOwnerProgram,
     external_arguments: &'program OwnerResidualDraftArguments,
     external_context: Option<&'program EvaluatedResultValue>,
     unifier: &'unifier mut TypeUnifier,
+    active_owners: &'unifier mut SmallVec<[StableCheckOwnerKey; 16]>,
     namespaces: Vec<OwnerResidualDraftVariables>,
     frames: Vec<Option<OwnerResidualFrameRuntime>>,
     initializing_frames: BTreeSet<OwnerResidualFrameId>,
@@ -4959,16 +4651,20 @@ struct CompiledOwnerResidualProgramEvaluator<'program, 'unifier> {
 
 impl<'program, 'unifier> CompiledOwnerResidualProgramEvaluator<'program, 'unifier> {
     fn new(
+        module: Option<&'program OwnerInterfaceTransferModule>,
         program: &'program OwnerResidualOwnerProgram,
         arguments: &'program OwnerResidualDraftArguments,
         context: Option<&'program EvaluatedResultValue>,
         unifier: &'unifier mut TypeUnifier,
+        active_owners: &'unifier mut SmallVec<[StableCheckOwnerKey; 16]>,
     ) -> Self {
         Self {
+            module,
             program,
             external_arguments: arguments,
             external_context: context,
             unifier,
+            active_owners,
             namespaces: program
                 .namespaces
                 .iter()
@@ -4980,33 +4676,7 @@ impl<'program, 'unifier> CompiledOwnerResidualProgramEvaluator<'program, 'unifie
         }
     }
 
-    fn frame_input(
-        &mut self,
-        input: &OwnerResidualFrameInput,
-        lexical: &BTreeMap<String, EvaluatedResultValue>,
-        active: &mut OwnerResidualDraftActiveNodes,
-    ) -> Option<EvaluatedResultValue> {
-        match input {
-            OwnerResidualFrameInput::ExternalArgument { ordinal } => {
-                self.external_arguments.get(ordinal).cloned()
-            }
-            OwnerResidualFrameInput::ExternalContext => self.external_context.cloned(),
-            OwnerResidualFrameInput::Value { op } => self.evaluate_op(*op, lexical, active),
-            OwnerResidualFrameInput::InheritedContext { frame } => self
-                .frames
-                .get(*frame as usize)
-                .and_then(Option::as_ref)
-                .and_then(|runtime| runtime.context.clone()),
-            OwnerResidualFrameInput::Missing => None,
-        }
-    }
-
-    fn initialize_frame(
-        &mut self,
-        frame: OwnerResidualFrameId,
-        lexical: &BTreeMap<String, EvaluatedResultValue>,
-        active: &mut OwnerResidualDraftActiveNodes,
-    ) -> Option<()> {
+    fn initialize_frame(&mut self, frame: OwnerResidualFrameId) -> Option<()> {
         if self.frames.get(frame as usize)?.is_some() {
             return Some(());
         }
@@ -5017,14 +4687,14 @@ impl<'program, 'unifier> CompiledOwnerResidualProgramEvaluator<'program, 'unifie
         let runtime = (|| {
             let mut arguments = OwnerResidualDraftArguments::default();
             for parameter in &descriptor.parameters {
-                if let Some(value) = self.frame_input(&parameter.input, lexical, active) {
+                if let Some(value) = self.external_arguments.get(&parameter.ordinal).cloned() {
                     arguments.insert(parameter.ordinal, value);
                 }
             }
             let context = descriptor
                 .context
                 .as_ref()
-                .and_then(|context| self.frame_input(&context.input, lexical, active));
+                .and(self.external_context.cloned());
             let namespace = descriptor.namespace as usize;
             let variables = self.namespaces.get_mut(namespace)?;
             let mut substitutions = crate::InlineTypeSubstitutions::default();
@@ -5195,12 +4865,11 @@ impl<'program, 'unifier> CompiledOwnerResidualProgramEvaluator<'program, 'unifie
     fn evaluate_root(
         &mut self,
         root: &OwnerResidualRoot,
-        caller_lexical: &BTreeMap<String, EvaluatedResultValue>,
         active: &mut OwnerResidualDraftActiveNodes,
         constant: Option<&EvaluatedResultValue>,
     ) -> Option<EvaluatedOwnerResult> {
         let frame = root.frame();
-        self.initialize_frame(frame, caller_lexical, active)?;
+        self.initialize_frame(frame)?;
         let evaluated = if let Some(constant) = constant {
             Some(constant.clone())
         } else {
@@ -5309,11 +4978,52 @@ impl<'program, 'unifier> CompiledOwnerResidualProgramEvaluator<'program, 'unifie
                 });
                 value.or_else(|| self.fallback(op))
             }
-            OwnerResidualOpKind::InlinedRoot { root }
-            | OwnerResidualOpKind::RecursiveCall { root } => self
-                .evaluate_root(root, lexical, active, None)
-                .map(|result| result.value)
-                .or_else(|| self.fallback(op)),
+            OwnerResidualOpKind::CompiledCall {
+                target,
+                actuals,
+                context,
+            } => {
+                let mut arguments = OwnerResidualDraftArguments::default();
+                for actual in actuals {
+                    arguments.insert(
+                        actual.formal_ordinal,
+                        self.evaluate_op(actual.value, lexical, active)?,
+                    );
+                }
+                let context = match context {
+                    OwnerResidualCallContext::Inherited => self
+                        .frames
+                        .get(op.frame as usize)
+                        .and_then(Option::as_ref)
+                        .and_then(|runtime| runtime.context.clone()),
+                    OwnerResidualCallContext::Explicit { value } => {
+                        Some(self.evaluate_op(*value, lexical, active)?)
+                    }
+                };
+                let current_module = self.module?;
+                let (module, owner) = match target {
+                    OwnerResidualCompiledCallTarget::Own { owner } => {
+                        (current_module, *owner as usize)
+                    }
+                    OwnerResidualCompiledCallTarget::Dependency { dependency, owner } => (
+                        current_module
+                            .dependencies
+                            .get(*dependency as usize)?
+                            .as_ref(),
+                        *owner as usize,
+                    ),
+                };
+                let result = evaluate_compiled_owner_in_module(
+                    module,
+                    owner,
+                    &arguments,
+                    context.as_ref(),
+                    self.unifier,
+                    self.active_owners,
+                )?;
+                self.owned_variables.extend(result.owned_variables);
+                Some(result.value)
+            }
             OwnerResidualOpKind::AbiCall {
                 canonical_name,
                 contract,
@@ -5652,22 +5362,63 @@ impl<'program, 'unifier> CompiledOwnerResidualProgramEvaluator<'program, 'unifie
         })
     }
 
-    fn evaluate(mut self, constant: Option<&EvaluatedResultValue>) -> Option<EvaluatedOwnerResult> {
-        let root = self.program.root.clone();
+    fn evaluate(
+        mut self,
+        constant: Option<&EvaluatedResultValue>,
+        principal_only: bool,
+    ) -> Option<EvaluatedOwnerResult> {
+        let root = if principal_only {
+            OwnerResidualRoot::Principal {
+                frame: self.program.root.frame(),
+            }
+        } else {
+            self.program.root.clone()
+        };
         let mut result = self.evaluate_root(
             &root,
-            &BTreeMap::new(),
             &mut OwnerResidualDraftActiveNodes::new(),
-            constant,
+            (!principal_only).then_some(constant).flatten(),
         )?;
         result.owned_variables = self.owned_variables;
         Some(result)
     }
 }
 
+fn evaluate_compiled_owner_in_module(
+    module: &OwnerInterfaceTransferModule,
+    owner: usize,
+    arguments: &OwnerResidualDraftArguments,
+    context: Option<&EvaluatedResultValue>,
+    unifier: &mut TypeUnifier,
+    active_owners: &mut SmallVec<[StableCheckOwnerKey; 16]>,
+) -> Option<EvaluatedOwnerResult> {
+    let owner_key = module.result.key.members.get(owner)?;
+    let program = module.program.owners.get(owner)?;
+    let principal_only = active_owners.iter().any(|active| active == owner_key);
+    if !principal_only {
+        active_owners.push(owner_key.clone());
+    }
+    let result = {
+        CompiledOwnerResidualProgramEvaluator::new(
+            Some(module),
+            program,
+            arguments,
+            context,
+            unifier,
+            active_owners,
+        )
+        .evaluate(module.constant_result_at(owner), principal_only)
+    };
+    if !principal_only {
+        debug_assert_eq!(active_owners.pop().as_ref(), Some(owner_key));
+    }
+    result
+}
+
 struct CompiledOwnerResidualEvaluator<'a, 'unifier> {
     providers: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerInterfaceTransferModule>,
     unifier: &'unifier mut TypeUnifier,
+    active_owners: SmallVec<[StableCheckOwnerKey; 16]>,
 }
 
 impl<'a, 'unifier> CompiledOwnerResidualEvaluator<'a, 'unifier> {
@@ -5675,7 +5426,11 @@ impl<'a, 'unifier> CompiledOwnerResidualEvaluator<'a, 'unifier> {
         providers: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerInterfaceTransferModule>,
         unifier: &'unifier mut TypeUnifier,
     ) -> Self {
-        Self { providers, unifier }
+        Self {
+            providers,
+            unifier,
+            active_owners: SmallVec::new(),
+        }
     }
 
     fn evaluate_owner(
@@ -5696,9 +5451,14 @@ impl<'a, 'unifier> CompiledOwnerResidualEvaluator<'a, 'unifier> {
         context: Option<&EvaluatedResultValue>,
     ) -> Option<EvaluatedOwnerResult> {
         let owner = module.result.key.members.binary_search(owner).ok()?;
-        let program = module.program.owners.get(owner)?;
-        CompiledOwnerResidualProgramEvaluator::new(program, arguments, context, self.unifier)
-            .evaluate(module.constant_result_at(owner))
+        evaluate_compiled_owner_in_module(
+            module,
+            owner,
+            arguments,
+            context,
+            self.unifier,
+            &mut self.active_owners,
+        )
     }
 }
 
@@ -9435,20 +9195,13 @@ mod tests {
             .expect("spare residual module");
         let wrapper_program = &wrapper_module.program.owners[0];
 
-        assert!(
-            wrapper_program
-                .ops
-                .iter()
-                .any(|op| matches!(op.kind, OwnerResidualOpKind::InlinedRoot { .. })),
-            "the dependency call must be represented by its composed residual root",
-        );
-        assert!(
-            wrapper_program
-                .ops
-                .iter()
-                .all(|op| !matches!(op.kind, OwnerResidualOpKind::RecursiveCall { .. })),
-            "an acyclic dependency call must not survive sealing as a recursive call",
-        );
+        assert!(wrapper_program.ops.iter().any(|op| matches!(
+            op.kind,
+            OwnerResidualOpKind::CompiledCall {
+                target: OwnerResidualCompiledCallTarget::Dependency { .. },
+                ..
+            }
+        )));
 
         let child_draft = OwnerResidualDraft::Expression {
             root: OwnerResidualExpressionRef::Child {
@@ -9504,7 +9257,7 @@ mod tests {
     }
 
     #[test]
-    fn residual_linker_inlines_same_scc_calls_until_the_actual_backedge() {
+    fn residual_linker_shares_same_scc_definitions_and_falls_back_only_on_the_actual_backedge() {
         let unit = link(concat!(
             "FUNCTION first(value) {\n",
             "    second(value: value)\n",
@@ -9570,21 +9323,27 @@ mod tests {
             .expect("recursive component module");
         assert!(recursive_module.owns_owner(&second));
         let first_index = recursive_module.key.members.binary_search(&first).unwrap();
+        let second_index = recursive_module.key.members.binary_search(&second).unwrap();
         let first_program = &recursive_module.program.owners[first_index];
-
-        assert!(
-            first_program
-                .ops
-                .iter()
-                .any(|op| matches!(op.kind, OwnerResidualOpKind::InlinedRoot { .. })),
-            "first -> second is acyclic on the active owner stack and must be composed",
-        );
-        assert!(
-            first_program
-                .ops
-                .iter()
-                .any(|op| matches!(op.kind, OwnerResidualOpKind::RecursiveCall { .. })),
-            "second -> first is the actual active-stack backedge and must use the principal",
+        let second_program = &recursive_module.program.owners[second_index];
+        assert!(first_program.ops.iter().any(|op| matches!(
+            op.kind,
+            OwnerResidualOpKind::CompiledCall {
+                target: OwnerResidualCompiledCallTarget::Own { owner },
+                ..
+            } if owner as usize == second_index
+        )));
+        assert!(second_program.ops.iter().any(|op| matches!(
+            op.kind,
+            OwnerResidualOpKind::CompiledCall {
+                target: OwnerResidualCompiledCallTarget::Own { owner },
+                ..
+            } if owner as usize == first_index
+        )));
+        assert_eq!(
+            recursive_module.program.op_count,
+            first_program.ops.len() as u64 + second_program.ops.len() as u64,
+            "same-component callees must be stored once, not physically copied at call sites",
         );
     }
 
@@ -9639,8 +9398,15 @@ mod tests {
         };
         let arguments = OwnerResidualDraftArguments::default();
         let mut unifier = TypeUnifier::default();
-        let mut evaluator =
-            CompiledOwnerResidualProgramEvaluator::new(&program, &arguments, None, &mut unifier);
+        let mut active_owners = SmallVec::new();
+        let mut evaluator = CompiledOwnerResidualProgramEvaluator::new(
+            None,
+            &program,
+            &arguments,
+            None,
+            &mut unifier,
+            &mut active_owners,
+        );
         let Type::Var(own) = evaluator
             .resolve_type(0, &Type::Var(TypeVar(0)), None)
             .unwrap()

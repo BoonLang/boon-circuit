@@ -914,18 +914,26 @@ Current checkpoints to preserve and audit rather than redo:
 - preserve checkpoint `c224e96` as the public-interface/compiled-residual
   ownership cut. It removes public source-shaped result transfers, seals one
   private residual program per interface component, composes dependency
-  programs, and leaves the regular typecheck/compiler suites green. The
-  follow-up residual compiler now walks same-component calls with an active-
-  owner stack: it physically composes ordinary acyclic calls and emits a
-  principal-only `RecursiveCall` only at an actual DFS backedge. A focused
-  mixed acyclic/cyclic component regression proves both branches. The exact
-  ignored NovyWave owner-assembly gate now passes in 182.99 seconds; the former
-  `selected_signal_defaults` open `formatter` and generic `segments` failures
-  were consequences of the coarse SCC-wide recursion fallback. Residual-
-  program, transfer-module, and compiler request domains advance with the new
-  compiled meaning. Next remeasure residual program work and dispatch before
-  choosing another owner; do not revive the disproven surface-substitution or
-  dependency-constant experiments, because neither moved the gate;
+  programs, and leaves the regular typecheck/compiler suites green. Preserve
+  `da649a2` as the correctness checkpoint that proved acyclic same-component
+  semantics and principal fallback only at an actual active-owner backedge;
+  the former `selected_signal_defaults` open `formatter` and generic `segments`
+  failures were consequences of the coarse SCC-wide recursion fallback. The
+  next measured cut replaces physical callee/dependency program copies with
+  compact compiled-call routes: every SCC member residual is stored once, each
+  invocation receives fresh arguments/context/alpha state, and only a repeated
+  active owner falls back to its principal. On a current single-threaded debug
+  NovyWave diagnostics sample, 3,358 transfer roots now account for 62,483
+  residual nodes and 63,042 edges instead of 6,096,178 and 5,987,886; peak RSS
+  falls from 1,165,800 KiB to 413,688 KiB, and elapsed time is 23.287 seconds.
+  Counter completes in 46.122 ms at 27,172 KiB. All 34 owner-body tests pass,
+  and the exact ignored NovyWave owner-assembly oracle passes in 152.04 seconds
+  versus 182.99 seconds before the compact-call cut. Residual-program,
+  transfer-module, and compiler request domains advance with the changed
+  compiled meaning. This closes the measured transfer-program storage
+  multiplier; continue with the planned span-free owner artifact core and
+  deletion of whole-project diagnostic replay, not more residual micro-tuning
+  or the disproven surface-substitution/dependency-constant experiments;
 - FjordPulse currently has no basis for weakening the 108-story/340-scenario
   acceptance inventory. Only its two explicitly deferred backup/restore
   automation scenarios may retain that final status.

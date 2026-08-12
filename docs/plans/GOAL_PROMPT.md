@@ -73,6 +73,16 @@ Authority and conflict rules:
   representations, but it does not own public language semantics, proof or
   evidence soundness, runtime persistence identity, native presentation
   semantics, or the mandatory verified artifact spine.
+- The compiler's primary optimization law is **one semantic computation, many
+  cheap projections**. Every diagnostics, editor, verified, proof, lowering,
+  serialization, and runtime request consumes the same immutable owner/SCC/
+  project facts and receipts. No request may reconstruct semantic meaning from
+  raw bodies, recursively reinterpret a source-shaped transfer graph, or
+  retain a second semantic authority. Exact-currentness receipts remain
+  separate from backdatable semantic-result fingerprints, and source maps
+  remain presentation inputs. This rule supersedes older dated resumption text
+  that still describes public diagnostics or compatibility assembly as the
+  semantic owner.
 - `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md` is subordinate to those budgets
   and owns the current post-`d177af9` multiplier decision, detailed by
   `BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`: immutable source and body-
@@ -742,22 +752,23 @@ Current checkpoints to preserve and audit rather than redo:
   unsafe `TypeUnifier`/CSR/packed-row kernels only afterward if a fresh profile
   proves safe mechanics dominate and a safe A/B oracle, invariants, parity,
   Miri/fuzz evidence, and material whole-run improvement all pass;
-- preserve the 2026-08-04 staged `OwnerDiagnosticsAggregate` correction. The
-  internal request globalizes owner-local spans through project source layouts,
-  seals exact owner/body/source-map coverage, and proves zero construction ABI,
-  checked-shard, compatibility, or executable requests. Independent reviews
-  rejected the initial public cutover because project-level forward-OUT/order/
-  output/render/host diagnostics and editor presentation facts were absent, and
-  because speculative record/pattern/context scope scans were not semantically
-  sound. Public `CompileIntent::Diagnostics` therefore still uses complete
-  checked assembly; the transient approximately 3.72-second lean NovyWave probe
-  is not an accepted score. Build one authoritative per-owner lexical/import
-  plan with exact projection and shadowing before project/ABI resolution,
-  memoize compact SCC/result-transfer dependency slices once, then publish
-  construction-independent owner/project diagnostic facts and an honest
-  optional editor-presentation sidecar. Cut over and rescore only after the
-  complete multi-unit invalid oracle and editor projection pass. Consider
-  narrow profiled unsafe kernels only after those architectural deletions;
+- the 2026-08-04 diagnostic-root text is historical. Public
+  `CompileIntent::Diagnostics` now consumes the lean aggregate and requests
+  zero construction ABI, checked shards, checked compatibility assembly, or
+  executable products. Per-owner replay evaluations and source-unit owner
+  diagnostics are currentness foundations, but `ProjectDiagnosticFacts` still
+  constructs a rich whole-project `ProjectFactIndex` from all owners and
+  replays semantic views that already exist in owner bodies. After the active
+  residual-transfer component cut, project span-free owner diagnostic facts
+  directly from the owning semantic result/evaluation as a separately
+  fingerprinted request without semantic replay, feed only compact typed
+  contributions into genuinely global reducers, and make source-unit requests
+  own relocation and presentation only. Verified assembly must consume those
+  same authenticated facts. Delete the raw all-owner replay/index and rich
+  aggregate reseal, prove complete valid/invalid/multi-unit/editor/verified
+  parity plus stale-input rejection and semantic backdating, then reprofile.
+  Consider narrow profiled unsafe kernels only after those architectural
+  deletions;
 - preserve the 2026-08-04 interface-import ownership cut. The body-evaluation
   request now drives one authoritative `OwnerBodyInterfacePlanner`, records
   exact dynamic owner-to-SCC and interface-result dependencies, and publishes
@@ -945,6 +956,17 @@ Execution strategy:
   owner. Use small explicitly non-acceptance preflight samples before the full
   three-setup/30-scored protocol. If the expected work does not fall, reassess
   the architecture rather than accumulating local patches.
+- When a measured phase contains duplicated semantic work, recursive transfer
+  replay, whole-project replay, or a globally red rich owner, deleting that
+  ownership is higher priority than threading, cache reuse, unsafe, hash or
+  container tuning, and crate splitting. The active order is: close the current
+  correctness/verified-path blocker; compile SCC result transfers into one
+  symbolic/residual component program; publish one span-free owner artifact
+  core; make diagnostics and verified compilation projections of that core;
+  simplify the interface/component transaction; delete the superseded paths;
+  then remeasure. Broad parallelism may be evaluated only after the normative
+  single-threaded cold gates pass, and only as a deterministic at-most-two-
+  worker A/B over graph-proven independent requests.
 - Treat compiler timeouts and graph explosions as architecture failures, not as
   requests for larger timeouts. The former 120-second rule and debug fixture
   ceilings are historical emergency bounds, not acceptance targets.
@@ -1023,6 +1045,19 @@ Blocking compiler-performance prerequisite:
   release protocol at milestone candidates. Do not substitute a crate split,
   a packed version of the exhaustive entity graph, or a fast subphase for the
   complete diagnostics or verified-plan gate.
+- Prioritize the active architecture simplification before broad
+  parallelization: preserve stable owner identities as compact rows; publish
+  one authority per typed dependency-edge fact and view-specific compact edge
+  tables through shared graph machinery; solve acyclic components once and use
+  fixed points only for actual cycles; use one SCC component transaction/root
+  to publish separately fingerprinted public-interface and prepared-residual-
+  transfer artifacts; publish one span-free per-owner body/diagnostic/lowering
+  core; keep source maps separate; make diagnostics a shallow owner/global-
+  reducer/source-unit-presentation projection; and make verified compilation
+  add only proof, persistence, and lowering. Hash at artifact boundaries rather
+  than inside repeated semantic walks. Retain project-global reducers only for
+  genuinely global questions such as duplicate declarations, recursion,
+  OUT/output/order cycles, and host/output uniqueness.
 - Pass the fresh-process and empty-`CompilerSession` no-cache gates first, then
   the warm edit, loaded switch, cancellation, invalidation-locality, scaling,
   deterministic-artifact, and RSS gates. Persistent compiler state is the

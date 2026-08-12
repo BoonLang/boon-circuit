@@ -14,14 +14,14 @@ use crate::{
     OwnerSyntaxGraph, OwnerSyntaxInput, RenderContractRegistry, SourcePayloadPathLookup,
     TypecheckSyntaxProgram, canonicalize_diagnostics, diagnostic_at_line, host_port_payload_types,
     host_port_table, http_response_type_is_valid, open_object_type, render_slot_type_error,
-    statement_contains_output_authority, statement_is_empty_delimiter, substitute_checked_type,
-    type_contains_absence, type_for_nested_path, type_is_deferred_order_key, type_is_orderable_key,
-    type_may_be_ordered_list, union_structural_type, websocket_actions_type_is_valid,
+    statement_contains_output_authority, statement_is_empty_delimiter, type_contains_absence,
+    type_is_deferred_order_key, type_is_orderable_key, type_may_be_ordered_list,
+    union_structural_type, websocket_actions_type_is_valid,
 };
 use boon_checked::{
     CheckedCallableKind, CheckedEffectSummary, CheckedValueUse, DiagnosticSeverity, FlowMode,
     FlowType, OwnerDeclarationStableKey, OwnerLexicalDeclarationCapability, OwnerLexicalTargetRef,
-    Type, TypeDiagnostic, apply_checked_type_substitutions, is_registered_render_constructor,
+    Type, TypeDiagnostic, apply_checked_type_substitutions_once, is_registered_render_constructor,
 };
 use boon_contract::SourceBundleDigestV1;
 use boon_data::{Bits, ExactNumber};
@@ -1217,6 +1217,7 @@ struct OwnerFactView<'a> {
     interface: &'a crate::OwnerPublicInterface,
     body: &'a OwnerBodyInferenceShard,
     replay: &'a OwnerDiagnosticReplayFacts,
+    inference_abi: &'a OwnerInferenceAbiEnvironment,
     source_map: &'a OwnerSourceMap,
 }
 
@@ -1550,6 +1551,7 @@ impl<'a> ProjectFactIndex<'a> {
                     interface,
                     body,
                     replay,
+                    inference_abi,
                     source_map,
                 },
             );
@@ -1945,52 +1947,6 @@ impl<'a> ProjectFactIndex<'a> {
         };
         active.remove(expression);
         result
-    }
-
-    fn deferred_style_parameter_type(
-        &self,
-        owner: &StableCheckOwnerKey,
-        ordinal: u32,
-        projection: &[String],
-    ) -> Result<Type, ProjectDiagnosticFactsError> {
-        let Some(interface) = self.owners.get(owner).map(|view| view.interface) else {
-            return Err(ProjectDiagnosticFactsError::new(
-                "owner diagnostic parameter read has no public interface",
-            ));
-        };
-        let Some(parameter) = interface
-            .parameters
-            .iter()
-            .find(|parameter| parameter.ordinal == ordinal)
-        else {
-            return Err(ProjectDiagnosticFactsError::new(
-                "owner diagnostic parameter read has no public interface parameter",
-            ));
-        };
-        let ty = type_for_nested_path(&parameter.flow_type.ty, projection)
-            .unwrap_or_else(|| parameter.flow_type.ty.clone());
-        // Body call facts publish substitutions in the callee-local
-        // alpha namespace, while an interface SCC uses one namespace for
-        // all members. Normalize this member's declared variables to the
-        // same dense call-local order before replaying substitutions.
-        let call_local_variables = interface
-            .type_variables
-            .iter()
-            .enumerate()
-            .map(|(index, variable)| {
-                Ok((
-                    *variable,
-                    Type::Var(boon_checked::TypeVar(u32::try_from(index).map_err(
-                        |_| {
-                            ProjectDiagnosticFactsError::new(
-                                "owner diagnostic interface has too many type variables",
-                            )
-                        },
-                    )?)),
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>, ProjectDiagnosticFactsError>>()?;
-        Ok(substitute_checked_type(&ty, &call_local_variables))
     }
 
     fn effective_read(
@@ -3257,6 +3213,16 @@ struct ProjectDeferredStyleConstraint {
     expectation: crate::DeferredStyleExpectation,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProjectDeferredStyleBase {
+    Static(Type),
+    Parameter {
+        owner: StableCheckOwnerKey,
+        ordinal: u32,
+        projection: Vec<String>,
+    },
+}
+
 fn project_style_expression_type(index: &ProjectFactIndex<'_>, expression: usize) -> Type {
     stable_syntax_expression(index, expression)
         .and_then(|stable| index.order_expression(&stable))
@@ -3572,17 +3538,92 @@ fn style_diagnostics(
         Ok(())
     }
 
-    fn validate_owner(
+    fn instantiated_parameter_type(
+        index: &ProjectFactIndex<'_>,
+        exact_types: &mut ProjectFlowTypeAnalyzer<'_, '_>,
         owner: &StableCheckOwnerKey,
-        substitutions: &BTreeMap<boon_checked::TypeVar, Type>,
+        ordinal: u32,
+        projection: &[String],
+        frames: &[ProjectOrderFrame],
+    ) -> Type {
+        let Some((frame_index, actual)) =
+            frames.iter().enumerate().rev().find_map(|(index, frame)| {
+                (&frame.callable_owner == owner)
+                    .then(|| {
+                        frame
+                            .bindings
+                            .get(&ordinal)
+                            .cloned()
+                            .map(|actual| (index, actual))
+                    })
+                    .flatten()
+            })
+        else {
+            return Type::Unknown;
+        };
+        instantiated_expression_type(
+            index,
+            exact_types,
+            &actual,
+            projection,
+            &frames[..frame_index],
+        )
+    }
+
+    fn instantiated_expression_type(
+        index: &ProjectFactIndex<'_>,
+        exact_types: &mut ProjectFlowTypeAnalyzer<'_, '_>,
+        expression: &StableOrderExpression,
+        projection: &[String],
+        frames: &[ProjectOrderFrame],
+    ) -> Type {
+        if let Some((owner, ordinal, projection)) =
+            index.deferred_style_parameter_origin(expression, projection, &mut BTreeSet::new())
+        {
+            return instantiated_parameter_type(
+                index,
+                exact_types,
+                &owner,
+                ordinal,
+                &projection,
+                frames,
+            );
+        }
+        let ty = exact_types.expression_type(expression);
+        ProjectFlowTypeAnalyzer::projected_type(&ty, projection).unwrap_or(Type::Unknown)
+    }
+
+    fn validate_owner(
+        index: &ProjectFactIndex<'_>,
+        owner: &StableCheckOwnerKey,
+        frames: &[ProjectOrderFrame],
+        exact_types: &mut ProjectFlowTypeAnalyzer<'_, '_>,
         constraints_by_owner: &BTreeMap<
             StableCheckOwnerKey,
-            Vec<(ProjectDeferredStyleConstraint, Type, TypeDiagnosticSpan)>,
+            Vec<(
+                ProjectDeferredStyleConstraint,
+                ProjectDeferredStyleBase,
+                TypeDiagnosticSpan,
+            )>,
         >,
         diagnostics: &mut Vec<TypeDiagnostic>,
     ) {
         for (constraint, base, span) in constraints_by_owner.get(owner).into_iter().flatten() {
-            let ty = substitute_checked_type(base, substitutions);
+            let ty = match base {
+                ProjectDeferredStyleBase::Static(ty) => ty.clone(),
+                ProjectDeferredStyleBase::Parameter {
+                    owner,
+                    ordinal,
+                    projection,
+                } => instantiated_parameter_type(
+                    index,
+                    exact_types,
+                    owner,
+                    *ordinal,
+                    projection,
+                    frames,
+                ),
+            };
             if crate::style_type_requires_instantiation(&ty)
                 || crate::deferred_style_expectation_accepts(constraint.expectation, &ty)
             {
@@ -3599,13 +3640,19 @@ fn style_diagnostics(
     }
 
     fn visit_call(
+        index: &ProjectFactIndex<'_>,
         call_expression: &StableOrderExpression,
-        inherited: &BTreeMap<boon_checked::TypeVar, Type>,
+        frames: &mut Vec<ProjectOrderFrame>,
+        exact_types: &mut ProjectFlowTypeAnalyzer<'_, '_>,
         calls: &BTreeMap<StableOrderExpression, &OwnerDiagnosticStableCallFact>,
         calls_by_owner: &BTreeMap<StableCheckOwnerKey, Vec<StableOrderExpression>>,
         constraints_by_owner: &BTreeMap<
             StableCheckOwnerKey,
-            Vec<(ProjectDeferredStyleConstraint, Type, TypeDiagnosticSpan)>,
+            Vec<(
+                ProjectDeferredStyleConstraint,
+                ProjectDeferredStyleBase,
+                TypeDiagnosticSpan,
+            )>,
         >,
         active: &mut BTreeSet<StableCheckOwnerKey>,
         diagnostics: &mut Vec<TypeDiagnostic>,
@@ -3617,26 +3664,41 @@ fn style_diagnostics(
         else {
             return;
         };
-        let substitutions = crate::compose_checked_type_substitutions(
-            inherited,
-            &call.diagnostic.type_substitutions,
+        frames.push(ProjectOrderFrame {
+            callable_owner: owner.clone(),
+            call: call_expression.clone(),
+            bindings: call
+                .matched_inputs
+                .iter()
+                .filter(|input| input.formal_kind == crate::OwnerParameterKind::Value)
+                .map(|input| (input.formal_ordinal, input.expression.clone()))
+                .collect(),
+        });
+        validate_owner(
+            index,
+            owner,
+            frames,
+            exact_types,
+            constraints_by_owner,
+            diagnostics,
         );
-        validate_owner(owner, &substitutions, constraints_by_owner, diagnostics);
-        if !active.insert(owner.clone()) {
-            return;
+        if active.insert(owner.clone()) {
+            for nested in calls_by_owner.get(owner).into_iter().flatten() {
+                visit_call(
+                    index,
+                    nested,
+                    frames,
+                    exact_types,
+                    calls,
+                    calls_by_owner,
+                    constraints_by_owner,
+                    active,
+                    diagnostics,
+                );
+            }
+            active.remove(owner);
         }
-        for nested in calls_by_owner.get(owner).into_iter().flatten() {
-            visit_call(
-                nested,
-                &substitutions,
-                calls,
-                calls_by_owner,
-                constraints_by_owner,
-                active,
-                diagnostics,
-            );
-        }
-        active.remove(owner);
+        frames.pop();
     }
 
     let mut constraints = Vec::new();
@@ -3687,7 +3749,11 @@ fn style_diagnostics(
         .collect::<BTreeSet<_>>();
     let mut constraints_by_owner = BTreeMap::<
         StableCheckOwnerKey,
-        Vec<(ProjectDeferredStyleConstraint, Type, TypeDiagnosticSpan)>,
+        Vec<(
+            ProjectDeferredStyleConstraint,
+            ProjectDeferredStyleBase,
+            TypeDiagnosticSpan,
+        )>,
     >::new();
     for constraint in constraints {
         let owner = index
@@ -3697,16 +3763,22 @@ fn style_diagnostics(
         let base = if let Some((parameter_owner, ordinal, projection)) =
             index.deferred_style_parameter_origin(&constraint.expression, &[], &mut BTreeSet::new())
         {
-            index.deferred_style_parameter_type(&parameter_owner, ordinal, &projection)?
+            ProjectDeferredStyleBase::Parameter {
+                owner: parameter_owner,
+                ordinal,
+                projection,
+            }
         } else {
-            index
-                .order_expression(&constraint.expression)
-                .map(|(_, _, _, inferred)| inferred.flow_type.ty.clone())
-                .ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "deferred style constraint has no inferred expression type",
-                    )
-                })?
+            ProjectDeferredStyleBase::Static(
+                index
+                    .order_expression(&constraint.expression)
+                    .map(|(_, _, _, inferred)| inferred.flow_type.ty.clone())
+                    .ok_or_else(|| {
+                        ProjectDiagnosticFactsError::new(
+                            "deferred style constraint has no inferred expression type",
+                        )
+                    })?,
+            )
         };
         let span = index.expression_span(&constraint.expression)?;
         constraints_by_owner
@@ -3714,13 +3786,16 @@ fn style_diagnostics(
             .or_default()
             .push((constraint, base, span));
     }
+    let mut exact_types = ProjectFlowTypeAnalyzer::new(index);
     for owner in constraints_by_owner
         .keys()
         .filter(|owner| !function_owners.contains(*owner))
     {
         validate_owner(
+            index,
             owner,
-            &BTreeMap::new(),
+            &[],
+            &mut exact_types,
             &constraints_by_owner,
             &mut diagnostics,
         );
@@ -3741,9 +3816,12 @@ fn style_diagnostics(
         if function_owners.contains(&owner) {
             continue;
         }
+        let mut frames = Vec::new();
         visit_call(
+            index,
             call,
-            &BTreeMap::new(),
+            &mut frames,
+            &mut exact_types,
             &index.all_calls,
             &calls_by_owner,
             &constraints_by_owner,
@@ -7138,6 +7216,32 @@ impl<'index, 'project> ProjectOrderAnalyzer<'index, 'project> {
         Some(input.expression.clone())
     }
 
+    fn call_formal_type(
+        &self,
+        call_expression: &StableOrderExpression,
+        name: &str,
+    ) -> Option<Type> {
+        let call = self.index.call(call_expression)?;
+        let input = call
+            .matched_inputs
+            .iter()
+            .find(|input| input.formal_name == name)?;
+        let contract = self
+            .index
+            .owners
+            .get(&call_expression.owner)?
+            .inference_abi
+            .callable(&call.function)?;
+        let formal = contract
+            .parameters
+            .iter()
+            .find(|parameter| parameter.ordinal == input.formal_ordinal)?;
+        Some(apply_checked_type_substitutions_once(
+            &formal.flow_type.ty,
+            &call.diagnostic.type_substitutions,
+        ))
+    }
+
     fn call_frame(
         &self,
         call_expression: &StableOrderExpression,
@@ -7796,18 +7900,24 @@ impl<'index, 'project> ProjectOrderAnalyzer<'index, 'project> {
         key: &StableOrderExpression,
         frames: &[ProjectOrderFrame],
     ) -> (ProjectOrderKey, ProjectOrderSemanticKey) {
+        // A call substitution crosses from the callee ABI namespace into the
+        // caller occurrence namespace. Resolve the key formal in that source
+        // namespace, then cross each enclosing user-call frame exactly once.
+        // Applying the ABI map to the already caller-owned key expression can
+        // capture an unrelated caller alpha that happens to reuse the same
+        // SCC-local ordinal (for example List/then_by item alpha 0 versus a
+        // local `item.name` alpha 0).
         let mut key_type = self
-            .index
-            .order_expression(key)
-            .map(|(_, _, _, expression)| expression.flow_type.ty.clone())
-            .unwrap_or(Type::Unknown);
-        if let Some(call) = self.index.call(call_expression) {
-            key_type =
-                apply_checked_type_substitutions(&key_type, &call.diagnostic.type_substitutions);
-        }
+            .call_formal_type(call_expression, "key")
+            .unwrap_or_else(|| {
+                self.index
+                    .order_expression(key)
+                    .map(|(_, _, _, expression)| expression.flow_type.ty.clone())
+                    .unwrap_or(Type::Unknown)
+            });
         for frame in frames.iter().rev() {
             if let Some(call) = self.index.call(&frame.call) {
-                key_type = apply_checked_type_substitutions(
+                key_type = apply_checked_type_substitutions_once(
                     &key_type,
                     &call.diagnostic.type_substitutions,
                 );

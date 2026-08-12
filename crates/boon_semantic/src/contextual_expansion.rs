@@ -1067,6 +1067,24 @@ fn refine_runtime_occurrence_type(existing: &Type, expected: &Type) -> Result<Ty
     Ok(refined)
 }
 
+fn refine_runtime_call_boundary_type(
+    existing: &Type,
+    formal_scheme: &Type,
+    instantiated_formal: &Type,
+) -> Result<Type, String> {
+    // A recursively closed call occurrence is provider authority. A generic
+    // parameter/result scheme can constrain its own variables, but an
+    // unrelated alpha with the same ordinal in an ancestor frame must not
+    // reinterpret that already-concrete occurrence. Closed schemes still take
+    // the strict compatibility path below.
+    if boon_checked::type_is_recursively_closed(existing)
+        && !boon_checked::type_is_recursively_closed(formal_scheme)
+    {
+        return Ok(existing.clone());
+    }
+    refine_runtime_occurrence_type(existing, instantiated_formal)
+}
+
 fn project_concrete_type(mut ty: Type, fields: &[String]) -> Option<Type> {
     for field in fields {
         ty = match ty {
@@ -1272,15 +1290,16 @@ fn semantic_callable_inventory(
                 })
                 .collect(),
             context_formal: callable.context_formal,
-            context_parameter: callable
-                .context_formal
-                .and_then(|formal| program.context_formal(formal))
-                .map(|formal| SemanticCallableContextParameter {
-                    id: semantic_parameter_id(id, callable.parameters.len()),
-                    formal: formal.id,
-                    name: "PASSED".to_owned(),
-                    flow_type: formal.scheme.flow_type.clone(),
-                }),
+            context_parameter: callable.context_formal.and_then(|formal| {
+                completed_context_formal_flow_type(program, formal).map(|flow_type| {
+                    SemanticCallableContextParameter {
+                        id: semantic_parameter_id(id, callable.parameters.len()),
+                        formal,
+                        name: "PASSED".to_owned(),
+                        flow_type,
+                    }
+                })
+            }),
             result: callable.result.clone(),
             role: callable.role,
             effect: callable.effect,
@@ -1291,6 +1310,76 @@ fn semantic_callable_inventory(
         });
     }
     Ok((callables, callable_ids))
+}
+
+fn context_projection_scaffold(fields: &[String], leaf: Type) -> Type {
+    let Some((field, remaining)) = fields.split_first() else {
+        return leaf;
+    };
+    Type::object(boon_checked::ObjectShape::from_ordered_fields(
+        [(field.clone(), context_projection_scaffold(remaining, leaf))],
+        true,
+    ))
+}
+
+fn add_missing_context_projection(ty: &Type, fields: &[String], leaf: Type) -> Type {
+    let Some((field, remaining)) = fields.split_first() else {
+        return ty.clone();
+    };
+    let Type::Object(shape) = ty else {
+        return context_projection_scaffold(fields, leaf);
+    };
+    let mut shape = shape.as_ref().clone();
+    if let Some(existing) = shape.fields.get(field).cloned() {
+        shape.fields.insert(
+            field.clone(),
+            add_missing_context_projection(&existing, remaining, leaf),
+        );
+    } else {
+        shape
+            .fields
+            .insert(field.clone(), context_projection_scaffold(remaining, leaf));
+        shape.field_order.push(field.clone());
+    }
+    Type::object(shape)
+}
+
+/// Dense compatibility assembly weaves child-owner expressions into one
+/// callable body, but the callable context interface intentionally contains
+/// only its owner-local sparse surface. Retained semantic definitions need the
+/// union of those exact body reads. Complete only missing paths here; existing
+/// scheme leaves keep their alpha correlation with parameters/results.
+fn completed_context_formal_flow_type(
+    program: &CheckedProgramFields,
+    formal: ContextFormalId,
+) -> Option<FlowType> {
+    let lookup = CheckedProgramLookup::new(program);
+    let formal = program.context_formal(formal)?;
+    let callable = program
+        .callables
+        .iter()
+        .find(|callable| callable.decl_id == formal.callable)?;
+    let mut flow_type = formal.scheme.flow_type.clone();
+    for expression in program.expressions.iter().filter(|expression| {
+        enclosing_function_owner(program, &lookup, expression.scope_id) == Some(callable.decl_id)
+            && matches!(
+                &expression.kind,
+                CheckedExpressionKind::Passed {
+                    formal: expression_formal,
+                    ..
+                } if *expression_formal == formal.id
+            )
+    }) {
+        let CheckedExpressionKind::Passed { projection, .. } = &expression.kind else {
+            unreachable!("filtered to PASSED expressions")
+        };
+        flow_type.ty = add_missing_context_projection(
+            &flow_type.ty,
+            projection,
+            erase_runtime_type_vars(&expression.flow_type.ty),
+        );
+    }
+    Some(flow_type)
 }
 
 fn semantic_call_inventory(
@@ -4031,6 +4120,49 @@ struct LocalProvenanceResolver<'a> {
 }
 
 impl<'a> LocalProvenanceResolver<'a> {
+    fn projected_declaration_dependency(
+        &self,
+        target: DeclId,
+        owner: Option<StaticOwnerId>,
+        projection: &[String],
+    ) -> Option<(SemanticExprId, usize)> {
+        let mut dependency = self
+            .declarations
+            .get(&(target, owner))
+            .or_else(|| self.declarations.get(&(target, None)))
+            .copied()?;
+        let mut consumed = 0;
+        while let Some(field_name) = projection.get(consumed) {
+            let Some(expression) = self
+                .expressions
+                .get(dependency.as_usize())
+                .filter(|candidate| candidate.id == dependency)
+            else {
+                break;
+            };
+            let fields = match &expression.kind {
+                SemanticExpressionKind::Object(fields)
+                | SemanticExpressionKind::TaggedObject { fields, .. } => fields,
+                _ => break,
+            };
+            if fields.iter().any(|field| field.spread) {
+                break;
+            }
+            let mut matching = fields
+                .iter()
+                .filter(|field| field.name.as_str() == field_name.as_str());
+            let Some(field) = matching.next() else {
+                break;
+            };
+            if matching.next().is_some() {
+                break;
+            }
+            dependency = field.value;
+            consumed += 1;
+        }
+        Some((dependency, consumed))
+    }
+
     fn resolve(
         &mut self,
         expression_id: SemanticExprId,
@@ -4053,8 +4185,34 @@ impl<'a> LocalProvenanceResolver<'a> {
                         continue;
                     }
                     if !visiting.insert(id) {
+                        const MAX_CYCLE_ENTRIES: usize = 32;
+                        let mut chain = visiting
+                            .iter()
+                            .chain(std::iter::once(&id))
+                            .take(MAX_CYCLE_ENTRIES)
+                            .filter_map(|expression| {
+                                self.expressions
+                                    .get(expression.as_usize())
+                                    .filter(|candidate| candidate.id == *expression)
+                                    .map(|definition| {
+                                        format!(
+                                            "{}(checked={},owner={:?})",
+                                            expression,
+                                            definition.checked_expr_id.0,
+                                            definition.owner,
+                                        )
+                                    })
+                            })
+                            .collect::<Vec<_>>();
+                        if visiting.len().saturating_add(1) > MAX_CYCLE_ENTRIES {
+                            chain.push(format!(
+                                "... {} more visiting expressions",
+                                visiting.len().saturating_add(1) - MAX_CYCLE_ENTRIES
+                            ));
+                        }
                         return Err(ExpansionError::InvalidLocalBindings(format!(
-                            "provenance cycle reaches expression {id}"
+                            "provenance cycle reaches expression {id}: {}",
+                            chain.join(" -> ")
                         )));
                     }
                     let expression = self
@@ -4094,12 +4252,14 @@ impl<'a> LocalProvenanceResolver<'a> {
                         SemanticExpressionKind::Block { result, .. }
                         | SemanticExpressionKind::Draining { input: result }
                         | SemanticExpressionKind::Project { input: result, .. } => vec![*result],
-                        SemanticExpressionKind::CanonicalRead { target, .. }
-                        | SemanticExpressionKind::Drain { target, .. } => self
-                            .declarations
-                            .get(&(*target, owner))
-                            .or_else(|| self.declarations.get(&(*target, None)))
-                            .copied()
+                        SemanticExpressionKind::CanonicalRead {
+                            target, projection, ..
+                        }
+                        | SemanticExpressionKind::Drain {
+                            target, projection, ..
+                        } => self
+                            .projected_declaration_dependency(*target, owner, projection)
+                            .map(|(value, _)| value)
                             .filter(|value| *value != id)
                             .into_iter()
                             .collect(),
@@ -4181,13 +4341,14 @@ impl<'a> LocalProvenanceResolver<'a> {
                         }
                         | SemanticExpressionKind::Drain {
                             target, projection, ..
-                        } => match self
-                            .declarations
-                            .get(&(target, owner))
-                            .or_else(|| self.declarations.get(&(target, None)))
-                            .copied()
-                        {
-                            Some(value) if value != id => cached(value)?.projected(&projection),
+                        } => match self.projected_declaration_dependency(
+                            target,
+                            owner,
+                            &projection,
+                        ) {
+                            Some((value, consumed)) if value != id => {
+                                cached(value)?.projected(&projection[consumed..])
+                            }
                             _ => expression.provenance,
                         },
                         SemanticExpressionKind::Latest { branches } => {
@@ -5573,34 +5734,38 @@ impl<'a> SemanticExpressionBuilder<'a> {
                                 );
                                 let existing =
                                     self.expressions[expanded.as_usize()].flow_type.ty.clone();
-                                let refined = refine_runtime_occurrence_type(&existing, &required)
-                                    .map_err(|error| {
-                                        let expanded = &self.expressions[expanded.as_usize()];
-                                        let checked_call = instance
-                                            .provenance
-                                            .call_id
-                                            .and_then(|call| self.lookup.call(self.program, call));
-                                        let checked_expression = self
-                                            .lookup
-                                            .expression(self.program, expanded.checked_expr_id);
-                                        ExpansionError::InvalidLocalBindings(format!(
-                                            "call frame {frame} {:?} function {:?} formal {} \
+                                let refined = refine_runtime_call_boundary_type(
+                                    &existing,
+                                    &parameter.flow_type.ty,
+                                    &required,
+                                )
+                                .map_err(|error| {
+                                    let expanded = &self.expressions[expanded.as_usize()];
+                                    let checked_call = instance
+                                        .provenance
+                                        .call_id
+                                        .and_then(|call| self.lookup.call(self.program, call));
+                                    let checked_expression = self
+                                        .lookup
+                                        .expression(self.program, expanded.checked_expr_id);
+                                    ExpansionError::InvalidLocalBindings(format!(
+                                        "call frame {frame} {:?} function {:?} formal {} \
                                                  `{}` scheme \
                                                  {:?} cannot refine expression {} checked {:?} \
                                                  checked definition {:?} kind {:?} flow {:?}: \
                                                  {error}",
-                                            instance.provenance,
-                                            checked_call.map(|call| call.function.as_str()),
-                                            target.0,
-                                            parameter.name,
-                                            parameter.flow_type,
-                                            expanded.id,
-                                            expanded.checked_expr_id,
-                                            checked_expression,
-                                            expanded.kind,
-                                            expanded.flow_type
-                                        ))
-                                    })?;
+                                        instance.provenance,
+                                        checked_call.map(|call| call.function.as_str()),
+                                        target.0,
+                                        parameter.name,
+                                        parameter.flow_type,
+                                        expanded.id,
+                                        expanded.checked_expr_id,
+                                        checked_expression,
+                                        expanded.kind,
+                                        expanded.flow_type
+                                    ))
+                                })?;
                                 let expanded = self.wrap_type_refinement(
                                     &expression,
                                     owner,
@@ -5664,11 +5829,10 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 }
                 if declaration.kind == boon_checked::CheckedDeclarationKind::Field
                     && declaration_is_function_local(self.program, declaration.scope_id)
-                    && !self
-                        .program
-                        .states
-                        .iter()
-                        .any(|state| state.declaration == declaration.id)
+                    && !self.program.states.iter().any(|state| {
+                        state.declaration == declaration.id
+                            || declaration.value == Some(state.expression)
+                    })
                     && !self
                         .program
                         .sources
@@ -5719,10 +5883,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                             found: formal,
                         });
                     }
-                    let mut flow_type = self
-                        .program
-                        .context_formal(formal)
-                        .map(|formal| formal.scheme.flow_type.clone())
+                    let mut flow_type = completed_context_formal_flow_type(self.program, formal)
                         .ok_or_else(|| {
                             ExpansionError::InvalidLocalBindings(format!(
                                 "ordinary callable {semantic_callable} has missing PASSED formal {}",
@@ -6140,8 +6301,9 @@ impl<'a> SemanticExpressionBuilder<'a> {
             // call-local result instead of leaving the callable's open
             // structural scheme on the shared body syntax.
             let existing_result = self.expressions[result.as_usize()].flow_type.clone();
-            let refined_result_type = refine_runtime_occurrence_type(
+            let refined_result_type = refine_runtime_call_boundary_type(
                 &existing_result.ty,
+                &callable.result.ty,
                 &concrete_result.ty,
             )
             .map_err(|error| {
@@ -6476,10 +6638,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
         formal: ContextFormalId,
         actual: SemanticExprId,
     ) -> Result<SemanticExprId, ExpansionError> {
-        let scheme = self
-            .program
-            .context_formal(formal)
-            .map(|formal| formal.scheme.flow_type.clone())
+        let scheme = completed_context_formal_flow_type(self.program, formal)
             .ok_or(ExpansionError::MissingPassedContext(origin.id))?;
         self.capture_ordinary_context_type(
             origin,
@@ -7517,6 +7676,106 @@ mod tests {
         materialization
     }
 
+    fn provenance_test_expression(
+        id: usize,
+        kind: SemanticExpressionKind,
+        provenance: SemanticValueProvenance,
+    ) -> SemanticExpression {
+        SemanticExpression {
+            id: SemanticExprId(id),
+            value_id: SemanticValueId(id),
+            checked_expr_id: CheckedExprId(id as u32),
+            flow_type: FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Text,
+            },
+            effect: boon_checked::CheckedEffectSummary::default(),
+            owner: None,
+            provenance,
+            resource_binding_path: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn projected_canonical_read_skips_unrelated_explicit_record_fields() {
+        let store = DeclId(41);
+        let selected_provenance = SemanticValueProvenance {
+            members: vec![SemanticValueMember {
+                path: Vec::new(),
+                origin: SemanticValueOrigin::Source {
+                    source: SemanticSourceId(7),
+                    owner: None,
+                },
+            }],
+        };
+        let expressions = vec![
+            provenance_test_expression(
+                0,
+                SemanticExpressionKind::Source {
+                    binding_path: "selected-source".to_owned(),
+                },
+                selected_provenance.clone(),
+            ),
+            provenance_test_expression(
+                1,
+                SemanticExpressionKind::Object(vec![SemanticRecordField {
+                    declaration: None,
+                    name: "leaf".to_owned(),
+                    value: SemanticExprId(0),
+                    spread: false,
+                }]),
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                2,
+                SemanticExpressionKind::CanonicalRead {
+                    target: store,
+                    path: "store".to_owned(),
+                    projection: vec!["selected".to_owned(), "leaf".to_owned()],
+                    source: None,
+                },
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                3,
+                SemanticExpressionKind::Object(vec![
+                    SemanticRecordField {
+                        declaration: None,
+                        name: "selected".to_owned(),
+                        value: SemanticExprId(1),
+                        spread: false,
+                    },
+                    SemanticRecordField {
+                        declaration: None,
+                        name: "recursive".to_owned(),
+                        value: SemanticExprId(2),
+                        spread: false,
+                    },
+                ]),
+                runtime_value_provenance(),
+            ),
+        ];
+        let mut resolver = LocalProvenanceResolver {
+            expressions: &expressions,
+            bindings: BTreeMap::new(),
+            declarations: BTreeMap::from([((store, None), SemanticExprId(3))]),
+            cache: BTreeMap::new(),
+        };
+
+        assert_eq!(
+            resolver
+                .resolve(SemanticExprId(2))
+                .expect("the exact projected read must not traverse its recursive sibling"),
+            selected_provenance
+        );
+        assert_eq!(
+            resolver.cache.keys().copied().collect::<Vec<_>>(),
+            [SemanticExprId(0), SemanticExprId(2)],
+            "provenance demand must skip both explicit record wrappers"
+        );
+    }
+
     #[test]
     fn runtime_occurrence_refinement_keeps_the_narrower_compatible_closed_type() {
         let narrow = Type::VariantSet(vec![boon_checked::Variant::Tag("Closed".to_owned())].into());
@@ -7539,6 +7798,130 @@ mod tests {
             narrow
         );
         assert!(refine_runtime_occurrence_type(&wide, &disjoint).is_err());
+    }
+
+    #[test]
+    fn closed_runtime_call_actual_is_authoritative_over_a_generic_formal_frame_collision() {
+        let actual = Type::VariantSet(
+            vec![
+                boon_checked::Variant::Tag("Dark".to_owned()),
+                boon_checked::Variant::Tag("Light".to_owned()),
+            ]
+            .into(),
+        );
+
+        assert_eq!(
+            refine_runtime_call_boundary_type(
+                &actual,
+                &Type::Var(boon_checked::TypeVar(0)),
+                &Type::Text,
+            )
+            .unwrap(),
+            actual,
+            "an unrelated instantiated alpha must not overwrite a closed argument occurrence",
+        );
+    }
+
+    #[test]
+    fn closed_runtime_call_formal_still_rejects_an_incompatible_closed_actual() {
+        let actual = Type::VariantSet(
+            vec![
+                boon_checked::Variant::Tag("Dark".to_owned()),
+                boon_checked::Variant::Tag("Light".to_owned()),
+            ]
+            .into(),
+        );
+
+        assert!(
+            refine_runtime_call_boundary_type(&actual, &Type::Text, &Type::Text).is_err(),
+            "a concrete formal remains a strict contract",
+        );
+    }
+
+    #[test]
+    fn retained_context_template_includes_missing_child_owned_passed_paths() {
+        let parsed = boon_parser::parse_source(
+            "semantic-retained-context-child.bn",
+            concat!(
+                "FUNCTION view(child_boundary) {\n",
+                "    [selected: PASSED.store.active_scope == TEXT { selected }]\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            !checked.report.has_errors(),
+            "diagnostics: {:#?}",
+            checked.report.diagnostics
+        );
+        let (mut program, _) = checked
+            .program
+            .expect("valid contextual callable")
+            .into_parts();
+        let callable = program
+            .callables
+            .iter()
+            .find(|callable| callable.name.ends_with("view"))
+            .expect("view callable");
+        let child_declaration = callable.parameters[0].decl_id;
+        let callable = callable.decl_id;
+        let formal = program
+            .callables
+            .iter()
+            .find(|candidate| candidate.decl_id == callable)
+            .and_then(|candidate| candidate.context_formal)
+            .expect("view PASSED formal");
+        let passed = program
+            .expressions
+            .iter()
+            .position(|expression| {
+                matches!(
+                    &expression.kind,
+                    CheckedExpressionKind::Passed {
+                        formal: expression_formal,
+                        projection,
+                        ..
+                    } if *expression_formal == formal
+                        && projection.as_slice() == ["store", "active_scope"]
+                )
+            })
+            .expect("child-owned PASSED expression");
+        program.expressions[passed].declaration = Some(child_declaration);
+        let lookup = CheckedProgramLookup::new(&program);
+        let passed = &program.expressions[passed];
+        assert_ne!(
+            passed.declaration,
+            Some(callable),
+            "the regression must cross a child record-field declaration",
+        );
+        assert_eq!(
+            enclosing_function_owner(&program, &lookup, passed.scope_id),
+            Some(callable),
+        );
+        program
+            .context_formals
+            .iter_mut()
+            .find(|candidate| candidate.id == formal)
+            .expect("view context scheme")
+            .scheme
+            .flow_type
+            .ty = Type::object(boon_checked::ObjectShape {
+            fields: BTreeMap::new(),
+            field_order: Vec::new(),
+            open: true,
+        });
+
+        let completed = completed_context_formal_flow_type(&program, formal)
+            .expect("completed retained context template");
+        assert!(
+            project_concrete_type(
+                completed.ty,
+                &["store".to_owned(), "active_scope".to_owned()],
+            )
+            .is_some(),
+            "the retained template must recover exact child-owned PASSED demand paths",
+        );
     }
 
     #[test]
@@ -7932,6 +8315,48 @@ FUNCTION selectable_row(row) {
             2,
             "each concrete SOURCE must bind its exact semantic declaration statement"
         );
+    }
+
+    #[test]
+    fn function_local_hold_update_reads_the_previous_state_without_recursive_expansion() {
+        let graph = semantic_graph(
+            r#"
+rows: LIST { [selected: False] }
+result:
+    rows
+    |> List/map(item, new: stateful_row(row: item))
+
+FUNCTION stateful_row(row) {
+    [
+        controls: [toggle: SOURCE]
+        selected:
+            row.selected |> HOLD selected {
+                controls.toggle |> THEN { selected }
+            }
+    ]
+}
+"#,
+        );
+
+        let state = graph.states.first().expect("one contextual HOLD state");
+        let expression = &graph.expressions[state.expression.as_usize()];
+        assert!(
+            matches!(
+                &expression.kind,
+                SemanticExpressionKind::Hold { updates, .. } if !updates.is_empty()
+            ),
+            "contextual HOLD did not retain its update branches: {expression:#?}",
+        );
+        assert!(graph.expressions.iter().any(|expression| {
+            matches!(
+                &expression.kind,
+                SemanticExpressionKind::CanonicalRead { target, .. }
+                    if graph
+                        .statements
+                        .iter()
+                        .any(|statement| statement.declaration == Some(*target))
+            )
+        }));
     }
 
     #[test]

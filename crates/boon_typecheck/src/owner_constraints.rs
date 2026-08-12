@@ -1745,6 +1745,25 @@ fn resolve_owner_constraint_seed_with_effective_resolutions_impl(
                     "owner lexical capture has no exact importing site",
                 ));
             }
+            if capture_sites.demand_paths.is_empty()
+                || capture_sites
+                    .demand_paths
+                    .windows(2)
+                    .any(|paths| paths[0] >= paths[1])
+                || capture_sites
+                    .demand_paths
+                    .iter()
+                    .enumerate()
+                    .any(|(index, path)| {
+                        capture_sites.demand_paths[..index]
+                            .iter()
+                            .any(|prefix| path.starts_with(prefix))
+                    })
+            {
+                return Err(OwnerConstraintSeedError::new(
+                    "owner lexical capture demand paths are empty, unsorted, duplicate, or not prefix-minimal",
+                ));
+            }
             let kind = if matches!(
                 capture,
                 OwnerLexicalTargetRef::Declaration {
@@ -1958,12 +1977,29 @@ fn declaration(
 pub fn project_owner_declaration_surface(
     input: &OwnerSyntaxInput,
 ) -> Result<OwnerDeclarationSurface, OwnerConstraintSeedError> {
-    let public = matches!(input.owner, StableCheckOwnerKey::Item(_))
+    let public = if let Some(statement) = matches!(input.owner, StableCheckOwnerKey::Item(_))
         .then(|| input.statements.first())
         .flatten()
-        .map(|statement| declaration(statement.id, true, &statement.kind))
-        .transpose()?
-        .flatten();
+    {
+        let owns_declaration = !matches!(
+            &statement.kind,
+            AstStatementKind::Hold {
+                field: None,
+                name: Some(_),
+            }
+        ) || matches!(
+            hold_alias_declaration_target(input, statement.id)?,
+            Some(OwnerLexicalDeclarationTarget::Statement {
+                statement: target,
+            }) if target == statement.id
+        );
+        owns_declaration
+            .then(|| declaration(statement.id, true, &statement.kind))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
     let fingerprint_v1 = fingerprint(
         OWNER_DECLARATION_SURFACE_DOMAIN_V1,
         &(stable_check_owner_key_fingerprint_v2(&input.owner), &public),
@@ -1983,6 +2019,84 @@ fn lexical_statement_name(kind: &AstStatementKind) -> Option<&str> {
         | AstStatementKind::List { field, .. } => field.as_deref(),
         AstStatementKind::Block | AstStatementKind::Spread | AstStatementKind::Expression => None,
     }
+}
+
+/// Return the declaration authority named by a HOLD update alias.
+///
+/// Field-bearing HOLD statements own their declaration. A fieldless HOLD
+/// instead reuses the nearest enclosing Field/HOLD declaration; when no such
+/// state owner exists before a different declaration boundary, the outermost
+/// fieldless HOLD in that lexical region owns one declaration for all nested
+/// updates. The same projection is consumed by lexical planning and checked
+/// row reservation so an alias can never point at a declaration the shard did
+/// not materialize.
+pub(crate) fn hold_alias_declaration_target(
+    input: &OwnerSyntaxInput,
+    statement: u32,
+) -> Result<Option<OwnerLexicalDeclarationTarget>, OwnerConstraintSeedError> {
+    let statement_input = input.statements.get(statement as usize).ok_or_else(|| {
+        OwnerConstraintSeedError::new("HOLD alias references a missing statement")
+    })?;
+    let AstStatementKind::Hold { field, name } = &statement_input.kind else {
+        return Ok(None);
+    };
+    if name.is_none() {
+        return Ok(None);
+    }
+    if field.is_some() {
+        return Ok(Some(OwnerLexicalDeclarationTarget::Statement {
+            statement: statement_input.id,
+        }));
+    }
+
+    let mut fieldless_hold = statement_input.id;
+    let mut parent = statement_input.parent;
+    let mut visited = BTreeSet::new();
+    while let Some(parent_id) = parent {
+        if !visited.insert(parent_id) {
+            return Err(OwnerConstraintSeedError::new(
+                "HOLD alias statement ancestry contains a cycle",
+            ));
+        }
+        let parent_input = input.statements.get(parent_id as usize).ok_or_else(|| {
+            OwnerConstraintSeedError::new("HOLD alias ancestry references a missing statement")
+        })?;
+        match &parent_input.kind {
+            AstStatementKind::Field { .. } | AstStatementKind::Hold { field: Some(_), .. } => {
+                return Ok(Some(OwnerLexicalDeclarationTarget::Statement {
+                    statement: parent_input.id,
+                }));
+            }
+            AstStatementKind::Hold {
+                field: None,
+                name: Some(_),
+            } => fieldless_hold = parent_input.id,
+            AstStatementKind::Function { .. }
+            | AstStatementKind::Source { field: Some(_), .. }
+            | AstStatementKind::List { field: Some(_), .. } => {
+                return Ok(Some(OwnerLexicalDeclarationTarget::Statement {
+                    statement: fieldless_hold,
+                }));
+            }
+            AstStatementKind::Source { field: None, .. }
+            | AstStatementKind::Hold {
+                field: None,
+                name: None,
+            }
+            | AstStatementKind::List { field: None, .. }
+            | AstStatementKind::Block
+            | AstStatementKind::Spread
+            | AstStatementKind::Expression => {}
+        }
+        parent = parent_input.parent;
+    }
+
+    Ok(Some(input.containing_hold_authority.clone().map_or(
+        OwnerLexicalDeclarationTarget::Statement {
+            statement: fieldless_hold,
+        },
+        |target| OwnerLexicalDeclarationTarget::Imported { target },
+    )))
 }
 
 fn lexical_pattern_names(pattern: &AstMatchPattern) -> Vec<String> {
@@ -2070,6 +2184,34 @@ fn lexical_record_fields(
     }
 }
 
+/// An explicit `PASS:` value is evaluated in the caller's lexical
+/// environment. Keep the record itself as a declaration-bearing object, but
+/// do not let its field declarations recursively shadow the expressions that
+/// construct that context. This is what makes the canonical
+/// `PASS: [store: store]` spelling forward the caller's `store` while ordinary
+/// records retain their whole-scope forward/self-reference semantics.
+pub(crate) fn caller_scoped_pass_record_expressions(input: &OwnerSyntaxInput) -> BTreeSet<u32> {
+    input
+        .expressions
+        .iter()
+        .filter_map(|expression| match &expression.kind {
+            AstExprKind::Call {
+                pass: Some(pass), ..
+            }
+            | AstExprKind::Pipe {
+                pass: Some(pass), ..
+            } => u32::try_from(pass.value).ok(),
+            _ => None,
+        })
+        .filter(|expression| {
+            input
+                .expressions
+                .get(*expression as usize)
+                .is_some_and(|expression| lexical_record_fields(expression).is_some())
+        })
+        .collect()
+}
+
 fn record_field_child_public_target(
     input: &OwnerSyntaxInput,
     value: usize,
@@ -2130,6 +2272,7 @@ fn assign_lexical_scope_regions(
     expression: OwnerExpressionId,
     inherited_scope: u32,
     boundaries: &BTreeMap<u32, u32>,
+    caller_scoped_pass_records: &BTreeSet<u32>,
     scopes: &mut [OwnerLexicalScopePlan],
     expression_scopes: &mut [u32],
     assigned: &mut [Option<u32>],
@@ -2174,14 +2317,20 @@ fn assign_lexical_scope_regions(
         ));
     }
     expression_scopes[index] = scope;
+    let child_scope = if caller_scoped_pass_records.contains(&expression.0) {
+        inherited_scope
+    } else {
+        scope
+    };
     for child in graph.expression_inputs(expression).unwrap_or_default() {
         match child {
             OwnerExpressionRef::Local { expression: child } => {
                 assign_lexical_scope_regions(
                     graph,
                     *child,
-                    scope,
+                    child_scope,
                     boundaries,
+                    caller_scoped_pass_records,
                     scopes,
                     expression_scopes,
                     assigned,
@@ -2298,6 +2447,101 @@ fn resolve_lexical_read_target(
         }
         scope = scopes[scope as usize].parent?;
     }
+}
+
+fn resolve_record_initializer_read_target(
+    root: &str,
+    origin_scope: u32,
+    initializer: Option<&OwnerLexicalDeclarationTarget>,
+    scopes: &[OwnerLexicalScopePlan],
+    declarations: &[BTreeMap<String, OwnerLexicalDeclarationTarget>],
+) -> Option<(OwnerLexicalDeclarationTarget, Option<u32>)> {
+    let resolved = resolve_lexical_read_target(root, origin_scope, scopes, declarations)?;
+    let Some(initializer) = initializer.filter(|initializer| initializer == &&resolved.0) else {
+        return Some(resolved);
+    };
+    let Some(parent) = scopes[origin_scope as usize].parent else {
+        return Some(resolved);
+    };
+    resolve_lexical_read_target(root, parent, scopes, declarations).or_else(|| {
+        // A record field with no outer authority remains a deliberate
+        // recursive/self reference. Only an existing enclosing declaration
+        // can supersede the initializer's own whole-scope declaration.
+        Some((initializer.clone(), resolved.1))
+    })
+}
+
+fn record_initializer_expression_targets(
+    input: &OwnerSyntaxInput,
+    graph: &crate::OwnerSyntaxGraph,
+    expression_scopes: &[u32],
+    record_fields: &[OwnerLexicalRecordFieldPlan],
+) -> Result<BTreeMap<(u32, u32), OwnerLexicalDeclarationTarget>, OwnerConstraintSeedError> {
+    let mut targets = BTreeMap::new();
+    for field in record_fields {
+        let fields =
+            lexical_record_fields(input.expressions.get(field.object as usize).ok_or_else(
+                || {
+                    OwnerConstraintSeedError::new(
+                        "owner lexical record field references a missing object expression",
+                    )
+                },
+            )?)
+            .ok_or_else(|| {
+                OwnerConstraintSeedError::new(
+                    "owner lexical record field references a non-record expression",
+                )
+            })?;
+        let value = fields
+            .get(field.ordinal as usize)
+            .ok_or_else(|| {
+                OwnerConstraintSeedError::new(
+                    "owner lexical record field ordinal exceeds its object fields",
+                )
+            })?
+            .value;
+        let target = OwnerLexicalDeclarationTarget::RecordField {
+            object: field.object,
+            ordinal: field.ordinal,
+            name: field.name.clone(),
+        };
+        let mut pending = vec![OwnerExpressionId(checked_u32(
+            value,
+            "owner record initializer expression",
+        )?)];
+        let mut visited = BTreeSet::new();
+        while let Some(expression) = pending.pop() {
+            if !visited.insert(expression) {
+                continue;
+            }
+            let index = expression.0 as usize;
+            if expression_scopes.get(index).copied() != Some(field.scope) {
+                continue;
+            }
+            match targets.entry((field.scope, expression.0)) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(target.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &target => {}
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(OwnerConstraintSeedError::new(
+                        "owner expression belongs to conflicting record field initializers",
+                    ));
+                }
+            }
+            pending.extend(
+                graph
+                    .expression_inputs(expression)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|input| match input {
+                        OwnerExpressionRef::Local { expression } => Some(expression),
+                        OwnerExpressionRef::Child { .. } => None,
+                    }),
+            );
+        }
+    }
+    Ok(targets)
 }
 
 fn containing_stable_scope(input: &OwnerSyntaxInput) -> Option<OwnerStableScopeRef> {
@@ -2864,6 +3108,7 @@ pub fn project_owner_lexical_plan(
     }
 
     let mut expression_boundaries = BTreeMap::new();
+    let caller_scoped_pass_records = caller_scoped_pass_record_expressions(input);
     let mut statement_record_scopes = BTreeMap::new();
     for (index, statement) in input.statements.iter().enumerate() {
         let Some(scope) = statement_body_scopes[index] else {
@@ -2938,6 +3183,7 @@ pub fn project_owner_lexical_plan(
             expression,
             inherited_scope,
             &expression_boundaries,
+            &caller_scoped_pass_records,
             &mut scopes,
             &mut expression_scopes,
             &mut scoped,
@@ -2956,6 +3202,7 @@ pub fn project_owner_lexical_plan(
             expression,
             inherited_scope,
             &expression_boundaries,
+            &caller_scoped_pass_records,
             &mut scopes,
             &mut expression_scopes,
             &mut scoped,
@@ -2978,14 +3225,14 @@ pub fn project_owner_lexical_plan(
             },
         )?;
     }
-    for (index, statement) in input.statements.iter().enumerate() {
+    for statement in &input.statements {
         let AstStatementKind::Hold {
             name: Some(name), ..
         } = &statement.kind
         else {
             continue;
         };
-        let Some(scope) = statement_body_scopes[index] else {
+        let Some(scope) = statement_body_scopes[statement.id as usize] else {
             continue;
         };
         // A HOLD's authored state name is an alias for the state declaration,
@@ -2996,9 +3243,9 @@ pub fn project_owner_lexical_plan(
             &mut declarations,
             scope,
             name.clone(),
-            OwnerLexicalDeclarationTarget::Statement {
-                statement: statement.id,
-            },
+            hold_alias_declaration_target(input, statement.id)?.ok_or_else(|| {
+                OwnerConstraintSeedError::new("HOLD update alias has no declaration authority")
+            })?,
         )?;
     }
     if let Some(statement) = input.statements.first()
@@ -3177,6 +3424,9 @@ pub fn project_owner_lexical_plan(
         }
     }
 
+    let record_initializer_targets =
+        record_initializer_expression_targets(input, &graph, &expression_scopes, &record_fields)?;
+
     let stable_scopes = stable_scope_projection(input, &scopes)?;
     let mut stable_targets = BTreeMap::new();
     let passed_target = OwnerLexicalDeclarationTarget::Passed;
@@ -3219,9 +3469,10 @@ pub fn project_owner_lexical_plan(
                 (lexical_access(expression), lexical_read_parts(expression))
                 && let Some((root, projection)) = parts.split_first()
             {
-                if let Some((target, declaration_scope)) = resolve_lexical_read_target(
+                if let Some((target, declaration_scope)) = resolve_record_initializer_read_target(
                     root,
                     expression_scopes[index],
+                    record_initializer_targets.get(&(expression_scopes[index], index as u32)),
                     &scopes,
                     &declarations,
                 ) {
@@ -3248,9 +3499,13 @@ pub fn project_owner_lexical_plan(
             external_candidates.insert(reference);
             continue;
         };
-        if let Some((target, declaration_scope)) =
-            resolve_lexical_read_target(root, expression_scopes[index], &scopes, &declarations)
-        {
+        if let Some((target, declaration_scope)) = resolve_record_initializer_read_target(
+            root,
+            expression_scopes[index],
+            record_initializer_targets.get(&(expression_scopes[index], index as u32)),
+            &scopes,
+            &declarations,
+        ) {
             reads[index] = Some(OwnerLexicalReadPlan {
                 target,
                 declaration_scope,
@@ -4449,6 +4704,59 @@ mod tests {
     }
 
     #[test]
+    fn non_owning_fieldless_hold_has_no_public_declaration_surface() {
+        let owning = link(concat!("0 |> HOLD state {\n", "    state + 1\n", "}\n",));
+        let owner = owner_named(&owning, "state");
+        let syntax =
+            project_owner_syntax_input(owning.owner_view_for_key(&owner).unwrap()).unwrap();
+        assert_eq!(
+            project_owner_declaration_surface(&syntax)
+                .unwrap()
+                .public()
+                .unwrap()
+                .names
+                .as_ref(),
+            ["state".to_owned()],
+            "an outermost fieldless HOLD remains its declaration authority"
+        );
+
+        let unit = link(concat!(
+            "container:\n",
+            "    0 |> HOLD outer {\n",
+            "        1 |> HOLD inner {\n",
+            "            inner + outer\n",
+            "        }\n",
+            "    }\n",
+            "copy: container.outer\n",
+        ));
+        let container = owner_named(&unit, "container");
+        let container =
+            project_owner_syntax_input(unit.owner_view_for_key(&container).unwrap()).unwrap();
+        assert_eq!(
+            project_owner_declaration_surface(&container)
+                .unwrap()
+                .public()
+                .unwrap()
+                .names
+                .as_ref(),
+            ["container".to_owned()]
+        );
+
+        for name in ["outer", "inner"] {
+            let owner = owner_named(&unit, name);
+            let syntax =
+                project_owner_syntax_input(unit.owner_view_for_key(&owner).unwrap()).unwrap();
+            assert!(
+                project_owner_declaration_surface(&syntax)
+                    .unwrap()
+                    .public()
+                    .is_none(),
+                "fieldless HOLD `{name}` must not advertise the enclosing declaration as its own public surface"
+            );
+        }
+    }
+
+    #[test]
     fn lexical_plan_predeclares_block_bindings_for_the_whole_scope() {
         let unit = link(concat!(
             "FUNCTION calculate(input) {\n",
@@ -4695,6 +5003,85 @@ mod tests {
                 .iter()
                 .all(|reference| reference.parts.as_ref() != ["base"]
                     && reference.parts.as_ref() != ["item"])
+        );
+    }
+
+    #[test]
+    fn record_self_initializer_uses_an_existing_outer_parameter() {
+        let unit = link(concat!(
+            "FUNCTION dimensions(width) {\n",
+            "    [width: width]\n",
+            "}\n",
+        ));
+        let owner = owner_named(&unit, "dimensions");
+        let syntax = project_owner_syntax_input(unit.owner_view_for_key(&owner).unwrap()).unwrap();
+        let plan = project_owner_lexical_plan(&syntax).unwrap();
+
+        let reads = syntax
+            .expressions
+            .iter()
+            .zip(plan.reads())
+            .filter_map(|(expression, read)| {
+                matches!(&expression.kind, AstExprKind::Identifier(name) if name == "width")
+                    .then_some(read.as_ref())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 1, "one width initializer read");
+        assert!(matches!(
+            reads[0].target,
+            OwnerLexicalDeclarationTarget::Parameter { ordinal: 0 }
+        ));
+    }
+
+    #[test]
+    fn explicit_pass_record_initializers_use_the_callers_lexical_scope() {
+        let unit = link(concat!(
+            "store: [count: 1]\n",
+            "FUNCTION read_count() {\n",
+            "    PASSED.store.count\n",
+            "}\n",
+            "value: read_count(PASS: [store: store])\n",
+        ));
+        let owner = owner_named(&unit, "value");
+        let syntax = project_owner_syntax_input(unit.owner_view_for_key(&owner).unwrap()).unwrap();
+        let plan = project_owner_lexical_plan(&syntax).unwrap();
+
+        let store_read = syntax
+            .expressions
+            .iter()
+            .zip(plan.reads())
+            .enumerate()
+            .find(|(_, (expression, _))| {
+                matches!(&expression.kind, AstExprKind::Identifier(name) if name == "store")
+            })
+            .expect("explicit PASS record must retain its store initializer");
+        assert!(
+            store_read.1.1.is_none(),
+            "the PASS initializer must not recursively read its own field: {:#?}",
+            store_read.1.1
+        );
+        assert!(plan.external_candidates().iter().any(|reference| {
+            reference.kind == OwnerReferenceKind::Value && reference.parts.as_ref() == ["store"]
+        }));
+
+        let pass_record = syntax
+            .expressions
+            .iter()
+            .enumerate()
+            .find(|(_, expression)| {
+                matches!(
+                    &expression.kind,
+                    AstExprKind::Object(fields)
+                        if fields.len() == 1 && fields[0].name == "store"
+                )
+            })
+            .map(|(index, _)| index)
+            .expect("explicit PASS record expression");
+        assert_ne!(
+            plan.expression_scopes()[pass_record],
+            plan.expression_scopes()[store_read.0],
+            "the context record owns declarations, while its initializer stays in the caller scope"
         );
     }
 

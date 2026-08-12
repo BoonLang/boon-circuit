@@ -1456,6 +1456,23 @@ pub fn apply_checked_type_substitutions(
     substitute_checked_type_from_lookup(ty, substitutions)
 }
 
+/// Applies one substitution frame without reinterpreting replacement values
+/// in the frame's key namespace.
+///
+/// Checked call substitutions cross two independently alpha-normalized
+/// namespaces: keys belong to the callee scheme, while values already belong
+/// to the caller frame. Recursively looking replacement values up in the same
+/// map can therefore capture an unrelated caller variable with the same
+/// ordinal. Use this operation when crossing exactly one such frame; use
+/// [`apply_checked_type_substitutions`] for a transitive environment whose
+/// keys and values deliberately share one namespace.
+pub fn apply_checked_type_substitutions_once(
+    ty: &Type,
+    substitutions: &[CheckedTypeSubstitution],
+) -> Type {
+    substitute_checked_type_from_lookup_once(ty, substitutions)
+}
+
 /// Applies a checked type environment without copying it into the serialized
 /// call-substitution representation.
 pub fn apply_checked_type_environment(ty: &Type, substitutions: &BTreeMap<TypeVar, Type>) -> Type {
@@ -1470,17 +1487,33 @@ pub fn apply_checked_type_substitution_lookup(
     substitute_checked_type_from_lookup(ty, substitutions)
 }
 
+/// Lookup-backed form of [`apply_checked_type_substitutions_once`].
+pub fn apply_checked_type_substitution_lookup_once(
+    ty: &Type,
+    substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
+) -> Type {
+    substitute_checked_type_from_lookup_once(ty, substitutions)
+}
+
 fn substitute_checked_type_from_lookup(
     ty: &Type,
     substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
 ) -> Type {
-    substitute_checked_type_inner(ty, substitutions, &mut SmallVec::new()).0
+    substitute_checked_type_inner(ty, substitutions, &mut SmallVec::new(), true).0
+}
+
+fn substitute_checked_type_from_lookup_once(
+    ty: &Type,
+    substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
+) -> Type {
+    substitute_checked_type_inner(ty, substitutions, &mut SmallVec::new(), false).0
 }
 
 fn substitute_checked_type_inner(
     ty: &Type,
     substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
     active: &mut SmallVec<[TypeVar; 8]>,
+    recurse_replacements: bool,
 ) -> (Type, bool) {
     match ty {
         Type::Var(variable) => {
@@ -1490,18 +1523,28 @@ fn substitute_checked_type_inner(
             else {
                 return (ty.clone(), false);
             };
+            if !recurse_replacements {
+                return (replacement.clone(), true);
+            }
             if active.contains(variable) {
                 return (ty.clone(), false);
             }
             active.push(*variable);
-            let substituted = substitute_checked_type_inner(replacement, substitutions, active).0;
+            let substituted = substitute_checked_type_inner(
+                replacement,
+                substitutions,
+                active,
+                recurse_replacements,
+            )
+            .0;
             let removed = active.pop();
             debug_assert_eq!(removed, Some(*variable));
             let changed = substituted != *ty;
             (substituted, changed)
         }
         Type::List(item) => {
-            let (substituted, changed) = substitute_checked_type_inner(item, substitutions, active);
+            let (substituted, changed) =
+                substitute_checked_type_inner(item, substitutions, active, recurse_replacements);
             if changed {
                 (Type::List(Type::shared(substituted)), true)
             } else {
@@ -1509,9 +1552,10 @@ fn substitute_checked_type_inner(
             }
         }
         Type::Map { key, value } => {
-            let (key, key_changed) = substitute_checked_type_inner(key, substitutions, active);
+            let (key, key_changed) =
+                substitute_checked_type_inner(key, substitutions, active, recurse_replacements);
             let (value, value_changed) =
-                substitute_checked_type_inner(value, substitutions, active);
+                substitute_checked_type_inner(value, substitutions, active, recurse_replacements);
             if key_changed || value_changed {
                 (
                     Type::Map {
@@ -1525,7 +1569,8 @@ fn substitute_checked_type_inner(
             }
         }
         Type::Set(item) => {
-            let (substituted, changed) = substitute_checked_type_inner(item, substitutions, active);
+            let (substituted, changed) =
+                substitute_checked_type_inner(item, substitutions, active, recurse_replacements);
             if changed {
                 (Type::Set(Type::shared(substituted)), true)
             } else {
@@ -1533,9 +1578,14 @@ fn substitute_checked_type_inner(
             }
         }
         Type::Function { args, result } => {
-            let substituted_args = substitute_checked_type_sequence(args, substitutions, active);
-            let (result_ty, result_changed) =
-                substitute_checked_type_inner(&result.ty, substitutions, active);
+            let substituted_args =
+                substitute_checked_type_sequence(args, substitutions, active, recurse_replacements);
+            let (result_ty, result_changed) = substitute_checked_type_inner(
+                &result.ty,
+                substitutions,
+                active,
+                recurse_replacements,
+            );
             if substituted_args.is_some() || result_changed {
                 (
                     Type::Function {
@@ -1552,7 +1602,9 @@ fn substitute_checked_type_inner(
             }
         }
         Type::Object(shape) => {
-            if let Some(shape) = substitute_checked_object_shape(shape, substitutions, active) {
+            if let Some(shape) =
+                substitute_checked_object_shape(shape, substitutions, active, recurse_replacements)
+            {
                 (Type::Object(shape), true)
             } else {
                 (ty.clone(), false)
@@ -1567,8 +1619,12 @@ fn substitute_checked_type_inner(
                     }
                     continue;
                 };
-                if let Some(fields) = substitute_checked_object_shape(fields, substitutions, active)
-                {
+                if let Some(fields) = substitute_checked_object_shape(
+                    fields,
+                    substitutions,
+                    active,
+                    recurse_replacements,
+                ) {
                     let changed = changed.get_or_insert_with(|| variants[..index].to_vec());
                     changed.push(Variant::Tagged {
                         tag: tag.clone(),
@@ -1585,8 +1641,12 @@ fn substitute_checked_type_inner(
             }
         }
         Type::Union(members) => {
-            if let Some(members) = substitute_checked_type_sequence(members, substitutions, active)
-            {
+            if let Some(members) = substitute_checked_type_sequence(
+                members,
+                substitutions,
+                active,
+                recurse_replacements,
+            ) {
                 (Type::Union(members), true)
             } else {
                 (ty.clone(), false)
@@ -1607,10 +1667,12 @@ fn substitute_checked_type_sequence(
     types: &[Type],
     substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
     active: &mut SmallVec<[TypeVar; 8]>,
+    recurse_replacements: bool,
 ) -> Option<Vec<Type>> {
     let mut changed = None::<Vec<Type>>;
     for (index, ty) in types.iter().enumerate() {
-        let (substituted, item_changed) = substitute_checked_type_inner(ty, substitutions, active);
+        let (substituted, item_changed) =
+            substitute_checked_type_inner(ty, substitutions, active, recurse_replacements);
         if item_changed {
             let changed = changed.get_or_insert_with(|| types[..index].to_vec());
             changed.push(substituted);
@@ -1625,10 +1687,12 @@ fn substitute_checked_object_shape(
     shape: &SharedObjectShape,
     substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
     active: &mut SmallVec<[TypeVar; 8]>,
+    recurse_replacements: bool,
 ) -> Option<SharedObjectShape> {
     let mut changed = None::<BTreeMap<String, Type>>;
     for (name, ty) in &shape.fields {
-        let (substituted, field_changed) = substitute_checked_type_inner(ty, substitutions, active);
+        let (substituted, field_changed) =
+            substitute_checked_type_inner(ty, substitutions, active, recurse_replacements);
         if field_changed {
             changed
                 .get_or_insert_with(|| shape.fields.clone())
@@ -2519,6 +2583,16 @@ pub fn specialize_checked_call_result(instantiated: &Type, occurrence: &Type) ->
     if type_is_recursively_closed(instantiated) {
         return instantiated.clone();
     }
+    if type_is_recursively_closed(occurrence) {
+        // The checked call occurrence has already solved this generic result
+        // against its exact arguments/context. In particular, a contextual
+        // empty collection can leave the definition principal as
+        // `Union<List<Concrete>, List<alpha>>` while the occurrence is the
+        // exact concrete list. Once that occurrence is recursively closed it
+        // is strictly more informative than the still-generic principal, even
+        // when their outer constructors differ.
+        return occurrence.clone();
+    }
     match (instantiated, occurrence) {
         (Type::List(instantiated), Type::List(occurrence)) => Type::List(Type::shared(
             specialize_checked_call_result(instantiated, occurrence),
@@ -2836,6 +2910,7 @@ pub fn widen_structural_type(left: &Type, right: &Type) -> Type {
                 open,
             })
         }
+        (left, right) if left == right => left.clone(),
         _ => open_object_type(),
     }
 }
@@ -3073,6 +3148,33 @@ mod tests {
     }
 
     #[test]
+    fn one_layer_substitution_does_not_capture_caller_variables_by_ordinal() {
+        let substitutions = [
+            CheckedTypeSubstitution {
+                variable: TypeVar(0),
+                value: object([("row", Type::Text)], false),
+            },
+            CheckedTypeSubstitution {
+                variable: TypeVar(2),
+                value: Type::Var(TypeVar(0)),
+            },
+        ];
+
+        assert_eq!(
+            apply_checked_type_substitutions_once(
+                &Type::List(Type::shared(Type::Var(TypeVar(2)))),
+                &substitutions,
+            ),
+            Type::List(Type::shared(Type::Var(TypeVar(0))))
+        );
+        assert_eq!(
+            apply_checked_type_substitutions(&Type::Var(TypeVar(2)), &substitutions),
+            object([("row", Type::Text)], false),
+            "transitive same-namespace environments retain their existing semantics"
+        );
+    }
+
+    #[test]
     fn checked_contract_classification_matches_language_contracts() {
         assert!(is_registered_render_constructor("Document/new"));
         assert!(is_registered_render_constructor("Scene/Element/text"));
@@ -3142,6 +3244,20 @@ mod tests {
     }
 
     #[test]
+    fn checked_call_specialization_prefers_a_closed_occurrence_over_a_generic_union() {
+        let principal = Type::Union(vec![
+            Type::List(Type::shared(Type::Text)),
+            Type::List(Type::shared(Type::Var(TypeVar(0)))),
+        ]);
+        let occurrence = Type::List(Type::shared(Type::Text));
+
+        assert_eq!(
+            specialize_checked_call_result(&principal, &occurrence),
+            occurrence,
+        );
+    }
+
+    #[test]
     fn canonical_union_is_order_independent_and_merges_variant_domains() {
         let candidates = vec![
             Type::VariantSet(vec![tag("True")].into()),
@@ -3159,5 +3275,51 @@ mod tests {
         };
         assert!(members.contains(&Type::Number));
         assert!(members.contains(&Type::VariantSet(vec![tag("False"), tag("True")].into())));
+    }
+
+    #[test]
+    fn structural_widening_preserves_equal_nested_types_while_canonicalizing_variants() {
+        let payload = canonical_union_type(vec![Type::Text, Type::Number]);
+        let found = Variant::tagged(
+            "Found".to_owned(),
+            ObjectShape::from_ordered_fields([("value".to_owned(), payload.clone())], false),
+        );
+        let left = Type::VariantSet(vec![found.clone(), tag("NotFound")].into());
+        let right = Type::VariantSet(vec![tag("NotFound"), found].into());
+
+        let widened = widen_structural_type(&left, &right);
+        let Type::VariantSet(variants) = widened else {
+            panic!("equal variant domains must remain a variant set");
+        };
+        let Some(Variant::Tagged { fields, .. }) = variants
+            .iter()
+            .find(|variant| matches!(variant, Variant::Tagged { tag, .. } if tag == "Found"))
+        else {
+            panic!("widened variant domain must retain Found");
+        };
+        assert_eq!(fields.fields.get("value"), Some(&payload));
+
+        let set = Type::Set(Type::shared(Type::Number));
+        assert_eq!(widen_structural_type(&set, &set), set);
+
+        let noncanonical_variants = Type::VariantSet(vec![tag("Zulu"), tag("Alpha")].into());
+        assert_eq!(
+            widen_structural_type(&noncanonical_variants, &noncanonical_variants),
+            Type::VariantSet(vec![tag("Alpha"), tag("Zulu")].into()),
+        );
+
+        let incomplete_object = Type::object(ObjectShape {
+            fields: BTreeMap::from([
+                ("first".to_owned(), Type::Number),
+                ("second".to_owned(), Type::Text),
+            ]),
+            field_order: vec!["first".to_owned()],
+            open: false,
+        });
+        let Type::Object(completed) = widen_structural_type(&incomplete_object, &incomplete_object)
+        else {
+            panic!("equal objects must remain objects");
+        };
+        assert_eq!(completed.field_order, ["first", "second"]);
     }
 }

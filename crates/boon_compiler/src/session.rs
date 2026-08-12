@@ -31,7 +31,7 @@ use boon_typecheck::{
     OwnerConstructionAbiEnvironment, OwnerConstructionCallableAbiLookup,
     OwnerConstructionValueAbiLookup, OwnerDeclarationKind, OwnerDeclarationSurface,
     OwnerDiagnosticReplayFacts, OwnerDiagnosticReplayFactsEvaluation, OwnerDiagnosticsAggregate,
-    OwnerInferenceAbiEnvironment, OwnerInterfaceScc, OwnerInterfaceSccEvaluation,
+    OwnerInferenceAbiEnvironment, OwnerInterfaceScc, OwnerInterfaceSccCurrentnessReceipt,
     OwnerInterfaceSccKey, OwnerInterfaceSccResult, OwnerInterfaceTopology,
     OwnerInterfaceTransferModule, OwnerLexicalPlan, OwnerParameterRequirementKey,
     OwnerParameterRequirementLookup, OwnerReferenceKind, OwnerSourceMap,
@@ -42,14 +42,16 @@ use boon_typecheck::{
     assemble_checked_owner_project, build_checked_owner_shard, build_owner_callable_scope_topology,
     build_owner_interface_topology, evaluate_owner_body_with_signature_plan,
     evaluate_owner_callable_scope_scc, evaluate_owner_diagnostic_replay_facts,
-    evaluate_owner_interface_scc_with_signature_scopes, evaluate_source_unit_project_diagnostics,
-    owner_interface_transfer_dependency_owners, project_diagnostic_facts,
-    project_output_flow_facts, project_owner_abi_environment,
+    evaluate_owner_interface_scc_component, evaluate_source_unit_project_diagnostics,
+    project_diagnostic_facts, project_output_flow_facts, project_owner_abi_environment,
     project_owner_callable_resolution_plan, project_owner_constraint_seed_with_lexical_plan,
-    project_owner_declaration_surface, project_owner_interface_transfer_module,
-    project_owner_lexical_plan, project_owner_source_map, project_owner_syntax_input,
-    project_source_unit_owner_diagnostics, resolve_owner_constraint_seed_with_signature_plan,
-    stable_check_owner_key_fingerprint_v2,
+    project_owner_declaration_surface, project_owner_lexical_plan, project_owner_source_map,
+    project_owner_syntax_input, project_source_unit_owner_diagnostics,
+    resolve_owner_constraint_seed_with_signature_plan, stable_check_owner_key_fingerprint_v2,
+};
+#[cfg(test)]
+use boon_typecheck::{
+    owner_interface_transfer_dependency_owners, project_owner_interface_transfer_module,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -485,7 +487,7 @@ impl RequestFamily for OwnerInputRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerSyntaxInput>;
 
-    const NAME: &'static str = "boon.compiler.owner-input.v2";
+    const NAME: &'static str = "boon.compiler.owner-input.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -827,7 +829,7 @@ impl RequestFamily for OwnerCallableScopeSccEvaluationRequest {
     type Key = OwnerCallableScopeSccKey;
     type Value = Arc<OwnerCallableScopeSccEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-callable-scope-scc-evaluation.v2";
+    const NAME: &'static str = "boon.compiler.owner-callable-scope-scc-evaluation.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerCallableScopeSccPlanRequest::key_fingerprint(key)
@@ -846,7 +848,7 @@ impl RequestFamily for OwnerCallableScopeSccRequest {
     type Key = OwnerCallableScopeSccKey;
     type Value = Arc<OwnerCallableScopeSccResult>;
 
-    const NAME: &'static str = "boon.compiler.owner-callable-scope-scc-result.v2";
+    const NAME: &'static str = "boon.compiler.owner-callable-scope-scc-result.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerCallableScopeSccPlanRequest::key_fingerprint(key)
@@ -1204,11 +1206,23 @@ impl RequestFamily for OwnerInterfaceSccPlanRequest {
 
 struct OwnerInterfaceSccEvaluationRequest;
 
+/// Exact component transaction result. The semantic public-interface and
+/// prepared-transfer projections retain independent fingerprints, while this
+/// root seals that they were produced from one current input transaction.
+#[derive(Clone, Debug)]
+struct OwnerInterfaceComponentEvaluation {
+    #[cfg_attr(not(test), allow(dead_code))]
+    currentness: OwnerInterfaceSccCurrentnessReceipt,
+    result: Arc<OwnerInterfaceSccResult>,
+    module: Arc<OwnerInterfaceTransferModule>,
+    fingerprint_v1: [u8; 32],
+}
+
 impl RequestFamily for OwnerInterfaceSccEvaluationRequest {
     type Key = OwnerInterfaceSccKey;
-    type Value = Arc<OwnerInterfaceSccEvaluation>;
+    type Value = Arc<OwnerInterfaceComponentEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v6";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v8";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1217,7 +1231,7 @@ impl RequestFamily for OwnerInterfaceSccEvaluationRequest {
     fn output_fingerprint(
         value: &Self::Value,
     ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
-        Ok(RequestOutputFingerprint(value.currentness.fingerprint_v1()))
+        Ok(RequestOutputFingerprint(value.fingerprint_v1))
     }
 }
 
@@ -1227,7 +1241,7 @@ impl RequestFamily for OwnerInterfaceSccRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceSccResult>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v5";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v6";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1246,7 +1260,7 @@ impl RequestFamily for OwnerInterfaceTransferModuleRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceTransferModule>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-transfer-module.v1";
+    const NAME: &'static str = "boon.compiler.owner-interface-transfer-module.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1301,7 +1315,7 @@ impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v10";
+    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v11";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -1320,7 +1334,7 @@ impl RequestFamily for OwnerBodyInferenceRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceShard>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference.v7";
+    const NAME: &'static str = "boon.compiler.owner-body-inference.v8";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -1512,7 +1526,7 @@ impl RequestFamily for ProjectDiagnosticFactsRequest {
     type Key = ProjectDiagnosticFactsKey;
     type Value = Arc<ProjectDiagnosticFacts>;
 
-    const NAME: &'static str = "boon.compiler.project-diagnostic-facts.v13";
+    const NAME: &'static str = "boon.compiler.project-diagnostic-facts.v14";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -2863,7 +2877,7 @@ fn evaluate_owner_body_requests(
         })?;
 
     let owner_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-input-dependencies.v2\0",
+        b"boon.compiler.owner-input-dependencies.v3\0",
         std::iter::empty(),
     ));
     let source_map_input = RequestInputFingerprint(request_fingerprint(
@@ -4129,11 +4143,11 @@ fn evaluate_owner_callable_scope_requests(
     trace.checkpoint("callable-scope-plans", topology.sccs.len());
 
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-callable-scope-scc-evaluation-dependencies.v2\0",
+        b"boon.compiler.owner-callable-scope-scc-evaluation-dependencies.v3\0",
         std::iter::empty(),
     ));
     let result_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-callable-scope-scc-result-projection-dependencies.v2\0",
+        b"boon.compiler.owner-callable-scope-scc-result-projection-dependencies.v3\0",
         std::iter::empty(),
     ));
     for expected in &topology.sccs {
@@ -4812,15 +4826,15 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
     trace.checkpoint("interface-scc-plans", topology.sccs.len());
 
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v6\0",
+        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v8\0",
         std::iter::empty(),
     ));
     let result_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-result-projection-dependencies.v4\0",
+        b"boon.compiler.owner-interface-scc-result-projection-dependencies.v5\0",
         std::iter::empty(),
     ));
     let transfer_module_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-transfer-module-dependencies.v1\0",
+        b"boon.compiler.owner-interface-transfer-module-dependencies.v2\0",
         std::iter::empty(),
     ));
     for expected in &topology.sccs {
@@ -4919,14 +4933,80 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                         })
                         .collect::<CompilerResult<Vec<_>>>()?;
                     let solve_started = Instant::now();
-                    let evaluation = evaluate_owner_interface_scc_with_signature_scopes(
+                    let mut resolved_transfer_modules =
+                        BTreeMap::<OwnerInterfaceSccKey, Arc<OwnerInterfaceTransferModule>>::new();
+                    let component = evaluate_owner_interface_scc_component(
                         &plan,
                         &abi,
                         seeds.iter().map(Arc::as_ref),
                         summaries.iter().map(Arc::as_ref),
                         dependencies.iter().map(Arc::as_ref),
-                        signature_scopes,
+                        signature_scopes.iter().copied(),
+                        |owners| {
+                            let mut modules = BTreeMap::<
+                                OwnerInterfaceSccKey,
+                                Arc<OwnerInterfaceTransferModule>,
+                            >::new();
+                            for owner in owners {
+                                let provider = Arc::clone(
+                                    state
+                                        .owner_interface_provider_requests
+                                        .require(&state.syntax_evaluator, &mut ticket, owner)
+                                        .map_err(|error| error.to_string())?,
+                                );
+                                if provider.key() == &expected.key {
+                                    return Err(format!(
+                                        "interface component {:?} classified own member {owner:?} as an external transfer dependency",
+                                        expected.key
+                                    ));
+                                }
+                                let module = Arc::clone(
+                                    state
+                                        .owner_interface_transfer_module_requests
+                                        .require(
+                                            &state.syntax_evaluator,
+                                            &mut ticket,
+                                            provider.key(),
+                                        )
+                                        .map_err(|error| error.to_string())?,
+                                );
+                                match modules.entry(provider.key().clone()) {
+                                    std::collections::btree_map::Entry::Vacant(entry) => {
+                                        entry.insert(Arc::clone(&module));
+                                    }
+                                    std::collections::btree_map::Entry::Occupied(entry)
+                                        if entry.get().fingerprint_v1()
+                                            == module.fingerprint_v1() => {}
+                                    std::collections::btree_map::Entry::Occupied(_) => {
+                                        return Err(format!(
+                                            "interface component {:?} observed conflicting transfer dependency versions for {:?}",
+                                            expected.key,
+                                            provider.key()
+                                        ));
+                                    }
+                                }
+                                match resolved_transfer_modules.entry(provider.key().clone()) {
+                                    std::collections::btree_map::Entry::Vacant(entry) => {
+                                        entry.insert(module);
+                                    }
+                                    std::collections::btree_map::Entry::Occupied(entry)
+                                        if entry.get().fingerprint_v1()
+                                            == module.fingerprint_v1() => {}
+                                    std::collections::btree_map::Entry::Occupied(_) => {
+                                        return Err(format!(
+                                            "interface component {:?} retained conflicting transfer dependency versions for {:?}",
+                                            expected.key,
+                                            provider.key()
+                                        ));
+                                    }
+                                }
+                            }
+                            Ok(modules.into_values().collect())
+                        },
                     )?;
+                    let evaluation = component.evaluation;
+                    let module = component.module;
+                    let iterations = component.transfer_iterations;
                     let solve_ms = solve_started.elapsed().as_secs_f64() * 1_000.0;
                     if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && solve_ms >= 10.0 {
                         let members = plan.key.members.iter().collect::<BTreeSet<_>>();
@@ -4939,16 +5019,34 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                             *internal_edge_kinds.entry(edge.kind).or_insert(0usize) += 1;
                         }
                         eprintln!(
-                            "boon owner interface scc members={} dependencies={} rounds={} expressions={} unifications={} internal_edges={internal_edge_kinds:?} sample_members={:?} solve_ms={solve_ms:.3}",
+                            "boon owner interface scc members={} dependencies={} residual_iterations={} rounds={} expressions={} unifications={} internal_edges={internal_edge_kinds:?} sample_members={:?} solve_ms={solve_ms:.3}",
                             plan.key.members.len(),
                             plan.dependencies.len(),
+                            iterations,
                             evaluation.result.work.solve_rounds,
                             evaluation.result.work.expressions,
                             evaluation.result.work.unification_steps,
                             plan.key.members.iter().take(8).collect::<Vec<_>>(),
                         );
                     }
-                    Ok(Arc::new(evaluation))
+                    let currentness_fingerprint = evaluation.currentness.fingerprint_v1();
+                    let module_fingerprint = module.fingerprint_v1();
+                    let mut component_inputs = vec![currentness_fingerprint, module_fingerprint];
+                    component_inputs.extend(
+                        resolved_transfer_modules
+                            .values()
+                            .map(|dependency| dependency.fingerprint_v1()),
+                    );
+                    let fingerprint_v1 = request_fingerprint(
+                        b"boon.compiler.owner-interface-component-evaluation.v2\0",
+                        component_inputs.iter().map(<[u8; 32]>::as_slice),
+                    );
+                    Ok(Arc::new(OwnerInterfaceComponentEvaluation {
+                        currentness: evaluation.currentness,
+                        result: evaluation.result,
+                        module,
+                        fingerprint_v1,
+                    }))
                 })();
                 let evaluation = match evaluation {
                     Ok(evaluation) => evaluation,
@@ -5009,52 +5107,12 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
             RequestStart::Reused => {}
             RequestStart::Execute(mut ticket) => {
                 let module = (|| -> CompilerResult<_> {
-                    let plan = Arc::clone(state.owner_interface_scc_plan_requests.require(
+                    let evaluation = state.owner_interface_scc_evaluation_requests.require(
                         &state.syntax_evaluator,
                         &mut ticket,
                         &expected.key,
-                    )?);
-                    let result = Arc::clone(state.owner_interface_scc_requests.require(
-                        &state.syntax_evaluator,
-                        &mut ticket,
-                        &expected.key,
-                    )?);
-                    let mut dependencies = BTreeMap::new();
-                    for dependency_owner in owner_interface_transfer_dependency_owners(&result) {
-                        let provider =
-                            Arc::clone(state.owner_interface_provider_requests.require(
-                                &state.syntax_evaluator,
-                                &mut ticket,
-                                &dependency_owner,
-                            )?);
-                        if provider.key() == &expected.key {
-                            return Err(session_error(format!(
-                                "interface transfer module {:?} classified own member {dependency_owner:?} as an external dependency",
-                                expected.key
-                            )));
-                        }
-                        let dependency =
-                            Arc::clone(state.owner_interface_transfer_module_requests.require(
-                                &state.syntax_evaluator,
-                                &mut ticket,
-                                provider.key(),
-                            )?);
-                        if let Some(previous) =
-                            dependencies.insert(provider.key().clone(), Arc::clone(&dependency))
-                            && previous.fingerprint_v1() != dependency.fingerprint_v1()
-                        {
-                            return Err(session_error(format!(
-                                "interface transfer module {:?} observed conflicting dependency versions for {:?}",
-                                expected.key,
-                                provider.key()
-                            )));
-                        }
-                    }
-                    Ok(Arc::new(project_owner_interface_transfer_module(
-                        &plan,
-                        result,
-                        dependencies.into_values(),
-                    )?))
+                    )?;
+                    Ok(Arc::clone(&evaluation.module))
                 })();
                 let module = match module {
                     Ok(module) => module,
@@ -5100,7 +5158,7 @@ fn evaluate_owner_body_inference_requests(
         .flat_map(|scc| scc.key.members.iter().cloned())
         .collect::<Vec<_>>();
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-body-inference-evaluation-dependencies.v10\0",
+        b"boon.compiler.owner-body-inference-evaluation-dependencies.v11\0",
         std::iter::empty(),
     ));
     let mut planning_ms = 0.0;
@@ -5253,7 +5311,7 @@ fn evaluate_owner_body_inference_requests(
         result_transfer_edges =
             result_transfer_edges.saturating_add(body_work.interface_plan_transfer_edges);
         let result_input = RequestInputFingerprint(request_fingerprint(
-            b"boon.compiler.owner-body-inference-result-projection-dependencies.v6\0",
+            b"boon.compiler.owner-body-inference-result-projection-dependencies.v7\0",
             std::iter::empty(),
         ));
         match state.owner_body_inference_requests.begin(
@@ -5482,7 +5540,7 @@ fn evaluate_project_diagnostic_facts_request(
         .collect::<Vec<_>>();
     let source_digest = project.source_bundle_digest_v1().to_string();
     let input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.project-diagnostic-facts-dependencies.v13\0",
+        b"boon.compiler.project-diagnostic-facts-dependencies.v14\0",
         std::iter::once(source_digest.as_bytes())
             .chain(std::iter::once(program_role_request_tag(
                 state.source.program_role,
@@ -6987,6 +7045,1156 @@ mod tests {
     }
 
     #[test]
+    fn syntax_selected_interface_occurrence_reaches_stored_sibling_without_scheme_backflow() {
+        use boon_checked::{Type, Variant};
+        use boon_typecheck::{
+            OwnerConstraintEdgeRole, OwnerConstraintNodeKind, OwnerResultTransfer,
+        };
+
+        fn assert_rich_object(ty: &Type, variable_row: &Type, context: &str) {
+            let Type::Object(shape) = ty else {
+                panic!("{context} must be one rich object, not its principal union: {ty:#?}");
+            };
+            assert!(!shape.open, "{context} must be closed: {shape:#?}");
+            assert_eq!(
+                shape.fields.get("item_kind"),
+                Some(variable_row),
+                "{context} item_kind",
+            );
+            assert_eq!(shape.fields.get("id"), Some(&Type::Text), "{context} id");
+            assert_eq!(
+                shape.fields.get("rich_label"),
+                Some(&Type::Text),
+                "{context} rich_label",
+            );
+            assert_eq!(
+                shape.fields.get("family"),
+                Some(&Type::Text),
+                "{context} family",
+            );
+        }
+
+        fn assert_rich_list(ty: &Type, variable_row: &Type, context: &str) {
+            let Type::List(item) = ty else {
+                panic!("{context} must be a list: {ty:#?}");
+            };
+            assert_rich_object(item, variable_row, context);
+        }
+
+        let source = concat!(
+            "store: [\n",
+            "    source_rows:\n",
+            "        LIST {\n",
+            "            [\n",
+            "                item_kind: VariableRow\n",
+            "                id: TEXT { one }\n",
+            "                segments: LIST {\n",
+            "                    [\n",
+            "                        file: TEXT { waveform.vcd }\n",
+            "                        signal_id: TEXT { one }\n",
+            "                        label: TEXT { high }\n",
+            "                    ]\n",
+            "                }\n",
+            "            ]\n",
+            "        }\n",
+            "\n",
+            "    metadata_rows:\n",
+            "        LIST {\n",
+            "            [\n",
+            "                file: TEXT { waveform.vcd }\n",
+            "                digest: TEXT { sha256:fixture }\n",
+            "                canvas_width: 360\n",
+            "                lane_count: lane_rows |> List/length()\n",
+            "            ]\n",
+            "        }\n",
+            "\n",
+            "    metadata_record:\n",
+            "        metadata(file: TEXT { waveform.vcd })\n",
+            "\n",
+            "    metadata_digest:\n",
+            "        metadata_record |> WHEN {\n",
+            "            Found[value] => value.digest\n",
+            "            NotFound => TEXT { sha256:none }\n",
+            "        }\n",
+            "\n",
+            "    metadata_width:\n",
+            "        metadata_record |> WHEN {\n",
+            "            Found[value] => value.canvas_width\n",
+            "            NotFound => 360\n",
+            "        }\n",
+            "\n",
+            "    rich_rows:\n",
+            "        source_rows\n",
+            "        |> List/map(item, new:\n",
+            "            dispatch(row: item)\n",
+            "        )\n",
+            "\n",
+            "    rich_labels:\n",
+            "        rich_rows\n",
+            "        |> List/map(item, new: item.rich_label)\n",
+            "\n",
+            "    visible_rows:\n",
+            "        rich_rows\n",
+            "        |> List/filter(item, if: item.item_kind == VariableRow)\n",
+            "        |> List/filter(item, if: item.id != TEXT { removed })\n",
+            "        |> List/filter(item, if: item.rich_label == TEXT { rich })\n",
+            "        |> List/filter(item, if: item.selected == True)\n",
+            "        |> List/filter(item, if: item.family == TEXT { fixture })\n",
+            "\n",
+            "    lane_rows:\n",
+            "        visible_rows\n",
+            "        |> List/map(item, new:\n",
+            "            lane(row: item)\n",
+            "        )\n",
+            "\n",
+            "    feedback:\n",
+            "        rich_rows\n",
+            "        |> List/any(item, if: item.id == TEXT { one })\n",
+            "]\n",
+            "\n",
+            "FUNCTION enrich(row) {\n",
+            "    [\n",
+            "        item_kind: row.item_kind\n",
+            "        id: row.id\n",
+            "        rich_label: TEXT { rich }\n",
+            "        family: TEXT { fixture }\n",
+            "        segments: row.segments\n",
+            "        selected: store.feedback\n",
+            "        visible_count: store.visible_rows |> List/length()\n",
+            "    ]\n",
+            "}\n",
+            "\n",
+            "FUNCTION dispatch(row) {\n",
+            "    row.item_kind |> WHEN {\n",
+            "        VariableRow => enrich(row: row)\n",
+            "        __ => row\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "FUNCTION lane(row) {\n",
+            "    row.item_kind |> WHEN {\n",
+            "        VariableRow => lane_variable(row: row)\n",
+            "        __ => lane_group(row: row)\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "FUNCTION lane_variable(row) {\n",
+            "    [\n",
+            "        item_kind: row.item_kind\n",
+            "        id: row.id\n",
+            "        label: row.rich_label\n",
+            "        family: row.family\n",
+            "        selected: row.selected\n",
+            "        feedback: store.feedback\n",
+            "        digest: store.metadata_digest\n",
+            "        canvas_width: store.metadata_width\n",
+            "        segments: segment_rows(row: row)\n",
+            "    ]\n",
+            "}\n",
+            "\n",
+            "FUNCTION lane_group(row) {\n",
+            "    [\n",
+            "        item_kind: row.item_kind\n",
+            "        id: row.id\n",
+            "        label: row.family\n",
+            "        family: row.family\n",
+            "        selected: row.selected\n",
+            "        feedback: store.feedback\n",
+            "        segments: segment_rows(row: row)\n",
+            "    ]\n",
+            "}\n",
+            "\n",
+            "FUNCTION metadata(file) {\n",
+            "    store.metadata_rows\n",
+            "    |> List/find(item, if: item.file == file)\n",
+            "}\n",
+            "\n",
+            "FUNCTION segment_row(segment, row) {\n",
+            "    [\n",
+            "        file: segment.file\n",
+            "        signal_id: segment.signal_id\n",
+            "        lane_id: row.id\n",
+            "        label: segment.label\n",
+            "    ]\n",
+            "}\n",
+            "\n",
+            "FUNCTION segment_rows(row) {\n",
+            "    row.segments\n",
+            "    |> List/retain(item, if: segment_is_visible(segment: item))\n",
+            "    |> List/map(item, new:\n",
+            "        segment_row(\n",
+            "            segment: normalized_segment(segment: item)\n",
+            "            row: row\n",
+            "        )\n",
+            "    )\n",
+            "}\n",
+            "\n",
+            "FUNCTION segment_is_visible(segment) {\n",
+            "    segment.label == TEXT { high }\n",
+            "}\n",
+            "\n",
+            "FUNCTION normalized_segment(segment) {\n",
+            "    [\n",
+            "        file: segment.file\n",
+            "        signal_id: segment.signal_id\n",
+            "        label: segment.label\n",
+            "    ]\n",
+            "}\n",
+        );
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project(source)).unwrap();
+        let (syntax, diagnostics, _, _, _) =
+            parse_project_diagnostics_snapshot(session.projects.get_mut(&project).unwrap())
+                .unwrap();
+        assert!(
+            diagnostics.diagnostics().is_empty(),
+            "focused syntax-selection diagnostics: {:#?}",
+            diagnostics.diagnostics(),
+        );
+        let owner_named = |name: &str| {
+            syntax
+                .stable_check_owner_keys()
+                .find(|owner| {
+                    matches!(
+                        owner,
+                        StableCheckOwnerKey::Item(item)
+                            if item.item_route.segments().last().is_some_and(|segment| {
+                                segment.names.as_ref() == [name]
+                            })
+                    )
+                })
+                .unwrap_or_else(|| panic!("missing focused owner {name}"))
+        };
+        let store = owner_named("store");
+        let source_rows = owner_named("source_rows");
+        let rich_rows = owner_named("rich_rows");
+        let rich_labels = owner_named("rich_labels");
+        let visible_rows = owner_named("visible_rows");
+        let lane_rows = owner_named("lane_rows");
+        let metadata_rows = owner_named("metadata_rows");
+        let metadata_record = owner_named("metadata_record");
+        let metadata_digest = owner_named("metadata_digest");
+        let metadata_width = owner_named("metadata_width");
+        let feedback = owner_named("feedback");
+        let enrich = owner_named("enrich");
+        let dispatch = owner_named("dispatch");
+        let lane = owner_named("lane");
+        let metadata = owner_named("metadata");
+        let interface_for = |session: &CompilerSession, owner: &StableCheckOwnerKey| {
+            let state = session.projects.get(&project).unwrap();
+            let provider = state
+                .owner_interface_provider_requests
+                .current_value(&state.syntax_evaluator, owner)
+                .unwrap()
+                .unwrap();
+            let result = state
+                .owner_interface_scc_requests
+                .current_value(&state.syntax_evaluator, provider.key())
+                .unwrap()
+                .unwrap();
+            result
+                .owner(owner)
+                .unwrap_or_else(|| panic!("missing interface for {owner:?}"))
+                .clone()
+        };
+        let variable_row = Type::VariantSet(vec![Variant::Tag("VariableRow".to_owned())].into());
+
+        {
+            let state = session.projects.get(&project).unwrap();
+            let component = state
+                .owner_interface_provider_requests
+                .current_value(&state.syntax_evaluator, &rich_rows)
+                .unwrap()
+                .unwrap();
+            for owner in [&visible_rows, &feedback, &enrich, &dispatch] {
+                let provider = state
+                    .owner_interface_provider_requests
+                    .current_value(&state.syntax_evaluator, owner)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    provider.key(),
+                    component.key(),
+                    "focused recursive consumer must share the rich_rows interface component",
+                );
+            }
+        }
+
+        for (owner, name) in [
+            (&metadata_rows, "metadata_rows"),
+            (&metadata_record, "metadata_record"),
+            (&metadata_digest, "metadata_digest"),
+            (&metadata_width, "metadata_width"),
+        ] {
+            let interface = interface_for(&session, owner);
+            assert!(
+                boon_checked::type_is_recursively_closed(&interface.result.ty),
+                "{name} must close the metadata find/projection chain: {interface:#?}",
+            );
+        }
+        let metadata_interface = interface_for(&session, &metadata);
+        assert!(
+            boon_checked::type_is_recursively_closed(&metadata_interface.result.ty),
+            "metadata callable must retain the closed List/find item: {metadata_interface:#?}",
+        );
+
+        let source_interface = interface_for(&session, &source_rows);
+        let Type::List(source_item) = &source_interface.result.ty else {
+            panic!(
+                "source_rows must publish a list: {:#?}",
+                source_interface.result
+            );
+        };
+        let Type::Object(source_item) = source_item.as_ref() else {
+            panic!(
+                "source_rows must publish object items: {:#?}",
+                source_interface.result
+            );
+        };
+        assert!(!source_item.open);
+        assert_eq!(source_item.fields.len(), 3);
+        assert_eq!(source_item.fields.get("item_kind"), Some(&variable_row));
+        assert_eq!(source_item.fields.get("id"), Some(&Type::Text));
+        assert!(!source_item.fields.contains_key("rich_label"));
+
+        let enrich_interface = interface_for(&session, &enrich);
+        let Type::Object(enrich_parameter) = &enrich_interface.parameters[0].flow_type.ty else {
+            panic!("enrich parameter must remain an open object scheme");
+        };
+        let Type::Object(enrich_result) = &enrich_interface.result.ty else {
+            panic!("enrich result must remain a closed object scheme");
+        };
+        assert!(enrich_parameter.open);
+        assert!(!enrich_result.open);
+        let mut enrich_alphas = BTreeSet::new();
+        for field in ["item_kind", "id"] {
+            let Some(Type::Var(parameter)) = enrich_parameter.fields.get(field) else {
+                panic!("enrich parameter must retain generic {field}");
+            };
+            let Some(Type::Var(result)) = enrich_result.fields.get(field) else {
+                panic!("enrich result must reuse generic {field}");
+            };
+            assert_eq!(parameter, result, "enrich {field} alpha");
+            enrich_alphas.insert(*parameter);
+        }
+        assert_eq!(enrich_alphas.len(), 2);
+        assert_eq!(enrich_result.fields.get("rich_label"), Some(&Type::Text));
+
+        let dispatch_interface = interface_for(&session, &dispatch);
+        let Type::Object(dispatch_parameter) = &dispatch_interface.parameters[0].flow_type.ty
+        else {
+            panic!("dispatch parameter must remain an open object scheme");
+        };
+        assert!(dispatch_parameter.open);
+        let Some(Type::Var(dispatch_kind_alpha)) = dispatch_parameter.fields.get("item_kind")
+        else {
+            panic!("dispatch parameter must retain generic item_kind");
+        };
+        let Some(Type::Var(dispatch_id_alpha)) = dispatch_parameter.fields.get("id") else {
+            panic!("dispatch parameter must retain generic id");
+        };
+        assert_ne!(dispatch_kind_alpha, dispatch_id_alpha);
+        assert!(
+            !dispatch_parameter.fields.contains_key("rich_label"),
+            "the rich branch must not flow its authored field back into the generic scheme",
+        );
+        let Type::Union(principal_members) = &dispatch_interface.result.ty else {
+            panic!(
+                "dispatch scheme must retain its broad rich-or-sparse principal: {:#?}",
+                dispatch_interface.result,
+            );
+        };
+        assert_eq!(principal_members.len(), 2, "dispatch principal members");
+        let rich_principal = principal_members
+            .iter()
+            .find_map(|member| match member {
+                Type::Object(shape) if shape.fields.get("rich_label") == Some(&Type::Text) => {
+                    Some(shape)
+                }
+                _ => None,
+            })
+            .expect("dispatch principal rich member");
+        let sparse_principal = principal_members
+            .iter()
+            .find_map(|member| match member {
+                Type::Object(shape) if !shape.fields.contains_key("rich_label") => Some(shape),
+                _ => None,
+            })
+            .expect("dispatch principal sparse member");
+        assert!(!rich_principal.open);
+        assert!(sparse_principal.open);
+        for (field, alpha) in [
+            ("item_kind", dispatch_kind_alpha),
+            ("id", dispatch_id_alpha),
+        ] {
+            assert_eq!(
+                rich_principal.fields.get(field),
+                Some(&Type::Var(*alpha)),
+                "rich principal {field} alpha",
+            );
+        }
+        assert_eq!(
+            sparse_principal.fields.get("item_kind"),
+            Some(&Type::Var(*dispatch_kind_alpha)),
+            "sparse principal selector alpha",
+        );
+        assert_eq!(rich_principal.fields.get("rich_label"), Some(&Type::Text));
+        assert!(!sparse_principal.fields.contains_key("rich_label"));
+        let OwnerResultTransfer::Expression { nodes, .. } = &dispatch_interface.result_transfer
+        else {
+            panic!("dispatch must publish a syntax-selectable result transfer");
+        };
+        assert!(
+            nodes
+                .iter()
+                .any(|node| matches!(node.kind, OwnerConstraintNodeKind::When)),
+            "dispatch transfer must retain its WHEN",
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind,
+                        OwnerConstraintNodeKind::MatchArm { .. }
+                            | OwnerConstraintNodeKind::Arrow { .. }
+                    )
+                })
+                .count(),
+            2,
+            "dispatch transfer must retain both ordered arms",
+        );
+
+        let rich_body = session
+            .owner_body_inference(project, &rich_rows)
+            .unwrap()
+            .expect("rich_rows body inference");
+        let dispatch_call = rich_body
+            .calls
+            .iter()
+            .find(|call| call.function == "dispatch")
+            .expect("rich_rows dispatch call");
+        let dispatch_actual = dispatch_call
+            .inputs
+            .iter()
+            .find(|input| {
+                matches!(
+                    &input.role,
+                    OwnerConstraintEdgeRole::CallArgument { name, .. } if name == "row"
+                )
+            })
+            .expect("dispatch row actual");
+        assert_eq!(
+            dispatch_actual.actual_type,
+            Type::Object((*source_item).clone()),
+            "dispatch must observe the closed source row before its generic formal",
+        );
+        assert!(
+            dispatch_call.syntax_discriminated_result,
+            "singleton VariableRow must select the rich WHEN arm: {dispatch_call:#?}",
+        );
+        assert_rich_object(
+            &dispatch_call.result.ty,
+            &variable_row,
+            "dispatch occurrence result",
+        );
+        let producer_map = rich_body
+            .calls
+            .iter()
+            .find(|call| call.function == "List/map")
+            .expect("rich_rows List/map call");
+        assert_rich_list(
+            &producer_map.result.ty,
+            &variable_row,
+            "producer List/map result",
+        );
+
+        let rich_interface = interface_for(&session, &rich_rows);
+        assert_rich_list(
+            &rich_interface.result.ty,
+            &variable_row,
+            "rich_rows public interface",
+        );
+        let store_interface = interface_for(&session, &store);
+        let Type::Object(store_result) = &store_interface.result.ty else {
+            panic!("focused store must publish its record: {store_interface:#?}");
+        };
+        assert_eq!(
+            store_result.fields.get("rich_rows"),
+            Some(&rich_interface.result.ty),
+            "the containing store interface must compose the final child endpoint",
+        );
+        let visible_interface = interface_for(&session, &visible_rows);
+        assert_eq!(
+            visible_interface.result.ty, rich_interface.result.ty,
+            "five List/filter calls must retain their captured provider exactly",
+        );
+        assert_rich_list(
+            &visible_interface.result.ty,
+            &variable_row,
+            "visible_rows public interface",
+        );
+        let visible_body = session
+            .owner_body_inference(project, &visible_rows)
+            .unwrap()
+            .expect("visible_rows body inference");
+        let visible_filters = visible_body
+            .calls
+            .iter()
+            .filter(|call| call.function == "List/filter")
+            .collect::<Vec<_>>();
+        assert_eq!(visible_filters.len(), 5, "visible_rows filter count");
+        for call in visible_filters {
+            let pipe = call
+                .inputs
+                .iter()
+                .find(|input| matches!(input.role, OwnerConstraintEdgeRole::PipeInput))
+                .expect("visible_rows filter pipe input");
+            assert_rich_list(
+                &pipe.actual_type,
+                &variable_row,
+                "visible_rows filter pipe input",
+            );
+            assert_rich_list(&call.result.ty, &variable_row, "visible_rows filter result");
+        }
+        let labels_body = session
+            .owner_body_inference(project, &rich_labels)
+            .unwrap()
+            .expect("rich_labels body inference");
+        let labels_map = labels_body
+            .calls
+            .iter()
+            .find(|call| call.function == "List/map")
+            .expect("rich_labels List/map call");
+        let labels_pipe = labels_map
+            .inputs
+            .iter()
+            .find(|input| matches!(input.role, OwnerConstraintEdgeRole::PipeInput))
+            .expect("rich_labels List/map pipe input");
+        assert_eq!(
+            labels_pipe.actual_type, rich_interface.result.ty,
+            "sibling must consume the producer's exact public type",
+        );
+        assert_rich_list(
+            &labels_pipe.actual_type,
+            &variable_row,
+            "rich_labels pipe input",
+        );
+        assert_eq!(
+            labels_map.result.ty,
+            Type::List(Type::shared(Type::Text)),
+            "rich_labels List/map result",
+        );
+        let labels_interface = interface_for(&session, &rich_labels);
+        assert_eq!(
+            labels_interface.result.ty,
+            Type::List(Type::shared(Type::Text)),
+        );
+
+        assert_eq!(source_interface, interface_for(&session, &source_rows));
+        assert_eq!(enrich_interface, interface_for(&session, &enrich));
+        assert_eq!(dispatch_interface, interface_for(&session, &dispatch));
+        assert_eq!(rich_interface, interface_for(&session, &rich_rows));
+        assert_eq!(visible_interface, interface_for(&session, &visible_rows));
+
+        let lane_interface = interface_for(&session, &lane_rows);
+        let Type::List(lane_item) = &lane_interface.result.ty else {
+            panic!("lane_rows must publish a list: {lane_interface:#?}");
+        };
+        let Type::Object(lane_item) = lane_item.as_ref() else {
+            panic!("lane_rows must publish record items: {lane_interface:#?}");
+        };
+        assert!(!lane_item.open);
+        assert_eq!(lane_item.fields.get("item_kind"), Some(&variable_row));
+        for field in ["id", "label", "family", "digest"] {
+            assert_eq!(
+                lane_item.fields.get(field),
+                Some(&Type::Text),
+                "lane {field}"
+            );
+        }
+        assert_eq!(
+            lane_item.fields.get("canvas_width"),
+            Some(&Type::Number),
+            "lane canvas_width",
+        );
+        let lane_scheme = interface_for(&session, &lane);
+        let Type::Object(lane_parameter) = &lane_scheme.parameters[0].flow_type.ty else {
+            panic!("lane parameter must retain its structural scheme: {lane_scheme:#?}");
+        };
+        assert!(lane_parameter.open);
+        for field in ["item_kind", "id", "rich_label", "family", "selected"] {
+            assert!(
+                matches!(lane_parameter.fields.get(field), Some(Type::Var(_))),
+                "lane parameter must retain generic {field}: {lane_scheme:#?}",
+            );
+        }
+        assert!(
+            matches!(lane_parameter.fields.get("segments"), Some(Type::List(_))),
+            "lane parameter must retain its generic segment list: {lane_scheme:#?}",
+        );
+        let lane_body = session
+            .owner_body_inference(project, &lane_rows)
+            .unwrap()
+            .expect("lane_rows body inference");
+        let lane_call = lane_body
+            .calls
+            .iter()
+            .find(|call| call.function == "lane")
+            .expect("lane_rows dispatcher call");
+        let lane_actual = lane_call
+            .inputs
+            .iter()
+            .find(|input| {
+                matches!(
+                    &input.role,
+                    OwnerConstraintEdgeRole::CallArgument { name, .. } if name == "row"
+                )
+            })
+            .expect("lane row actual");
+        assert_rich_object(&lane_actual.actual_type, &variable_row, "lane row actual");
+        assert!(boon_checked::type_is_recursively_closed(
+            &lane_call.result.ty
+        ));
+
+        let (_, assembly, _, _, _) =
+            parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let fields = assembly.fields();
+        let rich_declaration = fields
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == "rich_rows")
+            .expect("rich_rows checked declaration");
+        assert_rich_list(
+            &rich_declaration.flow_type.ty,
+            &variable_row,
+            "rich_rows checked declaration",
+        );
+        let visible_declaration = fields
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == "visible_rows")
+            .expect("visible_rows checked declaration");
+        assert_eq!(
+            visible_declaration.flow_type.ty, rich_declaration.flow_type.ty,
+            "checked visible_rows must retain rich_rows exactly",
+        );
+        let labels_declaration = fields
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == "rich_labels")
+            .expect("rich_labels checked declaration");
+        assert_eq!(
+            labels_declaration.flow_type.ty,
+            Type::List(Type::shared(Type::Text)),
+        );
+        let lane_callable = fields
+            .callables
+            .iter()
+            .find(|callable| callable.name == "lane")
+            .expect("lane checked callable");
+        assert!(matches!(
+            lane_callable.parameters[0].flow_type.ty,
+            Type::Object(_)
+        ));
+        let lane_declaration = fields
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == "lane_rows")
+            .expect("lane_rows checked declaration");
+        assert_eq!(lane_declaration.flow_type.ty, lane_interface.result.ty);
+
+        let revision = session.revision(project).unwrap();
+        session
+            .request(
+                project,
+                revision,
+                CompileIntent::VerifiedPreview,
+                &CancellationToken::new(),
+            )
+            .unwrap()
+            .compiled()
+            .expect("syntax-selected fixture must publish a verified plan");
+    }
+
+    #[test]
+    #[ignore = "large NovyWave owner assembly regression"]
+    fn novywave_owner_assembly_preserves_tagged_arm_projection_types() {
+        fn contains_unknown_type(ty: &boon_checked::Type) -> bool {
+            match ty {
+                boon_checked::Type::Unknown => true,
+                boon_checked::Type::Object(shape) => {
+                    shape.fields.values().any(contains_unknown_type)
+                }
+                boon_checked::Type::List(item) | boon_checked::Type::Set(item) => {
+                    contains_unknown_type(item)
+                }
+                boon_checked::Type::Map { key, value } => {
+                    contains_unknown_type(key) || contains_unknown_type(value)
+                }
+                boon_checked::Type::Function { args, result } => {
+                    args.iter().any(contains_unknown_type) || contains_unknown_type(&result.ty)
+                }
+                boon_checked::Type::VariantSet(variants) => variants.iter().any(|variant| {
+                    let boon_checked::Variant::Tagged { fields, .. } = variant else {
+                        return false;
+                    };
+                    fields.fields.values().any(contains_unknown_type)
+                }),
+                boon_checked::Type::Union(members) => members.iter().any(contains_unknown_type),
+                boon_checked::Type::Text
+                | boon_checked::Type::Number
+                | boon_checked::Type::Bytes(_)
+                | boon_checked::Type::Bits { .. }
+                | boon_checked::Type::Absent
+                | boon_checked::Type::RenderContract
+                | boon_checked::Type::UnresolvedShape { .. }
+                | boon_checked::Type::Var(_) => false,
+            }
+        }
+
+        fn unresolved_type_paths(ty: &boon_checked::Type) -> Vec<String> {
+            fn visit(ty: &boon_checked::Type, path: &str, unresolved: &mut Vec<String>) {
+                match ty {
+                    boon_checked::Type::Var(variable) => {
+                        unresolved.push(format!("{path}: Var({})", variable.0));
+                    }
+                    boon_checked::Type::Unknown => {
+                        unresolved.push(format!("{path}: Unknown"));
+                    }
+                    boon_checked::Type::UnresolvedShape { reason } => {
+                        unresolved.push(format!("{path}: UnresolvedShape({reason})"));
+                    }
+                    boon_checked::Type::Object(shape) => {
+                        if shape.open {
+                            unresolved.push(format!("{path}: open Object"));
+                        }
+                        for (field, ty) in &shape.fields {
+                            visit(ty, &format!("{path}.{field}"), unresolved);
+                        }
+                    }
+                    boon_checked::Type::List(item) => {
+                        visit(item, &format!("{path}[]"), unresolved);
+                    }
+                    boon_checked::Type::Set(item) => {
+                        visit(item, &format!("{path}{{}}"), unresolved);
+                    }
+                    boon_checked::Type::Map { key, value } => {
+                        visit(key, &format!("{path}.key"), unresolved);
+                        visit(value, &format!("{path}.value"), unresolved);
+                    }
+                    boon_checked::Type::Function { args, result } => {
+                        for (index, arg) in args.iter().enumerate() {
+                            visit(arg, &format!("{path}.arg[{index}]"), unresolved);
+                        }
+                        visit(&result.ty, &format!("{path}.result"), unresolved);
+                    }
+                    boon_checked::Type::VariantSet(variants) => {
+                        for variant in variants.iter() {
+                            let boon_checked::Variant::Tagged { tag, fields } = variant else {
+                                continue;
+                            };
+                            if fields.open {
+                                unresolved.push(format!("{path}<{tag}>: open payload"));
+                            }
+                            for (field, ty) in &fields.fields {
+                                visit(ty, &format!("{path}<{tag}>.{field}"), unresolved);
+                            }
+                        }
+                    }
+                    boon_checked::Type::Union(members) => {
+                        for (index, member) in members.iter().enumerate() {
+                            visit(member, &format!("{path}|{index}"), unresolved);
+                        }
+                    }
+                    boon_checked::Type::Text
+                    | boon_checked::Type::Number
+                    | boon_checked::Type::Bytes(_)
+                    | boon_checked::Type::Bits { .. }
+                    | boon_checked::Type::Absent
+                    | boon_checked::Type::RenderContract => {}
+                }
+            }
+
+            let mut unresolved = Vec::new();
+            visit(ty, "$", &mut unresolved);
+            unresolved
+        }
+
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
+        let (entrypoint, units) = crate::compiler_source_project_for_path(&source).unwrap();
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(CompilerProject::new(
+                entrypoint,
+                units.clone(),
+                TargetProfile::SoftwareDefault,
+                ProgramRole::Client,
+                ApplicationIdentity::compiler_default(),
+            ))
+            .unwrap();
+        let (diagnostic_syntax, _, _, _, _) =
+            parse_project_diagnostics_snapshot(session.projects.get_mut(&project).unwrap())
+                .unwrap();
+        let owner_named = |name: &str| {
+            diagnostic_syntax
+                .stable_check_owner_keys()
+                .find(|owner| {
+                    matches!(
+                        owner,
+                        StableCheckOwnerKey::Item(item)
+                            if item.item_route.segments().last().is_some_and(|segment| {
+                                segment.names.as_ref() == [name]
+                            })
+                    )
+                })
+                .unwrap_or_else(|| panic!("missing NovyWave owner {name}"))
+        };
+        let file_tree_rows = owner_named("file_tree_rows");
+        let signal_catalog = owner_named("signal_catalog");
+        let row_selected_signal_key = owner_named("row_selected_signal_key");
+        let real_waveform_segment = owner_named("real_waveform_segment");
+        let selected_signal_defaults = owner_named("selected_signal_defaults");
+        let selected_visible_items = owner_named("selected_visible_items");
+        let selected_signal_lane_rows = owner_named("selected_signal_lane_rows");
+        let new_signal_lane_row = owner_named("new_signal_lane_row");
+        let store = owner_named("store");
+        let bridge_request_compact_label = owner_named("bridge_request_compact_label");
+        {
+            let state = session.projects.get(&project).unwrap();
+            let current_interface = |owner: &StableCheckOwnerKey| {
+                let provider = state
+                    .owner_interface_provider_requests
+                    .current_value(&state.syntax_evaluator, owner)
+                    .unwrap()
+                    .unwrap();
+                let result = state
+                    .owner_interface_scc_requests
+                    .current_value(&state.syntax_evaluator, provider.key())
+                    .unwrap()
+                    .unwrap();
+                result
+                    .owner(owner)
+                    .expect("NovyWave owner public interface")
+                    .clone()
+            };
+            let provider = state
+                .owner_interface_provider_requests
+                .current_value(&state.syntax_evaluator, &file_tree_rows)
+                .unwrap()
+                .unwrap();
+            let result = state
+                .owner_interface_scc_requests
+                .current_value(&state.syntax_evaluator, provider.key())
+                .unwrap()
+                .unwrap();
+            let interface = result
+                .owner(&file_tree_rows)
+                .expect("file_tree_rows public interface");
+            assert!(
+                boon_checked::type_is_recursively_closed(&interface.result.ty),
+                "file_tree_rows must publish a closed result before its sibling consumer: {:#?}",
+                interface.result,
+            );
+
+            let provider = state
+                .owner_interface_provider_requests
+                .current_value(&state.syntax_evaluator, &signal_catalog)
+                .unwrap()
+                .unwrap();
+            let result = state
+                .owner_interface_scc_requests
+                .current_value(&state.syntax_evaluator, provider.key())
+                .unwrap()
+                .unwrap();
+            let interface = result
+                .owner(&signal_catalog)
+                .expect("signal_catalog public interface");
+            assert!(
+                boon_checked::type_is_recursively_closed(&interface.result.ty),
+                "signal_catalog must publish a closed result before its sibling consumer: {:#?}",
+                interface.result,
+            );
+            let boon_checked::Type::List(item) = &interface.result.ty else {
+                panic!(
+                    "signal_catalog must publish a list: {:#?}",
+                    interface.result
+                );
+            };
+            let boon_checked::Type::Object(item) = item.as_ref() else {
+                panic!(
+                    "signal_catalog must publish record items: {:#?}",
+                    interface.result
+                );
+            };
+            assert_eq!(item.fields.get("key"), Some(&boon_checked::Type::Text));
+
+            for (owner, name) in [
+                (&selected_signal_defaults, "selected_signal_defaults"),
+                (&selected_visible_items, "selected_visible_items"),
+            ] {
+                let provider = state
+                    .owner_interface_provider_requests
+                    .current_value(&state.syntax_evaluator, owner)
+                    .unwrap()
+                    .unwrap();
+                let result = state
+                    .owner_interface_scc_requests
+                    .current_value(&state.syntax_evaluator, provider.key())
+                    .unwrap()
+                    .unwrap();
+                let interface = result.owner(owner).unwrap_or_else(|| {
+                    panic!("{name} public interface is missing from its component")
+                });
+                assert!(
+                    boon_checked::type_is_recursively_closed(&interface.result.ty),
+                    "{name} must publish a recursively closed list: {interface:#?}",
+                );
+            }
+            let bridge_interface = current_interface(&bridge_request_compact_label);
+            assert_eq!(
+                bridge_interface.result.ty,
+                boon_checked::Type::Text,
+                "bridge request compact label must publish Text",
+            );
+            let store_interface = current_interface(&store);
+            let boon_checked::Type::Object(store_result) = &store_interface.result.ty else {
+                panic!("NovyWave store must publish its record boundary: {store_interface:#?}");
+            };
+            assert_eq!(
+                store_result.fields.get("bridge_request_compact_label"),
+                Some(&boon_checked::Type::Text),
+                "the parent store boundary must observe the child's closed public result",
+            );
+            let provider = state
+                .owner_interface_provider_requests
+                .current_value(&state.syntax_evaluator, &new_signal_lane_row)
+                .unwrap()
+                .unwrap();
+            let result = state
+                .owner_interface_scc_requests
+                .current_value(&state.syntax_evaluator, provider.key())
+                .unwrap()
+                .unwrap();
+            let interface = result
+                .owner(&new_signal_lane_row)
+                .expect("new_signal_lane_row public interface");
+            assert!(
+                matches!(
+                    &interface.parameters[0].flow_type.ty,
+                    boon_checked::Type::Object(_)
+                ),
+                "new_signal_lane_row must retain its structural parameter scheme: {interface:#?}",
+            );
+            assert!(
+                !contains_unknown_type(&interface.parameters[0].flow_type.ty),
+                "new_signal_lane_row parameter fields must remain generic variables, never ABI placeholders: {interface:#?}",
+            );
+        }
+        let (_, assembly, _, _, _) =
+            parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let fields = assembly.fields();
+        if std::env::var_os("BOON_DEBUG_NOVY_OUT").is_some() {
+            std::fs::write(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../target/novywave-owner-checked-current.toml"),
+                toml::to_string(fields).unwrap(),
+            )
+            .unwrap();
+        }
+        let declaration = fields
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == "comparison_cursor_values_result")
+            .expect("comparison cursor values declaration");
+        let reads = fields
+            .expressions
+            .iter()
+            .filter(|expression| {
+                matches!(
+                    &expression.kind,
+                    boon_checked::CheckedExpressionKind::Read {
+                        target,
+                        projection,
+                        ..
+                    } if target == &declaration.id && projection.as_ref() == ["rows"]
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 1, "tagged arm rows reads: {reads:#?}");
+        assert!(
+            reads.iter().all(|expression| {
+                matches!(
+                    &expression.flow_type.ty,
+                    boon_checked::Type::List(item)
+                        if matches!(
+                            item.as_ref(),
+                            boon_checked::Type::Object(shape)
+                                if shape.fields.get("signal_id") == Some(&boon_checked::Type::Text)
+                                    && matches!(
+                                        shape.fields.get("value"),
+                                        Some(boon_checked::Type::VariantSet(_))
+                                    )
+                        )
+                ) && !format!("{:?}", expression.flow_type.ty).contains("Var(")
+            }),
+            "tagged arm rows reads: {reads:#?}",
+        );
+        let legacy = crate::check_diagnostics_source(crate::CompilerCheckRequest::source_units(
+            "examples/novywave/RUN.bn",
+            &units,
+            ProgramRole::Client,
+        ))
+        .unwrap();
+        assert!(
+            legacy.output.report.diagnostics.is_empty(),
+            "legacy NovyWave diagnostics: {:#?}",
+            legacy.output.report.diagnostics,
+        );
+
+        let revision = session.revision(project).unwrap();
+        let token = CancellationToken::new();
+        let diagnostic_result = session
+            .request(project, revision, CompileIntent::Diagnostics, &token)
+            .unwrap();
+        let diagnostics = diagnostic_result
+            .diagnostics()
+            .expect("NovyWave diagnostics projection");
+        assert!(
+            diagnostics.diagnostics().is_empty(),
+            "owner NovyWave diagnostics: {:#?}",
+            diagnostics.diagnostics(),
+        );
+        let signal_catalog_body = session
+            .owner_body_inference(project, &signal_catalog)
+            .unwrap()
+            .expect("signal_catalog body inference");
+        for function in ["real_signal_catalog_row", "new_signal", "List/map"] {
+            let call = signal_catalog_body
+                .calls
+                .iter()
+                .find(|call| call.function == function)
+                .unwrap_or_else(|| panic!("missing signal_catalog call {function}"));
+            assert!(
+                call.valid && boon_checked::type_is_recursively_closed(&call.result.ty),
+                "signal_catalog call {function} must close its occurrence result: {call:#?}",
+            );
+        }
+        let waveform_body = session
+            .owner_body_inference(project, &real_waveform_segment)
+            .unwrap()
+            .expect("real_waveform_segment body inference");
+        for function in ["real_waveform_value_state", "real_waveform_value_text"] {
+            let call = waveform_body
+                .calls
+                .iter()
+                .find(|call| call.function == function)
+                .unwrap_or_else(|| panic!("missing real_waveform_segment call {function}"));
+            assert!(
+                call.valid && boon_checked::type_is_recursively_closed(&call.result.ty),
+                "real_waveform_segment call {function} must close every evaluated arm: {call:#?}",
+            );
+        }
+        let lane_body = session
+            .owner_body_inference(project, &selected_signal_lane_rows)
+            .unwrap()
+            .expect("selected_signal_lane_rows body inference");
+        let lane_map = lane_body
+            .calls
+            .iter()
+            .find(|call| call.function == "List/map")
+            .expect("selected_signal_lane_rows List/map call");
+        let lane_call = lane_body
+            .calls
+            .iter()
+            .find(|call| call.function == "new_signal_lane_row")
+            .expect("selected_signal_lane_rows dispatcher call");
+        let lane_actual = lane_call
+            .inputs
+            .iter()
+            .find(|input| {
+                matches!(
+                    &input.role,
+                    boon_typecheck::OwnerConstraintEdgeRole::CallArgument { name, .. }
+                        if name == "row"
+                )
+            })
+            .expect("new_signal_lane_row row actual");
+        assert!(
+            boon_checked::type_is_recursively_closed(&lane_actual.actual_type),
+            "new_signal_lane_row must receive the exact closed map item: {lane_call:#?}",
+        );
+        let lane_result_is_structural = match &lane_call.result.ty {
+            boon_checked::Type::Object(_) => true,
+            boon_checked::Type::Union(members) => members
+                .iter()
+                .all(|member| matches!(member, boon_checked::Type::Object(_))),
+            _ => false,
+        };
+        assert!(
+            lane_result_is_structural && !contains_unknown_type(&lane_call.result.ty),
+            "new_signal_lane_row occurrence must retain its structural result before OUT elaboration: {lane_call:#?}",
+        );
+        assert!(
+            boon_checked::type_is_recursively_closed(&lane_call.result.ty),
+            "new_signal_lane_row occurrence must close before OUT elaboration; unresolved paths: {}",
+            unresolved_type_paths(&lane_call.result.ty).join(", "),
+        );
+        let lane_input = lane_map
+            .inputs
+            .iter()
+            .find(|input| {
+                matches!(
+                    input.role,
+                    boon_typecheck::OwnerConstraintEdgeRole::PipeInput
+                )
+            })
+            .expect("selected_signal_lane_rows List/map pipe input");
+        assert!(
+            boon_checked::type_is_recursively_closed(&lane_input.actual_type),
+            "selected_signal_lane_rows must consume the closed visible list: {lane_map:#?}",
+        );
+        assert!(
+            boon_checked::type_is_recursively_closed(&lane_map.result.ty),
+            "selected_signal_lane_rows List/map must publish a closed result; unresolved paths: {}",
+            unresolved_type_paths(&lane_map.result.ty).join(", "),
+        );
+        let body = session
+            .owner_body_inference(project, &row_selected_signal_key)
+            .unwrap()
+            .expect("row_selected_signal_key body inference");
+        let map = body
+            .calls
+            .iter()
+            .find(|call| call.function == "List/map")
+            .expect("row_selected_signal_key List/map call");
+        let list = map
+            .inputs
+            .iter()
+            .find(|input| {
+                matches!(
+                    input.role,
+                    boon_typecheck::OwnerConstraintEdgeRole::PipeInput
+                )
+            })
+            .expect("row_selected_signal_key List/map pipe input");
+        assert!(
+            matches!(&list.actual_type, boon_checked::Type::List(_))
+                || matches!(
+                    &list.actual_type,
+                    boon_checked::Type::Union(members)
+                        if members.iter().all(|member| matches!(member, boon_checked::Type::List(_)))
+                ),
+            "row_selected_signal_key List/map must retain its provider list before OUT specialization: {map:#?}",
+        );
+        session
+            .request(project, revision, CompileIntent::VerifiedPreview, &token)
+            .unwrap()
+            .compiled()
+            .expect("NovyWave must publish a verified compiled plan");
+    }
+
+    #[test]
     fn owner_diagnostics_aggregate_includes_signature_lexical_errors_without_checked_shards() {
         let mut session = CompilerSession::new();
         let project = session
@@ -7176,21 +8384,60 @@ mod tests {
                     "        )\n",
                     "    )\n",
                     "}\n",
-                    "FUNCTION render_row(indent_width) {\n",
+                    "FUNCTION render_row(label_text, selected, row) {\n",
                     "    Scene/Element/stripe(\n",
                     "        element: []\n",
                     "        direction: Row\n",
                     "        items: LIST {\n",
-                    "            render_indent(width_value: indent_width)\n",
+                    "            render_indent(width_value: row.indent_width)\n",
                     "            Scene/Element/text(\n",
                     "                element: []\n",
                     "                style: [width: Fill, height: Fill]\n",
-                    "                text: TEXT { label }\n",
+                    "                text: label_text\n",
                     "            )\n",
                     "        }\n",
                     "    )\n",
                     "}\n",
-                    "scene: Scene/new(root: render_row(indent_width: 92))\n",
+                    "scene: Scene/new(root: render_row(\n",
+                    "    label_text: TEXT { label }\n",
+                    "    selected: True\n",
+                    "    row: [indent_width: 92]\n",
+                    "))\n",
+                ),
+            ),
+            (
+                ProgramRole::Client,
+                concat!(
+                    "FUNCTION render_indent(width_value) {\n",
+                    "    Scene/Element/label(\n",
+                    "        element: []\n",
+                    "        style: [width: width_value, height: Fill]\n",
+                    "        label: Scene/Element/text(\n",
+                    "            element: []\n",
+                    "            style: [width: Fill, height: Fill]\n",
+                    "            text: TEXT { indent }\n",
+                    "        )\n",
+                    "    )\n",
+                    "}\n",
+                    "FUNCTION render_row(label_text, selected, row) {\n",
+                    "    Scene/Element/stripe(\n",
+                    "        element: []\n",
+                    "        direction: Row\n",
+                    "        items: LIST {\n",
+                    "            render_indent(width_value: row.indent_width)\n",
+                    "            Scene/Element/text(\n",
+                    "                element: []\n",
+                    "                style: [width: Fill, height: Fill]\n",
+                    "                text: label_text\n",
+                    "            )\n",
+                    "        }\n",
+                    "    )\n",
+                    "}\n",
+                    "scene: Scene/new(root: render_row(\n",
+                    "    label_text: TEXT { label }\n",
+                    "    selected: True\n",
+                    "    row: [indent_width: TEXT { invalid }]\n",
+                    "))\n",
                 ),
             ),
             (
@@ -7981,7 +9228,8 @@ mod tests {
             if source.contains("TEXT { invalid }")
                 && (source.contains("sized_box")
                     || source.contains("styled_alias")
-                    || source.contains("styled_call_alias"))
+                    || source.contains("styled_call_alias")
+                    || source.contains("FUNCTION render_row(label_text, selected, row)"))
                 && !source.contains("styled_alias(first: TEXT { invalid }, second: 24)")
                 && !source.contains("styled_call_alias(first: TEXT { invalid }, second: 24)")
             {
@@ -7996,6 +9244,13 @@ mod tests {
                     lean.iter()
                         .all(|diagnostic| diagnostic.message != deferred_style_message),
                     "valid deferred style specialization was rejected:\n{source}\n{lean:#?}"
+                );
+            }
+            if source.contains("row: [indent_width: 92]") {
+                assert!(
+                    lean.iter()
+                        .all(|diagnostic| diagnostic.message != deferred_style_message),
+                    "stable projected actual was confused with a sibling parameter namespace:\n{source}\n{lean:#?}"
                 );
             }
             if source.contains("styled_alias(first: TEXT { invalid }, second: 24)") {
@@ -10235,6 +11490,75 @@ mod tests {
     }
 
     #[test]
+    fn explicit_pass_record_forwards_the_callers_same_named_value() {
+        let source = concat!(
+            "store: [count: 1]\n",
+            "FUNCTION read_count() {\n",
+            "    PASSED.store.count\n",
+            "}\n",
+            "value: read_count(PASS: [store: store])\n",
+        );
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project(source)).unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let owner_named = |name: &str| {
+            unit.stable_check_owner_keys()
+                .find(|owner| {
+                    matches!(
+                        owner,
+                        StableCheckOwnerKey::Item(owner)
+                            if owner.item_route.segments().last().is_some_and(|segment| segment.names == [name])
+                    )
+                })
+                .unwrap()
+        };
+        let store = owner_named("store");
+        let value = owner_named("value");
+        let summary = session
+            .owner_constraint_summary(project, &value)
+            .unwrap()
+            .unwrap();
+        assert!(summary.symbol_resolutions.iter().any(|resolution| {
+            matches!(
+                resolution,
+                OwnerSymbolResolution::Resolved {
+                    reference,
+                    owner,
+                    projection,
+                    ..
+                } if reference.parts.as_ref() == ["store"]
+                    && owner == &store
+                    && projection.is_empty()
+            )
+        }));
+
+        let body = session
+            .owner_body_inference(project, &value)
+            .unwrap()
+            .unwrap();
+        assert!(body.diagnostics.is_empty(), "{:#?}", body.diagnostics);
+        let store_actual = body
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, boon_syntax::AstExprKind::Identifier(name) if name == "store")
+            })
+            .expect("explicit PASS store initializer");
+        let boon_checked::Type::Object(shape) = &store_actual.flow_type.ty else {
+            panic!(
+                "explicit PASS must retain the caller's store object: {:?}",
+                store_actual.flow_type.ty
+            );
+        };
+        assert_eq!(shape.fields.get("count"), Some(&boon_checked::Type::Number));
+        assert!(!shape.open);
+    }
+
+    #[test]
     fn unused_value_dependencies_do_not_invalidate_transfer_modules_or_callers() {
         let before = concat!(
             "source: 1\n",
@@ -10728,9 +12052,13 @@ mod tests {
         // current diagnostic-replay evaluation and one normalized semantic fact.
         // The shared output-flow component executes once per cone and
         // backdates when the body-only edit leaves its graph unchanged.
+        // The live interface-component residual transaction directly records
+        // its exact transfer-module basis, so an exported interface edit also
+        // reexecutes and backdates one unchanged component projection that the
+        // retired post-solve transaction could reuse without that edge.
         assert_eq!(
             (interface_delta, body_delta),
-            ((205, 102, 103, 46, 56), (205, 42, 163, 17, 25))
+            ((205, 103, 102, 47, 56), (205, 42, 163, 17, 25))
         );
     }
 

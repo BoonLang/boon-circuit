@@ -205,6 +205,73 @@ does not reparse, recheck, reseal, reverify, or relower an unrelated unit or
 component. A timeout increase or a larger thread pool cannot satisfy a scaling
 gate.
 
+### Optimization Priority: One Semantic Computation, Many Cheap Projections
+
+Every semantic question has exactly one production authority at the smallest
+stable source-unit, owner, SCC, or project component that can answer it. Type
+and flow inference, lexical/call/OUT transfer, diagnostic decisions,
+order/output/render/host facts, and proof-bearing semantic rows are computed
+once for one exact current input set. Stable owner identity remains mandatory,
+but it is represented by compact rows and typed edges rather than duplicated
+rich object graphs.
+
+Currentness and semantic equality are separate. An evaluation receipt proves
+that exact syntax, body, interface, ABI, and dependency inputs were current;
+independently fingerprinted span-free semantic results may backdate only when
+their meaning is unchanged. `OwnerSourceMap` and global source coordinates are
+presentation inputs and must not invalidate semantic results.
+
+Diagnostics, editor presentation, checked compatibility, proof acceptance,
+lowering, serialization, and runtime publication are projections of the same
+canonical facts. A projection may relocate stable sites, filter, sort,
+deduplicate, assign dense IDs, build a compact index, or fold existing seals.
+It may not rerun inference, rebuild lexical/call/result-transfer closures,
+rescan raw owner bodies, reconstruct a whole-project semantic graph, or retain
+a second semantic authority.
+
+The target is a two-level, multi-projection DAG rather than one monolithic
+owner or component fingerprint:
+
+1. One SCC-level component transaction/root publishes public-interface and
+   prepared symbolic/residual result-transfer artifacts. Those projections
+   retain separate fingerprints and exact typed direct dependencies so an
+   equal public result can backdate without hiding a changed transfer
+   dependency.
+2. A per-owner artifact core owns one span-free statement/expression/call
+   representation, canonical typed cross-owner edges, diagnostic templates,
+   and verified-lowering seeds. Source maps remain separate. Checked rows are
+   an on-demand verified extension, not a second copy of the semantic core.
+
+Do not collapse edge kinds merely to reduce graph count. Callable lexical
+scope, public-interface inference, result transfer, output flow, and authority
+share graph/SCC machinery, while each typed edge fact has one authority and
+each compact view contains only dependencies that can affect that semantic
+result. Acyclic components execute once; fixed-point inference is restricted
+to actual cycles.
+
+The optimization order is mandatory:
+
+1. establish exact parity/currentness oracles and close the active correctness
+   blocker;
+2. compile result transfers once into the SCC component artifact and remove
+   recursive source-shaped reinterpretation across nested call frames;
+3. publish the owner artifact core and make diagnostics a shallow owner/global-
+   reducer/source-unit projection, deleting whole-project semantic replay;
+4. fuse redundant interface input validation/module construction into the
+   component transaction and migrate checked/verified consumers to the same
+   facts;
+5. delete every superseded scan, index, rich retained owner, and second
+   semantic implementation, then remeasure;
+6. only after the normative single-threaded cold gates pass, evaluate bounded
+   deterministic scheduling across graph-proven independent SCCs and owner
+   bodies.
+
+Hashing/container tuning, unsafe, caches, crate splitting, and broad
+parallelism do not precede those ownership deletions unless a fresh profile
+proves that one is the largest remaining owner. Parallelism is optional and
+cannot establish a phase exit; disabling every worker pool must leave all
+single-threaded cold gates green.
+
 ## Compiler Architecture
 
 ### Source And Checked Database
@@ -1956,33 +2023,57 @@ checked-shard construction about 1,854 ms, and project assembly about 641 ms.
 These are directional debug results and remain far above every acceptance
 gate.
 
-The next coherent deletion is therefore the already-planned diagnostic-fact
-and public-root cutover, not another lexical/import container tweak. Complete
-invalid/project/editor parity, make public diagnostics request the lean
-aggregate, and prove it constructs zero construction ABI, checked-shard,
-compatibility, or executable products. Reprofile after deleting those measured
-owners; only then optimize the remaining body evaluator or consider a narrow
-safe/unsafe kernel experiment.
+#### 2026-08-11 resumption: restore the owner proof path, then delete semantic multiplication
 
-The adversarial request audit also corrects the following diagnostic cut. The
-current singleton `OwnerDiagnosticsAggregate` is globally red whenever any
-covered owner/body/source map changes and its seal repeats whole-project input
-identity. Replace it with construction-independent per-owner semantic
-diagnostic facts, source-unit-local presentation projections, and a small
-project currentness/ordering receipt. Order, output-root, forward-OUT, render,
-and host validation must be compositional semantic facts shared by diagnostics
-and verified assembly; compatibility assembly may relocate authenticated facts
-but may not remain their second semantic owner. Only after complete invalid and
-editor-projection parity may public diagnostics switch roots and delete the
-measured 1,766.536 ms checked-shard plus 736.461 ms assembly families.
+The lean public diagnostics cutover is now live: a diagnostics request reaches
+the construction-independent aggregate without requesting construction ABI,
+checked shards, checked compatibility assembly, or an executable product. A
+single fresh release empty-session NovyWave observation takes 2,797.973 ms,
+peaks at 385,940 KiB in the compiler report, allocates 2,111,360,279 bytes in
+20,340,455 calls, reports zero diagnostics and full coverage, and spends
+2,708.487 ms in typechecking. This is directional evidence from one sample,
+not acceptance; RSS is also too close to the 384-MiB gate to claim closure.
+
+The verified owner path is presently red while the retained dense checker is
+green. The concrete mismatch is an exact tagged-selector narrowing whose arm
+body crosses into a child owner: the child keeps only the consumer-shaped
+`List<{signal_id: alpha, ..}>` projection and loses the selector-derived
+concrete sibling fields. Close that shared lexical-boundary/type equation and
+the fieldless-HOLD authority regression first, then regenerate the verified
+baseline. Do not begin a performance tranche on a known divergent semantic
+artifact.
+
+After parity is restored, the active optimization order is the two-level DAG
+and deletion contract above. Representative traces show callable/interface
+topology construction is only about 65 ms, while interface SCC/module work is
+roughly 750 ms and owner bodies roughly 1,038 ms. More importantly, 1,251
+result-transfer roots expand to 18,690 owner evaluations, 17,439 nested call
+frames, and 235,484 transfer-node visits. The next large cut is therefore a
+component-sealed symbolic/residual transfer program that removes recursive
+source-shaped interpretation, followed by a span-free owner artifact core and
+deletion of whole-project diagnostic replay. Broad parallelism, caches, hash
+tuning, and unsafe remain behind those single-threaded ownership deletions.
+
+The public-root part of the preceding checkpoint is complete. Per-owner replay
+evaluations and source-unit-local owner diagnostic projections now provide
+currentness and relocation foundations, but the rich whole-project
+`ProjectFactIndex` still rescans owner semantic rows and several checked/
+compatibility paths remain second semantic owners. Do not optimize that replay
+in place. After the residual-transfer cut, publish separately fingerprinted,
+span-free owner diagnostic contributions directly from the owning semantic
+evaluation, feed compact facts to the genuinely global order/output/OUT/
+render/host reducers, and retain a small project currentness/ordering receipt.
+Source-unit projections own spans and presentation. Compatibility assembly may
+relocate authenticated facts but may not independently derive them.
 
 The post-checkpoint `unsafe` review remains deferred. Large safe work is still
 measured and scheduled for deletion, while this tranche exposes no dominant
-allocation-free kernel. Reassess only after the signature overlay, exact symbol
-projections, diagnostic-fact cutover, and fresh profile. If one unifier/CSR/
-packed-offset/exact-initialization kernel then dominates, retain unsafe only
-behind the already-required safe A/B oracle, documented invariant, parity,
-Miri/fuzz where applicable, and material whole-run evidence.
+allocation-free kernel. Reassess only after residual-transfer compilation,
+owner-core/diagnostic localization, component-transaction simplification, and
+a fresh profile. If one unifier/CSR/packed-offset/exact-initialization kernel
+then dominates, retain unsafe only behind the already-required safe A/B oracle,
+documented invariant, parity, Miri/fuzz where applicable, and material whole-
+run evidence.
 
 Checkpoint `a48f488` remains the unit-native M1 ancestor of `42c1aa9`; preserve
 its production checking, compact execution receipt, proof/sealed-plan, and
@@ -2109,8 +2200,10 @@ Rust rebuild closure; keep that evidence separate from Boon latency.
    revisions. Separate public and implementation currentness; require exact
    reverse cones, backdating, add/delete/rename, error recovery, worklist-level
    cancellation, atomic latest-generation publication, and clean-full parity.
-   Use at most two deterministic workers only for graph-proven independent
-   requests.
+   After every single-threaded cold gate and one-authority exit below passes, a
+   separate measured workload may use at most two deterministic workers for
+   graph-proven independent requests. This is not permission to parallelize
+   the current eager request graph.
 9. Pull compiler/runtime adapters out of runtime cores, migration tooling out
    of host core, and semantic/runnable model crates away from their builders
    only at stable one-way seams with measured closure/rebuild improvements. Do
@@ -2143,7 +2236,12 @@ preflight pass.
    and backend name rediscovery as their replacements land.
 
 Exit: both cold checked-diagnostics gates and their RSS/scaling gates pass with
-complete unchanged diagnostics.
+complete unchanged diagnostics. Every diagnostic semantic family has one
+producer; public diagnostics requests no checked construction; project
+reducers consume compact semantic facts rather than raw owner evaluations,
+bodies, or source maps; stale evaluations reject current inputs; semantically
+equal results backdate; unaffected source-unit presentations reuse; and the
+superseded whole-project replay/index is deleted.
 
 ### Phase 2: Semantic Sealing And Verification
 
@@ -2162,7 +2260,9 @@ complete unchanged diagnostics.
 
 Exit: semantic/proof work counters scale within budget, exact dependency
 closures, flat-oracle behavior, stable-contract/persistence identities, and
-negative proof cases pass, and no unsealed artifact is executable.
+negative proof cases pass, and no unsealed artifact is executable. Every
+semantic row is constructed once; proof and currentness are projections of its
+receipt rather than a second semantic graph.
 
 ### Phase 3: Backend, Hash, And Memory Closure
 
@@ -2175,7 +2275,9 @@ negative proof cases pass, and no unsealed artifact is executable.
 Exit: both cold verified-runnable time and RSS gates pass for all fixtures, and
 each fixture has deterministic revision-local artifact hashes plus a passing
 accepted stable-contract/differential oracle. No fixture is pinned to a known
-under-approximated historical artifact.
+under-approximated historical artifact. Verified publication consumes the same
+semantic authorities as diagnostics and has one consuming runnable builder; it
+does not rematerialize semantic or serialization owners.
 
 ### Phase 4: Persistent Session And Editor Cutover
 
@@ -2193,7 +2295,9 @@ under-approximated historical artifact.
    remains the oracle.
 
 Exit: every warm latency, cancellation, latest-generation, and no-stale-
-publication gate passes under edit and example-switch storms.
+publication gate passes under edit and example-switch storms. Unrelated owners
+and components perform zero semantic computation, not merely cache lookups that
+replay a global reducer.
 
 ### Phase 5: Optional Artifact Reuse And Native Presentation
 
@@ -2333,6 +2437,9 @@ revision:
   whole-project editor/preview paths;
 - ordinary definitions are stored once, dead static branches create no later
   work, and unrelated dependency components are not recomputed;
+- every production semantic fact has one producer and every other compiler
+  root is a projection of that fact; no duplicate semantic replay, index,
+  rescan authority, or source-shaped result-transfer interpreter remains;
 - disabling all compiler caches leaves the cold gates green, while immutable
   cache corruption and mismatch cases fail closed;
 - all three fixture plans are deterministic for the final unchanged revision;
@@ -2344,7 +2451,9 @@ revision:
   duplicate compiler owners, and temporary fixture-specific diagnostics are
   deleted;
 - downstream evidence invalidated by the compiler change is rerun rather than
-  declared current by documentation.
+  declared current by documentation;
+- disabling every optional worker pool leaves all normative single-threaded
+  cold gates green.
 - all three independent adversarial reviewers pass every applicable checklist
   item against that same unchanged revision, and every finding from an earlier
   review is closed with regenerated affected evidence.

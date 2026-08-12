@@ -3,8 +3,9 @@ use crate::{
     OwnerConstraintSeed, OwnerConstraintSummary, OwnerInferenceAbiEnvironment,
     OwnerInterfaceEvaluationScope, OwnerLexicalAccess, OwnerLexicalBoundaryBindings,
     OwnerLexicalContainmentPlan, OwnerLexicalDeclarationTarget, OwnerLexicalPlan,
-    OwnerParameterKind, OwnerPublicInterface, OwnerReferenceKind, OwnerSymbolReference,
-    OwnerSymbolResolution, stable_check_owner_key_fingerprint_v2,
+    OwnerLexicalScopeOrigin, OwnerParameterKind, OwnerPatternConstraint, OwnerPublicInterface,
+    OwnerReferenceKind, OwnerSymbolReference, OwnerSymbolResolution,
+    stable_check_owner_key_fingerprint_v2,
 };
 use boon_checked::{
     CheckedCallContextKind, CheckedCallableKind, CheckedParameterKind, CheckedParameterRequirement,
@@ -21,20 +22,20 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-const OWNER_SIGNATURE_LEXICAL_PLAN_DOMAIN_V3: &[u8] = b"boon.owner-signature-lexical-plan.v3\0";
+const OWNER_SIGNATURE_LEXICAL_PLAN_DOMAIN_V4: &[u8] = b"boon.owner-signature-lexical-plan.v4\0";
 const OWNER_SIGNATURE_LEXICAL_READS_DOMAIN_V2: &[u8] = b"boon.owner-signature-lexical-reads.v2\0";
 const OWNER_SIGNATURE_LEXICAL_INPUTS_DOMAIN_V2: &[u8] = b"boon.owner-signature-lexical-inputs.v2\0";
-const OWNER_SIGNATURE_LEXICAL_ENVIRONMENT_DOMAIN_V2: &[u8] =
-    b"boon.owner-signature-lexical-environment.v2\0";
+const OWNER_SIGNATURE_LEXICAL_ENVIRONMENT_DOMAIN_V3: &[u8] =
+    b"boon.owner-signature-lexical-environment.v3\0";
 const OWNER_CALLABLE_SCOPE_COMPONENT_DOMAIN_V2: &[u8] = b"boon.owner-callable-scope-component.v2\0";
 const OWNER_LEXICAL_CONTAINMENT_CLUSTER_DOMAIN_V1: &[u8] =
     b"boon.owner-lexical-containment-cluster.v1\0";
 const OWNER_CALLABLE_RESOLUTION_PLAN_DOMAIN_V2: &[u8] = b"boon.owner-callable-resolution-plan.v2\0";
 const OWNER_CALLABLE_SCOPE_SCC_DOMAIN_V2: &[u8] = b"boon.owner-callable-scope-scc.v2\0";
 const OWNER_CALLABLE_SCOPE_TOPOLOGY_DOMAIN_V2: &[u8] = b"boon.owner-callable-scope-topology.v2\0";
-const OWNER_CALLABLE_SCOPE_RESULT_DOMAIN_V2: &[u8] = b"boon.owner-callable-scope-result.v2\0";
-const OWNER_CALLABLE_SCOPE_CURRENTNESS_DOMAIN_V2: &[u8] =
-    b"boon.owner-callable-scope-currentness.v2\0";
+const OWNER_CALLABLE_SCOPE_RESULT_DOMAIN_V3: &[u8] = b"boon.owner-callable-scope-result.v3\0";
+const OWNER_CALLABLE_SCOPE_CURRENTNESS_DOMAIN_V3: &[u8] =
+    b"boon.owner-callable-scope-currentness.v3\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerSignatureLexicalPlanError {
@@ -546,6 +547,24 @@ pub struct OwnerSignatureCallPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerInheritedPatternNarrowingPlan {
+    /// Stable provenance of the arm that owns this narrowing. This is not
+    /// inferred from a consumer spelling and remains distinct for nested arms
+    /// that happen to use the same pattern and selector path.
+    pub arm_expression: StableExpressionKey,
+    /// Exact selector occurrence evaluated by `arm_expression`.
+    pub selector_expression: StableExpressionKey,
+    /// Stable lexical declaration selected in the provider before crossing
+    /// the child-owner boundary.
+    pub selector_target: OwnerLexicalTargetRef,
+    /// Absolute projection from `selector_target` to the value matched by the
+    /// arm. Consumer reads below this path may use the arm-local type, while
+    /// the captured declaration surface remains unchanged.
+    pub selector_projection: Box<[String]>,
+    pub pattern: OwnerPatternConstraint,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerSignatureLexicalEnvironment {
     pub provider: StableCheckOwnerKey,
     pub consumer: StableCheckOwnerKey,
@@ -553,6 +572,10 @@ pub struct OwnerSignatureLexicalEnvironment {
     pub boundary_scope: Option<OwnerStableScopeRef>,
     pub bindings: OwnerLexicalBoundaryBindings,
     pub evaluation_scope: Option<OwnerLexicalTargetRef>,
+    /// Ordered outer-to-inner arm facts active at the child boundary. These
+    /// remain type-free; interface/body inference resolves the exact imported
+    /// target and applies the patterns without constraining the provider root.
+    pub pattern_narrowings: Box<[OwnerInheritedPatternNarrowingPlan]>,
     fingerprint_v1: [u8; 32],
 }
 
@@ -560,11 +583,20 @@ pub struct OwnerSignatureLexicalEnvironment {
 pub struct OwnerImportedLexicalCaptureSites {
     pub target: OwnerLexicalTargetRef,
     pub sites: Box<[StableExpressionKey]>,
+    /// Prefix-minimal projections whose complete result subtrees are observed
+    /// by this owner. An empty projection is an honest whole-target demand
+    /// (notably implicit PASSED); otherwise only object ancestors needed to
+    /// reach these terminals belong to the public capture surface.
+    pub demand_paths: Box<[Box<[String]>]>,
 }
 
 impl OwnerSignatureLexicalEnvironment {
     pub const fn fingerprint_v1(&self) -> [u8; 32] {
         self.fingerprint_v1
+    }
+
+    pub fn pattern_narrowings(&self) -> &[OwnerInheritedPatternNarrowingPlan] {
+        &self.pattern_narrowings
     }
 }
 
@@ -677,6 +709,16 @@ impl OwnerSignatureLexicalPlan {
         &self.imported_capture_sites
     }
 
+    pub fn imported_capture_sites_for(
+        &self,
+        target: &OwnerLexicalTargetRef,
+    ) -> Option<&OwnerImportedLexicalCaptureSites> {
+        self.imported_capture_sites
+            .binary_search_by(|capture| capture.target.cmp(target))
+            .ok()
+            .map(|index| &self.imported_capture_sites[index])
+    }
+
     pub(crate) fn is_external_candidate(&self, reference: &OwnerSymbolReference) -> bool {
         self.external_candidates.binary_search(reference).is_ok()
     }
@@ -752,6 +794,36 @@ impl OwnerSignatureLexicalPlan {
     }
 }
 
+fn effective_pattern_selector_target_is_readable(target: &OwnerEffectiveLexicalTarget) -> bool {
+    matches!(
+        target,
+        OwnerEffectiveLexicalTarget::Static { target }
+            if !matches!(target, OwnerLexicalDeclarationTarget::Ambiguous { .. })
+    ) || matches!(
+        target,
+        OwnerEffectiveLexicalTarget::FreshOut { .. }
+            | OwnerEffectiveLexicalTarget::CallContext { .. }
+            | OwnerEffectiveLexicalTarget::Imported {
+                target: OwnerLexicalTargetRef::Declaration {
+                    capability: OwnerLexicalDeclarationCapability::Value
+                        | OwnerLexicalDeclarationCapability::Out { .. },
+                    ..
+                } | OwnerLexicalTargetRef::ContextFormal { .. },
+            }
+    )
+}
+
+fn stable_pattern_selector_target_is_readable(target: &OwnerLexicalTargetRef) -> bool {
+    matches!(
+        target,
+        OwnerLexicalTargetRef::Declaration {
+            capability: OwnerLexicalDeclarationCapability::Value
+                | OwnerLexicalDeclarationCapability::Out { .. },
+            ..
+        } | OwnerLexicalTargetRef::ContextFormal { .. }
+    )
+}
+
 pub(crate) fn effective_narrowed_selector_read_matches(
     seed: &OwnerConstraintSeed,
     plan: &OwnerSignatureLexicalPlan,
@@ -766,27 +838,9 @@ pub(crate) fn effective_narrowed_selector_read_matches(
         .and_then(Option::as_ref);
     match (selector_read, candidate_read) {
         (Some(selector_read), Some(candidate_read)) => {
-            let target_is_narrowable = |target: &OwnerEffectiveLexicalTarget| {
-                matches!(
-                    target,
-                    OwnerEffectiveLexicalTarget::Static { target }
-                        if !matches!(target, OwnerLexicalDeclarationTarget::Ambiguous { .. })
-                ) || matches!(
-                    target,
-                    OwnerEffectiveLexicalTarget::FreshOut { .. }
-                        | OwnerEffectiveLexicalTarget::CallContext { .. }
-                        | OwnerEffectiveLexicalTarget::Imported {
-                            target: OwnerLexicalTargetRef::Declaration {
-                                capability: OwnerLexicalDeclarationCapability::Value
-                                    | OwnerLexicalDeclarationCapability::Out { .. },
-                                ..
-                            } | OwnerLexicalTargetRef::ContextFormal { .. },
-                        }
-                )
-            };
             selector_read.access == OwnerLexicalAccess::Read
                 && candidate_read.access == OwnerLexicalAccess::Read
-                && target_is_narrowable(&selector_read.target)
+                && effective_pattern_selector_target_is_readable(&selector_read.target)
                 && selector_read.target == candidate_read.target
                 && candidate_read
                     .projection
@@ -1322,7 +1376,7 @@ pub fn evaluate_owner_callable_scope_scc<'a>(
         })
         .collect::<Vec<_>>();
     let fingerprint_v1 = fingerprint(
-        OWNER_CALLABLE_SCOPE_RESULT_DOMAIN_V2,
+        OWNER_CALLABLE_SCOPE_RESULT_DOMAIN_V3,
         &(&scc.key, &semantic_fingerprints),
     )?;
     let result = Arc::new(OwnerCallableScopeSccResult {
@@ -1357,7 +1411,7 @@ pub fn evaluate_owner_callable_scope_scc<'a>(
     };
     let result_fingerprint_v1 = result.fingerprint_v1();
     let currentness_fingerprint_v1 = fingerprint(
-        OWNER_CALLABLE_SCOPE_CURRENTNESS_DOMAIN_V2,
+        OWNER_CALLABLE_SCOPE_CURRENTNESS_DOMAIN_V3,
         &(&basis, result_fingerprint_v1),
     )?;
     Ok(OwnerCallableScopeSccEvaluation {
@@ -2012,6 +2066,137 @@ impl<'a> Planner<'a> {
         Ok(Some(target))
     }
 
+    fn inherited_pattern_narrowings_at_boundary(
+        &self,
+        boundary: &crate::OwnerLexicalChildBoundaryPlan,
+    ) -> Result<Box<[OwnerInheritedPatternNarrowingPlan]>, OwnerSignatureLexicalPlanError> {
+        let mut narrowings = self
+            .inherited_environment
+            .as_ref()
+            .map(|environment| environment.pattern_narrowings.to_vec())
+            .unwrap_or_default();
+        let Some(stable_scope) = boundary.scope.as_ref() else {
+            // Project-root boundaries have no local lexical ancestry. They may
+            // still forward arm facts inherited from their own provider.
+            return Ok(narrowings.into_boxed_slice());
+        };
+        let mut dense_scope = None;
+        for (index, candidate) in self
+            .seed
+            .signature_regions()
+            .stable_scopes()
+            .iter()
+            .enumerate()
+        {
+            if candidate.as_ref() != Some(stable_scope) {
+                continue;
+            }
+            let index = checked_u32(index, "owner pattern boundary scope")?;
+            if dense_scope.replace(index).is_some() {
+                return Err(OwnerSignatureLexicalPlanError::new(
+                    "owner pattern boundary stable scope maps to multiple dense scopes",
+                ));
+            }
+        }
+        let mut scope = dense_scope.ok_or_else(|| {
+            OwnerSignatureLexicalPlanError::new(
+                "owner pattern boundary stable scope has no dense scope",
+            )
+        })?;
+        let scopes = self.seed.signature_regions().scopes();
+        let mut active = BTreeSet::new();
+        let mut arms = Vec::new();
+        loop {
+            if !active.insert(scope) {
+                return Err(OwnerSignatureLexicalPlanError::new(
+                    "owner pattern boundary scope ancestry contains a cycle",
+                ));
+            }
+            let scope_plan = scopes.get(scope as usize).ok_or_else(|| {
+                OwnerSignatureLexicalPlanError::new(
+                    "owner pattern boundary scope ancestry references a missing scope",
+                )
+            })?;
+            if let OwnerLexicalScopeOrigin::PatternArm { expression } = scope_plan.origin {
+                arms.push(expression);
+            }
+            let Some(parent) = scope_plan.parent else {
+                break;
+            };
+            scope = parent;
+        }
+        arms.reverse();
+
+        for arm in arms {
+            let arm_node = self.seed.expressions.get(arm as usize).ok_or_else(|| {
+                OwnerSignatureLexicalPlanError::new(
+                    "owner pattern boundary ancestry references a missing arm expression",
+                )
+            })?;
+            let OwnerConstraintNodeKind::MatchArm { pattern } = &arm_node.kind else {
+                return Err(OwnerSignatureLexicalPlanError::new(
+                    "owner pattern boundary scope is not backed by a match arm",
+                ));
+            };
+            if matches!(
+                pattern,
+                OwnerPatternConstraint::Wildcard
+                    | OwnerPatternConstraint::Binding { .. }
+                    | OwnerPatternConstraint::Invalid
+            ) {
+                continue;
+            }
+            let mut selectors = arm_node.inputs.iter().filter_map(|input| {
+                matches!(input.role, OwnerConstraintEdgeRole::MatchSelector)
+                    .then_some(input.expression)
+            });
+            let Some(selector) = selectors.next() else {
+                // Invalid/unattached arms are diagnosed from the syntax seed;
+                // they cannot export a branch-local selector fact.
+                continue;
+            };
+            if selectors.next().is_some() {
+                return Err(OwnerSignatureLexicalPlanError::new(
+                    "owner pattern arm has multiple selector expressions",
+                ));
+            }
+            let Some(read) = self.reads.get(selector as usize).and_then(Option::as_ref) else {
+                // A surviving external value candidate has no exact lexical
+                // target at this phase. Never turn its spelling into an
+                // inherited capture guess.
+                continue;
+            };
+            if read.access != OwnerLexicalAccess::Read
+                || !effective_pattern_selector_target_is_readable(&read.target)
+            {
+                continue;
+            }
+            let Some(target) = self.stable_effective_target(&read.target)? else {
+                continue;
+            };
+            if !stable_pattern_selector_target_is_readable(&target) {
+                continue;
+            }
+            let selector_node = self
+                .seed
+                .expressions
+                .get(selector as usize)
+                .ok_or_else(|| {
+                    OwnerSignatureLexicalPlanError::new(
+                        "owner pattern arm selector is outside the expression namespace",
+                    )
+                })?;
+            narrowings.push(OwnerInheritedPatternNarrowingPlan {
+                arm_expression: arm_node.expression.clone(),
+                selector_expression: selector_node.expression.clone(),
+                selector_target: target,
+                selector_projection: read.projection.clone(),
+                pattern: pattern.clone(),
+            });
+        }
+        Ok(narrowings.into_boxed_slice())
+    }
+
     fn emit_child_environment(
         &mut self,
         boundary: &crate::OwnerLexicalChildBoundaryPlan,
@@ -2092,8 +2277,9 @@ impl<'a> Planner<'a> {
                 "inheriting owner child boundary has no observation expression",
             )
         })?;
+        let pattern_narrowings = self.inherited_pattern_narrowings_at_boundary(boundary)?;
         let fingerprint_v1 = fingerprint(
-            OWNER_SIGNATURE_LEXICAL_ENVIRONMENT_DOMAIN_V2,
+            OWNER_SIGNATURE_LEXICAL_ENVIRONMENT_DOMAIN_V3,
             &(
                 &self.seed.owner,
                 &boundary.owner,
@@ -2101,6 +2287,7 @@ impl<'a> Planner<'a> {
                 &boundary.scope,
                 bindings.fingerprint_v1(),
                 &evaluation_scope,
+                &pattern_narrowings,
             ),
         )?;
         let environment = OwnerSignatureLexicalEnvironment {
@@ -2110,6 +2297,7 @@ impl<'a> Planner<'a> {
             boundary_scope: boundary.scope.clone(),
             bindings,
             evaluation_scope,
+            pattern_narrowings,
             fingerprint_v1,
         };
         match self.child_environments.entry(boundary.owner.clone()) {
@@ -2829,11 +3017,14 @@ impl<'a> Planner<'a> {
             ));
         }
         let child_environments = self.child_environments.into_values().collect::<Vec<_>>();
-        let mut imported_capture_sites =
-            BTreeMap::<OwnerLexicalTargetRef, BTreeSet<StableExpressionKey>>::new();
+        let mut imported_capture_sites = BTreeMap::<
+            OwnerLexicalTargetRef,
+            (BTreeSet<StableExpressionKey>, BTreeSet<Vec<String>>),
+        >::new();
         for (index, read) in self.reads.iter().enumerate() {
             let Some(OwnerEffectiveLexicalReadPlan {
                 target: OwnerEffectiveLexicalTarget::Imported { target },
+                projection,
                 ..
             }) = read
             else {
@@ -2850,7 +3041,13 @@ impl<'a> Planner<'a> {
                 imported_capture_sites
                     .entry(target.clone())
                     .or_default()
+                    .0
                     .insert(self.seed.expressions[index].expression.clone());
+                imported_capture_sites
+                    .get_mut(target)
+                    .expect("imported capture site was just inserted")
+                    .1
+                    .insert(projection.to_vec());
             }
         }
         // PASSED is also an implicit call input. A value child may need the
@@ -2864,15 +3061,49 @@ impl<'a> Planner<'a> {
                 imported_capture_sites
                     .entry(binding.target.clone())
                     .or_default()
+                    .0
                     .insert(environment.observation_expression.clone());
+                imported_capture_sites
+                    .get_mut(&binding.target)
+                    .expect("implicit PASSED capture site was just inserted")
+                    .1
+                    .insert(Vec::new());
+            }
+        }
+        // A child read below an inherited WHEN arm needs the selector subtree
+        // as one correlated observation. Merely retaining the deepest read
+        // path would flatten branch correlations before the child applies the
+        // arm-local narrowing. Only add frames for targets already demanded by
+        // an actual read/PASSED capability in this owner.
+        if let Some(environment) = &self.inherited_environment {
+            for narrowing in environment.pattern_narrowings() {
+                if let Some((_, demand_paths)) =
+                    imported_capture_sites.get_mut(&narrowing.selector_target)
+                {
+                    demand_paths.insert(narrowing.selector_projection.to_vec());
+                }
             }
         }
         let imported_captures = imported_capture_sites.keys().cloned().collect::<Vec<_>>();
         let imported_capture_sites = imported_capture_sites
             .into_iter()
-            .map(|(target, sites)| OwnerImportedLexicalCaptureSites {
-                target,
-                sites: sites.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            .map(|(target, (sites, demand_paths))| {
+                let mut prefix_minimal = Vec::<Vec<String>>::new();
+                for path in demand_paths {
+                    if prefix_minimal.iter().any(|prefix| path.starts_with(prefix)) {
+                        continue;
+                    }
+                    prefix_minimal.push(path);
+                }
+                OwnerImportedLexicalCaptureSites {
+                    target,
+                    sites: sites.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+                    demand_paths: prefix_minimal
+                        .into_iter()
+                        .map(Vec::into_boxed_slice)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                }
             })
             .collect::<Vec<_>>();
         let mut call_indices = vec![None; self.seed.expressions.len()];
@@ -2899,7 +3130,7 @@ impl<'a> Planner<'a> {
             .map(OwnerSignatureLexicalEnvironment::fingerprint_v1)
             .collect::<Vec<_>>();
         let fingerprint_v1 = fingerprint(
-            OWNER_SIGNATURE_LEXICAL_PLAN_DOMAIN_V3,
+            OWNER_SIGNATURE_LEXICAL_PLAN_DOMAIN_V4,
             &(
                 &self.seed.owner,
                 self.seed.fingerprint_v1(),

@@ -454,6 +454,28 @@ impl<'a> UnitOwnerSyntaxView<'a> {
         self.fields.owner_index.statement_locator(statement)
     }
 
+    /// Return any unit-local statement reachable through this owner's
+    /// containment chain, including an enclosing statement owned by another
+    /// item. Owner projections use this to preserve declaration authority at
+    /// a child boundary without retaining the whole parent AST.
+    pub fn statement_for_local(&self, statement: UnitLocalStatementId) -> Option<&'a AstStatement> {
+        unit_statement_by_local_id(self.fields, statement, 0)
+    }
+
+    /// Return the stable check owner of any unit-local statement. This is the
+    /// statement counterpart of `stable_check_owner_for_syntax_expression` and
+    /// is intended for exact cross-owner containment authority.
+    pub fn stable_check_owner_for_local_statement(
+        &self,
+        statement: UnitLocalStatementId,
+    ) -> Option<StableCheckOwnerKey> {
+        stable_check_owner_key_for_slot(
+            &self.fields.source_unit_id,
+            &self.fields.item_index,
+            self.fields.owner_index.statement_owner(statement)?,
+        )
+    }
+
     pub fn stable_statement_key_local(
         &self,
         statement: UnitLocalStatementId,
@@ -642,6 +664,110 @@ impl<'a> UnitOwnerSyntaxView<'a> {
                 route_digest_v1: fields.expression_route_digests_v1[expression.as_usize()]
                     .expect("owned parser expression has a structural identity"),
             })
+    }
+
+    /// Count authored fieldless HOLD owners for one declaration authority that
+    /// precede this owner in source order. This is unit-local lookup metadata,
+    /// not part of a stable owner key: checked state lowering uses it only to
+    /// reproduce the declaration's dense `state_N` path ordinal across owner
+    /// boundaries, including sibling HOLDs whose authored names differ.
+    pub fn preceding_fieldless_hold_count_for_authority(
+        &self,
+        authority: &StableCheckOwnerKey,
+    ) -> Option<usize> {
+        let StableCheckOwnerKey::Item(authority) = authority else {
+            return None;
+        };
+        if &authority.source_unit_id != self.source_unit_id() {
+            return None;
+        }
+        let UnitOwnerRoute::Item(_) = self.route() else {
+            return None;
+        };
+        let current_statement = self.entry.statements.first()?.as_usize();
+        let authority_route = authority.item_route.segments();
+        Some(
+            self.fields
+                .item_index
+                .entries
+                .iter()
+                .filter(|candidate| candidate.local_statement_id < current_statement)
+                .filter(|candidate| {
+                    let candidate_route = candidate.route.segments();
+                    let in_authority = candidate_route == authority_route
+                        && authority_route
+                            .last()
+                            .is_some_and(|segment| segment.kind == UnitItemKind::Hold);
+                    let in_fieldless_chain = candidate_route
+                        .strip_prefix(authority_route)
+                        .is_some_and(|descendants| {
+                            !descendants.is_empty()
+                                && descendants
+                                    .iter()
+                                    .all(|segment| segment.kind == UnitItemKind::Hold)
+                        });
+                    if !in_authority && !in_fieldless_chain {
+                        return false;
+                    }
+                    let statement = UnitLocalStatementId::__parser_new(
+                        candidate.local_statement_id,
+                    )
+                    .and_then(|statement| unit_statement_by_local_id(self.fields, statement, 0));
+                    matches!(
+                        statement.map(|statement| &statement.kind),
+                        Some(AstStatementKind::Hold {
+                            field: None,
+                            name: Some(_),
+                        })
+                    )
+                })
+                .count(),
+        )
+    }
+
+    /// Whether this owner's public result is the declaration value published
+    /// by `authority` after walking only the transparent state-path wrappers
+    /// used by checked lowering.
+    pub fn public_result_is_transparent_from_authority(
+        &self,
+        authority: &StableCheckOwnerKey,
+    ) -> Option<bool> {
+        let StableCheckOwnerKey::Item(authority) = authority else {
+            return None;
+        };
+        if &authority.source_unit_id != self.source_unit_id() {
+            return None;
+        }
+        let UnitOwnerRoute::Item(current_route) = self.route() else {
+            return None;
+        };
+        let result_for_route = |route: &StableItemRoute| {
+            self.fields
+                .owner_index
+                .entries()
+                .iter()
+                .flat_map(|entry| &entry.child_owners)
+                .find(|boundary| &boundary.route == route)
+                .and_then(UnitChildOwnerBoundary::result_expression)
+        };
+        let mut expression = result_for_route(&authority.item_route)?;
+        let target = result_for_route(current_route)?;
+        let mut visited = BTreeSet::new();
+        while visited.insert(expression) {
+            if expression == target {
+                return Some(true);
+            }
+            let syntax = self.fields.ast.expressions.get(expression.as_usize())?;
+            let next = match &syntax.kind {
+                AstExprKind::Draining { input } => Some(*input),
+                AstExprKind::Flush { payload } => *payload,
+                AstExprKind::Block { result, .. }
+                | AstExprKind::MatchArm { output: result, .. } => *result,
+                _ => None,
+            }?;
+            expression = self.local_expression_id(next)?;
+        }
+        Some(false)
     }
 }
 

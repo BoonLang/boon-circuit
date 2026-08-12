@@ -748,6 +748,47 @@ stronger three-reviewer performance closure defined below.
    a remaining dominant narrow kernel under the safe A/B, invariant, parity,
    Miri/fuzz, and material whole-run contract.
 
+   The 2026-08-11 architecture priority supersedes the older ordering in the
+   preceding historical checkpoint paragraphs. Step 1 now follows **one
+   semantic computation, many cheap projections**:
+
+   1. preserve exact semantic, diagnostic, proof, persistence, and artifact
+      parity while closing the current HOLD/verified-owner correctness lane;
+   2. use one interface-SCC component transaction/root to publish separately
+      fingerprinted public-interface and prepared symbolic/residual result-
+      transfer artifacts, then delete recursive source-shaped transfer
+      reinterpretation across nested call frames;
+   3. publish one span-free per-owner artifact core with canonical typed edges,
+      body rows, diagnostic templates, and verified-lowering seeds, while
+      keeping source maps separate;
+   4. make project diagnostics consume owner facts plus compact genuinely
+      global reducers, make source-unit requests presentation-only, and delete
+      the raw all-owner `ProjectFactIndex` semantic replay;
+   5. make checked/verified construction an authenticated extension of the same
+      core, then delete duplicate row stores, scans, compatibility semantics,
+      and rich reseals;
+   6. simplify interface/component input transactions and reprofile the
+      remaining single-threaded work;
+   7. only after every normative single-threaded cold gate passes, optionally
+      test deterministic at-most-two-worker scheduling across graph-proven
+      independent SCCs and owner bodies.
+
+   Stable owner identities remain, but as compact rows. Give each typed
+   dependency-edge fact one authority, and use shared graph/SCC machinery with
+   view-specific compact edge tables so unrelated semantics do not form
+   artificial cycles. Process acyclic components once and reserve fixed-point
+   solving for actual cycles. Hash at artifact boundaries; keep exact
+   evaluation currentness separate from backdatable semantic-result
+   fingerprints. Do not parallelize the current eager or globally red request
+   families.
+
+   This ordering is a deletion contract, not a packaging exercise. A wrapper
+   that stores the same old Arcs while consumers still gather, clone, scan, or
+   reinterpret them is not a checkpoint. Each tranche must name and remove the
+   superseded producer/index/scan, retain clean-vs-warm and stale-input oracles,
+   and show the expected counter and wall-time reduction before the next
+   tranche is chosen.
+
    Documentation, instrumentation, a crate split, a focused test pass, or an
    authorized checkpoint commit is not this step's exit. After each checkpoint,
    continue with the next red or missing performance gate in the same goal run.

@@ -17,7 +17,7 @@ use crate::{
     OwnerSignatureDeclarationPlan, OwnerSignatureDeclarationTarget,
     OwnerSignatureMatchedInputSource, OwnerSignatureOutputBindingPlan, OwnerSignaturePassSource,
     OwnerSourceAnchorSite, OwnerSymbolResolution, OwnerSyntaxGraph, OwnerSyntaxInput,
-    owner_abi_value_declaration_key,
+    hold_alias_declaration_target, owner_abi_value_declaration_key,
 };
 use boon_checked::{
     CheckedCallContextKind, CheckedCallableKind, CheckedDeclarationKind, CheckedIntrinsicV1,
@@ -557,6 +557,7 @@ struct OwnerRowConstruction<'a> {
     statement_declarations: BTreeMap<OwnerStatementId, OwnerDeclarationId>,
     parameter_declarations: BTreeMap<u32, OwnerDeclarationId>,
     record_expression_scopes: BTreeMap<OwnerExpressionId, OwnerScopeId>,
+    caller_scoped_pass_records: BTreeSet<OwnerExpressionId>,
     record_field_declarations: BTreeMap<(OwnerExpressionId, u32), OwnerDeclarationId>,
     statement_by_expression: BTreeMap<u32, OwnerStatementId>,
     statement_scopes: Vec<OwnerScopeRef>,
@@ -642,6 +643,11 @@ impl<'a> OwnerRowConstruction<'a> {
             statement_declarations: BTreeMap::new(),
             parameter_declarations: BTreeMap::new(),
             record_expression_scopes: BTreeMap::new(),
+            caller_scoped_pass_records:
+                crate::owner_constraints::caller_scoped_pass_record_expressions(syntax)
+                    .into_iter()
+                    .map(OwnerExpressionId)
+                    .collect(),
             record_field_declarations: BTreeMap::new(),
             statement_by_expression,
             statement_scopes: vec![containing_scope; syntax.statements.len()],
@@ -746,7 +752,14 @@ impl<'a> OwnerRowConstruction<'a> {
                     self.syntax.owner, statement.0
                 )));
             };
-            if declaration_name(&statement_input.kind).is_none() {
+            let owns_fieldless_hold = matches!(
+                hold_alias_declaration_target(self.syntax, statement.0)
+                    .map_err(|error| CheckedOwnerBuildError::new(error.to_string()))?,
+                Some(OwnerLexicalDeclarationTarget::Statement {
+                    statement: target,
+                }) if target == statement.0
+            );
+            if declaration_name(&statement_input.kind).is_none() && !owns_fieldless_hold {
                 continue;
             }
             let stable_key = if declaration.public {
@@ -953,7 +966,7 @@ impl<'a> OwnerRowConstruction<'a> {
                 DeclarationSpec {
                     stable_key,
                     scope: self.statement_scopes[statement_id.0 as usize].clone(),
-                    name: declaration_name(&statement.kind)
+                    name: materialized_declaration_name(&statement.kind)
                         .expect("reserved declarations have a lexical name")
                         .to_owned(),
                     kind: checked_declaration_kind(declaration.kind),
@@ -1384,6 +1397,7 @@ impl<'a> OwnerRowConstruction<'a> {
             return Ok(());
         }
         let expression_id = OwnerExpressionId(expression);
+        let inherited_scope = scope.clone();
         let scope = if let Some(record_scope) =
             self.record_expression_scopes.get(&expression_id).copied()
         {
@@ -1433,6 +1447,11 @@ impl<'a> OwnerRowConstruction<'a> {
             _ => None,
         };
         if let Some(fields) = record_fields {
+            let field_scope = if self.caller_scoped_pass_records.contains(&expression_id) {
+                inherited_scope
+            } else {
+                scope.clone()
+            };
             for (ordinal, field) in fields.into_iter().enumerate() {
                 let field_declaration = if field.spread {
                     declaration.clone()
@@ -1446,7 +1465,7 @@ impl<'a> OwnerRowConstruction<'a> {
                 };
                 self.assign_expression_tree(
                     checked_u32(field.value, "owner record field value")?,
-                    scope.clone(),
+                    field_scope.clone(),
                     field_declaration,
                     true,
                     assigned,
@@ -3158,6 +3177,82 @@ impl<'a> OwnerRowConstruction<'a> {
         None
     }
 
+    /// Whether `target` is the value published by a declaration after walking
+    /// only transparent result wrappers. This is the owner-row equivalent of
+    /// the retiring dense checker's declaration-result authority walk.
+    fn state_is_declaration_result(
+        expressions: &[OwnerExpressionRow],
+        root: &OwnerExpressionRef,
+        target: OwnerExpressionId,
+    ) -> bool {
+        let OwnerExpressionRef::Local { expression } = root else {
+            return false;
+        };
+        let mut current = *expression;
+        let mut visited = BTreeSet::new();
+        while visited.insert(current) {
+            if current == target {
+                return true;
+            }
+            let Some(expression) = expressions
+                .get(current.0 as usize)
+                .filter(|expression| expression.id == current)
+            else {
+                return false;
+            };
+            let next = match &expression.kind {
+                OwnerExpressionKind::Draining { input }
+                | OwnerExpressionKind::Flush { payload: input } => input,
+                OwnerExpressionKind::Block {
+                    result: Some(result),
+                    ..
+                }
+                | OwnerExpressionKind::MatchArm {
+                    output: Some(result),
+                    ..
+                } => result,
+                _ => return false,
+            };
+            let OwnerExpressionRef::Local { expression } = next else {
+                return false;
+            };
+            current = *expression;
+        }
+        false
+    }
+
+    /// Return the count of state rows already owned by an enclosing declaration
+    /// before this fieldless-HOLD owner begins. Owner-local row counts cannot
+    /// distinguish nested child owners because every child starts at row zero;
+    /// the stable item-route ancestry supplies the missing authored prefix.
+    fn inherited_hold_state_ordinal_base(
+        &self,
+        declaration: &OwnerDeclarationRef,
+    ) -> Result<Option<usize>, CheckedOwnerBuildError> {
+        if !matches!(
+            declaration,
+            OwnerDeclarationRef::ScopeOwner {
+                scope: OwnerScopeRef::Imported { .. },
+            } | OwnerDeclarationRef::ImportedStable { .. }
+                | OwnerDeclarationRef::Imported { .. }
+        ) {
+            return Ok(None);
+        }
+        let Some(root) = self.syntax.statements.first() else {
+            return Ok(None);
+        };
+        if !matches!(
+            &root.kind,
+            AstStatementKind::Hold {
+                field: None,
+                name: Some(_),
+            }
+        ) {
+            return Ok(None);
+        }
+        Ok(self.syntax.containing_hold_state_ordinal_base)
+    }
+
     fn derive_resource_rows(
         &self,
         statements: &mut [OwnerStatementRow],
@@ -3272,27 +3367,37 @@ impl<'a> OwnerRowConstruction<'a> {
             };
             let mut projection =
                 self.declaration_resource_projection(expressions, &declaration, expression.id);
-            if projection.is_empty()
-                && matches!(
-                    &declaration,
-                    OwnerDeclarationRef::Local { declaration }
-                        if self
-                            .declaration_specs
-                            .get(declaration.0 as usize)
-                            .and_then(Option::as_ref)
-                            .is_some_and(|declaration| {
-                                declaration.kind == CheckedDeclarationKind::Function
-                            })
-                )
-            {
-                projection.push(format!(
-                    "state_{}",
-                    derived
-                        .states
-                        .iter()
-                        .filter(|state| state.declaration == declaration)
-                        .count()
-                ));
+            let inherited_ordinal_base = self.inherited_hold_state_ordinal_base(&declaration)?;
+            let local_declaration = match &declaration {
+                OwnerDeclarationRef::Local { declaration } => self
+                    .declaration_specs
+                    .get(declaration.0 as usize)
+                    .and_then(Option::as_ref),
+                OwnerDeclarationRef::Imported { .. }
+                | OwnerDeclarationRef::ImportedStable { .. }
+                | OwnerDeclarationRef::Abi { .. }
+                | OwnerDeclarationRef::ScopeOwner { .. } => None,
+            };
+            let declaration_result = local_declaration
+                .and_then(|declaration| declaration.value.as_ref())
+                .is_some_and(|root| {
+                    Self::state_is_declaration_result(expressions, root, expression.id)
+                })
+                || inherited_ordinal_base.is_some()
+                    && self.syntax.containing_hold_is_declaration_result;
+            let function_declaration = local_declaration
+                .is_some_and(|declaration| declaration.kind == CheckedDeclarationKind::Function);
+            if projection.is_empty() && (!declaration_result || function_declaration) {
+                let local_ordinal = derived
+                    .states
+                    .iter()
+                    .filter(|state| state.declaration == declaration)
+                    .count();
+                let ordinal = inherited_ordinal_base
+                    .unwrap_or_default()
+                    .checked_add(local_ordinal)
+                    .ok_or_else(|| CheckedOwnerBuildError::new("owner state ordinal overflowed"))?;
+                projection.push(format!("state_{ordinal}"));
             }
             let state = OwnerStateRow {
                 id: OwnerStateId(checked_u32(derived.states.len(), "owner state id")?),
@@ -5720,6 +5825,25 @@ fn declaration_name(kind: &AstStatementKind) -> Option<&str> {
     }
 }
 
+/// Return the name of a declaration that the checked shard actually
+/// materializes. `declaration_name` intentionally excludes fieldless HOLD
+/// update aliases because most of them reuse an enclosing declaration. The
+/// reservation pass admits the one alias selected as the lexical authority;
+/// only that reserved row may use the authored HOLD name here.
+fn materialized_declaration_name(kind: &AstStatementKind) -> Option<&str> {
+    declaration_name(kind).or_else(|| match kind {
+        AstStatementKind::Hold { field: None, name } => name.as_deref(),
+        AstStatementKind::Function { .. }
+        | AstStatementKind::Field { .. }
+        | AstStatementKind::Source { .. }
+        | AstStatementKind::Hold { field: Some(_), .. }
+        | AstStatementKind::List { .. }
+        | AstStatementKind::Block
+        | AstStatementKind::Spread
+        | AstStatementKind::Expression => None,
+    })
+}
+
 fn public_declaration_flow_type(interface: &OwnerPublicInterface) -> FlowType {
     if interface.declaration_kind != Some(OwnerDeclarationKind::Function) {
         return interface.result.clone();
@@ -6025,8 +6149,8 @@ pub fn build_checked_owner_shard<'a>(
 mod tests {
     use super::*;
     use crate::{
-        OwnerConstraintEdgeRole, OwnerSignatureCallLexicalError, OwnerSourceAnchorRole,
-        build_owner_callable_scope_topology, build_owner_interface_topology,
+        OwnerConstraintEdgeRole, OwnerPatternConstraint, OwnerSignatureCallLexicalError,
+        OwnerSourceAnchorRole, build_owner_callable_scope_topology, build_owner_interface_topology,
         evaluate_owner_body_with_signature_plan, evaluate_owner_callable_scope_scc,
         evaluate_owner_interface_scc_with_signature_scopes, plan_owner_body_interfaces,
         project_owner_abi_environment, project_owner_callable_resolution_plan,
@@ -7514,20 +7638,23 @@ mod tests {
             "copy",
         );
         let rows = rows(&fixture);
-        assert!(rows.expressions.iter().any(|expression| {
-            expression.flow_type.ty == Type::Number
-                && matches!(
-                    &expression.kind,
-                    OwnerExpressionKind::Read {
-                        target: OwnerDeclarationRef::ImportedStable {
-                            declaration: OwnerDeclarationStableKey::Public,
+        assert!(
+            rows.expressions.iter().any(|expression| {
+                expression.flow_type.ty == Type::Number
+                    && matches!(
+                        &expression.kind,
+                        OwnerExpressionKind::Read {
+                            target: OwnerDeclarationRef::ImportedStable {
+                                declaration: OwnerDeclarationStableKey::Public,
+                                ..
+                            },
+                            projection,
                             ..
-                        },
-                        projection,
-                        ..
-                    } if projection.is_empty()
-                )
-        }));
+                        } if projection.is_empty()
+                    )
+            }),
+            "child rows: {rows:#?}"
+        );
     }
 
     #[test]
@@ -7636,20 +7763,23 @@ mod tests {
             "leaf",
         );
         let rows = rows(&fixture);
-        assert!(rows.expressions.iter().any(|expression| {
-            expression.flow_type.ty == Type::Number
-                && matches!(
-                    expression.kind,
-                    OwnerExpressionKind::Read {
-                        target: OwnerDeclarationRef::ImportedStable {
-                            declaration: OwnerDeclarationStableKey::PatternBinding { .. },
+        assert!(
+            rows.expressions.iter().any(|expression| {
+                expression.flow_type.ty == Type::Number
+                    && matches!(
+                        expression.kind,
+                        OwnerExpressionKind::Read {
+                            target: OwnerDeclarationRef::ImportedStable {
+                                declaration: OwnerDeclarationStableKey::PatternBinding { .. },
+                                ..
+                            },
+                            ref projection,
                             ..
-                        },
-                        ref projection,
-                        ..
-                    } if projection.is_empty()
-                )
-        }));
+                        } if projection.is_empty()
+                    )
+            }),
+            "grandchild rows: {rows:#?}"
+        );
     }
 
     #[test]
@@ -7708,6 +7838,11 @@ mod tests {
                 )
             })
             .expect("choice lexical capture");
+        assert_eq!(
+            choice.demand_paths.as_ref(),
+            &[Box::<[String]>::default()],
+            "the active arm observes the complete selector before projecting its payload",
+        );
         assert!(matches!(
             &choice.flow_type.ty,
             Type::VariantSet(variants)
@@ -7733,6 +7868,358 @@ mod tests {
                     } if projection.as_ref() == ["value"]
                 )
         }));
+    }
+
+    #[test]
+    fn tagged_union_selector_projection_closes_a_generic_list_call_input() {
+        fn assert_rows_are_exact(fixture: &Fixture) {
+            let rows = rows(fixture);
+            let projected = rows
+                .expressions
+                .iter()
+                .find(|expression| {
+                    matches!(
+                        &expression.kind,
+                        OwnerExpressionKind::Read { projection, .. }
+                            if projection.as_ref() == ["rows"]
+                    )
+                })
+                .expect("tagged arm must retain its projected selector read");
+            assert!(
+                matches!(
+                    &projected.flow_type.ty,
+                    Type::List(item)
+                        if matches!(
+                            item.as_ref(),
+                            Type::Object(shape)
+                                if shape.fields.get("signal_id") == Some(&Type::Text)
+                                    && shape.fields.get("value") == Some(&Type::Number)
+                        )
+                ),
+                "generic list input must receive the complete exact arm-local item type, got {:?}",
+                projected.flow_type.ty
+            );
+        }
+
+        let local = fixture(
+            concat!(
+                "FUNCTION probe() {\n",
+                "    choice: LATEST {\n",
+                "        NotStarted\n",
+                "        Page[rows: LIST { [signal_id: TEXT { id }, value: 1] }]\n",
+                "    }\n",
+                "    result:\n",
+                "        choice |> WHEN {\n",
+                "            Page =>\n",
+                "                choice.rows\n",
+                "                |> List/find(item, if: item.signal_id == TEXT { id })\n",
+                "            __ => NotFound\n",
+                "        }\n",
+                "    result\n",
+                "}\n",
+            ),
+            "probe",
+        );
+        assert_rows_are_exact(&local);
+
+        let imported = fixture(
+            concat!(
+                "store: [\n",
+                "    choice: LATEST {\n",
+                "        NotStarted\n",
+                "        Page[rows: LIST { [signal_id: TEXT { id }, value: 1] }]\n",
+                "    }\n",
+                "    result:\n",
+                "        choice |> WHEN {\n",
+                "            Page =>\n",
+                "                choice.rows\n",
+                "                |> List/find(item, if: item.signal_id == TEXT { id })\n",
+                "            __ => NotFound\n",
+                "        }\n",
+                "]\n",
+            ),
+            "result",
+        );
+        assert_rows_are_exact(&imported);
+
+        let nested_source = concat!(
+            "FUNCTION identity(value) { value }\n",
+            "store: [\n",
+            "    choice: LATEST {\n",
+            "        NotStarted\n",
+            "        Page[rows: LIST { [signal_id: TEXT { id }, value: 1] }]\n",
+            "    }\n",
+            "    result:\n",
+            "        choice |> WHEN {\n",
+            "            Page => identity(\n",
+            "                value:\n",
+            "                    choice.rows\n",
+            "                    |> List/find(item, if: item.signal_id == TEXT { id })\n",
+            "                    |> WHEN {\n",
+            "                        Found[value] => value.value\n",
+            "                        NotFound => 0\n",
+            "                    }\n",
+            "            )\n",
+            "            __ => NotFound\n",
+            "        }\n",
+            "]\n",
+        );
+        let nested = fixture(nested_source, "result");
+        assert_rows_are_exact(&nested);
+
+        let child_source = concat!(
+            "store: [\n",
+            "    choice: LATEST {\n",
+            "        NotStarted\n",
+            "        Page[rows: LIST { [signal_id: TEXT { id }, value: 1] }]\n",
+            "    }\n",
+            "    result:\n",
+            "        choice |> WHEN {\n",
+            "            Page => [\n",
+            "                outer: [\n",
+            "                    nested:\n",
+            "                        choice.rows\n",
+            "                        |> List/find(item, if: item.signal_id == TEXT { id })\n",
+            "                ]\n",
+            "            ]\n",
+            "            __ => []\n",
+            "        }\n",
+            "]\n",
+        );
+        let child = fixture(child_source, "nested");
+        let environment = child
+            .body
+            .signature_lexical_plan
+            .inherited_environment()
+            .expect("nested grandchild field must inherit its provider environment");
+        assert_eq!(environment.pattern_narrowings().len(), 1);
+        assert!(matches!(
+            &environment.pattern_narrowings()[0].pattern,
+            OwnerPatternConstraint::Tag { name, .. } if name == "Page"
+        ));
+        assert_rows_are_exact(&child);
+    }
+
+    #[test]
+    fn projected_pattern_binding_keeps_only_the_projected_payload_type() {
+        let consumed = fixture(
+            concat!(
+                "FUNCTION probe() {\n",
+                "    choice: LATEST {\n",
+                "        Missing\n",
+                "        Found[value: [transitions: LIST { [time: 1] }]]\n",
+                "    }\n",
+                "    result:\n",
+                "        choice |> WHEN {\n",
+                "            Found[value] => value.transitions\n",
+                "            Missing => LIST {}\n",
+                "        }\n",
+                "        |> List/map(item, new: item.time)\n",
+                "    result\n",
+                "}\n",
+            ),
+            "probe",
+        );
+        let consumed_rows = rows(&consumed);
+        let projected = consumed_rows
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(
+                    &expression.kind,
+                    OwnerExpressionKind::Read { projection, .. }
+                        if projection.as_ref() == ["transitions"]
+                )
+            })
+            .expect("pattern binding projection must remain an exact read");
+        assert!(
+            matches!(
+                &projected.flow_type.ty,
+                Type::List(item)
+                    if matches!(
+                        item.as_ref(),
+                        Type::Object(shape)
+                            if shape.fields.get("time") == Some(&Type::Number)
+                    )
+            ),
+            "projected pattern binding must be the transitions list, got {:?}",
+            projected.flow_type.ty,
+        );
+        assert!(
+            !format!("{:?}", projected.flow_type.ty).contains("Var("),
+            "projected pattern binding must be closed: {:?}",
+            projected.flow_type.ty,
+        );
+        let when = consumed_rows
+            .expressions
+            .iter()
+            .find(|expression| matches!(expression.kind, OwnerExpressionKind::When { .. }))
+            .expect("fixture must retain the inner WHEN");
+        assert!(
+            matches!(&when.flow_type.ty, Type::List(item) if !format!("{item:?}").contains("Var(")),
+            "WHEN result must be one concrete list: {:?}",
+            when.flow_type.ty,
+        );
+        let map = consumed
+            .body
+            .calls
+            .iter()
+            .find(|call| call.function == "List/map")
+            .expect("fixture must retain List/map");
+        let list_input = map
+            .inputs
+            .iter()
+            .find(|input| matches!(input.role, OwnerConstraintEdgeRole::PipeInput))
+            .expect("List/map must retain its pipeline list input");
+        assert!(
+            !format!("{:?}", list_input.actual_type).contains("Var("),
+            "List/map list input must be concrete: {:#?}",
+            list_input,
+        );
+        assert!(
+            matches!(map.result.ty, Type::List(_)),
+            "List/map must retain a list result: {:?}",
+            map.result.ty,
+        );
+
+        let unconsumed = fixture(
+            concat!(
+                "FUNCTION probe() {\n",
+                "    choice: LATEST {\n",
+                "        Missing\n",
+                "        Found[value: [transitions: LIST { [time: 1] }]]\n",
+                "    }\n",
+                "    result: choice |> WHEN {\n",
+                "        Found[value] => value.transitions\n",
+                "        Missing => LIST {}\n",
+                "    }\n",
+                "    result\n",
+                "}\n",
+            ),
+            "probe",
+        );
+        let unconsumed_rows = rows(&unconsumed);
+        let unconsumed_when = unconsumed_rows
+            .expressions
+            .iter()
+            .find(|expression| matches!(expression.kind, OwnerExpressionKind::When { .. }))
+            .expect("fixture must retain the unconsumed WHEN");
+        assert!(
+            matches!(
+                &unconsumed_when.flow_type.ty,
+                Type::List(item)
+                    if matches!(
+                        item.as_ref(),
+                        Type::Object(shape)
+                            if shape.fields.get("time") == Some(&Type::Number)
+                    )
+            ),
+            "unconsumed empty branch must inherit its sibling List item: {:?}",
+            unconsumed_when.flow_type.ty,
+        );
+    }
+
+    #[test]
+    fn inherited_pattern_narrowings_compose_outer_to_inner_for_a_grandchild_owner() {
+        let fixture = fixture(
+            concat!(
+                "store: [\n",
+                "    choice: LATEST {\n",
+                "        Other[inner: Leaf[value: TEXT { wrong }]]\n",
+                "        Outer[inner: Leaf[value: 1]]\n",
+                "    }\n",
+                "    result:\n",
+                "        choice |> WHEN {\n",
+                "            Outer => choice.inner |> WHEN {\n",
+                "                Leaf => [\n",
+                "                    outer: [\n",
+                "                        nested: choice.inner.value\n",
+                "                    ]\n",
+                "                ]\n",
+                "                __ => []\n",
+                "            }\n",
+                "            __ => []\n",
+                "        }\n",
+                "]\n",
+            ),
+            "nested",
+        );
+        let environment = fixture
+            .body
+            .signature_lexical_plan
+            .inherited_environment()
+            .expect("nested grandchild must inherit both active match arms");
+        assert_eq!(environment.pattern_narrowings().len(), 2);
+        assert!(matches!(
+            &environment.pattern_narrowings()[0].pattern,
+            OwnerPatternConstraint::Tag { name, .. } if name == "Outer"
+        ));
+        assert!(matches!(
+            &environment.pattern_narrowings()[1].pattern,
+            OwnerPatternConstraint::Tag { name, .. } if name == "Leaf"
+        ));
+        let capture = fixture
+            .interface
+            .owner(&fixture.syntax.owner)
+            .expect("nested grandchild interface")
+            .lexical_captures
+            .first()
+            .expect("nested grandchild must capture its selector provider");
+        assert_eq!(
+            capture.demand_paths.as_ref(),
+            &[Box::<[String]>::default()],
+            "the outer selector root dominates deeper inherited selector and read paths",
+        );
+        assert!(rows(&fixture).expressions.iter().any(|expression| {
+            expression.flow_type.ty == Type::Number
+                && matches!(
+                    &expression.kind,
+                    OwnerExpressionKind::Read { projection, .. }
+                        if projection.as_ref() == ["inner", "value"]
+                )
+        }));
+    }
+
+    #[test]
+    fn inherited_pattern_narrowing_does_not_materialize_an_impossible_closed_arm() {
+        let fixture = fixture(
+            concat!(
+                "container: BLOCK {\n",
+                "    choice: Other\n",
+                "    result: choice |> WHEN {\n",
+                "        Found => BLOCK {\n",
+                "            child: choice\n",
+                "            child\n",
+                "        }\n",
+                "        __ => []\n",
+                "    }\n",
+                "    result\n",
+                "}\n",
+            ),
+            "child",
+        );
+        let interface = fixture
+            .interface
+            .owner(&fixture.syntax.owner)
+            .expect("impossible-arm child interface");
+        let other = Type::VariantSet(vec![boon_checked::Variant::Tag("Other".to_owned())].into());
+        let capture = interface
+            .lexical_captures
+            .first()
+            .expect("impossible-arm child must retain its exact selector capture");
+        assert_eq!(capture.demand_paths.as_ref(), &[Box::<[String]>::default()]);
+        assert_eq!(capture.flow_type.ty, other);
+        assert!(
+            matches!(
+                &interface.result.ty,
+                Type::VariantSet(variants)
+                    if variants.as_ref().as_slice()
+                        == [boon_checked::Variant::Tag("Other".to_owned())]
+            ),
+            "closed selector must not synthesize the impossible Found arm: {:#?}",
+            interface.result.ty
+        );
+        assert!(!format!("{:?}", interface.result.ty).contains("Found"));
     }
 
     #[test]
@@ -7783,6 +8270,72 @@ mod tests {
                     ref projection,
                 } if projection.is_empty()
             )
+        }));
+    }
+
+    #[test]
+    fn imported_store_capture_materializes_only_the_demanded_object_path() {
+        let fixture = fixture(
+            concat!(
+                "container: BLOCK {\n",
+                "    store: [\n",
+                "        selected: [value: 1, omitted: TEXT { sibling }]\n",
+                "        unrelated: [payload: TEXT { large }]\n",
+                "    ]\n",
+                "    observed: store.selected.value\n",
+                "    observed\n",
+                "}\n",
+            ),
+            "observed",
+        );
+        let interface = fixture
+            .interface
+            .owner(&fixture.syntax.owner)
+            .expect("observed interface");
+        let capture = interface
+            .lexical_captures
+            .iter()
+            .find(|capture| {
+                matches!(
+                    &capture.target,
+                    OwnerLexicalTargetRef::Declaration {
+                        declaration: OwnerDeclarationStableKey::Public,
+                        ..
+                    }
+                )
+            })
+            .expect("observed child must capture the enclosing store value");
+        assert_eq!(
+            capture.demand_paths.as_ref(),
+            &[Box::<[String]>::from([
+                "selected".to_owned(),
+                "value".to_owned(),
+            ])],
+        );
+        assert!(
+            matches!(
+                &capture.flow_type.ty,
+                Type::Object(store)
+                    if !store.open
+                        && !store.fields.contains_key("unrelated")
+                        && matches!(
+                            store.fields.get("selected"),
+                            Some(Type::Object(selected))
+                                if !selected.open
+                                    && selected.fields.get("value") == Some(&Type::Number)
+                                    && !selected.fields.contains_key("omitted")
+                        )
+            ),
+            "capture must contain only the selected.value surface: {:#?}",
+            capture.flow_type.ty
+        );
+        assert!(rows(&fixture).expressions.iter().any(|expression| {
+            expression.flow_type.ty == Type::Number
+                && matches!(
+                    &expression.kind,
+                    OwnerExpressionKind::Read { projection, .. }
+                        if projection.as_ref() == ["selected", "value"]
+                )
         }));
     }
 
@@ -8823,6 +9376,194 @@ mod tests {
             inline_rows.callables[0].body.unwrap(),
             "an inline list belongs to its containing expression statement"
         );
+    }
+
+    #[test]
+    fn fieldless_hold_aliases_materialize_exactly_one_declaration_authority() {
+        let local_source = concat!(
+            "FUNCTION update() {\n",
+            "    0 |> HOLD state {\n",
+            "        state + 1\n",
+            "    }\n",
+            "}\n",
+        );
+        let local = fixture(local_source, "update");
+        let local_rows = rows(&local);
+        let local_hold = local_rows
+            .statements
+            .iter()
+            .find_map(|statement| match &statement.kind {
+                OwnerStatementKind::Hold {
+                    declaration: Some(declaration),
+                    name: Some(name),
+                } if name == "state" => Some(*declaration),
+                _ => None,
+            })
+            .expect("a function-local fieldless HOLD must own one declaration");
+        assert!(matches!(
+            local_rows.declarations[local_hold.0 as usize].stable_key,
+            OwnerDeclarationStableKey::Statement { .. }
+        ));
+        assert_eq!(local_rows.declarations[local_hold.0 as usize].name, "state");
+        assert!(local_rows.expressions.iter().any(|expression| {
+            matches!(
+                &expression.kind,
+                OwnerExpressionKind::Read {
+                    target: OwnerDeclarationRef::Local { declaration },
+                    ..
+                } if *declaration == local_hold
+            )
+        }));
+        assert!(local_rows.states.iter().any(|state| {
+            state.declaration
+                == (OwnerDeclarationRef::Local {
+                    declaration: local_hold,
+                })
+        }));
+
+        let nested_local_source = concat!(
+            "FUNCTION update() {\n",
+            "    0 |> HOLD outer {\n",
+            "        1 |> HOLD inner {\n",
+            "            inner + outer\n",
+            "        }\n",
+            "    }\n",
+            "}\n",
+        );
+        let nested_local = fixture(nested_local_source, "update");
+        let nested_local_rows = rows(&nested_local);
+        let hold_statements = nested_local_rows
+            .statements
+            .iter()
+            .filter_map(|statement| match &statement.kind {
+                OwnerStatementKind::Hold { declaration, name } => {
+                    Some((name.as_deref(), *declaration))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(hold_statements.len(), 2);
+        let outer = hold_statements
+            .iter()
+            .find_map(|(name, declaration)| (*name == Some("outer")).then_some(*declaration))
+            .flatten()
+            .expect("the outer fieldless HOLD must own the declaration");
+        assert!(
+            hold_statements
+                .iter()
+                .any(|(name, declaration)| *name == Some("inner") && declaration.is_none())
+        );
+        for (syntax, expression) in nested_local
+            .syntax
+            .expressions
+            .iter()
+            .zip(&nested_local_rows.expressions)
+        {
+            if matches!(&syntax.kind, AstExprKind::Identifier(name) if name == "outer" || name == "inner")
+            {
+                assert!(matches!(
+                    &expression.kind,
+                    OwnerExpressionKind::Read {
+                        target: OwnerDeclarationRef::Local { declaration },
+                        ..
+                    } if *declaration == outer
+                ));
+            }
+        }
+        let mut local_state_paths = nested_local_rows
+            .states
+            .iter()
+            .filter(|state| {
+                state.declaration == (OwnerDeclarationRef::Local { declaration: outer })
+            })
+            .map(|state| state.path.projection.clone())
+            .collect::<Vec<_>>();
+        local_state_paths.sort();
+        assert_eq!(
+            local_state_paths,
+            vec![Vec::<String>::new(), vec!["state_1".to_owned()]],
+            "the declaration result and its nested HOLD need distinct dense-compatible paths"
+        );
+
+        let imported_source = concat!(
+            "container:\n",
+            "    0 |> HOLD outer {\n",
+            "        1 |> HOLD inner {\n",
+            "            inner + outer\n",
+            "        }\n",
+            "    }\n",
+        );
+        let container = fixture(imported_source, "container");
+        for name in ["outer", "inner"] {
+            let update = fixture(imported_source, name);
+            let update_rows = rows(&update);
+            assert!(update_rows.statements.iter().all(|statement| {
+                !matches!(
+                    statement.kind,
+                    OwnerStatementKind::Hold {
+                        declaration: Some(_),
+                        ..
+                    }
+                )
+            }));
+            assert!(update_rows.declarations.is_empty());
+            let [state] = update_rows.states.as_slice() else {
+                panic!("fieldless HOLD owner `{name}` must emit exactly one state row");
+            };
+            if name == "outer" {
+                assert!(
+                    state.path.projection.is_empty(),
+                    "the outer HOLD is the enclosing declaration's result authority"
+                );
+            } else {
+                assert_eq!(
+                    state.path.projection,
+                    ["state_1".to_owned()],
+                    "the nested child owner must include its stable inherited state ordinal"
+                );
+            }
+            for (syntax, expression) in update
+                .syntax
+                .expressions
+                .iter()
+                .zip(&update_rows.expressions)
+            {
+                if matches!(&syntax.kind, AstExprKind::Identifier(alias) if alias == "outer" || alias == "inner")
+                {
+                    assert!(matches!(
+                        &expression.kind,
+                        OwnerExpressionKind::Read {
+                            target:
+                                OwnerDeclarationRef::ImportedStable {
+                                    owner,
+                                    declaration: OwnerDeclarationStableKey::Public,
+                                },
+                            ..
+                        } if owner == &container.syntax.owner
+                    ));
+                }
+            }
+        }
+
+        let sibling_source = concat!(
+            "container:\n",
+            "    LATEST {\n",
+            "        0 |> HOLD first { first + 1 }\n",
+            "        0 |> HOLD second { second + 1 }\n",
+            "    }\n",
+        );
+        for (name, expected) in [("first", "state_0"), ("second", "state_1")] {
+            let update = fixture(sibling_source, name);
+            let update_rows = rows(&update);
+            let [state] = update_rows.states.as_slice() else {
+                panic!("sibling HOLD owner `{name}` must emit exactly one state row");
+            };
+            assert_eq!(
+                state.path.projection,
+                [expected.to_owned()],
+                "sibling HOLD ordinals must follow authored source order even when aliases differ"
+            );
+        }
     }
 
     #[test]

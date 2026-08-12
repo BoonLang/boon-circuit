@@ -2351,7 +2351,7 @@ fn map_reactive_binding(
         SemanticBindingTargetV1::State { state } => {
             let state = semantic_state_resource(resources, state)?;
             if state.statement != binding.statement
-                || state.declaration != binding.declaration
+                || state.binding_declaration != binding.declaration
                 || state.expression != binding.producer
             {
                 return Err(format!(
@@ -2360,7 +2360,7 @@ fn map_reactive_binding(
                     state.id,
                     state.statement,
                     binding.statement,
-                    state.declaration,
+                    state.binding_declaration,
                     binding.declaration,
                     state.expression,
                     binding.producer,
@@ -2369,7 +2369,7 @@ fn map_reactive_binding(
             let field = unique_mapped_field_for_statement(
                 fields,
                 executable_statement,
-                binding.declaration,
+                state.declaration,
                 "semantic state binding",
             )?;
             (

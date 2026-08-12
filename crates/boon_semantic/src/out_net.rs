@@ -10,8 +10,8 @@ use boon_checked::{
     CheckedContextBinding, CheckedDeclaration, CheckedDeclarationKind, CheckedEvaluationScope,
     CheckedExprId, CheckedExpressionKind, CheckedMatchPattern, CheckedPassedAccess,
     CheckedPatternBinding, CheckedProgramFields, CheckedScopeKind, CheckedTypeSubstitution,
-    CheckedTypeSubstitutionLookup, ContextFormalId, DeclId, FlowType, LexicalScopeId, Type,
-    TypeVar, apply_checked_type_environment, apply_checked_type_substitution_lookup,
+    ContextFormalId, DeclId, FlowType, LexicalScopeId, Type, TypeVar,
+    apply_checked_type_substitutions_once,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -254,6 +254,10 @@ pub struct OutNet<Contract = ()> {
     pub static_owners: Vec<StaticOwnerDef>,
     call_instance_by_checked_frame:
         BTreeMap<(CheckedCallId, Option<OutCallInstanceId>), Option<OutCallInstanceId>>,
+    #[serde(skip)]
+    intentionally_elided_calls: BTreeSet<(CheckedCallId, Option<OutCallInstanceId>)>,
+    #[serde(skip)]
+    intentionally_elided_frames: BTreeSet<OutCallInstanceId>,
     output_net_by_frame_target: BTreeMap<(Option<OutCallInstanceId>, DeclId), Option<OutNetId>>,
     concrete_producers_by_checked: BTreeMap<CheckedCallId, Vec<ConcreteOutProducer>>,
     producer_roots: Vec<ProducerRoot>,
@@ -261,35 +265,32 @@ pub struct OutNet<Contract = ()> {
     producer_root_calls: BTreeSet<OutCallInstanceId>,
 }
 
-struct OutCallTypeSubstitutionLookup<'graph, Contract> {
-    graph: &'graph OutNet<Contract>,
-    call: OutCallInstanceId,
-}
-
-impl<Contract> CheckedTypeSubstitutionLookup for OutCallTypeSubstitutionLookup<'_, Contract> {
-    fn replacement(&self, variable: TypeVar) -> Option<&Type> {
-        let mut next = Some(self.call);
-        let mut remaining = self.graph.call_instances.len().saturating_add(1);
-        while let Some(call) = next {
-            if remaining == 0 {
-                return None;
-            }
-            remaining -= 1;
-            let instance = self
-                .graph
-                .call_instances
-                .get(call.as_usize())
-                .filter(|instance| instance.id == call)?;
-            if let Ok(index) = instance
-                .local_type_substitutions
-                .binary_search_by_key(&variable, |substitution| substitution.variable)
-            {
-                return Some(&instance.local_type_substitutions[index].value);
-            }
-            next = instance.parent;
+fn apply_type_substitution_frames(
+    call_instances: &[OutCallInstance],
+    mut frame: Option<OutCallInstanceId>,
+    ty: &Type,
+) -> Type {
+    let mut ty = ty.clone();
+    let mut remaining = call_instances.len().saturating_add(1);
+    while let Some(call) = frame {
+        if remaining == 0 {
+            break;
         }
-        None
+        remaining -= 1;
+        let Some(instance) = call_instances
+            .get(call.as_usize())
+            .filter(|instance| instance.id == call)
+        else {
+            break;
+        };
+        // Each checked-call row is a directional edge between two independently
+        // alpha-normalized namespaces: its keys belong to this callee, while
+        // its values belong to the parent. Apply one frame at a time without
+        // reinterpreting replacement values in the frame that produced them.
+        ty = apply_checked_type_substitutions_once(&ty, &instance.local_type_substitutions);
+        frame = instance.parent;
     }
+    ty
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -319,6 +320,37 @@ impl<Contract> OutNet<Contract> {
             .flatten()
     }
 
+    pub(crate) fn has_checked_call_frame_index_entry(
+        &self,
+        call_id: CheckedCallId,
+        frame: Option<OutCallInstanceId>,
+    ) -> bool {
+        self.call_instance_by_checked_frame
+            .contains_key(&(call_id, frame))
+    }
+
+    pub(crate) fn intentionally_elided_call(
+        &self,
+        call_id: CheckedCallId,
+        owner_callable: Option<DeclId>,
+        frame: Option<OutCallInstanceId>,
+    ) -> bool {
+        if self.has_checked_call_frame_index_entry(call_id, frame) {
+            return false;
+        }
+        self.intentionally_elided_calls.contains(&(call_id, frame))
+            || frame.is_some_and(|frame| {
+                self.intentionally_elided_frames.contains(&frame)
+                    && self
+                        .call_instances
+                        .get(frame.as_usize())
+                        .is_some_and(|instance| {
+                            instance.id == frame
+                                && owner_callable == Some(instance.provenance.callable)
+                        })
+            })
+    }
+
     pub fn net_for_port(&self, port: OutPortId) -> OutNetId {
         self.ports[port.as_usize()].net
     }
@@ -331,41 +363,33 @@ impl<Contract> OutNet<Contract> {
         self.call_instances[call.as_usize()].owner
     }
 
-    /// Reconstructs the exact checked type environment for one concrete call.
+    /// Reconstructs this call's exact local scheme-to-root environment.
     ///
-    /// Call instances retain only their local delta. Walking parents here is
-    /// intentionally paid only by consumers that need a complete mutable
-    /// environment; the common specialization path uses the same compact
-    /// ownership without permanently cloning inherited structural types.
+    /// Raw `TypeVar` ordinals from ancestor call schemes are not globally
+    /// unique, so their maps cannot be flattened into one `BTreeMap`. Values
+    /// are instead composed through ordered one-shot parent frames while the
+    /// returned keys remain solely in this call's scheme namespace.
     pub fn type_substitution_environment(
         &self,
         call: OutCallInstanceId,
     ) -> BTreeMap<TypeVar, Type> {
-        let mut ancestry = Vec::new();
-        let mut next = Some(call);
-        let mut remaining = self.call_instances.len().saturating_add(1);
-        while let Some(instance) = next {
-            if remaining == 0 {
-                break;
-            }
-            remaining -= 1;
-            let Some(instance) = self
-                .call_instances
-                .get(instance.as_usize())
-                .filter(|candidate| candidate.id == instance)
-            else {
-                break;
-            };
-            ancestry.push(instance.id);
-            next = instance.parent;
-        }
-        ancestry.reverse();
-
         let mut environment = BTreeMap::new();
-        for instance in ancestry {
-            for substitution in &self.call_instances[instance.as_usize()].local_type_substitutions {
-                environment.insert(substitution.variable, substitution.value.clone());
-            }
+        let Some(instance) = self
+            .call_instances
+            .get(call.as_usize())
+            .filter(|candidate| candidate.id == call)
+        else {
+            return environment;
+        };
+        for substitution in &instance.local_type_substitutions {
+            environment.insert(
+                substitution.variable,
+                apply_type_substitution_frames(
+                    &self.call_instances,
+                    instance.parent,
+                    &substitution.value,
+                ),
+            );
         }
         environment
     }
@@ -378,10 +402,7 @@ impl<Contract> OutNet<Contract> {
     }
 
     pub fn apply_type_substitutions(&self, call: OutCallInstanceId, ty: &Type) -> Type {
-        apply_checked_type_substitution_lookup(
-            ty,
-            &OutCallTypeSubstitutionLookup { graph: self, call },
-        )
+        apply_type_substitution_frames(&self.call_instances, Some(call), ty)
     }
 
     pub fn owner_for_call_evaluation(&self, mut call: OutCallInstanceId) -> Option<StaticOwnerId> {
@@ -825,6 +846,8 @@ impl<Contract> OutNet<Contract> {
             nets,
             static_owners,
             call_instance_by_checked_frame,
+            intentionally_elided_calls,
+            intentionally_elided_frames,
             output_net_by_frame_target,
             concrete_producers_by_checked,
             producer_roots,
@@ -853,6 +876,8 @@ impl<Contract> OutNet<Contract> {
                 nets,
                 static_owners,
                 call_instance_by_checked_frame,
+                intentionally_elided_calls,
+                intentionally_elided_frames,
                 output_net_by_frame_target,
                 concrete_producers_by_checked,
                 producer_roots,
@@ -967,36 +992,6 @@ enum StaticOwnerNode {
     Call(OutCallInstanceId),
 }
 
-type TypeEnvironmentRollback = Vec<(TypeVar, Option<Type>)>;
-
-fn push_type_environment_overlay(
-    environment: &mut BTreeMap<TypeVar, Type>,
-    substitutions: &[CheckedTypeSubstitution],
-) -> TypeEnvironmentRollback {
-    substitutions
-        .iter()
-        .map(|substitution| {
-            (
-                substitution.variable,
-                environment.insert(substitution.variable, substitution.value.clone()),
-            )
-        })
-        .collect()
-}
-
-fn pop_type_environment_overlay(
-    environment: &mut BTreeMap<TypeVar, Type>,
-    rollback: TypeEnvironmentRollback,
-) {
-    for (variable, previous) in rollback.into_iter().rev() {
-        if let Some(previous) = previous {
-            environment.insert(variable, previous);
-        } else {
-            environment.remove(&variable);
-        }
-    }
-}
-
 struct OutNetBuilder<'program, Contract, MakeContract, IsProducer> {
     program: &'program CheckedProgramFields,
     signature_by_id: BTreeMap<DeclId, &'program CheckedCallableSignature>,
@@ -1016,6 +1011,8 @@ struct OutNetBuilder<'program, Contract, MakeContract, IsProducer> {
     retained_direct_call_sites_not_instantiated: usize,
     retained_overlay_frames: usize,
     retained_overlay_call_sites_instantiated: usize,
+    intentionally_elided_calls: BTreeSet<(CheckedCallId, Option<OutCallInstanceId>)>,
+    intentionally_elided_frames: BTreeSet<OutCallInstanceId>,
     expanded_frames: usize,
     lexical_call_sites_considered: usize,
     demanded_call_sites_instantiated: usize,
@@ -1103,6 +1100,8 @@ where
             retained_direct_call_sites_not_instantiated: 0,
             retained_overlay_frames: 0,
             retained_overlay_call_sites_instantiated: 0,
+            intentionally_elided_calls: BTreeSet::new(),
+            intentionally_elided_frames: BTreeSet::new(),
             expanded_frames: 0,
             lexical_call_sites_considered: 0,
             demanded_call_sites_instantiated: 0,
@@ -1118,14 +1117,7 @@ where
     }
 
     fn build(mut self) -> OutNetBuild<Contract> {
-        let mut type_environment = BTreeMap::new();
-        self.instantiate_frame(
-            None,
-            None,
-            BTreeMap::new(),
-            &mut type_environment,
-            &mut Vec::new(),
-        );
+        self.instantiate_frame(None, None, BTreeMap::new(), &mut Vec::new());
         let producer_roots = std::mem::take(&mut self.producer_root_specs);
         for producer in producer_roots {
             self.instantiate_producer_root(producer);
@@ -1174,12 +1166,10 @@ where
         });
         self.producer_identity_by_call.insert(call, spec.identity);
         self.producer_roots.push(ProducerRoot { spec, call });
-        let mut type_environment = BTreeMap::new();
         self.instantiate_frame(
             Some(signature.decl_id),
             Some(call),
             BTreeMap::new(),
-            &mut type_environment,
             &mut vec![signature.decl_id],
         );
     }
@@ -1351,7 +1341,15 @@ where
         if owner_callable.is_some_and(|owner| self.retained_definitions.contains(&owner)) {
             self.retained_overlay_frames += 1;
             let reachable_count = demanded.len();
-            demanded.retain(|index| self.retained_call_site_requires_overlay(*index));
+            let mut intentionally_elided = Vec::new();
+            demanded.retain(|index| {
+                let requires_overlay = self.retained_call_site_requires_overlay(*index);
+                if !requires_overlay && let Some(call) = self.program.calls.get(*index) {
+                    intentionally_elided.push((call.id, frame));
+                }
+                requires_overlay
+            });
+            self.intentionally_elided_calls.extend(intentionally_elided);
             self.retained_direct_call_sites_not_instantiated +=
                 reachable_count.saturating_sub(demanded.len());
             self.retained_overlay_call_sites_instantiated += demanded.len();
@@ -1537,33 +1535,7 @@ where
     }
 
     fn checked_type_in_frame(&self, frame: OutCallInstanceId, ty: &Type) -> Type {
-        let mut ancestry = Vec::new();
-        let mut next = Some(frame);
-        let mut remaining = self.call_instances.len().saturating_add(1);
-        while let Some(call) = next {
-            if remaining == 0 {
-                break;
-            }
-            remaining -= 1;
-            let Some(instance) = self
-                .call_instances
-                .get(call.as_usize())
-                .filter(|instance| instance.id == call)
-            else {
-                break;
-            };
-            ancestry.push(call);
-            next = instance.parent;
-        }
-        ancestry.reverse();
-        let mut environment = BTreeMap::new();
-        for call in ancestry {
-            for substitution in &self.call_instances[call.as_usize()].local_type_substitutions {
-                let value = apply_checked_type_environment(&substitution.value, &environment);
-                environment.insert(substitution.variable, value);
-            }
-        }
-        apply_checked_type_environment(ty, &environment)
+        apply_type_substitution_frames(&self.call_instances, Some(frame), ty)
     }
 
     fn static_checked_selector_value(
@@ -1739,7 +1711,6 @@ where
         owner_callable: Option<DeclId>,
         parent: Option<OutCallInstanceId>,
         mut frame_bindings: BTreeMap<DeclId, usize>,
-        active_type_environment: &mut BTreeMap<TypeVar, Type>,
         active_callables: &mut Vec<DeclId>,
     ) {
         let program = self.program;
@@ -1800,33 +1771,28 @@ where
                     None
                 }
             };
-            let mut local_type_environment = BTreeMap::new();
-            for substitution in &checked_call.type_substitutions {
-                local_type_environment.insert(
-                    substitution.variable,
-                    apply_checked_type_environment(&substitution.value, active_type_environment),
-                );
-            }
-            let local_type_substitutions = local_type_environment
-                .iter()
-                .map(|(variable, value)| CheckedTypeSubstitution {
-                    variable: *variable,
-                    value: value.clone(),
-                })
-                .collect::<Vec<_>>();
-            let type_environment_rollback =
-                push_type_environment_overlay(active_type_environment, &local_type_substitutions);
-            let type_substitution_count = active_type_environment.len();
+            // Keep the call row as one directional namespace edge. Its keys
+            // are callee alphas and its values are caller alphas; pre-flattening
+            // those values through an ancestry map aliases unrelated equal
+            // ordinals from intermediate call schemes.
+            let local_type_substitutions = checked_call.type_substitutions.to_vec();
+            let type_substitution_count = parent
+                .and_then(|parent| self.call_instances.get(parent.as_usize()))
+                .map_or(0, |parent| parent.type_substitution_count)
+                .saturating_add(local_type_substitutions.len());
             let result_scheme = signature
                 .map(|signature| &signature.result)
                 .unwrap_or(&checked_call.result);
+            let local_result =
+                apply_checked_type_substitutions_once(&result_scheme.ty, &local_type_substitutions);
             let instantiated_result =
-                apply_checked_type_environment(&result_scheme.ty, active_type_environment);
+                apply_type_substitution_frames(&self.call_instances, parent, &local_result);
+            let checked_occurrence_result = apply_type_substitution_frames(
+                &self.call_instances,
+                parent,
+                &checked_call.result.ty,
+            );
             let checked_result = if checked_call.syntax_discriminated_result {
-                let checked_occurrence_result = apply_checked_type_environment(
-                    &checked_call.result.ty,
-                    active_type_environment,
-                );
                 // Checked-call finalization owns syntax-discriminated
                 // occurrences. A heterogeneous dispatcher may have a closed
                 // scalar principal while this exact tagged request selects a
@@ -1837,7 +1803,7 @@ where
             } else {
                 boon_checked::specialize_checked_call_result(
                     &instantiated_result,
-                    &checked_call.result.ty,
+                    &checked_occurrence_result,
                 )
             };
             let expression_result = self
@@ -1846,9 +1812,10 @@ where
                 .get(checked_call.expression.0 as usize)
                 .filter(|expression| expression.id == checked_call.expression)
                 .map(|expression| {
-                    apply_checked_type_environment(
+                    apply_type_substitution_frames(
+                        &self.call_instances,
+                        parent,
                         &expression.flow_type.ty,
-                        active_type_environment,
                     )
                 })
                 .unwrap_or_else(|| checked_result.clone());
@@ -1902,7 +1869,6 @@ where
                     .unwrap_or(checked_call.result.mode),
                 ty: result_type,
             };
-            pop_type_environment_overlay(active_type_environment, type_environment_rollback);
             self.call_instances.push(OutCallInstance {
                 id: instance,
                 parent,
@@ -2131,6 +2097,7 @@ where
                     .contains(&pending.callable)
                 {
                     self.retained_frame_expansion_skips += 1;
+                    self.intentionally_elided_frames.insert(pending.instance);
                     continue;
                 }
             }
@@ -2143,19 +2110,12 @@ where
                 continue;
             }
             active_callables.push(pending.callable);
-            let local_type_substitutions = self.call_instances[pending.instance.as_usize()]
-                .local_type_substitutions
-                .clone();
-            let type_environment_rollback =
-                push_type_environment_overlay(active_type_environment, &local_type_substitutions);
             self.instantiate_frame(
                 Some(pending.callable),
                 Some(pending.instance),
                 pending.output_bindings,
-                active_type_environment,
                 active_callables,
             );
-            pop_type_environment_overlay(active_type_environment, type_environment_rollback);
             active_callables.pop();
         }
     }
@@ -2566,6 +2526,8 @@ where
             .map(|root| (root.spec.identity, root.call))
             .collect::<BTreeMap<_, _>>();
         let producer_root_calls = producer_root_by_identity.values().copied().collect();
+        let mut intentionally_elided_calls = self.intentionally_elided_calls;
+        intentionally_elided_calls.retain(|key| !call_instance_by_checked_frame.contains_key(key));
 
         OutNetBuild {
             graph: OutNet {
@@ -2574,6 +2536,8 @@ where
                 nets,
                 static_owners,
                 call_instance_by_checked_frame,
+                intentionally_elided_calls,
+                intentionally_elided_frames: self.intentionally_elided_frames,
                 output_net_by_frame_target,
                 concrete_producers_by_checked,
                 producer_roots: self.producer_roots,

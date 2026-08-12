@@ -2319,7 +2319,7 @@ impl<'a> ReactiveBuilder<'a> {
                     let expression = self.execution.expression(state.expression)?;
                     candidates.push((
                         statement.id,
-                        declaration,
+                        state.binding_declaration,
                         statement.call_instance,
                         expression.owner,
                         state.expression,
@@ -2587,7 +2587,7 @@ impl<'a> ReactiveBuilder<'a> {
                         .get(cause.as_usize())
                         .filter(|candidate| candidate.id == cause)
                         .is_some_and(|candidate| {
-                            candidate.declaration == state.declaration
+                            candidate.binding_declaration == state.binding_declaration
                                 && candidate.owner == state.owner
                         }),
                     SemanticEventCauseV1::Source(_)
@@ -4228,9 +4228,28 @@ fn lexical_binding_for_decl<'a>(
     }
     candidates.sort_by_key(|(distance, binding)| (*distance, binding.id));
     let Some((best_distance, _)) = candidates.first() else {
+        let declaration_bindings = bindings
+            .iter()
+            .filter(|binding| binding.declaration == declaration)
+            .take(16)
+            .map(|binding| {
+                (
+                    binding.id,
+                    binding.statement,
+                    binding.call_instance,
+                    binding.owner,
+                    binding.producer,
+                    binding.target,
+                )
+            })
+            .collect::<Vec<_>>();
         return Err(SemanticReactiveError::new(format!(
-            "{diagnostic} {} resolves declaration {} to no lexically visible owner/frame binding",
-            expression.id, declaration.0
+            "{diagnostic} {} checked {} owner {:?} frame {:?} resolves declaration {} to no lexically visible owner/frame binding; declaration bindings: {declaration_bindings:?}",
+            expression.id,
+            expression.checked_expr_id.0,
+            expression.owner,
+            call_instance,
+            declaration.0,
         )));
     };
     let best = candidates

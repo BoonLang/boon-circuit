@@ -1,7 +1,9 @@
 use crate::owner_interface::{
     OwnerPatternNarrowing, TypeUnifier, alpha_normalize_type, bind_flow_variables, bind_projection,
-    flow_mode_join, instantiate_type, merge_effects, pattern_binding_type_from_pattern,
-    pattern_type, refine_owner_pattern_narrowings, true_false_type,
+    flow_mode_join, inherited_pattern_read_plans, instantiate_owner_inherited_pattern_narrowings,
+    instantiate_type, merge_effects, pattern_binding_type_from_pattern, pattern_type,
+    refine_owner_inherited_pattern_narrowings, refine_owner_pattern_narrowings,
+    signature_dynamic_expression_index, true_false_type,
 };
 use crate::owner_signature_lexical::effective_narrowed_selector_read_matches;
 use crate::{
@@ -38,10 +40,10 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-const OWNER_BODY_INFERENCE_DOMAIN_V7: &[u8] = b"boon.owner-body-inference.v7\0";
-const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V5: &[u8] = b"boon.owner-body-inference-content.v5\0";
-const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V9: &[u8] =
-    b"boon.owner-body-inference-currentness.v9\0";
+const OWNER_BODY_INFERENCE_DOMAIN_V8: &[u8] = b"boon.owner-body-inference.v8\0";
+const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V6: &[u8] = b"boon.owner-body-inference-content.v6\0";
+const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V10: &[u8] =
+    b"boon.owner-body-inference-currentness.v10\0";
 const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V4: &[u8] = b"boon.owner-body-interface-plan.v4\0";
 const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V1: &[u8] =
     b"boon.owner-interface-transfer-module.v1\0";
@@ -166,6 +168,10 @@ impl OwnerInterfaceTransferModule {
         self.fingerprint_v1
     }
 
+    pub(crate) fn owns_owner(&self, owner: &StableCheckOwnerKey) -> bool {
+        self.key.members.binary_search(owner).is_ok()
+    }
+
     fn result(&self) -> &OwnerInterfaceSccResult {
         &self.result
     }
@@ -216,6 +222,7 @@ impl OwnerInterfaceTransferModule {
         ))
     }
 
+    #[cfg(test)]
     fn own_prepared_owner(
         &self,
         owner: &StableCheckOwnerKey,
@@ -435,6 +442,15 @@ fn owner_result_transfer_interface_variables_are_complete(
             .result_flush_type
             .as_ref()
             .is_none_or(|ty| owner_result_transfer_type_variables_are_declared(ty, declared))
+        && interface.captures.iter().all(|capture| {
+            owner_result_transfer_type_variables_are_declared(&capture.flow_type.ty, declared)
+                && capture.flush_type.as_ref().is_none_or(|ty| {
+                    owner_result_transfer_type_variables_are_declared(ty, declared)
+                })
+        })
+        && interface.lexical_captures.iter().all(|capture| {
+            owner_result_transfer_type_variables_are_declared(&capture.flow_type.ty, declared)
+        })
         && match &interface.result_transfer {
             OwnerResultTransfer::Principal | OwnerResultTransfer::Parameter { .. } => true,
             OwnerResultTransfer::Expression { nodes, .. } => nodes.iter().all(|node| {
@@ -1233,7 +1249,7 @@ impl OwnerBodyInferenceCurrentnessReceipt {
             result_fingerprint_v1,
         );
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V9,
+            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V10,
             &compact_currentness,
         )?;
         Ok(Self {
@@ -2871,29 +2887,27 @@ fn frozen_scc_ref(
     })
 }
 
-fn signature_read_preserves_base_target(
+fn signature_read_preserved_projection(
     seed: &OwnerConstraintSeed,
     signature_lexical_plan: &OwnerSignatureLexicalPlan,
     expression: u32,
-) -> bool {
+) -> Option<Box<[String]>> {
     let Some(base) = seed
         .lexical_reads()
         .get(expression as usize)
         .and_then(Option::as_ref)
     else {
-        return false;
+        return None;
     };
-    matches!(
-        signature_lexical_plan
-            .reads()
-            .get(expression as usize)
-            .and_then(Option::as_ref),
-        Some(read)
-            if matches!(
-                &read.target,
-                OwnerEffectiveLexicalTarget::Static { target } if target == &base.target
-            ) && read.projection == base.projection
-    )
+    let read = signature_lexical_plan
+        .reads()
+        .get(expression as usize)
+        .and_then(Option::as_ref)?;
+    (matches!(
+        &read.target,
+        OwnerEffectiveLexicalTarget::Static { target } if target == &base.target
+    ) && read.projection == base.projection)
+        .then(|| read.projection.clone())
 }
 
 fn exact_pattern_local_expressions(
@@ -2908,11 +2922,12 @@ fn exact_pattern_local_expressions(
         for input in &arm.inputs {
             match &input.role {
                 OwnerConstraintEdgeRole::MatchBinding { .. }
-                    if signature_read_preserves_base_target(
+                    if signature_read_preserved_projection(
                         seed,
                         signature_lexical_plan,
                         input.expression,
-                    ) =>
+                    )
+                    .is_some() =>
                 {
                     expressions.insert(input.expression);
                 }
@@ -3234,29 +3249,32 @@ fn bind_local_constraints(
                     mode = Some(FlowMode::Absent);
                 }
                 let pattern_ty = pattern_type(pattern, unifier);
-                let bindings = expression
+                let local_bindings = expression
                     .inputs
                     .iter()
                     .filter_map(|input| {
                         let OwnerConstraintEdgeRole::MatchBinding { name } = &input.role else {
                             return None;
                         };
-                        if !signature_read_preserves_base_target(
+                        let projection = signature_read_preserved_projection(
                             seed,
                             signature_lexical_plan,
                             input.expression,
-                        ) {
-                            return None;
-                        }
+                        )?;
                         expression_variable(expressions, external_expressions, input.expression)
-                            .map(|read| (name.clone(), read))
+                            .map(|read| (name.clone(), projection, read))
                     })
                     .collect::<Vec<_>>();
-                for (name, read) in &bindings {
+                let mut bindings = Vec::new();
+                for (name, projection, read) in &local_bindings {
                     if let Some(binding_ty) =
                         pattern_binding_type_from_pattern(pattern, &pattern_ty, name)
                     {
-                        unifier.unify(Type::Var(*read), binding_ty);
+                        let root = unifier.fresh();
+                        unifier.bind_var(root, binding_ty);
+                        let projected = bind_projection(unifier, root, projection);
+                        unifier.unify(Type::Var(*read), Type::Var(projected));
+                        bindings.push((name.clone(), root));
                     }
                 }
                 let narrowed_payload = unifier.fresh();
@@ -3341,7 +3359,11 @@ fn bind_local_constraints(
                 fixed_size_or_capacity,
             } => match collection {
                 OwnerCollectionKind::List => {
-                    let item = unifier.fresh();
+                    let item = if expression.inputs.is_empty() {
+                        unifier.fresh_contextual_hole()
+                    } else {
+                        unifier.fresh()
+                    };
                     for input in &expression.inputs {
                         if let Some(input) =
                             expression_variable(expressions, external_expressions, input.expression)
@@ -3352,7 +3374,11 @@ fn bind_local_constraints(
                     unifier.bind_var(variable, Type::List(Type::shared(Type::Var(item))));
                 }
                 OwnerCollectionKind::Set => {
-                    let item = unifier.fresh();
+                    let item = if expression.inputs.is_empty() {
+                        unifier.fresh_contextual_hole()
+                    } else {
+                        unifier.fresh()
+                    };
                     for input in &expression.inputs {
                         if let Some(input) =
                             expression_variable(expressions, external_expressions, input.expression)
@@ -3369,8 +3395,17 @@ fn bind_local_constraints(
                     unifier.bind_var(variable, Type::Bytes(size));
                 }
                 OwnerCollectionKind::Map => {
-                    let key = unifier.fresh();
-                    let value = unifier.fresh();
+                    let empty = expression.inputs.is_empty();
+                    let key = if empty {
+                        unifier.fresh_contextual_hole()
+                    } else {
+                        unifier.fresh()
+                    };
+                    let value = if empty {
+                        unifier.fresh_contextual_hole()
+                    } else {
+                        unifier.fresh()
+                    };
                     for input in &expression.inputs {
                         let Some(input) = expression_variable(
                             expressions,
@@ -3495,23 +3530,23 @@ struct InferredCallDraft {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-struct EvaluatedResultValue {
-    flow_type: FlowType,
-    parameter_derived: bool,
-    syntax_selected: bool,
-    static_number: Option<ExactNumber>,
+pub(crate) struct EvaluatedResultValue {
+    pub(crate) flow_type: FlowType,
+    pub(crate) parameter_derived: bool,
+    pub(crate) syntax_selected: bool,
+    pub(crate) static_number: Option<ExactNumber>,
 }
 
 /// Formal-ordinal-indexed values stay tiny in result-transfer evaluation.
 /// Keep them inline while retaining the deterministic replace-and-sort
 /// semantics of the former `BTreeMap` representation.
 #[derive(Clone, Default, Eq, PartialEq)]
-struct OwnerResultTransferArguments {
+pub(crate) struct OwnerResultTransferArguments {
     entries: SmallVec<[(u32, EvaluatedResultValue); 4]>,
 }
 
 impl OwnerResultTransferArguments {
-    fn insert(&mut self, ordinal: u32, value: EvaluatedResultValue) {
+    pub(crate) fn insert(&mut self, ordinal: u32, value: EvaluatedResultValue) {
         match self
             .entries
             .binary_search_by_key(&ordinal, |(candidate, _)| *candidate)
@@ -3566,6 +3601,7 @@ struct EvaluatedOwnerResult {
 
 struct OwnerResultTransferFallbacks {
     variables: OwnerResultTransferVariables,
+    dependency_variables: BTreeMap<u32, OwnerResultTransferVariables>,
     substitutions: crate::InlineTypeSubstitutions,
 }
 
@@ -3774,7 +3810,51 @@ impl OwnerResultTransferFallbacks {
     ) -> Self {
         Self {
             variables,
+            dependency_variables: BTreeMap::new(),
             substitutions,
+        }
+    }
+
+    fn resolve_child(
+        &mut self,
+        route: PreparedOwnerInterfaceTransferRoute,
+        result: &FlowType,
+        unifier: &mut TypeUnifier,
+        owned_variables: &mut Vec<TypeVar>,
+    ) -> EvaluatedResultValue {
+        // A Child reference is a structural continuation of the current
+        // owner, not a callable invocation. Owners in one interface SCC share
+        // one stable alpha namespace, so their child surfaces must be
+        // instantiated through the current invocation frame. Returning the
+        // child's raw public TypeVars leaks SCC-local ordinals into the caller
+        // unifier and detaches fields that the parent arguments already
+        // specialized.
+        let ty = match route {
+            PreparedOwnerInterfaceTransferRoute::Own(_) => {
+                let ty = self
+                    .variables
+                    .instantiate(&result.ty, unifier, owned_variables);
+                apply_checked_type_substitution_lookup(&ty, &self.substitutions)
+            }
+            PreparedOwnerInterfaceTransferRoute::Dependency { dependency, .. } => {
+                // Dependency SCCs own distinct alpha namespaces. Give every
+                // dependency module one shared child frame for this
+                // invocation so repeated child reads retain correlation
+                // without aliasing equal raw ordinals from the current SCC.
+                self.dependency_variables
+                    .entry(dependency)
+                    .or_insert_with(OwnerResultTransferVariables::new)
+                    .instantiate(&result.ty, unifier, owned_variables)
+            }
+        };
+        EvaluatedResultValue {
+            flow_type: FlowType {
+                mode: result.mode,
+                ty: unifier.resolve(&ty),
+            },
+            parameter_derived: false,
+            syntax_selected: false,
+            static_number: None,
         }
     }
 
@@ -3831,7 +3911,18 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         context: Option<&EvaluatedResultValue>,
     ) -> Option<EvaluatedOwnerResult> {
         let module = *self.providers.get(owner)?;
-        let (owner, _, _) = module.own_prepared_owner(owner)?;
+        self.evaluate_owner_from_root_module(module, owner, arguments, context)
+    }
+
+    fn evaluate_owner_from_root_module(
+        &mut self,
+        module: &OwnerInterfaceTransferModule,
+        owner: &StableCheckOwnerKey,
+        arguments: &OwnerResultTransferArguments,
+        context: Option<&EvaluatedResultValue>,
+    ) -> Option<EvaluatedOwnerResult> {
+        let route = module.prepared_route(owner)?;
+        let (module, owner, _, _) = module.resolve_prepared_owner(route)?;
         let mut result = self.evaluate_owner_in_module(module, owner, arguments, context)?;
         result.owned_variables = std::mem::take(&mut self.owned_variables);
         Some(result)
@@ -3865,11 +3956,10 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     self.unifier,
                     &mut self.owned_variables,
                 );
-                crate::unify_checked_type_pattern(
-                    &formal,
-                    &actual.flow_type.ty,
-                    &mut substitutions,
-                );
+                let actual = self.unifier.resolve(&actual.flow_type.ty);
+                if !self.unifier.bind_call_pattern_input(&actual, &formal) {
+                    crate::unify_checked_type_pattern(&formal, &actual, &mut substitutions);
+                }
             }
         }
         if let (Some(formal), Some(actual)) = (&interface.context, context) {
@@ -3878,13 +3968,33 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 self.unifier,
                 &mut self.owned_variables,
             );
-            crate::unify_checked_type_pattern(&formal, &actual.flow_type.ty, &mut substitutions);
+            let actual = self.unifier.resolve(&actual.flow_type.ty);
+            if !self.unifier.bind_call_pattern_input(&actual, &formal) {
+                crate::unify_checked_type_pattern(&formal, &actual, &mut substitutions);
+            }
         }
         let instantiated_result = variables.instantiate(
             &interface.result.ty,
             self.unifier,
             &mut self.owned_variables,
         );
+        // Closed record unions bind open formal holes directionally in the
+        // caller unifier rather than through the first-concrete substitution
+        // matcher. Fold those resolved roots back into the invocation
+        // substitution surface so result nodes and diagnostics observe the
+        // complete structural aggregate, not one arbitrary union member.
+        for variable in &interface.type_variables {
+            let Some(instantiated) = variables.replacement(*variable) else {
+                continue;
+            };
+            if substitutions.replacement(instantiated).is_some() {
+                continue;
+            }
+            let resolved = self.unifier.resolve(&Type::Var(instantiated));
+            if resolved != Type::Var(instantiated) {
+                substitutions.insert(instantiated, resolved);
+            }
+        }
         let principal = FlowType {
             mode: interface.result.mode,
             ty: apply_checked_type_substitution_lookup(&instantiated_result, &substitutions),
@@ -3978,7 +4088,9 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         let mut value = if let Some(mut evaluated) = evaluated {
             let selected = evaluated.syntax_selected
                 && crate::type_has_concrete_outer_shape(&evaluated.flow_type.ty);
-            evaluated.flow_type.ty = if selected {
+            let evaluated_is_closed =
+                boon_checked::type_is_recursively_closed(&evaluated.flow_type.ty);
+            evaluated.flow_type.ty = if selected || evaluated_is_closed {
                 evaluated.flow_type.ty
             } else {
                 specialize_checked_call_result(&principal.ty, &evaluated.flow_type.ty)
@@ -4024,12 +4136,12 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         match reference {
             PreparedOwnerResultExpressionRef::Child(route) => {
                 let (_, _, interface, _) = module.resolve_prepared_owner(route)?;
-                Some(EvaluatedResultValue {
-                    flow_type: interface.result.clone(),
-                    parameter_derived: false,
-                    syntax_selected: false,
-                    static_number: None,
-                })
+                Some(fallbacks.resolve_child(
+                    route,
+                    &interface.result,
+                    self.unifier,
+                    &mut self.owned_variables,
+                ))
             }
             PreparedOwnerResultExpressionRef::Local(expression) => {
                 let index = expression as usize;
@@ -4739,6 +4851,26 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
     }
 }
 
+/// Evaluate one call occurrence against an SCC-sealed result-transfer module.
+///
+/// Interface inference and body inference share this exact specialization
+/// authority. Every invocation receives a fresh alpha frame in `unifier`, and
+/// only the occurrence result is returned; the callable's generic public
+/// interface is never constrained by the caller.
+pub(crate) fn evaluate_owner_result_transfer_occurrence(
+    module: &OwnerInterfaceTransferModule,
+    owner: &StableCheckOwnerKey,
+    arguments: &OwnerResultTransferArguments,
+    context: Option<&EvaluatedResultValue>,
+    unifier: &mut TypeUnifier,
+) -> Option<EvaluatedResultValue> {
+    let providers = BTreeMap::new();
+    let mut evaluator = OwnerResultTransferEvaluator::new(&providers, unifier);
+    evaluator
+        .evaluate_owner_from_root_module(module, owner, arguments, context)
+        .map(|result| result.value)
+}
+
 fn static_number_infix(
     left: &ExactNumber,
     operation: &str,
@@ -5093,83 +5225,6 @@ fn push_signature_call_lexical_diagnostics(
     }
 }
 
-fn signature_declaration_target(
-    target: &OwnerEffectiveLexicalTarget,
-) -> Option<OwnerSignatureDeclarationTarget> {
-    match target {
-        OwnerEffectiveLexicalTarget::FreshOut {
-            call,
-            formal_ordinal,
-        } => Some(OwnerSignatureDeclarationTarget::FreshOut {
-            call: call.clone(),
-            formal_ordinal: *formal_ordinal,
-        }),
-        OwnerEffectiveLexicalTarget::CallContext {
-            call,
-            context_ordinal,
-        } => Some(OwnerSignatureDeclarationTarget::CallContext {
-            call: call.clone(),
-            context_ordinal: *context_ordinal,
-        }),
-        OwnerEffectiveLexicalTarget::Static { .. }
-        | OwnerEffectiveLexicalTarget::Imported { .. }
-        | OwnerEffectiveLexicalTarget::InvalidBareBinding { .. }
-        | OwnerEffectiveLexicalTarget::Ambiguous { .. } => None,
-    }
-}
-
-fn signature_dynamic_expression_index(
-    seed: &OwnerConstraintSeed,
-    plan: &OwnerSignatureLexicalPlan,
-) -> (
-    Vec<bool>,
-    BTreeMap<OwnerSignatureDeclarationTarget, Vec<usize>>,
-) {
-    let mut parents = vec![Vec::new(); seed.expressions.len()];
-    for (parent, expression) in seed.expressions.iter().enumerate() {
-        for input in &expression.inputs {
-            if let Some(parents) = parents.get_mut(input.expression as usize) {
-                parents.push(parent);
-            }
-        }
-    }
-    for parents in &mut parents {
-        parents.sort_unstable();
-        parents.dedup();
-    }
-    let mut pending = VecDeque::new();
-    let mut seen = BTreeSet::new();
-    for (expression, read) in plan.reads().iter().enumerate() {
-        let Some(target) = read
-            .as_ref()
-            .and_then(|read| signature_declaration_target(&read.target))
-        else {
-            continue;
-        };
-        if seen.insert((expression, target.clone())) {
-            pending.push_back((expression, target));
-        }
-    }
-    while let Some((expression, target)) = pending.pop_front() {
-        for parent in &parents[expression] {
-            if seen.insert((*parent, target.clone())) {
-                pending.push_back((*parent, target.clone()));
-            }
-        }
-    }
-    let mut dynamic = vec![false; seed.expressions.len()];
-    let mut by_target = BTreeMap::<OwnerSignatureDeclarationTarget, Vec<usize>>::new();
-    for (expression, target) in seen {
-        dynamic[expression] = true;
-        by_target.entry(target).or_default().push(expression);
-    }
-    for expressions in by_target.values_mut() {
-        expressions.sort_unstable();
-        expressions.dedup();
-    }
-    (dynamic, by_target)
-}
-
 fn bind_calls(
     calls: Vec<BodyCallPlan>,
     seed: &OwnerConstraintSeed,
@@ -5383,7 +5438,7 @@ fn bind_calls(
                         .ok()
                         .and_then(|index| parameters.get(index))
                     {
-                        unifier.unify(Type::Var(input), expected.flow_type.ty.clone());
+                        unifier.bind_call_input(input, expected.flow_type.ty.clone());
                     }
                 }
                 if let (Some(pass), Some(context)) = (&signature_call.explicit_pass, &context)
@@ -5394,7 +5449,7 @@ fn bind_calls(
                     && let Some(input) =
                         expression_variable(expressions, external_expressions, pass.expression)
                 {
-                    unifier.unify(Type::Var(input), context.clone());
+                    unifier.bind_call_input(input, context.clone());
                 }
             }
             if valid
@@ -5574,60 +5629,112 @@ fn bind_calls(
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn bind_staged_dynamic_call_inputs(
+fn expression_depends_on_pending_call(
+    seed: &OwnerConstraintSeed,
+    expression: u32,
+    pending_calls: &BTreeSet<usize>,
+    active: &mut BTreeSet<usize>,
+) -> bool {
+    let expression = expression as usize;
+    if pending_calls.contains(&expression) {
+        return true;
+    }
+    let Some(node) = seed.expressions.get(expression) else {
+        return false;
+    };
+    if !active.insert(expression) {
+        return false;
+    }
+    let depends = node.inputs.iter().any(|input| {
+        expression_depends_on_pending_call(seed, input.expression, pending_calls, active)
+    });
+    active.remove(&expression);
+    depends
+}
+
+fn bind_ready_dynamic_call_input_layer(
     drafts: &mut [InferredCallDraft],
-    signature_dynamic_scope_expressions: &BTreeMap<OwnerSignatureDeclarationTarget, Vec<usize>>,
+    seed: &OwnerConstraintSeed,
     unifier: &mut TypeUnifier,
     expressions: &[TypeVar],
     external_expressions: &[TypeVar],
-    pre_call_actual_types: &mut [Type],
-) {
-    // User-call providers are frozen by the first transfer pass. Preserve
-    // those producer results before any consumer constraint can widen them.
-    for draft in drafts.iter().filter(|draft| draft.valid) {
-        if let Some(slot) = pre_call_actual_types.get_mut(draft.plan.expression) {
-            *slot = unifier.resolve(&Type::Var(expressions[draft.plan.expression]));
-        }
+) -> Result<bool, OwnerBodyInferenceError> {
+    let pending_calls = drafts
+        .iter()
+        .filter(|draft| {
+            draft.valid && (!draft.dynamic_inputs.is_empty() || draft.dynamic_pass.is_some())
+        })
+        .map(|draft| draft.plan.expression)
+        .collect::<BTreeSet<_>>();
+    if pending_calls.is_empty() {
+        return Ok(false);
     }
-    // Freeze every producer-dependent expression globally before any outer or
-    // sibling consumer can widen one shared declaration root.
-    let mut dynamic_expressions = BTreeSet::new();
-    for expressions in signature_dynamic_scope_expressions.values() {
-        dynamic_expressions.extend(expressions.iter().copied());
+    let ready = drafts
+        .iter()
+        .enumerate()
+        .filter(|(_, draft)| {
+            draft.valid
+                && (!draft.dynamic_inputs.is_empty() || draft.dynamic_pass.is_some())
+                && draft
+                    .dynamic_inputs
+                    .iter()
+                    .map(|(expression, _)| *expression)
+                    .chain(draft.dynamic_pass.iter().map(|(expression, _)| *expression))
+                    .all(|expression| {
+                        !expression_depends_on_pending_call(
+                            seed,
+                            expression,
+                            &pending_calls,
+                            &mut BTreeSet::new(),
+                        )
+                    })
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if ready.is_empty() {
+        return Err(OwnerBodyInferenceError::new(
+            "dynamic call-input dependency graph contains no ready producer layer",
+        ));
     }
-    for expression in dynamic_expressions {
-        if let Some(slot) = pre_call_actual_types.get_mut(expression) {
-            *slot = unifier.resolve(&Type::Var(expressions[expression]));
-        }
-    }
-    for draft in drafts.iter_mut().filter(|draft| draft.valid) {
-        draft.actual_inputs = draft
-            .plan
-            .inputs
-            .iter()
-            .filter_map(|(_, reference)| {
-                pre_call_actual_types
-                    .get(*reference as usize)
-                    .cloned()
-                    .map(|actual| (*reference, actual))
-            })
-            .collect();
-    }
-    for draft in drafts.iter().filter(|draft| draft.valid) {
-        for (expression, expected) in &draft.dynamic_inputs {
+
+    // Freeze every sibling consumer in this ready layer before mutating any
+    // shared producer. This preserves one exact provider epoch for repeated
+    // uses while still letting child layers close results for their parents.
+    for index in &ready {
+        let draft = &mut drafts[*index];
+        for (expression, _) in &draft.dynamic_inputs {
             let Some(input) = expression_variable(expressions, external_expressions, *expression)
             else {
                 continue;
             };
-            unifier.unify(Type::Var(input), expected.clone());
+            draft
+                .actual_inputs
+                .insert(*expression, unifier.resolve(&Type::Var(input)));
         }
-        if let Some((expression, expected)) = &draft.dynamic_pass
+        if let Some((expression, _)) = &draft.dynamic_pass
             && let Some(input) = expression_variable(expressions, external_expressions, *expression)
         {
-            unifier.unify(Type::Var(input), expected.clone());
+            draft
+                .actual_inputs
+                .insert(*expression, unifier.resolve(&Type::Var(input)));
         }
     }
+    for index in ready {
+        let draft = &mut drafts[index];
+        for (expression, expected) in std::mem::take(&mut draft.dynamic_inputs).into_vec() {
+            let Some(input) = expression_variable(expressions, external_expressions, expression)
+            else {
+                continue;
+            };
+            unifier.bind_call_input(input, expected);
+        }
+        if let Some((expression, expected)) = draft.dynamic_pass.take()
+            && let Some(input) = expression_variable(expressions, external_expressions, expression)
+        {
+            unifier.bind_call_input(input, expected);
+        }
+    }
+    Ok(true)
 }
 
 fn body_expression_result_value(
@@ -5815,7 +5922,7 @@ fn refine_owner_call_at(
         evaluated
     };
     if let Some(evaluated) = evaluated {
-        unifier.bind_var(
+        unifier.publish_authoritative_provider(
             expressions[plan.expression],
             evaluated.value.flow_type.ty.clone(),
         );
@@ -6191,6 +6298,21 @@ fn validate_inputs(
         ));
     }
     Ok(())
+}
+
+fn owner_body_alpha_namespace(
+    unifier: &mut TypeUnifier,
+    own_variables: &BTreeMap<TypeVar, TypeVar>,
+    own_scc_type_variable_count: u32,
+) -> (BTreeMap<TypeVar, TypeVar>, u32) {
+    let mut alpha_variables = BTreeMap::new();
+    for (stable, instantiated) in own_variables {
+        debug_assert!(stable.0 < own_scc_type_variable_count);
+        if let Type::Var(root) = unifier.resolve(&Type::Var(*instantiated)) {
+            alpha_variables.entry(root).or_insert(*stable);
+        }
+    }
+    (alpha_variables, own_scc_type_variable_count)
 }
 
 /// Infer one immutable owner body against exact frozen public interfaces.
@@ -6584,18 +6706,16 @@ fn evaluate_owner_body_impl(
         variable
     });
     let expected_lexical_captures = signature_lexical_plan
-        .imported_captures()
+        .imported_capture_sites()
         .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
+        .map(|capture| (capture.target.clone(), capture.demand_paths.clone()))
+        .collect::<Vec<_>>();
     let actual_lexical_captures = own_interface
         .lexical_captures
         .iter()
-        .map(|capture| capture.target.clone())
-        .collect::<BTreeSet<_>>();
-    if actual_lexical_captures != expected_lexical_captures
-        || actual_lexical_captures.len() != own_interface.lexical_captures.len()
-    {
+        .map(|capture| (capture.target.clone(), capture.demand_paths.clone()))
+        .collect::<Vec<_>>();
+    if actual_lexical_captures != expected_lexical_captures {
         return Err(OwnerBodyInferenceError::new(format!(
             "owner body inference {:?} received stale or duplicate lexical captures",
             seed.owner
@@ -6653,7 +6773,25 @@ fn evaluate_owner_body_impl(
     let mut direct_effects = vec![CheckedEffectSummary::default(); expressions.len()];
     let mut calls = Vec::new();
     let mut pattern_narrowings = Vec::new();
-    let pattern_local_expressions = exact_pattern_local_expressions(seed, &signature_lexical_plan);
+    let inherited_pattern_plans = inherited_pattern_read_plans(&signature_lexical_plan);
+    let mut pattern_local_expressions =
+        exact_pattern_local_expressions(seed, &signature_lexical_plan);
+    pattern_local_expressions.extend(
+        inherited_pattern_plans
+            .iter()
+            .flat_map(|plan| plan.reads.iter().map(|read| read.expression)),
+    );
+    let inherited_pattern_narrowings = instantiate_owner_inherited_pattern_narrowings(
+        &inherited_pattern_plans,
+        |target| {
+            lexical_capture_variables
+                .get(target)
+                .map(|(variable, _)| *variable)
+        },
+        &expressions,
+        &mut unifier,
+    )
+    .map_err(OwnerBodyInferenceError::new)?;
     bind_local_constraints(
         seed,
         summary,
@@ -6670,6 +6808,20 @@ fn evaluate_owner_body_impl(
         &mut pattern_narrowings,
         &mut work,
     );
+    for plan in &inherited_pattern_plans {
+        let mode = lexical_capture_variables
+            .get(&plan.target)
+            .map(|(_, mode)| *mode)
+            .ok_or_else(|| {
+                OwnerBodyInferenceError::new(format!(
+                    "inherited pattern target {:?} has no capture mode",
+                    plan.target
+                ))
+            })?;
+        for read in &plan.reads {
+            modes[read.expression as usize] = Some(mode);
+        }
+    }
 
     let expression_by_key = seed
         .expressions
@@ -6703,6 +6855,13 @@ fn evaluate_owner_body_impl(
         modes[index] = flow_mode_join(modes[index], Some(interface.result.mode));
         work.interface_imports = work.interface_imports.saturating_add(1);
     }
+    // Selectors that are already concrete from local/project authority must
+    // narrow projected bindings before call inputs are frozen. The later pass
+    // remains necessary for selectors whose concrete result is produced by a
+    // user call during transfer evaluation.
+    refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
+    refine_owner_inherited_pattern_narrowings(&mut unifier, &inherited_pattern_narrowings);
+    unifier.refine_contextual_flow_holes();
     let mut pre_call_actual_types = expressions
         .iter()
         .chain(&external_expressions)
@@ -6742,7 +6901,7 @@ fn evaluate_owner_body_impl(
                 .push(index);
         }
     }
-    let (signature_dynamic_expressions, signature_dynamic_scope_expressions) =
+    let signature_dynamic_expressions =
         signature_dynamic_expression_index(seed, &signature_lexical_plan);
     let caller_is_callable =
         own_interface.declaration_kind == Some(crate::OwnerDeclarationKind::Function);
@@ -6766,26 +6925,31 @@ fn evaluate_owner_body_impl(
         &mut diagnostics,
         &mut work,
     );
-    refine_owner_call_transfers(
-        &mut call_drafts,
-        syntax,
-        seed,
-        &interfaces,
-        &providers,
-        &mut unifier,
-        &expressions,
-        &external_expressions,
-        effective_context,
-        &mut modes,
-    );
-    bind_staged_dynamic_call_inputs(
-        &mut call_drafts,
-        &signature_dynamic_scope_expressions,
-        &mut unifier,
-        &expressions,
-        &external_expressions,
-        &mut pre_call_actual_types,
-    );
+    // Freeze one all-providers-first epoch before result-transfer consumers
+    // run. `resolve` retains still-live TypeVar roots, so a child user-call
+    // result can close later without replacing this snapshot. Re-snapshotting
+    // after the first transfer pass would instead record requirements imposed
+    // by sibling/outer consumers (for example Number in place of a FreshOut
+    // Text item) and suppress the diagnostic that this exact snapshot owns.
+    for (slot, variable) in pre_call_actual_types
+        .iter_mut()
+        .zip(expressions.iter().chain(&external_expressions))
+    {
+        *slot = unifier.resolve(&Type::Var(*variable));
+    }
+    for draft in call_drafts.iter_mut().filter(|draft| draft.valid) {
+        draft.actual_inputs = draft
+            .plan
+            .inputs
+            .iter()
+            .filter_map(|(_, reference)| {
+                pre_call_actual_types
+                    .get(*reference as usize)
+                    .cloned()
+                    .map(|actual| (*reference, actual))
+            })
+            .collect();
+    }
     refine_owner_call_transfers(
         &mut call_drafts,
         syntax,
@@ -6799,6 +6963,31 @@ fn evaluate_owner_body_impl(
         &mut modes,
     );
     refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
+    refine_owner_inherited_pattern_narrowings(&mut unifier, &inherited_pattern_narrowings);
+    unifier.refine_contextual_flow_holes();
+    while bind_ready_dynamic_call_input_layer(
+        &mut call_drafts,
+        seed,
+        &mut unifier,
+        &expressions,
+        &external_expressions,
+    )? {
+        refine_owner_call_transfers(
+            &mut call_drafts,
+            syntax,
+            seed,
+            &interfaces,
+            &providers,
+            &mut unifier,
+            &expressions,
+            &external_expressions,
+            effective_context,
+            &mut modes,
+        );
+        refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
+        refine_owner_inherited_pattern_narrowings(&mut unifier, &inherited_pattern_narrowings);
+        unifier.refine_contextual_flow_holes();
+    }
     validate_owner_call_types(
         &mut call_drafts,
         &interfaces,
@@ -6809,8 +6998,21 @@ fn evaluate_owner_body_impl(
         effective_context,
         &mut diagnostics,
     );
-    let mut alpha_variables = BTreeMap::new();
-    let mut next_alpha = 0;
+    // Own-interface alphas already live in the SCC's stable namespace. Keep
+    // that identity when projecting the body instead of renumbering the same
+    // live roots from zero. Checked compatibility assembly combines the
+    // interface scheme with these occurrence types, so independently
+    // renumbering an interface-backed root would sever correlations such as a
+    // callable parameter alpha reused by a nested HOLD/read expression.
+    //
+    // Body-only roots start after the complete SCC namespace. They remain
+    // private implementation variables and therefore cannot collide with a
+    // stable interface alpha from this SCC.
+    let (mut alpha_variables, mut next_alpha) = owner_body_alpha_namespace(
+        &mut unifier,
+        &own_variables,
+        own_scc.type_variable_count,
+    );
     for variable in own_parameter_variables {
         let _ = alpha_normalize_type(
             &unifier.resolve(&Type::Var(variable)),
@@ -6951,7 +7153,7 @@ fn evaluate_owner_body_impl(
     let relocations = collect_relocations(seed, summary, &signature_lexical_plan);
 
     let local_content_digest_v1 = fingerprint(
-        OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V5,
+        OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V6,
         &(
             &inferred_statements,
             &inferred_children,
@@ -6976,7 +7178,7 @@ fn evaluate_owner_body_impl(
     // The construction receipt already commits every semantic row, diagnostic,
     // effect, and row count above. Bind the stable owner to that compact seal
     // instead of serializing the same rich body a second time.
-    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V7, &(&seed.owner, &receipt))?;
+    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V8, &(&seed.owner, &receipt))?;
     work.unification_steps = unifier.steps();
     let result = Arc::new(OwnerBodyInferenceShard {
         owner: seed.owner.clone(),
@@ -7218,6 +7420,40 @@ mod tests {
             results.iter().filter(|result| result.key != own_scc.key),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn body_normalization_reuses_the_own_interface_alpha_namespace() {
+        let mut unifier = TypeUnifier::default();
+        let earlier = unifier.fresh();
+        let selected_once = unifier.fresh();
+        let body_only = unifier.fresh();
+        let own_variables = BTreeMap::from([
+            (TypeVar(36), earlier),
+            (TypeVar(46), selected_once),
+        ]);
+        let (mut variables, mut next) =
+            owner_body_alpha_namespace(&mut unifier, &own_variables, 47);
+
+        assert_eq!(
+            alpha_normalize_type(
+                &Type::Union(vec![
+                    Type::Var(selected_once),
+                    Type::VariantSet(vec![Variant::Tag("False".to_owned())].into()),
+                ]),
+                &mut variables,
+                &mut next,
+            ),
+            Type::Union(vec![
+                Type::Var(TypeVar(46)),
+                Type::VariantSet(vec![Variant::Tag("False".to_owned())].into()),
+            ]),
+        );
+        assert_eq!(
+            alpha_normalize_type(&Type::Var(body_only), &mut variables, &mut next),
+            Type::Var(TypeVar(47)),
+        );
+        assert_eq!(next, 48);
     }
 
     #[test]
@@ -7653,6 +7889,25 @@ mod tests {
         };
         assert!(prepare_owner_result_transfer(module, &forged).is_err());
 
+        let mut forged_capture = interface.clone();
+        forged_capture.lexical_captures = vec![crate::OwnerInterfaceLexicalCapture {
+            target: OwnerLexicalTargetRef::Declaration {
+                owner: choose.clone(),
+                declaration: boon_checked::OwnerDeclarationStableKey::Public,
+                capability: boon_checked::OwnerLexicalDeclarationCapability::Value,
+            },
+            demand_paths: vec![Box::<[String]>::default()].into_boxed_slice(),
+            flow_type: FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Var(TypeVar(u32::MAX)),
+            },
+        }]
+        .into_boxed_slice();
+        assert!(
+            !owner_result_transfer_interface_variables_are_complete(&forged_capture),
+            "transfer sealing must reject undeclared lexical-capture alphas",
+        );
+
         let mut unifier = TypeUnifier::default();
         let mut owned_variables = Vec::new();
         let variables = OwnerResultTransferVariables::new();
@@ -7673,10 +7928,148 @@ mod tests {
     }
 
     #[test]
+    fn child_transfer_uses_the_current_scc_frame_and_isolates_dependency_alphas() {
+        let stable = TypeVar(0);
+        let result = FlowType {
+            mode: FlowMode::PresentOrAbsent,
+            ty: Type::Var(stable),
+        };
+        let mut unifier = TypeUnifier::default();
+        let mut owned_variables = Vec::new();
+        let mut variables = OwnerResultTransferVariables::new();
+        let Type::Var(local) =
+            variables.instantiate(&Type::Var(stable), &mut unifier, &mut owned_variables)
+        else {
+            unreachable!();
+        };
+        unifier.bind_var(local, Type::Text);
+        let mut fallbacks =
+            OwnerResultTransferFallbacks::new(variables, crate::InlineTypeSubstitutions::default());
+
+        let own = fallbacks.resolve_child(
+            PreparedOwnerInterfaceTransferRoute::Own(1),
+            &result,
+            &mut unifier,
+            &mut owned_variables,
+        );
+        assert_eq!(
+            own.flow_type,
+            FlowType {
+                mode: result.mode,
+                ty: Type::Text,
+            }
+        );
+
+        let first_dependency = fallbacks.resolve_child(
+            PreparedOwnerInterfaceTransferRoute::Dependency {
+                dependency: 0,
+                owner: 0,
+            },
+            &result,
+            &mut unifier,
+            &mut owned_variables,
+        );
+        let repeated_dependency = fallbacks.resolve_child(
+            PreparedOwnerInterfaceTransferRoute::Dependency {
+                dependency: 0,
+                owner: 1,
+            },
+            &result,
+            &mut unifier,
+            &mut owned_variables,
+        );
+        let second_dependency = fallbacks.resolve_child(
+            PreparedOwnerInterfaceTransferRoute::Dependency {
+                dependency: 1,
+                owner: 0,
+            },
+            &result,
+            &mut unifier,
+            &mut owned_variables,
+        );
+        assert!(first_dependency == repeated_dependency);
+        assert_ne!(first_dependency.flow_type.ty, Type::Text);
+        assert_ne!(
+            first_dependency.flow_type.ty,
+            second_dependency.flow_type.ty
+        );
+    }
+
+    #[test]
+    fn closed_all_arm_transfer_replaces_an_open_principal_without_syntax_selection() {
+        let unit = link(concat!(
+            "FUNCTION label(value) {\n",
+            "    value |> WHEN {\n",
+            "        BinaryValue => value.bits\n",
+            "        StringValue => value.text\n",
+            "        __ => TEXT { ? }\n",
+            "    }\n",
+            "}\n",
+        ));
+        let label = owner_named(&unit, "label");
+        let (_, _, seed) = inputs(&unit, &label);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let interfaces = solve(&[seed.clone()], &[summary.clone()]);
+        let interface = interfaces
+            .iter()
+            .find_map(|result| result.owner(&label))
+            .expect("label interface");
+        assert!(
+            !boon_checked::type_is_recursively_closed(&interface.result.ty),
+            "fixture requires the broad definition-site principal: {interface:#?}",
+        );
+
+        let plan = plan_owner_body_interfaces(&seed, &summary, &interfaces).unwrap();
+        let providers = BTreeMap::from([(label.clone(), plan.own_scc.module.as_ref())]);
+        let actual = Type::VariantSet(
+            vec![
+                Variant::Tagged {
+                    tag: "BinaryValue".to_owned(),
+                    fields: ObjectShape::from_ordered_fields::<boon_checked::SharedObjectShape>(
+                        [("bits".to_owned(), Type::Text)],
+                        false,
+                    ),
+                },
+                Variant::Tagged {
+                    tag: "StringValue".to_owned(),
+                    fields: ObjectShape::from_ordered_fields::<boon_checked::SharedObjectShape>(
+                        [("text".to_owned(), Type::Text)],
+                        false,
+                    ),
+                },
+            ]
+            .into(),
+        );
+        let arguments = OwnerResultTransferArguments::from([(
+            0,
+            EvaluatedResultValue {
+                flow_type: FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: actual,
+                },
+                parameter_derived: true,
+                syntax_selected: false,
+                static_number: None,
+            },
+        )]);
+        let mut unifier = TypeUnifier::default();
+        let mut evaluator = OwnerResultTransferEvaluator::new(&providers, &mut unifier);
+        let evaluated = evaluator
+            .evaluate_owner(&label, &arguments, None)
+            .expect("label transfer result");
+        assert_eq!(evaluated.value.flow_type.ty, Type::Text);
+        assert!(evaluated.value.parameter_derived);
+        assert!(
+            !evaluated.value.syntax_selected,
+            "a multi-variant selector evaluates every arm",
+        );
+    }
+
+    #[test]
     fn syntax_selected_call_transfer_matches_the_whole_checker_oracle() {
-        let source = "FUNCTION choose(kind) {\n    kind |> WHEN {\n        Record => [value: 1]\n        __ => LIST { 1 }\n    }\n}\nvalue: choose(kind: Record)\n";
+        let source = "FUNCTION choose(kind) {\n    kind |> WHEN {\n        Record => [value: 1]\n        __ => LIST { 1 }\n    }\n}\nFUNCTION probe() {\n    selected: choose(kind: Record)\n    checked: selected.value + 1\n    selected\n}\n";
         let unit = link(source);
-        let value = owner_named(&unit, "value");
+        let value = owner_named(&unit, "probe");
         let choose = owner_named(&unit, "choose");
         let (value_syntax, _, value_seed) = inputs(&unit, &value);
         let (_, _, choose_seed) = inputs(&unit, &choose);
@@ -7746,6 +8139,14 @@ mod tests {
             oracle.syntax_discriminated_result
         );
         assert!(call.syntax_discriminated_result);
+        let Type::Object(result) = &call.result.ty else {
+            panic!("selected choose occurrence must be one record: {call:#?}");
+        };
+        assert!(
+            !result.open,
+            "a downstream field requirement must not reopen the selected result",
+        );
+        assert_eq!(result.fields.get("value"), Some(&Type::Number));
     }
 
     #[test]

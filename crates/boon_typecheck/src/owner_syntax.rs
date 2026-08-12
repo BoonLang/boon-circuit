@@ -1,4 +1,7 @@
-use boon_checked::CheckedValueUse;
+use boon_checked::{
+    CheckedValueUse, OwnerDeclarationStableKey, OwnerLexicalDeclarationCapability,
+    OwnerLexicalTargetRef,
+};
 use boon_parser::UnitOwnerSyntaxView;
 use boon_syntax::{
     AstBlockBinding, AstBlockBindingDeclaration, AstCallArg, AstExprKind, AstParameter,
@@ -8,13 +11,13 @@ use boon_syntax::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
 
 const OWNER_KEY_FINGERPRINT_DOMAIN_V2: &[u8] = b"boon.check-owner-key.v2\0";
-const OWNER_SYNTAX_FINGERPRINT_DOMAIN_V2: &[u8] = b"boon.owner-syntax-input.v2\0";
+const OWNER_SYNTAX_FINGERPRINT_DOMAIN_V3: &[u8] = b"boon.owner-syntax-input.v3\0";
 const OWNER_SOURCE_MAP_FINGERPRINT_DOMAIN_V2: &[u8] = b"boon.owner-source-map.v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,6 +140,19 @@ pub enum OwnerContainingScopeInput {
 pub struct OwnerSyntaxInput {
     pub owner: StableCheckOwnerKey,
     pub containing_scope: OwnerContainingScopeInput,
+    /// Exact enclosing Field/HOLD declaration that owns a nested fieldless
+    /// HOLD update. This can skip one or more fieldless HOLD item boundaries;
+    /// the target therefore cannot be reconstructed from the immediate
+    /// containing owner alone.
+    pub containing_hold_authority: Option<OwnerLexicalTargetRef>,
+    /// Number of earlier fieldless HOLD states sharing
+    /// `containing_hold_authority`, in authored source order. Stable item-route
+    /// ordinals intentionally ignore differently named siblings, so this
+    /// separate parser-issued offset owns dense-compatible `state_N` paths.
+    pub containing_hold_state_ordinal_base: Option<usize>,
+    /// Whether this owner's HOLD is the enclosing declaration's published
+    /// value through only transparent result wrappers.
+    pub containing_hold_is_declaration_result: bool,
     pub statements: Box<[OwnerStatementInput]>,
     pub expressions: Box<[OwnerExpressionInput]>,
     pub external_expressions: Box<[OwnerExternalExpressionInput]>,
@@ -918,12 +934,106 @@ fn containing_scope_is_render_context(containing_scope: &OwnerContainingScopeInp
             })
 }
 
+fn stable_statement_declaration_target(
+    view: UnitOwnerSyntaxView<'_>,
+    statement: UnitLocalStatementId,
+) -> Result<OwnerLexicalTargetRef, OwnerSyntaxProjectionError> {
+    let owner = view
+        .stable_check_owner_for_local_statement(statement)
+        .ok_or_else(|| {
+            OwnerSyntaxProjectionError::new(
+                "containing HOLD authority has no stable statement owner",
+            )
+        })?;
+    let statement = view.stable_statement_key_local(statement).ok_or_else(|| {
+        OwnerSyntaxProjectionError::new(
+            "containing HOLD authority has no stable statement identity",
+        )
+    })?;
+    let declaration = match &owner {
+        StableCheckOwnerKey::Item(owner)
+            if statement.route.owner.as_ref() == Some(&owner.item_route)
+                && statement.route.statement_route.is_empty() =>
+        {
+            OwnerDeclarationStableKey::Public
+        }
+        StableCheckOwnerKey::UnitRoot(_) | StableCheckOwnerKey::Item(_) => {
+            OwnerDeclarationStableKey::Statement {
+                statement: statement.clone(),
+            }
+        }
+    };
+    Ok(OwnerLexicalTargetRef::Declaration {
+        owner,
+        declaration,
+        capability: OwnerLexicalDeclarationCapability::Value,
+    })
+}
+
+/// Resolve the lexical state owner visible immediately outside an item.
+///
+/// A fieldless HOLD owns a declaration only when the surrounding lexical
+/// owner is not itself a Field/HOLD. Multiple nested fieldless HOLDs therefore
+/// collapse onto the outermost such HOLD before a non-state owner, or onto the
+/// nearest authored Field/HOLD when one exists.
+fn containing_hold_authority(
+    view: UnitOwnerSyntaxView<'_>,
+    mut statement: UnitLocalStatementId,
+) -> Result<Option<OwnerLexicalTargetRef>, OwnerSyntaxProjectionError> {
+    let mut fieldless_hold = None;
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(statement.as_usize()) {
+            return Err(OwnerSyntaxProjectionError::new(
+                "containing statement chain is cyclic",
+            ));
+        }
+        let input = view.statement_for_local(statement).ok_or_else(|| {
+            OwnerSyntaxProjectionError::new("containing statement chain is incomplete")
+        })?;
+        match &input.kind {
+            AstStatementKind::Field { .. } | AstStatementKind::Hold { field: Some(_), .. } => {
+                return stable_statement_declaration_target(view, statement).map(Some);
+            }
+            AstStatementKind::Hold {
+                field: None,
+                name: Some(_),
+            } => fieldless_hold = Some(statement),
+            AstStatementKind::Function { .. }
+            | AstStatementKind::Source { field: Some(_), .. }
+            | AstStatementKind::List { field: Some(_), .. } => {
+                return fieldless_hold
+                    .map(|statement| stable_statement_declaration_target(view, statement))
+                    .transpose();
+            }
+            AstStatementKind::Source { field: None, .. }
+            | AstStatementKind::Hold {
+                field: None,
+                name: None,
+            }
+            | AstStatementKind::List { field: None, .. }
+            | AstStatementKind::Block
+            | AstStatementKind::Spread
+            | AstStatementKind::Expression => {}
+        }
+        let Some(parent) = view
+            .statement_locator(statement)
+            .and_then(|locator| locator.parent())
+        else {
+            return fieldless_hold
+                .map(|statement| stable_statement_declaration_target(view, statement))
+                .transpose();
+        };
+        statement = parent;
+    }
+}
+
 pub fn project_owner_syntax_input(
     view: UnitOwnerSyntaxView<'_>,
 ) -> Result<OwnerSyntaxInput, OwnerSyntaxProjectionError> {
     let owner = view.stable_key();
-    let containing_scope = match &owner {
-        StableCheckOwnerKey::UnitRoot(_) => OwnerContainingScopeInput::ProjectRoot,
+    let (containing_scope, containing_hold_authority) = match &owner {
+        StableCheckOwnerKey::UnitRoot(_) => (OwnerContainingScopeInput::ProjectRoot, None),
         StableCheckOwnerKey::Item(_) => {
             let root = *view.statement_ids().first().ok_or_else(|| {
                 OwnerSyntaxProjectionError::new(format!(
@@ -939,7 +1049,7 @@ pub fn project_owner_syntax_input(
                 })?
                 .parent();
             match parent {
-                None => OwnerContainingScopeInput::ProjectRoot,
+                None => (OwnerContainingScopeInput::ProjectRoot, None),
                 Some(parent) => {
                     let statement = view.stable_statement_key_local(parent).ok_or_else(|| {
                         OwnerSyntaxProjectionError::new(format!(
@@ -955,14 +1065,37 @@ pub fn project_owner_syntax_input(
                             })
                         },
                     );
-                    OwnerContainingScopeInput::OwnerStatement {
-                        owner: parent_owner,
-                        statement,
-                    }
+                    (
+                        OwnerContainingScopeInput::OwnerStatement {
+                            owner: parent_owner,
+                            statement,
+                        },
+                        containing_hold_authority(view, parent)?,
+                    )
                 }
             }
         }
     };
+    let containing_hold_state_ordinal_base =
+        containing_hold_authority
+            .as_ref()
+            .and_then(|target| match target {
+                OwnerLexicalTargetRef::Declaration { owner, .. } => {
+                    view.preceding_fieldless_hold_count_for_authority(owner)
+                }
+                OwnerLexicalTargetRef::ContextFormal { .. }
+                | OwnerLexicalTargetRef::Ambiguous { .. } => None,
+            });
+    let containing_hold_is_declaration_result = containing_hold_authority
+        .as_ref()
+        .and_then(|target| match target {
+            OwnerLexicalTargetRef::Declaration { owner, .. } => {
+                view.public_result_is_transparent_from_authority(owner)
+            }
+            OwnerLexicalTargetRef::ContextFormal { .. }
+            | OwnerLexicalTargetRef::Ambiguous { .. } => None,
+        })
+        .unwrap_or(false);
     let mut statement_by_local = BTreeMap::<UnitLocalStatementId, u32>::new();
     let mut statement_by_syntax = BTreeMap::<usize, u32>::new();
     for (dense, (local, statement)) in view
@@ -1178,10 +1311,13 @@ pub fn project_owner_syntax_input(
     let external_expressions = expression_projection.into_external_expressions();
 
     let fingerprint_v1 = fingerprint_serialized(
-        OWNER_SYNTAX_FINGERPRINT_DOMAIN_V2,
+        OWNER_SYNTAX_FINGERPRINT_DOMAIN_V3,
         &(
             &owner,
             &containing_scope,
+            &containing_hold_authority,
+            containing_hold_state_ordinal_base,
+            containing_hold_is_declaration_result,
             &statements,
             &expressions,
             &external_expressions,
@@ -1191,6 +1327,9 @@ pub fn project_owner_syntax_input(
     Ok(OwnerSyntaxInput {
         owner,
         containing_scope,
+        containing_hold_authority,
+        containing_hold_state_ordinal_base,
+        containing_hold_is_declaration_result,
         statements: statements.into_boxed_slice(),
         expressions: expressions.into_boxed_slice(),
         external_expressions: external_expressions.into_boxed_slice(),

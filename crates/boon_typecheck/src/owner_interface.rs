@@ -1,3 +1,8 @@
+use crate::owner_body::{
+    EvaluatedResultValue, OwnerInterfaceTransferModule, OwnerResultTransferArguments,
+    evaluate_owner_result_transfer_occurrence, owner_interface_transfer_dependency_owners,
+    project_owner_interface_transfer_module,
+};
 use crate::owner_signature_lexical::effective_narrowed_selector_read_matches;
 use crate::{
     AuthoritativeCallableSignature, AuthoritativeParameter, BuiltinSignatureRegistry,
@@ -5,10 +10,11 @@ use crate::{
     OwnerCollectionKind, OwnerConstraintEdgeRole, OwnerConstraintNodeKind, OwnerConstraintSeed,
     OwnerConstraintSeedError, OwnerConstraintSummary, OwnerDeclarationKind,
     OwnerEffectiveLexicalReadPlan, OwnerEffectiveLexicalTarget, OwnerInferenceAbiEnvironment,
-    OwnerInterfaceScc, OwnerInterfaceSccKey, OwnerLexicalDeclarationTarget, OwnerParameterKind,
-    OwnerPatternConstraint, OwnerReferenceKind, OwnerSignatureDeclarationTarget,
-    OwnerSignatureLexicalPlan, OwnerSymbolResolution, RenderContractRegistry,
-    host_effect_signature, infix_requires_number_operands, infix_returns_bool,
+    OwnerInheritedPatternNarrowingPlan, OwnerInterfaceScc, OwnerInterfaceSccKey,
+    OwnerLexicalAccess, OwnerLexicalDeclarationTarget, OwnerParameterKind, OwnerPatternConstraint,
+    OwnerReferenceKind, OwnerSignatureDeclarationTarget, OwnerSignatureLexicalPlan,
+    OwnerSymbolResolution, RenderContractRegistry, host_effect_signature,
+    infix_requires_number_operands, infix_returns_bool,
     project_owner_signature_lexical_scope_plans, session_info_intrinsic_type,
 };
 use boon_checked::{
@@ -16,16 +22,17 @@ use boon_checked::{
     FlowType, ObjectShape, OwnerDeclarationStableKey, OwnerLexicalDeclarationCapability,
     OwnerLexicalTargetRef, Type, TypeVar, Variant, widen_structural_type,
 };
+use boon_data::ExactNumber;
 use boon_syntax::{StableCheckOwnerKey, StableExpressionKey};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
-const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V5: &[u8] = b"boon.owner-interface-scc-result.v5\0";
+const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V6: &[u8] = b"boon.owner-interface-scc-result.v6\0";
 const OWNER_INTERFACE_SCC_KEY_DOMAIN_V1: &[u8] = b"boon.owner-interface-scc-key.v1\0";
-const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V6: &[u8] =
-    b"boon.owner-interface-scc-currentness.v6\0";
-const OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V3: &[u8] = b"boon.owner-body-interface-import.v3\0";
+const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V7: &[u8] =
+    b"boon.owner-interface-scc-currentness.v7\0";
+const OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V4: &[u8] = b"boon.owner-body-interface-import.v4\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerInterfaceParameter {
@@ -185,6 +192,12 @@ pub struct OwnerInterfaceCapture {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerInterfaceLexicalCapture {
     pub target: OwnerLexicalTargetRef,
+    /// Exact prefix-minimal terminal projections used to shape `flow_type`.
+    /// `[]` means the full declaration is captured. Otherwise Object
+    /// ancestors contain only demanded fields while preserving their original
+    /// open/closed status; each terminal retains its complete subtype and all
+    /// paths share one alpha frame.
+    pub demand_paths: Box<[Box<[String]>]>,
     pub flow_type: FlowType,
 }
 
@@ -331,7 +344,7 @@ impl OwnerInterfaceSccCurrentnessReceipt {
         }
         let result_fingerprint_v1 = result.fingerprint_v1();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V6,
+            OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V7,
             &(&basis, result_fingerprint_v1),
         )
         .map_err(|error| {
@@ -356,6 +369,24 @@ impl OwnerInterfaceSccCurrentnessReceipt {
 pub struct OwnerInterfaceSccEvaluation {
     pub currentness: OwnerInterfaceSccCurrentnessReceipt,
     pub result: Arc<OwnerInterfaceSccResult>,
+}
+
+/// One interface component evaluated once, together with the transfer module
+/// compiled from the same final semantic surface.
+///
+/// `transfer_iterations` counts only quiescent residual-transfer epochs. It
+/// never counts a fresh reconstruction of the SCC solver.
+#[derive(Clone)]
+pub struct OwnerInterfaceSccComponentEvaluation {
+    pub evaluation: OwnerInterfaceSccEvaluation,
+    pub module: Arc<OwnerInterfaceTransferModule>,
+    pub transfer_iterations: u32,
+}
+
+struct OwnerInterfaceSccSolveOutput {
+    evaluation: OwnerInterfaceSccEvaluation,
+    module: Option<Arc<OwnerInterfaceTransferModule>>,
+    transfer_iterations: u32,
 }
 
 fn type_contains_inference_variable(ty: &Type) -> bool {
@@ -393,26 +424,45 @@ fn type_contains_inference_variable(ty: &Type) -> bool {
 /// never widened by this operation.
 fn bind_provider_inference_holes(unifier: &mut TypeUnifier, provider: &Type, requirement: &Type) {
     let requirement = unifier.resolve(requirement);
+    bind_provider_inference_holes_resolved(unifier, provider, &requirement);
+}
+
+fn bind_provider_inference_holes_resolved(
+    unifier: &mut TypeUnifier,
+    provider: &Type,
+    requirement: &Type,
+) {
     if matches!(requirement, Type::Unknown | Type::UnresolvedShape { .. })
         || matches!(
-            &requirement,
+            requirement,
             Type::Object(shape) if shape.open && shape.fields.is_empty()
         )
     {
         return;
     }
     match (provider, requirement) {
-        (Type::Var(variable), requirement) => unifier.bind_var(*variable, requirement),
+        (Type::Var(variable), Type::Union(members)) => {
+            let own = Type::Var(unifier.root_readonly(*variable));
+            let residual = members
+                .iter()
+                .filter(|member| !unifier.same_live_type(&own, member))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !residual.is_empty() {
+                unifier.bind_var(*variable, boon_checked::canonical_union_type(residual));
+            }
+        }
+        (Type::Var(variable), requirement) => unifier.bind_var(*variable, requirement.clone()),
         (Type::Object(provider), Type::Object(requirement)) => {
             for (name, provider) in &provider.fields {
                 if let Some(requirement) = requirement.fields.get(name) {
-                    bind_provider_inference_holes(unifier, provider, requirement);
+                    bind_provider_inference_holes_resolved(unifier, provider, requirement);
                 }
             }
         }
         (Type::List(provider), Type::List(requirement))
         | (Type::Set(provider), Type::Set(requirement)) => {
-            bind_provider_inference_holes(unifier, provider, &requirement);
+            bind_provider_inference_holes_resolved(unifier, provider, requirement);
         }
         (
             Type::Map {
@@ -424,8 +474,8 @@ fn bind_provider_inference_holes(unifier: &mut TypeUnifier, provider: &Type, req
                 value: requirement_value,
             },
         ) => {
-            bind_provider_inference_holes(unifier, provider_key, &requirement_key);
-            bind_provider_inference_holes(unifier, provider_value, &requirement_value);
+            bind_provider_inference_holes_resolved(unifier, provider_key, requirement_key);
+            bind_provider_inference_holes_resolved(unifier, provider_value, requirement_value);
         }
         (
             Type::Function {
@@ -438,9 +488,13 @@ fn bind_provider_inference_holes(unifier: &mut TypeUnifier, provider: &Type, req
             },
         ) => {
             for (provider, requirement) in provider_args.iter().zip(requirement_args) {
-                bind_provider_inference_holes(unifier, provider, &requirement);
+                bind_provider_inference_holes_resolved(unifier, provider, requirement);
             }
-            bind_provider_inference_holes(unifier, &provider_result.ty, &requirement_result.ty);
+            bind_provider_inference_holes_resolved(
+                unifier,
+                &provider_result.ty,
+                &requirement_result.ty,
+            );
         }
         (Type::VariantSet(provider), Type::VariantSet(requirement)) => {
             for provider in provider.iter() {
@@ -465,7 +519,7 @@ fn bind_provider_inference_holes(unifier: &mut TypeUnifier, provider: &Type, req
                 };
                 for (name, provider) in &provider_fields.fields {
                     if let Some(requirement) = requirement_fields.fields.get(name) {
-                        bind_provider_inference_holes(unifier, provider, requirement);
+                        bind_provider_inference_holes_resolved(unifier, provider, requirement);
                     }
                 }
             }
@@ -474,11 +528,366 @@ fn bind_provider_inference_holes(unifier: &mut TypeUnifier, provider: &Type, req
             if provider.len() == requirement.len() =>
         {
             for (provider, requirement) in provider.iter().zip(requirement) {
-                bind_provider_inference_holes(unifier, provider, &requirement);
+                bind_provider_inference_holes_resolved(unifier, provider, requirement);
             }
         }
         _ => {}
     }
+}
+
+/// Build only the structural additions that a consumer requirement may make
+/// to an open provider surface. Existing fields are traversed recursively;
+/// missing fields are admitted only by an open Object at that exact path.
+/// Closed provider structure and non-Object barriers remain authoritative.
+fn open_provider_requirement_patch(provider: &Type, requirement: &Type) -> Option<Type> {
+    match (provider, requirement) {
+        (Type::Object(provider), Type::Object(requirement)) => {
+            let mut fields = Vec::new();
+            let mut seen = BTreeSet::new();
+            for name in requirement
+                .field_order
+                .iter()
+                .chain(requirement.fields.keys())
+            {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let Some(requirement_field) = requirement.fields.get(name) else {
+                    continue;
+                };
+                let patch = match provider.fields.get(name) {
+                    Some(provider_field) => {
+                        open_provider_requirement_patch(provider_field, requirement_field)
+                    }
+                    None if provider.open => Some(requirement_field.clone()),
+                    None => None,
+                };
+                if let Some(patch) = patch {
+                    fields.push((name.clone(), patch));
+                }
+            }
+            (!fields.is_empty())
+                .then(|| Type::object(ObjectShape::from_ordered_fields(fields, false)))
+        }
+        (Type::List(provider), Type::List(requirement)) => {
+            open_provider_requirement_patch(provider, requirement)
+                .map(|item| Type::List(Type::shared(item)))
+        }
+        (Type::Set(provider), Type::Set(requirement)) => {
+            open_provider_requirement_patch(provider, requirement)
+                .map(|item| Type::Set(Type::shared(item)))
+        }
+        (
+            Type::Map {
+                key: provider_key,
+                value: provider_value,
+            },
+            Type::Map {
+                key: requirement_key,
+                value: requirement_value,
+            },
+        ) => {
+            let key = open_provider_requirement_patch(provider_key, requirement_key);
+            let value = open_provider_requirement_patch(provider_value, requirement_value);
+            match (key, value) {
+                (None, None) => None,
+                (key, value) => Some(Type::Map {
+                    key: Box::new(key.unwrap_or_else(|| provider_key.as_ref().clone())),
+                    value: Box::new(value.unwrap_or_else(|| provider_value.as_ref().clone())),
+                }),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn bind_open_provider_requirement(
+    unifier: &mut TypeUnifier,
+    provider: TypeVar,
+    provider_surface: &Type,
+    requirement: &Type,
+) {
+    if let Some(patch) = open_provider_requirement_patch(provider_surface, requirement) {
+        unifier.bind_var(provider, patch);
+    }
+}
+
+/// Project closed call-site alternatives into one instantiated formal without
+/// rewriting the authoritative provider union. Alternatives retain their
+/// identity; only formal inference holes receive the union of corresponding
+/// structural leaves.
+fn bind_call_formal_from_closed_alternatives(
+    unifier: &mut TypeUnifier,
+    formal: &Type,
+    actual: &[Type],
+) {
+    if actual.is_empty() {
+        return;
+    }
+    match formal {
+        Type::Var(_) => {
+            let concrete = actual
+                .iter()
+                .filter(|actual| !matches!(actual, Type::Absent))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !concrete.is_empty() {
+                let provider = boon_checked::canonical_union_type(concrete);
+                let Type::Var(variable) = formal else {
+                    unreachable!("matched a non-variable call formal")
+                };
+                let current = unifier.resolve(formal);
+                if boon_checked::type_is_recursively_closed(&provider)
+                    && !boon_checked::type_is_recursively_closed(&current)
+                {
+                    // FreshOut/context consumers can shape a shared formal
+                    // alpha before its parent-scope provider becomes exact.
+                    // That open shape is a requirement, not a co-authority.
+                    // Once the provider is recursively closed, preserve its
+                    // genuine holes and replace only that provisional root.
+                    unifier.replace_authoritative_binding(*variable, provider);
+                } else {
+                    // A partial provider or a second closed provider retains
+                    // ordinary equality semantics; no argument can become a
+                    // traversal-order last writer.
+                    bind_provider_inference_holes(unifier, formal, &provider);
+                }
+            }
+        }
+        Type::Object(formal) => {
+            if !actual
+                .iter()
+                .all(|actual| matches!(actual, Type::Object(_)))
+            {
+                return;
+            }
+            for (name, formal) in &formal.fields {
+                let fields = actual
+                    .iter()
+                    .filter_map(|actual| match actual {
+                        Type::Object(shape) => shape.fields.get(name).cloned(),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if fields.len() == actual.len() {
+                    bind_call_formal_from_closed_alternatives(unifier, formal, &fields);
+                }
+            }
+        }
+        Type::List(formal) => {
+            let items = actual
+                .iter()
+                .filter_map(|actual| match actual {
+                    Type::List(item) => Some(item.as_ref().clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if items.len() == actual.len() {
+                bind_call_formal_from_closed_alternatives(unifier, formal, &items);
+            }
+        }
+        Type::Set(formal) => {
+            let items = actual
+                .iter()
+                .filter_map(|actual| match actual {
+                    Type::Set(item) => Some(item.as_ref().clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if items.len() == actual.len() {
+                bind_call_formal_from_closed_alternatives(unifier, formal, &items);
+            }
+        }
+        Type::Map {
+            key: formal_key,
+            value: formal_value,
+        } => {
+            let entries = actual
+                .iter()
+                .filter_map(|actual| match actual {
+                    Type::Map { key, value } => {
+                        Some((key.as_ref().clone(), value.as_ref().clone()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if entries.len() == actual.len() {
+                bind_call_formal_from_closed_alternatives(
+                    unifier,
+                    formal_key,
+                    &entries
+                        .iter()
+                        .map(|(key, _)| key.clone())
+                        .collect::<Vec<_>>(),
+                );
+                bind_call_formal_from_closed_alternatives(
+                    unifier,
+                    formal_value,
+                    &entries
+                        .iter()
+                        .map(|(_, value)| value.clone())
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        Type::Function {
+            args: formal_args,
+            result: formal_result,
+        } => {
+            let functions = actual
+                .iter()
+                .filter_map(|actual| match actual {
+                    Type::Function { args, result } if args.len() == formal_args.len() => {
+                        Some((args, result))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if functions.len() == actual.len() {
+                for (index, formal) in formal_args.iter().enumerate() {
+                    bind_call_formal_from_closed_alternatives(
+                        unifier,
+                        formal,
+                        &functions
+                            .iter()
+                            .map(|(args, _)| args[index].clone())
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                bind_call_formal_from_closed_alternatives(
+                    unifier,
+                    &formal_result.ty,
+                    &functions
+                        .iter()
+                        .map(|(_, result)| result.ty.clone())
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        Type::VariantSet(_)
+        | Type::Union(_)
+        | Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown => {}
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LexicalCaptureDemand {
+    full: bool,
+    children: BTreeMap<String, LexicalCaptureDemand>,
+}
+
+impl LexicalCaptureDemand {
+    fn from_paths(paths: &[Box<[String]>]) -> Result<Self, OwnerConstraintSeedError> {
+        if paths.is_empty()
+            || paths.windows(2).any(|paths| paths[0] >= paths[1])
+            || paths
+                .iter()
+                .enumerate()
+                .any(|(index, path)| paths[..index].iter().any(|prefix| path.starts_with(prefix)))
+        {
+            return Err(OwnerConstraintSeedError::new(
+                "lexical capture demand paths are empty, unsorted, duplicate, or not prefix-minimal",
+            ));
+        }
+        let mut demand = Self::default();
+        for path in paths {
+            demand.insert(path);
+        }
+        Ok(demand)
+    }
+
+    fn insert(&mut self, path: &[String]) {
+        if self.full {
+            return;
+        }
+        let Some((field, rest)) = path.split_first() else {
+            self.full = true;
+            self.children.clear();
+            return;
+        };
+        self.children.entry(field.clone()).or_default().insert(rest);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        if self.full || other.children.is_empty() && !other.full {
+            return;
+        }
+        if other.full {
+            self.full = true;
+            self.children.clear();
+            return;
+        }
+        for (field, demand) in &other.children {
+            self.children
+                .entry(field.clone())
+                .or_default()
+                .merge(demand);
+        }
+    }
+
+    fn project_resolved(&self, ty: &Type) -> Type {
+        if self.full {
+            return ty.clone();
+        }
+        let Type::Object(shape) = ty else {
+            // The first exact cut prunes only Object siblings. Every other
+            // constructor is a correlation barrier and retains its complete
+            // subtree.
+            return ty.clone();
+        };
+        let fields = self
+            .children
+            .iter()
+            .filter_map(|(name, demand)| {
+                shape
+                    .fields
+                    .get(name)
+                    .map(|ty| (name.clone(), demand.project_resolved(ty)))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut field_order = shape
+            .field_order
+            .iter()
+            .filter(|name| fields.contains_key(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        for name in fields.keys() {
+            if !field_order.contains(name) {
+                field_order.push(name.clone());
+            }
+        }
+        Type::object(ObjectShape {
+            // `demand_paths` is the authority for omitted siblings. Preserve
+            // the provider node's own openness so a closed missing selector
+            // cannot be mistaken for a schematic/open value by inherited
+            // narrowing. An empty demand path always retains the full node.
+            open: shape.open,
+            fields,
+            field_order,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct InternalLexicalCaptureProvider {
+    consumer: StableCheckOwnerKey,
+    target: OwnerLexicalTargetRef,
+    capture: TypeVar,
+    provider: TypeVar,
+    demand: LexicalCaptureDemand,
+}
+
+#[derive(Default)]
+struct LexicalCaptureAlphaFrame {
+    variables: BTreeMap<TypeVar, TypeVar>,
+    demands: BTreeMap<TypeVar, LexicalCaptureDemand>,
 }
 
 #[derive(Default)]
@@ -486,6 +895,7 @@ pub(crate) struct TypeUnifier {
     parents: Vec<u32>,
     ranks: Vec<u8>,
     bindings: Vec<Option<Type>>,
+    contextual_holes: Vec<bool>,
     steps: u64,
     changes: u64,
 }
@@ -496,7 +906,14 @@ impl TypeUnifier {
         self.parents.push(id);
         self.ranks.push(0);
         self.bindings.push(None);
+        self.contextual_holes.push(false);
         TypeVar(id)
+    }
+
+    pub(crate) fn fresh_contextual_hole(&mut self) -> TypeVar {
+        let variable = self.fresh();
+        self.contextual_holes[variable.0 as usize] = true;
+        variable
     }
 
     fn root(&mut self, variable: TypeVar) -> TypeVar {
@@ -520,14 +937,221 @@ impl TypeUnifier {
         }
     }
 
+    fn same_live_object_shape_inner(
+        &self,
+        left: &boon_checked::SharedObjectShape,
+        right: &boon_checked::SharedObjectShape,
+        active: &mut BTreeSet<TypeVar>,
+    ) -> bool {
+        boon_checked::SharedObjectShape::ptr_eq(left, right)
+            || (left.open == right.open
+                && left.field_order == right.field_order
+                && left.fields.len() == right.fields.len()
+                && left.fields.iter().all(|(name, left)| {
+                    right
+                        .fields
+                        .get(name)
+                        .is_some_and(|right| self.same_live_type_inner(left, right, active))
+                }))
+    }
+
+    fn same_live_type(&self, left: &Type, right: &Type) -> bool {
+        self.same_live_type_inner(left, right, &mut BTreeSet::new())
+    }
+
+    fn same_live_type_inner(
+        &self,
+        left: &Type,
+        right: &Type,
+        active: &mut BTreeSet<TypeVar>,
+    ) -> bool {
+        match (left, right) {
+            (Type::Var(left), Type::Var(right)) => {
+                let left = self.root_readonly(*left);
+                let right = self.root_readonly(*right);
+                if left == right {
+                    return true;
+                }
+                let Some(left_binding) = self.bindings[left.0 as usize].as_ref() else {
+                    return false;
+                };
+                let Some(right_binding) = self.bindings[right.0 as usize].as_ref() else {
+                    return false;
+                };
+                if !active.insert(left) {
+                    return false;
+                }
+                if !active.insert(right) {
+                    active.remove(&left);
+                    return false;
+                }
+                let same = self.same_live_type_inner(left_binding, right_binding, active);
+                active.remove(&left);
+                active.remove(&right);
+                same
+            }
+            (Type::Var(variable), right) => {
+                let root = self.root_readonly(*variable);
+                let Some(binding) = self.bindings[root.0 as usize].as_ref() else {
+                    return false;
+                };
+                if !active.insert(root) {
+                    return false;
+                }
+                let same = self.same_live_type_inner(binding, right, active);
+                active.remove(&root);
+                same
+            }
+            (left, Type::Var(variable)) => {
+                let root = self.root_readonly(*variable);
+                let Some(binding) = self.bindings[root.0 as usize].as_ref() else {
+                    return false;
+                };
+                if !active.insert(root) {
+                    return false;
+                }
+                let same = self.same_live_type_inner(left, binding, active);
+                active.remove(&root);
+                same
+            }
+            (Type::Object(left), Type::Object(right)) => {
+                self.same_live_object_shape_inner(left, right, active)
+            }
+            (Type::List(left), Type::List(right)) | (Type::Set(left), Type::Set(right)) => {
+                boon_checked::SharedType::ptr_eq(left, right)
+                    || self.same_live_type_inner(left, right, active)
+            }
+            (
+                Type::Map {
+                    key: left_key,
+                    value: left_value,
+                },
+                Type::Map {
+                    key: right_key,
+                    value: right_value,
+                },
+            ) => {
+                self.same_live_type_inner(left_key, right_key, active)
+                    && self.same_live_type_inner(left_value, right_value, active)
+            }
+            (
+                Type::Function {
+                    args: left_args,
+                    result: left_result,
+                },
+                Type::Function {
+                    args: right_args,
+                    result: right_result,
+                },
+            ) => {
+                left_args.len() == right_args.len()
+                    && left_args
+                        .iter()
+                        .zip(right_args)
+                        .all(|(left, right)| self.same_live_type_inner(left, right, active))
+                    && left_result.mode == right_result.mode
+                    && self.same_live_type_inner(&left_result.ty, &right_result.ty, active)
+            }
+            (Type::VariantSet(left), Type::VariantSet(right)) => {
+                boon_checked::SharedVariantSet::ptr_eq(left, right)
+                    || (left.len() == right.len()
+                        && left
+                            .iter()
+                            .zip(right.iter())
+                            .all(|(left, right)| match (left, right) {
+                                (Variant::Tag(left), Variant::Tag(right)) => left == right,
+                                (
+                                    Variant::Tagged {
+                                        tag: left_tag,
+                                        fields: left_fields,
+                                    },
+                                    Variant::Tagged {
+                                        tag: right_tag,
+                                        fields: right_fields,
+                                    },
+                                ) => {
+                                    left_tag == right_tag
+                                        && self.same_live_object_shape_inner(
+                                            left_fields,
+                                            right_fields,
+                                            active,
+                                        )
+                                }
+                                _ => false,
+                            }))
+            }
+            (Type::Union(left), Type::Union(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| self.same_live_type_inner(left, right, active))
+            }
+            (left, right) => left == right,
+        }
+    }
+
     pub(crate) fn resolve(&mut self, ty: &Type) -> Type {
+        self.resolve_with_cache(ty, &mut Vec::new())
+    }
+
+    fn resolve_with_cache(&mut self, ty: &Type, resolved_roots: &mut Vec<Option<Type>>) -> Type {
         if !type_contains_inference_variable(ty) {
             return ty.clone();
         }
-        self.resolve_inner(ty, &mut BTreeSet::new())
+        resolved_roots.resize(self.parents.len(), None);
+        self.resolve_inner(ty, &mut BTreeSet::new(), resolved_roots)
     }
 
-    fn resolve_inner(&mut self, ty: &Type, active: &mut BTreeSet<TypeVar>) -> Type {
+    #[cfg(test)]
+    fn resolve_lexical_capture_surface(
+        &mut self,
+        provider: TypeVar,
+        demand: &LexicalCaptureDemand,
+        resolved_roots: &mut Vec<Option<Type>>,
+    ) -> Type {
+        self.resolve_lexical_capture_surface_with_demands(provider, demand, resolved_roots)
+            .0
+    }
+
+    fn resolve_lexical_capture_surface_with_demands(
+        &mut self,
+        provider: TypeVar,
+        demand: &LexicalCaptureDemand,
+        resolved_roots: &mut Vec<Option<Type>>,
+    ) -> (Type, BTreeMap<TypeVar, LexicalCaptureDemand>) {
+        resolved_roots.resize(self.parents.len(), None);
+        let mut unresolved_demands = BTreeMap::new();
+        let ty = self.resolve_lexical_capture_surface_inner(
+            &Type::Var(provider),
+            demand,
+            &mut BTreeSet::new(),
+            resolved_roots,
+            &mut unresolved_demands,
+        );
+        (ty, unresolved_demands)
+    }
+
+    fn resolve_lexical_capture_surface_inner(
+        &mut self,
+        ty: &Type,
+        demand: &LexicalCaptureDemand,
+        active: &mut BTreeSet<TypeVar>,
+        resolved_roots: &mut [Option<Type>],
+        unresolved_demands: &mut BTreeMap<TypeVar, LexicalCaptureDemand>,
+    ) -> Type {
+        if demand.full {
+            let resolved = self.resolve_inner(ty, active, resolved_roots);
+            let mut variables = BTreeSet::new();
+            collect_type_variables(&resolved, &mut variables);
+            for variable in variables {
+                unresolved_demands
+                    .entry(variable)
+                    .or_default()
+                    .merge(demand);
+            }
+            return resolved;
+        }
         match ty {
             Type::Var(variable) => {
                 let root = self.root(*variable);
@@ -535,35 +1159,133 @@ impl TypeUnifier {
                     return Type::Var(root);
                 }
                 let binding = self.bindings[root.0 as usize].clone();
+                let projected = match binding {
+                    None => {
+                        unresolved_demands.entry(root).or_default().merge(demand);
+                        Type::Var(root)
+                    }
+                    Some(binding) => self.resolve_lexical_capture_surface_inner(
+                        &binding,
+                        demand,
+                        active,
+                        resolved_roots,
+                        unresolved_demands,
+                    ),
+                };
+                active.remove(&root);
+                projected
+            }
+            Type::Object(shape) => {
+                let fields = demand
+                    .children
+                    .iter()
+                    .filter_map(|(name, demand)| {
+                        shape.fields.get(name).map(|ty| {
+                            (
+                                name.clone(),
+                                self.resolve_lexical_capture_surface_inner(
+                                    ty,
+                                    demand,
+                                    active,
+                                    resolved_roots,
+                                    unresolved_demands,
+                                ),
+                            )
+                        })
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let mut field_order = shape
+                    .field_order
+                    .iter()
+                    .filter(|name| fields.contains_key(*name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for name in fields.keys() {
+                    if !field_order.contains(name) {
+                        field_order.push(name.clone());
+                    }
+                }
+                Type::object(ObjectShape {
+                    open: shape.open,
+                    fields,
+                    field_order,
+                })
+            }
+            // Union/VariantSet/List/Set/Map/Function and scalar/unknown nodes
+            // are full-subtree barriers in the first exact cut. This keeps
+            // branch/member correlation identical to the whole capture.
+            _ => {
+                let resolved = self.resolve_inner(ty, active, resolved_roots);
+                let mut variables = BTreeSet::new();
+                collect_type_variables(&resolved, &mut variables);
+                let full = LexicalCaptureDemand {
+                    full: true,
+                    children: BTreeMap::new(),
+                };
+                for variable in variables {
+                    unresolved_demands.entry(variable).or_default().merge(&full);
+                }
+                resolved
+            }
+        }
+    }
+
+    fn resolve_inner(
+        &mut self,
+        ty: &Type,
+        active: &mut BTreeSet<TypeVar>,
+        resolved_roots: &mut [Option<Type>],
+    ) -> Type {
+        match ty {
+            Type::Var(variable) => {
+                let root = self.root(*variable);
+                if let Some(resolved) = &resolved_roots[root.0 as usize] {
+                    return resolved.clone();
+                }
+                if !active.insert(root) {
+                    return Type::Var(root);
+                }
+                let binding = self.bindings[root.0 as usize].clone();
                 let resolved = binding.map_or(Type::Var(root), |binding| {
-                    self.resolve_inner(&binding, active)
+                    self.resolve_inner(&binding, active, resolved_roots)
                 });
                 active.remove(&root);
+                resolved_roots[root.0 as usize] = Some(resolved.clone());
                 resolved
             }
             Type::Object(shape) => Type::object(ObjectShape {
                 fields: shape
                     .fields
                     .iter()
-                    .map(|(name, ty)| (name.clone(), self.resolve_inner(ty, active)))
+                    .map(|(name, ty)| {
+                        (name.clone(), self.resolve_inner(ty, active, resolved_roots))
+                    })
                     .collect(),
                 field_order: shape.field_order.clone(),
                 open: shape.open,
             }),
-            Type::List(item) => Type::List(Type::shared(self.resolve_inner(item, active))),
-            Type::Set(item) => Type::Set(Type::shared(self.resolve_inner(item, active))),
+            Type::List(item) => Type::List(Type::shared(self.resolve_inner(
+                item,
+                active,
+                resolved_roots,
+            ))),
+            Type::Set(item) => Type::Set(Type::shared(self.resolve_inner(
+                item,
+                active,
+                resolved_roots,
+            ))),
             Type::Map { key, value } => Type::Map {
-                key: Box::new(self.resolve_inner(key, active)),
-                value: Box::new(self.resolve_inner(value, active)),
+                key: Box::new(self.resolve_inner(key, active, resolved_roots)),
+                value: Box::new(self.resolve_inner(value, active, resolved_roots)),
             },
             Type::Function { args, result } => Type::Function {
                 args: args
                     .iter()
-                    .map(|argument| self.resolve_inner(argument, active))
+                    .map(|argument| self.resolve_inner(argument, active, resolved_roots))
                     .collect(),
                 result: Box::new(FlowType {
                     mode: result.mode,
-                    ty: self.resolve_inner(&result.ty, active),
+                    ty: self.resolve_inner(&result.ty, active, resolved_roots),
                 }),
             },
             Type::VariantSet(variants) => Type::VariantSet(
@@ -578,7 +1300,10 @@ impl TypeUnifier {
                                     .fields
                                     .iter()
                                     .map(|(name, ty)| {
-                                        (name.clone(), self.resolve_inner(ty, active))
+                                        (
+                                            name.clone(),
+                                            self.resolve_inner(ty, active, resolved_roots),
+                                        )
                                     })
                                     .collect(),
                                 field_order: fields.field_order.clone(),
@@ -592,7 +1317,191 @@ impl TypeUnifier {
             Type::Union(members) => boon_checked::canonical_union_type(
                 members
                     .iter()
-                    .map(|member| self.resolve_inner(member, active))
+                    .map(|member| self.resolve_inner(member, active, resolved_roots))
+                    .collect(),
+            ),
+            Type::Text
+            | Type::Number
+            | Type::Bytes(_)
+            | Type::Bits { .. }
+            | Type::Absent
+            | Type::RenderContract
+            | Type::UnresolvedShape { .. }
+            | Type::Unknown => ty.clone(),
+        }
+    }
+
+    /// Resolve a type for public artifact projection while allowing a closed
+    /// child-owner endpoint to supersede its stale persistent result root.
+    ///
+    /// These authorities are deliberately read-only and never enter the live
+    /// unifier. A transfer residual can close a child expression after the
+    /// containing record was wired to the child's persistent result root;
+    /// mutating that root during residual convergence makes the solve
+    /// non-monotone. Final projection can safely follow the closed endpoint
+    /// without changing any inference equation.
+    fn resolve_with_projection_authorities(
+        &mut self,
+        ty: &Type,
+        authorities: &BTreeMap<TypeVar, Type>,
+    ) -> Type {
+        if authorities.is_empty() || !type_contains_inference_variable(ty) {
+            return self.resolve(ty);
+        }
+        let mut resolved_roots = vec![None; self.parents.len()];
+        self.resolve_with_projection_authorities_inner(
+            ty,
+            authorities,
+            &mut BTreeSet::new(),
+            &mut resolved_roots,
+        )
+    }
+
+    fn resolve_with_projection_authorities_inner(
+        &mut self,
+        ty: &Type,
+        authorities: &BTreeMap<TypeVar, Type>,
+        active: &mut BTreeSet<TypeVar>,
+        resolved_roots: &mut [Option<Type>],
+    ) -> Type {
+        match ty {
+            Type::Var(variable) => {
+                let root = self.root(*variable);
+                if let Some(authority) = authorities.get(&root) {
+                    return authority.clone();
+                }
+                if let Some(resolved) = &resolved_roots[root.0 as usize] {
+                    return resolved.clone();
+                }
+                if !active.insert(root) {
+                    return Type::Var(root);
+                }
+                let binding = self.bindings[root.0 as usize].clone();
+                let resolved = binding.map_or(Type::Var(root), |binding| {
+                    self.resolve_with_projection_authorities_inner(
+                        &binding,
+                        authorities,
+                        active,
+                        resolved_roots,
+                    )
+                });
+                active.remove(&root);
+                resolved_roots[root.0 as usize] = Some(resolved.clone());
+                resolved
+            }
+            Type::Object(shape) => Type::object(ObjectShape {
+                fields: shape
+                    .fields
+                    .iter()
+                    .map(|(name, ty)| {
+                        (
+                            name.clone(),
+                            self.resolve_with_projection_authorities_inner(
+                                ty,
+                                authorities,
+                                active,
+                                resolved_roots,
+                            ),
+                        )
+                    })
+                    .collect(),
+                field_order: shape.field_order.clone(),
+                open: shape.open,
+            }),
+            Type::List(item) => Type::List(Type::shared(
+                self.resolve_with_projection_authorities_inner(
+                    item,
+                    authorities,
+                    active,
+                    resolved_roots,
+                ),
+            )),
+            Type::Set(item) => Type::Set(Type::shared(
+                self.resolve_with_projection_authorities_inner(
+                    item,
+                    authorities,
+                    active,
+                    resolved_roots,
+                ),
+            )),
+            Type::Map { key, value } => Type::Map {
+                key: Box::new(self.resolve_with_projection_authorities_inner(
+                    key,
+                    authorities,
+                    active,
+                    resolved_roots,
+                )),
+                value: Box::new(self.resolve_with_projection_authorities_inner(
+                    value,
+                    authorities,
+                    active,
+                    resolved_roots,
+                )),
+            },
+            Type::Function { args, result } => Type::Function {
+                args: args
+                    .iter()
+                    .map(|argument| {
+                        self.resolve_with_projection_authorities_inner(
+                            argument,
+                            authorities,
+                            active,
+                            resolved_roots,
+                        )
+                    })
+                    .collect(),
+                result: Box::new(FlowType {
+                    mode: result.mode,
+                    ty: self.resolve_with_projection_authorities_inner(
+                        &result.ty,
+                        authorities,
+                        active,
+                        resolved_roots,
+                    ),
+                }),
+            },
+            Type::VariantSet(variants) => Type::VariantSet(
+                variants
+                    .iter()
+                    .map(|variant| match variant {
+                        Variant::Tag(tag) => Variant::Tag(tag.clone()),
+                        Variant::Tagged { tag, fields } => Variant::Tagged {
+                            tag: tag.clone(),
+                            fields: ObjectShape {
+                                fields: fields
+                                    .fields
+                                    .iter()
+                                    .map(|(name, ty)| {
+                                        (
+                                            name.clone(),
+                                            self.resolve_with_projection_authorities_inner(
+                                                ty,
+                                                authorities,
+                                                active,
+                                                resolved_roots,
+                                            ),
+                                        )
+                                    })
+                                    .collect(),
+                                field_order: fields.field_order.clone(),
+                                open: fields.open,
+                            }
+                            .into(),
+                        },
+                    })
+                    .collect(),
+            ),
+            Type::Union(members) => boon_checked::canonical_union_type(
+                members
+                    .iter()
+                    .map(|member| {
+                        self.resolve_with_projection_authorities_inner(
+                            member,
+                            authorities,
+                            active,
+                            resolved_roots,
+                        )
+                    })
                     .collect(),
             ),
             Type::Text
@@ -646,6 +1555,8 @@ impl TypeUnifier {
             std::mem::swap(&mut left, &mut right);
         }
         self.parents[right.0 as usize] = left.0;
+        self.contextual_holes[left.0 as usize] |= self.contextual_holes[right.0 as usize];
+        self.contextual_holes[right.0 as usize] = false;
         self.changes = self.changes.saturating_add(1);
         if self.ranks[left.0 as usize] == self.ranks[right.0 as usize] {
             self.ranks[left.0 as usize] = self.ranks[left.0 as usize].saturating_add(1);
@@ -656,9 +1567,72 @@ impl TypeUnifier {
         }
     }
 
+    fn transparent_alias_reaches(&self, candidate: TypeVar, destination: TypeVar) -> bool {
+        let mut candidate = candidate;
+        let mut visited = BTreeSet::new();
+        loop {
+            let root = self.root_readonly(candidate);
+            if root == destination {
+                return true;
+            }
+            if !visited.insert(root) {
+                return false;
+            }
+            let Some(Type::Var(next)) = self.bindings[root.0 as usize].as_ref() else {
+                return false;
+            };
+            candidate = *next;
+        }
+    }
+
+    fn remove_transparent_self_aliases(
+        &self,
+        variable: TypeVar,
+        binding: Type,
+    ) -> (Option<Type>, bool) {
+        match binding {
+            Type::Var(candidate) if self.transparent_alias_reaches(candidate, variable) => {
+                (None, true)
+            }
+            Type::Union(members) => {
+                let original_len = members.len();
+                let retained = members
+                    .iter()
+                    .filter(|member| {
+                        !matches!(
+                            member,
+                            Type::Var(candidate)
+                                if self.transparent_alias_reaches(*candidate, variable)
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if retained.len() == original_len {
+                    (Some(Type::Union(members)), false)
+                } else if retained.is_empty() {
+                    (None, true)
+                } else {
+                    (Some(boon_checked::canonical_union_type(retained)), true)
+                }
+            }
+            binding => (Some(binding), false),
+        }
+    }
+
     pub(crate) fn bind_var(&mut self, variable: TypeVar, incoming: Type) {
         self.steps = self.steps.saturating_add(1);
         let variable = self.root(variable);
+        // Replaying the same live equation does not require resolving either
+        // side. The stored and incoming trees already reference the same
+        // unifier roots, so later bindings remain observable through both.
+        // This avoids repeatedly materializing large generic call results in
+        // fixed-point rounds.
+        if self.bindings[variable.0 as usize]
+            .as_ref()
+            .is_some_and(|current| self.same_live_type(current, &incoming))
+        {
+            return;
+        }
         let incoming = self.resolve(&incoming);
         if let Type::Var(other) = incoming {
             self.union(variable, other);
@@ -667,13 +1641,22 @@ impl TypeUnifier {
         if self.occurs(variable, &incoming) {
             return;
         }
-        let slot = self.bindings[variable.0 as usize].take();
+        // Union-find can coalesce transparent flow aliases after their raw
+        // union was stored, turning one or more members into direct aliases of
+        // the binding's own root. `T = T | X` carries no information from the
+        // self member; retain only X before merging a later exact equation.
+        // Otherwise resolving the temporarily removed slot exposes T again
+        // and a concrete late capture refresh can remain `T | Concrete`.
+        let raw_slot = self.bindings[variable.0 as usize].take();
+        let (slot, removed_self_alias) = raw_slot.map_or((None, false), |binding| {
+            self.remove_transparent_self_aliases(variable, binding)
+        });
         let (merged, changed) = match slot {
             None => (incoming, true),
-            Some(current) if current == incoming => (current, false),
+            Some(current) if current == incoming => (current, removed_self_alias),
             Some(current) => {
                 let merged = self.merge_resolved(current.clone(), incoming);
-                let changed = merged != current;
+                let changed = removed_self_alias || merged != current;
                 (merged, changed)
             }
         };
@@ -714,8 +1697,88 @@ impl TypeUnifier {
         }
     }
 
+    /// Publish a directional provider surface whose outer shape is authoritative.
+    ///
+    /// A transfer-aware call deliberately withholds its broad definition-site
+    /// principal while local consumers are being solved. Those consumers can
+    /// still shape the empty occurrence root (for example, a later field read
+    /// creates an open Object requirement). Merging the exact transfer result
+    /// with that provisional requirement would retain the open scaffold and
+    /// make a closed record permanently open. Project only genuine provider
+    /// holes from the frozen requirement, then replace the provisional root
+    /// with the live provider result. Concrete consumer mismatches remain for
+    /// checked-call validation; they do not rewrite provider authority.
+    pub(crate) fn publish_authoritative_provider(&mut self, variable: TypeVar, provider: Type) {
+        self.steps = self.steps.saturating_add(1);
+        let variable = self.root(variable);
+        if self.bindings[variable.0 as usize]
+            .as_ref()
+            .is_some_and(|current| self.same_live_type(current, &provider))
+        {
+            return;
+        }
+        let requirement = if self.bindings[variable.0 as usize].is_some() {
+            Some(self.resolve(&Type::Var(variable)))
+        } else {
+            None
+        };
+        if let Some(requirement) = &requirement {
+            match &provider {
+                Type::Union(members) => {
+                    bind_call_formal_from_closed_alternatives(self, requirement, members)
+                }
+                provider => bind_call_formal_from_closed_alternatives(
+                    self,
+                    requirement,
+                    std::slice::from_ref(provider),
+                ),
+            }
+            bind_provider_inference_holes(self, &provider, requirement);
+        }
+        self.replace_authoritative_binding(variable, provider);
+    }
+
+    fn replace_authoritative_binding(&mut self, variable: TypeVar, provider: Type) {
+        let variable = self.root(variable);
+        if self.bindings[variable.0 as usize]
+            .as_ref()
+            .is_some_and(|current| self.same_live_type(current, &provider))
+            || self.occurs(variable, &provider)
+        {
+            return;
+        }
+        self.bindings[variable.0 as usize] = Some(provider);
+        self.changes = self.changes.saturating_add(1);
+    }
+
     fn merge_resolved(&mut self, left: Type, right: Type) -> Type {
+        // A flow binding can retain a raw union whose member variables have
+        // since collapsed to one structural type. Normalize only at that
+        // union seam. Resolving every enclosing record/variant binding here
+        // materializes large semantic DAGs during each SCC round.
+        let left = if matches!(left, Type::Union(_)) {
+            self.resolve(&left)
+        } else {
+            left
+        };
+        let right = if matches!(right, Type::Union(_)) {
+            self.resolve(&right)
+        } else {
+            right
+        };
         match (left, right) {
+            // `Unknown` and `UnresolvedShape` are diagnostic placeholders,
+            // not evidence about a generic type variable. In particular, a
+            // same-component call can observe a provisional placeholder in
+            // one caller before another equation closes the callee scheme.
+            // Binding the scheme variable to that placeholder permanently
+            // turns a generic public field into literal `Unknown`. The dense
+            // call-pattern matcher already treats these pairs as no-ops; keep
+            // the owner unifier's structural merge consistent with it.
+            (Type::Var(variable), Type::Unknown | Type::UnresolvedShape { .. })
+            | (Type::Unknown | Type::UnresolvedShape { .. }, Type::Var(variable)) => {
+                Type::Var(self.root(variable))
+            }
             (Type::Var(variable), right) => {
                 self.bind_var(variable, right);
                 Type::Var(self.root(variable))
@@ -775,20 +1838,244 @@ impl TypeUnifier {
         }
     }
 
+    fn contains_contextual_hole(&self, ty: &Type, active: &mut BTreeSet<TypeVar>) -> bool {
+        match ty {
+            Type::Var(variable) => {
+                let root = self.root_readonly(*variable);
+                if self.contextual_holes[root.0 as usize] {
+                    return true;
+                }
+                if !active.insert(root) {
+                    return false;
+                }
+                let contains = self.bindings[root.0 as usize]
+                    .as_ref()
+                    .is_some_and(|binding| self.contains_contextual_hole(binding, active));
+                active.remove(&root);
+                contains
+            }
+            Type::Object(shape) => shape
+                .fields
+                .values()
+                .any(|ty| self.contains_contextual_hole(ty, active)),
+            Type::List(item) | Type::Set(item) => self.contains_contextual_hole(item, active),
+            Type::Map { key, value } => {
+                self.contains_contextual_hole(key, active)
+                    || self.contains_contextual_hole(value, active)
+            }
+            Type::Function { args, result } => {
+                args.iter()
+                    .any(|ty| self.contains_contextual_hole(ty, active))
+                    || self.contains_contextual_hole(&result.ty, active)
+            }
+            Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+                Variant::Tag(_) => false,
+                Variant::Tagged { fields, .. } => fields
+                    .fields
+                    .values()
+                    .any(|ty| self.contains_contextual_hole(ty, active)),
+            }),
+            Type::Union(members) => members
+                .iter()
+                .any(|ty| self.contains_contextual_hole(ty, active)),
+            Type::Text
+            | Type::Number
+            | Type::Bytes(_)
+            | Type::Bits { .. }
+            | Type::Absent
+            | Type::RenderContract
+            | Type::UnresolvedShape { .. }
+            | Type::Unknown => false,
+        }
+    }
+
+    fn is_concrete_contextual_donor(ty: &Type) -> bool {
+        !type_contains_inference_variable(ty)
+            && !matches!(ty, Type::Unknown | Type::UnresolvedShape { .. })
+            && !matches!(ty, Type::Object(shape) if shape.open && shape.fields.is_empty())
+    }
+
+    fn bind_contextual_holes(&mut self, provider: &Type, requirement: &Type) {
+        let provider = self.resolve(provider);
+        let requirement = self.resolve(requirement);
+        if !Self::is_concrete_contextual_donor(&requirement) {
+            return;
+        }
+        match (provider, requirement) {
+            (Type::Var(variable), requirement) => {
+                let root = self.root(variable);
+                if self.contextual_holes[root.0 as usize] {
+                    self.bind_var(root, requirement);
+                }
+            }
+            (Type::Object(provider), Type::Object(requirement)) => {
+                for (name, provider) in &provider.fields {
+                    if let Some(requirement) = requirement.fields.get(name) {
+                        self.bind_contextual_holes(provider, requirement);
+                    }
+                }
+            }
+            (Type::List(provider), Type::List(requirement))
+            | (Type::Set(provider), Type::Set(requirement)) => {
+                self.bind_contextual_holes(&provider, &requirement);
+            }
+            (
+                Type::Map {
+                    key: provider_key,
+                    value: provider_value,
+                },
+                Type::Map {
+                    key: requirement_key,
+                    value: requirement_value,
+                },
+            ) => {
+                self.bind_contextual_holes(&provider_key, &requirement_key);
+                self.bind_contextual_holes(&provider_value, &requirement_value);
+            }
+            (Type::Union(provider), requirement) => {
+                for provider in provider.iter() {
+                    self.bind_contextual_holes(provider, &requirement);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn refine_contextual_union(&mut self, members: &[Type]) {
+        let hole_members = members
+            .iter()
+            .filter(|member| self.contains_contextual_hole(member, &mut BTreeSet::new()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if hole_members.is_empty() {
+            return;
+        }
+        let mut donors = Vec::new();
+        for donor in members
+            .iter()
+            .map(|member| self.resolve(member))
+            .filter(Self::is_concrete_contextual_donor)
+        {
+            if !donors.contains(&donor) {
+                donors.push(donor);
+            }
+        }
+        // Canonical unions do not retain authored alternative order. One
+        // unique concrete donor is therefore the largest exact refinement we
+        // can make here; multiple distinct donors require the future ordered
+        // residual-flow program to reproduce dense source-order widening.
+        let [donor] = donors.as_slice() else {
+            return;
+        };
+        for member in &hole_members {
+            self.bind_contextual_holes(member, donor);
+        }
+    }
+
+    fn refine_contextual_holes_in_type(&mut self, ty: &Type, active: &mut BTreeSet<TypeVar>) {
+        match ty {
+            Type::Var(variable) => {
+                let root = self.root(*variable);
+                if !active.insert(root) {
+                    return;
+                }
+                if let Some(binding) = self.bindings[root.0 as usize].clone() {
+                    self.refine_contextual_holes_in_type(&binding, active);
+                }
+                active.remove(&root);
+            }
+            Type::Union(members) => {
+                self.refine_contextual_union(members);
+                for member in members.iter() {
+                    self.refine_contextual_holes_in_type(member, active);
+                }
+            }
+            Type::Object(shape) => {
+                for ty in shape.fields.values() {
+                    self.refine_contextual_holes_in_type(ty, active);
+                }
+            }
+            Type::List(item) | Type::Set(item) => {
+                self.refine_contextual_holes_in_type(item, active);
+            }
+            Type::Map { key, value } => {
+                self.refine_contextual_holes_in_type(key, active);
+                self.refine_contextual_holes_in_type(value, active);
+            }
+            Type::Function { args, result } => {
+                for ty in args {
+                    self.refine_contextual_holes_in_type(ty, active);
+                }
+                self.refine_contextual_holes_in_type(&result.ty, active);
+            }
+            Type::VariantSet(variants) => {
+                for variant in variants.iter() {
+                    if let Variant::Tagged { fields, .. } = variant {
+                        for ty in fields.fields.values() {
+                            self.refine_contextual_holes_in_type(ty, active);
+                        }
+                    }
+                }
+            }
+            Type::Text
+            | Type::Number
+            | Type::Bytes(_)
+            | Type::Bits { .. }
+            | Type::Absent
+            | Type::RenderContract
+            | Type::UnresolvedShape { .. }
+            | Type::Unknown => {}
+        }
+    }
+
+    pub(crate) fn refine_contextual_flow_holes(&mut self) {
+        loop {
+            let changes_before = self.changes;
+            let bindings = self.bindings.iter().flatten().cloned().collect::<Vec<_>>();
+            for binding in &bindings {
+                self.refine_contextual_holes_in_type(binding, &mut BTreeSet::new());
+            }
+            if self.changes == changes_before {
+                break;
+            }
+        }
+    }
+
+    fn refine_contextual_binding_against(&mut self, variable: TypeVar, requirement: &Type) {
+        let root = self.root(variable);
+        let Some(binding) = self.bindings[root.0 as usize].clone() else {
+            return;
+        };
+        if self.contains_contextual_hole(&binding, &mut BTreeSet::new()) {
+            self.bind_contextual_holes(&binding, requirement);
+        }
+    }
+
     pub(crate) fn unify(&mut self, left: Type, right: Type) {
         self.steps = self.steps.saturating_add(1);
         match (left, right) {
             (Type::Var(left), Type::Var(right)) => self.union(left, right),
-            (Type::Var(variable), ty) | (ty, Type::Var(variable)) => self.bind_var(variable, ty),
+            (Type::Var(_), Type::Unknown | Type::UnresolvedShape { .. })
+            | (Type::Unknown | Type::UnresolvedShape { .. }, Type::Var(_)) => {}
+            (Type::Var(variable), ty) | (ty, Type::Var(variable)) => {
+                let root = self.root_readonly(variable);
+                if self.bindings[root.0 as usize]
+                    .as_ref()
+                    .is_some_and(|current| self.same_live_type(current, &ty))
+                {
+                    return;
+                }
+                self.refine_contextual_binding_against(variable, &ty);
+                self.bind_var(variable, ty)
+            }
             (Type::Union(members), ty) | (ty, Type::Union(members)) => {
-                // A flow join may retain an unresolved branch beside already
-                // concrete alternatives. A later equality/ABI requirement
-                // constrains every branch, so propagate it into the holes
-                // instead of leaving `VALUE | True | False` generic forever.
-                // Concrete mismatches remain untouched here and are reported
-                // by the exact assignability validator.
-                for member in members.iter() {
-                    self.unify(member.clone(), ty.clone());
+                if members
+                    .iter()
+                    .any(|member| self.contains_contextual_hole(member, &mut BTreeSet::new()))
+                {
+                    for member in members.iter() {
+                        self.bind_contextual_holes(member, &ty);
+                    }
                 }
             }
             (Type::Object(left), Type::Object(right)) => {
@@ -818,6 +2105,40 @@ impl TypeUnifier {
         }
     }
 
+    /// Match one call-site provider against its instantiated formal scheme.
+    ///
+    /// A resolved authored value is authoritative over an open formal scheme.
+    /// Project that proven shape into the formal holes instead of structurally
+    /// merging it with the scheme, which would preserve neither provider
+    /// authority nor the formal/result alpha equations. Open generic actuals
+    /// retain the ordinary equation so callee requirements can still constrain
+    /// the caller. Union alternatives need their correlation-preserving
+    /// projection even while some provider leaves remain live.
+    pub(crate) fn bind_call_pattern_input(&mut self, actual: &Type, formal: &Type) -> bool {
+        if let Type::Union(actual) = actual {
+            bind_call_formal_from_closed_alternatives(self, formal, actual);
+            // Preserve every provider alternative, including its live alpha
+            // leaves, in a directional formal projection. This does not bind
+            // provider holes from consumer requirements; unresolved providers
+            // therefore remain fail-closed while later provider closure stays
+            // visible through the formal/result scheme.
+            return true;
+        }
+        if boon_checked::type_is_recursively_closed(actual) {
+            bind_call_formal_from_closed_alternatives(self, formal, std::slice::from_ref(actual));
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn bind_call_input(&mut self, actual: TypeVar, formal: Type) {
+        let actual_type = self.resolve(&Type::Var(actual));
+        if self.bind_call_pattern_input(&actual_type, &formal) {
+            return;
+        }
+        self.unify(Type::Var(actual), formal);
+    }
+
     pub(crate) const fn steps(&self) -> u64 {
         self.steps
     }
@@ -836,6 +2157,7 @@ impl TypeUnifier {
             Type::Var(variable) => {
                 output.push(0);
                 let root = self.root_readonly(*variable);
+                output.push(u8::from(self.contextual_holes[root.0 as usize]));
                 if !active.insert(root) {
                     output.push(0);
                     output.extend_from_slice(&root.0.to_le_bytes());
@@ -989,6 +2311,8 @@ struct OwnerSolveState<'a> {
     lexical_capture_modes: BTreeMap<OwnerLexicalTargetRef, Option<FlowMode>>,
     signature_declaration_modes: BTreeMap<OwnerSignatureDeclarationTarget, Option<FlowMode>>,
     signature_read_expressions: BTreeMap<OwnerSignatureDeclarationTarget, Vec<usize>>,
+    signature_dynamic_expressions: Vec<bool>,
+    inherited_pattern_plans: Box<[OwnerInheritedPatternTargetPlan]>,
     pattern_local_expressions: BTreeSet<u32>,
     declaration_kind: Option<OwnerDeclarationKind>,
     names: Box<[String]>,
@@ -1021,8 +2345,150 @@ struct CrossCall {
 pub(crate) struct OwnerPatternNarrowing {
     pub selector: TypeVar,
     pub pattern: OwnerPatternConstraint,
+    /// One preallocated root for each exact pattern-binding authority or read.
+    /// Projection equations are installed once while the narrowing is built;
+    /// fixed-point refinement only updates these roots and never grows the
+    /// unifier graph.
     pub bindings: Box<[(String, TypeVar)]>,
     pub selector_reads: Box<[(Box<[String]>, TypeVar)]>,
+}
+
+#[derive(Clone)]
+pub(crate) struct OwnerInheritedPatternReadPlan {
+    pub expression: u32,
+    pub projection: Box<[String]>,
+}
+
+#[derive(Clone)]
+pub(crate) struct OwnerInheritedPatternTargetPlan {
+    pub target: OwnerLexicalTargetRef,
+    pub frames: Box<[OwnerInheritedPatternNarrowingPlan]>,
+    pub reads: Box<[OwnerInheritedPatternReadPlan]>,
+}
+
+#[derive(Clone)]
+pub(crate) struct OwnerInstantiatedPatternFrame {
+    pub projection: Box<[String]>,
+    pub pattern: OwnerPatternConstraint,
+    pub schematic: Type,
+}
+
+#[derive(Clone)]
+pub(crate) struct OwnerInstantiatedPatternRead {
+    pub projection: Box<[String]>,
+    pub variable: TypeVar,
+}
+
+#[derive(Clone)]
+pub(crate) struct OwnerInheritedPatternNarrowing {
+    pub root: TypeVar,
+    pub frames: Box<[OwnerInstantiatedPatternFrame]>,
+    pub reads: Box<[OwnerInstantiatedPatternRead]>,
+}
+
+/// Project the type-free boundary frames onto the exact imported read rows in
+/// one consumer. Frames remain outer-to-inner for each stable target; reads
+/// retain absolute projections from that target.
+pub(crate) fn inherited_pattern_read_plans(
+    plan: &OwnerSignatureLexicalPlan,
+) -> Box<[OwnerInheritedPatternTargetPlan]> {
+    let Some(environment) = plan.inherited_environment() else {
+        return Box::new([]);
+    };
+    let mut frames =
+        BTreeMap::<OwnerLexicalTargetRef, Vec<OwnerInheritedPatternNarrowingPlan>>::new();
+    for frame in environment.pattern_narrowings() {
+        frames
+            .entry(frame.selector_target.clone())
+            .or_default()
+            .push(frame.clone());
+    }
+    frames
+        .into_iter()
+        .filter_map(|(target, frames)| {
+            let reads = plan
+                .reads()
+                .iter()
+                .enumerate()
+                .filter_map(|(expression, read)| {
+                    let read = read.as_ref()?;
+                    if read.access != OwnerLexicalAccess::Read
+                        || !matches!(
+                            &read.target,
+                            OwnerEffectiveLexicalTarget::Imported {
+                                target: candidate,
+                            } if candidate == &target
+                        )
+                        || !frames
+                            .iter()
+                            .any(|frame| read.projection.starts_with(&frame.selector_projection))
+                    {
+                        return None;
+                    }
+                    Some(OwnerInheritedPatternReadPlan {
+                        expression: u32::try_from(expression)
+                            .expect("owner expression index exceeds u32"),
+                        projection: read.projection.clone(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (!reads.is_empty()).then(|| OwnerInheritedPatternTargetPlan {
+                target,
+                frames: frames.into_boxed_slice(),
+                reads: reads.into_boxed_slice(),
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+pub(crate) fn instantiate_owner_inherited_pattern_narrowings(
+    plans: &[OwnerInheritedPatternTargetPlan],
+    mut root_for_target: impl FnMut(&OwnerLexicalTargetRef) -> Option<TypeVar>,
+    expressions: &[TypeVar],
+    unifier: &mut TypeUnifier,
+) -> Result<Vec<OwnerInheritedPatternNarrowing>, String> {
+    plans
+        .iter()
+        .map(|plan| {
+            let root = root_for_target(&plan.target).ok_or_else(|| {
+                format!(
+                    "inherited pattern target {:?} has no imported capture root",
+                    plan.target
+                )
+            })?;
+            let frames = plan
+                .frames
+                .iter()
+                .map(|frame| OwnerInstantiatedPatternFrame {
+                    projection: frame.selector_projection.clone(),
+                    pattern: frame.pattern.clone(),
+                    schematic: pattern_type(&frame.pattern, unifier),
+                })
+                .collect::<Vec<_>>();
+            let reads = plan
+                .reads
+                .iter()
+                .map(|read| {
+                    let variable = expressions
+                        .get(read.expression as usize)
+                        .copied()
+                        .ok_or_else(|| {
+                            "inherited pattern read is outside the expression namespace".to_owned()
+                        })?;
+                    Ok(OwnerInstantiatedPatternRead {
+                        projection: read.projection.clone(),
+                        variable,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(OwnerInheritedPatternNarrowing {
+                root,
+                frames: frames.into_boxed_slice(),
+                reads: reads.into_boxed_slice(),
+            })
+        })
+        .collect()
 }
 
 fn matching_pattern_variants(ty: &Type, tag: &str, matches: &mut Vec<Variant>) {
@@ -1128,29 +2594,169 @@ fn matching_selector_projection(
         .reduce(|left, right| boon_checked::canonical_union_type(vec![left, right]))
 }
 
+fn project_pattern_overlay(base: &Type, projection: &[String]) -> Option<Type> {
+    if projection.is_empty() {
+        return Some(base.clone());
+    }
+    match base {
+        Type::VariantSet(variants) => variants
+            .iter()
+            .filter_map(|variant| match variant {
+                Variant::Tagged { fields, .. } => {
+                    crate::type_for_nested_path(&Type::Object(fields.clone()), projection)
+                }
+                Variant::Tag(_) => None,
+            })
+            .reduce(|left, right| boon_checked::canonical_union_type(vec![left, right])),
+        Type::Union(members) => members
+            .iter()
+            .filter_map(|member| project_pattern_overlay(member, projection))
+            .reduce(|left, right| boon_checked::canonical_union_type(vec![left, right])),
+        _ => crate::type_for_nested_path(base, projection),
+    }
+}
+
+fn pattern_selector_is_open(ty: &Type) -> bool {
+    type_contains_inference_variable(ty)
+        || matches!(ty, Type::Unknown | Type::UnresolvedShape { .. })
+        || matches!(ty, Type::Object(shape) if shape.open)
+        || matches!(ty, Type::Union(members) if members.iter().any(pattern_selector_is_open))
+}
+
+#[derive(Clone)]
+struct OwnerResolvedPatternOverlay {
+    projection: Box<[String]>,
+    selected: Type,
+    schematic: bool,
+}
+
+fn projected_pattern_overlay_type(
+    root: &Type,
+    overlays: &[OwnerResolvedPatternOverlay],
+    projection: &[String],
+) -> (Option<Type>, bool) {
+    let overlay = overlays
+        .iter()
+        .enumerate()
+        .filter(|(_, overlay)| projection.starts_with(overlay.projection.as_ref()))
+        .max_by_key(|(index, overlay)| (overlay.projection.len(), *index));
+    if let Some((_, overlay)) = overlay {
+        let remaining = &projection[overlay.projection.len()..];
+        let projected = project_pattern_overlay(&overlay.selected, remaining).or_else(|| {
+            overlay
+                .schematic
+                .then(|| project_pattern_overlay(root, projection))
+                .flatten()
+        });
+        let open = projected.as_ref().is_some_and(pattern_selector_is_open);
+        return (projected, open);
+    }
+    let projected = project_pattern_overlay(root, projection);
+    let open = projected.as_ref().is_some_and(pattern_selector_is_open);
+    (projected, open)
+}
+
+fn projected_type_from_active_pattern_overlay(
+    root: &Type,
+    overlays: &[OwnerResolvedPatternOverlay],
+    projection: &[String],
+) -> Option<Type> {
+    let overlay = overlays
+        .iter()
+        .enumerate()
+        .filter(|(_, overlay)| projection.starts_with(overlay.projection.as_ref()))
+        .max_by_key(|(index, overlay)| (overlay.projection.len(), *index));
+    let Some((_, overlay)) = overlay else {
+        return project_pattern_overlay(root, projection);
+    };
+    project_pattern_overlay(&overlay.selected, &projection[overlay.projection.len()..]).or_else(
+        || {
+            overlay
+                .schematic
+                .then(|| project_pattern_overlay(root, projection))
+                .flatten()
+        },
+    )
+}
+
+/// Apply inherited arm facts only to consumer-owned occurrence variables.
+/// The imported capture root is resolved but never unified or constrained, so
+/// an arm-local demand cannot widen its provider's authoritative declaration.
+/// Nested frames compose outer-to-inner through the latest longest overlay.
+pub(crate) fn refine_owner_inherited_pattern_narrowings(
+    unifier: &mut TypeUnifier,
+    narrowings: &[OwnerInheritedPatternNarrowing],
+) {
+    for narrowing in narrowings {
+        let root = unifier.resolve(&Type::Var(narrowing.root));
+        let mut overlays = Vec::<OwnerResolvedPatternOverlay>::new();
+        for frame in &narrowing.frames {
+            let (selector, inherited_open) =
+                projected_pattern_overlay_type(&root, &overlays, &frame.projection);
+            let selected = selector
+                .as_ref()
+                .and_then(|selector| matching_pattern_type(selector, &frame.pattern));
+            let (selected, schematic) = match selected {
+                Some(selected) => (selected, false),
+                None if inherited_open
+                    || selector.as_ref().is_some_and(pattern_selector_is_open) =>
+                {
+                    (frame.schematic.clone(), true)
+                }
+                None => continue,
+            };
+            overlays.push(OwnerResolvedPatternOverlay {
+                projection: frame.projection.clone(),
+                selected,
+                schematic,
+            });
+        }
+        for read in &narrowing.reads {
+            let selected =
+                projected_type_from_active_pattern_overlay(&root, &overlays, &read.projection);
+            if let Some(selected) = selected {
+                unifier.bind_var(read.variable, selected);
+            }
+        }
+    }
+}
+
 pub(crate) fn refine_owner_pattern_narrowings(
     unifier: &mut TypeUnifier,
     narrowings: &[OwnerPatternNarrowing],
 ) {
+    let publish = |unifier: &mut TypeUnifier, variable: TypeVar, ty: Type| {
+        if boon_checked::type_is_recursively_closed(&ty) {
+            unifier.publish_authoritative_provider(variable, ty);
+        } else {
+            unifier.bind_var(variable, ty);
+        }
+    };
     for narrowing in narrowings {
         let selector = unifier.resolve(&Type::Var(narrowing.selector));
         for (name, binding) in &narrowing.bindings {
             if let Some(ty) = matching_pattern_field(&selector, &narrowing.pattern, name) {
-                match unifier.resolve(&Type::Var(*binding)) {
-                    // A demand-shaped capture can leave an explicit alias to
-                    // an otherwise unconstrained consumer variable. Resolve
-                    // that hole instead of preserving it as a spurious union
-                    // member beside the selector-derived type.
-                    Type::Var(open) => unifier.bind_var(open, ty),
-                    _ => unifier.bind_flow_result(*binding, ty),
-                }
+                // The selector owns the matched payload surface. A projected
+                // arm read may already have shaped this binding as an open
+                // Object requirement before a late lexical-capture epoch
+                // closes the selector. In particular, a closed
+                // `Union<Object, Object>` payload must project its common
+                // fields into that requirement; symmetric Object/Union
+                // widening would retain the arm's schematic alpha forever.
+                publish(unifier, *binding, ty);
             }
         }
         for (projection, read) in &narrowing.selector_reads {
             if let Some(ty) =
                 matching_selector_projection(&selector, &narrowing.pattern, projection)
             {
-                unifier.bind_flow_result(*read, ty);
+                // This occurrence is owned by one match arm and is therefore
+                // an exact type equation, not a covariant branch join.  A
+                // generic consumer may already have shaped the occurrence as
+                // (for example) `List<alpha>`; structurally bind that alpha to
+                // the selector-derived item type instead of widening the read
+                // to `List<alpha> | List<Number>`.
+                publish(unifier, *read, ty);
             }
         }
     }
@@ -1162,6 +2768,7 @@ struct InstantiatedInterfaceParameter {
     ordinal: u32,
     ty: Type,
     mode: FlowMode,
+    evaluation_scope: OwnerInterfaceEvaluationScope,
 }
 
 #[derive(Clone)]
@@ -1269,8 +2876,15 @@ pub(crate) fn bind_projection(
     let mut current = root;
     for field in fields {
         let next = unifier.fresh();
-        let existing = match unifier.resolve(&Type::Var(current)) {
+        let resolved = unifier.resolve(&Type::Var(current));
+        let existing = match &resolved {
             Type::Object(shape) => shape.fields.get(field).cloned(),
+            Type::Union(members) => members
+                .iter()
+                .filter_map(|member| {
+                    crate::type_for_nested_path(member, std::slice::from_ref(field))
+                })
+                .reduce(|left, right| boon_checked::canonical_union_type(vec![left, right])),
             _ => None,
         };
         if let Some(existing) = existing {
@@ -1392,6 +3006,101 @@ fn signature_declaration_target_ref(
             capability: OwnerLexicalDeclarationCapability::Value,
         },
     }
+}
+
+fn signature_declaration_target(
+    target: &OwnerEffectiveLexicalTarget,
+) -> Option<OwnerSignatureDeclarationTarget> {
+    match target {
+        OwnerEffectiveLexicalTarget::FreshOut {
+            call,
+            formal_ordinal,
+        } => Some(OwnerSignatureDeclarationTarget::FreshOut {
+            call: call.clone(),
+            formal_ordinal: *formal_ordinal,
+        }),
+        OwnerEffectiveLexicalTarget::CallContext {
+            call,
+            context_ordinal,
+        } => Some(OwnerSignatureDeclarationTarget::CallContext {
+            call: call.clone(),
+            context_ordinal: *context_ordinal,
+        }),
+        OwnerEffectiveLexicalTarget::Imported {
+            target:
+                OwnerLexicalTargetRef::Declaration {
+                    declaration:
+                        OwnerDeclarationStableKey::FreshOut {
+                            call,
+                            formal_ordinal,
+                        },
+                    ..
+                },
+        } => Some(OwnerSignatureDeclarationTarget::FreshOut {
+            call: call.clone(),
+            formal_ordinal: *formal_ordinal,
+        }),
+        OwnerEffectiveLexicalTarget::Imported {
+            target:
+                OwnerLexicalTargetRef::Declaration {
+                    declaration: OwnerDeclarationStableKey::CallContext { call, ordinal },
+                    ..
+                },
+        } => Some(OwnerSignatureDeclarationTarget::CallContext {
+            call: call.clone(),
+            context_ordinal: *ordinal,
+        }),
+        OwnerEffectiveLexicalTarget::Static { .. }
+        | OwnerEffectiveLexicalTarget::Imported { .. }
+        | OwnerEffectiveLexicalTarget::InvalidBareBinding { .. }
+        | OwnerEffectiveLexicalTarget::Ambiguous { .. } => None,
+    }
+}
+
+/// Mark every expression whose value depends on one FreshOut or call-context
+/// declaration. Call inputs in this set must be staged until all calls have
+/// published their output declarations for the current solve round; otherwise
+/// a consumer can impose its open formal shape before the producer supplies a
+/// closed authoritative value.
+pub(crate) fn signature_dynamic_expression_index(
+    seed: &OwnerConstraintSeed,
+    plan: &OwnerSignatureLexicalPlan,
+) -> Vec<bool> {
+    let mut parents = vec![Vec::new(); seed.expressions.len()];
+    for (parent, expression) in seed.expressions.iter().enumerate() {
+        for input in &expression.inputs {
+            if let Some(parents) = parents.get_mut(input.expression as usize) {
+                parents.push(parent);
+            }
+        }
+    }
+    for parents in &mut parents {
+        parents.sort_unstable();
+        parents.dedup();
+    }
+    let mut pending = VecDeque::new();
+    let mut dynamic = vec![false; seed.expressions.len()];
+    for (expression, read) in plan.reads().iter().enumerate() {
+        let Some(_target) = read
+            .as_ref()
+            .and_then(|read| signature_declaration_target(&read.target))
+        else {
+            continue;
+        };
+        if !dynamic[expression] {
+            dynamic[expression] = true;
+            pending.push_back(expression);
+        }
+    }
+    while let Some(expression) = pending.pop_front() {
+        for parent in &parents[expression] {
+            if !dynamic[*parent] {
+                dynamic[*parent] = true;
+                pending.push_back(*parent);
+            }
+        }
+    }
+    dynamic
 }
 
 fn initialize_lexical_declaration_variables(
@@ -1643,33 +3352,27 @@ fn planned_lexical_read_variables(
     Ok(reads)
 }
 
-fn signature_read_preserves_base_target_for(
+fn signature_read_preserved_projection_for(
     seed: &OwnerConstraintSeed,
     signature_lexical_plan: &OwnerSignatureLexicalPlan,
     expression: u32,
-) -> bool {
+) -> Option<Box<[String]>> {
     let Some(base) = seed
         .lexical_reads()
         .get(expression as usize)
         .and_then(Option::as_ref)
     else {
-        return false;
+        return None;
     };
-    matches!(
-        signature_lexical_plan
-            .reads()
-            .get(expression as usize)
-            .and_then(Option::as_ref),
-        Some(read)
-            if matches!(
-                &read.target,
-                OwnerEffectiveLexicalTarget::Static { target } if target == &base.target
-            ) && read.projection == base.projection
-    )
-}
-
-fn signature_read_preserves_base_target(state: &OwnerSolveState<'_>, expression: u32) -> bool {
-    signature_read_preserves_base_target_for(state.seed, &state.signature_lexical_plan, expression)
+    let read = signature_lexical_plan
+        .reads()
+        .get(expression as usize)
+        .and_then(Option::as_ref)?;
+    (matches!(
+        &read.target,
+        OwnerEffectiveLexicalTarget::Static { target } if target == &base.target
+    ) && read.projection == base.projection)
+        .then(|| read.projection.clone())
 }
 
 fn exact_pattern_local_expressions(
@@ -1684,11 +3387,12 @@ fn exact_pattern_local_expressions(
         for input in &arm.inputs {
             match &input.role {
                 OwnerConstraintEdgeRole::MatchBinding { .. }
-                    if signature_read_preserves_base_target_for(
+                    if signature_read_preserved_projection_for(
                         seed,
                         signature_lexical_plan,
                         input.expression,
-                    ) =>
+                    )
+                    .is_some() =>
                 {
                     expressions.insert(input.expression);
                 }
@@ -1868,48 +3572,313 @@ fn lexical_declaration_mode(
 
 fn propagate_lexical_capture_types(
     states: &BTreeMap<StableCheckOwnerKey, OwnerSolveState<'_>>,
-    internal_providers: &[(StableCheckOwnerKey, OwnerLexicalTargetRef, TypeVar, TypeVar)],
-    capture_type_variables: &mut BTreeMap<
+    internal_providers: &[InternalLexicalCaptureProvider],
+    capture_alpha_frames: &mut BTreeMap<
         (StableCheckOwnerKey, OwnerLexicalTargetRef),
-        BTreeMap<TypeVar, TypeVar>,
+        LexicalCaptureAlphaFrame,
     >,
+    previous_capture_surfaces: &mut BTreeMap<(StableCheckOwnerKey, OwnerLexicalTargetRef), Type>,
     allow_requirement_backflow: bool,
     unifier: &mut TypeUnifier,
 ) -> Result<(), OwnerConstraintSeedError> {
+    // A readable public declaration is projected from its exact result
+    // expression boundary, while its persistent lexical root (`state.result`)
+    // also receives consumer requirements from same-component captures. A
+    // consumer can therefore leave that persistent root holding a stale
+    // sparse scaffold even after the expression boundary has become closed.
+    // Before exporting a closed public value, restore the same authority used
+    // by `project_owner_interface_scc_result`; otherwise the provider can
+    // publish a closed interface while a full-root lexical capture of it still
+    // observes the earlier consumer shape.
+    let mut refreshed_public_roots = BTreeSet::new();
+    for provider in internal_providers {
+        if !matches!(
+            &provider.target,
+            OwnerLexicalTargetRef::Declaration {
+                declaration: OwnerDeclarationStableKey::Public,
+                capability: OwnerLexicalDeclarationCapability::Value,
+                ..
+            }
+        ) || !refreshed_public_roots.insert(unifier.root_readonly(provider.provider))
+        {
+            continue;
+        }
+        let provider_owner = match &provider.target {
+            OwnerLexicalTargetRef::Declaration { owner, .. } => owner,
+            OwnerLexicalTargetRef::ContextFormal { .. }
+            | OwnerLexicalTargetRef::Ambiguous { .. } => unreachable!(),
+        };
+        let state = states.get(provider_owner).ok_or_else(|| {
+            OwnerConstraintSeedError::new(
+                "internal public lexical capture lost its provider owner state",
+            )
+        })?;
+        let Some(expression) = owner_result_expression(state) else {
+            continue;
+        };
+        let raw_mode = state
+            .modes
+            .get(expression as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(FlowMode::Continuous);
+        let authority = resolved_expression_boundary(state, expression, unifier, raw_mode);
+        if boon_checked::type_is_recursively_closed(&authority.ty) {
+            unifier.publish_authoritative_provider(provider.provider, authority.ty);
+        }
+    }
+
+    // Provider roots may coalesce between rounds. Canonicalize each persistent
+    // frame before taking the frozen provider epoch and merge the corresponding
+    // consumer copies. Otherwise a newly canonical provider alpha could be
+    // absent from the frame even though both pre-union roots were mapped.
+    for frame in capture_alpha_frames.values_mut() {
+        let previous_variables = std::mem::take(&mut frame.variables);
+        let mut previous_demands = std::mem::take(&mut frame.demands);
+        for (provider, consumer) in previous_variables {
+            let demand = previous_demands.remove(&provider).ok_or_else(|| {
+                OwnerConstraintSeedError::new(
+                    "interface lexical capture alpha has no relative demand",
+                )
+            })?;
+            let provider = unifier.root(provider);
+            let consumer = unifier.root(consumer);
+            frame.demands.entry(provider).or_default().merge(&demand);
+            if let Some(existing) = frame.variables.get(&provider).copied() {
+                unifier.unify(Type::Var(existing), Type::Var(consumer));
+                frame.variables.insert(provider, unifier.root(existing));
+            } else {
+                frame.variables.insert(provider, consumer);
+            }
+        }
+        if !previous_demands.is_empty() {
+            return Err(OwnerConstraintSeedError::new(
+                "interface lexical capture retains demand for an unknown alpha",
+            ));
+        }
+    }
+
     // Classify providers before mutating any capture in this round. Otherwise
     // the first consumer of one generic provider can close it and make later
     // consumers look authoritative, turning inference into owner-route order.
-    let open_providers = allow_requirement_backflow
-        .then(|| {
-            internal_providers
-                .iter()
-                .filter_map(|(_, _, _, provider)| {
-                    let ty = unifier.resolve(&Type::Var(*provider));
-                    type_contains_inference_variable(&ty).then_some((*provider, ty))
-                })
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
-    for (consumer, target, capture, provider) in internal_providers {
-        let provider_type = open_providers
-            .get(provider)
-            .cloned()
-            .unwrap_or_else(|| unifier.resolve(&Type::Var(*provider)));
-        let variables = capture_type_variables
-            .entry((consumer.clone(), target.clone()))
-            .or_default();
-        let captured = instantiate_type(&provider_type, unifier, variables);
-        unifier.bind_var(*capture, captured);
-        if let Some(provider_type) = open_providers.get(provider) {
-            // An unresolved declaration remains part of the joint interface
-            // equation: requirements discovered in a child must constrain its
-            // provider. Backflow the consumer requirement through the frozen
-            // structural provider shape instead of unioning roots: this binds
-            // exact generic holes while preserving concrete sibling fields.
-            let requirement = unifier.resolve(&Type::Var(*capture));
-            bind_provider_inference_holes(unifier, provider_type, &requirement);
+    let mut resolved_provider_roots = Vec::new();
+    let mut resolved_capture_roots = Vec::new();
+    let mut capture_surfaces = Vec::with_capacity(internal_providers.len());
+    let mut frozen_capture_requirements = BTreeMap::new();
+    let mut seen_capture_keys = BTreeSet::new();
+    for provider in internal_providers {
+        let key = (provider.consumer.clone(), provider.target.clone());
+        if !seen_capture_keys.insert(key.clone()) {
+            return Err(OwnerConstraintSeedError::new(
+                "interface lexical capture repeats one consumer target",
+            ));
+        }
+        let (ty, demands) = unifier.resolve_lexical_capture_surface_with_demands(
+            provider.provider,
+            &provider.demand,
+            &mut resolved_provider_roots,
+        );
+        let changed = previous_capture_surfaces.get(&key) != Some(&ty);
+        let open_variables = if allow_requirement_backflow {
+            let mut variables = BTreeSet::new();
+            collect_type_variables(&ty, &mut variables);
+            variables
+        } else {
+            BTreeSet::new()
+        };
+        if allow_requirement_backflow {
+            let requirement = unifier
+                .resolve_with_cache(&Type::Var(provider.capture), &mut resolved_capture_roots);
+            frozen_capture_requirements.insert(key.clone(), requirement);
+        }
+        capture_surfaces.push((key, ty, changed, open_variables, demands));
+    }
+
+    // A provider alpha can initially stand for a strict demanded prefix and
+    // acquire an Object binding in a later round. Retain that relative demand
+    // on the persistent frame; refreshing it with an ordinary full resolve
+    // would reintroduce every omitted sibling through the alpha seam.
+    for (key, _, _, _, demands) in &capture_surfaces {
+        let frame = capture_alpha_frames.entry(key.clone()).or_default();
+        for (variable, demand) in demands {
+            if frame.variables.contains_key(variable) {
+                frame.demands.entry(*variable).or_default().merge(demand);
+            }
         }
     }
+
+    for (provider, (key, provider_type, provider_changed, _, surface_demands)) in
+        internal_providers.iter().zip(&capture_surfaces)
+    {
+        let frame = capture_alpha_frames.entry(key.clone()).or_default();
+        // `variables` is the stable provider-alpha -> consumer-alpha frame
+        // created when this capture first observes an open provider. A later
+        // fixed-point round can close those provider alphas without changing
+        // the provider's outer surface. Refresh the already-published
+        // consumer copies before merging that newer surface; otherwise the
+        // capture retains detached `Var` members even though its provider is
+        // now concrete.
+        if *provider_changed {
+            let copied_variables = frame
+                .variables
+                .iter()
+                .map(|(provider, consumer)| (*provider, *consumer))
+                .collect::<Vec<_>>();
+            for (provider_variable, consumer_variable) in copied_variables {
+                let demand = frame
+                    .demands
+                    .get(&provider_variable)
+                    .cloned()
+                    .ok_or_else(|| {
+                        OwnerConstraintSeedError::new(
+                            "interface lexical capture alpha refresh has no relative demand",
+                        )
+                    })?;
+                let (resolved, nested_demands) = unifier
+                    .resolve_lexical_capture_surface_with_demands(
+                        provider_variable,
+                        &demand,
+                        &mut resolved_provider_roots,
+                    );
+                let resolved = instantiate_type(&resolved, unifier, &mut frame.variables);
+                for (variable, demand) in nested_demands {
+                    frame.demands.entry(variable).or_default().merge(&demand);
+                }
+                // This slot is the consumer-owned copy of one exact provider
+                // alpha. A consumer may have shaped it while the provider was
+                // unresolved, but that scaffold is a requirement rather than
+                // a second provider epoch. Preserve requirements in genuine
+                // provider holes, then let the refreshed provider alpha own
+                // the copied slot's outer structure.
+                unifier.publish_authoritative_provider(consumer_variable, resolved);
+            }
+            let captured = instantiate_type(provider_type, unifier, &mut frame.variables);
+            for (variable, demand) in surface_demands {
+                frame.demands.entry(*variable).or_default().merge(demand);
+            }
+            if frame
+                .variables
+                .keys()
+                .any(|variable| !frame.demands.contains_key(variable))
+            {
+                return Err(OwnerConstraintSeedError::new(
+                    "interface lexical capture instantiated an alpha without demand provenance",
+                ));
+            }
+            // Once the copied alpha frame resolves to the current provider
+            // surface, rebinding the outer capture would merge its stale raw
+            // `Union<Var...>` slot with the same concrete value. Compare
+            // resolved surfaces only for providers whose exact surface
+            // changed since the previous propagation.
+            let capture_root = unifier.root_readonly(provider.capture);
+            let same_live = unifier.bindings[capture_root.0 as usize]
+                .as_ref()
+                .is_some_and(|current| unifier.same_live_type(current, &captured));
+            let resolved_capture =
+                (!same_live).then(|| unifier.resolve(&Type::Var(provider.capture)));
+            let resolved_captured = (!same_live).then(|| unifier.resolve(&captured));
+            let resolved_equal = same_live || resolved_capture == resolved_captured;
+            if !resolved_equal {
+                // A lexical capture is a directional provider surface, not a
+                // branch join. Consumer work from an earlier round may have
+                // shaped its independent copy while the provider was still
+                // unresolved. Once the provider closes, retain requirements
+                // only in genuine copied holes and replace that provisional
+                // outer scaffold; unioning the two epochs would make stale
+                // consumer shape co-authoritative forever.
+                unifier.publish_authoritative_provider(provider.capture, captured);
+            }
+        }
+    }
+    // Apply the consumer requirements that were frozen before any forward
+    // capture publication in this round. Resolving the requirement here would
+    // combine it with the provider echo into a semantic Union, obscuring the
+    // exact Object/List requirement that must be projected into the independent
+    // alpha frame. The frame then supplies the exact provider-hole ->
+    // consumer-hole seams for deterministic backflow.
+    let mut capture_requirements = Vec::new();
+    if allow_requirement_backflow {
+        // The outer capture is a directional flow surface. Project consumer
+        // constraints from that surface into its independent alpha slots
+        // before reading the exact provider-alpha seams; never union the whole
+        // provider and capture roots merely to make nested requirements visible.
+        let mut slot_requirements = Vec::new();
+        for (provider, (key, provider_type, _, _, _)) in
+            internal_providers.iter().zip(&capture_surfaces)
+        {
+            let frame = capture_alpha_frames.get_mut(key).ok_or_else(|| {
+                OwnerConstraintSeedError::new(
+                    "interface lexical capture has no alpha frame for requirement projection",
+                )
+            })?;
+            let template = instantiate_type(provider_type, unifier, &mut frame.variables);
+            let requirement = frozen_capture_requirements
+                .get(key)
+                .cloned()
+                .ok_or_else(|| {
+                    OwnerConstraintSeedError::new(
+                        "interface lexical capture has no frozen consumer requirement",
+                    )
+                })?;
+            let demanded_requirement = provider.demand.project_resolved(&requirement);
+            bind_open_provider_requirement(
+                unifier,
+                provider.provider,
+                provider_type,
+                &demanded_requirement,
+            );
+            slot_requirements.push((template, requirement));
+        }
+        for (template, requirement) in slot_requirements {
+            bind_provider_inference_holes_resolved(unifier, &template, &requirement);
+        }
+        resolved_capture_roots.clear();
+        for (key, _, _, open_variables, _) in &capture_surfaces {
+            let frame = capture_alpha_frames.get(key).ok_or_else(|| {
+                OwnerConstraintSeedError::new(
+                    "interface lexical capture has no instantiated alpha frame",
+                )
+            })?;
+            for provider in open_variables {
+                let demand = frame.demands.get(provider).ok_or_else(|| {
+                    OwnerConstraintSeedError::new(
+                        "interface lexical capture omits relative demand for an open alpha",
+                    )
+                })?;
+                let consumer = frame.variables.get(provider).copied().ok_or_else(|| {
+                    OwnerConstraintSeedError::new(
+                        "interface lexical capture omits an open provider alpha",
+                    )
+                })?;
+                let requirement =
+                    unifier.resolve_with_cache(&Type::Var(consumer), &mut resolved_capture_roots);
+                if !demand.full
+                    && (matches!(
+                        requirement,
+                        Type::Var(_) | Type::Unknown | Type::UnresolvedShape { .. }
+                    ) || matches!(
+                        &requirement,
+                        Type::Object(shape) if shape.open && shape.fields.is_empty()
+                    ))
+                {
+                    // A bare consumer alpha at a strict projection prefix is
+                    // not an equation for the provider's unseen outer shape.
+                    // Keep the seam detached until the consumer contributes a
+                    // structural requirement; that sparse requirement can then
+                    // flow back directionally without unioning the two roots.
+                    continue;
+                }
+                capture_requirements.push((*provider, requirement));
+            }
+        }
+    }
+    for (provider, requirement) in capture_requirements {
+        bind_provider_inference_holes_resolved(unifier, &Type::Var(provider), &requirement);
+    }
+    *previous_capture_surfaces = capture_surfaces
+        .into_iter()
+        .map(|(key, ty, _, _, _)| (key, ty))
+        .collect();
 
     for (_owner, state) in states {
         for (target, capture) in &state.lexical_capture_variables {
@@ -1931,6 +3900,28 @@ fn propagate_lexical_capture_types(
                         )
                     })?;
                 unifier.unify(Type::Var(read), Type::Var(capture_variable));
+
+                // The expression is a directional occurrence of this capture.
+                // Its one-time flow alias can detach when a consumer shapes it
+                // before the internal provider epoch closes. Republish the
+                // current projected provider into the occurrence after every
+                // capture epoch so downstream call formals observe late
+                // authority. Pattern-local occurrences remain owned by their
+                // inherited narrowing overlay below.
+                if state.pattern_local_expressions.contains(&(*index as u32)) {
+                    continue;
+                }
+                let plan = state.signature_lexical_plan.reads()[*index]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        OwnerConstraintSeedError::new(
+                            "interface lexical capture occurrence lost its read plan",
+                        )
+                    })?;
+                let provider = unifier.resolve(&Type::Var(capture_variable));
+                if let Some(projected) = crate::type_for_nested_path(&provider, &plan.projection) {
+                    unifier.publish_authoritative_provider(state.expressions[*index], projected);
+                }
             }
         }
     }
@@ -2059,6 +4050,22 @@ fn resolved_expression_flush_type(
     .then_some(ty)
 }
 
+fn resolved_expression_flush_type_with_projection_authorities(
+    state: &OwnerSolveState<'_>,
+    reference: u32,
+    unifier: &mut TypeUnifier,
+    authorities: &BTreeMap<TypeVar, Type>,
+) -> Option<Type> {
+    let ty = expression_flush_variable(state, reference).map(|variable| {
+        unifier.resolve_with_projection_authorities(&Type::Var(variable), authorities)
+    })?;
+    (!matches!(
+        ty,
+        Type::Unknown | Type::UnresolvedShape { .. } | Type::Absent
+    ))
+    .then_some(ty)
+}
+
 fn resolved_expression_boundary(
     state: &OwnerSolveState<'_>,
     reference: u32,
@@ -2079,6 +4086,69 @@ fn resolved_expression_boundary(
             boon_checked::canonical_union_type(vec![value, flush])
         }),
     }
+}
+
+fn resolved_expression_boundary_with_projection_authorities(
+    state: &OwnerSolveState<'_>,
+    reference: u32,
+    unifier: &mut TypeUnifier,
+    raw_mode: FlowMode,
+    authorities: &BTreeMap<TypeVar, Type>,
+) -> FlowType {
+    let value = expression_variable(state, reference)
+        .map(|variable| {
+            unifier.resolve_with_projection_authorities(&Type::Var(variable), authorities)
+        })
+        .unwrap_or(Type::Absent);
+    let flush = resolved_expression_flush_type_with_projection_authorities(
+        state,
+        reference,
+        unifier,
+        authorities,
+    );
+    FlowType {
+        mode: if raw_mode == FlowMode::Absent && flush.is_some() {
+            FlowMode::Continuous
+        } else {
+            raw_mode
+        },
+        ty: flush.map_or(value.clone(), |flush| {
+            boon_checked::canonical_union_type(vec![value, flush])
+        }),
+    }
+}
+
+fn interface_transfer_expression_value(
+    state: &OwnerSolveState<'_>,
+    reference: u32,
+    unifier: &mut TypeUnifier,
+) -> Option<EvaluatedResultValue> {
+    let variable = expression_variable(state, reference)?;
+    let index = reference as usize;
+    let mode = state
+        .modes
+        .get(index)
+        .copied()
+        .flatten()
+        .unwrap_or(FlowMode::Continuous);
+    let static_number = state.seed.expressions.get(index).and_then(|expression| {
+        state
+            .seed
+            .result_static_numbers
+            .binary_search_by(|number| number.expression.cmp(&expression.expression))
+            .ok()
+            .and_then(|index| state.seed.result_static_numbers.get(index))
+            .and_then(|number| ExactNumber::parse_strict(&number.literal, None).ok())
+    });
+    Some(EvaluatedResultValue {
+        flow_type: FlowType {
+            mode,
+            ty: unifier.resolve(&Type::Var(variable)),
+        },
+        parameter_derived: false,
+        syntax_selected: false,
+        static_number,
+    })
 }
 
 fn owner_result_expression(state: &OwnerSolveState<'_>) -> Option<u32> {
@@ -2294,6 +4364,12 @@ fn owner_result_parameter_alias(
     resolve(state, reference, &mut BTreeSet::new())
 }
 
+fn owner_result_requires_occurrence_transfer(state: &OwnerSolveState<'_>) -> bool {
+    state.declaration_kind == Some(OwnerDeclarationKind::Function)
+        && owner_result_expression(state)
+            .is_some_and(|root| owner_result_parameter_alias(state, root).is_none())
+}
+
 fn build_owner_result_transfer(
     state: &OwnerSolveState<'_>,
     abi: &OwnerInferenceAbiEnvironment,
@@ -2457,6 +4533,371 @@ fn write_solver_surface_snapshot(
             unifier.append_resolved_type_snapshot(&Type::Var(*variable), output, &mut active);
         }
     }
+}
+
+fn owner_containment_depth(owner: &StableCheckOwnerKey) -> usize {
+    match owner {
+        StableCheckOwnerKey::UnitRoot(_) => 0,
+        StableCheckOwnerKey::Item(owner) => owner.item_route.segments().len(),
+    }
+}
+
+fn insert_unique_projection_authority(
+    authorities: &mut BTreeMap<TypeVar, Type>,
+    ambiguous: &mut BTreeSet<TypeVar>,
+    root: TypeVar,
+    authority: Type,
+) {
+    if ambiguous.contains(&root) {
+        return;
+    }
+    match authorities.get(&root) {
+        None => {
+            authorities.insert(root, authority);
+        }
+        Some(existing) if existing == &authority => {}
+        Some(_) => {
+            authorities.remove(&root);
+            ambiguous.insert(root);
+        }
+    }
+}
+
+/// Compose closed child-owner endpoints into their containing public records
+/// without mutating the inference graph.
+///
+/// Child items are projected before their containing items. Every internal
+/// child result and its parent-owned external expression share a persistent
+/// root, but a late result-transfer publication may close only the child's
+/// exact expression endpoint. Recording that closed endpoint here lets final
+/// artifact projection follow it through the parent record. Conflicting
+/// authorities for a coalesced root are deliberately ignored rather than
+/// selecting a traversal-order winner.
+fn closed_public_result_projection_authorities(
+    states: &BTreeMap<StableCheckOwnerKey, OwnerSolveState<'_>>,
+    unifier: &mut TypeUnifier,
+) -> (
+    BTreeMap<TypeVar, Type>,
+    BTreeMap<StableCheckOwnerKey, FlowType>,
+) {
+    let mut owners = states.keys().collect::<Vec<_>>();
+    owners.sort_by(|left, right| {
+        owner_containment_depth(right)
+            .cmp(&owner_containment_depth(left))
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut authorities = BTreeMap::new();
+    let mut ambiguous = BTreeSet::new();
+    let mut owner_results = BTreeMap::<StableCheckOwnerKey, FlowType>::new();
+    for owner in owners {
+        let state = &states[owner];
+        for (external, variable) in state
+            .seed
+            .external_expressions
+            .iter()
+            .zip(&state.external_expressions)
+        {
+            if external.is_exact_enclosing_capture_for(&state.seed.owner) {
+                continue;
+            }
+            let Some(authority) = owner_results.get(&external.owner) else {
+                continue;
+            };
+            insert_unique_projection_authority(
+                &mut authorities,
+                &mut ambiguous,
+                unifier.root(*variable),
+                authority.ty.clone(),
+            );
+        }
+
+        let Some(expression) = owner_result_expression(state) else {
+            continue;
+        };
+        let raw_mode = state
+            .modes
+            .get(expression as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(FlowMode::Continuous);
+        let authority = resolved_expression_boundary_with_projection_authorities(
+            state,
+            expression,
+            unifier,
+            raw_mode,
+            &authorities,
+        );
+        if !boon_checked::type_is_recursively_closed(&authority.ty) {
+            continue;
+        }
+        insert_unique_projection_authority(
+            &mut authorities,
+            &mut ambiguous,
+            unifier.root(state.result),
+            authority.ty.clone(),
+        );
+        owner_results.insert(owner.clone(), authority);
+    }
+    (authorities, owner_results)
+}
+
+fn project_owner_interface_scc_result(
+    scc: &OwnerInterfaceScc,
+    abi: &OwnerInferenceAbiEnvironment,
+    states: &BTreeMap<StableCheckOwnerKey, OwnerSolveState<'_>>,
+    unifier: &mut TypeUnifier,
+    mut work: OwnerInterfaceSolveWork,
+) -> Result<Arc<OwnerInterfaceSccResult>, OwnerConstraintSeedError> {
+    let mut interfaces = Vec::with_capacity(states.len());
+    let mut alpha_variables = BTreeMap::new();
+    let mut next_alpha = 0;
+    let (projection_authorities, closed_owner_results) =
+        closed_public_result_projection_authorities(states, unifier);
+    for owner in &scc.key.members {
+        let state = &states[owner];
+        let parameters = state
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let ty = unifier.resolve(&Type::Var(parameter.variable));
+                OwnerInterfaceParameter {
+                    name: parameter.name.clone(),
+                    kind: parameter.kind,
+                    ordinal: parameter.ordinal,
+                    flow_type: FlowType {
+                        mode: FlowMode::Continuous,
+                        ty: alpha_normalize_type(&ty, &mut alpha_variables, &mut next_alpha),
+                    },
+                    requirement: CheckedParameterRequirement::Required,
+                    evaluation_scope: parameter.evaluation_scope,
+                }
+            })
+            .collect::<Vec<_>>();
+        let result_expression = owner_result_expression(state);
+        let raw_result_mode = result_expression
+            .and_then(|expression| {
+                ((expression as usize) < state.expressions.len())
+                    .then(|| state.modes[expression as usize])
+                    .flatten()
+            })
+            .unwrap_or(FlowMode::Continuous);
+        let resolved_result = closed_owner_results.get(owner).cloned().unwrap_or_else(|| {
+            result_expression.map_or(
+                FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: Type::Absent,
+                },
+                |expression| {
+                    resolved_expression_boundary_with_projection_authorities(
+                        state,
+                        expression,
+                        unifier,
+                        raw_result_mode,
+                        &projection_authorities,
+                    )
+                },
+            )
+        });
+        let resolved_result_flush_type = result_expression.and_then(|expression| {
+            resolved_expression_flush_type_with_projection_authorities(
+                state,
+                expression,
+                unifier,
+                &projection_authorities,
+            )
+        });
+        let result = FlowType {
+            mode: resolved_result.mode,
+            ty: alpha_normalize_type(&resolved_result.ty, &mut alpha_variables, &mut next_alpha),
+        };
+        let result_flush_type = resolved_result_flush_type
+            .map(|ty| alpha_normalize_type(&ty, &mut alpha_variables, &mut next_alpha));
+        let context_ty = unifier.resolve(&Type::Var(state.context));
+        let context = (state.declaration_kind == Some(OwnerDeclarationKind::Function)
+            && !matches!(context_ty, Type::Var(_) | Type::Unknown))
+        .then(|| {
+            let flow_type = FlowType {
+                mode: FlowMode::Continuous,
+                ty: alpha_normalize_type(&context_ty, &mut alpha_variables, &mut next_alpha),
+            };
+            OwnerContextInterface {
+                projections: crate::context_scheme_projections(&flow_type.ty)
+                    .into_iter()
+                    .map(Vec::into_boxed_slice)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                flow_type,
+            }
+        });
+        let result_transfer = build_owner_result_transfer(
+            state,
+            abi,
+            unifier,
+            &mut alpha_variables,
+            &mut next_alpha,
+        )?;
+        let captures = state
+            .seed
+            .external_expressions
+            .iter()
+            .filter(|external| external.is_exact_enclosing_capture_for(&state.seed.owner))
+            .map(|external| {
+                let provider = &states[&external.owner];
+                let expression = *provider
+                    .expression_by_key
+                    .get(&external.expression)
+                    .expect("validated enclosing capture has a provider expression");
+                let mode = provider.modes[expression].unwrap_or(FlowMode::Continuous);
+                let flow_type = resolved_expression_boundary_with_projection_authorities(
+                    provider,
+                    expression as u32,
+                    unifier,
+                    mode,
+                    &projection_authorities,
+                );
+                let flush_type = resolved_expression_flush_type_with_projection_authorities(
+                    provider,
+                    expression as u32,
+                    unifier,
+                    &projection_authorities,
+                );
+                OwnerInterfaceCapture {
+                    owner: external.owner.clone(),
+                    expression: external.expression.clone(),
+                    flow_type: FlowType {
+                        mode: flow_type.mode,
+                        ty: alpha_normalize_type(
+                            &flow_type.ty,
+                            &mut alpha_variables,
+                            &mut next_alpha,
+                        ),
+                    },
+                    flush_type: flush_type
+                        .map(|ty| alpha_normalize_type(&ty, &mut alpha_variables, &mut next_alpha)),
+                }
+            })
+            .collect::<Vec<_>>();
+        let lexical_captures = state
+            .lexical_capture_variables
+            .iter()
+            .map(|(target, variable)| {
+                let mode = state
+                    .lexical_capture_modes
+                    .get(target)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| {
+                        OwnerConstraintSeedError::new(format!(
+                            "owner interface {owner:?} did not resolve lexical capture mode for {target:?}"
+                        ))
+                    })?;
+                Ok(OwnerInterfaceLexicalCapture {
+                    target: target.clone(),
+                    demand_paths: state
+                        .signature_lexical_plan
+                        .imported_capture_sites_for(target)
+                        .ok_or_else(|| {
+                            OwnerConstraintSeedError::new(
+                                "owner interface lexical capture has no exact demand manifest",
+                            )
+                        })?
+                        .demand_paths
+                        .clone(),
+                    flow_type: FlowType {
+                        mode,
+                        ty: alpha_normalize_type(
+                            &unifier.resolve(&Type::Var(*variable)),
+                            &mut alpha_variables,
+                            &mut next_alpha,
+                        ),
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, OwnerConstraintSeedError>>()?;
+        let mut type_variables = BTreeSet::new();
+        for parameter in &parameters {
+            collect_type_variables(&parameter.flow_type.ty, &mut type_variables);
+        }
+        collect_type_variables(&result.ty, &mut type_variables);
+        if let Some(flush_type) = &result_flush_type {
+            collect_type_variables(flush_type, &mut type_variables);
+        }
+        if let Some(context) = &context {
+            collect_type_variables(&context.flow_type.ty, &mut type_variables);
+        }
+        for capture in &captures {
+            collect_type_variables(&capture.flow_type.ty, &mut type_variables);
+            if let Some(flush_type) = &capture.flush_type {
+                collect_type_variables(flush_type, &mut type_variables);
+            }
+        }
+        for capture in &lexical_captures {
+            collect_type_variables(&capture.flow_type.ty, &mut type_variables);
+        }
+        if let OwnerResultTransfer::Expression { nodes, .. } = &result_transfer {
+            for node in nodes {
+                collect_type_variables(&node.flow_type.ty, &mut type_variables);
+            }
+        }
+        let mut interface = OwnerPublicInterface {
+            owner: owner.clone(),
+            declaration_kind: state.declaration_kind,
+            names: state.names.clone(),
+            parameters: parameters.into_boxed_slice(),
+            result,
+            result_flush_type,
+            result_transfer,
+            captures: captures.into_boxed_slice(),
+            lexical_captures: lexical_captures.into_boxed_slice(),
+            context,
+            effect: state.effect,
+            type_variables: type_variables
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            fingerprint_v1: [0; 32],
+        };
+        interface.fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+            OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V4,
+            &interface,
+        )
+        .map_err(|error| {
+            OwnerConstraintSeedError::new(format!(
+                "cannot fingerprint owner body interface import: {error}"
+            ))
+        })?;
+        interfaces.push(interface);
+    }
+    work.unification_steps = unifier.steps;
+    let interface_fingerprints = interfaces
+        .iter()
+        .map(OwnerPublicInterface::fingerprint_v1)
+        .collect::<Vec<_>>();
+    let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+        OWNER_INTERFACE_SCC_RESULT_DOMAIN_V6,
+        &(&scc.key, &interface_fingerprints, next_alpha),
+    )
+    .map_err(|error| {
+        OwnerConstraintSeedError::new(format!(
+            "cannot fingerprint owner interface SCC result: {error}"
+        ))
+    })?;
+    let key_fingerprint_v1 =
+        boon_contract::canonical_serde_hash_v1(OWNER_INTERFACE_SCC_KEY_DOMAIN_V1, &scc.key)
+            .map_err(|error| {
+                OwnerConstraintSeedError::new(format!(
+                    "cannot fingerprint owner interface SCC key: {error}"
+                ))
+            })?;
+    Ok(Arc::new(OwnerInterfaceSccResult {
+        key: scc.key.clone(),
+        owners: interfaces.into_boxed_slice(),
+        type_variable_count: next_alpha,
+        work,
+        key_fingerprint_v1,
+        fingerprint_v1,
+    }))
 }
 
 pub(crate) fn authoritative_signature(
@@ -2761,7 +5202,8 @@ pub fn evaluate_owner_interface_scc<'a>(
     summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
     dependency_results: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<OwnerInterfaceSccEvaluation, OwnerConstraintSeedError> {
-    evaluate_owner_interface_scc_impl(scc, abi, seeds, summaries, dependency_results, None)
+    evaluate_owner_interface_scc_impl(scc, abi, seeds, summaries, dependency_results, None, None)
+        .map(|output| output.evaluation)
 }
 
 pub fn evaluate_owner_interface_scc_with_signature_scopes<'a, 'b>(
@@ -2779,8 +5221,52 @@ pub fn evaluate_owner_interface_scc_with_signature_scopes<'a, 'b>(
         summaries,
         dependency_results,
         Some(signature_scopes.into_iter().collect()),
+        None,
     )
+    .map(|output| output.evaluation)
 }
+
+/// Solve one interface SCC once and run only its quiescent result-transfer
+/// residuals until the public surface and compiled module stabilize.
+///
+/// The resolver is called once with the exact external owner set referenced by
+/// the component's transfer programs or user-call occurrences. It lets a
+/// persistent evaluator record precise module dependencies without rebuilding
+/// the complete SCC solver in a second transaction.
+pub fn evaluate_owner_interface_scc_component<'a, 'b, F>(
+    scc: &OwnerInterfaceScc,
+    abi: &OwnerInferenceAbiEnvironment,
+    seeds: impl IntoIterator<Item = &'a OwnerConstraintSeed>,
+    summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
+    dependency_results: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
+    signature_scopes: impl IntoIterator<Item = &'b OwnerCallableScopeOwnerResult>,
+    mut resolve_transfer_modules: F,
+) -> Result<OwnerInterfaceSccComponentEvaluation, OwnerConstraintSeedError>
+where
+    F: FnMut(&[StableCheckOwnerKey]) -> Result<Vec<Arc<OwnerInterfaceTransferModule>>, String>,
+{
+    let output = evaluate_owner_interface_scc_impl(
+        scc,
+        abi,
+        seeds,
+        summaries,
+        dependency_results,
+        Some(signature_scopes.into_iter().collect()),
+        Some(&mut resolve_transfer_modules),
+    )?;
+    Ok(OwnerInterfaceSccComponentEvaluation {
+        evaluation: output.evaluation,
+        module: output.module.ok_or_else(|| {
+            OwnerConstraintSeedError::new(
+                "component interface solve did not publish its transfer module",
+            )
+        })?,
+        transfer_iterations: output.transfer_iterations,
+    })
+}
+
+type OwnerInterfaceTransferModuleResolver<'a> = dyn FnMut(&[StableCheckOwnerKey]) -> Result<Vec<Arc<OwnerInterfaceTransferModule>>, String>
+    + 'a;
 
 fn evaluate_owner_interface_scc_impl<'a>(
     scc: &OwnerInterfaceScc,
@@ -2789,7 +5275,8 @@ fn evaluate_owner_interface_scc_impl<'a>(
     summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
     dependency_results: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
     signature_scopes: Option<Vec<&OwnerCallableScopeOwnerResult>>,
-) -> Result<OwnerInterfaceSccEvaluation, OwnerConstraintSeedError> {
+    mut transfer_module_resolver: Option<&mut OwnerInterfaceTransferModuleResolver<'_>>,
+) -> Result<OwnerInterfaceSccSolveOutput, OwnerConstraintSeedError> {
     let seeds = seeds
         .into_iter()
         .map(|seed| (seed.owner.clone(), seed))
@@ -3111,8 +5598,16 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 )));
             }
         }
-        let pattern_local_expressions =
+        let inherited_pattern_plans = inherited_pattern_read_plans(&signature_lexical_plan);
+        let signature_dynamic_expressions =
+            signature_dynamic_expression_index(seed, &signature_lexical_plan);
+        let mut pattern_local_expressions =
             exact_pattern_local_expressions(seed, &signature_lexical_plan);
+        pattern_local_expressions.extend(
+            inherited_pattern_plans
+                .iter()
+                .flat_map(|plan| plan.reads.iter().map(|read| read.expression)),
+        );
         let mut signature_read_expressions =
             BTreeMap::<OwnerSignatureDeclarationTarget, Vec<usize>>::new();
         for (index, read) in signature_lexical_plan.reads().iter().enumerate() {
@@ -3156,6 +5651,8 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 lexical_capture_modes: BTreeMap::new(),
                 signature_declaration_modes: BTreeMap::new(),
                 signature_read_expressions,
+                signature_dynamic_expressions,
+                inherited_pattern_plans,
                 pattern_local_expressions,
                 declaration_kind: public.map(|declaration| declaration.kind),
                 names: public
@@ -3221,16 +5718,27 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         "owner interface {consumer:?} captures missing lexical target {target:?}",
                     ))
                 })?;
+            let demand_paths = states[&consumer]
+                .signature_lexical_plan
+                .imported_capture_sites_for(&target)
+                .ok_or_else(|| {
+                    OwnerConstraintSeedError::new(
+                        "interface lexical capture has no exact demand manifest",
+                    )
+                })?
+                .demand_paths
+                .clone();
             // Cross-owner lexical capture is a provider-to-consumer flow, not
             // a type equation. Keep the consumer root independent so a local
             // projection or use-site contract cannot widen the declaring
             // PatternBinding/FreshOut/public surface before it is frozen.
-            internal_lexical_capture_providers.push((
-                consumer.clone(),
-                target.clone(),
+            internal_lexical_capture_providers.push(InternalLexicalCaptureProvider {
+                consumer: consumer.clone(),
+                target: target.clone(),
                 capture,
                 provider,
-            ));
+                demand: LexicalCaptureDemand::from_paths(&demand_paths)?,
+            });
             continue;
         }
         if !matches!(
@@ -3249,8 +5757,23 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 "owner interface {consumer:?} has no dependency interface for public lexical target {target:?}"
             ))
         })?;
+        let demand_paths = states[&consumer]
+            .signature_lexical_plan
+            .imported_capture_sites_for(&target)
+            .ok_or_else(|| {
+                OwnerConstraintSeedError::new(
+                    "interface public lexical capture has no exact demand manifest",
+                )
+            })?
+            .demand_paths
+            .clone();
+        let demand = LexicalCaptureDemand::from_paths(&demand_paths)?;
         let mut variables = BTreeMap::new();
-        let ty = instantiate_type(&interface.result.ty, &mut unifier, &mut variables);
+        let ty = instantiate_type(
+            &demand.project_resolved(&interface.result.ty),
+            &mut unifier,
+            &mut variables,
+        );
         unifier.bind_var(capture, ty);
         let mode = states
             .get_mut(&consumer)
@@ -3263,14 +5786,32 @@ fn evaluate_owner_interface_scc_impl<'a>(
         *mode = Some(interface.result.mode);
     }
     let mut lexical_capture_type_variables = BTreeMap::new();
+    let mut lexical_capture_provider_types = BTreeMap::new();
     propagate_lexical_capture_types(
         &states,
         &internal_lexical_capture_providers,
         &mut lexical_capture_type_variables,
+        &mut lexical_capture_provider_types,
         false,
         &mut unifier,
     )?;
-
+    let mut inherited_pattern_narrowings = Vec::new();
+    for state in states.values() {
+        inherited_pattern_narrowings.extend(
+            instantiate_owner_inherited_pattern_narrowings(
+                &state.inherited_pattern_plans,
+                |target| state.lexical_capture_variables.get(target).copied(),
+                &state.expressions,
+                &mut unifier,
+            )
+            .map_err(|error| {
+                OwnerConstraintSeedError::new(format!(
+                    "cannot instantiate inherited pattern narrowing for {:?}: {error}",
+                    state.seed.owner
+                ))
+            })?,
+        );
+    }
     // A transparent result wrapper is part of the public type equation, not
     // merely result-transfer metadata.  In particular, BLOCK-local aliases
     // can be projected correctly even when their lexical reference is not a
@@ -3617,21 +6158,26 @@ fn evaluate_owner_interface_scc_impl<'a>(
                             let OwnerConstraintEdgeRole::MatchBinding { name } = &input.role else {
                                 return None;
                             };
-                            if !signature_read_preserves_base_target(state, input.expression) {
-                                return None;
-                            }
+                            let projection = signature_read_preserved_projection_for(
+                                state.seed,
+                                &state.signature_lexical_plan,
+                                input.expression,
+                            )?;
                             expression_variable(state, input.expression)
-                                .map(|read| (name.clone(), read))
+                                .map(|read| (name.clone(), projection, read))
                         })
                         .collect::<Vec<_>>();
-                    for (name, read) in &local_bindings {
+                    for (name, projection, read) in &local_bindings {
                         if let Some(binding_ty) =
                             pattern_binding_type_from_pattern(pattern, &pattern_ty, name)
                         {
-                            unifier.unify(Type::Var(*read), binding_ty);
+                            let root = unifier.fresh();
+                            unifier.bind_var(root, binding_ty);
+                            let projected = bind_projection(&mut unifier, root, projection);
+                            unifier.unify(Type::Var(*read), Type::Var(projected));
+                            bindings.push((name.clone(), root));
                         }
                     }
-                    bindings.extend(local_bindings);
                     let narrowed_payload = unifier.fresh();
                     if let (OwnerPatternConstraint::Tag { name, .. }, Type::VariantSet(variants)) =
                         (pattern, &pattern_ty)
@@ -3707,7 +6253,11 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 }
                 OwnerConstraintNodeKind::Collection { collection, .. } => match collection {
                     OwnerCollectionKind::List => {
-                        let item = unifier.fresh();
+                        let item = if expression.inputs.is_empty() {
+                            unifier.fresh_contextual_hole()
+                        } else {
+                            unifier.fresh()
+                        };
                         for input in &expression.inputs {
                             if let Some(input) = expression_variable(state, input.expression) {
                                 unifier.bind_flow_result(item, Type::Var(input));
@@ -3716,7 +6266,11 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         unifier.bind_var(variable, Type::List(Type::shared(Type::Var(item))));
                     }
                     OwnerCollectionKind::Set => {
-                        let item = unifier.fresh();
+                        let item = if expression.inputs.is_empty() {
+                            unifier.fresh_contextual_hole()
+                        } else {
+                            unifier.fresh()
+                        };
                         for input in &expression.inputs {
                             if let Some(input) = expression_variable(state, input.expression) {
                                 unifier.bind_flow_result(item, Type::Var(input));
@@ -3728,8 +6282,17 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         unifier.bind_var(variable, Type::Bytes(BytesType::Dynamic));
                     }
                     OwnerCollectionKind::Map => {
-                        let key = unifier.fresh();
-                        let value = unifier.fresh();
+                        let empty = expression.inputs.is_empty();
+                        let key = if empty {
+                            unifier.fresh_contextual_hole()
+                        } else {
+                            unifier.fresh()
+                        };
+                        let value = if empty {
+                            unifier.fresh_contextual_hole()
+                        } else {
+                            unifier.fresh()
+                        };
                         for input in &expression.inputs {
                             let Some(input) = expression_variable(state, input.expression) else {
                                 continue;
@@ -3796,6 +6359,21 @@ fn evaluate_owner_interface_scc_impl<'a>(
             work.local_constraints = work.local_constraints.saturating_add(1);
         }
     }
+    calls.sort_by(|left, right| {
+        left.caller.cmp(&right.caller).then_with(|| {
+            let ordinal = |call: &CrossCall| {
+                states[&call.caller]
+                    .signature_lexical_plan
+                    .call(call.expression)
+                    .map_or(u32::MAX, |call| call.structural_ordinal)
+            };
+            // Signature ordinals are preorder (outer first). Solve nested
+            // result producers before their enclosing consumers; dynamic
+            // FreshOut/CallContext inputs remain staged until the parent has
+            // published those declarations.
+            ordinal(right).cmp(&ordinal(left))
+        })
+    });
 
     // Child expression boundaries and resolved value reads consume the exact
     // interface result instead of a copied child body.
@@ -3928,6 +6506,54 @@ fn evaluate_owner_interface_scc_impl<'a>(
         }
     }
 
+    refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
+    refine_owner_inherited_pattern_narrowings(&mut unifier, &inherited_pattern_narrowings);
+    unifier.refine_contextual_flow_holes();
+    let internal_call_graph = calls.iter().fold(
+        BTreeMap::<StableCheckOwnerKey, BTreeSet<StableCheckOwnerKey>>::new(),
+        |mut graph, call| {
+            if let Some(target) = call
+                .target
+                .as_ref()
+                .filter(|target| states.contains_key(*target))
+            {
+                graph
+                    .entry(call.caller.clone())
+                    .or_default()
+                    .insert(target.clone());
+            }
+            graph
+        },
+    );
+    let recursive_owner_calls = calls
+        .iter()
+        .map(|call| {
+            let Some(target) = call
+                .target
+                .as_ref()
+                .filter(|target| states.contains_key(*target))
+            else {
+                return false;
+            };
+            let mut pending = vec![target.clone()];
+            let mut visited = BTreeSet::new();
+            while let Some(owner) = pending.pop() {
+                if owner == call.caller {
+                    return true;
+                }
+                if !visited.insert(owner.clone()) {
+                    continue;
+                }
+                pending.extend(
+                    internal_call_graph
+                        .get(&owner)
+                        .into_iter()
+                        .flat_map(|targets| targets.iter().cloned()),
+                );
+            }
+            false
+        })
+        .collect::<Vec<_>>();
     let mut call_variables = vec![BTreeMap::new(); calls.len()];
     // Context schemes are instantiated independently from the ordinary call
     // result/parameter scheme. The checked-program oracle deliberately gives
@@ -3935,7 +6561,13 @@ fn evaluate_owner_interface_scc_impl<'a>(
     // substitution map would incorrectly couple a wrapper's result type to its
     // inherited context leaf.
     let mut call_context_variables = vec![BTreeMap::new(); calls.len()];
-    let requires_fixed_point = !calls.is_empty()
+    let live_component = transfer_module_resolver.is_some();
+    let component_members = scc.key.members.iter().collect::<BTreeSet<_>>();
+    let component_has_internal_edges = scc.edges.iter().any(|edge| {
+        component_members.contains(&edge.request) && component_members.contains(&edge.dependency)
+    });
+    let requires_fixed_point = live_component
+        || !calls.is_empty()
         || !pattern_narrowings.is_empty()
         || !internal_lexical_capture_providers.is_empty()
         || states
@@ -3947,15 +6579,35 @@ fn evaluate_owner_interface_scc_impl<'a>(
     }
     let mut current_surface = Vec::with_capacity(previous_surface.len());
     let maximum_rounds = if requires_fixed_point {
-        states.len().saturating_add(calls.len()).saturating_add(2)
+        states
+            .len()
+            .saturating_add(calls.len())
+            .saturating_add(if live_component { 4 } else { 2 })
     } else {
         0
     };
     let mut converged = !requires_fixed_point;
-    for _round in 0..maximum_rounds {
+    let mut external_transfer_modules = None::<Vec<Arc<OwnerInterfaceTransferModule>>>;
+    let mut resolved_transfer_owners = None::<Box<[StableCheckOwnerKey]>>;
+    let mut final_transfer_module = None::<Arc<OwnerInterfaceTransferModule>>;
+    let mut final_result = None::<Arc<OwnerInterfaceSccResult>>;
+    let mut transfer_iterations = 0_u32;
+    let mut seen_transfer_surfaces = BTreeSet::new();
+    let mut committed_transfer_results = vec![None::<Type>; calls.len()];
+    for round in 0..maximum_rounds {
         work.solve_rounds = work.solve_rounds.saturating_add(1);
         let changes_before = unifier.changes();
         let mut surface_changed = false;
+        let mut staged_provider_inputs = vec![Vec::<(TypeVar, Type)>::new(); calls.len()];
+        let mut staged_dynamic_inputs = vec![Vec::<(TypeVar, Type)>::new(); calls.len()];
+        let mut staged_dynamic_fields = vec![None::<(TypeVar, TypeVar, String)>; calls.len()];
+        let mut staged_signature_reads = Vec::<(
+            StableCheckOwnerKey,
+            OwnerSignatureDeclarationTarget,
+            TypeVar,
+            FlowMode,
+        )>::new();
+        let mut staged_owner_transfers = vec![None::<StableCheckOwnerKey>; calls.len()];
         for (call_index, call) in calls.iter().enumerate() {
             let caller = states.get(&call.caller).ok_or_else(|| {
                 OwnerConstraintSeedError::new("interface call has no caller state")
@@ -3986,6 +6638,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                                 &mut *variables,
                             ),
                             mode: FlowMode::Continuous,
+                            evaluation_scope: parameter.evaluation_scope,
                         })
                         .collect::<Vec<_>>();
                     let result = instantiate_type(
@@ -3998,11 +6651,15 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         &mut unifier,
                         &mut *variables,
                     );
-                    let context = instantiate_type(
-                        &unifier.resolve(&Type::Var(callee.context)),
-                        &mut unifier,
-                        &mut *context_variables,
-                    );
+                    let resolved_context = unifier.resolve(&Type::Var(callee.context));
+                    let context =
+                        (!matches!(resolved_context, Type::Var(_) | Type::Unknown)).then(|| {
+                            instantiate_type(
+                                &resolved_context,
+                                &mut unifier,
+                                &mut *context_variables,
+                            )
+                        });
                     let result_mode = owner_result_expression(callee)
                         .map(|expression| {
                             let raw_mode = callee
@@ -4022,7 +6679,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         crate::OwnerAbiResultSpecialization::Fixed,
                         result_flush,
                         result_mode,
-                        Some(context),
+                        context,
                         callee.effect,
                         true,
                     )
@@ -4039,6 +6696,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                                 &mut *variables,
                             ),
                             mode: parameter.flow_type.mode,
+                            evaluation_scope: parameter.evaluation_scope,
                         })
                         .collect();
                     let result = instantiate_type(&callee.result.ty, &mut unifier, &mut *variables);
@@ -4093,8 +6751,16 @@ fn evaluate_owner_interface_scc_impl<'a>(
                             &mut *variables,
                         ),
                         mode: parameter.flow_type.mode,
+                        evaluation_scope: match parameter.evaluation_scope {
+                            crate::OwnerAbiEvaluationScope::Parent => {
+                                OwnerInterfaceEvaluationScope::Parent
+                            }
+                            crate::OwnerAbiEvaluationScope::Output { parameter_ordinal } => {
+                                OwnerInterfaceEvaluationScope::Output { parameter_ordinal }
+                            }
+                        },
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
                 let call_contexts = signature
                     .contexts
                     .iter()
@@ -4156,6 +6822,31 @@ fn evaluate_owner_interface_scc_impl<'a>(
             let call_valid = signature_found
                 && signature_call.valid
                 && (has_explicit_pass || context.is_none() || caller_context.is_some());
+            // Only an expression transfer can make one occurrence narrower
+            // than its callable principal (for example an ordered WHEN whose
+            // selector is concrete at the call site). Principal and direct
+            // parameter transfers are ordinary live equations; withholding
+            // them adds an unnecessary residual cycle and can prevent a
+            // mutually recursive alias component from reaching its least
+            // fixed point.
+            let transfer_target = live_component
+                .then(|| call.target.as_ref())
+                .flatten()
+                .filter(|target| {
+                    states.get(*target).is_some_and(|state| {
+                        !recursive_owner_calls[call_index]
+                            && owner_result_requires_occurrence_transfer(state)
+                    }) || dependency_interfaces.get(*target).is_some_and(|interface| {
+                        matches!(
+                            &interface.result_transfer,
+                            OwnerResultTransfer::Expression { .. }
+                        )
+                    })
+                })
+                .cloned();
+            if call_valid {
+                staged_owner_transfers[call_index] = transfer_target.clone();
+            }
 
             let call_variable = caller.expressions[call.expression];
             let result = crate::specialize_owner_abi_result_type(
@@ -4172,6 +6863,19 @@ fn evaluate_owner_interface_scc_impl<'a>(
                     Some((parameter.name.clone(), Type::Var(input)))
                 }),
             );
+            // Frozen dependency interfaces and fixed ABI signatures are
+            // instantiated into one persistent per-occurrence alpha frame.
+            // Their result equation remains live through that frame while
+            // later rounds refine the inputs, so rebinding it would only
+            // resolve and clone the increasingly rich result graph. Internal
+            // SCC results and actual-dependent render constructors must still
+            // be refreshed as their source surface changes.
+            let refresh_result_binding = round == 0
+                || result_specialization == crate::OwnerAbiResultSpecialization::RenderConstructor
+                || call
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| states.contains_key(target));
             if call_valid
                 && !has_explicit_pass
                 && let Some(context) = &context
@@ -4180,19 +6884,29 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 unifier.unify(Type::Var(caller_context), context.clone());
             }
             if call_valid && let Some(field) = call.function.strip_prefix("Field/") {
-                if let Some(input) = signature_call
+                if let Some(input_expression) = signature_call
                     .matched_inputs
                     .iter()
                     .find(|input| {
                         input.source == crate::OwnerSignatureMatchedInputSource::PipeInput
                     })
                     .map(|input| input.expression)
-                    && let Some(input) = expression_variable(caller, input)
+                    && let Some(input) = expression_variable(caller, input_expression)
                 {
-                    let projected = bind_projection(&mut unifier, input, &[field.to_owned()]);
-                    unifier.unify(Type::Var(call_variable), Type::Var(projected));
+                    if caller
+                        .signature_dynamic_expressions
+                        .get(input_expression as usize)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        staged_dynamic_fields[call_index] =
+                            Some((call_variable, input, field.to_owned()));
+                    } else {
+                        let projected = bind_projection(&mut unifier, input, &[field.to_owned()]);
+                        unifier.unify(Type::Var(call_variable), Type::Var(projected));
+                    }
                 }
-            } else if call_valid {
+            } else if call_valid && transfer_target.is_none() && refresh_result_binding {
                 unifier.bind_var(call_variable, result);
             }
             for planned in signature_call.matched_inputs.iter().filter(|_| call_valid) {
@@ -4207,14 +6921,42 @@ fn evaluate_owner_interface_scc_impl<'a>(
                     continue;
                 };
                 if planned.from_pipe || planned.argument_kind == OwnerArgumentKind::Named {
-                    unifier.unify(Type::Var(input), parameter.ty.clone());
+                    if caller
+                        .signature_dynamic_expressions
+                        .get(planned.expression as usize)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        let staged = if matches!(
+                            parameter.evaluation_scope,
+                            OwnerInterfaceEvaluationScope::Parent
+                        ) && (!signature_call.outputs.is_empty()
+                            || !signature_call.contexts.is_empty())
+                        {
+                            &mut staged_provider_inputs[call_index]
+                        } else {
+                            &mut staged_dynamic_inputs[call_index]
+                        };
+                        staged.push((input, parameter.ty.clone()));
+                    } else {
+                        unifier.bind_call_input(input, parameter.ty.clone());
+                    }
                 }
             }
             if call_valid
                 && let (Some(pass), Some(context)) = (&signature_call.explicit_pass, &context)
                 && let Some(input) = expression_variable(caller, pass.expression)
             {
-                unifier.unify(Type::Var(input), context.clone());
+                if caller
+                    .signature_dynamic_expressions
+                    .get(pass.expression as usize)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    staged_dynamic_inputs[call_index].push((input, context.clone()));
+                } else {
+                    unifier.bind_call_input(input, context.clone());
+                }
             }
             unifier.bind_var(
                 call.flush,
@@ -4259,13 +7001,12 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         let merged = flow_mode_join(*slot, Some(parameter.mode));
                         surface_changed |= merged != *slot;
                         *slot = merged;
-                        bind_signature_declaration_reads(
-                            state,
-                            target,
+                        staged_signature_reads.push((
+                            call.caller.clone(),
+                            target.clone(),
                             variable,
                             parameter.mode,
-                            &mut unifier,
-                        );
+                        ));
                     }
                     for planned in &signature_call.contexts {
                         let Some(variable) = state
@@ -4291,13 +7032,12 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         let merged = flow_mode_join(*slot, Some(context.mode));
                         surface_changed |= merged != *slot;
                         *slot = merged;
-                        bind_signature_declaration_reads(
-                            state,
-                            &planned.target,
+                        staged_signature_reads.push((
+                            call.caller.clone(),
+                            planned.target.clone(),
                             variable,
                             context.mode,
-                            &mut unifier,
-                        );
+                        ));
                     }
                 }
                 if call_valid {
@@ -4305,7 +7045,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                     surface_changed |= merged != state.effect;
                     state.effect = merged;
                 }
-                if call_valid {
+                if call_valid && transfer_target.is_none() {
                     let mode = flow_mode_join(state.modes[call.expression], Some(result_mode));
                     surface_changed |= mode != state.modes[call.expression];
                     state.modes[call.expression] = mode;
@@ -4314,24 +7054,433 @@ fn evaluate_owner_interface_scc_impl<'a>(
             let _ = call.stable_expression;
             work.cross_owner_constraints = work.cross_owner_constraints.saturating_add(1);
         }
+        // Every local output declaration for this round is now published.
+        // Forward those provider surfaces across child-owner capture seams
+        // before any producer-dependent consumer formal can shape them. This
+        // phase is deliberately one-way; consumer requirements flow back only
+        // after all staged inputs have observed the frozen provider epoch.
+        propagate_lexical_capture_types(
+            &states,
+            &internal_lexical_capture_providers,
+            &mut lexical_capture_type_variables,
+            &mut lexical_capture_provider_types,
+            false,
+            &mut unifier,
+        )?;
+        // Contextual calls derive their OUT/context declarations from one or
+        // more parent-scope provider inputs (for example List/filter's list
+        // parameter). Settle every such producer chain before projecting any
+        // FreshOut read. Otherwise the child-first call walk lets `item.id`
+        // create an open one-field item before the enclosing filter has seen
+        // its exact list item.
+        for inputs in &mut staged_provider_inputs {
+            for (input, expected) in inputs.drain(..) {
+                unifier.bind_call_input(input, expected);
+            }
+        }
+        for (owner, target, variable, mode) in staged_signature_reads.drain(..) {
+            let state = states.get_mut(&owner).ok_or_else(|| {
+                OwnerConstraintSeedError::new(
+                    "staged interface signature read lost its caller state",
+                )
+            })?;
+            bind_signature_declaration_reads(state, &target, variable, mode, &mut unifier);
+        }
+        // FreshOut reads can themselves cross a child-owner boundary. Publish
+        // the now-shaped provider epoch before replaying consumer/body inputs.
+        propagate_lexical_capture_types(
+            &states,
+            &internal_lexical_capture_providers,
+            &mut lexical_capture_type_variables,
+            &mut lexical_capture_provider_types,
+            false,
+            &mut unifier,
+        )?;
+        refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
+        refine_owner_inherited_pattern_narrowings(&mut unifier, &inherited_pattern_narrowings);
+        unifier.refine_contextual_flow_holes();
+
+        // Apply producer-dependent inputs child-before-parent within each
+        // caller. Keep authored argument and PASS order within each call.
+        let mut caller_start = 0;
+        while caller_start < calls.len() {
+            let mut caller_end = caller_start + 1;
+            while caller_end < calls.len() && calls[caller_end].caller == calls[caller_start].caller
+            {
+                caller_end += 1;
+            }
+            for call_index in caller_start..caller_end {
+                for (input, expected) in staged_dynamic_inputs[call_index].drain(..) {
+                    unifier.bind_call_input(input, expected);
+                }
+            }
+            caller_start = caller_end;
+        }
+        // A Field/* call whose provider is FreshOut/CallContext-dependent is
+        // itself a consumer of the staged epoch. Projecting it during the
+        // child-first call walk would create a sparse open object before the
+        // enclosing contextual call has bound its list/context provider.
+        // Replay all provider inputs first, then publish each exact field
+        // result authoritatively so an already-wired outer consumer cannot
+        // turn its provisional scaffold into co-authority.
+        for staged in staged_dynamic_fields.into_iter().flatten() {
+            let (call_variable, input, field) = staged;
+            let projected = bind_projection(&mut unifier, input, &[field]);
+            unifier.publish_authoritative_provider(call_variable, Type::Var(projected));
+        }
         refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
         propagate_lexical_capture_types(
             &states,
             &internal_lexical_capture_providers,
             &mut lexical_capture_type_variables,
+            &mut lexical_capture_provider_types,
             true,
             &mut unifier,
         )?;
+        refine_owner_inherited_pattern_narrowings(&mut unifier, &inherited_pattern_narrowings);
         surface_changed |= propagate_lexical_capture_modes(&mut states)?;
-        if unifier.changes() == changes_before && !surface_changed {
-            converged = true;
-            break;
+
+        // A committed transfer result can still contain live occurrence
+        // alphas. Later input replay must be allowed to constrain those holes,
+        // but its open formal scaffold must not become the result's new outer
+        // authority. Republish the retained provider program after every
+        // replay epoch; this is a cheap live-root operation and does not
+        // re-evaluate transfer syntax.
+        for (call_index, provider) in committed_transfer_results.iter().enumerate() {
+            let Some(provider) = provider else {
+                continue;
+            };
+            let caller = states.get(&calls[call_index].caller).ok_or_else(|| {
+                OwnerConstraintSeedError::new("committed interface transfer lost its caller state")
+            })?;
+            unifier.publish_authoritative_provider(
+                caller.expressions[calls[call_index].expression],
+                provider.clone(),
+            );
         }
+
+        let raw_stable_before_transfer = unifier.changes() == changes_before && !surface_changed;
         write_solver_surface_snapshot(&unifier, &states, &mut current_surface);
-        if current_surface == previous_surface && !surface_changed {
+        let semantic_stable_before_transfer =
+            current_surface == previous_surface && !surface_changed;
+        let stable_before_transfer = raw_stable_before_transfer || semantic_stable_before_transfer;
+
+        if stable_before_transfer && !live_component {
             converged = true;
             break;
         }
+
+        if stable_before_transfer {
+            let provisional =
+                project_owner_interface_scc_result(scc, abi, &states, &mut unifier, work)?;
+            let module_dependency_owners = owner_interface_transfer_dependency_owners(&provisional);
+            let own_members = scc.key.members.iter().collect::<BTreeSet<_>>();
+            let mut requested_owners = module_dependency_owners.iter().cloned().collect::<Vec<_>>();
+            requested_owners.extend(
+                staged_owner_transfers
+                    .iter()
+                    .flatten()
+                    .filter(|owner| !own_members.contains(owner))
+                    .cloned(),
+            );
+            requested_owners.sort();
+            requested_owners.dedup();
+
+            if let Some(previous) = &resolved_transfer_owners {
+                if previous.as_ref() != requested_owners.as_slice() {
+                    return Err(OwnerConstraintSeedError::new(format!(
+                        "interface component {:?} changed its exact transfer dependency set while solving",
+                        scc.key
+                    )));
+                }
+            } else {
+                let resolver = transfer_module_resolver.as_mut().ok_or_else(|| {
+                    OwnerConstraintSeedError::new(
+                        "live interface component has no transfer-module resolver",
+                    )
+                })?;
+                let modules = resolver(&requested_owners).map_err(|error| {
+                    OwnerConstraintSeedError::new(format!(
+                        "cannot resolve interface component {:?} transfer modules: {error}",
+                        scc.key
+                    ))
+                })?;
+                let mut canonical_modules =
+                    BTreeMap::<OwnerInterfaceSccKey, Arc<OwnerInterfaceTransferModule>>::new();
+                for module in modules {
+                    if module.key() == &scc.key {
+                        return Err(OwnerConstraintSeedError::new(format!(
+                            "interface component {:?} received its own transfer module as an external dependency",
+                            scc.key
+                        )));
+                    }
+                    if !requested_owners
+                        .iter()
+                        .any(|owner| module.owns_owner(owner))
+                    {
+                        return Err(OwnerConstraintSeedError::new(format!(
+                            "interface component {:?} received unused transfer module {:?}",
+                            scc.key,
+                            module.key()
+                        )));
+                    }
+                    match canonical_modules.entry(module.key().clone()) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(module);
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry)
+                            if entry.get().fingerprint_v1() == module.fingerprint_v1() => {}
+                        std::collections::btree_map::Entry::Occupied(_) => {
+                            return Err(OwnerConstraintSeedError::new(format!(
+                                "interface component {:?} received conflicting versions of one transfer module",
+                                scc.key
+                            )));
+                        }
+                    }
+                }
+                let modules = canonical_modules.into_values().collect::<Vec<_>>();
+                for owner in &requested_owners {
+                    let matches = modules
+                        .iter()
+                        .filter(|module| module.owns_owner(owner))
+                        .count();
+                    if matches != 1 {
+                        return Err(OwnerConstraintSeedError::new(format!(
+                            "interface component {:?} resolved transfer owner {owner:?} through {matches} modules",
+                            scc.key
+                        )));
+                    }
+                }
+                resolved_transfer_owners = Some(requested_owners.clone().into_boxed_slice());
+                external_transfer_modules = Some(modules);
+            }
+
+            let external_modules = external_transfer_modules
+                .as_ref()
+                .expect("live interface transfer dependencies were initialized");
+            let mut module_dependencies =
+                BTreeMap::<OwnerInterfaceSccKey, Arc<OwnerInterfaceTransferModule>>::new();
+            for owner in &module_dependency_owners {
+                let module = external_modules
+                    .iter()
+                    .find(|module| module.owns_owner(owner))
+                    .ok_or_else(|| {
+                        OwnerConstraintSeedError::new(format!(
+                            "interface component {:?} cannot route transfer dependency {owner:?}",
+                            scc.key
+                        ))
+                    })?;
+                module_dependencies.insert(module.key().clone(), Arc::clone(module));
+            }
+            let own_module = Arc::new(
+                project_owner_interface_transfer_module(
+                    scc,
+                    Arc::clone(&provisional),
+                    module_dependencies.into_values(),
+                )
+                .map_err(|error| {
+                    OwnerConstraintSeedError::new(format!(
+                        "cannot compile interface component {:?} transfer residual: {error}",
+                        scc.key
+                    ))
+                })?,
+            );
+
+            let mut residual_key = Vec::new();
+            residual_key.extend_from_slice(&provisional.fingerprint_v1());
+            residual_key.extend_from_slice(&own_module.fingerprint_v1());
+            let mut residual_active = BTreeSet::new();
+            for (call_index, target) in staged_owner_transfers.iter().enumerate() {
+                if target.is_none() {
+                    continue;
+                }
+                let call = &calls[call_index];
+                let caller = states.get(&call.caller).ok_or_else(|| {
+                    OwnerConstraintSeedError::new(
+                        "interface transfer residual lost its caller state",
+                    )
+                })?;
+                unifier.append_resolved_type_snapshot(
+                    &Type::Var(caller.expressions[call.expression]),
+                    &mut residual_key,
+                    &mut residual_active,
+                );
+                let signature_call = caller
+                    .signature_lexical_plan
+                    .call(call.expression)
+                    .ok_or_else(|| {
+                        OwnerConstraintSeedError::new(
+                            "interface transfer residual lost its signature plan",
+                        )
+                    })?;
+                for input in &signature_call.matched_inputs {
+                    if let Some(variable) = expression_variable(caller, input.expression) {
+                        unifier.append_resolved_type_snapshot(
+                            &Type::Var(variable),
+                            &mut residual_key,
+                            &mut residual_active,
+                        );
+                    }
+                }
+            }
+            let repeated_residual = !seen_transfer_surfaces.insert(residual_key);
+            let pre_transfer_surface = current_surface.clone();
+            let mut transfer_surface_changed = false;
+            let mut evaluated_any = false;
+            for (call_index, target) in staged_owner_transfers.iter().enumerate() {
+                let Some(target) = target.as_ref() else {
+                    continue;
+                };
+                let module = if own_module.owns_owner(target) {
+                    own_module.as_ref()
+                } else {
+                    external_modules
+                        .iter()
+                        .find(|module| module.owns_owner(target))
+                        .map(Arc::as_ref)
+                        .ok_or_else(|| {
+                            OwnerConstraintSeedError::new(format!(
+                                "interface transfer environment cannot route target {target:?}"
+                            ))
+                        })?
+                };
+                let call = &calls[call_index];
+                let caller = states.get(&call.caller).ok_or_else(|| {
+                    OwnerConstraintSeedError::new("interface transfer call has no caller state")
+                })?;
+                let signature_call = caller
+                    .signature_lexical_plan
+                    .call(call.expression)
+                    .ok_or_else(|| {
+                        OwnerConstraintSeedError::new(
+                            "interface transfer call disappeared from its signature plan",
+                        )
+                    })?;
+                let mut arguments = OwnerResultTransferArguments::default();
+                for input in &signature_call.matched_inputs {
+                    if let Some(value) =
+                        interface_transfer_expression_value(caller, input.expression, &mut unifier)
+                    {
+                        arguments.insert(input.formal_ordinal, value);
+                    }
+                }
+                let explicit_context = signature_call.explicit_pass.as_ref().and_then(|pass| {
+                    interface_transfer_expression_value(caller, pass.expression, &mut unifier)
+                });
+                let inherited_context = if explicit_context.is_none() {
+                    effective_context_variable(caller)?.map(|variable| EvaluatedResultValue {
+                        flow_type: FlowType {
+                            mode: FlowMode::Continuous,
+                            ty: unifier.resolve(&Type::Var(variable)),
+                        },
+                        parameter_derived: false,
+                        syntax_selected: false,
+                        static_number: None,
+                    })
+                } else {
+                    None
+                };
+                let evaluated = evaluate_owner_result_transfer_occurrence(
+                    module,
+                    target,
+                    &arguments,
+                    explicit_context.as_ref().or(inherited_context.as_ref()),
+                    &mut unifier,
+                )
+                .ok_or_else(|| {
+                    OwnerConstraintSeedError::new(format!(
+                        "interface transfer module {:?} cannot evaluate target {target:?}",
+                        module.key()
+                    ))
+                })?;
+                evaluated_any = true;
+                let call_variable = caller.expressions[call.expression];
+                let provider = evaluated.flow_type.ty;
+                unifier.publish_authoritative_provider(call_variable, provider.clone());
+                committed_transfer_results[call_index] = Some(provider);
+                let state = states.get_mut(&call.caller).ok_or_else(|| {
+                    OwnerConstraintSeedError::new(
+                        "interface transfer call lost its mutable caller state",
+                    )
+                })?;
+                let mode =
+                    flow_mode_join(state.modes[call.expression], Some(evaluated.flow_type.mode));
+                transfer_surface_changed |= mode != state.modes[call.expression];
+                state.modes[call.expression] = mode;
+            }
+            if evaluated_any {
+                transfer_iterations = transfer_iterations.saturating_add(1);
+            }
+            final_transfer_module = Some(Arc::clone(&own_module));
+            write_solver_surface_snapshot(&unifier, &states, &mut current_surface);
+            transfer_surface_changed |= current_surface != pre_transfer_surface;
+            if !transfer_surface_changed {
+                final_result = Some(provisional);
+                converged = true;
+                break;
+            }
+            if !component_has_internal_edges {
+                // With frozen dependency interfaces and no edge back into the
+                // component, a quiescent occurrence-transfer sweep cannot
+                // alter any of its own inputs. Nested calls are evaluated by
+                // the sealed transfer module itself, and true recursive call
+                // edges were conservatively left on their principal above.
+                // Re-entering the complete interface solver merely resolves
+                // and hashes the same potentially enormous result tree two or
+                // three more times. Project the changed public surface once
+                // and seal its final module directly.
+                let projected =
+                    project_owner_interface_scc_result(scc, abi, &states, &mut unifier, work)?;
+                let final_dependency_owners =
+                    owner_interface_transfer_dependency_owners(&projected);
+                if final_dependency_owners != module_dependency_owners {
+                    return Err(OwnerConstraintSeedError::new(format!(
+                        "interface component {:?} changed its transfer dependency set after an acyclic residual sweep",
+                        scc.key
+                    )));
+                }
+                let mut final_dependencies =
+                    BTreeMap::<OwnerInterfaceSccKey, Arc<OwnerInterfaceTransferModule>>::new();
+                for owner in &final_dependency_owners {
+                    let module = external_modules
+                        .iter()
+                        .find(|module| module.owns_owner(owner))
+                        .ok_or_else(|| {
+                            OwnerConstraintSeedError::new(format!(
+                                "interface component {:?} cannot route final transfer dependency {owner:?}",
+                                scc.key
+                            ))
+                        })?;
+                    final_dependencies.insert(module.key().clone(), Arc::clone(module));
+                }
+                final_transfer_module = Some(Arc::new(
+                    project_owner_interface_transfer_module(
+                        scc,
+                        Arc::clone(&projected),
+                        final_dependencies.into_values(),
+                    )
+                    .map_err(|error| {
+                        OwnerConstraintSeedError::new(format!(
+                            "cannot compile final acyclic interface component {:?} transfer residual: {error}",
+                            scc.key
+                        ))
+                    })?,
+                ));
+                final_result = Some(projected);
+                converged = true;
+                break;
+            }
+            if repeated_residual {
+                return Err(OwnerConstraintSeedError::new(format!(
+                    "owner interface SCC {:?} oscillated while evaluating transfer residuals",
+                    scc.key
+                )));
+            }
+        }
+
+        // Publish the post-round (and, when applicable, post-transfer) surface
+        // as the next convergence baseline without reconstructing the SCC.
+        write_solver_surface_snapshot(&unifier, &states, &mut current_surface);
         std::mem::swap(&mut previous_surface, &mut current_surface);
     }
     if !converged {
@@ -4341,227 +7490,18 @@ fn evaluate_owner_interface_scc_impl<'a>(
         )));
     }
 
-    let mut interfaces = Vec::with_capacity(states.len());
-    let mut alpha_variables = BTreeMap::new();
-    let mut next_alpha = 0;
-    for owner in &scc.key.members {
-        let state = &states[owner];
-        let parameters = state
-            .parameters
-            .iter()
-            .map(|parameter| {
-                let ty = unifier.resolve(&Type::Var(parameter.variable));
-                OwnerInterfaceParameter {
-                    name: parameter.name.clone(),
-                    kind: parameter.kind,
-                    ordinal: parameter.ordinal,
-                    flow_type: FlowType {
-                        mode: FlowMode::Continuous,
-                        ty: alpha_normalize_type(&ty, &mut alpha_variables, &mut next_alpha),
-                    },
-                    requirement: CheckedParameterRequirement::Required,
-                    evaluation_scope: parameter.evaluation_scope,
-                }
-            })
-            .collect::<Vec<_>>();
-        let result_expression = owner_result_expression(state);
-        let raw_result_mode = result_expression
-            .and_then(|expression| {
-                ((expression as usize) < state.expressions.len())
-                    .then(|| state.modes[expression as usize])
-                    .flatten()
-            })
-            .unwrap_or(FlowMode::Continuous);
-        let resolved_result = result_expression.map_or(
-            FlowType {
-                mode: FlowMode::Continuous,
-                ty: Type::Absent,
-            },
-            |expression| {
-                resolved_expression_boundary(state, expression, &mut unifier, raw_result_mode)
-            },
-        );
-        let resolved_result_flush_type = result_expression
-            .and_then(|expression| resolved_expression_flush_type(state, expression, &mut unifier));
-        let result = FlowType {
-            mode: resolved_result.mode,
-            ty: alpha_normalize_type(&resolved_result.ty, &mut alpha_variables, &mut next_alpha),
-        };
-        let result_flush_type = resolved_result_flush_type
-            .map(|ty| alpha_normalize_type(&ty, &mut alpha_variables, &mut next_alpha));
-        let context_ty = unifier.resolve(&Type::Var(state.context));
-        let context = (state.declaration_kind == Some(OwnerDeclarationKind::Function)
-            && !matches!(context_ty, Type::Var(_) | Type::Unknown))
-        .then(|| {
-            let flow_type = FlowType {
-                mode: FlowMode::Continuous,
-                ty: alpha_normalize_type(&context_ty, &mut alpha_variables, &mut next_alpha),
-            };
-            OwnerContextInterface {
-                projections: crate::context_scheme_projections(&flow_type.ty)
-                    .into_iter()
-                    .map(Vec::into_boxed_slice)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-                flow_type,
-            }
-        });
-        let result_transfer = build_owner_result_transfer(
-            state,
-            abi,
-            &mut unifier,
-            &mut alpha_variables,
-            &mut next_alpha,
-        )?;
-        let captures = state
-            .seed
-            .external_expressions
-            .iter()
-            .filter(|external| external.is_exact_enclosing_capture_for(&state.seed.owner))
-            .map(|external| {
-                let provider = &states[&external.owner];
-                let expression = *provider
-                    .expression_by_key
-                    .get(&external.expression)
-                    .expect("validated enclosing capture has a provider expression");
-                let mode = provider.modes[expression].unwrap_or(FlowMode::Continuous);
-                let flow_type =
-                    resolved_expression_boundary(provider, expression as u32, &mut unifier, mode);
-                let flush_type =
-                    resolved_expression_flush_type(provider, expression as u32, &mut unifier);
-                OwnerInterfaceCapture {
-                    owner: external.owner.clone(),
-                    expression: external.expression.clone(),
-                    flow_type: FlowType {
-                        mode: flow_type.mode,
-                        ty: alpha_normalize_type(
-                            &flow_type.ty,
-                            &mut alpha_variables,
-                            &mut next_alpha,
-                        ),
-                    },
-                    flush_type: flush_type
-                        .map(|ty| alpha_normalize_type(&ty, &mut alpha_variables, &mut next_alpha)),
-                }
-            })
-            .collect::<Vec<_>>();
-        let lexical_captures = state
-            .lexical_capture_variables
-            .iter()
-            .map(|(target, variable)| {
-                let mode = state
-                    .lexical_capture_modes
-                    .get(target)
-                    .copied()
-                    .flatten()
-                    .ok_or_else(|| {
-                        OwnerConstraintSeedError::new(format!(
-                            "owner interface {owner:?} did not resolve lexical capture mode for {target:?}"
-                        ))
-                    })?;
-                Ok(OwnerInterfaceLexicalCapture {
-                    target: target.clone(),
-                    flow_type: FlowType {
-                        mode,
-                        ty: alpha_normalize_type(
-                            &unifier.resolve(&Type::Var(*variable)),
-                            &mut alpha_variables,
-                            &mut next_alpha,
-                        ),
-                    },
-                })
-            })
-            .collect::<Result<Vec<_>, OwnerConstraintSeedError>>()?;
-        let mut type_variables = BTreeSet::new();
-        for parameter in &parameters {
-            collect_type_variables(&parameter.flow_type.ty, &mut type_variables);
-        }
-        collect_type_variables(&result.ty, &mut type_variables);
-        if let Some(flush_type) = &result_flush_type {
-            collect_type_variables(flush_type, &mut type_variables);
-        }
-        if let Some(context) = &context {
-            collect_type_variables(&context.flow_type.ty, &mut type_variables);
-        }
-        for capture in &captures {
-            collect_type_variables(&capture.flow_type.ty, &mut type_variables);
-            if let Some(flush_type) = &capture.flush_type {
-                collect_type_variables(flush_type, &mut type_variables);
-            }
-        }
-        for capture in &lexical_captures {
-            collect_type_variables(&capture.flow_type.ty, &mut type_variables);
-        }
-        if let OwnerResultTransfer::Expression { nodes, .. } = &result_transfer {
-            for node in nodes {
-                collect_type_variables(&node.flow_type.ty, &mut type_variables);
-            }
-        }
-        let mut interface = OwnerPublicInterface {
-            owner: owner.clone(),
-            declaration_kind: state.declaration_kind,
-            names: state.names.clone(),
-            parameters: parameters.into_boxed_slice(),
-            result,
-            result_flush_type,
-            result_transfer,
-            captures: captures.into_boxed_slice(),
-            lexical_captures: lexical_captures.into_boxed_slice(),
-            context,
-            effect: state.effect,
-            type_variables: type_variables
-                .into_iter()
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            fingerprint_v1: [0; 32],
-        };
-        interface.fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V3,
-            &interface,
-        )
-        .map_err(|error| {
-            OwnerConstraintSeedError::new(format!(
-                "cannot fingerprint owner body interface import: {error}"
-            ))
-        })?;
-        interfaces.push(interface);
-    }
-    work.unification_steps = unifier.steps;
-    // Every public interface already owns an exact canonical semantic
-    // fingerprint. Aggregate those seals instead of serializing every full
-    // interface a second time at the SCC boundary.
-    let interface_fingerprints = interfaces
-        .iter()
-        .map(OwnerPublicInterface::fingerprint_v1)
-        .collect::<Vec<_>>();
-    let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_INTERFACE_SCC_RESULT_DOMAIN_V5,
-        &(&scc.key, &interface_fingerprints, next_alpha),
-    )
-    .map_err(|error| {
-        OwnerConstraintSeedError::new(format!(
-            "cannot fingerprint owner interface SCC result: {error}"
-        ))
-    })?;
-    let key_fingerprint_v1 =
-        boon_contract::canonical_serde_hash_v1(OWNER_INTERFACE_SCC_KEY_DOMAIN_V1, &scc.key)
-            .map_err(|error| {
-                OwnerConstraintSeedError::new(format!(
-                    "cannot fingerprint owner interface SCC key: {error}"
-                ))
-            })?;
-    let result = Arc::new(OwnerInterfaceSccResult {
-        key: scc.key.clone(),
-        owners: interfaces.into_boxed_slice(),
-        type_variable_count: next_alpha,
-        work,
-        key_fingerprint_v1,
-        fingerprint_v1,
-    });
+    let result = match final_result {
+        Some(result) => result,
+        None => project_owner_interface_scc_result(scc, abi, &states, &mut unifier, work)?,
+    };
     let currentness = OwnerInterfaceSccCurrentnessReceipt::from_current_evaluation(basis, &result)?;
-    Ok(OwnerInterfaceSccEvaluation {
-        currentness,
-        result,
+    Ok(OwnerInterfaceSccSolveOutput {
+        evaluation: OwnerInterfaceSccEvaluation {
+            currentness,
+            result,
+        },
+        module: final_transfer_module,
+        transfer_iterations,
     })
 }
 
@@ -4620,6 +7560,53 @@ mod tests {
                 )
             })
             .unwrap()
+    }
+
+    fn full_internal_capture(
+        consumer: StableCheckOwnerKey,
+        target: OwnerLexicalTargetRef,
+        capture: TypeVar,
+        provider: TypeVar,
+    ) -> InternalLexicalCaptureProvider {
+        InternalLexicalCaptureProvider {
+            consumer,
+            target,
+            capture,
+            provider,
+            demand: LexicalCaptureDemand {
+                full: true,
+                children: BTreeMap::new(),
+            },
+        }
+    }
+
+    fn capture_demand(paths: &[&[&str]]) -> LexicalCaptureDemand {
+        let paths = paths
+            .iter()
+            .map(|path| {
+                path.iter()
+                    .map(|field| (*field).to_owned())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            })
+            .collect::<Vec<_>>();
+        LexicalCaptureDemand::from_paths(&paths).unwrap()
+    }
+
+    fn projected_internal_capture(
+        consumer: StableCheckOwnerKey,
+        target: OwnerLexicalTargetRef,
+        capture: TypeVar,
+        provider: TypeVar,
+        paths: &[&[&str]],
+    ) -> InternalLexicalCaptureProvider {
+        InternalLexicalCaptureProvider {
+            consumer,
+            target,
+            capture,
+            provider,
+            demand: capture_demand(paths),
+        }
     }
 
     fn seed(unit: &UnitSyntaxSnapshot, owner: &StableCheckOwnerKey) -> OwnerConstraintSeed {
@@ -5043,26 +8030,199 @@ mod tests {
     }
 
     #[test]
-    fn union_equality_constrains_unresolved_flow_branches() {
+    fn one_source_flow_alias_preserves_a_semantic_union() {
         let mut unifier = TypeUnifier::default();
-        let unresolved = unifier.fresh();
-        let boolean = Type::VariantSet(boon_checked::SharedVariantSet::new(vec![
-            Variant::Tag("False".to_owned()),
-            Variant::Tag("True".to_owned()),
-        ]));
-        let joined = boon_checked::canonical_union_type(vec![
-            Type::Var(unresolved),
-            Type::VariantSet(boon_checked::SharedVariantSet::new(vec![Variant::Tag(
-                "False".to_owned(),
-            )])),
-            Type::VariantSet(boon_checked::SharedVariantSet::new(vec![Variant::Tag(
-                "True".to_owned(),
-            )])),
-        ]);
+        let source = unifier.fresh();
+        let alias = unifier.fresh();
+        let union = boon_checked::canonical_union_type(vec![Type::Number, Type::Text]);
+        unifier.bind_var(source, union.clone());
 
-        unifier.unify(joined, boolean.clone());
+        bind_flow_variables(&mut unifier, alias, [source]);
 
-        assert_eq!(unifier.resolve(&Type::Var(unresolved)), boolean);
+        assert_eq!(unifier.resolve(&Type::Var(alias)), union);
+    }
+
+    #[test]
+    fn late_exact_binding_discards_flow_aliases_coalesced_into_their_own_root() {
+        let mut unifier = TypeUnifier::default();
+        let value = unifier.fresh();
+        let flush = unifier.fresh();
+        let boundary = unifier.fresh();
+        let alias = unifier.fresh();
+
+        unifier.bind_flow_result(
+            boundary,
+            boon_checked::canonical_union_type(vec![Type::Var(value), Type::Var(flush)]),
+        );
+        unifier.bind_flow_result(value, Type::Var(alias));
+        unifier.bind_flow_result(flush, Type::Var(alias));
+        unifier.unify(Type::Var(boundary), Type::Var(alias));
+        unifier.bind_var(boundary, Type::Number);
+
+        assert_eq!(unifier.resolve(&Type::Var(boundary)), Type::Number);
+    }
+
+    #[test]
+    fn authored_empty_collection_holes_inherit_only_compatible_concrete_siblings() {
+        let mut unifier = TypeUnifier::default();
+        let empty_item = unifier.fresh_contextual_hole();
+        let joined = unifier.fresh();
+        unifier.bind_flow_result(
+            joined,
+            boon_checked::canonical_union_type(vec![
+                Type::List(Type::shared(Type::Var(empty_item))),
+                Type::List(Type::shared(Type::Number)),
+            ]),
+        );
+
+        unifier.refine_contextual_flow_holes();
+
+        assert_eq!(unifier.resolve(&Type::Var(empty_item)), Type::Number);
+        assert_eq!(
+            unifier.resolve(&Type::Var(joined)),
+            Type::List(Type::shared(Type::Number)),
+        );
+
+        let mismatched_item = unifier.fresh_contextual_hole();
+        unifier.unify(
+            boon_checked::canonical_union_type(vec![
+                Type::List(Type::shared(Type::Var(mismatched_item))),
+                Type::Number,
+            ]),
+            Type::Number,
+        );
+        assert!(matches!(
+            unifier.resolve(&Type::Var(mismatched_item)),
+            Type::Var(_)
+        ));
+
+        let ambiguous_item = unifier.fresh_contextual_hole();
+        let ambiguous_join = unifier.fresh();
+        unifier.bind_flow_result(
+            ambiguous_join,
+            boon_checked::canonical_union_type(vec![
+                Type::List(Type::shared(Type::Var(ambiguous_item))),
+                Type::List(Type::shared(Type::object(
+                    ObjectShape::from_ordered_fields([("x".to_owned(), Type::Number)], false),
+                ))),
+                Type::List(Type::shared(Type::object(
+                    ObjectShape::from_ordered_fields([("y".to_owned(), Type::Number)], false),
+                ))),
+            ]),
+        );
+        unifier.refine_contextual_flow_holes();
+        assert!(matches!(
+            unifier.resolve(&Type::Var(ambiguous_item)),
+            Type::Var(_)
+        ));
+
+        let outer = unifier.fresh();
+        let inner = unifier.fresh();
+        let outer_empty = unifier.fresh_contextual_hole();
+        let inner_empty = unifier.fresh_contextual_hole();
+        unifier.bind_flow_result(
+            outer,
+            boon_checked::canonical_union_type(vec![
+                Type::Var(inner),
+                Type::List(Type::shared(Type::Var(outer_empty))),
+            ]),
+        );
+        unifier.bind_flow_result(
+            inner,
+            boon_checked::canonical_union_type(vec![
+                Type::List(Type::shared(Type::Var(inner_empty))),
+                Type::List(Type::shared(Type::Text)),
+            ]),
+        );
+        unifier.refine_contextual_flow_holes();
+        assert_eq!(unifier.resolve(&Type::Var(inner_empty)), Type::Text);
+        assert_eq!(unifier.resolve(&Type::Var(outer_empty)), Type::Text);
+        assert_eq!(
+            unifier.resolve(&Type::Var(outer)),
+            Type::List(Type::shared(Type::Text)),
+        );
+    }
+
+    #[test]
+    fn ordinary_union_producers_never_receive_contextual_backflow() {
+        let mut unifier = TypeUnifier::default();
+        let parameter = unifier.fresh();
+        let requirement = Type::object(ObjectShape::from_ordered_fields(
+            [("generated".to_owned(), Type::Number)],
+            false,
+        ));
+        let joined =
+            boon_checked::canonical_union_type(vec![Type::Var(parameter), requirement.clone()]);
+
+        unifier.unify(joined, requirement);
+
+        assert!(matches!(
+            unifier.resolve(&Type::Var(parameter)),
+            Type::Var(_)
+        ));
+    }
+
+    #[test]
+    fn flow_join_binding_is_resolved_before_a_later_structural_equation() {
+        fn row_type() -> Type {
+            Type::object(ObjectShape {
+                fields: [("time".to_owned(), Type::Number)].into(),
+                field_order: vec!["time".to_owned()],
+                open: false,
+            })
+        }
+
+        let mut unifier = TypeUnifier::default();
+        let empty_item = unifier.fresh();
+        let projected_branch = unifier.fresh();
+        let joined = unifier.fresh();
+        unifier.bind_flow_result(
+            joined,
+            boon_checked::canonical_union_type(vec![
+                Type::List(Type::shared(Type::Var(empty_item))),
+                Type::Var(projected_branch),
+            ]),
+        );
+        unifier.bind_var(projected_branch, Type::List(Type::shared(row_type())));
+        unifier.bind_var(empty_item, row_type());
+        assert_eq!(
+            unifier.resolve(&Type::Var(joined)),
+            Type::List(Type::shared(row_type())),
+        );
+
+        let expected_item = unifier.fresh();
+        unifier.bind_var(joined, Type::List(Type::shared(Type::Var(expected_item))));
+
+        assert_eq!(
+            unifier.resolve(&Type::Var(joined)),
+            Type::List(Type::shared(row_type())),
+        );
+        assert_eq!(unifier.resolve(&Type::Var(expected_item)), row_type());
+    }
+
+    #[test]
+    fn repeated_identical_live_equation_does_not_materialize_its_resolved_tree() {
+        let mut unifier = TypeUnifier::default();
+        let item = unifier.fresh();
+        let equivalent_item = unifier.fresh();
+        let result = unifier.fresh();
+        let template = Type::List(Type::shared(Type::Var(item)));
+        unifier.bind_var(result, template.clone());
+        unifier.unify(Type::Var(item), Type::Var(equivalent_item));
+        unifier.bind_var(item, Type::Number);
+        let changes_before = unifier.changes();
+
+        unifier.unify(
+            Type::Var(result),
+            Type::List(Type::shared(Type::Var(equivalent_item))),
+        );
+        unifier.unify(Type::Var(result), Type::List(Type::shared(Type::Number)));
+
+        assert_eq!(unifier.changes(), changes_before);
+        assert_eq!(
+            unifier.resolve(&Type::Var(result)),
+            Type::List(Type::shared(Type::Number)),
+        );
     }
 
     #[test]
@@ -5092,8 +8252,8 @@ mod tests {
             unifier.bind_var(first, required_field("number", Type::Number));
             unifier.bind_var(second, required_field("text", Type::Text));
             let mut providers = vec![
-                (first_owner, target.clone(), first, provider),
-                (second_owner, target, second, provider),
+                full_internal_capture(first_owner, target.clone(), first, provider),
+                full_internal_capture(second_owner, target, second, provider),
             ];
             if reverse {
                 providers.reverse();
@@ -5102,6 +8262,7 @@ mod tests {
             propagate_lexical_capture_types(
                 &states,
                 &providers,
+                &mut BTreeMap::new(),
                 &mut BTreeMap::new(),
                 true,
                 &mut unifier,
@@ -5119,6 +8280,964 @@ mod tests {
         assert_eq!(forward.fields, reverse.fields);
         assert_eq!(forward.fields.get("number"), Some(&Type::Number));
         assert_eq!(forward.fields.get("text"), Some(&Type::Text));
+    }
+
+    #[test]
+    fn full_capture_backflow_adds_a_child_field_to_an_open_provider_object() {
+        let unit = link("provider: 0\nconsumer: 0\n");
+        let provider_owner = owner_named(&unit, "provider");
+        let consumer_owner = owner_named(&unit, "consumer");
+        let target = OwnerLexicalTargetRef::ContextFormal {
+            owner: provider_owner,
+        };
+        let mut unifier = TypeUnifier::default();
+        let direct = unifier.fresh();
+        let provider = unifier.fresh();
+        unifier.bind_var(
+            provider,
+            Type::object(ObjectShape::from_ordered_fields(
+                [(
+                    "store".to_owned(),
+                    Type::object(ObjectShape::from_ordered_fields(
+                        [(
+                            "elements".to_owned(),
+                            Type::object(ObjectShape::from_ordered_fields(
+                                [("collapse".to_owned(), Type::Var(direct))],
+                                true,
+                            )),
+                        )],
+                        true,
+                    )),
+                )],
+                true,
+            )),
+        );
+        let capture = unifier.fresh();
+        unifier.bind_var(
+            capture,
+            Type::object(ObjectShape::from_ordered_fields(
+                [(
+                    "store".to_owned(),
+                    Type::object(ObjectShape::from_ordered_fields(
+                        [
+                            (
+                                "elements".to_owned(),
+                                Type::object(ObjectShape::from_ordered_fields(
+                                    [("collapse".to_owned(), Type::Number)],
+                                    true,
+                                )),
+                            ),
+                            ("active_scope".to_owned(), Type::Text),
+                        ],
+                        true,
+                    )),
+                )],
+                true,
+            )),
+        );
+        let providers = [full_internal_capture(
+            consumer_owner,
+            target,
+            capture,
+            provider,
+        )];
+        let states = BTreeMap::<StableCheckOwnerKey, OwnerSolveState<'_>>::new();
+        let mut frames = BTreeMap::new();
+        let mut surfaces = BTreeMap::new();
+
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            true,
+            &mut unifier,
+        )
+        .unwrap();
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            true,
+            &mut unifier,
+        )
+        .unwrap();
+
+        let Type::Object(provider) = unifier.resolve(&Type::Var(provider)) else {
+            panic!("whole context provider must remain an object");
+        };
+        let Type::Object(store) = &provider.fields["store"] else {
+            panic!("whole context provider must retain its store object");
+        };
+        assert_eq!(store.fields.get("active_scope"), Some(&Type::Text));
+        assert_eq!(unifier.resolve(&Type::Var(direct)), Type::Number);
+
+        let Type::Object(capture) = unifier.resolve(&Type::Var(capture)) else {
+            panic!("whole context capture must remain an object");
+        };
+        let Type::Object(store) = &capture.fields["store"] else {
+            panic!("whole context capture must retain its store object");
+        };
+        assert_eq!(store.fields.get("active_scope"), Some(&Type::Text));
+    }
+
+    #[test]
+    fn lexical_capture_surface_prunes_unread_object_siblings_and_shares_selected_alphas() {
+        let mut unifier = TypeUnifier::default();
+        let shared = unifier.fresh();
+        let omitted = unifier.fresh();
+        let provider = unifier.fresh();
+        unifier.bind_var(
+            provider,
+            Type::object(ObjectShape {
+                fields: [
+                    (
+                        "session".to_owned(),
+                        Type::object(ObjectShape {
+                            fields: [
+                                ("left".to_owned(), Type::Var(shared)),
+                                ("right".to_owned(), Type::Var(shared)),
+                            ]
+                            .into(),
+                            field_order: vec!["left".to_owned(), "right".to_owned()],
+                            open: false,
+                        }),
+                    ),
+                    ("unrelated".to_owned(), Type::Var(omitted)),
+                ]
+                .into(),
+                field_order: vec!["session".to_owned(), "unrelated".to_owned()],
+                open: false,
+            }),
+        );
+
+        let surface = unifier.resolve_lexical_capture_surface(
+            provider,
+            &capture_demand(&[&["session", "left"], &["session", "right"]]),
+            &mut Vec::new(),
+        );
+        let Type::Object(root) = &surface else {
+            panic!("projected capture root must remain an object");
+        };
+        assert!(!root.open);
+        assert!(!root.fields.contains_key("unrelated"));
+        let Type::Object(session) = &root.fields["session"] else {
+            panic!("selected object prefix must remain structural");
+        };
+        assert_eq!(session.field_order, ["left", "right"]);
+        assert_eq!(session.fields["left"], session.fields["right"]);
+
+        let mut frame = BTreeMap::new();
+        let instantiated = instantiate_type(&surface, &mut unifier, &mut frame);
+        assert_eq!(
+            frame.len(),
+            1,
+            "omitted provider alpha entered capture frame"
+        );
+        let Type::Object(root) = instantiated else {
+            panic!("instantiated capture root must remain an object");
+        };
+        let Type::Object(session) = &root.fields["session"] else {
+            panic!("instantiated selected prefix must remain an object");
+        };
+        assert_eq!(session.fields["left"], session.fields["right"]);
+    }
+
+    #[test]
+    fn lexical_capture_surface_keeps_union_terminals_correlated() {
+        let choice = Type::Union(vec![
+            Type::object(ObjectShape::from_ordered_fields(
+                [("x".to_owned(), Type::Number), ("y".to_owned(), Type::Text)],
+                false,
+            )),
+            Type::object(ObjectShape::from_ordered_fields(
+                [("x".to_owned(), Type::Text), ("y".to_owned(), Type::Number)],
+                false,
+            )),
+        ]);
+        let provider = Type::object(ObjectShape::from_ordered_fields(
+            [
+                ("choice".to_owned(), choice.clone()),
+                ("unrelated".to_owned(), Type::Bytes(BytesType::Fixed(8))),
+            ],
+            false,
+        ));
+
+        let surface = capture_demand(&[&["choice", "x"]]).project_resolved(&provider);
+        let Type::Object(surface) = surface else {
+            panic!("capture surface must retain its object root");
+        };
+        assert!(!surface.open);
+        assert_eq!(surface.fields.len(), 1);
+        assert_eq!(surface.fields.get("choice"), Some(&choice));
+    }
+
+    #[test]
+    fn projected_capture_alpha_keeps_its_relative_demand_after_late_shape_binding() {
+        let unit = link("provider: 0\nconsumer: 0\n");
+        let provider_owner = owner_named(&unit, "provider");
+        let consumer_owner = owner_named(&unit, "consumer");
+        let target = OwnerLexicalTargetRef::Declaration {
+            owner: provider_owner,
+            declaration: OwnerDeclarationStableKey::Public,
+            capability: OwnerLexicalDeclarationCapability::Value,
+        };
+        let mut unifier = TypeUnifier::default();
+        let provider = unifier.fresh();
+        let omitted = unifier.fresh();
+        let capture = unifier.fresh();
+        let providers = [projected_internal_capture(
+            consumer_owner,
+            target,
+            capture,
+            provider,
+            &[&["selected"]],
+        )];
+        let states = BTreeMap::<StableCheckOwnerKey, OwnerSolveState<'_>>::new();
+        let mut frames = BTreeMap::new();
+        let mut surfaces = BTreeMap::new();
+
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            false,
+            &mut unifier,
+        )
+        .unwrap();
+        unifier.bind_var(
+            provider,
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("selected".to_owned(), Type::Number),
+                    ("omitted".to_owned(), Type::Var(omitted)),
+                ],
+                false,
+            )),
+        );
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            true,
+            &mut unifier,
+        )
+        .unwrap();
+
+        let Type::Object(surface) = unifier.resolve(&Type::Var(capture)) else {
+            panic!("late-bound projected capture must become an object");
+        };
+        assert!(!surface.open);
+        assert_eq!(surface.fields.get("selected"), Some(&Type::Number));
+        assert!(!surface.fields.contains_key("omitted"));
+        assert!(matches!(unifier.resolve(&Type::Var(omitted)), Type::Var(_)));
+
+        let changes = unifier.changes();
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            true,
+            &mut unifier,
+        )
+        .unwrap();
+        assert_eq!(unifier.changes(), changes);
+    }
+
+    #[test]
+    fn late_authoritative_capture_replaces_an_earlier_consumer_scaffold() {
+        let unit = link("provider: 0\nconsumer: 0\n");
+        let provider_owner = owner_named(&unit, "provider");
+        let consumer_owner = owner_named(&unit, "consumer");
+        let target = OwnerLexicalTargetRef::Declaration {
+            owner: provider_owner,
+            declaration: OwnerDeclarationStableKey::Public,
+            capability: OwnerLexicalDeclarationCapability::Value,
+        };
+        let mut unifier = TypeUnifier::default();
+        let provider = unifier.fresh();
+        let capture = unifier.fresh();
+        let providers = [full_internal_capture(
+            consumer_owner,
+            target,
+            capture,
+            provider,
+        )];
+        let states = BTreeMap::<StableCheckOwnerKey, OwnerSolveState<'_>>::new();
+        let mut frames = BTreeMap::new();
+        let mut surfaces = BTreeMap::new();
+
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            false,
+            &mut unifier,
+        )
+        .unwrap();
+        unifier.bind_var(
+            capture,
+            Type::List(Type::shared(Type::object(
+                ObjectShape::from_ordered_fields([("id".to_owned(), Type::Unknown)], true),
+            ))),
+        );
+
+        let rich = Type::List(Type::shared(Type::object(
+            ObjectShape::from_ordered_fields(
+                [
+                    ("id".to_owned(), Type::Text),
+                    ("family".to_owned(), Type::Text),
+                ],
+                false,
+            ),
+        )));
+        unifier.bind_var(provider, rich.clone());
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            true,
+            &mut unifier,
+        )
+        .unwrap();
+
+        assert_eq!(
+            unifier.resolve(&Type::Var(capture)),
+            rich,
+            "a late provider epoch must replace, not union with, the consumer scaffold",
+        );
+    }
+
+    #[test]
+    fn late_capture_alpha_refresh_replaces_its_consumer_scaffold() {
+        let unit = link("provider: 0\nconsumer: 0\n");
+        let provider_owner = owner_named(&unit, "provider");
+        let consumer_owner = owner_named(&unit, "consumer");
+        let target = OwnerLexicalTargetRef::Declaration {
+            owner: provider_owner,
+            declaration: OwnerDeclarationStableKey::Public,
+            capability: OwnerLexicalDeclarationCapability::Value,
+        };
+        let mut unifier = TypeUnifier::default();
+        let provider_item = unifier.fresh();
+        let provider = unifier.fresh();
+        unifier.bind_var(provider, Type::List(Type::shared(Type::Var(provider_item))));
+        let capture = unifier.fresh();
+        let providers = [full_internal_capture(
+            consumer_owner,
+            target,
+            capture,
+            provider,
+        )];
+        let states = BTreeMap::<StableCheckOwnerKey, OwnerSolveState<'_>>::new();
+        let mut frames = BTreeMap::new();
+        let mut surfaces = BTreeMap::new();
+
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            false,
+            &mut unifier,
+        )
+        .unwrap();
+        let copied_item = frames
+            .values()
+            .next()
+            .and_then(|frame| frame.variables.get(&unifier.root_readonly(provider_item)))
+            .copied()
+            .expect("capture must copy the provider item alpha");
+        unifier.bind_var(
+            copied_item,
+            Type::object(ObjectShape::from_ordered_fields(
+                [("id".to_owned(), Type::Unknown)],
+                true,
+            )),
+        );
+
+        let rich_item = Type::object(ObjectShape::from_ordered_fields(
+            [
+                ("id".to_owned(), Type::Text),
+                ("payload".to_owned(), Type::Text),
+            ],
+            false,
+        ));
+        unifier.bind_var(provider_item, rich_item.clone());
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            true,
+            &mut unifier,
+        )
+        .unwrap();
+
+        assert_eq!(
+            unifier.resolve(&Type::Var(copied_item)),
+            rich_item.clone(),
+            "the provider alpha must replace its copied consumer scaffold",
+        );
+        assert_eq!(
+            unifier.resolve(&Type::Var(capture)),
+            Type::List(Type::shared(rich_item)),
+            "the capture and its consumer-shared item alpha must close together",
+        );
+    }
+
+    #[test]
+    fn projected_capture_backflows_only_a_concrete_sparse_requirement() {
+        let unit = link("provider: 0\nconsumer: 0\n");
+        let provider_owner = owner_named(&unit, "provider");
+        let consumer_owner = owner_named(&unit, "consumer");
+        let target = OwnerLexicalTargetRef::Declaration {
+            owner: provider_owner,
+            declaration: OwnerDeclarationStableKey::Public,
+            capability: OwnerLexicalDeclarationCapability::Value,
+        };
+        let mut unifier = TypeUnifier::default();
+        let provider = unifier.fresh();
+        let capture = unifier.fresh();
+        unifier.bind_var(
+            capture,
+            Type::object(ObjectShape::from_ordered_fields(
+                [("selected".to_owned(), Type::Number)],
+                true,
+            )),
+        );
+        let providers = [projected_internal_capture(
+            consumer_owner,
+            target,
+            capture,
+            provider,
+            &[&["selected"]],
+        )];
+        let states = BTreeMap::<StableCheckOwnerKey, OwnerSolveState<'_>>::new();
+        let mut frames = BTreeMap::new();
+        let mut surfaces = BTreeMap::new();
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            true,
+            &mut unifier,
+        )
+        .unwrap();
+
+        let Type::Object(provider_shape) = unifier.resolve(&Type::Var(provider)) else {
+            panic!("concrete sparse consumer requirement must shape the provider hole");
+        };
+        assert!(provider_shape.open);
+        assert_eq!(provider_shape.fields.get("selected"), Some(&Type::Number));
+        assert_eq!(provider_shape.fields.len(), 1);
+
+        unifier.bind_var(
+            provider,
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("selected".to_owned(), Type::Number),
+                    ("omitted".to_owned(), Type::Text),
+                ],
+                false,
+            )),
+        );
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            true,
+            &mut unifier,
+        )
+        .unwrap();
+        let Type::Object(capture_shape) = unifier.resolve(&Type::Var(capture)) else {
+            panic!("projected capture must remain an object");
+        };
+        assert_eq!(capture_shape.fields.get("selected"), Some(&Type::Number));
+        assert!(!capture_shape.fields.contains_key("omitted"));
+    }
+
+    #[test]
+    fn closed_sparse_selector_does_not_synthesize_an_impossible_inherited_arm() {
+        let mut unifier = TypeUnifier::default();
+        let root = unifier.fresh();
+        let read = unifier.fresh();
+        let other = Type::VariantSet(vec![Variant::Tag("Other".to_owned())].into());
+        unifier.bind_var(
+            root,
+            Type::object(ObjectShape::from_ordered_fields(
+                [("choice".to_owned(), other.clone())],
+                false,
+            )),
+        );
+        let pattern = OwnerPatternConstraint::Tag {
+            name: "Found".to_owned(),
+            fields: Box::new([]),
+        };
+        let schematic = pattern_type(&pattern, &mut unifier);
+        refine_owner_inherited_pattern_narrowings(
+            &mut unifier,
+            &[OwnerInheritedPatternNarrowing {
+                root,
+                frames: vec![OwnerInstantiatedPatternFrame {
+                    projection: vec!["choice".to_owned()].into_boxed_slice(),
+                    pattern,
+                    schematic,
+                }]
+                .into_boxed_slice(),
+                reads: vec![OwnerInstantiatedPatternRead {
+                    projection: vec!["choice".to_owned()].into_boxed_slice(),
+                    variable: read,
+                }]
+                .into_boxed_slice(),
+            }],
+        );
+
+        assert_eq!(unifier.resolve(&Type::Var(read)), other);
+    }
+
+    #[test]
+    fn closed_union_payload_authoritatively_closes_a_projected_pattern_binding() {
+        let mut unifier = TypeUnifier::default();
+        let selector = unifier.fresh();
+        let binding = unifier.fresh();
+        let pattern = OwnerPatternConstraint::Tag {
+            name: "Found".to_owned(),
+            fields: vec!["value".to_owned()].into_boxed_slice(),
+        };
+        let schematic = pattern_type(&pattern, &mut unifier);
+        let binding_type = pattern_binding_type_from_pattern(&pattern, &schematic, "value")
+            .expect("Found[value] must expose its payload binding");
+        unifier.bind_var(binding, binding_type);
+        let digest = bind_projection(&mut unifier, binding, &["digest".to_owned()]);
+        let fallback = unifier.fresh();
+        unifier.bind_var(fallback, Type::Text);
+        let result = unifier.fresh();
+        bind_flow_variables(&mut unifier, result, [digest, fallback]);
+
+        let payload = |source: &str| {
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("digest".to_owned(), Type::Text),
+                    (
+                        "source".to_owned(),
+                        Type::VariantSet(vec![Variant::Tag(source.to_owned())].into()),
+                    ),
+                ],
+                false,
+            ))
+        };
+        let payload =
+            boon_checked::canonical_union_type(vec![payload("NoFile"), payload("FileHeader")]);
+        unifier.bind_var(
+            selector,
+            Type::VariantSet(
+                vec![Variant::Tagged {
+                    tag: "Found".to_owned(),
+                    fields: boon_checked::SharedObjectShape::new(ObjectShape::from_ordered_fields(
+                        [("value".to_owned(), payload.clone())],
+                        false,
+                    )),
+                }]
+                .into(),
+            ),
+        );
+
+        refine_owner_pattern_narrowings(
+            &mut unifier,
+            &[OwnerPatternNarrowing {
+                selector,
+                pattern,
+                bindings: vec![("value".to_owned(), binding)].into_boxed_slice(),
+                selector_reads: Box::new([]),
+            }],
+        );
+
+        assert_eq!(unifier.resolve(&Type::Var(binding)), payload);
+        assert_eq!(unifier.resolve(&Type::Var(digest)), Type::Text);
+        assert_eq!(unifier.resolve(&Type::Var(result)), Type::Text);
+    }
+
+    #[test]
+    fn closed_narrowed_selector_replaces_a_sparse_consumer_projection() {
+        let mut unifier = TypeUnifier::default();
+        let selector = unifier.fresh();
+        let read = unifier.fresh();
+        let transition = Type::object(ObjectShape::from_ordered_fields(
+            [
+                ("time".to_owned(), Type::Number),
+                ("end_time".to_owned(), Type::Number),
+            ],
+            false,
+        ));
+        let signal = Type::object(ObjectShape::from_ordered_fields(
+            [
+                ("signal_id".to_owned(), Type::Text),
+                (
+                    "transitions".to_owned(),
+                    Type::List(Type::shared(transition)),
+                ),
+            ],
+            false,
+        ));
+        let signals = Type::List(Type::shared(signal));
+        unifier.bind_var(
+            selector,
+            Type::VariantSet(
+                vec![Variant::Tagged {
+                    tag: "SignalPage".to_owned(),
+                    fields: boon_checked::SharedObjectShape::new(ObjectShape::from_ordered_fields(
+                        [("signals".to_owned(), signals.clone())],
+                        false,
+                    )),
+                }]
+                .into(),
+            ),
+        );
+        let sparse_id = unifier.fresh();
+        unifier.bind_var(
+            read,
+            Type::List(Type::shared(Type::object(
+                ObjectShape::from_ordered_fields(
+                    [("signal_id".to_owned(), Type::Var(sparse_id))],
+                    true,
+                ),
+            ))),
+        );
+
+        refine_owner_pattern_narrowings(
+            &mut unifier,
+            &[OwnerPatternNarrowing {
+                selector,
+                pattern: OwnerPatternConstraint::Tag {
+                    name: "SignalPage".to_owned(),
+                    fields: Box::new([]),
+                },
+                bindings: Box::new([]),
+                selector_reads: vec![(vec!["signals".to_owned()].into_boxed_slice(), read)]
+                    .into_boxed_slice(),
+            }],
+        );
+
+        assert_eq!(unifier.resolve(&Type::Var(sparse_id)), Type::Text);
+        assert_eq!(unifier.resolve(&Type::Var(read)), signals);
+    }
+
+    #[test]
+    fn projected_selector_openness_ignores_unrelated_open_siblings() {
+        let mut unifier = TypeUnifier::default();
+        let root = unifier.fresh();
+        let read = unifier.fresh();
+        let unrelated = unifier.fresh();
+        let other = Type::VariantSet(vec![Variant::Tag("Other".to_owned())].into());
+        unifier.bind_var(
+            root,
+            Type::object(ObjectShape {
+                fields: [
+                    ("choice".to_owned(), other.clone()),
+                    ("unrelated".to_owned(), Type::Var(unrelated)),
+                ]
+                .into(),
+                field_order: vec!["choice".to_owned(), "unrelated".to_owned()],
+                open: true,
+            }),
+        );
+        let pattern = OwnerPatternConstraint::Tag {
+            name: "Found".to_owned(),
+            fields: Box::new([]),
+        };
+        let schematic = pattern_type(&pattern, &mut unifier);
+        refine_owner_inherited_pattern_narrowings(
+            &mut unifier,
+            &[OwnerInheritedPatternNarrowing {
+                root,
+                frames: vec![OwnerInstantiatedPatternFrame {
+                    projection: vec!["choice".to_owned()].into_boxed_slice(),
+                    pattern,
+                    schematic,
+                }]
+                .into_boxed_slice(),
+                reads: vec![OwnerInstantiatedPatternRead {
+                    projection: vec!["choice".to_owned()].into_boxed_slice(),
+                    variable: read,
+                }]
+                .into_boxed_slice(),
+            }],
+        );
+
+        assert_eq!(unifier.resolve(&Type::Var(read)), other);
+    }
+
+    #[test]
+    fn projected_capture_backflow_never_reaches_omitted_sibling_alphas() {
+        let unit = link("provider: 0\nconsumer: 0\n");
+        let provider_owner = owner_named(&unit, "provider");
+        let consumer_owner = owner_named(&unit, "consumer");
+        let target = OwnerLexicalTargetRef::Declaration {
+            owner: provider_owner,
+            declaration: OwnerDeclarationStableKey::Public,
+            capability: OwnerLexicalDeclarationCapability::Value,
+        };
+        let mut unifier = TypeUnifier::default();
+        let selected = unifier.fresh();
+        let omitted = unifier.fresh();
+        let provider = unifier.fresh();
+        let capture = unifier.fresh();
+        unifier.bind_var(
+            provider,
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("selected".to_owned(), Type::Var(selected)),
+                    ("omitted".to_owned(), Type::Var(omitted)),
+                ],
+                false,
+            )),
+        );
+        unifier.bind_var(
+            capture,
+            Type::object(ObjectShape::from_ordered_fields(
+                [("selected".to_owned(), Type::Number)],
+                true,
+            )),
+        );
+        let states = BTreeMap::<StableCheckOwnerKey, OwnerSolveState<'_>>::new();
+        propagate_lexical_capture_types(
+            &states,
+            &[projected_internal_capture(
+                consumer_owner,
+                target,
+                capture,
+                provider,
+                &[&["selected"]],
+            )],
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            true,
+            &mut unifier,
+        )
+        .unwrap();
+
+        assert_eq!(unifier.resolve(&Type::Var(selected)), Type::Number);
+        assert!(matches!(unifier.resolve(&Type::Var(omitted)), Type::Var(_)));
+    }
+
+    #[test]
+    fn projected_capture_backflows_a_nested_requirement_added_after_publication() {
+        let unit = link("provider: 0\nconsumer: 0\n");
+        let provider_owner = owner_named(&unit, "provider");
+        let consumer_owner = owner_named(&unit, "consumer");
+        let target = OwnerLexicalTargetRef::Declaration {
+            owner: provider_owner,
+            declaration: OwnerDeclarationStableKey::Public,
+            capability: OwnerLexicalDeclarationCapability::Value,
+        };
+        let mut unifier = TypeUnifier::default();
+        let selected = unifier.fresh();
+        let omitted = unifier.fresh();
+        let provider = unifier.fresh();
+        let capture = unifier.fresh();
+        unifier.bind_var(
+            provider,
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("selected".to_owned(), Type::Var(selected)),
+                    ("omitted".to_owned(), Type::Var(omitted)),
+                ],
+                false,
+            )),
+        );
+        let states = BTreeMap::<StableCheckOwnerKey, OwnerSolveState<'_>>::new();
+        let providers = [projected_internal_capture(
+            consumer_owner,
+            target,
+            capture,
+            provider,
+            &[&["selected", "value"]],
+        )];
+        let mut frames = BTreeMap::new();
+        let mut surfaces = BTreeMap::new();
+
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            false,
+            &mut unifier,
+        )
+        .unwrap();
+        assert!(matches!(
+            unifier.resolve(&Type::Var(selected)),
+            Type::Var(_)
+        ));
+        let frame = frames.values().next().expect("projected alpha frame");
+        assert!(
+            frame
+                .variables
+                .contains_key(&unifier.root_readonly(selected))
+        );
+        assert!(
+            !frame
+                .variables
+                .contains_key(&unifier.root_readonly(omitted))
+        );
+
+        let value = bind_projection(
+            &mut unifier,
+            capture,
+            &["selected".to_owned(), "value".to_owned()],
+        );
+        unifier.bind_var(value, Type::Number);
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            true,
+            &mut unifier,
+        )
+        .unwrap();
+
+        let Type::Object(selected) = unifier.resolve(&Type::Var(selected)) else {
+            panic!("late nested consumer requirement must shape the selected provider alpha");
+        };
+        assert!(selected.open);
+        assert_eq!(selected.fields.get("value"), Some(&Type::Number));
+        assert!(matches!(unifier.resolve(&Type::Var(omitted)), Type::Var(_)));
+    }
+
+    #[test]
+    fn capture_frames_canonicalize_provider_roots_that_coalesce_between_rounds() {
+        let unit = link("provider: 0\nconsumer: 0\n");
+        let provider_owner = owner_named(&unit, "provider");
+        let consumer_owner = owner_named(&unit, "consumer");
+        let target = OwnerLexicalTargetRef::Declaration {
+            owner: provider_owner,
+            declaration: OwnerDeclarationStableKey::Public,
+            capability: OwnerLexicalDeclarationCapability::Value,
+        };
+        let mut unifier = TypeUnifier::default();
+        let left = unifier.fresh();
+        let right = unifier.fresh();
+        let provider = unifier.fresh();
+        let capture = unifier.fresh();
+        unifier.bind_var(
+            provider,
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("left".to_owned(), Type::Var(left)),
+                    ("right".to_owned(), Type::Var(right)),
+                ],
+                false,
+            )),
+        );
+        let states = BTreeMap::<StableCheckOwnerKey, OwnerSolveState<'_>>::new();
+        let providers = [projected_internal_capture(
+            consumer_owner,
+            target,
+            capture,
+            provider,
+            &[&["left"], &["right"]],
+        )];
+        let mut frames = BTreeMap::new();
+        let mut surfaces = BTreeMap::new();
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            false,
+            &mut unifier,
+        )
+        .unwrap();
+        assert_eq!(frames.values().next().unwrap().variables.len(), 2);
+
+        unifier.unify(Type::Var(left), Type::Var(right));
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut frames,
+            &mut surfaces,
+            false,
+            &mut unifier,
+        )
+        .unwrap();
+
+        assert_eq!(frames.values().next().unwrap().variables.len(), 1);
+        let Type::Object(capture) = unifier.resolve(&Type::Var(capture)) else {
+            panic!("capture must retain both selected paths");
+        };
+        assert_eq!(capture.fields["left"], capture.fields["right"]);
+    }
+
+    #[test]
+    fn lexical_capture_refreshes_provider_variables_closed_by_a_later_round() {
+        let unit = link("provider: 0\nconsumer: 0\n");
+        let provider_owner = owner_named(&unit, "provider");
+        let consumer_owner = owner_named(&unit, "consumer");
+        let target = OwnerLexicalTargetRef::Declaration {
+            owner: provider_owner,
+            declaration: OwnerDeclarationStableKey::Public,
+            capability: OwnerLexicalDeclarationCapability::Value,
+        };
+        let mut unifier = TypeUnifier::default();
+        let provider = unifier.fresh();
+        let first = unifier.fresh();
+        let second = unifier.fresh();
+        let capture = unifier.fresh();
+        unifier.bind_var(
+            provider,
+            Type::Union(vec![Type::Var(first), Type::Var(second)]),
+        );
+        let states = BTreeMap::<StableCheckOwnerKey, OwnerSolveState<'_>>::new();
+        let providers = [full_internal_capture(
+            consumer_owner,
+            target,
+            capture,
+            provider,
+        )];
+        let mut copied_variables = BTreeMap::new();
+        let mut provider_types = BTreeMap::new();
+
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut copied_variables,
+            &mut provider_types,
+            false,
+            &mut unifier,
+        )
+        .unwrap();
+        assert!(type_contains_inference_variable(
+            &unifier.resolve(&Type::Var(capture))
+        ));
+
+        unifier.bind_var(first, Type::Text);
+        unifier.bind_var(second, Type::Number);
+        propagate_lexical_capture_types(
+            &states,
+            &providers,
+            &mut copied_variables,
+            &mut provider_types,
+            false,
+            &mut unifier,
+        )
+        .unwrap();
+
+        let capture = unifier.resolve(&Type::Var(capture));
+        assert!(!type_contains_inference_variable(&capture));
+        assert_eq!(
+            capture,
+            boon_checked::canonical_union_type(vec![Type::Text, Type::Number])
+        );
     }
 
     #[test]
@@ -5165,7 +9284,13 @@ mod tests {
         let states = BTreeMap::<StableCheckOwnerKey, OwnerSolveState<'_>>::new();
         propagate_lexical_capture_types(
             &states,
-            &[(consumer_owner, target, capture, provider)],
+            &[full_internal_capture(
+                consumer_owner,
+                target,
+                capture,
+                provider,
+            )],
+            &mut BTreeMap::new(),
             &mut BTreeMap::new(),
             true,
             &mut unifier,
@@ -5211,6 +9336,456 @@ mod tests {
 
         bind_provider_inference_holes(&mut unifier, &provider, &requirement);
         assert_eq!(unifier.resolve(&Type::Var(payload)), Type::Number);
+    }
+
+    #[test]
+    fn closed_union_call_actual_specializes_formal_holes_without_provider_backflow() {
+        let mut unifier = TypeUnifier::default();
+        let actual = unifier.fresh();
+        let formal_kind = unifier.fresh();
+        let formal_label = unifier.fresh();
+        let first = Type::object(ObjectShape::from_ordered_fields(
+            [
+                (
+                    "kind".to_owned(),
+                    Type::VariantSet(vec![Variant::Tag("First".to_owned())].into()),
+                ),
+                ("label".to_owned(), Type::Text),
+            ],
+            false,
+        ));
+        let second = Type::object(ObjectShape::from_ordered_fields(
+            [
+                (
+                    "kind".to_owned(),
+                    Type::VariantSet(vec![Variant::Tag("Second".to_owned())].into()),
+                ),
+                ("label".to_owned(), Type::Text),
+            ],
+            false,
+        ));
+        let actual_type = boon_checked::canonical_union_type(vec![first, second]);
+        unifier.bind_var(actual, actual_type.clone());
+        let formal = Type::object(ObjectShape::from_ordered_fields(
+            [
+                ("kind".to_owned(), Type::Var(formal_kind)),
+                ("label".to_owned(), Type::Var(formal_label)),
+            ],
+            true,
+        ));
+
+        unifier.bind_call_input(actual, formal);
+
+        assert_eq!(unifier.resolve(&Type::Var(actual)), actual_type);
+        assert_eq!(unifier.resolve(&Type::Var(formal_label)), Type::Text);
+        assert_eq!(
+            unifier.resolve(&Type::Var(formal_kind)),
+            crate::type_for_nested_path(&actual_type, &["kind".to_owned()]).unwrap()
+        );
+
+        let concrete_actual = unifier.fresh();
+        unifier.bind_var(concrete_actual, actual_type.clone());
+        unifier.bind_call_input(
+            concrete_actual,
+            Type::object(ObjectShape::from_ordered_fields(
+                [("label".to_owned(), Type::Text)],
+                true,
+            )),
+        );
+        assert_eq!(
+            unifier.resolve(&Type::Var(concrete_actual)),
+            actual_type,
+            "a concrete open formal must not structurally rewrite a closed union provider",
+        );
+
+        let Type::Union(records) = &actual_type else {
+            panic!("fixture must retain two record alternatives");
+        };
+        let list_actual_type = boon_checked::canonical_union_type(
+            records
+                .iter()
+                .cloned()
+                .map(|record| Type::List(Type::shared(record)))
+                .collect(),
+        );
+        let list_actual = unifier.fresh();
+        let formal_item = unifier.fresh();
+        unifier.bind_var(list_actual, list_actual_type.clone());
+        unifier.bind_call_input(
+            list_actual,
+            Type::List(Type::shared(Type::Var(formal_item))),
+        );
+        assert_eq!(unifier.resolve(&Type::Var(list_actual)), list_actual_type);
+        assert_eq!(unifier.resolve(&Type::Var(formal_item)), actual_type);
+
+        let object_actual = unifier.fresh();
+        let formal_signal_id = unifier.fresh();
+        let object_actual_type = Type::object(ObjectShape::from_ordered_fields(
+            [
+                ("signal_id".to_owned(), Type::Text),
+                ("unrelated".to_owned(), Type::Number),
+            ],
+            false,
+        ));
+        unifier.bind_var(object_actual, object_actual_type.clone());
+        unifier.bind_call_input(
+            object_actual,
+            Type::object(ObjectShape::from_ordered_fields(
+                [("signal_id".to_owned(), Type::Var(formal_signal_id))],
+                true,
+            )),
+        );
+        assert_eq!(
+            unifier.resolve(&Type::Var(object_actual)),
+            object_actual_type
+        );
+        assert_eq!(unifier.resolve(&Type::Var(formal_signal_id)), Type::Text);
+
+        let absent_actual = unifier.fresh();
+        let missing = unifier.fresh();
+        let present = unifier.fresh();
+        unifier.bind_var(
+            absent_actual,
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("missing".to_owned(), Type::Absent),
+                    ("present".to_owned(), Type::Text),
+                ],
+                false,
+            )),
+        );
+        unifier.bind_call_input(
+            absent_actual,
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("missing".to_owned(), Type::Var(missing)),
+                    ("present".to_owned(), Type::Var(present)),
+                ],
+                true,
+            )),
+        );
+        assert_eq!(unifier.resolve(&Type::Var(missing)), Type::Var(missing));
+        assert_eq!(unifier.resolve(&Type::Var(present)), Type::Text);
+    }
+
+    #[test]
+    fn union_projection_preserves_the_provider_and_projects_all_members() {
+        let mut unifier = TypeUnifier::default();
+        let root = unifier.fresh();
+        let actual_type = boon_checked::canonical_union_type(vec![
+            Type::object(ObjectShape::from_ordered_fields(
+                [("value".to_owned(), Type::Number)],
+                false,
+            )),
+            Type::object(ObjectShape::from_ordered_fields(
+                [("value".to_owned(), Type::Text)],
+                false,
+            )),
+        ]);
+        unifier.bind_var(root, actual_type.clone());
+
+        let projected = bind_projection(&mut unifier, root, &["value".to_owned()]);
+
+        assert_eq!(unifier.resolve(&Type::Var(root)), actual_type);
+        assert_eq!(
+            unifier.resolve(&Type::Var(projected)),
+            boon_checked::canonical_union_type(vec![Type::Number, Type::Text])
+        );
+    }
+
+    #[test]
+    fn partially_open_union_call_actual_projects_all_alternatives_without_provider_backflow() {
+        let mut unifier = TypeUnifier::default();
+        let actual = unifier.fresh();
+        let actual_detail = unifier.fresh();
+        let formal_label = unifier.fresh();
+        let formal_detail = unifier.fresh();
+        let actual_type = boon_checked::canonical_union_type(vec![
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("label".to_owned(), Type::Text),
+                    ("detail".to_owned(), Type::Var(actual_detail)),
+                ],
+                false,
+            )),
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("label".to_owned(), Type::Text),
+                    ("detail".to_owned(), Type::Number),
+                ],
+                false,
+            )),
+        ]);
+        unifier.bind_var(actual, actual_type);
+        let formal = Type::object(ObjectShape::from_ordered_fields(
+            [
+                ("label".to_owned(), Type::Var(formal_label)),
+                ("detail".to_owned(), Type::Var(formal_detail)),
+            ],
+            true,
+        ));
+
+        unifier.bind_call_input(actual, formal);
+
+        assert_eq!(
+            unifier.resolve(&Type::Var(actual_detail)),
+            Type::Var(actual_detail)
+        );
+        assert_eq!(unifier.resolve(&Type::Var(formal_label)), Type::Text);
+        assert_eq!(
+            unifier.resolve(&Type::Var(formal_detail)),
+            boon_checked::canonical_union_type(vec![Type::Var(actual_detail), Type::Number])
+        );
+        let Type::Union(actual) = unifier.resolve(&Type::Var(actual)) else {
+            panic!("partially open provider must remain a union");
+        };
+        assert!(actual.iter().all(|member| {
+            matches!(
+                member,
+                Type::Object(shape)
+                    if shape.fields.get("label") == Some(&Type::Text)
+            )
+        }));
+    }
+
+    #[test]
+    fn open_call_actual_remains_an_equation_with_a_concrete_formal() {
+        let mut unifier = TypeUnifier::default();
+        let actual = unifier.fresh();
+        unifier.bind_call_input(actual, Type::Number);
+        assert_eq!(unifier.resolve(&Type::Var(actual)), Type::Number);
+
+        let open_actual = unifier.fresh();
+        unifier.bind_var(
+            open_actual,
+            Type::object(ObjectShape::from_ordered_fields(
+                [("a".to_owned(), Type::Number)],
+                true,
+            )),
+        );
+        unifier.bind_call_input(
+            open_actual,
+            Type::object(ObjectShape::from_ordered_fields(
+                [("b".to_owned(), Type::Text)],
+                true,
+            )),
+        );
+        let Type::Object(open_actual) = unifier.resolve(&Type::Var(open_actual)) else {
+            panic!("open call actual must remain an object equation");
+        };
+        assert_eq!(open_actual.fields.get("a"), Some(&Type::Number));
+        assert_eq!(open_actual.fields.get("b"), Some(&Type::Text));
+        assert!(open_actual.open);
+    }
+
+    #[test]
+    fn call_placeholders_do_not_replace_generic_structural_fields() {
+        for placeholder in [
+            Type::Unknown,
+            Type::UnresolvedShape {
+                reason: "provisional call input".to_owned(),
+            },
+        ] {
+            let mut direct = TypeUnifier::default();
+            let generic = direct.fresh();
+            direct.bind_call_input(generic, placeholder.clone());
+            assert_eq!(
+                direct.resolve(&Type::Var(generic)),
+                Type::Var(generic),
+                "a direct call placeholder must not close its generic input",
+            );
+
+            for reverse in [false, true] {
+                let mut unifier = TypeUnifier::default();
+                let actual = unifier.fresh();
+                let generic = unifier.fresh();
+                let actual_shape = Type::object(ObjectShape::from_ordered_fields(
+                    [("value".to_owned(), placeholder.clone())],
+                    true,
+                ));
+                let formal_shape = Type::object(ObjectShape::from_ordered_fields(
+                    [("value".to_owned(), Type::Var(generic))],
+                    true,
+                ));
+                unifier.bind_var(
+                    actual,
+                    if reverse {
+                        formal_shape.clone()
+                    } else {
+                        actual_shape.clone()
+                    },
+                );
+                unifier.bind_call_input(actual, if reverse { actual_shape } else { formal_shape });
+
+                assert_eq!(
+                    unifier.resolve(&Type::Var(generic)),
+                    Type::Var(generic),
+                    "placeholder {placeholder:?}, reverse={reverse}",
+                );
+                let Type::Object(resolved) = unifier.resolve(&Type::Var(actual)) else {
+                    panic!("call input must remain an object")
+                };
+                assert_eq!(resolved.fields.get("value"), Some(&Type::Var(generic)));
+
+                unifier.bind_var(generic, Type::Text);
+                let Type::Object(resolved) = unifier.resolve(&Type::Var(actual)) else {
+                    panic!("late exact call input must remain an object")
+                };
+                assert_eq!(resolved.fields.get("value"), Some(&Type::Text));
+            }
+        }
+    }
+
+    #[test]
+    fn closed_call_provider_replaces_only_an_open_shared_formal_scaffold() {
+        fn rich_item(id: Type) -> Type {
+            Type::object(ObjectShape::from_ordered_fields(
+                [("id".to_owned(), id), ("payload".to_owned(), Type::Text)],
+                false,
+            ))
+        }
+
+        let mut unifier = TypeUnifier::default();
+        let actual = unifier.fresh();
+        let formal_item = unifier.fresh();
+        let provider = Type::List(Type::shared(rich_item(Type::Text)));
+        unifier.bind_var(actual, provider.clone());
+        unifier.bind_var(
+            formal_item,
+            Type::object(ObjectShape::from_ordered_fields(
+                [("id".to_owned(), Type::Unknown)],
+                true,
+            )),
+        );
+        unifier.bind_call_input(actual, Type::List(Type::shared(Type::Var(formal_item))));
+        assert_eq!(unifier.resolve(&Type::Var(actual)), provider);
+        assert_eq!(
+            unifier.resolve(&Type::Var(formal_item)),
+            rich_item(Type::Text),
+            "a closed parent provider must replace the FreshOut consumer scaffold",
+        );
+
+        let solve_conflict = |reverse: bool| {
+            let mut unifier = TypeUnifier::default();
+            let formal = unifier.fresh();
+            unifier.bind_var(
+                formal,
+                Type::object(ObjectShape::from_ordered_fields(
+                    [("id".to_owned(), Type::Unknown)],
+                    true,
+                )),
+            );
+            let mut providers = [rich_item(Type::Text), rich_item(Type::Number)];
+            if reverse {
+                providers.reverse();
+            }
+            for provider in providers {
+                bind_call_formal_from_closed_alternatives(
+                    &mut unifier,
+                    &Type::Var(formal),
+                    &[provider],
+                );
+            }
+            unifier.resolve(&Type::Var(formal))
+        };
+        assert_eq!(
+            solve_conflict(false),
+            solve_conflict(true),
+            "two closed providers must retain order-independent equality semantics",
+        );
+    }
+
+    #[test]
+    fn authoritative_call_result_replaces_only_the_provisional_consumer_scaffold() {
+        let mut unifier = TypeUnifier::default();
+        let occurrence = unifier.fresh();
+        let provider_key = unifier.fresh();
+        unifier.bind_var(
+            occurrence,
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("key".to_owned(), Type::Text),
+                    ("consumer_only".to_owned(), Type::Number),
+                ],
+                true,
+            )),
+        );
+        unifier.publish_authoritative_provider(
+            occurrence,
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("key".to_owned(), Type::Var(provider_key)),
+                    ("label".to_owned(), Type::Text),
+                ],
+                false,
+            )),
+        );
+
+        assert_eq!(unifier.resolve(&Type::Var(provider_key)), Type::Text);
+        let Type::Object(result) = unifier.resolve(&Type::Var(occurrence)) else {
+            panic!("authoritative occurrence must remain an object");
+        };
+        assert!(!result.open, "the provider's closedness is authoritative");
+        assert_eq!(result.fields.get("key"), Some(&Type::Text));
+        assert_eq!(result.fields.get("label"), Some(&Type::Text));
+        assert!(
+            !result.fields.contains_key("consumer_only"),
+            "a provisional consumer field must not widen the provider result",
+        );
+
+        let list_occurrence = unifier.fresh();
+        let provisional_item = unifier.fresh();
+        unifier.bind_var(
+            list_occurrence,
+            Type::List(Type::shared(Type::Var(provisional_item))),
+        );
+        unifier
+            .publish_authoritative_provider(list_occurrence, Type::List(Type::shared(Type::Text)));
+        assert_eq!(
+            unifier.resolve(&Type::Var(provisional_item)),
+            Type::Text,
+            "provider leaves must close holes in the provisional consumer scaffold",
+        );
+        assert_eq!(
+            unifier.resolve(&Type::Var(list_occurrence)),
+            Type::List(Type::shared(Type::Text)),
+        );
+
+        let live_occurrence = unifier.fresh();
+        let provider_value = unifier.fresh();
+        let consumer_value = unifier.fresh();
+        let live_provider = Type::object(ObjectShape::from_ordered_fields(
+            [
+                ("value".to_owned(), Type::Var(provider_value)),
+                ("label".to_owned(), Type::Text),
+            ],
+            false,
+        ));
+        unifier.publish_authoritative_provider(live_occurrence, live_provider.clone());
+        unifier.bind_call_input(
+            live_occurrence,
+            Type::object(ObjectShape::from_ordered_fields(
+                [("value".to_owned(), Type::Var(consumer_value))],
+                true,
+            )),
+        );
+        let Type::Object(replayed) = unifier.resolve(&Type::Var(live_occurrence)) else {
+            panic!("replayed occurrence must remain an object");
+        };
+        assert!(
+            replayed.open,
+            "the ordinary input equation demonstrates the provisional reopen seam",
+        );
+        unifier.publish_authoritative_provider(live_occurrence, live_provider);
+        unifier.bind_var(consumer_value, Type::Number);
+        let Type::Object(republished) = unifier.resolve(&Type::Var(live_occurrence)) else {
+            panic!("republished occurrence must remain an object");
+        };
+        assert!(
+            !republished.open,
+            "provider authority must be restored after every input replay",
+        );
+        assert_eq!(republished.fields.get("value"), Some(&Type::Number));
     }
 
     #[test]
@@ -5367,6 +9942,28 @@ mod tests {
     }
 
     #[test]
+    fn record_self_initializer_reuses_the_outer_parameter_type() {
+        let unit = link(concat!(
+            "FUNCTION dimensions(width) {\n",
+            "    [width: width]\n",
+            "}\n",
+        ));
+        let owner = owner_named(&unit, "dimensions");
+        let seed = seed(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let results = solve(&[seed], &[summary]);
+        let interface = results[0].owner(&owner).unwrap();
+        let Type::Object(shape) = &interface.result.ty else {
+            panic!("dimensions must return an object: {interface:#?}");
+        };
+        assert_eq!(
+            shape.fields.get("width"),
+            Some(&interface.parameters[0].flow_type.ty),
+        );
+        assert!(matches!(interface.parameters[0].flow_type.ty, Type::Var(_)));
+    }
+
+    #[test]
     fn result_transfer_excludes_unrelated_child_body_changes() {
         fn identity_interface(source: &str) -> OwnerPublicInterface {
             let unit = link(source);
@@ -5398,6 +9995,42 @@ mod tests {
         assert_eq!(interface.parameters[0].flow_type.ty, Type::Number);
         assert_eq!(interface.result.ty, Type::Number);
         assert!(interface.type_variables.is_empty());
+    }
+
+    #[test]
+    fn text_formattable_abi_placeholders_preserve_generic_projected_fields() {
+        let source = concat!(
+            "FUNCTION lane_identity(row) {\n",
+            "    row.file\n",
+            "        |> Text/concat(with: row.family, separator: row.id)\n",
+            "}\n",
+        );
+        assert_checked_interface_parity(source, "lane_identity");
+        let unit = link(source);
+        let owner = owner_named(&unit, "lane_identity");
+        let seed = seed(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let results = solve(&[seed], &[summary]);
+        let interface = results[0].owner(&owner).unwrap();
+        let Type::Object(parameter) = &interface.parameters[0].flow_type.ty else {
+            panic!("lane identity parameter must retain its projected object scheme")
+        };
+        assert!(parameter.open);
+        let fields = ["file", "family", "id"]
+            .into_iter()
+            .map(|name| {
+                let Some(Type::Var(variable)) = parameter.fields.get(name) else {
+                    panic!("lane identity {name} must remain generic: {interface:#?}")
+                };
+                *variable
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            fields.len(),
+            3,
+            "formattable fields need independent alphas"
+        );
+        assert_eq!(interface.result.ty, Type::Text);
     }
 
     #[test]
@@ -5569,6 +10202,677 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         assert_eq!(interfaces[&left], Type::Number);
         assert_eq!(interfaces[&right], Type::Number);
+    }
+
+    #[test]
+    fn dynamic_out_producer_closes_nested_user_call_before_sibling_consumption() {
+        let unit = link(concat!(
+            "FUNCTION copy(row) {\n",
+            "    [\n",
+            "        kind: row.kind\n",
+            "        file: row.file\n",
+            "    ]\n",
+            "}\n",
+            "rows:\n",
+            "    LIST {\n",
+            "        [kind: First, file: TEXT { a }]\n",
+            "        [kind: Second, file: TEXT { b }]\n",
+            "    }\n",
+            "    |> List/map(item, new: copy(row: item))\n",
+            "filtered:\n",
+            "    rows |> List/filter(item, if: item.file == TEXT { a })\n",
+        ));
+        let copy = owner_named(&unit, "copy");
+        let rows = owner_named(&unit, "rows");
+        let filtered = owner_named(&unit, "filtered");
+        let seeds = unit
+            .stable_check_owner_keys()
+            .filter(|owner| matches!(owner, StableCheckOwnerKey::Item(_)))
+            .map(|owner| seed(&unit, &owner))
+            .collect::<Vec<_>>();
+        let parameters = seeds
+            .iter()
+            .find(|seed| seed.owner == copy)
+            .expect("copy owner seed")
+            .declarations
+            .iter()
+            .find(|declaration| declaration.public)
+            .expect("copy public declaration")
+            .parameters
+            .clone();
+        let summaries = seeds
+            .iter()
+            .map(|seed| {
+                let resolutions = seed.references.iter().filter_map(|reference| {
+                    if reference.kind == OwnerReferenceKind::Callable
+                        && reference.parts.as_ref() == ["copy"]
+                    {
+                        Some(ResolvedOwnerSymbolReference {
+                            reference: reference.clone(),
+                            owner: copy.clone(),
+                            projection: Box::new([]),
+                            parameters: parameters.clone(),
+                        })
+                    } else if reference.kind == OwnerReferenceKind::Value
+                        && reference.parts.as_ref() == ["rows"]
+                    {
+                        Some(ResolvedOwnerSymbolReference {
+                            reference: reference.clone(),
+                            owner: rows.clone(),
+                            projection: Box::new([]),
+                            parameters: Box::new([]),
+                        })
+                    } else {
+                        None
+                    }
+                });
+                resolve_owner_constraint_seed(seed, resolutions).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summaries
+                .iter()
+                .flat_map(|summary| summary.resolved_references.iter())
+                .filter(|resolved| {
+                    resolved.owner == copy
+                        && resolved.reference.kind == OwnerReferenceKind::Callable
+                })
+                .count(),
+            1,
+            "fixture must resolve exactly one call to copy",
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .flat_map(|summary| summary.resolved_references.iter())
+                .filter(|resolved| {
+                    resolved.owner == rows && resolved.reference.kind == OwnerReferenceKind::Value
+                })
+                .count(),
+            1,
+            "fixture must resolve exactly one sibling read of rows",
+        );
+
+        let results = solve(&seeds, &summaries);
+        let interfaces = results
+            .iter()
+            .flat_map(|result| result.owners.iter())
+            .map(|interface| (interface.owner.clone(), interface))
+            .collect::<BTreeMap<_, _>>();
+        let copy_interface = interfaces[&copy];
+        let Type::Object(copy_parameter) = &copy_interface.parameters[0].flow_type.ty else {
+            panic!("copy parameter must be an open record scheme");
+        };
+        let Type::Object(copy_result) = &copy_interface.result.ty else {
+            panic!("copy result must be a closed record scheme");
+        };
+        assert!(copy_parameter.open);
+        assert!(!copy_result.open);
+        let mut copied_alphas = BTreeSet::new();
+        for field in ["kind", "file"] {
+            let Some(Type::Var(parameter)) = copy_parameter.fields.get(field) else {
+                panic!("copy parameter must expose a generic {field} field");
+            };
+            let Some(Type::Var(result)) = copy_result.fields.get(field) else {
+                panic!("copy result must reuse a generic {field} field");
+            };
+            assert_eq!(parameter, result, "copy must retain the {field} alpha");
+            copied_alphas.insert(*parameter);
+        }
+        assert_eq!(copied_alphas.len(), 2, "copy fields need distinct alphas");
+        for owner in [&rows, &filtered] {
+            assert!(
+                boon_checked::type_is_recursively_closed(&interfaces[owner].result.ty),
+                "{owner:?} must publish a closed mapped row interface: {:#?}",
+                interfaces[owner].result,
+            );
+            let Type::List(item) = &interfaces[owner].result.ty else {
+                panic!("{owner:?} must publish a list result");
+            };
+            assert_eq!(
+                crate::type_for_nested_path(item, &["file".to_owned()]),
+                Some(Type::Text),
+                "{owner:?} must preserve the authored file field",
+            );
+            assert_eq!(
+                crate::type_for_nested_path(item, &["kind".to_owned()]),
+                Some(Type::VariantSet(
+                    vec![
+                        Variant::Tag("First".to_owned()),
+                        Variant::Tag("Second".to_owned()),
+                    ]
+                    .into(),
+                )),
+                "{owner:?} must preserve the authored tag alternatives",
+            );
+        }
+        assert_eq!(
+            interfaces[&rows].result.ty, interfaces[&filtered].result.ty,
+            "List/filter must preserve the exact mapped row type",
+        );
+    }
+
+    #[test]
+    fn filter_chain_waits_for_its_closed_sibling_list_before_field_projection() {
+        let unit = link(concat!(
+            "rows: LIST {\n",
+            "    [\n",
+            "        id: TEXT { one }\n",
+            "        family: Family\n",
+            "        enabled: TEXT { yes }\n",
+            "        selected: True\n",
+            "        hidden_when_group: Group\n",
+            "    ]\n",
+            "}\n",
+            "visible:\n",
+            "    rows\n",
+            "    |> List/filter(item, if: item.family == Family)\n",
+            "    |> List/filter(item, if: item.enabled == TEXT { yes })\n",
+            "    |> List/filter(item, if: item.selected == True)\n",
+            "    |> List/filter(item, if: item.hidden_when_group != OtherGroup)\n",
+            "    |> List/filter(item, if: item.id != TEXT { removed })\n",
+        ));
+        let rows = owner_named(&unit, "rows");
+        let visible = owner_named(&unit, "visible");
+        let seeds = unit
+            .stable_check_owner_keys()
+            .filter(|owner| matches!(owner, StableCheckOwnerKey::Item(_)))
+            .map(|owner| seed(&unit, &owner))
+            .collect::<Vec<_>>();
+        let owners = [("rows", &rows), ("visible", &visible)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let summaries = seeds
+            .iter()
+            .map(|seed| {
+                let resolutions = seed.references.iter().filter_map(|reference| {
+                    if reference.kind != OwnerReferenceKind::Value {
+                        return None;
+                    }
+                    let [name] = reference.parts.as_ref() else {
+                        return None;
+                    };
+                    owners
+                        .get(name.as_str())
+                        .map(|owner| ResolvedOwnerSymbolReference {
+                            reference: reference.clone(),
+                            owner: (*owner).clone(),
+                            projection: Box::new([]),
+                            parameters: Box::new([]),
+                        })
+                });
+                resolve_owner_constraint_seed(seed, resolutions).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let results = solve(&seeds, &summaries);
+        let interfaces = results
+            .iter()
+            .flat_map(|result| result.owners.iter())
+            .map(|interface| (interface.owner.clone(), interface))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            interfaces[&visible].result.ty, interfaces[&rows].result.ty,
+            "List/filter must retain the exact late sibling provider type: {:#?}",
+            interfaces[&visible],
+        );
+        assert!(
+            boon_checked::type_is_recursively_closed(&interfaces[&visible].result.ty),
+            "same-component filter result must be recursively closed: {:#?}",
+            interfaces[&visible],
+        );
+        let Type::List(item) = &interfaces[&visible].result.ty else {
+            panic!("visible must publish a list")
+        };
+        let Type::Object(item) = item.as_ref() else {
+            panic!("visible must retain its authored record item")
+        };
+        assert!(!item.open);
+        assert_eq!(item.fields.get("id"), Some(&Type::Text));
+        assert!(item.fields.contains_key("family"));
+        assert!(item.fields.contains_key("enabled"));
+    }
+
+    #[test]
+    fn same_component_filter_result_tracks_a_late_lexical_capture_alpha() {
+        let unit = link(concat!(
+            "store: [\n",
+            "    rows:\n",
+            "        visible |> THEN {\n",
+            "            LIST {\n",
+            "                [\n",
+            "                    id: TEXT { one }\n",
+            "                    payload: TEXT { rich }\n",
+            "                    family: Family\n",
+            "                    enabled: TEXT { yes }\n",
+            "                    selected: True\n",
+            "                    hidden_when_group: Group\n",
+            "                ]\n",
+            "            }\n",
+            "        }\n",
+            "    visible:\n",
+            "        rows\n",
+            "        |> List/filter(item, if: item.family == Family)\n",
+            "        |> List/filter(item, if: item.enabled == TEXT { yes })\n",
+            "        |> List/filter(item, if: item.selected == True)\n",
+            "        |> List/filter(item, if: item.hidden_when_group != OtherGroup)\n",
+            "        |> List/filter(item, if: item.id != TEXT { removed })\n",
+            "]\n",
+        ));
+        let rows = owner_named(&unit, "rows");
+        let visible = owner_named(&unit, "visible");
+        let seeds = unit
+            .stable_check_owner_keys()
+            .filter(|owner| matches!(owner, StableCheckOwnerKey::Item(_)))
+            .map(|owner| seed(&unit, &owner))
+            .collect::<Vec<_>>();
+        let summaries = seeds
+            .iter()
+            .map(|seed| resolve_owner_constraint_seed(seed, []).unwrap())
+            .collect::<Vec<_>>();
+        let results = solve(&seeds, &summaries);
+        let component = results
+            .iter()
+            .find(|result| result.owner(&visible).is_some())
+            .expect("visible interface component");
+        assert!(
+            component.owner(&rows).is_some(),
+            "fixture must keep provider and consumer in one interface SCC",
+        );
+        let interfaces = results
+            .iter()
+            .flat_map(|result| result.owners.iter())
+            .map(|interface| (interface.owner.clone(), interface))
+            .collect::<BTreeMap<_, _>>();
+        let rows_interface = interfaces[&rows];
+        let visible_interface = interfaces[&visible];
+        let capture = visible_interface
+            .lexical_captures
+            .iter()
+            .find(|capture| {
+                matches!(
+                    &capture.target,
+                    OwnerLexicalTargetRef::Declaration {
+                        owner,
+                        declaration: OwnerDeclarationStableKey::Public,
+                        capability: OwnerLexicalDeclarationCapability::Value,
+                    } if owner == &rows
+                )
+            })
+            .expect("visible must import rows through a lexical capture");
+        assert_eq!(capture.demand_paths.as_ref(), [Box::<[String]>::default()]);
+        assert_eq!(capture.flow_type.ty, rows_interface.result.ty);
+        assert!(boon_checked::type_is_recursively_closed(
+            &capture.flow_type.ty
+        ));
+        assert_eq!(
+            visible_interface.result.ty, capture.flow_type.ty,
+            "the filter occurrence must publish its closed captured provider",
+        );
+        let Type::List(item) = &visible_interface.result.ty else {
+            panic!("visible must publish a list")
+        };
+        let Type::Object(item) = item.as_ref() else {
+            panic!("visible must retain record items")
+        };
+        assert!(!item.open);
+        assert_eq!(item.fields.get("id"), Some(&Type::Text));
+        assert_eq!(item.fields.get("payload"), Some(&Type::Text));
+    }
+
+    #[test]
+    fn public_record_declaration_interface_uses_its_record_value() {
+        let unit = link("store: [count: 1, label: TEXT { ok }]\n");
+        let store = owner_named(&unit, "store");
+        let seeds = unit
+            .stable_check_owner_keys()
+            .filter(|owner| matches!(owner, StableCheckOwnerKey::Item(_)))
+            .map(|owner| seed(&unit, &owner))
+            .collect::<Vec<_>>();
+        let summaries = seeds
+            .iter()
+            .map(|seed| resolve_owner_constraint_seed(seed, []).unwrap())
+            .collect::<Vec<_>>();
+        let interfaces = solve(&seeds, &summaries)
+            .into_iter()
+            .flat_map(|result| result.owners.into_vec())
+            .map(|interface| (interface.owner.clone(), interface))
+            .collect::<BTreeMap<_, _>>();
+        let Type::Object(shape) = &interfaces[&store].result.ty else {
+            panic!(
+                "public store must publish its record value: {:#?}",
+                interfaces[&store]
+            );
+        };
+        assert_eq!(shape.fields.get("count"), Some(&Type::Number));
+        assert_eq!(shape.fields.get("label"), Some(&Type::Text));
+    }
+
+    #[test]
+    fn broad_when_republishes_late_closed_capture_into_every_branch() {
+        let unit = link(concat!(
+            "store: [\n",
+            "    rows:\n",
+            "        selected |> THEN {\n",
+            "            LIST {\n",
+            "                [\n",
+            "                    id: TEXT { one }\n",
+            "                    item_kind: VariableRow\n",
+            "                    payload: TEXT { rich }\n",
+            "                ]\n",
+            "            }\n",
+            "        }\n",
+            "    visible:\n",
+            "        rows\n",
+            "        |> List/filter(item, if: item.item_kind == VariableRow)\n",
+            "    selected:\n",
+            "        True |> HOLD { False } |> WHEN {\n",
+            "            True => visible |> List/filter(item, if: item.id == TEXT { one })\n",
+            "            False => visible\n",
+            "        }\n",
+            "]\n",
+        ));
+        let rows = owner_named(&unit, "rows");
+        let visible = owner_named(&unit, "visible");
+        let selected = owner_named(&unit, "selected");
+        let seeds = unit
+            .stable_check_owner_keys()
+            .filter(|owner| matches!(owner, StableCheckOwnerKey::Item(_)))
+            .map(|owner| seed(&unit, &owner))
+            .collect::<Vec<_>>();
+        let summaries = seeds
+            .iter()
+            .map(|seed| resolve_owner_constraint_seed(seed, []).unwrap())
+            .collect::<Vec<_>>();
+        let results = solve(&seeds, &summaries);
+        let component = results
+            .iter()
+            .find(|result| result.owner(&selected).is_some())
+            .expect("selected interface component");
+        assert!(component.owner(&rows).is_some());
+        assert!(component.owner(&visible).is_some());
+        let interfaces = results
+            .iter()
+            .flat_map(|result| result.owners.iter())
+            .map(|interface| (interface.owner.clone(), interface))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            interfaces[&selected].result.ty, interfaces[&rows].result.ty,
+            "both WHEN branches must republish the exact late provider: {:#?}",
+            interfaces[&selected],
+        );
+        assert!(boon_checked::type_is_recursively_closed(
+            &interfaces[&selected].result.ty
+        ));
+    }
+
+    #[test]
+    fn broad_when_republishes_a_frozen_closed_dependency_into_every_branch() {
+        let unit = link(concat!(
+            "rows: LIST {\n",
+            "    [\n",
+            "        id: TEXT { one }\n",
+            "        item_kind: VariableRow\n",
+            "        payload: TEXT { rich }\n",
+            "    ]\n",
+            "}\n",
+            "visible:\n",
+            "    rows\n",
+            "    |> List/filter(item, if: item.item_kind == VariableRow)\n",
+            "flag: True |> HOLD { False }\n",
+            "selected:\n",
+            "    flag |> WHEN {\n",
+            "        True => visible |> List/filter(item, if: item.id == TEXT { one })\n",
+            "        False => visible\n",
+            "    }\n",
+        ));
+        let rows = owner_named(&unit, "rows");
+        let visible = owner_named(&unit, "visible");
+        let flag = owner_named(&unit, "flag");
+        let selected = owner_named(&unit, "selected");
+        let seeds = unit
+            .stable_check_owner_keys()
+            .filter(|owner| matches!(owner, StableCheckOwnerKey::Item(_)))
+            .map(|owner| seed(&unit, &owner))
+            .collect::<Vec<_>>();
+        let owners = [
+            ("rows", &rows),
+            ("visible", &visible),
+            ("flag", &flag),
+            ("selected", &selected),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let summaries = seeds
+            .iter()
+            .map(|seed| {
+                let resolutions = seed.references.iter().filter_map(|reference| {
+                    if reference.kind != OwnerReferenceKind::Value {
+                        return None;
+                    }
+                    let [name] = reference.parts.as_ref() else {
+                        return None;
+                    };
+                    owners
+                        .get(name.as_str())
+                        .map(|owner| ResolvedOwnerSymbolReference {
+                            reference: reference.clone(),
+                            owner: (*owner).clone(),
+                            projection: Box::new([]),
+                            parameters: Box::new([]),
+                        })
+                });
+                resolve_owner_constraint_seed(seed, resolutions).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let results = solve(&seeds, &summaries);
+        let interfaces = results
+            .iter()
+            .flat_map(|result| result.owners.iter())
+            .map(|interface| (interface.owner.clone(), interface))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            interfaces[&selected].result.ty, interfaces[&rows].result.ty,
+            "both WHEN branches must republish the frozen provider: {:#?}",
+            interfaces[&selected],
+        );
+        assert!(boon_checked::type_is_recursively_closed(
+            &interfaces[&selected].result.ty
+        ));
+    }
+
+    #[test]
+    fn dynamic_inputs_replay_inner_calls_before_enclosing_open_formals() {
+        let unit = link(concat!(
+            "FUNCTION identity(row) {\n",
+            "    row\n",
+            "}\n",
+            "FUNCTION project(row) {\n",
+            "    [\n",
+            "        kind: row.kind\n",
+            "        file: row.file\n",
+            "    ]\n",
+            "}\n",
+            "rows:\n",
+            "    LIST {\n",
+            "        [kind: First, file: TEXT { a }]\n",
+            "        [kind: Second, file: TEXT { b }]\n",
+            "    }\n",
+            "    |> List/map(\n",
+            "        item\n",
+            "        new: project(row: identity(row: item))\n",
+            "    )\n",
+        ));
+        let identity = owner_named(&unit, "identity");
+        let project = owner_named(&unit, "project");
+        let rows = owner_named(&unit, "rows");
+        let seeds = unit
+            .stable_check_owner_keys()
+            .filter(|owner| matches!(owner, StableCheckOwnerKey::Item(_)))
+            .map(|owner| seed(&unit, &owner))
+            .collect::<Vec<_>>();
+        let parameters_for = |owner: &StableCheckOwnerKey| {
+            seeds
+                .iter()
+                .find(|seed| &seed.owner == owner)
+                .expect("callable owner seed")
+                .declarations
+                .iter()
+                .find(|declaration| declaration.public)
+                .expect("callable public declaration")
+                .parameters
+                .clone()
+        };
+        let identity_parameters = parameters_for(&identity);
+        let project_parameters = parameters_for(&project);
+        let summaries = seeds
+            .iter()
+            .map(|seed| {
+                let resolutions = seed.references.iter().filter_map(|reference| {
+                    if reference.kind == OwnerReferenceKind::Callable
+                        && reference.parts.as_ref() == ["identity"]
+                    {
+                        Some(ResolvedOwnerSymbolReference {
+                            reference: reference.clone(),
+                            owner: identity.clone(),
+                            projection: Box::new([]),
+                            parameters: identity_parameters.clone(),
+                        })
+                    } else if reference.kind == OwnerReferenceKind::Callable
+                        && reference.parts.as_ref() == ["project"]
+                    {
+                        Some(ResolvedOwnerSymbolReference {
+                            reference: reference.clone(),
+                            owner: project.clone(),
+                            projection: Box::new([]),
+                            parameters: project_parameters.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                });
+                resolve_owner_constraint_seed(seed, resolutions).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let results = solve(&seeds, &summaries);
+        let interfaces = results
+            .iter()
+            .flat_map(|result| result.owners.iter())
+            .map(|interface| (interface.owner.clone(), interface))
+            .collect::<BTreeMap<_, _>>();
+        let identity_interface = interfaces[&identity];
+        assert_eq!(
+            identity_interface.parameters[0].flow_type.ty, identity_interface.result.ty,
+            "identity must retain one live parameter/result alpha",
+        );
+        assert!(matches!(identity_interface.result.ty, Type::Var(_)));
+
+        let Type::List(item) = &interfaces[&rows].result.ty else {
+            panic!("nested dynamic calls must publish a list result");
+        };
+        assert_eq!(
+            crate::type_for_nested_path(item, &["file".to_owned()]),
+            Some(Type::Text),
+        );
+        assert_eq!(
+            crate::type_for_nested_path(item, &["kind".to_owned()]),
+            Some(Type::VariantSet(
+                vec![
+                    Variant::Tag("First".to_owned()),
+                    Variant::Tag("Second".to_owned()),
+                ]
+                .into(),
+            )),
+        );
+        assert!(boon_checked::type_is_recursively_closed(
+            &interfaces[&rows].result.ty
+        ));
+    }
+
+    #[test]
+    fn nested_ordinary_call_results_publish_before_enclosing_input_matching() {
+        let unit = link(concat!(
+            "FUNCTION choose(kind) {\n",
+            "    kind |> WHEN {\n",
+            "        First => [kind: First, file: TEXT { a }]\n",
+            "        __ => [kind: Second, file: TEXT { b }]\n",
+            "    }\n",
+            "}\n",
+            "FUNCTION project(row) {\n",
+            "    [kind: row.kind, file: row.file]\n",
+            "}\n",
+            "value: project(row: choose(kind: First))\n",
+        ));
+        let choose = owner_named(&unit, "choose");
+        let project = owner_named(&unit, "project");
+        let value = owner_named(&unit, "value");
+        let seeds = unit
+            .stable_check_owner_keys()
+            .filter(|owner| matches!(owner, StableCheckOwnerKey::Item(_)))
+            .map(|owner| seed(&unit, &owner))
+            .collect::<Vec<_>>();
+        let parameters_for = |owner: &StableCheckOwnerKey| {
+            seeds
+                .iter()
+                .find(|seed| &seed.owner == owner)
+                .unwrap()
+                .declarations
+                .iter()
+                .find(|declaration| declaration.public)
+                .unwrap()
+                .parameters
+                .clone()
+        };
+        let choose_parameters = parameters_for(&choose);
+        let project_parameters = parameters_for(&project);
+        let summaries = seeds
+            .iter()
+            .map(|seed| {
+                let resolutions = seed.references.iter().filter_map(|reference| {
+                    let (owner, parameters) = if reference.kind == OwnerReferenceKind::Callable
+                        && reference.parts.as_ref() == ["choose"]
+                    {
+                        (choose.clone(), choose_parameters.clone())
+                    } else if reference.kind == OwnerReferenceKind::Callable
+                        && reference.parts.as_ref() == ["project"]
+                    {
+                        (project.clone(), project_parameters.clone())
+                    } else {
+                        return None;
+                    };
+                    Some(ResolvedOwnerSymbolReference {
+                        reference: reference.clone(),
+                        owner,
+                        projection: Box::new([]),
+                        parameters,
+                    })
+                });
+                resolve_owner_constraint_seed(seed, resolutions).unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let results = solve(&seeds, &summaries);
+        let interface = results
+            .iter()
+            .find_map(|result| result.owner(&value))
+            .expect("value interface");
+        assert!(boon_checked::type_is_recursively_closed(
+            &interface.result.ty
+        ));
+        assert_eq!(
+            crate::type_for_nested_path(&interface.result.ty, &["file".to_owned()]),
+            Some(Type::Text),
+        );
+        assert_eq!(
+            crate::type_for_nested_path(&interface.result.ty, &["kind".to_owned()]),
+            Some(Type::VariantSet(
+                vec![
+                    Variant::Tag("First".to_owned()),
+                    Variant::Tag("Second".to_owned()),
+                ]
+                .into(),
+            )),
+        );
     }
 
     #[test]

@@ -277,7 +277,12 @@ pub struct SemanticPayloadFieldV1 {
 pub struct SemanticStateResourceV1 {
     pub id: SemanticStateId,
     pub checked_state: CheckedStateId,
+    /// Canonical storage anchor from the checked state path. Function-local
+    /// states use the callable declaration plus a generated path segment.
     pub declaration: DeclId,
+    /// Exact lexical declaration referenced by HOLD self-reads. This can
+    /// differ from `declaration` for a state nested in a callable record.
+    pub binding_declaration: DeclId,
     pub statement: SemanticStatementId,
     pub checked_statement: CheckedStatementId,
     pub expression: SemanticExprId,
@@ -731,10 +736,10 @@ fn typed_list_targets(
             if target.declaration != checked_list.declaration || target.path != path {
                 continue;
             }
-            let Some(authority) = inline_list_authority_root(execution, target.producer)? else {
+            let Some(authority) = inline_list_authority(execution, target.producer)? else {
                 continue;
             };
-            if expression(execution, authority)?.checked_expr_id == checked_list.producer {
+            if expression(execution, authority.root)?.checked_expr_id == checked_list.producer {
                 matches.push(index);
             }
         }
@@ -841,16 +846,21 @@ fn typed_list_targets(
                 ));
             }
             let target = &mut targets[index];
-            if target.item_type != checked_list.item_type
+            let authority = inline_list_authority(execution, target.producer)?;
+            let mapped_item_authority = authority.is_some_and(|authority| authority.maps_items);
+            if !authority.is_some_and(|authority| {
+                authority.accepts_item_type(&checked_list.item_type, &target.item_type)
+            })
                 || target.capacity != checked_list.capacity
                 || target.alias.is_some()
             {
                 return Err(format!(
-                    "checked list {} differs from semantic list target {}: item type {:?} vs {:?}, capacity {:?} vs {:?}, alias {:?}",
+                    "checked list {} differs from semantic list target {}: item type {:?} vs {:?}, mapped item authority {}, capacity {:?} vs {:?}, alias {:?}",
                     checked_list.id.0,
                     target.statement,
                     checked_list.item_type,
                     target.item_type,
+                    mapped_item_authority,
                     checked_list.capacity,
                     target.capacity,
                     target.alias,
@@ -2192,12 +2202,25 @@ fn static_projection(
     Ok(value)
 }
 
-fn inline_list_authority_root(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InlineListAuthority {
+    root: SemanticExprId,
+    maps_items: bool,
+}
+
+impl InlineListAuthority {
+    fn accepts_item_type(self, checked: &Type, target: &Type) -> bool {
+        checked == target || self.maps_items
+    }
+}
+
+fn inline_list_authority(
     execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
-) -> Result<Option<SemanticExprId>, String> {
+) -> Result<Option<InlineListAuthority>, String> {
     let mut next = Some(root);
     let mut visited = BTreeSet::new();
+    let mut maps_items = false;
     while let Some(id) = next.take() {
         if !visited.insert(id) {
             return Err(format!(
@@ -2206,13 +2229,24 @@ fn inline_list_authority_root(
         }
         let value = expression(execution, id)?;
         next = match &value.kind {
-            SemanticExpressionKind::List { .. } => return Ok(Some(id)),
-            SemanticExpressionKind::Call { name, .. } if name == "List/range" => {
-                return Ok(Some(id));
+            SemanticExpressionKind::List { .. } => {
+                return Ok(Some(InlineListAuthority {
+                    root: id,
+                    maps_items,
+                }));
             }
-            SemanticExpressionKind::Call { arguments, .. }
+            SemanticExpressionKind::Call { name, .. } if name == "List/range" => {
+                return Ok(Some(InlineListAuthority {
+                    root: id,
+                    maps_items,
+                }));
+            }
+            SemanticExpressionKind::Call {
+                name, arguments, ..
+            }
                 if matches!(value.flow_type.ty, Type::List(_)) =>
             {
+                maps_items |= name == "List/map";
                 let mut inputs = Vec::new();
                 for argument in arguments {
                     let input = expression(execution, argument.value)?;
@@ -2225,11 +2259,17 @@ fn inline_list_authority_root(
                     _ => return Ok(None),
                 }
             }
-            SemanticExpressionKind::Materialize { materialization } => execution
-                .materializations
-                .get(materialization.as_usize())
-                .filter(|candidate| candidate.id == *materialization)
-                .map(|materialization| materialization.source),
+            SemanticExpressionKind::Materialize { materialization } => {
+                let Some(materialization) = execution
+                    .materializations
+                    .get(materialization.as_usize())
+                    .filter(|candidate| candidate.id == *materialization)
+                else {
+                    return Ok(None);
+                };
+                maps_items |= materialization.operation == SemanticContextualOperationKind::Map;
+                Some(materialization.source)
+            }
             SemanticExpressionKind::Draining { input }
             | SemanticExpressionKind::Project { input, .. } => Some(*input),
             SemanticExpressionKind::Block { result, .. } => Some(*result),
@@ -2245,6 +2285,13 @@ fn inline_list_authority_root(
         };
     }
     Ok(None)
+}
+
+fn inline_list_authority_root(
+    execution: &SemanticExecutionImageColumnsV1,
+    root: SemanticExprId,
+) -> Result<Option<SemanticExprId>, String> {
+    Ok(inline_list_authority(execution, root)?.map(|authority| authority.root))
 }
 
 fn materialization_target_lists(
@@ -4198,6 +4245,22 @@ fn build_state_resources(
             )
         })?;
         let value = expression(execution, state.expression)?;
+        let binding_declaration = checked
+            .expressions
+            .get(checked_state.expression.0 as usize)
+            .filter(|candidate| candidate.id == checked_state.expression)
+            .and_then(|expression| expression.declaration)
+            .unwrap_or(state.declaration);
+        checked
+            .declarations
+            .iter()
+            .find(|candidate| candidate.id == binding_declaration)
+            .ok_or_else(|| {
+                format!(
+                    "semantic state {} references missing lexical binding declaration {}",
+                    state.id, binding_declaration.0
+                )
+            })?;
         expression(execution, state.initial)?;
         let concrete_initial = semantic_state_initial_expression(execution, state.expression)?;
         if checked_state.declaration != state.declaration
@@ -4221,10 +4284,10 @@ fn build_state_resources(
         let statement = state.statement;
         let expression_members = reachable_expression_members(execution, state.expression)?;
         let is_published = semantic_state_is_published(execution, state)?;
-        if is_published && !published.insert((state.declaration, state.owner)) {
+        if is_published && !published.insert((state.owner, declared_path.clone())) {
             return Err(format!(
-                "declaration {} owner {:?} publishes more than one semantic state",
-                state.declaration.0, state.owner
+                "declaration {} owner {:?} publishes semantic state path `{declared_path}` more than once",
+                state.declaration.0, state.owner,
             ));
         }
         let authority_row =
@@ -4266,6 +4329,7 @@ fn build_state_resources(
             id: state.id,
             checked_state: state.checked_state,
             declaration: state.declaration,
+            binding_declaration,
             statement,
             checked_statement: checked_state.statement,
             expression: state.expression,
@@ -6514,12 +6578,130 @@ remaining:
 count: store.todos |> List/count()
 "#,
         );
+        let todos = semantic
+            .resource_graph
+            .lists
+            .iter()
+            .find(|list| list.semantic_path == "store.todos")
+            .expect("store.todos mapped list authority");
+        let checked_list_id = match &todos.origin {
+            SemanticListResourceOriginV1::CheckedLiteral { checked_list } => *checked_list,
+            _ => panic!("mapped storage lost its input literal row authority: {todos:#?}"),
+        };
+        let checked_list = semantic
+            .checked_program
+            .lists
+            .get(checked_list_id.0 as usize)
+            .filter(|candidate| candidate.id == checked_list_id)
+            .expect("mapped storage checked literal");
+        let Type::Object(checked_item) = &checked_list.item_type else {
+            panic!("input literal item is not an object: {checked_list:#?}");
+        };
+        let Type::Object(mapped_item) = &todos.item_type else {
+            panic!("mapped storage item is not an object: {todos:#?}");
+        };
+        assert!(checked_item.fields.contains_key("completed"));
         assert!(
-            semantic
-                .resource_graph
-                .lists
+            ["remove", "toggle", "edit", "title", "completed"]
+                .into_iter()
+                .all(|field| mapped_item.fields.contains_key(field)),
+            "the stored row must retain the mapped runtime schema: {mapped_item:#?}"
+        );
+        let SemanticListInitializerV1::RecordLiteral { rows, .. } = &todos.initializer else {
+            panic!("mapped storage lost its literal rows: {todos:#?}");
+        };
+        assert!(
+            rows.iter().all(|row| row
+                .fields
                 .iter()
-                .any(|list| list.semantic_path == "store.todos")
+                .map(|field| field.name.as_str())
+                .eq(["completed"])),
+            "mapped storage initializers must retain only authored input fields: {rows:#?}"
+        );
+        let authority = inline_list_authority(semantic.execution_graph(), todos.producer)
+            .expect("mapped list route is valid")
+            .expect("mapped list reaches its literal authority");
+        assert!(
+            authority.maps_items,
+            "item-type divergence is exact only across an explicit List/map"
+        );
+        let sparse_input = Type::object(boon_checked::ObjectShape::from_ordered_fields(
+            [("completed".to_owned(), Type::Text)],
+            false,
+        ));
+        assert!(
+            authority.accepts_item_type(&sparse_input, &todos.item_type),
+            "an explicit map may transform its checked input row schema"
+        );
+        assert!(
+            !InlineListAuthority {
+                root: authority.root,
+                maps_items: false,
+            }
+            .accepts_item_type(&sparse_input, &todos.item_type),
+            "identity-preserving list routes must still require exact item types"
+        );
+        assert_eq!(
+            semantic.execution_graph().expressions[authority.root.as_usize()].checked_expr_id,
+            checked_list.producer
+        );
+    }
+
+    #[test]
+    fn contextual_callable_may_publish_two_distinct_hold_paths() {
+        let semantic = elaborate_source(
+            r#"
+first_rows:
+    LIST { [first: 1, second: 2] }
+    |> List/map(item, new: stateful_row(row: item))
+
+second_rows:
+    LIST { [first: 3, second: 4] }
+    |> List/map(item, new: stateful_row(row: item))
+
+FUNCTION stateful_row(row) {
+    [
+        toggle: SOURCE
+        first: row.first |> HOLD first {
+            toggle |> THEN {
+                row.first == 1 |> WHEN {
+                    True => 2
+                    False => first
+                }
+            }
+        }
+        second: row.second |> HOLD second {
+            toggle |> THEN { second }
+        }
+    ]
+}
+"#,
+        );
+        let mut contextual_states = semantic
+            .resource_graph
+            .states
+            .iter()
+            .filter(|state| state.owner.is_some() && state.published)
+            .collect::<Vec<_>>();
+        contextual_states.sort_by(|left, right| left.declared_path.cmp(&right.declared_path));
+        assert_eq!(contextual_states.len(), 4, "{contextual_states:#?}");
+        let states_by_owner = contextual_states.iter().fold(
+            BTreeMap::<Option<StaticOwnerId>, Vec<_>>::new(),
+            |mut by_owner, state| {
+                by_owner.entry(state.owner).or_default().push(*state);
+                by_owner
+            },
+        );
+        assert_eq!(states_by_owner.len(), 2, "{states_by_owner:#?}");
+        assert!(states_by_owner.values().all(|states| {
+            states.len() == 2 && states[0].declared_path != states[1].declared_path
+        }));
+        assert_eq!(
+            contextual_states
+                .iter()
+                .map(|state| state.hold_name.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["first", "second"])
         );
     }
 

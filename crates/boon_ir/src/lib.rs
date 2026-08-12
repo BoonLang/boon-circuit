@@ -1365,20 +1365,59 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
             ErasedBindingTarget::State {
                 executable,
                 runtime,
+                published,
                 ..
             } => {
-                if !program
+                let executable_state = program
                     .executable
                     .states
-                    .iter()
-                    .any(|state| state.id == executable && state.declaration == binding.declaration)
-                    || !program.state_cells.iter().any(|state| {
-                        state.id == runtime && state.executable_state_id == Some(executable)
-                    })
+                    .get(executable.as_usize())
+                    .filter(|state| state.id == executable)
+                    .ok_or_else(|| {
+                        format!(
+                            "storage binding {} references missing executable state {executable}",
+                            binding.id,
+                        )
+                    })?;
+                // State declarations have two intentional authorities: the
+                // executable definition keeps the canonical storage/path
+                // anchor, while this binding keeps the lexical HOLD self-read
+                // declaration. Join the allocation through its exact state
+                // and producer identities, never by comparing those distinct
+                // declaration namespaces.
+                if executable_state.expression != binding.producer
+                    || executable_state.owner != binding.static_owner
                 {
                     return Err(format!(
-                        "storage binding {} has an invalid state allocation",
-                        binding.id
+                        "storage binding {} state {executable} has producer/owner {:?}/{:?}, expected {}/{:?}",
+                        binding.id,
+                        executable_state.expression,
+                        executable_state.owner,
+                        binding.producer,
+                        binding.static_owner,
+                    ));
+                }
+                let runtime_state = program
+                    .state_cells
+                    .get(runtime.as_usize())
+                    .filter(|state| state.id == runtime)
+                    .ok_or_else(|| {
+                        format!(
+                            "storage binding {} references missing runtime state {runtime}",
+                            binding.id,
+                        )
+                    })?;
+                if runtime_state.executable_state_id != Some(executable)
+                    || runtime_state.static_owner != binding.static_owner
+                    || runtime_state.published != published
+                {
+                    return Err(format!(
+                        "storage binding {} runtime state {runtime} has executable/owner/published {:?}/{:?}/{}, expected {executable}/{:?}/{published}",
+                        binding.id,
+                        runtime_state.executable_state_id,
+                        runtime_state.static_owner,
+                        runtime_state.published,
+                        binding.static_owner,
                     ));
                 }
             }
@@ -3675,6 +3714,59 @@ mod typed_derived_list_storage_tests {
         assert_eq!(list.row_scope_id, Some(row_scope_id));
         assert!(list.has_generation);
         (list_id, row_scope_id)
+    }
+
+    #[test]
+    fn contextual_hold_binding_joins_state_allocation_by_producer() {
+        let parsed = boon_parser::parse_source(
+            "contextual-hold-state-allocation.bn",
+            r#"
+rows: LIST { [initial: First] }
+result:
+    rows
+    |> List/map(item, new: wrapper(row: item))
+
+FUNCTION wrapper(row) {
+    stateful(row: row)
+}
+
+FUNCTION stateful(row) {
+    [
+        controls: [toggle: SOURCE]
+        current:
+            row.initial |> HOLD current {
+                controls.toggle |> THEN { current }
+            }
+    ]
+}
+"#,
+        )
+        .unwrap();
+        let ir = lower(&parsed).expect("contextual HOLD allocation must lower");
+        let binding = ir
+            .scope_index
+            .bindings
+            .iter()
+            .find(|binding| matches!(binding.target, ErasedBindingTarget::State { .. }))
+            .expect("contextual HOLD storage binding");
+        let ErasedBindingTarget::State {
+            executable,
+            runtime,
+            ..
+        } = binding.target
+        else {
+            unreachable!("filtered to a state binding")
+        };
+        let executable_state = &ir.executable.states[executable.as_usize()];
+        let runtime_state = &ir.state_cells[runtime.as_usize()];
+        assert_eq!(executable_state.expression, binding.producer);
+        assert_eq!(runtime_state.executable_state_id, Some(executable));
+
+        let mut stale = ir.clone();
+        stale.fields.executable.states[executable.as_usize()].expression = executable_state.initial;
+        let error = verify_erased_scope_index(&stale)
+            .expect_err("a state allocation with a stale producer must fail closed");
+        assert!(error.contains("producer/owner"), "{error}");
     }
 
     #[test]

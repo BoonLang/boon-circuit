@@ -13,7 +13,7 @@ use crate::{
     SemanticFieldId, SemanticHostEffectScheduleId, SemanticListId, SemanticListMutationId,
     SemanticListResourceOriginV1, SemanticLocalBindingId, SemanticMaterializationId,
     SemanticMaterializationLocalId, SemanticParameterId, SemanticPulseBatchId, SemanticReadId,
-    SemanticResourceGraphV1, SemanticRootKindV1, SemanticRowBinding, SemanticRowScopeId,
+    SemanticResourceGraphV2, SemanticRootKindV1, SemanticRowBinding, SemanticRowScopeId,
     SemanticScopeId, SemanticSourceId, SemanticStateId, SemanticStateUpdateArmId,
     SemanticStatementId, SemanticStatementKind, SemanticTriggerArmId, SemanticValueId,
     SemanticValueOrigin, StaticOwnerId,
@@ -444,12 +444,12 @@ pub struct SemanticDerivedValueV1 {
     pub producer: SemanticExprId,
     pub value: SemanticValueId,
     pub kind: SemanticDerivedValueKindV1,
-    /// Exact whole-value HOLD state backing a producer result.
+    /// Exact whole-value state backing this derived value.
     ///
     /// This is semantic state identity, not a diagnostic path or an
-    /// executable-expression guess. A producer result may retain a
-    /// context-free checked fallback expression even though its expanded
-    /// value is the current value of a distinct state occurrence.
+    /// executable-expression guess. An ordinary field may be a facade for the
+    /// canonical state expression; a producer-result wrapper may instead
+    /// retain exact state provenance around a context-free checked fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_backing: Option<SemanticStateId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -567,7 +567,7 @@ impl From<String> for SemanticReactiveError {
 /// resolved-OUT identity.  There is no name/path fallback.
 pub fn build_semantic_reactive_graph(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     out_net: &ResolvedOutGraph,
 ) -> Result<SemanticReactiveGraphV1, SemanticReactiveError> {
     build_semantic_reactive_graph_with_external_events(execution, resources, out_net, &[])
@@ -575,7 +575,7 @@ pub fn build_semantic_reactive_graph(
 
 pub fn build_semantic_reactive_graph_with_external_events(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     out_net: &ResolvedOutGraph,
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
 ) -> Result<SemanticReactiveGraphV1, SemanticReactiveError> {
@@ -602,7 +602,7 @@ pub fn build_semantic_reactive_graph_with_external_events(
 /// prove inputs that were just validated by the orchestrating elaboration.
 pub(crate) fn build_semantic_reactive_graph_from_validated_inputs(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     out_net: &ResolvedOutGraph,
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
 ) -> Result<SemanticReactiveGraphV1, SemanticReactiveError> {
@@ -672,7 +672,7 @@ impl SemanticReactiveGraphV1 {
     pub fn validate(
         &self,
         execution: &SemanticExecutionImageColumnsV1,
-        resources: &SemanticResourceGraphV1,
+        resources: &SemanticResourceGraphV2,
         out_net: &ResolvedOutGraph,
     ) -> Result<(), SemanticReactiveError> {
         let expected = build_semantic_reactive_graph_with_external_events(
@@ -857,21 +857,44 @@ impl ReactiveReachabilityIndex {
             )?;
 
             match &expression.kind {
-                SemanticExpressionKind::CanonicalRead { target, .. } => {
-                    let binding = match reads_by_expression[index].map(|read| &read.target) {
+                SemanticExpressionKind::CanonicalRead {
+                    target,
+                    projection: expression_projection,
+                    ..
+                } => {
+                    let (binding, projection) = match reads_by_expression[index]
+                        .map(|read| &read.target)
+                    {
+                        Some(SemanticReadTargetV1::Binding {
+                            binding,
+                            projection,
+                        }) => (
+                            bindings
+                                .get(binding.as_usize())
+                                .filter(|candidate| candidate.id == *binding)
+                                .ok_or_else(|| {
+                                    SemanticReactiveError::new(format!(
+                                        "semantic reachability read {} references missing binding {binding}",
+                                        expression.id
+                                    ))
+                                })?,
+                            Some(projection.as_slice()),
+                        ),
                         Some(
-                            SemanticReadTargetV1::Binding { binding, .. }
-                            | SemanticReadTargetV1::SourcePayload { binding, .. }
+                            SemanticReadTargetV1::SourcePayload { binding, .. }
                             | SemanticReadTargetV1::StateProjection { binding, .. },
-                        ) => bindings
-                            .get(binding.as_usize())
-                            .filter(|candidate| candidate.id == *binding)
-                            .ok_or_else(|| {
-                                SemanticReactiveError::new(format!(
-                                    "semantic reachability read {} references missing binding {binding}",
-                                    expression.id
-                                ))
-                            })?,
+                        ) => (
+                            bindings
+                                .get(binding.as_usize())
+                                .filter(|candidate| candidate.id == *binding)
+                                .ok_or_else(|| {
+                                    SemanticReactiveError::new(format!(
+                                        "semantic reachability read {} references missing binding {binding}",
+                                        expression.id
+                                    ))
+                                })?,
+                            None,
+                        ),
                         Some(other) => {
                             return Err(SemanticReactiveError::new(format!(
                                 "semantic canonical read {} has non-binding target {other:?}",
@@ -881,13 +904,23 @@ impl ReactiveReachabilityIndex {
                         None if builder.is_detached_context_free_local_read_copy(expression) => {
                             continue;
                         }
-                        None => builder.resolve_decl_binding(*target, expression, bindings)?,
+                        None => (
+                            builder.resolve_decl_binding(*target, expression, bindings)?,
+                            Some(expression_projection.as_slice()),
+                        ),
                     };
+                    let producer = projection
+                        .map(|projection| {
+                            exact_projected_binding_producer(builder.execution, binding, projection)
+                        })
+                        .transpose()?
+                        .flatten()
+                        .unwrap_or(binding.producer);
                     Self::insert_reverse_edges(
                         builder.execution,
                         &mut value_parents,
                         expression.id,
-                        std::iter::once(binding.producer),
+                        std::iter::once(producer),
                         "value",
                     )?;
                 }
@@ -1070,19 +1103,20 @@ fn reachable_reactive_expressions(
 
 struct ReactiveBuilder<'a> {
     execution: &'a SemanticExecutionImageColumnsV1,
-    resources: &'a SemanticResourceGraphV1,
+    resources: &'a SemanticResourceGraphV2,
     out_net: &'a ResolvedOutGraph,
     reachable_expressions: BTreeSet<SemanticExprId>,
     reachable_local_checked_expressions: BTreeSet<CheckedExprId>,
     local_values: BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
     parameter_inputs: BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
+    states_by_expression: BTreeMap<SemanticExprId, SemanticStateId>,
     external_event_identities: BTreeSet<CheckedExternalDeclarationIdentityV1>,
 }
 
 impl<'a> ReactiveBuilder<'a> {
     fn new(
         execution: &'a SemanticExecutionImageColumnsV1,
-        resources: &'a SemanticResourceGraphV1,
+        resources: &'a SemanticResourceGraphV2,
         out_net: &'a ResolvedOutGraph,
         external_event_identities: BTreeSet<CheckedExternalDeclarationIdentityV1>,
     ) -> Result<Self, SemanticReactiveError> {
@@ -1148,6 +1182,15 @@ impl<'a> ReactiveBuilder<'a> {
                 pending.extend(semantic_expression_children(&expression.kind, execution)?);
             }
         }
+        let mut states_by_expression = BTreeMap::new();
+        for state in &resources.states {
+            if let Some(previous) = states_by_expression.insert(state.expression, state.id) {
+                return Err(SemanticReactiveError::new(format!(
+                    "semantic states {previous} and {} share exact expression {}",
+                    state.id, state.expression,
+                )));
+            }
+        }
         Ok(Self {
             execution,
             resources,
@@ -1156,6 +1199,7 @@ impl<'a> ReactiveBuilder<'a> {
             reachable_local_checked_expressions,
             local_values,
             parameter_inputs,
+            states_by_expression,
             external_event_identities,
         })
     }
@@ -1842,14 +1886,7 @@ impl<'a> ReactiveBuilder<'a> {
         let output_values = reactive_phase!("output_values", self.build_output_values(&fields))?;
         let view_captures = reactive_phase!(
             "view_captures",
-            self.build_view_captures(
-                &output_values,
-                &fields,
-                &bindings,
-                &reads,
-                &mut triggers,
-                &pulse_states,
-            )
+            self.build_view_captures(&output_values, &fields, &bindings, &reads, &mut triggers,)
         )?;
         let migration_inputs = reactive_phase!("migration_inputs", self.build_migration_inputs())?;
         let pulse_batches = reactive_phase!(
@@ -3044,7 +3081,7 @@ impl<'a> ReactiveBuilder<'a> {
                 continue;
             }
             let state_backing =
-                self.producer_result_state_backing(binding.statement, binding.producer)?;
+                self.exact_derived_state_backing(binding.statement, binding.producer)?;
             let state_backed_current = state_backing.is_some();
             let triggers_for_value = if structural_group
                 || materialized.is_some()
@@ -3109,15 +3146,15 @@ impl<'a> ReactiveBuilder<'a> {
         Ok(result)
     }
 
-    fn producer_result_state_backing(
+    fn exact_derived_state_backing(
         &self,
         statement: SemanticStatementId,
         expression: SemanticExprId,
     ) -> Result<Option<SemanticStateId>, SemanticReactiveError> {
-        // A synthetic invocation wrapper can make a producer result appear
-        // event-owned even when its actual value is only current HOLD state.
-        // Preserve that result as a pure state read; the state update schedule
-        // owns any nested SOURCE or host effect.
+        // An ordinary field can expose the canonical state expression, while
+        // a synthetic invocation wrapper can expose that state through exact
+        // producer-result provenance. Preserve either as a pure state read;
+        // the state update schedule owns any nested SOURCE or host effect.
         let statement = self
             .execution
             .statements
@@ -3125,16 +3162,49 @@ impl<'a> ReactiveBuilder<'a> {
             .filter(|candidate| candidate.id == statement)
             .ok_or_else(|| {
                 SemanticReactiveError::new(format!(
-                    "derived producer result references missing semantic statement {statement}"
+                    "derived value references missing semantic statement {statement}"
                 ))
             })?;
+        let expression = self.execution.expression(expression)?;
+        if let Some(state) = self.states_by_expression.get(&expression.id).copied() {
+            let resource = self
+                .resources
+                .states
+                .get(state.as_usize())
+                .filter(|candidate| candidate.id == state)
+                .ok_or_else(|| {
+                    SemanticReactiveError::new(format!(
+                        "derived expression {} maps to missing exact state {state}",
+                        expression.id,
+                    ))
+                })?;
+            let [member] = expression.provenance.members.as_slice() else {
+                return Err(SemanticReactiveError::new(format!(
+                    "derived expression {} is exact state {} but has non-exact value provenance",
+                    expression.id, resource.id,
+                )));
+            };
+            if !member.path.is_empty()
+                || !matches!(
+                    member.origin,
+                    SemanticValueOrigin::State { state, owner }
+                        if state == resource.id && owner == resource.owner
+                )
+                || resource.flow_type != expression.flow_type
+            {
+                return Err(SemanticReactiveError::new(format!(
+                    "derived expression {} has stale exact state provenance for state {}",
+                    expression.id, resource.id,
+                )));
+            }
+            return Ok(Some(resource.id));
+        }
         if !matches!(
             statement.origin,
             crate::SemanticStatementOrigin::ProducerResult { .. }
         ) {
             return Ok(None);
         }
-        let expression = self.execution.expression(expression)?;
         let [member] = expression.provenance.members.as_slice() else {
             return Ok(None);
         };
@@ -3935,7 +4005,6 @@ impl<'a> ReactiveBuilder<'a> {
         bindings: &[SemanticBindingV1],
         reads: &[SemanticReadBindingV1],
         triggers: &mut TriggerResolver<'_>,
-        pulse_states: &BTreeMap<SemanticPulseBatchId, SemanticStateId>,
     ) -> Result<Vec<SemanticViewCaptureV1>, SemanticReactiveError> {
         let reads_by_expression = reads
             .iter()
@@ -3971,22 +4040,15 @@ impl<'a> ReactiveBuilder<'a> {
                         }
                         _ => SemanticViewCaptureTargetV1::Read { read: read.id },
                     };
-                    let trigger_scope = trigger_row_scope(
-                        &triggers.event_causes_for_expression(expression)?,
-                        self.resources,
-                        pulse_states,
-                    )?;
-                    let read_scope =
-                        materialization_local_read_scope(read, self.execution, self.resources)?;
-                    let row_scope = match (trigger_scope, read_scope) {
-                        (Some(trigger), Some(read)) if trigger != read => {
-                            return Err(SemanticReactiveError::new(format!(
-                                "view capture expression {expression} has trigger row scope {trigger} but reads materialization row scope {read}"
-                            )));
-                        }
-                        (Some(scope), _) | (_, Some(scope)) => Some(scope),
-                        (None, None) => None,
-                    };
+                    // Placement identity belongs to the value being captured,
+                    // not to every transitive event that can schedule its
+                    // producer. A map may legitimately depend on sources in an
+                    // input row while publishing freshly-created sources in a
+                    // different output row. Trigger traversal must retain both
+                    // dependency layers, but the capture belongs only to the
+                    // exact routed storage/list authority.
+                    let row_scope =
+                        self.view_capture_read_row_scope(read, fields, bindings, triggers)?;
                     raw.insert((output.ordinal, expression, read.value, target, row_scope));
                 } else if let Some(field) = fields_by_expression.get(&expression) {
                     raw.insert((
@@ -4015,6 +4077,127 @@ impl<'a> ReactiveBuilder<'a> {
                 },
             )
             .collect())
+    }
+
+    fn view_capture_read_row_scope(
+        &self,
+        read: &SemanticReadBindingV1,
+        fields: &[SemanticFieldV1],
+        bindings: &[SemanticBindingV1],
+        triggers: &TriggerResolver<'_>,
+    ) -> Result<Option<SemanticRowScopeId>, SemanticReactiveError> {
+        let source_scope = |source: SemanticSourceId| {
+            self.resources
+                .sources
+                .get(source.as_usize())
+                .filter(|candidate| candidate.id == source)
+                .map(|source| source.row_scope)
+                .ok_or_else(|| {
+                    SemanticReactiveError::new(format!(
+                        "view capture read {} references missing source {source}",
+                        read.id
+                    ))
+                })
+        };
+        let state_scope = |state: SemanticStateId| {
+            self.resources
+                .states
+                .get(state.as_usize())
+                .filter(|candidate| candidate.id == state)
+                .map(|state| state.row_scope)
+                .ok_or_else(|| {
+                    SemanticReactiveError::new(format!(
+                        "view capture read {} references missing state {state}",
+                        read.id
+                    ))
+                })
+        };
+        match read.target {
+            SemanticReadTargetV1::SourcePayload { source, .. } => return source_scope(source),
+            SemanticReadTargetV1::StateProjection { state, .. } => return state_scope(state),
+            SemanticReadTargetV1::MaterializationLocal { .. } => {
+                return materialization_local_read_scope(read, self.execution, self.resources);
+            }
+            SemanticReadTargetV1::Binding { binding, .. } => {
+                let binding = bindings
+                    .get(binding.as_usize())
+                    .filter(|candidate| candidate.id == binding)
+                    .ok_or_else(|| {
+                        SemanticReactiveError::new(format!(
+                            "view capture read {} references missing binding {binding}",
+                            read.id
+                        ))
+                    })?;
+                let direct = match binding.target {
+                    SemanticBindingTargetV1::List { list } => Some(
+                        self.resources
+                            .lists
+                            .get(list.as_usize())
+                            .filter(|candidate| candidate.id == list)
+                            .ok_or_else(|| {
+                                SemanticReactiveError::new(format!(
+                                    "view capture read {} references missing list {list}",
+                                    read.id
+                                ))
+                            })?
+                            .row_scope,
+                    ),
+                    SemanticBindingTargetV1::Source { source } => source_scope(source)?,
+                    SemanticBindingTargetV1::State { state } => state_scope(state)?,
+                    SemanticBindingTargetV1::Field { field } => fields
+                        .get(field.as_usize())
+                        .filter(|candidate| candidate.id == field)
+                        .ok_or_else(|| {
+                            SemanticReactiveError::new(format!(
+                                "view capture read {} references missing field {field}",
+                                read.id
+                            ))
+                        })?
+                        .row
+                        .map(|row| row.scope),
+                };
+                if direct.is_some() {
+                    return Ok(direct);
+                }
+            }
+            SemanticReadTargetV1::External { .. }
+            | SemanticReadTargetV1::Local { .. }
+            | SemanticReadTargetV1::ElementState { .. }
+            | SemanticReadTargetV1::FunctionParameter { .. } => return Ok(None),
+        }
+
+        let TriggerReadRoute::Producer { expression, .. } = triggers.read_route(read.expression)?
+        else {
+            return Ok(None);
+        };
+        let lists_by_declaration = self
+            .resources
+            .lists
+            .iter()
+            .map(|list| (list.declaration, list.id))
+            .collect::<BTreeMap<_, _>>();
+        let Some(list) = crate::resource::semantic_list_id(
+            self.execution,
+            &self.resources.materialization_bindings,
+            &lists_by_declaration,
+            &self.local_values,
+            expression,
+        )
+        .map_err(SemanticReactiveError::new)?
+        else {
+            return Ok(None);
+        };
+        self.resources
+            .lists
+            .get(list.as_usize())
+            .filter(|candidate| candidate.id == list)
+            .map(|list| Some(list.row_scope))
+            .ok_or_else(|| {
+                SemanticReactiveError::new(format!(
+                    "view capture read {} routed to missing list {list}",
+                    read.id
+                ))
+            })
     }
 
     fn build_migration_inputs(
@@ -4087,15 +4270,78 @@ struct RawDerivedValue {
 enum TriggerReadRoute {
     Producer {
         expression: SemanticExprId,
-        suppress_unprojected_provenance: bool,
+        /// The route already identifies the exact projected authority. Any
+        /// provenance cached on the consumer read predates that resolution
+        /// and may still describe the whole aggregate.
+        suppress_consumer_provenance: bool,
     },
     Cause(SemanticEventCauseV1),
     NonValue,
 }
 
+/// Resolve a projected read to an exact explicit record-field producer.
+///
+/// Runtime value reads retain their canonical declaration plus projection.
+/// Trigger discovery, however, must not traverse the declaration's entire
+/// aggregate producer when every projection segment names one unique explicit
+/// field. Doing so can walk through an unrelated sibling that reads the same
+/// aggregate and manufacture a producer cycle. Spread or partial projections
+/// deliberately keep the aggregate route because they have no single static
+/// field authority.
+fn exact_projected_trigger_producer(
+    execution: &SemanticExecutionImageColumnsV1,
+    producer: SemanticExprId,
+    projection: &[String],
+) -> Result<Option<SemanticExprId>, SemanticReactiveError> {
+    if projection.is_empty() {
+        return Ok(None);
+    }
+    let mut current = producer;
+    for field_name in projection {
+        let expression = execution.expression(current)?;
+        let fields = match &expression.kind {
+            SemanticExpressionKind::Object(fields)
+            | SemanticExpressionKind::TaggedObject { fields, .. } => fields,
+            _ => return Ok(None),
+        };
+        if fields.iter().any(|field| field.spread) {
+            return Ok(None);
+        }
+        let matches = fields
+            .iter()
+            .filter(|field| field.name == *field_name)
+            .collect::<Vec<_>>();
+        let [field] = matches.as_slice() else {
+            if matches.is_empty() {
+                return Ok(None);
+            }
+            return Err(SemanticReactiveError::new(format!(
+                "semantic trigger projection `{field_name}` from {current} resolves to {} explicit fields",
+                matches.len()
+            )));
+        };
+        current = field.value;
+    }
+    Ok(Some(current))
+}
+
+fn exact_projected_binding_producer(
+    execution: &SemanticExecutionImageColumnsV1,
+    binding: &SemanticBindingV1,
+    projection: &[String],
+) -> Result<Option<SemanticExprId>, SemanticReactiveError> {
+    if !matches!(
+        &binding.target,
+        SemanticBindingTargetV1::Field { .. } | SemanticBindingTargetV1::List { .. }
+    ) {
+        return Ok(None);
+    }
+    exact_projected_trigger_producer(execution, binding.producer, projection)
+}
+
 struct TriggerResolver<'a> {
     execution: &'a SemanticExecutionImageColumnsV1,
-    resources: &'a SemanticResourceGraphV1,
+    resources: &'a SemanticResourceGraphV2,
     parameter_inputs: &'a BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
     pulse_by_expression: &'a BTreeMap<SemanticExprId, SemanticPulseBatchId>,
     pulse_states: &'a BTreeMap<SemanticPulseBatchId, SemanticStateId>,
@@ -4180,7 +4426,7 @@ fn lexical_call_frame_distance(
 
 fn lexical_binding_for_decl<'a>(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     out_net: &ResolvedOutGraph,
     bindings: &'a [SemanticBindingV1],
     declaration: DeclId,
@@ -4282,7 +4528,7 @@ impl<'a> TriggerResolver<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         execution: &'a SemanticExecutionImageColumnsV1,
-        resources: &'a SemanticResourceGraphV1,
+        resources: &'a SemanticResourceGraphV2,
         reads: &'a [SemanticReadBindingV1],
         bindings: &'a [SemanticBindingV1],
         parameter_inputs: &'a BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
@@ -4307,7 +4553,10 @@ impl<'a> TriggerResolver<'a> {
                 )));
             }
             let route = match &read.target {
-                SemanticReadTargetV1::Binding { binding, .. } => {
+                SemanticReadTargetV1::Binding {
+                    binding,
+                    projection,
+                } => {
                     let binding = bindings
                         .get(binding.as_usize())
                         .filter(|candidate| candidate.id == *binding)
@@ -4325,10 +4574,15 @@ impl<'a> TriggerResolver<'a> {
                             TriggerReadRoute::Cause(SemanticEventCauseV1::State(state))
                         }
                         SemanticBindingTargetV1::Field { .. }
-                        | SemanticBindingTargetV1::List { .. } => TriggerReadRoute::Producer {
-                            expression: binding.producer,
-                            suppress_unprojected_provenance: true,
-                        },
+                        | SemanticBindingTargetV1::List { .. } => {
+                            let projected =
+                                exact_projected_binding_producer(execution, binding, projection)?;
+                            TriggerReadRoute::Producer {
+                                expression: projected.unwrap_or(binding.producer),
+                                suppress_consumer_provenance: projected.is_some()
+                                    || projection.is_empty(),
+                            }
+                        }
                     }
                 }
                 SemanticReadTargetV1::SourcePayload { source, .. } => {
@@ -4339,7 +4593,7 @@ impl<'a> TriggerResolver<'a> {
                 }
                 SemanticReadTargetV1::Local { producer, .. } => TriggerReadRoute::Producer {
                     expression: *producer,
-                    suppress_unprojected_provenance: false,
+                    suppress_consumer_provenance: false,
                 },
                 SemanticReadTargetV1::External { .. }
                 | SemanticReadTargetV1::ElementState { .. }
@@ -4513,16 +4767,19 @@ impl<'a> TriggerResolver<'a> {
             causes.insert(SemanticEventCauseV1::Pulse(pulse));
             return Ok(causes);
         }
-        if let SemanticExpressionKind::CanonicalRead { projection, .. } = &expression.kind {
+        if matches!(
+            expression.kind,
+            SemanticExpressionKind::CanonicalRead { .. }
+        ) {
             match self.read_route(expression.id)? {
                 TriggerReadRoute::Cause(cause) => {
                     causes.insert(cause);
                     return Ok(causes);
                 }
                 TriggerReadRoute::Producer {
-                    suppress_unprojected_provenance: true,
+                    suppress_consumer_provenance: true,
                     ..
-                } if projection.is_empty() => return Ok(causes),
+                } => return Ok(causes),
                 TriggerReadRoute::Producer { .. } => {}
                 TriggerReadRoute::NonValue => {
                     return Err(SemanticReactiveError::new(format!(
@@ -5191,7 +5448,7 @@ fn require_trigger(
 fn materialization_local_read_scope(
     read: &SemanticReadBindingV1,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
 ) -> Result<Option<SemanticRowScopeId>, SemanticReactiveError> {
     let SemanticReadTargetV1::MaterializationLocal { owner, local, .. } = read.target else {
         return Ok(None);
@@ -5221,49 +5478,10 @@ fn materialization_local_read_scope(
     Ok(binding.source.map(|row| row.scope))
 }
 
-fn trigger_row_scope(
-    causes: &BTreeSet<SemanticEventCauseV1>,
-    resources: &SemanticResourceGraphV1,
-    pulse_states: &BTreeMap<SemanticPulseBatchId, SemanticStateId>,
-) -> Result<Option<SemanticRowScopeId>, SemanticReactiveError> {
-    let scopes = causes
-        .iter()
-        .filter_map(|cause| match cause {
-            SemanticEventCauseV1::Source(source) => resources
-                .sources
-                .get(source.as_usize())
-                .filter(|candidate| candidate.id == *source)
-                .and_then(|source| source.row_scope),
-            SemanticEventCauseV1::State(state) => resources
-                .states
-                .get(state.as_usize())
-                .filter(|candidate| candidate.id == *state)
-                .and_then(|state| state.row_scope),
-            SemanticEventCauseV1::Pulse(pulse) => pulse_states
-                .get(pulse)
-                .and_then(|state| {
-                    resources
-                        .states
-                        .get(state.as_usize())
-                        .filter(|candidate| candidate.id == *state)
-                })
-                .and_then(|state| state.row_scope),
-            SemanticEventCauseV1::ExternalRead(_) => None,
-        })
-        .collect::<BTreeSet<_>>();
-    match scopes.len() {
-        0 => Ok(None),
-        1 => Ok(scopes.iter().next().copied()),
-        count => Err(SemanticReactiveError::new(format!(
-            "view capture has {count} exact row scopes"
-        ))),
-    }
-}
-
 fn validate_semantic_reactive_shape(
     graph: &SemanticReactiveGraphV1,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
 ) -> Result<(), SemanticReactiveError> {
     if graph.schema != SEMANTIC_REACTIVE_GRAPH_SCHEMA_V1 {
         return Err(SemanticReactiveError::new(format!(
@@ -5434,6 +5652,12 @@ fn validate_semantic_reactive_shape(
                     schedule.id
                 )));
             }
+            if derived.state_backing.is_some() {
+                return Err(SemanticReactiveError::new(format!(
+                    "host effect schedule {} transient result {} is state-backed",
+                    schedule.id, derived.id
+                )));
+            }
         }
     }
     for (index, causes) in graph.possible_causes.iter().enumerate() {
@@ -5561,6 +5785,359 @@ mod tests {
         }
     }
 
+    fn object_expression(
+        id: usize,
+        fields: impl IntoIterator<Item = (&'static str, SemanticExprId)>,
+    ) -> SemanticExpression {
+        SemanticExpression {
+            id: SemanticExprId(id),
+            value_id: SemanticValueId(id),
+            checked_expr_id: CheckedExprId(id as u32),
+            flow_type: FlowType {
+                ty: Type::Unknown,
+                mode: FlowMode::Continuous,
+            },
+            effect: CheckedEffectSummary::default(),
+            owner: None,
+            provenance: SemanticValueProvenance::default(),
+            resource_binding_path: None,
+            kind: SemanticExpressionKind::Object(
+                fields
+                    .into_iter()
+                    .map(|(name, value)| crate::SemanticRecordField {
+                        declaration: None,
+                        name: name.to_owned(),
+                        value,
+                        spread: false,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn canonical_projection_expression(
+        id: usize,
+        declaration: DeclId,
+        projection: &[&str],
+    ) -> SemanticExpression {
+        SemanticExpression {
+            id: SemanticExprId(id),
+            value_id: SemanticValueId(id),
+            checked_expr_id: CheckedExprId(id as u32),
+            flow_type: flow(FlowMode::Continuous),
+            effect: CheckedEffectSummary::default(),
+            owner: None,
+            provenance: SemanticValueProvenance::default(),
+            resource_binding_path: None,
+            kind: SemanticExpressionKind::CanonicalRead {
+                target: declaration,
+                path: "store".to_owned(),
+                projection: projection
+                    .iter()
+                    .map(|segment| (*segment).to_owned())
+                    .collect(),
+                source: None,
+            },
+        }
+    }
+
+    #[test]
+    fn projected_trigger_route_reaches_only_the_exact_explicit_record_leaf() {
+        let execution = graph(vec![
+            source_expression(0, 0, None),
+            object_expression(1, [("toggle", SemanticExprId(0))]),
+            object_expression(2, [("elements", SemanticExprId(1))]),
+        ]);
+        assert_eq!(
+            exact_projected_trigger_producer(
+                &execution,
+                SemanticExprId(2),
+                &["elements".to_owned(), "toggle".to_owned()],
+            )
+            .unwrap(),
+            Some(SemanticExprId(0))
+        );
+        assert_eq!(
+            exact_projected_trigger_producer(
+                &execution,
+                SemanticExprId(2),
+                &["elements".to_owned(), "missing".to_owned()],
+            )
+            .unwrap(),
+            None,
+            "an unresolved projection must retain aggregate fallback routing"
+        );
+
+        let mut spread = execution.clone();
+        spread.expressions.push(canonical_projection_expression(
+            3,
+            DeclId(0),
+            &["elements", "toggle"],
+        ));
+        spread
+            .checked_expression_origins
+            .push(SemanticExpressionOrigin {
+                expression: SemanticExprId(3),
+                checked_expression: CheckedExprId(3),
+                checked_scope: LexicalScopeId(0),
+                checked_span: CheckedSpan {
+                    line: 1,
+                    start: 3,
+                    end: 4,
+                },
+                owning_statement: None,
+                call_instance: None,
+            });
+        let SemanticExpressionKind::Object(fields) = &mut spread.expressions[2].kind else {
+            unreachable!()
+        };
+        fields.push(crate::SemanticRecordField {
+            declaration: None,
+            name: String::new(),
+            value: SemanticExprId(0),
+            spread: true,
+        });
+        assert_eq!(
+            exact_projected_trigger_producer(
+                &spread,
+                SemanticExprId(2),
+                &["elements".to_owned(), "toggle".to_owned()],
+            )
+            .unwrap(),
+            None,
+            "a spread record has no unique explicit projection authority"
+        );
+
+        let unresolved_read = SemanticReadBindingV1 {
+            id: SemanticReadId(0),
+            expression: SemanticExprId(3),
+            value: SemanticValueId(3),
+            target: SemanticReadTargetV1::Binding {
+                binding: SemanticBindingId(0),
+                projection: vec!["elements".to_owned(), "toggle".to_owned()],
+            },
+        };
+        let unresolved_binding = SemanticBindingV1 {
+            id: SemanticBindingId(0),
+            declaration: DeclId(0),
+            statement: SemanticStatementId(0),
+            call_instance: None,
+            owner: None,
+            producer: SemanticExprId(2),
+            value: SemanticValueId(2),
+            flow_type: flow(FlowMode::Continuous),
+            target: SemanticBindingTargetV1::Field {
+                field: SemanticFieldId(0),
+            },
+        };
+        let parameter_inputs = BTreeMap::new();
+        let pulse_by_expression = BTreeMap::new();
+        let pulse_states = BTreeMap::new();
+        let pulse_activation_expressions = BTreeSet::new();
+        let external_event_identities = BTreeSet::new();
+        let resources = crate::SemanticResourceGraphV2::empty_for_tests();
+        let reads = [unresolved_read];
+        let bindings = [unresolved_binding];
+        let resolver = TriggerResolver::new(
+            &spread,
+            &resources,
+            &reads,
+            &bindings,
+            &parameter_inputs,
+            &pulse_by_expression,
+            &pulse_states,
+            &pulse_activation_expressions,
+            &external_event_identities,
+        )
+        .unwrap();
+        assert_eq!(
+            resolver.read_route(SemanticExprId(3)).unwrap(),
+            TriggerReadRoute::Producer {
+                expression: SemanticExprId(2),
+                suppress_consumer_provenance: false,
+            },
+            "a spread-defined projection must retain conservative aggregate provenance"
+        );
+    }
+
+    #[test]
+    fn projected_binding_trigger_route_reaches_only_the_exact_source_leaf() {
+        let declaration = DeclId(9);
+        let projection = vec!["elements".to_owned(), "toggle".to_owned()];
+        let mut execution = graph(vec![
+            source_expression(0, 0, None),
+            object_expression(1, [("toggle", SemanticExprId(0))]),
+            object_expression(2, [("elements", SemanticExprId(1))]),
+            canonical_projection_expression(3, declaration, &["elements", "toggle"]),
+        ]);
+        execution.expressions[3].provenance.members = vec![
+            SemanticValueMember {
+                path: vec!["elements".to_owned(), "toggle".to_owned()],
+                origin: SemanticValueOrigin::Source {
+                    source: SemanticSourceId(0),
+                    owner: None,
+                },
+            },
+            SemanticValueMember {
+                path: vec!["unrelated".to_owned()],
+                origin: SemanticValueOrigin::Source {
+                    source: SemanticSourceId(1),
+                    owner: None,
+                },
+            },
+        ];
+        let resources = crate::SemanticResourceGraphV2::empty_for_tests();
+        let reads = [
+            SemanticReadBindingV1 {
+                id: SemanticReadId(0),
+                expression: SemanticExprId(3),
+                value: SemanticValueId(3),
+                target: SemanticReadTargetV1::Binding {
+                    binding: SemanticBindingId(0),
+                    projection,
+                },
+            },
+            SemanticReadBindingV1 {
+                id: SemanticReadId(1),
+                expression: SemanticExprId(0),
+                value: SemanticValueId(0),
+                target: SemanticReadTargetV1::Binding {
+                    binding: SemanticBindingId(1),
+                    projection: Vec::new(),
+                },
+            },
+        ];
+        let bindings = [
+            SemanticBindingV1 {
+                id: SemanticBindingId(0),
+                declaration,
+                statement: SemanticStatementId(0),
+                call_instance: None,
+                owner: None,
+                producer: SemanticExprId(2),
+                value: SemanticValueId(2),
+                flow_type: flow(FlowMode::Continuous),
+                target: SemanticBindingTargetV1::Field {
+                    field: SemanticFieldId(0),
+                },
+            },
+            SemanticBindingV1 {
+                id: SemanticBindingId(1),
+                declaration: DeclId(0),
+                statement: SemanticStatementId(0),
+                call_instance: None,
+                owner: None,
+                producer: SemanticExprId(0),
+                value: SemanticValueId(0),
+                flow_type: flow(FlowMode::TickPresent),
+                target: SemanticBindingTargetV1::Source {
+                    source: SemanticSourceId(0),
+                },
+            },
+        ];
+        let parameter_inputs = BTreeMap::new();
+        let pulse_by_expression = BTreeMap::new();
+        let pulse_states = BTreeMap::new();
+        let pulse_activation_expressions = BTreeSet::new();
+        let external_event_identities = BTreeSet::new();
+        assert_eq!(
+            exact_projected_binding_producer(
+                &execution,
+                &bindings[0],
+                &["elements".to_owned(), "toggle".to_owned()],
+            )
+            .unwrap(),
+            Some(SemanticExprId(0)),
+            "value reachability and trigger routing must share the exact projected producer",
+        );
+        let mut resolver = TriggerResolver::new(
+            &execution,
+            &resources,
+            &reads,
+            &bindings,
+            &parameter_inputs,
+            &pulse_by_expression,
+            &pulse_states,
+            &pulse_activation_expressions,
+            &external_event_identities,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolver.read_route(SemanticExprId(3)).unwrap(),
+            TriggerReadRoute::Producer {
+                expression: SemanticExprId(0),
+                suppress_consumer_provenance: true,
+            }
+        );
+        assert_eq!(
+            resolver
+                .event_causes_for_expression(SemanticExprId(3))
+                .unwrap(),
+            BTreeSet::from([SemanticEventCauseV1::Source(SemanticSourceId(0))])
+        );
+    }
+
+    #[test]
+    fn projected_read_value_reachability_excludes_unselected_record_siblings() {
+        let declaration = DeclId(9);
+        let execution = graph(vec![
+            object_expression(0, std::iter::empty()),
+            object_expression(1, std::iter::empty()),
+            object_expression(
+                2,
+                [
+                    ("selected", SemanticExprId(0)),
+                    ("unselected", SemanticExprId(1)),
+                ],
+            ),
+            canonical_projection_expression(3, declaration, &["selected"]),
+        ]);
+        let resources = crate::SemanticResourceGraphV2::empty_for_tests();
+        let out_net = ResolvedOutGraph::empty_for_tests();
+        let builder = ReactiveBuilder::new(&execution, &resources, &out_net, BTreeSet::new())
+            .expect("projected-read reachability builder");
+        let bindings = [SemanticBindingV1 {
+            id: SemanticBindingId(0),
+            declaration,
+            statement: SemanticStatementId(0),
+            call_instance: None,
+            owner: None,
+            producer: SemanticExprId(2),
+            value: SemanticValueId(2),
+            flow_type: flow(FlowMode::Continuous),
+            target: SemanticBindingTargetV1::Field {
+                field: SemanticFieldId(0),
+            },
+        }];
+        let reads = [SemanticReadBindingV1 {
+            id: SemanticReadId(0),
+            expression: SemanticExprId(3),
+            value: SemanticValueId(3),
+            target: SemanticReadTargetV1::Binding {
+                binding: SemanticBindingId(0),
+                projection: vec!["selected".to_owned()],
+            },
+        }];
+        let reachability = ReactiveReachabilityIndex::build(&builder, &bindings, &reads)
+            .expect("projected value reachability");
+
+        assert!(
+            reachability
+                .value_roots_reaching(SemanticExprId(0))
+                .unwrap()
+                .contains(SemanticExprId(3)),
+            "the projected read must reach its selected field producer",
+        );
+        assert!(
+            !reachability
+                .value_roots_reaching(SemanticExprId(1))
+                .unwrap()
+                .contains(SemanticExprId(3)),
+            "an unselected sibling must not become value-reachable through the aggregate binding",
+        );
+    }
+
     fn append_callable() -> crate::SemanticCallable {
         crate::SemanticCallable {
             id: crate::SemanticCallableId(0),
@@ -5685,5 +6262,224 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("0 exact bindings"));
+    }
+
+    #[test]
+    fn ordinary_field_with_the_exact_hold_value_is_state_backed() {
+        let state = SemanticStateId(0);
+        let initial_id = SemanticExprId(0);
+        let expression_id = SemanticExprId(1);
+        let field_statement_id = SemanticStatementId(0);
+        let state_statement_id = SemanticStatementId(1);
+        let owner = None;
+        let flow_type = FlowType {
+            ty: Type::Number,
+            mode: FlowMode::Continuous,
+        };
+        let mut initial = object_expression(0, []);
+        initial.flow_type = flow_type.clone();
+        initial.kind = SemanticExpressionKind::Number(boon_data::ExactNumber::from_i64(0));
+        let mut expression = object_expression(1, []);
+        expression.flow_type = flow_type.clone();
+        expression.provenance = SemanticValueProvenance {
+            members: vec![SemanticValueMember {
+                path: Vec::new(),
+                origin: SemanticValueOrigin::State { state, owner },
+            }],
+        };
+        expression.kind = SemanticExpressionKind::Hold {
+            initial: initial_id,
+            name: "held".to_owned(),
+            binding_path: "store.held".to_owned(),
+            updates: Vec::new(),
+        };
+        let mut execution = graph(vec![initial, expression]);
+        execution.states.push(crate::SemanticStateDef {
+            id: state,
+            checked_state: boon_checked::CheckedStateId(0),
+            declaration: DeclId(0),
+            statement: state_statement_id,
+            checked_statement: boon_checked::CheckedStatementId(1),
+            expression: expression_id,
+            initial: initial_id,
+            call_instance: None,
+            binding_path: "store.held".to_owned(),
+            owner,
+            lifetime: crate::SemanticStateLifetimeV1::Persistent,
+        });
+        execution.statements.push(crate::SemanticStatement {
+            id: field_statement_id,
+            origin: crate::SemanticStatementOrigin::Checked {
+                statement: boon_checked::CheckedStatementId(0),
+            },
+            scope: SemanticScopeId(0),
+            parent: None,
+            call_instance: None,
+            span: CheckedSpan::default(),
+            checked_resources: Vec::new(),
+            declaration: Some(DeclId(0)),
+            flow_type: Some(flow_type.clone()),
+            kind: crate::SemanticStatementKind::Field {
+                name: "held".to_owned(),
+                path: "store.held".to_owned(),
+            },
+            value: Some(expression_id),
+            value_use: crate::SemanticMaterializationResultKind::RuntimeValue,
+            children: vec![state_statement_id],
+        });
+        execution.statements.push(crate::SemanticStatement {
+            id: state_statement_id,
+            origin: crate::SemanticStatementOrigin::Checked {
+                statement: boon_checked::CheckedStatementId(1),
+            },
+            scope: SemanticScopeId(0),
+            parent: Some(field_statement_id),
+            call_instance: None,
+            span: CheckedSpan::default(),
+            checked_resources: Vec::new(),
+            declaration: Some(DeclId(0)),
+            flow_type: Some(flow_type.clone()),
+            kind: crate::SemanticStatementKind::Hold {
+                name: Some("held".to_owned()),
+                path: Some("store.held".to_owned()),
+                hold_name: Some("held".to_owned()),
+            },
+            value: Some(expression_id),
+            value_use: crate::SemanticMaterializationResultKind::RuntimeValue,
+            children: Vec::new(),
+        });
+        let mut resources = crate::SemanticResourceGraphV2::empty_for_tests();
+        resources.states.push(crate::SemanticStateResourceV2 {
+            id: state,
+            checked_state: boon_checked::CheckedStateId(0),
+            declaration: DeclId(0),
+            binding_declaration: DeclId(0),
+            statement: state_statement_id,
+            checked_statement: boon_checked::CheckedStatementId(1),
+            expression: expression_id,
+            expression_members: vec![initial_id, expression_id],
+            initial: initial_id,
+            flow_type: flow_type.clone(),
+            kind: boon_checked::CheckedStateKind::Hold,
+            binding_path: "store.held".to_owned(),
+            declared_path: "store.held".to_owned(),
+            path: "store.held".to_owned(),
+            semantic_path: Some("store.held".to_owned()),
+            published: true,
+            hold_name: "held".to_owned(),
+            owner,
+            lifetime: crate::SemanticStateLifetimeV1::Persistent,
+            owner_ancestry: Vec::new(),
+            target_list: None,
+            row_scope: None,
+            scoped: false,
+            checked_span: crate::SemanticResourceSpanV1 {
+                line: 0,
+                start: 0,
+                end: 0,
+            },
+            span: crate::SemanticResourceSpanV1 {
+                line: 0,
+                start: 0,
+                end: 0,
+            },
+        });
+        let out_net = ResolvedOutGraph::empty_for_tests();
+        let builder = ReactiveBuilder::new(&execution, &resources, &out_net, BTreeSet::new())
+            .expect("exact state facade builder");
+
+        assert_eq!(
+            builder
+                .exact_derived_state_backing(field_statement_id, expression_id)
+                .unwrap(),
+            Some(state),
+        );
+
+        let fields = [SemanticFieldV1 {
+            id: SemanticFieldId(0),
+            statement: field_statement_id,
+            declaration: DeclId(0),
+            owner,
+            row: None,
+            name: "held".to_owned(),
+            path: "store.held".to_owned(),
+            producer: expression_id,
+            value: SemanticValueId(1),
+            flow_type: flow_type.clone(),
+        }];
+        let bindings = [SemanticBindingV1 {
+            id: SemanticBindingId(0),
+            declaration: DeclId(0),
+            statement: field_statement_id,
+            call_instance: None,
+            owner,
+            producer: expression_id,
+            value: SemanticValueId(1),
+            flow_type: flow_type.clone(),
+            target: SemanticBindingTargetV1::Field {
+                field: SemanticFieldId(0),
+            },
+        }];
+        let parameter_inputs = BTreeMap::new();
+        let pulse_by_expression = BTreeMap::new();
+        let pulse_states = BTreeMap::new();
+        let pulse_activation_expressions = BTreeSet::new();
+        let external_event_identities = BTreeSet::new();
+        let mut triggers = TriggerResolver::new(
+            &execution,
+            &resources,
+            &[],
+            &bindings,
+            &parameter_inputs,
+            &pulse_by_expression,
+            &pulse_states,
+            &pulse_activation_expressions,
+            &external_event_identities,
+        )
+        .expect("exact state facade trigger resolver");
+        let derived = builder
+            .build_raw_derived_values(&fields, &bindings, &mut triggers)
+            .expect("exact state facade derived value");
+        let [derived] = derived.as_slice() else {
+            panic!("exact state facade must produce one derived value, got {derived:#?}");
+        };
+        assert_eq!(derived.producer, expression_id);
+        assert_eq!(derived.statement, field_statement_id);
+        assert_eq!(derived.field, SemanticFieldId(0));
+        assert_eq!(derived.state_backing, Some(state));
+        assert_eq!(derived.kind, SemanticDerivedValueKindV1::Pure);
+        assert!(derived.causes.is_empty());
+        assert!(derived.trigger_arms.is_empty());
+        assert!(!derived.startup_recompute);
+
+        let wrapper_id = SemanticExprId(2);
+        let mut wrapper = object_expression(2, []);
+        wrapper.flow_type = flow_type;
+        wrapper.provenance = execution.expressions[expression_id.as_usize()]
+            .provenance
+            .clone();
+        wrapper.kind = SemanticExpressionKind::Latest {
+            branches: vec![expression_id],
+        };
+        execution.expressions.push(wrapper);
+        execution
+            .checked_expression_origins
+            .push(SemanticExpressionOrigin {
+                expression: wrapper_id,
+                checked_expression: CheckedExprId(2),
+                checked_scope: LexicalScopeId(0),
+                checked_span: CheckedSpan::default(),
+                owning_statement: Some(field_statement_id),
+                call_instance: None,
+            });
+        let builder = ReactiveBuilder::new(&execution, &resources, &out_net, BTreeSet::new())
+            .expect("state-provenance wrapper builder");
+        assert_eq!(
+            builder
+                .exact_derived_state_backing(field_statement_id, wrapper_id)
+                .unwrap(),
+            None,
+            "a LATEST wrapper may inherit state provenance but is not the state value",
+        );
     }
 }

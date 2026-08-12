@@ -14,11 +14,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Write};
 
 const OWNER_KEY_FINGERPRINT_DOMAIN_V2: &[u8] = b"boon.check-owner-key.v2\0";
-const OWNER_SYNTAX_FINGERPRINT_DOMAIN_V3: &[u8] = b"boon.owner-syntax-input.v3\0";
-const OWNER_SOURCE_MAP_FINGERPRINT_DOMAIN_V2: &[u8] = b"boon.owner-source-map.v2\0";
+const OWNER_SYNTAX_FINGERPRINT_DOMAIN_V4: &[u8] = b"boon.owner-syntax-input.v4\0";
+const OWNER_SOURCE_MAP_FINGERPRINT_DOMAIN_V3: &[u8] = b"boon.owner-source-map.v3\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerSyntaxProjectionError {
@@ -88,6 +87,10 @@ pub struct OwnerChildInput {
     pub owner: StableCheckOwnerKey,
     pub parent: Option<u32>,
     pub child_index: u32,
+    /// Exact authored field name published by this child statement, when it
+    /// has one. Stable item routes cannot reconstruct this for SOURCE/HOLD:
+    /// their route names also contain the event/state alias.
+    pub field_name: Option<String>,
     /// Stable identity of the authored expression at the direct owner
     /// boundary. This can differ from `result_expression` when the child's
     /// public value is supplied by a deeper descendant owner.
@@ -262,29 +265,13 @@ impl OwnerSourceMap {
     }
 }
 
-struct Sha256Writer(Sha256);
-
-impl Write for Sha256Writer {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 fn fingerprint_serialized<T: Serialize>(
     domain: &[u8],
     value: &T,
 ) -> Result<[u8; 32], OwnerSyntaxProjectionError> {
-    let mut writer = Sha256Writer(Sha256::new());
-    writer.0.update(domain);
-    serde_json::to_writer(&mut writer, value).map_err(|error| {
+    boon_contract::canonical_serde_hash_v1_streaming(domain, value).map_err(|error| {
         OwnerSyntaxProjectionError::new(format!("cannot fingerprint owner syntax: {error}"))
-    })?;
-    Ok(writer.0.finalize().into())
+    })
 }
 
 fn hash_owner_key_bytes(hasher: &mut Sha256, bytes: &[u8]) {
@@ -1241,6 +1228,25 @@ pub fn project_owner_syntax_input(
     );
     let mut child_owners = Vec::with_capacity(view.child_owners().len());
     for boundary in view.child_owners() {
+        let field_name = view
+            .statement_for_local(boundary.statement())
+            .ok_or_else(|| {
+                OwnerSyntaxProjectionError::new(format!(
+                    "owner {owner:?} child boundary has no authored statement"
+                ))
+            })
+            .and_then(|statement| {
+                Ok(match &statement.kind {
+                    AstStatementKind::Field { name } => Some(name.clone()),
+                    AstStatementKind::Source { field, .. }
+                    | AstStatementKind::Hold { field, .. }
+                    | AstStatementKind::List { field, .. } => field.clone(),
+                    AstStatementKind::Function { .. }
+                    | AstStatementKind::Block
+                    | AstStatementKind::Spread
+                    | AstStatementKind::Expression => None,
+                })
+            })?;
         let parent = boundary
             .parent()
             .map(|parent| {
@@ -1303,6 +1309,7 @@ pub fn project_owner_syntax_input(
             owner: child_owner,
             parent,
             child_index: checked_u32(boundary.child_index(), "child-owner position")?,
+            field_name,
             boundary_expression,
             result_expression,
             result_placement,
@@ -1311,7 +1318,7 @@ pub fn project_owner_syntax_input(
     let external_expressions = expression_projection.into_external_expressions();
 
     let fingerprint_v1 = fingerprint_serialized(
-        OWNER_SYNTAX_FINGERPRINT_DOMAIN_V3,
+        OWNER_SYNTAX_FINGERPRINT_DOMAIN_V4,
         &(
             &owner,
             &containing_scope,
@@ -1521,7 +1528,7 @@ pub fn project_owner_source_map(
     }
     let path = view.path().to_owned();
     let fingerprint_v2 = fingerprint_serialized(
-        OWNER_SOURCE_MAP_FINGERPRINT_DOMAIN_V2,
+        OWNER_SOURCE_MAP_FINGERPRINT_DOMAIN_V3,
         &(&owner, &path, &statements, &expressions, &anchors),
     )?;
     Ok(OwnerSourceMap {

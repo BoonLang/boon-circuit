@@ -1,9 +1,13 @@
 use crate::owner_interface::{
-    OwnerPatternNarrowing, TypeUnifier, alpha_normalize_type, bind_flow_variables, bind_projection,
-    flow_mode_join, inherited_pattern_read_plans, instantiate_owner_inherited_pattern_narrowings,
-    instantiate_type, merge_effects, pattern_binding_type_from_pattern, pattern_type,
+    OwnerFlowConstraint, OwnerInheritedPatternNarrowing, OwnerPatternNarrowing, TypeUnifier,
+    alpha_normalize_type, bind_and_record_flow_variables,
+    bind_and_record_structural_flow_variables, bind_projection, flow_mode_join,
+    inherited_pattern_read_plans, initialize_owner_hold_constraints,
+    instantiate_owner_inherited_pattern_narrowings, instantiate_type, mark_owner_derived_providers,
+    merge_effects, pattern_binding_type_from_pattern, pattern_type,
     refine_owner_inherited_pattern_narrowings, refine_owner_pattern_narrowings,
-    signature_dynamic_expression_index, true_false_type,
+    replay_flow_constraints, replay_owner_hold_constraints, signature_dynamic_expression_index,
+    true_false_type,
 };
 use crate::owner_signature_lexical::effective_narrowed_selector_read_matches;
 use crate::{
@@ -40,13 +44,13 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-const OWNER_BODY_INFERENCE_DOMAIN_V8: &[u8] = b"boon.owner-body-inference.v8\0";
-const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V6: &[u8] = b"boon.owner-body-inference-content.v6\0";
-const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V10: &[u8] =
-    b"boon.owner-body-inference-currentness.v10\0";
+const OWNER_BODY_INFERENCE_DOMAIN_V9: &[u8] = b"boon.owner-body-inference.v9\0";
+const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V7: &[u8] = b"boon.owner-body-inference-content.v7\0";
+const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V11: &[u8] =
+    b"boon.owner-body-inference-currentness.v11\0";
 const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V4: &[u8] = b"boon.owner-body-interface-plan.v4\0";
-const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V1: &[u8] =
-    b"boon.owner-interface-transfer-module.v1\0";
+const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V2: &[u8] =
+    b"boon.owner-interface-transfer-module.v2\0";
 const SOURCE_UNIT_OWNER_DIAGNOSTICS_DOMAIN_V1: &[u8] = b"boon.source-unit-owner-diagnostics.v1\0";
 const OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V8: &[u8] = b"boon.owner-diagnostics-aggregate.v8\0";
 
@@ -596,7 +600,7 @@ fn seal_owner_interface_transfer_module(
         .map(|dependency| (&dependency.key, dependency.fingerprint_v1))
         .collect::<Vec<_>>();
     let fingerprint_v1 = fingerprint(
-        OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V1,
+        OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V2,
         &(
             &result.key,
             result.fingerprint_v1(),
@@ -1249,7 +1253,7 @@ impl OwnerBodyInferenceCurrentnessReceipt {
             result_fingerprint_v1,
         );
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V10,
+            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V11,
             &compact_currentness,
         )?;
         Ok(Self {
@@ -2981,6 +2985,7 @@ fn bind_local_constraints(
     direct_effects: &mut [CheckedEffectSummary],
     calls: &mut Vec<BodyCallPlan>,
     pattern_narrowings: &mut Vec<OwnerPatternNarrowing>,
+    flow_constraints: &mut Vec<OwnerFlowConstraint>,
     work: &mut OwnerBodyInferenceWork,
 ) {
     let resolved = summary
@@ -3159,16 +3164,11 @@ fn bind_local_constraints(
                 if let Some(input) = expression.inputs.first().and_then(|input| {
                     expression_variable(expressions, external_expressions, input.expression)
                 }) {
-                    bind_flow_variables(unifier, variable, [input]);
+                    bind_and_record_flow_variables(unifier, flow_constraints, variable, [input]);
                 }
                 mode = None;
             }
             OwnerConstraintNodeKind::Hold { .. } => {
-                if let Some(input) = expression.inputs.first().and_then(|input| {
-                    expression_variable(expressions, external_expressions, input.expression)
-                }) {
-                    unifier.unify(Type::Var(variable), Type::Var(input));
-                }
                 direct_effects[index].reads_state = true;
                 direct_effects[index].writes_state = true;
             }
@@ -3180,7 +3180,7 @@ fn bind_local_constraints(
                         expression_variable(expressions, external_expressions, input.expression)
                     })
                     .collect::<Vec<_>>();
-                bind_flow_variables(unifier, variable, inputs);
+                bind_and_record_flow_variables(unifier, flow_constraints, variable, inputs);
                 mode = None;
             }
             OwnerConstraintNodeKind::When => {
@@ -3192,7 +3192,7 @@ fn bind_local_constraints(
                         expression_variable(expressions, external_expressions, input.expression)
                     })
                     .collect::<Vec<_>>();
-                bind_flow_variables(unifier, variable, inputs);
+                bind_and_record_flow_variables(unifier, flow_constraints, variable, inputs);
                 mode = None;
             }
             OwnerConstraintNodeKind::Then => {
@@ -3209,7 +3209,7 @@ fn bind_local_constraints(
                 if let Some(input) = input.and_then(|input| {
                     expression_variable(expressions, external_expressions, input.expression)
                 }) {
-                    bind_flow_variables(unifier, variable, [input]);
+                    bind_and_record_flow_variables(unifier, flow_constraints, variable, [input]);
                 }
                 mode = Some(FlowMode::PresentOrAbsent);
             }
@@ -3241,7 +3241,12 @@ fn bind_local_constraints(
                     if let Some(output) =
                         expression_variable(expressions, external_expressions, output.expression)
                     {
-                        bind_flow_variables(unifier, variable, [output]);
+                        bind_and_record_flow_variables(
+                            unifier,
+                            flow_constraints,
+                            variable,
+                            [output],
+                        );
                     }
                     mode = None;
                 } else {
@@ -3333,6 +3338,7 @@ fn bind_local_constraints(
                         selector,
                         pattern: pattern.clone(),
                         bindings: bindings.into_boxed_slice(),
+                        binding_reads: local_bindings.into_boxed_slice(),
                         selector_reads: selector_reads.into_boxed_slice(),
                     });
                 }
@@ -3346,7 +3352,12 @@ fn bind_local_constraints(
                     if let Some(result) =
                         expression_variable(expressions, external_expressions, result.expression)
                     {
-                        bind_flow_variables(unifier, variable, [result]);
+                        bind_and_record_flow_variables(
+                            unifier,
+                            flow_constraints,
+                            variable,
+                            [result],
+                        );
                     }
                     mode = None;
                 } else {
@@ -3364,14 +3375,25 @@ fn bind_local_constraints(
                     } else {
                         unifier.fresh()
                     };
-                    for input in &expression.inputs {
-                        if let Some(input) =
+                    let inputs = expression
+                        .inputs
+                        .iter()
+                        .filter_map(|input| {
                             expression_variable(expressions, external_expressions, input.expression)
-                        {
-                            unifier.unify(Type::Var(item), Type::Var(input));
-                        }
+                        })
+                        .collect::<Vec<_>>();
+                    if !inputs.is_empty() {
+                        bind_and_record_structural_flow_variables(
+                            unifier,
+                            flow_constraints,
+                            item,
+                            inputs,
+                        );
                     }
-                    unifier.bind_var(variable, Type::List(Type::shared(Type::Var(item))));
+                    unifier.replace_derived_provider(
+                        variable,
+                        Type::List(Type::shared(Type::Var(item))),
+                    );
                 }
                 OwnerCollectionKind::Set => {
                     let item = if expression.inputs.is_empty() {
@@ -3379,20 +3401,31 @@ fn bind_local_constraints(
                     } else {
                         unifier.fresh()
                     };
-                    for input in &expression.inputs {
-                        if let Some(input) =
+                    let inputs = expression
+                        .inputs
+                        .iter()
+                        .filter_map(|input| {
                             expression_variable(expressions, external_expressions, input.expression)
-                        {
-                            unifier.unify(Type::Var(item), Type::Var(input));
-                        }
+                        })
+                        .collect::<Vec<_>>();
+                    if !inputs.is_empty() {
+                        bind_and_record_structural_flow_variables(
+                            unifier,
+                            flow_constraints,
+                            item,
+                            inputs,
+                        );
                     }
-                    unifier.bind_var(variable, Type::Set(Type::shared(Type::Var(item))));
+                    unifier.replace_derived_provider(
+                        variable,
+                        Type::Set(Type::shared(Type::Var(item))),
+                    );
                 }
                 OwnerCollectionKind::Bytes => {
                     let size = fixed_size_or_capacity
                         .map(|size| BytesType::Fixed(size as usize))
                         .unwrap_or(BytesType::Dynamic);
-                    unifier.bind_var(variable, Type::Bytes(size));
+                    unifier.replace_derived_provider(variable, Type::Bytes(size));
                 }
                 OwnerCollectionKind::Map => {
                     let empty = expression.inputs.is_empty();
@@ -3406,26 +3439,36 @@ fn bind_local_constraints(
                     } else {
                         unifier.fresh()
                     };
-                    for input in &expression.inputs {
-                        let Some(input) = expression_variable(
-                            expressions,
-                            external_expressions,
-                            input.expression,
-                        ) else {
-                            continue;
-                        };
-                        unifier.bind_var(
-                            input,
-                            Type::object(ObjectShape::from_ordered_fields(
-                                [
-                                    ("key".to_owned(), Type::Var(key)),
-                                    ("value".to_owned(), Type::Var(value)),
-                                ],
-                                false,
-                            )),
+                    let entries = expression
+                        .inputs
+                        .iter()
+                        .filter_map(|input| {
+                            expression_variable(expressions, external_expressions, input.expression)
+                        })
+                        .collect::<Vec<_>>();
+                    let keys = entries
+                        .iter()
+                        .map(|entry| bind_projection(unifier, *entry, &["key".to_owned()]))
+                        .collect::<Vec<_>>();
+                    let values = entries
+                        .iter()
+                        .map(|entry| bind_projection(unifier, *entry, &["value".to_owned()]))
+                        .collect::<Vec<_>>();
+                    if !keys.is_empty() {
+                        bind_and_record_structural_flow_variables(
+                            unifier,
+                            flow_constraints,
+                            key,
+                            keys,
+                        );
+                        bind_and_record_structural_flow_variables(
+                            unifier,
+                            flow_constraints,
+                            value,
+                            values,
                         );
                     }
-                    unifier.bind_var(
+                    unifier.replace_derived_provider(
                         variable,
                         Type::Map {
                             key: Box::new(Type::Var(key)),
@@ -3443,7 +3486,7 @@ fn bind_local_constraints(
                         expression_variable(expressions, external_expressions, output.expression)
                     })
                 {
-                    bind_flow_variables(unifier, variable, [output]);
+                    bind_and_record_flow_variables(unifier, flow_constraints, variable, [output]);
                 }
                 let _ = pattern_type(pattern, unifier);
             }
@@ -4452,18 +4495,40 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     static_number: None,
                 })
             }
-            OwnerConstraintNodeKind::Draining | OwnerConstraintNodeKind::Hold { .. } => node
+            OwnerConstraintNodeKind::Draining => node
                 .inputs
                 .first()
                 .zip(prepared_inputs.first())
                 .and_then(|(_, expression)| evaluate(self, *expression, lexical, active))
-                .map(|mut value| {
-                    if matches!(node.kind, OwnerConstraintNodeKind::Hold { .. }) {
-                        value.flow_type.mode = FlowMode::Continuous;
-                    }
-                    value
-                })
                 .or_else(|| fallbacks.resolve(node, self.unifier, &mut self.owned_variables)),
+            OwnerConstraintNodeKind::Hold { .. } => {
+                let initial = node
+                    .inputs
+                    .iter()
+                    .zip(prepared_inputs)
+                    .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::HoldInitial))
+                    .and_then(|(_, expression)| evaluate(self, *expression, lexical, active));
+                let Some(mut value) = initial else {
+                    return fallbacks.resolve(node, self.unifier, &mut self.owned_variables);
+                };
+                for (input, expression) in node.inputs.iter().zip(prepared_inputs) {
+                    if !matches!(input.role, OwnerConstraintEdgeRole::HoldUpdate) {
+                        continue;
+                    }
+                    let update = evaluate(self, *expression, lexical, active)?;
+                    if !matches!(update.flow_type.ty, Type::Absent) {
+                        value.flow_type.ty = crate::widen_checked_hold_type(
+                            &value.flow_type.ty,
+                            &update.flow_type.ty,
+                        );
+                    }
+                    value.parameter_derived |= update.parameter_derived;
+                    value.syntax_selected |= update.syntax_selected;
+                }
+                value.flow_type.mode = FlowMode::Continuous;
+                value.static_number = None;
+                Some(value)
+            }
             OwnerConstraintNodeKind::Then => {
                 let value = node
                     .inputs
@@ -5080,13 +5145,77 @@ fn bind_signature_declaration_reads(
     expressions: &[TypeVar],
     modes: &mut [Option<FlowMode>],
 ) {
+    bind_signature_declaration_read_types(
+        target,
+        root,
+        signature_lexical_plan,
+        signature_read_expressions,
+        unifier,
+        expressions,
+    );
+    for expression in signature_read_expressions.get(target).into_iter().flatten() {
+        modes[*expression] = flow_mode_join(modes[*expression], Some(mode));
+    }
+}
+
+fn bind_signature_declaration_read_types(
+    target: &OwnerSignatureDeclarationTarget,
+    root: TypeVar,
+    signature_lexical_plan: &OwnerSignatureLexicalPlan,
+    signature_read_expressions: &BTreeMap<OwnerSignatureDeclarationTarget, Vec<usize>>,
+    unifier: &mut TypeUnifier,
+    expressions: &[TypeVar],
+) {
     for expression in signature_read_expressions.get(target).into_iter().flatten() {
         let Some(read) = signature_lexical_plan.reads()[*expression].as_ref() else {
             continue;
         };
-        let projected = bind_projection(unifier, root, &read.projection);
-        unifier.unify(Type::Var(expressions[*expression]), Type::Var(projected));
-        modes[*expression] = flow_mode_join(modes[*expression], Some(mode));
+        bind_signature_declaration_read_type(
+            unifier,
+            root,
+            expressions[*expression],
+            &read.projection,
+        );
+    }
+}
+
+fn bind_signature_declaration_read_type(
+    unifier: &mut TypeUnifier,
+    root: TypeVar,
+    occurrence: TypeVar,
+    projection: &[String],
+) {
+    let projected = bind_projection(unifier, root, projection);
+    let provider = unifier.resolve(&Type::Var(projected));
+    if boon_checked::type_is_recursively_closed(&provider) {
+        // A contextual provider can close after its first projected read
+        // created a sparse consumer scaffold. The closed FreshOut/context
+        // surface owns this occurrence; replacing the detached scaffold keeps
+        // later consumers from retaining a stale private alpha.
+        unifier.publish_authoritative_provider(occurrence, provider);
+    } else {
+        // An open provider still carries live inference holes. Preserve the
+        // ordinary equation so downstream requirements can reach it.
+        unifier.unify(Type::Var(occurrence), Type::Var(projected));
+    }
+}
+
+fn replay_signature_declaration_read_types(
+    signature_declaration_variables: &BTreeMap<OwnerSignatureDeclarationTarget, TypeVar>,
+    signature_lexical_plan: &OwnerSignatureLexicalPlan,
+    signature_read_expressions: &BTreeMap<OwnerSignatureDeclarationTarget, Vec<usize>>,
+    unifier: &mut TypeUnifier,
+    expressions: &[TypeVar],
+) {
+    for (target, root) in signature_declaration_variables {
+        bind_signature_declaration_read_types(
+            target,
+            *root,
+            signature_lexical_plan,
+            signature_read_expressions,
+            unifier,
+            expressions,
+        );
     }
 }
 
@@ -5922,10 +6051,9 @@ fn refine_owner_call_at(
         evaluated
     };
     if let Some(evaluated) = evaluated {
-        unifier.publish_authoritative_provider(
-            expressions[plan.expression],
-            evaluated.value.flow_type.ty.clone(),
-        );
+        let result = expressions[plan.expression];
+        unifier.mark_authoritative_provider(result);
+        unifier.replace_derived_provider(result, evaluated.value.flow_type.ty.clone());
         modes[plan.expression] = Some(evaluated.value.flow_type.mode);
         let draft = &mut drafts[call_index];
         draft.resolved_result = Some(evaluated.value.flow_type.clone());
@@ -5972,6 +6100,122 @@ fn refine_owner_call_transfers(
             modes,
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn settle_owner_call_transfers_and_holds(
+    drafts: &mut [InferredCallDraft],
+    syntax: &OwnerSyntaxInput,
+    seed: &OwnerConstraintSeed,
+    interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
+    providers: &BTreeMap<StableCheckOwnerKey, &OwnerInterfaceTransferModule>,
+    unifier: &mut TypeUnifier,
+    hold_authorities: &mut BTreeMap<TypeVar, Type>,
+    expressions: &[TypeVar],
+    external_expressions: &[TypeVar],
+    caller_context: Option<TypeVar>,
+    modes: &mut [Option<FlowMode>],
+    pattern_narrowings: &[OwnerPatternNarrowing],
+    inherited_pattern_narrowings: &[OwnerInheritedPatternNarrowing],
+    flow_constraints: &[OwnerFlowConstraint],
+) -> Result<(), OwnerBodyInferenceError> {
+    fn semantic_surface_snapshot(
+        unifier: &mut TypeUnifier,
+        expressions: &[TypeVar],
+        external_expressions: &[TypeVar],
+        modes: &[Option<FlowMode>],
+    ) -> (Vec<Type>, Vec<Option<FlowMode>>) {
+        let mut variables = BTreeMap::new();
+        let mut next = 0;
+        let types = expressions
+            .iter()
+            .chain(external_expressions)
+            .map(|variable| {
+                let resolved = unifier.resolve(&Type::Var(*variable));
+                alpha_normalize_type(&resolved, &mut variables, &mut next)
+            })
+            .collect();
+        (types, modes.to_vec())
+    }
+
+    let hold_count = seed
+        .expressions
+        .iter()
+        .filter(|expression| {
+            matches!(expression.kind, OwnerConstraintNodeKind::Hold { .. })
+                && expression
+                    .inputs
+                    .iter()
+                    .any(|input| matches!(input.role, OwnerConstraintEdgeRole::HoldUpdate))
+        })
+        .count();
+    if hold_count == 0 {
+        refine_owner_call_transfers(
+            drafts,
+            syntax,
+            seed,
+            interfaces,
+            providers,
+            unifier,
+            expressions,
+            external_expressions,
+            caller_context,
+            modes,
+        );
+        refine_owner_pattern_narrowings(unifier, pattern_narrowings);
+        refine_owner_inherited_pattern_narrowings(unifier, inherited_pattern_narrowings);
+        if !replay_flow_constraints(unifier, flow_constraints) {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "owner body {:?} has a non-convergent local value-flow graph",
+                seed.owner
+            )));
+        }
+        unifier.refine_contextual_flow_holes();
+        return Ok(());
+    }
+    let maximum_rounds = drafts.len().saturating_add(hold_count).saturating_add(3);
+    let mut previous_surface =
+        semantic_surface_snapshot(unifier, expressions, external_expressions, modes);
+    for _ in 0..maximum_rounds {
+        refine_owner_call_transfers(
+            drafts,
+            syntax,
+            seed,
+            interfaces,
+            providers,
+            unifier,
+            expressions,
+            external_expressions,
+            caller_context,
+            modes,
+        );
+        refine_owner_pattern_narrowings(unifier, pattern_narrowings);
+        refine_owner_inherited_pattern_narrowings(unifier, inherited_pattern_narrowings);
+        replay_owner_hold_constraints(
+            unifier,
+            hold_authorities,
+            seed,
+            expressions,
+            external_expressions,
+        );
+        if !replay_flow_constraints(unifier, flow_constraints) {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "owner body {:?} has a non-convergent local value-flow graph",
+                seed.owner
+            )));
+        }
+        unifier.refine_contextual_flow_holes();
+        let current_surface =
+            semantic_surface_snapshot(unifier, expressions, external_expressions, modes);
+        if current_surface == previous_surface {
+            return Ok(());
+        }
+        previous_surface = current_surface;
+    }
+    Err(OwnerBodyInferenceError::new(format!(
+        "owner body {:?} did not settle calls and HOLD updates in {maximum_rounds} rounds",
+        seed.owner
+    )))
 }
 
 fn body_expression_type(
@@ -6588,9 +6832,11 @@ fn evaluate_owner_body_impl(
         ..OwnerBodyInferenceWork::default()
     };
     let mut unifier = TypeUnifier::default();
+    let mut hold_authorities = BTreeMap::new();
     let expressions = (0..seed.expressions.len())
         .map(|_| unifier.fresh())
         .collect::<Vec<_>>();
+    mark_owner_derived_providers(&mut unifier, seed, &expressions);
     let expression_flushes = (0..seed.expressions.len())
         .map(|_| unifier.fresh())
         .collect::<Vec<_>>();
@@ -6773,6 +7019,7 @@ fn evaluate_owner_body_impl(
     let mut direct_effects = vec![CheckedEffectSummary::default(); expressions.len()];
     let mut calls = Vec::new();
     let mut pattern_narrowings = Vec::new();
+    let mut flow_constraints = Vec::new();
     let inherited_pattern_plans = inherited_pattern_read_plans(&signature_lexical_plan);
     let mut pattern_local_expressions =
         exact_pattern_local_expressions(seed, &signature_lexical_plan);
@@ -6806,6 +7053,7 @@ fn evaluate_owner_body_impl(
         &mut direct_effects,
         &mut calls,
         &mut pattern_narrowings,
+        &mut flow_constraints,
         &mut work,
     );
     for plan in &inherited_pattern_plans {
@@ -6861,6 +7109,19 @@ fn evaluate_owner_body_impl(
     // user call during transfer evaluation.
     refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
     refine_owner_inherited_pattern_narrowings(&mut unifier, &inherited_pattern_narrowings);
+    if !replay_flow_constraints(&mut unifier, &flow_constraints) {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "owner body {:?} has a non-convergent local value-flow graph",
+            seed.owner
+        )));
+    }
+    initialize_owner_hold_constraints(
+        &mut unifier,
+        &mut hold_authorities,
+        seed,
+        &expressions,
+        &external_expressions,
+    );
     unifier.refine_contextual_flow_holes();
     let mut pre_call_actual_types = expressions
         .iter()
@@ -6925,6 +7186,41 @@ fn evaluate_owner_body_impl(
         &mut diagnostics,
         &mut work,
     );
+    // Calls are initialized outer-first so their consumer requirements cannot
+    // pre-shape a nested contextual provider. A later call in that same pass
+    // can therefore close a FreshOut/context root after its projected reads
+    // were first linked. Replay the now-current provider epoch before any
+    // actual-input snapshot or occurrence transfer consumes those reads.
+    replay_signature_declaration_read_types(
+        &signature_declaration_variables,
+        &signature_lexical_plan,
+        &signature_read_expressions,
+        &mut unifier,
+        &expressions,
+    );
+    refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
+    refine_owner_inherited_pattern_narrowings(&mut unifier, &inherited_pattern_narrowings);
+    if !replay_flow_constraints(&mut unifier, &flow_constraints) {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "owner body {:?} has a non-convergent local value-flow graph",
+            seed.owner
+        )));
+    }
+    // The call pass publishes principal results for update expressions. Replay
+    // HOLD before freezing the all-provider actual-input epoch.
+    replay_owner_hold_constraints(
+        &mut unifier,
+        &mut hold_authorities,
+        seed,
+        &expressions,
+        &external_expressions,
+    );
+    if !replay_flow_constraints(&mut unifier, &flow_constraints) {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "owner body {:?} has a non-convergent local value-flow graph",
+            seed.owner
+        )));
+    }
     // Freeze one all-providers-first epoch before result-transfer consumers
     // run. `resolve` retains still-live TypeVar roots, so a child user-call
     // result can close later without replacing this snapshot. Re-snapshotting
@@ -6950,21 +7246,37 @@ fn evaluate_owner_body_impl(
             })
             .collect();
     }
-    refine_owner_call_transfers(
+    settle_owner_call_transfers_and_holds(
         &mut call_drafts,
         syntax,
         seed,
         &interfaces,
         &providers,
         &mut unifier,
+        &mut hold_authorities,
         &expressions,
         &external_expressions,
         effective_context,
         &mut modes,
+        &pattern_narrowings,
+        &inherited_pattern_narrowings,
+        &flow_constraints,
+    )?;
+    replay_signature_declaration_read_types(
+        &signature_declaration_variables,
+        &signature_lexical_plan,
+        &signature_read_expressions,
+        &mut unifier,
+        &expressions,
     );
     refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
     refine_owner_inherited_pattern_narrowings(&mut unifier, &inherited_pattern_narrowings);
-    unifier.refine_contextual_flow_holes();
+    if !replay_flow_constraints(&mut unifier, &flow_constraints) {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "owner body {:?} has a non-convergent local value-flow graph",
+            seed.owner
+        )));
+    }
     while bind_ready_dynamic_call_input_layer(
         &mut call_drafts,
         seed,
@@ -6972,21 +7284,47 @@ fn evaluate_owner_body_impl(
         &expressions,
         &external_expressions,
     )? {
-        refine_owner_call_transfers(
+        // Binding one ready dynamic layer can close a contextual declaration
+        // root. Refresh its projected occurrences before transfer evaluation
+        // observes this provider epoch.
+        replay_signature_declaration_read_types(
+            &signature_declaration_variables,
+            &signature_lexical_plan,
+            &signature_read_expressions,
+            &mut unifier,
+            &expressions,
+        );
+        settle_owner_call_transfers_and_holds(
             &mut call_drafts,
             syntax,
             seed,
             &interfaces,
             &providers,
             &mut unifier,
+            &mut hold_authorities,
             &expressions,
             &external_expressions,
             effective_context,
             &mut modes,
+            &pattern_narrowings,
+            &inherited_pattern_narrowings,
+            &flow_constraints,
+        )?;
+        replay_signature_declaration_read_types(
+            &signature_declaration_variables,
+            &signature_lexical_plan,
+            &signature_read_expressions,
+            &mut unifier,
+            &expressions,
         );
         refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
         refine_owner_inherited_pattern_narrowings(&mut unifier, &inherited_pattern_narrowings);
-        unifier.refine_contextual_flow_holes();
+        if !replay_flow_constraints(&mut unifier, &flow_constraints) {
+            return Err(OwnerBodyInferenceError::new(format!(
+                "owner body {:?} has a non-convergent local value-flow graph",
+                seed.owner
+            )));
+        }
     }
     validate_owner_call_types(
         &mut call_drafts,
@@ -7008,11 +7346,8 @@ fn evaluate_owner_body_impl(
     // Body-only roots start after the complete SCC namespace. They remain
     // private implementation variables and therefore cannot collide with a
     // stable interface alpha from this SCC.
-    let (mut alpha_variables, mut next_alpha) = owner_body_alpha_namespace(
-        &mut unifier,
-        &own_variables,
-        own_scc.type_variable_count,
-    );
+    let (mut alpha_variables, mut next_alpha) =
+        owner_body_alpha_namespace(&mut unifier, &own_variables, own_scc.type_variable_count);
     for variable in own_parameter_variables {
         let _ = alpha_normalize_type(
             &unifier.resolve(&Type::Var(variable)),
@@ -7153,7 +7488,7 @@ fn evaluate_owner_body_impl(
     let relocations = collect_relocations(seed, summary, &signature_lexical_plan);
 
     let local_content_digest_v1 = fingerprint(
-        OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V6,
+        OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V7,
         &(
             &inferred_statements,
             &inferred_children,
@@ -7178,7 +7513,7 @@ fn evaluate_owner_body_impl(
     // The construction receipt already commits every semantic row, diagnostic,
     // effect, and row count above. Bind the stable owner to that compact seal
     // instead of serializing the same rich body a second time.
-    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V8, &(&seed.owner, &receipt))?;
+    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V9, &(&seed.owner, &receipt))?;
     work.unification_steps = unifier.steps();
     let result = Arc::new(OwnerBodyInferenceShard {
         owner: seed.owner.clone(),
@@ -7428,10 +7763,7 @@ mod tests {
         let earlier = unifier.fresh();
         let selected_once = unifier.fresh();
         let body_only = unifier.fresh();
-        let own_variables = BTreeMap::from([
-            (TypeVar(36), earlier),
-            (TypeVar(46), selected_once),
-        ]);
+        let own_variables = BTreeMap::from([(TypeVar(36), earlier), (TypeVar(46), selected_once)]);
         let (mut variables, mut next) =
             owner_body_alpha_namespace(&mut unifier, &own_variables, 47);
 
@@ -7761,6 +8093,280 @@ mod tests {
     }
 
     #[test]
+    fn hold_call_transfer_replays_initial_and_update_values() {
+        let source = concat!(
+            "FUNCTION machine(trigger) {\n",
+            "    NotStarted |> HOLD state {\n",
+            "        trigger |> THEN { WaveformOpened[timescale_unit: TEXT { ns }] }\n",
+            "    }\n",
+            "}\n",
+            "value: machine(trigger: True)\n",
+        );
+        let unit = link(source);
+        let machine = owner_named(&unit, "machine");
+        let value = owner_named(&unit, "value");
+        let owners = unit.stable_check_owner_keys().collect::<Vec<_>>();
+        let inputs = owners
+            .iter()
+            .map(|owner| (owner.clone(), self::inputs(&unit, owner)))
+            .collect::<BTreeMap<_, _>>();
+        let machine_parameters = inputs[&machine]
+            .2
+            .declarations
+            .iter()
+            .find(|declaration| declaration.public)
+            .expect("machine declaration")
+            .parameters
+            .clone();
+        let summaries = owners
+            .iter()
+            .map(|owner| {
+                let seed = &inputs[owner].2;
+                if owner == &value {
+                    let reference = seed
+                        .references
+                        .iter()
+                        .find(|reference| {
+                            reference.kind == OwnerReferenceKind::Callable
+                                && reference.parts.as_ref() == ["machine"]
+                        })
+                        .cloned()
+                        .expect("value machine reference");
+                    resolve_owner_constraint_seed(
+                        seed,
+                        [ResolvedOwnerSymbolReference {
+                            reference,
+                            owner: machine.clone(),
+                            projection: Box::new([]),
+                            parameters: machine_parameters.clone(),
+                        }],
+                    )
+                    .unwrap()
+                } else {
+                    resolve_owner_constraint_seed(seed, []).unwrap()
+                }
+            })
+            .collect::<Vec<_>>();
+        let seeds = owners
+            .iter()
+            .map(|owner| inputs[owner].2.clone())
+            .collect::<Vec<_>>();
+        let interfaces = solve(&seeds, &summaries);
+        let value_index = owners
+            .iter()
+            .position(|owner| owner == &value)
+            .expect("value owner index");
+        let body = infer(
+            &inputs[&value].0,
+            &inputs[&value].2,
+            &summaries[value_index],
+            &interfaces,
+        );
+        let call = body
+            .calls
+            .iter()
+            .find(|call| call.function == "machine")
+            .expect("machine occurrence");
+        let Type::VariantSet(variants) = &call.result.ty else {
+            panic!("machine call must retain HOLD state domain: {call:#?}");
+        };
+        assert!(
+            variants
+                .iter()
+                .any(|variant| { matches!(variant, Variant::Tag(tag) if tag == "NotStarted") })
+        );
+        assert!(variants.iter().any(|variant| {
+            matches!(
+                variant,
+                Variant::Tagged { tag, fields }
+                    if tag == "WaveformOpened"
+                        && fields.fields.get("timescale_unit") == Some(&Type::Text)
+            )
+        }));
+        assert!(boon_checked::type_is_recursively_closed(&call.result.ty));
+    }
+
+    #[test]
+    fn late_closed_contextual_provider_replaces_a_projected_occurrence() {
+        let mut unifier = TypeUnifier::default();
+        let root = unifier.fresh();
+        let occurrence = unifier.fresh();
+        let projection = ["file".to_owned()];
+
+        // The first owner-body pass sees only the contextual declaration root
+        // and creates an open consumer projection.
+        bind_signature_declaration_read_type(&mut unifier, root, occurrence, &projection);
+        assert!(!boon_checked::type_is_recursively_closed(
+            &unifier.resolve(&Type::Var(occurrence))
+        ));
+
+        // A later enclosing List/filter or List/map input closes the FreshOut
+        // item. Replaying the read must replace the detached occurrence root,
+        // which is the exact default_file_tree_selected_file failure shape.
+        unifier.publish_authoritative_provider(
+            root,
+            Type::object(ObjectShape::from_ordered_fields(
+                [("file".to_owned(), Type::Text)],
+                false,
+            )),
+        );
+        bind_signature_declaration_read_type(&mut unifier, root, occurrence, &projection);
+        assert_eq!(unifier.resolve(&Type::Var(occurrence)), Type::Text);
+    }
+
+    #[test]
+    fn closed_call_input_refreshes_an_existing_fresh_out_projection() {
+        let mut unifier = TypeUnifier::default();
+        let actual = unifier.fresh();
+        let fresh_out = unifier.fresh();
+        let occurrence = unifier.fresh();
+        let projection = ["file".to_owned()];
+
+        // The output-scoped mapper body projects its FreshOut before the
+        // parent list actual has specialized the formal item alpha.
+        bind_signature_declaration_read_type(&mut unifier, fresh_out, occurrence, &projection);
+        assert!(!boon_checked::type_is_recursively_closed(
+            &unifier.resolve(&Type::Var(occurrence))
+        ));
+
+        unifier.bind_var(
+            actual,
+            Type::List(Type::shared(Type::object(
+                ObjectShape::from_ordered_fields([("file".to_owned(), Type::Text)], false),
+            ))),
+        );
+        unifier.bind_call_input(actual, Type::List(Type::shared(Type::Var(fresh_out))));
+        bind_signature_declaration_read_type(&mut unifier, fresh_out, occurrence, &projection);
+
+        assert_eq!(unifier.resolve(&Type::Var(occurrence)), Type::Text);
+    }
+
+    #[test]
+    fn filter_map_then_projection_latest_closes_the_owner_body_result() {
+        let source = concat!(
+            "rows: LIST {\n",
+            "    [kind: FileTreeFile, file: TEXT { simple.vcd }, file_row_elements: [select_file: Duration[milliseconds: 1] |> Timer/interval()]]\n",
+            "}\n",
+            "selected_file:\n",
+            "    rows\n",
+            "    |> List/filter(item, if: item.kind == FileTreeFile)\n",
+            "    |> List/map(item, new:\n",
+            "        item.file_row_elements.select_file |> THEN { item.file }\n",
+            "    )\n",
+            "    |> List/latest()\n",
+        );
+        let unit = link(source);
+        let rows = owner_named(&unit, "rows");
+        let selected_file = owner_named(&unit, "selected_file");
+        let owners = unit.stable_check_owner_keys().collect::<Vec<_>>();
+        let inputs = owners
+            .iter()
+            .map(|owner| (owner.clone(), self::inputs(&unit, owner)))
+            .collect::<BTreeMap<_, _>>();
+        let summaries = owners
+            .iter()
+            .map(|owner| {
+                let seed = &inputs[owner].2;
+                if owner == &selected_file {
+                    let reference = seed
+                        .references
+                        .iter()
+                        .find(|reference| {
+                            reference.kind == OwnerReferenceKind::Value
+                                && reference.parts.as_ref() == ["rows"]
+                        })
+                        .cloned()
+                        .expect("selected_file rows reference");
+                    resolve_owner_constraint_seed(
+                        seed,
+                        [ResolvedOwnerSymbolReference {
+                            reference,
+                            owner: rows.clone(),
+                            projection: Box::new([]),
+                            parameters: Box::new([]),
+                        }],
+                    )
+                    .unwrap()
+                } else {
+                    resolve_owner_constraint_seed(seed, []).unwrap()
+                }
+            })
+            .collect::<Vec<_>>();
+        let seeds = owners
+            .iter()
+            .map(|owner| inputs[owner].2.clone())
+            .collect::<Vec<_>>();
+        let project =
+            ProjectSyntaxSnapshot::from_unit_snapshots("app/RUN.bn", vec![Arc::new(unit.clone())])
+                .unwrap();
+        let abi_provider = crate::project_owner_abi_environment(
+            &project,
+            &boon_checked::ExternalTypeEnvironment::empty(boon_checked::ProgramRole::Client),
+        )
+        .unwrap();
+        let interfaces = solve_with_abi(&seeds, &summaries, &abi_provider);
+        let selected_index = owners
+            .iter()
+            .position(|owner| owner == &selected_file)
+            .expect("selected_file owner index");
+        let body = infer_with_abi(
+            &inputs[&selected_file].0,
+            &inputs[&selected_file].2,
+            &summaries[selected_index],
+            &interfaces,
+            &abi_provider,
+        );
+
+        assert_eq!(
+            body.calls
+                .iter()
+                .map(|call| call.function.as_str())
+                .collect::<Vec<_>>(),
+            ["List/latest", "List/map", "List/filter"]
+        );
+        let filter = body
+            .calls
+            .iter()
+            .find(|call| call.function == "List/filter")
+            .expect("List/filter call");
+        let map = body
+            .calls
+            .iter()
+            .find(|call| call.function == "List/map")
+            .expect("List/map call");
+        let latest = body
+            .calls
+            .iter()
+            .find(|call| call.function == "List/latest")
+            .expect("List/latest call");
+        assert!(matches!(filter.result.ty, Type::List(_)));
+        assert_eq!(
+            map.result,
+            FlowType {
+                ty: Type::List(Type::shared(Type::Text)),
+                mode: FlowMode::PresentOrAbsent,
+            }
+        );
+        assert_eq!(latest.result.ty, Type::Text);
+        assert_eq!(
+            body.expression(&latest.expression)
+                .expect("List/latest expression")
+                .flow_type
+                .ty,
+            Type::Text
+        );
+        assert_eq!(
+            interfaces
+                .iter()
+                .find_map(|result| result.owner(&selected_file))
+                .expect("selected_file interface")
+                .result
+                .ty,
+            Type::Text
+        );
+    }
+
+    #[test]
     fn generic_call_transfer_matches_the_whole_checker_oracle() {
         let source = "FUNCTION identity(input) {\n    input\n}\nvalue: identity(input: 1)\n";
         let unit = link(source);
@@ -8067,7 +8673,7 @@ mod tests {
 
     #[test]
     fn syntax_selected_call_transfer_matches_the_whole_checker_oracle() {
-        let source = "FUNCTION choose(kind) {\n    kind |> WHEN {\n        Record => [value: 1]\n        __ => LIST { 1 }\n    }\n}\nFUNCTION probe() {\n    selected: choose(kind: Record)\n    checked: selected.value + 1\n    selected\n}\n";
+        let source = "FUNCTION choose(kind) {\n    kind |> WHEN {\n        Record => [\n            value: 1\n        ]\n        __ => LIST { 1 }\n    }\n}\nFUNCTION probe() {\n    selected: choose(kind: Record)\n    checked: selected.value + 1\n    selected\n}\n";
         let unit = link(source);
         let value = owner_named(&unit, "probe");
         let choose = owner_named(&unit, "choose");

@@ -44,13 +44,39 @@ use boon_syntax::{
     AstBlockBindingDeclaration, AstDrainPath, AstExprKind, AstMatchPattern, AstStatementKind,
     AstTextSegment, BytesSizeSyntax, StableCheckOwnerKey, StableExpressionKey,
 };
+use ciborium::Value;
 use serde::Serialize;
-use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-const CHECKED_OWNER_SHARD_DOMAIN_V7: &[u8] = b"boon.checked-owner-shard.v7\0";
+const CHECKED_OWNER_SHARD_DOMAIN_V8: &[u8] = b"boon.checked-owner-shard.v8\0";
+
+fn canonical_dynamic_value<T: Serialize + ?Sized>(value: &T) -> Value {
+    Value::serialized(value).expect("checked owner canonical value serializes")
+}
+
+/// Construct the ordered dynamic value used only while sealing owner rows.
+///
+/// The old implementation materialized `serde_json::Value` on the production
+/// path, then immediately re-serialized it as canonical CBOR. Building the
+/// equivalent CBOR value directly removes that JSON owner. Sorting field names
+/// preserves the deterministic object order previously supplied by
+/// `serde_json::Map`.
+macro_rules! canonical_value {
+    ({ $($key:literal : $value:expr),* $(,)? }) => {{
+        let mut fields = vec![
+            $(($key.to_owned(), canonical_dynamic_value(&$value))),*
+        ];
+        fields.sort_by(|left, right| left.0.cmp(&right.0));
+        Value::Map(
+            fields
+                .into_iter()
+                .map(|(key, value)| (Value::Text(key), value))
+                .collect(),
+        )
+    }};
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CheckedOwnerShardBasis {
@@ -160,7 +186,7 @@ impl CheckedOwnerShard {
             )));
         }
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            CHECKED_OWNER_SHARD_DOMAIN_V7,
+            CHECKED_OWNER_SHARD_DOMAIN_V8,
             &(&self.basis, &self.receipts.construction),
         )
         .map_err(|error| {
@@ -1897,6 +1923,103 @@ impl<'a> OwnerRowConstruction<'a> {
         })
     }
 
+    fn state_binding_declaration(
+        &self,
+        expression: OwnerExpressionId,
+        kind: CheckedStateKind,
+        declaration: &OwnerDeclarationRef,
+    ) -> Result<OwnerDeclarationRef, CheckedOwnerBuildError> {
+        if kind != CheckedStateKind::Hold {
+            return Ok(declaration.clone());
+        }
+        let expression_input = self
+            .syntax
+            .expressions
+            .get(expression.0 as usize)
+            .ok_or_else(|| CheckedOwnerBuildError::new("owner HOLD expression is missing"))?;
+        let AstExprKind::Hold { .. } = &expression_input.kind else {
+            return Err(CheckedOwnerBuildError::new(format!(
+                "owner state expression {} is not a HOLD syntax expression",
+                expression.0
+            )));
+        };
+        let Some(statement) = self.statement_by_expression.get(&expression.0).copied() else {
+            // An inline record-field HOLD has no standalone HOLD statement.
+            // Its field declaration is nevertheless an exact lexical state
+            // authority when the field's value is this very expression. Do
+            // not broaden this to an arbitrary containing declaration: that
+            // would manufacture alias identity for a nested state.
+            let OwnerDeclarationRef::Local { declaration: local } = declaration else {
+                return Err(CheckedOwnerBuildError::new(format!(
+                    "owner inline HOLD expression {} has no local declaration authority",
+                    expression.0
+                )));
+            };
+            let exact_field_authority = self
+                .declaration_specs
+                .get(local.0 as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|candidate| {
+                    candidate.kind == CheckedDeclarationKind::Field
+                        && matches!(
+                            candidate.stable_key,
+                            OwnerDeclarationStableKey::RecordField { .. }
+                        )
+                        && candidate.value == Some(OwnerExpressionRef::Local { expression })
+                })
+                && self.expression_declarations.get(expression.0 as usize)
+                    == Some(&Some(declaration.clone()));
+            return exact_field_authority
+                .then(|| declaration.clone())
+                .ok_or_else(|| {
+                    CheckedOwnerBuildError::new(format!(
+                        "owner HOLD expression {} has neither a direct syntax statement nor an exact record-field authority",
+                        expression.0
+                    ))
+                });
+        };
+        let statement_input = self
+            .syntax
+            .statements
+            .get(statement.0 as usize)
+            .ok_or_else(|| CheckedOwnerBuildError::new("owner HOLD statement is missing"))?;
+        let AstStatementKind::Hold { name, .. } = &statement_input.kind else {
+            return Err(CheckedOwnerBuildError::new(format!(
+                "owner HOLD expression {} belongs to a non-HOLD syntax statement",
+                expression.0
+            )));
+        };
+        if name.is_none() {
+            return Ok(declaration.clone());
+        }
+        let target = hold_alias_declaration_target(self.syntax, statement.0)
+            .map_err(|error| CheckedOwnerBuildError::new(error.to_string()))?
+            .ok_or_else(|| {
+                CheckedOwnerBuildError::new("authored HOLD alias has no declaration authority")
+            })?;
+        match target {
+            OwnerLexicalDeclarationTarget::Statement { statement } => self
+                .statement_declarations
+                .get(&OwnerStatementId(statement))
+                .copied()
+                .map(local_declaration_ref)
+                .ok_or_else(|| {
+                    CheckedOwnerBuildError::new(format!(
+                        "HOLD alias statement {statement} has no checked declaration"
+                    ))
+                }),
+            OwnerLexicalDeclarationTarget::Imported {
+                target:
+                    OwnerLexicalTargetRef::Declaration {
+                        owner, declaration, ..
+                    },
+            } => Ok(OwnerDeclarationRef::ImportedStable { owner, declaration }),
+            target => Err(CheckedOwnerBuildError::new(format!(
+                "HOLD alias resolves to unsupported declaration authority {target:?}"
+            ))),
+        }
+    }
+
     fn effective_target_is_out(
         &self,
         target: &OwnerEffectiveLexicalTarget,
@@ -3399,8 +3522,11 @@ impl<'a> OwnerRowConstruction<'a> {
                     .ok_or_else(|| CheckedOwnerBuildError::new("owner state ordinal overflowed"))?;
                 projection.push(format!("state_{ordinal}"));
             }
+            let binding_declaration =
+                self.state_binding_declaration(expression.id, kind, &declaration)?;
             let state = OwnerStateRow {
                 id: OwnerStateId(checked_u32(derived.states.len(), "owner state id")?),
+                binding_declaration,
                 declaration: declaration.clone(),
                 statement,
                 expression: expression.id,
@@ -3448,6 +3574,7 @@ impl<'a> OwnerRowConstruction<'a> {
             };
             let state = OwnerStateRow {
                 id: OwnerStateId(checked_u32(derived.states.len(), "owner state id")?),
+                binding_declaration: declaration_ref.clone(),
                 declaration: declaration_ref.clone(),
                 statement: statement.id,
                 expression,
@@ -3782,7 +3909,7 @@ impl<'a> OwnerRowConstruction<'a> {
         relocations: &mut Vec<OwnerRelocationTarget>,
     ) -> Result<Value, CheckedOwnerBuildError> {
         Ok(match scope {
-            OwnerScopeRef::Local { scope } => json!({
+            OwnerScopeRef::Local { scope } => canonical_value!({
                 "kind": "local",
                 "scope": self.local_scope_key(*scope)?,
             }),
@@ -3791,11 +3918,11 @@ impl<'a> OwnerRowConstruction<'a> {
                     owner: owner.clone(),
                     scope: scope.clone(),
                 });
-                json!({"kind": "imported", "owner": owner, "scope": scope})
+                canonical_value!({"kind": "imported", "owner": owner, "scope": scope})
             }
             OwnerScopeRef::ProjectRoot => {
                 relocations.push(OwnerRelocationTarget::ProjectRootScope);
-                json!({"kind": "project_root"})
+                canonical_value!({"kind": "project_root"})
             }
         })
     }
@@ -3806,7 +3933,7 @@ impl<'a> OwnerRowConstruction<'a> {
         relocations: &mut Vec<OwnerRelocationTarget>,
     ) -> Result<Value, CheckedOwnerBuildError> {
         Ok(match declaration {
-            OwnerDeclarationRef::Local { declaration } => json!({
+            OwnerDeclarationRef::Local { declaration } => canonical_value!({
                 "kind": "local",
                 "declaration": self.local_declaration_key(*declaration)?,
             }),
@@ -3815,14 +3942,14 @@ impl<'a> OwnerRowConstruction<'a> {
                     owner: owner.clone(),
                     member: member.clone(),
                 });
-                json!({"kind": "imported", "owner": owner, "member": member})
+                canonical_value!({"kind": "imported", "owner": owner, "member": member})
             }
             OwnerDeclarationRef::ImportedStable { owner, declaration } => {
                 relocations.push(OwnerRelocationTarget::StableDeclaration {
                     owner: owner.clone(),
                     declaration: declaration.clone(),
                 });
-                json!({
+                canonical_value!({
                     "kind": "imported_stable",
                     "owner": owner,
                     "declaration": declaration,
@@ -3838,14 +3965,14 @@ impl<'a> OwnerRowConstruction<'a> {
                     declaration: *declaration,
                     member: *member,
                 });
-                json!({
+                canonical_value!({
                     "kind": "abi",
                     "canonical_name": canonical_name,
                     "declaration": declaration,
                     "member": member,
                 })
             }
-            OwnerDeclarationRef::ScopeOwner { scope } => json!({
+            OwnerDeclarationRef::ScopeOwner { scope } => canonical_value!({
                 "kind": "scope_owner",
                 "scope": self.normalize_scope_ref(scope, relocations)?,
             }),
@@ -3858,7 +3985,7 @@ impl<'a> OwnerRowConstruction<'a> {
         relocations: &mut Vec<OwnerRelocationTarget>,
     ) -> Result<Value, CheckedOwnerBuildError> {
         Ok(match expression {
-            OwnerExpressionRef::Local { expression } => json!({
+            OwnerExpressionRef::Local { expression } => canonical_value!({
                 "kind": "local",
                 "expression": self.local_expression_key(*expression)?,
             }),
@@ -3867,7 +3994,7 @@ impl<'a> OwnerRowConstruction<'a> {
                     owner: owner.clone(),
                     expression: expression.clone(),
                 });
-                json!({"kind": "child", "owner": owner, "expression": expression})
+                canonical_value!({"kind": "child", "owner": owner, "expression": expression})
             }
         })
     }
@@ -3884,13 +4011,13 @@ impl<'a> OwnerRowConstruction<'a> {
                         "owner local context formal is not defined",
                     ));
                 }
-                json!({"kind": "local", "owner": self.syntax.owner})
+                canonical_value!({"kind": "local", "owner": self.syntax.owner})
             }
             OwnerContextFormalRef::Imported { owner } => {
                 relocations.push(OwnerRelocationTarget::ContextFormal {
                     owner: owner.clone(),
                 });
-                json!({"kind": "imported", "owner": owner})
+                canonical_value!({"kind": "imported", "owner": owner})
             }
         })
     }
@@ -3911,13 +4038,13 @@ impl<'a> OwnerRowConstruction<'a> {
                         CheckedOwnerBuildError::new("owner source read seed is missing")
                     })?
                     .stable_key;
-                json!({"kind": "local", "source": stable_key})
+                canonical_value!({"kind": "local", "source": stable_key})
             }
             boon_checked::OwnerSourceRef::Imported { source } => {
                 relocations.push(OwnerRelocationTarget::Source {
                     source: source.clone(),
                 });
-                json!({"kind": "imported", "source": source})
+                canonical_value!({"kind": "imported", "source": source})
             }
         })
     }
@@ -3930,7 +4057,7 @@ impl<'a> OwnerRowConstruction<'a> {
         fields
             .iter()
             .map(|field| {
-                Ok(json!({
+                Ok(canonical_value!({
                     "declaration": field
                         .declaration
                         .as_ref()
@@ -3962,14 +4089,14 @@ impl<'a> OwnerRowConstruction<'a> {
                 target,
                 projection,
                 source_seed,
-            } => json!({
+            } => canonical_value!({
                 "kind": "read",
                 "target": self.normalize_declaration_ref(target, relocations)?,
                 "projection": projection,
                 "source_seed": source_seed
                     .as_ref()
                     .map(|seed| {
-                        Ok::<Value, CheckedOwnerBuildError>(json!({
+                        Ok::<Value, CheckedOwnerBuildError>(canonical_value!({
                             "source": self.normalize_source_ref(
                                 &seed.source,
                                 rows,
@@ -3984,7 +4111,7 @@ impl<'a> OwnerRowConstruction<'a> {
                 formal,
                 projection,
                 access,
-            } => json!({
+            } => canonical_value!({
                 "kind": "passed",
                 "formal": self.normalize_context_formal_ref(formal, relocations)?,
                 "projection": projection,
@@ -4001,28 +4128,30 @@ impl<'a> OwnerRowConstruction<'a> {
                         member: OwnerAbiMemberRef::Declaration,
                     });
                 }
-                json!({
+                canonical_value!({
                     "kind": "external_read",
                     "canonical_path": canonical_path,
                     "declaration": declaration,
                 })
             }
-            OwnerExpressionKind::Drain { target, projection } => json!({
+            OwnerExpressionKind::Drain { target, projection } => canonical_value!({
                 "kind": "drain",
                 "target": self.normalize_declaration_ref(target, relocations)?,
                 "projection": projection,
             }),
-            OwnerExpressionKind::Text { value } => json!({"kind": "text", "value": value}),
-            OwnerExpressionKind::TextTemplate { segments } => json!({
+            OwnerExpressionKind::Text { value } => {
+                canonical_value!({"kind": "text", "value": value})
+            }
+            OwnerExpressionKind::TextTemplate { segments } => canonical_value!({
                 "kind": "text_template",
                 "segments": segments
                     .iter()
                     .map(|segment| match segment {
-                        OwnerTextSegment::Static { value } => Ok(json!({
+                        OwnerTextSegment::Static { value } => Ok(canonical_value!({
                             "kind": "static",
                             "value": value,
                         })),
-                        OwnerTextSegment::Dynamic { value } => Ok(json!({
+                        OwnerTextSegment::Dynamic { value } => Ok(canonical_value!({
                             "kind": "dynamic",
                             "value": self.normalize_expression_ref(value, relocations)?,
                         })),
@@ -4030,51 +4159,51 @@ impl<'a> OwnerRowConstruction<'a> {
                     .collect::<Result<Vec<_>, CheckedOwnerBuildError>>()?,
             }),
             OwnerExpressionKind::Number { value } => {
-                json!({"kind": "number", "value": value})
+                canonical_value!({"kind": "number", "value": value})
             }
             OwnerExpressionKind::BytesByte { value } => {
-                json!({"kind": "bytes_byte", "value": value})
+                canonical_value!({"kind": "bytes_byte", "value": value})
             }
-            OwnerExpressionKind::Absent => json!({"kind": "absent"}),
-            OwnerExpressionKind::Flush { payload } => json!({
+            OwnerExpressionKind::Absent => canonical_value!({"kind": "absent"}),
+            OwnerExpressionKind::Flush { payload } => canonical_value!({
                 "kind": "flush",
                 "payload": self.normalize_expression_ref(payload, relocations)?,
             }),
-            OwnerExpressionKind::Tag { name } => json!({"kind": "tag", "name": name}),
-            OwnerExpressionKind::TaggedObject { tag, fields } => json!({
+            OwnerExpressionKind::Tag { name } => canonical_value!({"kind": "tag", "name": name}),
+            OwnerExpressionKind::TaggedObject { tag, fields } => canonical_value!({
                 "kind": "tagged_object",
                 "tag": tag,
                 "fields": self.normalize_record_fields(fields, relocations)?,
             }),
-            OwnerExpressionKind::Source => json!({"kind": "source"}),
-            OwnerExpressionKind::Call { call } => json!({
+            OwnerExpressionKind::Source => canonical_value!({"kind": "source"}),
+            OwnerExpressionKind::Call { call } => canonical_value!({
                 "kind": "call",
                 "call": self.local_call_key(*call)?,
             }),
-            OwnerExpressionKind::Draining { input } => json!({
+            OwnerExpressionKind::Draining { input } => canonical_value!({
                 "kind": "draining",
                 "input": self.normalize_expression_ref(input, relocations)?,
             }),
-            OwnerExpressionKind::Hold { initial, name } => json!({
+            OwnerExpressionKind::Hold { initial, name } => canonical_value!({
                 "kind": "hold",
                 "initial": self.normalize_expression_ref(initial, relocations)?,
                 "name": name,
             }),
-            OwnerExpressionKind::Latest { branches } => json!({
+            OwnerExpressionKind::Latest { branches } => canonical_value!({
                 "kind": "latest",
                 "branches": expressions(branches, relocations)?,
             }),
-            OwnerExpressionKind::When { input, arms } => json!({
+            OwnerExpressionKind::When { input, arms } => canonical_value!({
                 "kind": "when",
                 "input": self.normalize_expression_ref(input, relocations)?,
                 "arms": expressions(arms, relocations)?,
             }),
-            OwnerExpressionKind::While { input, arms } => json!({
+            OwnerExpressionKind::While { input, arms } => canonical_value!({
                 "kind": "while",
                 "input": self.normalize_expression_ref(input, relocations)?,
                 "arms": expressions(arms, relocations)?,
             }),
-            OwnerExpressionKind::Then { input, output } => json!({
+            OwnerExpressionKind::Then { input, output } => canonical_value!({
                 "kind": "then",
                 "input": self.normalize_expression_ref(input, relocations)?,
                 "output": output
@@ -4082,7 +4211,7 @@ impl<'a> OwnerRowConstruction<'a> {
                     .map(|output| self.normalize_expression_ref(output, relocations))
                     .transpose()?,
             }),
-            OwnerExpressionKind::Infix { left, op, right } => json!({
+            OwnerExpressionKind::Infix { left, op, right } => canonical_value!({
                 "kind": "infix",
                 "left": self.normalize_expression_ref(left, relocations)?,
                 "op": op,
@@ -4092,7 +4221,7 @@ impl<'a> OwnerRowConstruction<'a> {
                 pattern,
                 bindings,
                 output,
-            } => json!({
+            } => canonical_value!({
                 "kind": "match_arm",
                 "pattern": pattern,
                 "bindings": bindings
@@ -4104,11 +4233,11 @@ impl<'a> OwnerRowConstruction<'a> {
                     .map(|output| self.normalize_expression_ref(output, relocations))
                     .transpose()?,
             }),
-            OwnerExpressionKind::Block { bindings, result } => json!({
+            OwnerExpressionKind::Block { bindings, result } => canonical_value!({
                 "kind": "block",
                 "bindings": bindings
                     .iter()
-                    .map(|binding| Ok(json!({
+                    .map(|binding| Ok(canonical_value!({
                         "declaration": self.normalize_declaration_ref(
                             &binding.declaration,
                             relocations,
@@ -4122,38 +4251,40 @@ impl<'a> OwnerRowConstruction<'a> {
                     .map(|result| self.normalize_expression_ref(result, relocations))
                     .transpose()?,
             }),
-            OwnerExpressionKind::Object { fields } => json!({
+            OwnerExpressionKind::Object { fields } => canonical_value!({
                 "kind": "object",
                 "fields": self.normalize_record_fields(fields, relocations)?,
             }),
-            OwnerExpressionKind::List { capacity, items } => json!({
+            OwnerExpressionKind::List { capacity, items } => canonical_value!({
                 "kind": "list",
                 "capacity": capacity,
                 "items": expressions(items, relocations)?,
             }),
-            OwnerExpressionKind::Bytes { fixed_size, items } => json!({
+            OwnerExpressionKind::Bytes { fixed_size, items } => canonical_value!({
                 "kind": "bytes",
                 "fixed_size": fixed_size,
                 "items": expressions(items, relocations)?,
             }),
-            OwnerExpressionKind::Delimiter => json!({"kind": "delimiter"}),
+            OwnerExpressionKind::Delimiter => canonical_value!({"kind": "delimiter"}),
             OwnerExpressionKind::Invalid { tokens } => {
-                json!({"kind": "invalid", "tokens": tokens})
+                canonical_value!({"kind": "invalid", "tokens": tokens})
             }
-            OwnerExpressionKind::MapEntry { key, value } => json!({
+            OwnerExpressionKind::MapEntry { key, value } => canonical_value!({
                 "kind": "map_entry",
                 "key": self.normalize_expression_ref(key, relocations)?,
                 "value": self.normalize_expression_ref(value, relocations)?,
             }),
-            OwnerExpressionKind::Map { entries } => json!({
+            OwnerExpressionKind::Map { entries } => canonical_value!({
                 "kind": "map",
                 "entries": expressions(entries, relocations)?,
             }),
-            OwnerExpressionKind::Set { items } => json!({
+            OwnerExpressionKind::Set { items } => canonical_value!({
                 "kind": "set",
                 "items": expressions(items, relocations)?,
             }),
-            OwnerExpressionKind::Bits { value } => json!({"kind": "bits", "value": value}),
+            OwnerExpressionKind::Bits { value } => {
+                canonical_value!({"kind": "bits", "value": value})
+            }
         })
     }
 
@@ -4162,22 +4293,22 @@ impl<'a> OwnerRowConstruction<'a> {
         kind: &OwnerStatementKind,
     ) -> Result<Value, CheckedOwnerBuildError> {
         Ok(match kind {
-            OwnerStatementKind::Function { declaration } => json!({
+            OwnerStatementKind::Function { declaration } => canonical_value!({
                 "kind": "function",
                 "declaration": self.local_declaration_key(*declaration)?,
             }),
-            OwnerStatementKind::Field { declaration } => json!({
+            OwnerStatementKind::Field { declaration } => canonical_value!({
                 "kind": "field",
                 "declaration": self.local_declaration_key(*declaration)?,
             }),
-            OwnerStatementKind::Source { declaration, event } => json!({
+            OwnerStatementKind::Source { declaration, event } => canonical_value!({
                 "kind": "source",
                 "declaration": declaration
                     .map(|declaration| self.local_declaration_key(declaration))
                     .transpose()?,
                 "event": event,
             }),
-            OwnerStatementKind::Hold { declaration, name } => json!({
+            OwnerStatementKind::Hold { declaration, name } => canonical_value!({
                 "kind": "hold",
                 "declaration": declaration
                     .map(|declaration| self.local_declaration_key(declaration))
@@ -4187,16 +4318,16 @@ impl<'a> OwnerRowConstruction<'a> {
             OwnerStatementKind::List {
                 declaration,
                 capacity,
-            } => json!({
+            } => canonical_value!({
                 "kind": "list",
                 "declaration": declaration
                     .map(|declaration| self.local_declaration_key(declaration))
                     .transpose()?,
                 "capacity": capacity,
             }),
-            OwnerStatementKind::Block => json!({"kind": "block"}),
-            OwnerStatementKind::Spread => json!({"kind": "spread"}),
-            OwnerStatementKind::Expression => json!({"kind": "expression"}),
+            OwnerStatementKind::Block => canonical_value!({"kind": "block"}),
+            OwnerStatementKind::Spread => canonical_value!({"kind": "spread"}),
+            OwnerStatementKind::Expression => canonical_value!({"kind": "expression"}),
         })
     }
 
@@ -4212,15 +4343,15 @@ impl<'a> OwnerRowConstruction<'a> {
                 value,
                 from_pipe,
                 evaluation_scope,
-            } => json!({
+            } => canonical_value!({
                 "kind": "input",
                 "formal": self.normalize_declaration_ref(formal, relocations)?,
                 "name": name,
                 "value": self.normalize_expression_ref(value, relocations)?,
                 "from_pipe": from_pipe,
                 "evaluation_scope": match evaluation_scope {
-                    OwnerEvaluationScope::Parent => json!({"kind": "parent"}),
-                    OwnerEvaluationScope::Output { formal } => json!({
+                    OwnerEvaluationScope::Parent => canonical_value!({"kind": "parent"}),
+                    OwnerEvaluationScope::Output { formal } => canonical_value!({
                         "kind": "output",
                         "formal": self.normalize_declaration_ref(formal, relocations)?,
                     }),
@@ -4231,7 +4362,7 @@ impl<'a> OwnerRowConstruction<'a> {
                 name,
                 output,
                 scope_id,
-            } => json!({
+            } => canonical_value!({
                 "kind": "fresh_out",
                 "formal": self.normalize_declaration_ref(formal, relocations)?,
                 "name": name,
@@ -4243,7 +4374,7 @@ impl<'a> OwnerRowConstruction<'a> {
                 name,
                 target,
                 target_name,
-            } => json!({
+            } => canonical_value!({
                 "kind": "forward_out",
                 "formal": self.normalize_declaration_ref(formal, relocations)?,
                 "name": name,
@@ -4259,16 +4390,16 @@ impl<'a> OwnerRowConstruction<'a> {
         relocations: &mut Vec<OwnerRelocationTarget>,
     ) -> Result<Value, CheckedOwnerBuildError> {
         Ok(match binding {
-            OwnerContextBinding::Explicit { value, source } => json!({
+            OwnerContextBinding::Explicit { value, source } => canonical_value!({
                 "kind": "explicit",
                 "value": self.normalize_expression_ref(value, relocations)?,
                 "source": source,
             }),
-            OwnerContextBinding::Inherited { formal } => json!({
+            OwnerContextBinding::Inherited { formal } => canonical_value!({
                 "kind": "inherited",
                 "formal": self.normalize_context_formal_ref(formal, relocations)?,
             }),
-            OwnerContextBinding::None => json!({"kind": "none"}),
+            OwnerContextBinding::None => canonical_value!({"kind": "none"}),
         })
     }
 
@@ -4277,7 +4408,7 @@ impl<'a> OwnerRowConstruction<'a> {
         row: &OwnerScopeRow,
         relocations: &mut Vec<OwnerRelocationTarget>,
     ) -> Result<Value, CheckedOwnerBuildError> {
-        Ok(json!({
+        Ok(canonical_value!({
             "parent": row
                 .parent
                 .as_ref()
@@ -4298,7 +4429,7 @@ impl<'a> OwnerRowConstruction<'a> {
         row: &OwnerDeclarationRow,
         relocations: &mut Vec<OwnerRelocationTarget>,
     ) -> Result<Value, CheckedOwnerBuildError> {
-        Ok(json!({
+        Ok(canonical_value!({
             "scope": self.normalize_scope_ref(&row.scope, relocations)?,
             "name": row.name,
             "kind": row.kind,
@@ -4326,7 +4457,7 @@ impl<'a> OwnerRowConstruction<'a> {
             .children
             .iter()
             .map(|child| match child {
-                boon_checked::OwnerStatementChild::Local { statement } => Ok(json!({
+                boon_checked::OwnerStatementChild::Local { statement } => Ok(canonical_value!({
                     "kind": "local",
                     "statement": self.local_statement_key(*statement)?,
                 })),
@@ -4334,7 +4465,7 @@ impl<'a> OwnerRowConstruction<'a> {
                     relocations.push(OwnerRelocationTarget::ChildOwner {
                         owner: owner.clone(),
                     });
-                    Ok(json!({
+                    Ok(canonical_value!({
                         "kind": "owner",
                         "owner": owner,
                     }))
@@ -4347,7 +4478,7 @@ impl<'a> OwnerRowConstruction<'a> {
             .map(|resource| {
                 Ok(match resource {
                     OwnerResourceBinding::Source { source } => match source {
-                        boon_checked::OwnerSourceRef::Local { source } => json!({
+                        boon_checked::OwnerSourceRef::Local { source } => canonical_value!({
                             "kind": "source",
                             "source": &rows
                                 .sources
@@ -4360,7 +4491,7 @@ impl<'a> OwnerRowConstruction<'a> {
                             relocations.push(OwnerRelocationTarget::Source {
                                 source: source.clone(),
                             });
-                            json!({"kind": "source", "source": source})
+                            canonical_value!({"kind": "source", "source": source})
                         }
                     },
                     OwnerResourceBinding::State { state } => {
@@ -4369,7 +4500,7 @@ impl<'a> OwnerRowConstruction<'a> {
                             .get(state.0 as usize)
                             .filter(|row| row.id == *state)
                             .ok_or_else(|| CheckedOwnerBuildError::new("owner state binding is missing"))?;
-                        json!({
+                        canonical_value!({
                             "kind": "state",
                             "expression": self.local_expression_key(state.expression)?,
                             "state_kind": state.kind,
@@ -4381,19 +4512,19 @@ impl<'a> OwnerRowConstruction<'a> {
                             .get(list.0 as usize)
                             .filter(|row| row.id == *list)
                             .ok_or_else(|| CheckedOwnerBuildError::new("owner list binding is missing"))?;
-                        json!({
+                        canonical_value!({
                             "kind": "list_authority",
                             "producer": self.local_expression_key(list.producer)?,
                         })
                     }
-                    OwnerResourceBinding::ListAlias { target } => json!({
+                    OwnerResourceBinding::ListAlias { target } => canonical_value!({
                         "kind": "list_alias",
                         "target": self.normalize_declaration_ref(target, relocations)?,
                     }),
                 })
             })
             .collect::<Result<Vec<_>, CheckedOwnerBuildError>>()?;
-        Ok(json!({
+        Ok(canonical_value!({
             "scope": self.normalize_scope_ref(&row.scope, relocations)?,
             "kind": self.normalize_statement_kind(&row.kind)?,
             "resources": resources,
@@ -4414,7 +4545,7 @@ impl<'a> OwnerRowConstruction<'a> {
         rows: &CheckedOwnerRows,
         relocations: &mut Vec<OwnerRelocationTarget>,
     ) -> Result<Value, CheckedOwnerBuildError> {
-        Ok(json!({
+        Ok(canonical_value!({
             "scope": self.normalize_scope_ref(&row.scope, relocations)?,
             "declaration": row
                 .declaration
@@ -4438,7 +4569,7 @@ impl<'a> OwnerRowConstruction<'a> {
             .parameters
             .iter()
             .map(|parameter| {
-                Ok(json!({
+                Ok(canonical_value!({
                     "declaration": self.local_declaration_key(parameter.declaration)?,
                     "name": parameter.name,
                     "kind": parameter.kind,
@@ -4446,8 +4577,8 @@ impl<'a> OwnerRowConstruction<'a> {
                     "flow_type": parameter.flow_type,
                     "requirement": parameter.requirement,
                     "evaluation_scope": match &parameter.evaluation_scope {
-                        OwnerEvaluationScope::Parent => json!({"kind": "parent"}),
-                        OwnerEvaluationScope::Output { formal } => json!({
+                        OwnerEvaluationScope::Parent => canonical_value!({"kind": "parent"}),
+                        OwnerEvaluationScope::Output { formal } => canonical_value!({
                             "kind": "output",
                             "formal": self.normalize_declaration_ref(formal, relocations)?,
                         }),
@@ -4460,7 +4591,7 @@ impl<'a> OwnerRowConstruction<'a> {
             .contexts
             .iter()
             .map(|context| {
-                Ok(json!({
+                Ok(canonical_value!({
                     "name": context.name,
                     "kind": context.kind,
                     "provider": self.normalize_declaration_ref(&context.provider, relocations)?,
@@ -4468,7 +4599,7 @@ impl<'a> OwnerRowConstruction<'a> {
                 }))
             })
             .collect::<Result<Vec<_>, CheckedOwnerBuildError>>()?;
-        Ok(json!({
+        Ok(canonical_value!({
             "declaration": self.local_declaration_key(row.declaration)?,
             "scope": self.normalize_scope_ref(&row.scope, relocations)?,
             "kind": row.kind,
@@ -4478,7 +4609,7 @@ impl<'a> OwnerRowConstruction<'a> {
             "parameters": parameters,
             "contexts": contexts,
             "context_formal": row.context_formal.map(|formal| {
-                if formal.0 == 0 { json!({"owner": self.syntax.owner}) } else { Value::Null }
+                if formal.0 == 0 { canonical_value!({"owner": self.syntax.owner}) } else { Value::Null }
             }),
             "result": row.result,
             "role": row.role,
@@ -4498,7 +4629,7 @@ impl<'a> OwnerRowConstruction<'a> {
         row: &OwnerCallRow,
         relocations: &mut Vec<OwnerRelocationTarget>,
     ) -> Result<Value, CheckedOwnerBuildError> {
-        Ok(json!({
+        Ok(canonical_value!({
             "expression": self.local_expression_key(row.expression)?,
             "callable": self.normalize_declaration_ref(&row.callable, relocations)?,
             "owner_callable": row
@@ -4516,7 +4647,7 @@ impl<'a> OwnerRowConstruction<'a> {
             "contexts": row
                 .contexts
                 .iter()
-                .map(|context| Ok(json!({
+                .map(|context| Ok(canonical_value!({
                     "declaration": self.local_declaration_key(context.declaration)?,
                     "context_ordinal": context.context_ordinal,
                     "scope": self.local_scope_key(context.scope_id)?,
@@ -4527,7 +4658,7 @@ impl<'a> OwnerRowConstruction<'a> {
                 .contextual_substitutions
                 .iter()
                 .map(|substitution| {
-                    Ok(json!({
+                    Ok(canonical_value!({
                         "formal": self.normalize_context_formal_ref(
                             &substitution.formal,
                             relocations,
@@ -4550,11 +4681,11 @@ impl<'a> OwnerRowConstruction<'a> {
         site: &OwnerSourceAnchorSite,
     ) -> Result<Value, CheckedOwnerBuildError> {
         Ok(match site {
-            OwnerSourceAnchorSite::Statement { statement } => json!({
+            OwnerSourceAnchorSite::Statement { statement } => canonical_value!({
                 "kind": "statement",
                 "statement": self.local_statement_key(OwnerStatementId(*statement))?,
             }),
-            OwnerSourceAnchorSite::Expression { expression } => json!({
+            OwnerSourceAnchorSite::Expression { expression } => canonical_value!({
                 "kind": "expression",
                 "expression": expression,
             }),
@@ -4685,11 +4816,11 @@ impl<'a> OwnerRowConstruction<'a> {
             )?;
         }
         for row in &rows.context_formals {
-            let stable_key = json!({
+            let stable_key = canonical_value!({
                 "owner": self.syntax.owner,
                 "context_formal": row.id.0,
             });
-            let payload = json!({
+            let payload = canonical_value!({
                 "callable": self.local_declaration_key(row.callable)?,
                 "flow_type": row.flow_type,
                 "projections": row.projections,
@@ -4714,7 +4845,7 @@ impl<'a> OwnerRowConstruction<'a> {
         for row in &rows.call_result_paths {
             let mut relocations = Vec::new();
             let stable_key = self.local_call_key(row.call)?;
-            let payload = json!({
+            let payload = canonical_value!({
                 "call": stable_key,
                 "anchor": self.normalize_declaration_ref(&row.anchor, &mut relocations)?,
                 "projection": row.projection,
@@ -4729,7 +4860,7 @@ impl<'a> OwnerRowConstruction<'a> {
         for row in &rows.pattern_bindings {
             let mut relocations = Vec::new();
             let stable_key = self.local_declaration_key(row.declaration)?;
-            let payload = json!({
+            let payload = canonical_value!({
                 "declaration": stable_key,
                 "selector": self.normalize_expression_ref(&row.selector, &mut relocations)?,
                 "projection": row.projection,
@@ -4744,7 +4875,7 @@ impl<'a> OwnerRowConstruction<'a> {
         for row in &rows.resource_projection_seeds {
             let mut relocations = Vec::new();
             let stable_key = self.local_expression_key(row.expression)?;
-            let payload = json!({
+            let payload = canonical_value!({
                 "expression": stable_key,
                 "target": self.normalize_declaration_ref(&row.target, &mut relocations)?,
                 "projection": row.projection,
@@ -4759,15 +4890,15 @@ impl<'a> OwnerRowConstruction<'a> {
         }
         for row in &rows.sources {
             let mut relocations = Vec::new();
-            let payload = json!({
+            let payload = canonical_value!({
                 "declaration": self.normalize_declaration_ref(&row.declaration, &mut relocations)?,
                 "statement": self.local_statement_key(row.statement)?,
                 "expression": self.local_expression_key(row.expression)?,
                 "owner_scope": self.normalize_scope_ref(&row.owner_scope, &mut relocations)?,
-                "path": {
+                "path": canonical_value!({
                     "anchor": self.normalize_declaration_ref(&row.path.anchor, &mut relocations)?,
                     "projection": row.path.projection,
-                },
+                }),
                 "interval_ms": row.interval_ms,
                 "payload_type": row.payload_type,
                 "source": row.source,
@@ -4781,20 +4912,21 @@ impl<'a> OwnerRowConstruction<'a> {
         }
         for row in &rows.states {
             let mut relocations = Vec::new();
-            let stable_key = json!({
+            let stable_key = canonical_value!({
                 "expression": self.local_expression_key(row.expression)?,
                 "kind": row.kind,
             });
-            let payload = json!({
+            let payload = canonical_value!({
+                "binding_declaration": self.normalize_declaration_ref(&row.binding_declaration, &mut relocations)?,
                 "declaration": self.normalize_declaration_ref(&row.declaration, &mut relocations)?,
                 "statement": self.local_statement_key(row.statement)?,
                 "expression": self.local_expression_key(row.expression)?,
                 "initial": self.normalize_expression_ref(&row.initial, &mut relocations)?,
                 "owner_scope": self.normalize_scope_ref(&row.owner_scope, &mut relocations)?,
-                "path": {
+                "path": canonical_value!({
                     "anchor": self.normalize_declaration_ref(&row.path.anchor, &mut relocations)?,
                     "projection": row.path.projection,
-                },
+                }),
                 "kind": row.kind,
                 "flow_type": row.flow_type,
                 "source": row.source,
@@ -4809,15 +4941,15 @@ impl<'a> OwnerRowConstruction<'a> {
         for row in &rows.lists {
             let mut relocations = Vec::new();
             let stable_key = self.local_expression_key(row.producer)?;
-            let payload = json!({
+            let payload = canonical_value!({
                 "declaration": self.normalize_declaration_ref(&row.declaration, &mut relocations)?,
                 "statement": self.local_statement_key(row.statement)?,
                 "producer": stable_key,
                 "owner_scope": self.normalize_scope_ref(&row.owner_scope, &mut relocations)?,
-                "path": {
+                "path": canonical_value!({
                     "anchor": self.normalize_declaration_ref(&row.path.anchor, &mut relocations)?,
                     "projection": row.path.projection,
-                },
+                }),
                 "item_type": row.item_type,
                 "capacity": row.capacity,
                 "key_policy": row.key_policy,
@@ -4833,13 +4965,13 @@ impl<'a> OwnerRowConstruction<'a> {
         for row in &rows.occurrences {
             let mut relocations = Vec::new();
             let target = self.normalize_declaration_ref(&row.target, &mut relocations)?;
-            let stable_key = json!({
+            let stable_key = canonical_value!({
                 "target": target,
                 "kind": row.kind,
                 "source": row.source,
             });
-            let payload = json!({
-                "target": stable_key["target"],
+            let payload = canonical_value!({
+                "target": target,
                 "kind": row.kind,
                 "source": row.source,
             });
@@ -4852,17 +4984,17 @@ impl<'a> OwnerRowConstruction<'a> {
         }
         for diagnostic in &self.diagnostics {
             let site = self.normalized_diagnostic_site(&diagnostic.site)?;
-            let stable_key = json!({
+            let stable_key = canonical_value!({
                 "site": site,
                 "role": diagnostic.role,
                 "code": diagnostic.code,
                 "message": diagnostic.message,
             });
-            let payload = json!({
+            let payload = canonical_value!({
                 "severity": diagnostic.severity,
                 "code": diagnostic.code,
                 "message": diagnostic.message,
-                "site": stable_key["site"],
+                "site": site,
                 "role": diagnostic.role,
             });
             sink.record(
@@ -6127,7 +6259,7 @@ pub fn build_checked_owner_shard<'a>(
     // relocation. Bind that compact seal to the exact current basis instead of
     // serializing the complete rich row tables for a second time.
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        CHECKED_OWNER_SHARD_DOMAIN_V7,
+        CHECKED_OWNER_SHARD_DOMAIN_V8,
         &(&basis, &receipts.construction),
     )
     .map_err(|error| {
@@ -6170,6 +6302,7 @@ mod tests {
         inference_abi: OwnerInferenceAbiEnvironment,
         construction_abi: OwnerConstructionAbiEnvironment,
         interface: OwnerInterfaceSccResult,
+        imported_sccs: Vec<OwnerInterfaceSccResult>,
         imported_interfaces: BTreeMap<StableCheckOwnerKey, OwnerPublicInterface>,
         body: OwnerBodyInferenceShard,
         body_currentness: OwnerBodyInferenceCurrentnessReceipt,
@@ -6473,6 +6606,7 @@ mod tests {
             .flat_map(|result| result.owners.iter())
             .map(|interface| (interface.owner.clone(), interface.clone()))
             .collect::<BTreeMap<_, _>>();
+        let imported_sccs = imported.iter().map(|result| (*result).clone()).collect();
         let body_evaluation = evaluate_owner_body_with_signature_plan(
             &syntax,
             &lexical_plan,
@@ -6499,6 +6633,7 @@ mod tests {
             inference_abi,
             construction_abi,
             interface: Arc::unwrap_or_clone(interface),
+            imported_sccs,
             imported_interfaces,
             body,
             body_currentness: body_evaluation.currentness,
@@ -6583,7 +6718,7 @@ mod tests {
             &fixture.inference_abi,
             &fixture.construction_abi,
             &fixture.interface,
-            [],
+            fixture.imported_sccs.iter(),
         )
         .unwrap();
 
@@ -8875,6 +9010,10 @@ mod tests {
         let anchor = |fixture: &Fixture| {
             let rows = rows(fixture);
             let state = rows.states.first().expect("record field state row");
+            assert_eq!(
+                state.binding_declaration, state.declaration,
+                "an inline record-field HOLD must use its exact field declaration for lexical self reads"
+            );
             let OwnerDeclarationRef::Local { declaration } = &state.path.anchor else {
                 panic!("record field state must have a local declaration anchor");
             };
@@ -9309,6 +9448,120 @@ mod tests {
     }
 
     #[test]
+    fn heterogeneous_list_checked_rows_share_widened_authority_but_keep_precise_items() {
+        let fixture = fixture(
+            concat!(
+                "rows: LIST {\n",
+                "    [\n",
+                "        kind: Header\n",
+                "        file: TEXT { a }\n",
+                "    ]\n",
+                "    [\n",
+                "        kind: Empty\n",
+                "        file: TEXT { b }\n",
+                "    ]\n",
+                "}\n",
+            ),
+            "rows",
+        );
+        let shard = build_checked_owner_shard(
+            &fixture.syntax,
+            &fixture.lexical_plan,
+            &fixture.seed,
+            &fixture.summary,
+            &fixture.body,
+            &fixture.body_currentness,
+            &fixture.inference_abi,
+            &fixture.construction_abi,
+            &fixture.interface,
+            fixture.imported_sccs.iter(),
+        )
+        .unwrap();
+        let rows = shard.rows();
+        let declaration = rows
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == "rows")
+            .expect("rows declaration");
+        let producer_id = match declaration.value.as_ref() {
+            Some(OwnerExpressionRef::Local { expression }) => *expression,
+            Some(OwnerExpressionRef::Child { .. }) | None => {
+                panic!("rows declaration must own one local value expression")
+            }
+        };
+        let producer = rows
+            .expressions
+            .get(producer_id.0 as usize)
+            .expect("rows producer expression");
+        let [list] = rows.lists.as_slice() else {
+            panic!(
+                "rows must emit exactly one list authority: {:#?}",
+                rows.lists
+            )
+        };
+
+        assert_eq!(
+            list.declaration,
+            OwnerDeclarationRef::Local {
+                declaration: declaration.id,
+            }
+        );
+        assert_eq!(list.producer, producer.id);
+        assert_eq!(declaration.flow_type, producer.flow_type);
+        let Type::List(declaration_item) = &declaration.flow_type.ty else {
+            panic!("rows declaration must have a LIST type: {declaration:#?}")
+        };
+        let Type::List(producer_item) = &producer.flow_type.ty else {
+            panic!("rows producer must have a LIST type: {producer:#?}")
+        };
+        assert_eq!(declaration_item.as_ref(), producer_item.as_ref());
+        assert_eq!(declaration_item.as_ref(), &list.item_type);
+
+        let Type::Object(merged_item) = &list.item_type else {
+            panic!("heterogeneous record items must structurally widen: {list:#?}")
+        };
+        assert_eq!(merged_item.fields.get("file"), Some(&Type::Text));
+        assert_eq!(
+            merged_item.fields.get("kind"),
+            Some(&Type::VariantSet(
+                vec![
+                    Variant::Tag("Empty".to_owned()),
+                    Variant::Tag("Header".to_owned()),
+                ]
+                .into(),
+            ))
+        );
+
+        let OwnerExpressionKind::List { items, .. } = &producer.kind else {
+            panic!("rows producer must retain its LIST expression kind")
+        };
+        let item_rows = items
+            .iter()
+            .map(|item| {
+                let OwnerExpressionRef::Local { expression } = item else {
+                    panic!("inline LIST item must remain in the list owner")
+                };
+                rows.expressions
+                    .get(expression.0 as usize)
+                    .expect("inline LIST item expression")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(item_rows.len(), 2);
+        for (item, tag) in item_rows.into_iter().zip(["Header", "Empty"]) {
+            let Type::Object(item_type) = &item.flow_type.ty else {
+                panic!("inline LIST item must retain its record type: {item:#?}")
+            };
+            assert_eq!(item_type.fields.get("file"), Some(&Type::Text));
+            assert_eq!(
+                item_type.fields.get("kind"),
+                Some(&Type::VariantSet(vec![Variant::Tag(tag.to_owned())].into(),)),
+                "structural collection widening must not backflow into producer literals",
+            );
+            assert_ne!(item.flow_type.ty, list.item_type);
+        }
+    }
+
+    #[test]
     fn owner_resources_are_emitted_with_statement_bindings_and_receipts() {
         let source = fixture("events: SOURCE\n", "events");
         let (source_rows, source_receipts) = built_rows(&source);
@@ -9359,13 +9612,36 @@ mod tests {
                 scope: OwnerScopeRef::Imported { .. }
             }
         ));
+        assert_eq!(
+            update_body_rows.states[0].binding_declaration,
+            OwnerDeclarationRef::ImportedStable {
+                owner: update_authority.syntax.owner.clone(),
+                declaration: OwnerDeclarationStableKey::Public,
+            }
+        );
+        assert_ne!(
+            update_body_rows.states[0].binding_declaration, update_body_rows.states[0].declaration,
+            "the child state must keep lexical HOLD identity distinct from its storage anchor"
+        );
+        let state_receipt = update_body_receipts
+            .row_receipts
+            .iter()
+            .find(|receipt| receipt.domain == OwnerCheckedRowDomain::State)
+            .expect("child-owner state receipt");
         assert!(
-            update_body_receipts
-                .row_receipts
-                .iter()
-                .any(|receipt| receipt.domain == OwnerCheckedRowDomain::State
-                    && receipt.relocations.len > 0),
-            "a child-owner state must receipt its lexical declaration relocation"
+            update_body_receipts.relocations[state_receipt
+                .relocations
+                .checked_range()
+                .expect("valid state relocation span")]
+            .iter()
+            .any(|relocation| matches!(
+                &relocation.target,
+                OwnerRelocationTarget::StableDeclaration {
+                    owner,
+                    declaration: OwnerDeclarationStableKey::Public,
+                } if owner == &update_authority.syntax.owner
+            )),
+            "the state row must receipt its exact imported HOLD declaration"
         );
 
         let inline = fixture("FUNCTION make() {\n    [items: LIST { 1 }]\n}\n", "make");
@@ -9416,6 +9692,12 @@ mod tests {
         }));
         assert!(local_rows.states.iter().any(|state| {
             state.declaration
+                == (OwnerDeclarationRef::Local {
+                    declaration: local_hold,
+                })
+        }));
+        assert!(local_rows.states.iter().all(|state| {
+            state.binding_declaration
                 == (OwnerDeclarationRef::Local {
                     declaration: local_hold,
                 })
@@ -9484,6 +9766,9 @@ mod tests {
             vec![Vec::<String>::new(), vec!["state_1".to_owned()]],
             "the declaration result and its nested HOLD need distinct dense-compatible paths"
         );
+        assert!(nested_local_rows.states.iter().all(|state| {
+            state.binding_declaration == (OwnerDeclarationRef::Local { declaration: outer })
+        }));
 
         let imported_source = concat!(
             "container:\n",
@@ -9510,6 +9795,13 @@ mod tests {
             let [state] = update_rows.states.as_slice() else {
                 panic!("fieldless HOLD owner `{name}` must emit exactly one state row");
             };
+            assert_eq!(
+                state.binding_declaration,
+                OwnerDeclarationRef::ImportedStable {
+                    owner: container.syntax.owner.clone(),
+                    declaration: OwnerDeclarationStableKey::Public,
+                }
+            );
             if name == "outer" {
                 assert!(
                     state.path.projection.is_empty(),

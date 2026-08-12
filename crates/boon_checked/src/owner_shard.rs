@@ -753,6 +753,11 @@ pub struct OwnerSourceRow {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerStateRow {
     pub id: OwnerStateId,
+    /// Exact lexical declaration named by reads inside this state update.
+    ///
+    /// This can differ from `declaration`, which remains the canonical
+    /// storage/path anchor for a state nested in a callable or imported owner.
+    pub binding_declaration: OwnerDeclarationRef,
     pub declaration: OwnerDeclarationRef,
     pub statement: OwnerStatementId,
     pub expression: OwnerExpressionId,

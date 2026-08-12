@@ -5098,6 +5098,12 @@ pub(crate) fn compile_erased_program_with_distributed_context(
                 schedule.id
             ))
         })?;
+        if derived.state_backing.is_some() {
+            return Err(PlanError::new(format!(
+                "transient host-effect schedule {} targets state-backed derived value `{}`",
+                schedule.id, derived.path
+            )));
+        }
         if !executable_expression_reaches(program, derived.producer, schedule.expression) {
             return Err(PlanError::new(format!(
                 "transient host-effect schedule {} does not belong to derived value `{}`",

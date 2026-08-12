@@ -16,7 +16,7 @@ use boon_checked::{
     CheckedStatementKind, LexicalScopeId,
 };
 use boon_checked::{
-    CheckedEvaluationScope, CheckedImageHandoffV2, CheckedImageProjectionIdV2,
+    CheckedEvaluationScope, CheckedImageHandoffV3, CheckedImageProjectionIdV2,
     CheckedImageRowDomainV2, CheckedProgramFields, CheckedShardCallableKindV2,
     CheckedShardOwnerKeyV2, CheckedShardProjectionKeyV2, CheckedShardRegionV2, DeclId, FlowMode,
     FlowType, ProgramRole, Type, TypeVar,
@@ -64,12 +64,6 @@ const DEPENDENCY_IMPLEMENTATION_COMPONENT_DOMAIN: &[u8] =
 const DEPENDENCY_IMPLEMENTATION_DOMAIN: &[u8] = b"boon.callable-dependency-implementation.v2\0";
 #[cfg(test)]
 const DEPENDENCY_MANIFEST_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-manifest.v3\0";
-#[cfg(test)]
-const DEPENDENCY_PROGRAM_ROOT_ENTRY_DIGEST_DOMAIN: &[u8] =
-    b"boon.callable-dependency-program-root-entry.v3\0";
-#[cfg(test)]
-const DEPENDENCY_SEALED_MANIFEST_DIGEST_DOMAIN: &[u8] =
-    b"boon.callable-dependency-sealed-manifest.v1\0";
 const DEPENDENCY_STABLE_OWNER_DOMAIN_V4: &[u8] = b"boon.callable-dependency-stable-owner.v4\0";
 #[cfg(test)]
 const DEPENDENCY_PROJECTION_KEY_DOMAIN_V4: &[u8] = b"boon.callable-dependency-projection-key.v4\0";
@@ -609,38 +603,6 @@ pub struct SemanticDependencyCoverageV1 {
     pub disposition: SemanticDependencyCoverageDispositionV1,
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProgramRootDependencyEntryV3 {
-    pub public_shape_digest: [u8; 32],
-    pub implementation_dependency_digest: [u8; 32],
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CallableDependencyEntryV3 {
-    pub callable: SemanticCallableId,
-    pub checked_callable: DeclId,
-    pub public_shape_digest: [u8; 32],
-    pub implementation_dependency_digest: [u8; 32],
-}
-
-/// Digests of the exhaustive proof inventories discarded when the semantic
-/// program is sealed.
-///
-/// These values retain the exact V3 proof identity without retaining hundreds
-/// of thousands of dependency and coverage records in every compiled program.
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CallableDependencyProofDigestsV1 {
-    pub program_root_entry_digest: [u8; 32],
-    pub callable_entries_digest: [u8; 32],
-    pub dependency_records_digest: [u8; 32],
-    pub coverage_digest: [u8; 32],
-    pub dependency_record_count: usize,
-    pub coverage_record_count: usize,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CallableDependencyComponentDigestsV1 {
     pub producer_materializations: [u8; 32],
@@ -652,21 +614,6 @@ pub struct CallableDependencyComponentDigestsV1 {
     pub view_binding_graph: [u8; 32],
     pub scope_storage_graph: [u8; 32],
     pub memory_graph: [u8; 32],
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CallableDependencyManifestV3 {
-    pub schema: String,
-    pub source_bundle_digest_v1: SourceBundleDigestV1,
-    pub checked_program_digest: CheckedProgramDigestV1,
-    pub dependency_classifier_schema_digest: DependencyClassifierSchemaDigestV1,
-    pub component_digests: CallableDependencyComponentDigestsV1,
-    pub program_root: ProgramRootDependencyEntryV3,
-    pub callable_entries: Vec<CallableDependencyEntryV3>,
-    pub proof_digests: CallableDependencyProofDigestsV1,
-    pub manifest_digest: CallableDependencyManifestDigestV1,
-    sealed_manifest_digest: [u8; 32],
 }
 
 /// Revision-stable identity for one dependency owner inside a compiler project.
@@ -888,7 +835,6 @@ struct ValidatedCallableDependencyConstructionV3 {
     component_digests: CallableDependencyComponentDigestsV1,
     program_root: ProgramRootDependencyProofEntryV3,
     callable_entries: Vec<CallableDependencyProofEntryV3>,
-    proof_digests: CallableDependencyProofDigestsV1,
     manifest_digest: CallableDependencyManifestDigestV1,
     #[cfg(test)]
     retained_dependencies: Option<Vec<SemanticDependencyRecordV1>>,
@@ -971,7 +917,7 @@ impl DependencyOwnerIndex {
         checked: &CheckedProgramFields,
         out: &ResolvedOutGraph,
         execution: &SemanticExecutionImageColumnsV1,
-        resources: &SemanticResourceGraphV1,
+        resources: &SemanticResourceGraphV2,
         reactive: &SemanticReactiveGraphV1,
         storage: &SemanticScopeStorageGraphV1,
         memory: &SemanticMemoryGraphV1,
@@ -1512,10 +1458,10 @@ impl DependencyOwnerIndex {
     }
 
     fn derive_from_image_routes(
-        checked_handoff: &CheckedImageHandoffV2,
+        checked_handoff: &CheckedImageHandoffV3,
         execution_handoff: &ExecutionImageHandoffV3,
         execution: &SemanticExecutionImageColumnsV1,
-        resources: &SemanticResourceGraphV1,
+        resources: &SemanticResourceGraphV2,
         reactive: &SemanticReactiveGraphV1,
         storage: &SemanticScopeStorageGraphV1,
         memory: &SemanticMemoryGraphV1,
@@ -2682,7 +2628,7 @@ struct DependencyCollector {
 
 impl DependencyCollector {
     fn for_presealed_images(
-        checked: &CheckedImageHandoffV2,
+        checked: &CheckedImageHandoffV3,
         execution: &ExecutionImageHandoffV3,
     ) -> Self {
         let checked_rows = checked
@@ -5412,7 +5358,7 @@ fn stable_owner_for_checked_key_v7(
 }
 
 fn execution_projection_owner_v7(
-    checked: &CheckedImageHandoffV2,
+    checked: &CheckedImageHandoffV3,
     execution: &ExecutionImageHandoffV3,
     projection: &ExecutionConstructionProjectionV3,
 ) -> Result<SemanticDependencyStableOwnerV4, CallableDependencyManifestError> {
@@ -5544,7 +5490,7 @@ fn execution_dependency_entity_domain_v7(
 }
 
 fn build_dense_projection_index_v7(
-    checked: &CheckedImageHandoffV2,
+    checked: &CheckedImageHandoffV3,
     execution_handoff: &ExecutionImageHandoffV3,
     execution: &SemanticExecutionImageColumnsV1,
     stable_owners: &BTreeMap<SemanticDependencyOwnerV1, SemanticDependencyStableOwnerV4>,
@@ -6203,12 +6149,12 @@ fn canonical_dependency_hash_with_buffer(
 pub(crate) fn build_callable_dependency_manifest_v7(
     dependency_classifier_schema_digest: [u8; 32],
     checked: &CheckedProgramFields,
-    checked_handoff: &CheckedImageHandoffV2,
+    checked_handoff: &CheckedImageHandoffV3,
     execution_handoff: &ExecutionImageHandoffV3,
     producer_materializations: &[ProducerMaterializationRequest],
     out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     resource_rows: &ConstructionDependencyRowsV1,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV2,
@@ -6503,7 +6449,7 @@ pub(crate) fn build_callable_dependency_manifest(
     producer_materializations: &[ProducerMaterializationRequest],
     out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV2,
     view: &SemanticViewBindingGraphV1,
@@ -6752,7 +6698,7 @@ fn build_callable_dependency_construction(
     producer_materializations: &[ProducerMaterializationRequest],
     out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV2,
     view: &SemanticViewBindingGraphV1,
@@ -6890,12 +6836,10 @@ fn build_callable_dependency_construction(
         coverage,
         mut direct,
     } = dependency_manifest_phase!("finish", collector.finish(&owners))?;
-    let coverage_record_count = coverage.len();
     let coverage_digest =
         dependency_manifest_phase!("coverage_digest", dependency_coverage_digest(&coverage))?;
     let retained_coverage = Some(coverage);
 
-    let dependency_record_count = dependencies.len();
     let owner_list = owners.iter().copied().collect::<Vec<_>>();
     let (graph_digests, graph_stats, dependency_records_digest) = dependency_manifest_phase!(
         "dependency_graph_digests",
@@ -7033,13 +6977,6 @@ fn build_callable_dependency_construction(
         "callable_entries_digest",
         callable_entries_digest(&callable_entries)
     )?;
-    let program_root_entry_digest = dependency_manifest_phase!(
-        "program_root_entry_digest",
-        canonical_dependency_hash_streaming(
-            DEPENDENCY_PROGRAM_ROOT_ENTRY_DIGEST_DOMAIN,
-            &program_root,
-        )
-    )?;
     let manifest_digest = dependency_manifest_phase!(
         "manifest_digest",
         callable_dependency_manifest_digest_from_content(
@@ -7054,14 +6991,6 @@ fn build_callable_dependency_construction(
             coverage_digest,
         )
     )?;
-    let proof_digests = CallableDependencyProofDigestsV1 {
-        program_root_entry_digest,
-        callable_entries_digest,
-        dependency_records_digest,
-        coverage_digest,
-        dependency_record_count,
-        coverage_record_count,
-    };
     Ok(ValidatedCallableDependencyConstructionV3 {
         schema,
         source_bundle_digest_v1,
@@ -7070,7 +6999,6 @@ fn build_callable_dependency_construction(
         component_digests,
         program_root,
         callable_entries,
-        proof_digests,
         manifest_digest,
         #[cfg(test)]
         retained_dependencies,
@@ -7090,7 +7018,6 @@ impl ValidatedCallableDependencyConstructionV3 {
             component_digests,
             program_root,
             callable_entries,
-            proof_digests: _,
             manifest_digest,
             retained_dependencies,
             retained_coverage,
@@ -7122,7 +7049,7 @@ fn build_callable_dependency_proof_manifest(
     producer_materializations: &[ProducerMaterializationRequest],
     out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV2,
     view: &SemanticViewBindingGraphV1,
@@ -7155,87 +7082,6 @@ fn build_callable_dependency_proof_manifest(
     );
     validate_manifest_shape(&validated.manifest, &owners)?;
     Ok(validated)
-}
-
-#[cfg(test)]
-fn seal_callable_dependency_manifest(
-    validated: ValidatedCallableDependencyConstructionV3,
-) -> Result<CallableDependencyManifestV3, CallableDependencyManifestError> {
-    let ValidatedCallableDependencyConstructionV3 {
-        schema,
-        source_bundle_digest_v1,
-        checked_program_digest,
-        dependency_classifier_schema_digest,
-        component_digests,
-        program_root,
-        callable_entries,
-        proof_digests,
-        manifest_digest,
-        #[cfg(test)]
-            retained_dependencies: _,
-        #[cfg(test)]
-            retained_coverage: _,
-    } = validated;
-    let program_root = ProgramRootDependencyEntryV3 {
-        public_shape_digest: program_root.public_shape_digest,
-        implementation_dependency_digest: program_root.implementation_dependency_digest,
-    };
-    let callable_entries = callable_entries
-        .into_iter()
-        .map(|entry| CallableDependencyEntryV3 {
-            callable: entry.callable,
-            checked_callable: entry.checked_callable,
-            public_shape_digest: entry.public_shape_digest,
-            implementation_dependency_digest: entry.implementation_dependency_digest,
-        })
-        .collect();
-    let mut manifest = CallableDependencyManifestV3 {
-        schema,
-        source_bundle_digest_v1,
-        checked_program_digest,
-        dependency_classifier_schema_digest,
-        component_digests,
-        program_root,
-        callable_entries,
-        proof_digests,
-        manifest_digest,
-        sealed_manifest_digest: [0; 32],
-    };
-    manifest.sealed_manifest_digest = sealed_callable_dependency_manifest_digest(&manifest)?;
-    Ok(manifest)
-}
-
-#[cfg(test)]
-fn sealed_callable_dependency_manifest_digest(
-    manifest: &CallableDependencyManifestV3,
-) -> Result<[u8; 32], CallableDependencyManifestError> {
-    #[derive(Serialize)]
-    struct Payload<'a> {
-        schema: &'a str,
-        source_bundle_digest_v1: SourceBundleDigestV1,
-        checked_program_digest: CheckedProgramDigestV1,
-        dependency_classifier_schema_digest: DependencyClassifierSchemaDigestV1,
-        component_digests: &'a CallableDependencyComponentDigestsV1,
-        program_root: &'a ProgramRootDependencyEntryV3,
-        callable_entries: &'a [CallableDependencyEntryV3],
-        proof_digests: &'a CallableDependencyProofDigestsV1,
-        manifest_digest: CallableDependencyManifestDigestV1,
-    }
-
-    canonical_dependency_hash(
-        DEPENDENCY_SEALED_MANIFEST_DIGEST_DOMAIN,
-        &Payload {
-            schema: &manifest.schema,
-            source_bundle_digest_v1: manifest.source_bundle_digest_v1,
-            checked_program_digest: manifest.checked_program_digest,
-            dependency_classifier_schema_digest: manifest.dependency_classifier_schema_digest,
-            component_digests: &manifest.component_digests,
-            program_root: &manifest.program_root,
-            callable_entries: &manifest.callable_entries,
-            proof_digests: &manifest.proof_digests,
-            manifest_digest: manifest.manifest_digest,
-        },
-    )
 }
 
 #[cfg(test)]
@@ -7419,7 +7265,7 @@ impl CallableDependencyProofManifestV3 {
         producer_materializations: &[ProducerMaterializationRequest],
         out: &ResolvedOutGraph,
         execution: &SemanticExecutionImageColumnsV1,
-        resources: &SemanticResourceGraphV1,
+        resources: &SemanticResourceGraphV2,
         reactive: &SemanticReactiveGraphV1,
         lowering: &SemanticLoweringContractV2,
         view: &SemanticViewBindingGraphV1,
@@ -7551,116 +7397,6 @@ impl CallableDependencyManifestV7 {
 
 #[cfg(test)]
 impl CallableDependencyManifestV4 {
-    pub(crate) fn validate_integrity(
-        &self,
-        dependency_classifier_schema_digest: [u8; 32],
-        checked: &CheckedProgramFields,
-        execution: &SemanticExecutionImageColumnsV1,
-    ) -> Result<(), CallableDependencyManifestError> {
-        if self.schema != CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V4 {
-            return Err(CallableDependencyManifestError::new(format!(
-                "unsupported callable dependency manifest schema `{}`",
-                self.schema
-            )));
-        }
-        if self.source_bundle_digest_v1 != checked.source_bundle_digest_v1 {
-            return Err(CallableDependencyManifestError::new(
-                "dependency manifest source-bundle identity differs from its checked program",
-            ));
-        }
-        if self.dependency_classifier_schema_digest
-            != DependencyClassifierSchemaDigestV1(dependency_classifier_schema_digest)
-        {
-            return Err(CallableDependencyManifestError::new(
-                "dependency manifest classifier schema digest is stale",
-            ));
-        }
-        let expected_checked_program_digest = CheckedProgramDigestV1(
-            canonical_dependency_hash_streaming(CHECKED_PROGRAM_DIGEST_DOMAIN, checked)?,
-        );
-        if self.checked_program_digest != expected_checked_program_digest {
-            return Err(CallableDependencyManifestError::new(
-                "dependency manifest checked-program digest is stale",
-            ));
-        }
-        let mut owners = BTreeSet::from([SemanticDependencyOwnerV1::ProgramRoot]);
-        owners.extend(execution.callables.iter().map(|callable| {
-            SemanticDependencyOwnerV1::Callable {
-                callable: callable.id,
-            }
-        }));
-        let stable_owners = stable_dependency_owner_index_v4(checked, execution, &owners)?;
-        let root_owner = SemanticDependencyOwnerV1::ProgramRoot;
-        if self.program_root.stable_owner != stable_owners[&root_owner]
-            || self.program_root.public_shape_digest
-                != canonical_dependency_hash(
-                    DEPENDENCY_PUBLIC_SHAPE_DOMAIN,
-                    &(checked.role, checked.source_bundle_digest_v1),
-                )?
-        {
-            return Err(CallableDependencyManifestError::new(
-                "sealed dependency manifest program-root identity or public shape is stale",
-            ));
-        }
-        if self.callable_entries.len() != execution.callables.len() {
-            return Err(CallableDependencyManifestError::new(format!(
-                "sealed dependency manifest has {} callable identities for {} semantic callables",
-                self.callable_entries.len(),
-                execution.callables.len()
-            )));
-        }
-        for (entry, callable) in self.callable_entries.iter().zip(&execution.callables) {
-            let owner = SemanticDependencyOwnerV1::Callable {
-                callable: callable.id,
-            };
-            if entry.callable != callable.id
-                || entry.checked_callable != callable.checked_callable
-                || entry.stable_owner != stable_owners[&owner]
-            {
-                return Err(CallableDependencyManifestError::new(format!(
-                    "sealed dependency manifest callable {} does not match semantic callable {} / checked declaration {}",
-                    entry.callable, callable.id, callable.checked_callable.0
-                )));
-            }
-            if entry.public_shape_digest != callable_public_shape_digest(callable)? {
-                return Err(CallableDependencyManifestError::new(format!(
-                    "sealed dependency manifest callable {} public shape is stale",
-                    entry.callable
-                )));
-            }
-        }
-        if self.proof_digests.coverage_record_count < self.proof_digests.dependency_record_count
-            || self.proof_digests.projection_count == 0
-            || self.proof_digests.projection_count > self.proof_digests.coverage_record_count
-        {
-            return Err(CallableDependencyManifestError::new(
-                "sealed dependency manifest has inconsistent projection receipt counts",
-            ));
-        }
-        let expected_manifest_digest = callable_dependency_manifest_digest_v4(
-            &self.schema,
-            self.source_bundle_digest_v1,
-            self.checked_program_digest,
-            self.dependency_classifier_schema_digest,
-            &self.component_digests,
-            &self.program_root,
-            &self.callable_entries,
-            &self.proof_digests,
-        )?;
-        if self.manifest_digest != expected_manifest_digest {
-            return Err(CallableDependencyManifestError::new(
-                "callable dependency manifest digest does not match its projection receipt payload",
-            ));
-        }
-        let expected_seal = sealed_callable_dependency_manifest_digest_v4(self)?;
-        if self.sealed_manifest_digest != expected_seal {
-            return Err(CallableDependencyManifestError::new(
-                "sealed dependency manifest digest does not match its retained proof identity",
-            ));
-        }
-        Ok(())
-    }
-
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn validate_against(
@@ -7670,7 +7406,7 @@ impl CallableDependencyManifestV4 {
         producer_materializations: &[ProducerMaterializationRequest],
         out: &ResolvedOutGraph,
         execution: &SemanticExecutionImageColumnsV1,
-        resources: &SemanticResourceGraphV1,
+        resources: &SemanticResourceGraphV2,
         reactive: &SemanticReactiveGraphV1,
         lowering: &SemanticLoweringContractV2,
         view: &SemanticViewBindingGraphV1,
@@ -7690,124 +7426,6 @@ impl CallableDependencyManifestV4 {
             storage,
             memory,
         )?;
-        if self != &expected {
-            return Err(CallableDependencyManifestError::new(
-                "callable dependency manifest differs from its deterministic checked+semantic rederivation",
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-impl CallableDependencyManifestV3 {
-    pub(crate) fn validate_integrity(
-        &self,
-        dependency_classifier_schema_digest: [u8; 32],
-        checked: &CheckedProgramFields,
-        execution: &SemanticExecutionImageColumnsV1,
-    ) -> Result<(), CallableDependencyManifestError> {
-        if self.schema != CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V3 {
-            return Err(CallableDependencyManifestError::new(format!(
-                "unsupported callable dependency manifest schema `{}`",
-                self.schema
-            )));
-        }
-        if self.source_bundle_digest_v1 != checked.source_bundle_digest_v1 {
-            return Err(CallableDependencyManifestError::new(
-                "dependency manifest source-bundle identity differs from its checked program",
-            ));
-        }
-        if self.dependency_classifier_schema_digest
-            != DependencyClassifierSchemaDigestV1(dependency_classifier_schema_digest)
-        {
-            return Err(CallableDependencyManifestError::new(
-                "dependency manifest classifier schema digest is stale",
-            ));
-        }
-        let expected_checked_program_digest = CheckedProgramDigestV1(
-            canonical_dependency_hash_streaming(CHECKED_PROGRAM_DIGEST_DOMAIN, checked)?,
-        );
-        if self.checked_program_digest != expected_checked_program_digest {
-            return Err(CallableDependencyManifestError::new(
-                "dependency manifest checked-program digest is stale",
-            ));
-        }
-        let expected_root_public_shape = canonical_dependency_hash(
-            DEPENDENCY_PUBLIC_SHAPE_DOMAIN,
-            &(checked.role, checked.source_bundle_digest_v1),
-        )?;
-        if self.program_root.public_shape_digest != expected_root_public_shape {
-            return Err(CallableDependencyManifestError::new(
-                "sealed dependency manifest program-root public shape is stale",
-            ));
-        }
-        if self.callable_entries.len() != execution.callables.len() {
-            return Err(CallableDependencyManifestError::new(format!(
-                "sealed dependency manifest has {} callable identities for {} semantic callables",
-                self.callable_entries.len(),
-                execution.callables.len()
-            )));
-        }
-        for (entry, callable) in self.callable_entries.iter().zip(&execution.callables) {
-            if entry.callable != callable.id || entry.checked_callable != callable.checked_callable
-            {
-                return Err(CallableDependencyManifestError::new(format!(
-                    "sealed dependency manifest callable {} does not match semantic callable {} / checked declaration {}",
-                    entry.callable, callable.id, callable.checked_callable.0
-                )));
-            }
-            if entry.public_shape_digest != callable_public_shape_digest(callable)? {
-                return Err(CallableDependencyManifestError::new(format!(
-                    "sealed dependency manifest callable {} public shape is stale",
-                    entry.callable
-                )));
-            }
-        }
-        if self.manifest_digest == CallableDependencyManifestDigestV1([0; 32]) {
-            return Err(CallableDependencyManifestError::new(
-                "sealed dependency manifest has a zero exhaustive-proof digest",
-            ));
-        }
-        let expected_seal = sealed_callable_dependency_manifest_digest(self)?;
-        if self.sealed_manifest_digest != expected_seal {
-            return Err(CallableDependencyManifestError::new(
-                "sealed dependency manifest digest does not match its retained proof identity",
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn validate_against(
-        &self,
-        dependency_classifier_schema_digest: [u8; 32],
-        checked: &CheckedProgramFields,
-        producer_materializations: &[ProducerMaterializationRequest],
-        out: &ResolvedOutGraph,
-        execution: &SemanticExecutionImageColumnsV1,
-        resources: &SemanticResourceGraphV1,
-        reactive: &SemanticReactiveGraphV1,
-        lowering: &SemanticLoweringContractV2,
-        view: &SemanticViewBindingGraphV1,
-        storage: &SemanticScopeStorageGraphV1,
-        memory: &SemanticMemoryGraphV1,
-    ) -> Result<(), CallableDependencyManifestError> {
-        let expected = seal_callable_dependency_manifest(build_callable_dependency_construction(
-            dependency_classifier_schema_digest,
-            checked,
-            producer_materializations,
-            out,
-            execution,
-            resources,
-            reactive,
-            lowering,
-            view,
-            storage,
-            memory,
-            ExhaustiveProofRetention::Retain,
-        )?)?;
         if self != &expected {
             return Err(CallableDependencyManifestError::new(
                 "callable dependency manifest differs from its deterministic checked+semantic rederivation",
@@ -10732,7 +10350,7 @@ fn semantic_expression_lifetime(kind: &SemanticExpressionKind) -> SemanticDepend
 
 #[cfg(test)]
 fn inventory_resources(
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     execution: &SemanticExecutionImageColumnsV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
@@ -12099,7 +11717,7 @@ fn view_capture_target_entity(target: SemanticViewCaptureTargetV1) -> SemanticDe
 fn inventory_lowering(
     lowering: &SemanticLoweringContractV2,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
 ) -> Result<(), CallableDependencyManifestError> {
@@ -12797,7 +12415,7 @@ fn view_argument_owner(
 fn inventory_storage(
     storage: &SemanticScopeStorageGraphV1,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,

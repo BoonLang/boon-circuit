@@ -14,7 +14,7 @@ use crate::{
     SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpressionKind, SemanticFieldId,
     SemanticListId, SemanticLoweringContractV2, SemanticMaterializationLocalId,
     SemanticNamedValueId, SemanticReactiveGraphV1, SemanticReadId, SemanticReadTargetV1,
-    SemanticResourceGraphV1, SemanticRowBinding, SemanticSourceId, SemanticSourceOrigin,
+    SemanticResourceGraphV2, SemanticRowBinding, SemanticSourceId, SemanticSourceOrigin,
     SemanticStateId, SemanticStatementId, SemanticValueId, SemanticValueListAuthorityId,
     SemanticValueOrigin, SemanticValueProvenance, StaticOwnerId,
 };
@@ -474,7 +474,7 @@ impl std::error::Error for SemanticScopeStorageError {}
 pub(crate) fn build_semantic_scope_storage_graph(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV2,
     out_net: &ResolvedOutGraph,
@@ -497,7 +497,7 @@ pub(crate) fn build_semantic_scope_storage_graph(
 pub(crate) fn build_semantic_scope_storage_graph_from_validated_inputs(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV2,
 ) -> Result<SemanticScopeStorageGraphV1, SemanticScopeStorageError> {
@@ -544,7 +544,7 @@ impl SemanticScopeStorageGraphV1 {
         &self,
         checked: &CheckedProgramFields,
         execution: &SemanticExecutionImageColumnsV1,
-        resources: &SemanticResourceGraphV1,
+        resources: &SemanticResourceGraphV2,
         reactive: &SemanticReactiveGraphV1,
         lowering: &SemanticLoweringContractV2,
         out_net: &ResolvedOutGraph,
@@ -563,7 +563,7 @@ impl SemanticScopeStorageGraphV1 {
 
 fn build_owners(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
 ) -> Result<Vec<SemanticStorageOwnerV1>, SemanticScopeStorageError> {
     execution
         .static_owners
@@ -598,7 +598,7 @@ fn build_owners(
 fn build_storage_fields(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<Vec<SemanticStorageFieldV1>, SemanticScopeStorageError> {
     let reactive_by_statement = reactive
@@ -680,7 +680,7 @@ fn build_storage_fields(
 }
 
 fn append_state_authority_fields(
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive_by_statement: &BTreeMap<SemanticStatementId, &crate::SemanticFieldV1>,
     reactive_storage: &BTreeMap<SemanticFieldId, SemanticStorageFieldId>,
     fields: &mut Vec<SemanticStorageFieldV1>,
@@ -775,7 +775,7 @@ fn nearest_parent_storage_field(
 
 fn append_list_authority_fields(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     reactive_by_statement: &BTreeMap<SemanticStatementId, &crate::SemanticFieldV1>,
     reactive_storage: &BTreeMap<SemanticFieldId, SemanticStorageFieldId>,
@@ -1188,7 +1188,7 @@ fn flattened_type_fields(data_type: &Type) -> Vec<(Vec<String>, Type)> {
 
 fn append_materialized_value_fields(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     fields: &mut Vec<SemanticStorageFieldV1>,
 ) -> Result<(), SemanticScopeStorageError> {
     for list in &resources.lists {
@@ -1232,16 +1232,25 @@ fn append_materialized_value_fields(
         if materializations.is_empty() {
             continue;
         }
+        let mut existing_value_paths = fields
+            .iter()
+            .filter(|field| {
+                field.row == Some(row) && field.role == SemanticStorageFieldRoleV1::Value
+            })
+            .map(|field| storage_field_row_path(resources, fields, field))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        // The list root itself has the empty row path. It owns the row but is
+        // not an item member, so it must not suppress a same-named item field.
+        existing_value_paths.remove(&Vec::new());
         for (path, _) in list_item_fields(&list.item_type, &list.item_fields) {
             let [name] = path.as_slice() else {
                 continue;
             };
-            if fields.iter().any(|field| {
-                field.row == Some(row)
-                    && field.parent == Some(*parent)
-                    && field.name == *name
-                    && field.role == SemanticStorageFieldRoleV1::Value
-            }) {
+            // `(row, item path)` is the physical storage identity. A reactive
+            // field can reach that slot through a state-owned statement
+            // parent, so parent equality is not a valid deduplication key for
+            // a materialized row projection.
+            if existing_value_paths.contains(&path) {
                 continue;
             }
             let mut candidates = BTreeSet::new();
@@ -1294,6 +1303,7 @@ fn append_materialized_value_fields(
                     ty: value.flow_type.ty.clone(),
                 },
             });
+            existing_value_paths.insert(path);
         }
     }
     let materialized_rows = resources
@@ -1537,7 +1547,7 @@ fn append_record_projection_fields(
 
 fn build_storage_locals(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     fields: &[SemanticStorageFieldV1],
 ) -> Result<Vec<SemanticStorageLocalV1>, SemanticScopeStorageError> {
     execution
@@ -1583,7 +1593,7 @@ fn build_storage_locals(
 
 fn local_members_for_row(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     fields: &[SemanticStorageFieldV1],
     row: SemanticRowBinding,
     item_type: &Type,
@@ -1787,6 +1797,85 @@ fn storage_field_item_path(field: &SemanticStorageFieldV1) -> Option<Vec<String>
     }
 }
 
+pub(crate) fn storage_field_row_path(
+    resources: &SemanticResourceGraphV2,
+    fields: &[SemanticStorageFieldV1],
+    field: &SemanticStorageFieldV1,
+) -> Result<Vec<String>, SemanticScopeStorageError> {
+    // This is also the executable row-path authority used by core lowering.
+    // The direct list root owns the row and therefore has an empty item path;
+    // deeper same-row parents are structural item path segments.
+    let Some(row) = field.row else {
+        return Ok(Vec::new());
+    };
+    match &field.origin {
+        SemanticStorageFieldOriginV1::ListAuthority { item_path, .. } => {
+            return Ok(item_path.clone());
+        }
+        SemanticStorageFieldOriginV1::RecordProjection { projection, .. } => {
+            return Ok(projection.clone());
+        }
+        SemanticStorageFieldOriginV1::DetachedCapture { .. }
+        | SemanticStorageFieldOriginV1::ValueListAuthority { .. } => return Ok(Vec::new()),
+        SemanticStorageFieldOriginV1::Reactive { .. }
+        | SemanticStorageFieldOriginV1::StateAuthority { .. } => {}
+    }
+    if resources.lists.iter().any(|list| {
+        list.id == row.list
+            && list.row_scope == row.scope
+            && field.statement == Some(list.statement)
+            && matches!(field.origin, SemanticStorageFieldOriginV1::Reactive { .. })
+    }) {
+        return Ok(Vec::new());
+    }
+    let Some(parent_id) = field.parent else {
+        return Ok(vec![field.name.clone()]);
+    };
+    let mut parent = fields
+        .get(parent_id.as_usize())
+        .filter(|candidate| candidate.id == parent_id)
+        .ok_or_else(|| {
+            SemanticScopeStorageError::new(format!(
+                "semantic storage field {} references missing parent {parent_id}",
+                field.id,
+            ))
+        })?;
+    if parent.row != Some(row) {
+        return Ok(vec![field.name.clone()]);
+    }
+
+    let mut reversed = vec![field.name.clone()];
+    let mut remaining = fields.len().saturating_add(1);
+    loop {
+        if remaining == 0 {
+            return Err(SemanticScopeStorageError::new(format!(
+                "semantic storage field {} has cyclic structural row ancestry",
+                field.id,
+            )));
+        }
+        remaining -= 1;
+        let Some(grandparent_id) = parent.parent else {
+            break;
+        };
+        let grandparent = fields
+            .get(grandparent_id.as_usize())
+            .filter(|candidate| candidate.id == grandparent_id)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "semantic storage field {} ancestry references missing field {grandparent_id}",
+                    field.id,
+                ))
+            })?;
+        if grandparent.row != Some(row) {
+            break;
+        }
+        reversed.push(parent.name.clone());
+        parent = grandparent;
+    }
+    reversed.reverse();
+    Ok(reversed)
+}
+
 fn insert_local_member(
     members: &mut BTreeMap<Vec<String>, SemanticStorageLocalMemberV1>,
     incoming: SemanticStorageLocalMemberV1,
@@ -1844,7 +1933,7 @@ fn insert_local_member(
 
 fn resolve_local_forwarding(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     locals: &mut [SemanticStorageLocalV1],
 ) -> Result<(), SemanticScopeStorageError> {
     let local_index = locals
@@ -1947,7 +2036,7 @@ struct CaptureRequestKey {
 
 fn discover_detached_captures(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     owners: &[SemanticStorageOwnerV1],
     locals: &[SemanticStorageLocalV1],
@@ -2028,7 +2117,7 @@ fn discover_detached_captures(
 
 fn nearest_target_materialization(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     owners: &[SemanticStorageOwnerV1],
     mut owner: StaticOwnerId,
     row: SemanticRowBinding,
@@ -2329,7 +2418,7 @@ fn append_capture_fields(
 
 fn classify_resource_only_fields(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     locals: &[SemanticStorageLocalV1],
     fields: &mut [SemanticStorageFieldV1],
 ) -> Result<(), SemanticScopeStorageError> {
@@ -2351,7 +2440,7 @@ fn classify_resource_only_fields(
 }
 
 fn source_for_resource_origin(
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     origin: &SemanticValueOrigin,
 ) -> Result<Option<SemanticSourceId>, SemanticScopeStorageError> {
     match origin {
@@ -2399,7 +2488,7 @@ fn source_for_resource_origin(
 
 struct StorageProvenanceResolver<'a> {
     execution: &'a SemanticExecutionImageColumnsV1,
-    resources: &'a SemanticResourceGraphV1,
+    resources: &'a SemanticResourceGraphV2,
     locals: &'a [SemanticStorageLocalV1],
     fields: &'a [SemanticStorageFieldV1],
     visiting: BTreeSet<SemanticStorageFieldId>,
@@ -2850,7 +2939,7 @@ fn list_initializer_path_is_resource_only(
 
 fn build_storage_bindings(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     fields: &[SemanticStorageFieldV1],
     owners: &[SemanticStorageOwnerV1],
@@ -3014,7 +3103,7 @@ fn build_storage_bindings(
 }
 
 fn build_storage_sources(
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     owners: &[SemanticStorageOwnerV1],
 ) -> Result<Vec<SemanticStorageSourceV1>, SemanticScopeStorageError> {
@@ -3049,7 +3138,7 @@ fn build_storage_sources(
 
 fn build_row_values(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     locals: &[SemanticStorageLocalV1],
 ) -> Result<Vec<SemanticStorageRowValueV1>, SemanticScopeStorageError> {
     let local_rows = locals
@@ -3327,7 +3416,7 @@ fn build_row_values(
 
 fn build_row_source_projections(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     locals: &[SemanticStorageLocalV1],
 ) -> Result<Vec<SemanticStorageRowSourceProjectionV1>, SemanticScopeStorageError> {
     let mut projections =
@@ -3600,7 +3689,7 @@ fn build_producer_result_fields(
 fn build_named_value_storage(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV2,
     fields: &[SemanticStorageFieldV1],
@@ -3701,7 +3790,7 @@ fn build_named_value_storage(
 fn named_value_targets(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     fields: &[SemanticStorageFieldV1],
     bindings: &[SemanticStorageBindingV1],
@@ -3935,7 +4024,7 @@ fn named_value_target_from_binding(
 
 fn named_value_target_flow_type(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     fields: &[SemanticStorageFieldV1],
     target: &SemanticNamedValueStorageTargetV1,
@@ -4534,7 +4623,7 @@ fn validate_storage_shape(
     graph: &SemanticScopeStorageGraphV1,
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV2,
 ) -> Result<(), SemanticScopeStorageError> {
@@ -4545,6 +4634,7 @@ fn validate_storage_shape(
             "semantic scope-storage schema or source digest differs",
         ));
     }
+    let mut value_fields_by_row_path = BTreeMap::new();
     for (index, field) in graph.fields.iter().enumerate() {
         if field.id != SemanticStorageFieldId(index) {
             return Err(SemanticScopeStorageError::new(
@@ -4593,6 +4683,21 @@ fn validate_storage_shape(
                 return Err(SemanticScopeStorageError::new(format!(
                     "state-authority storage field {} differs from state {}",
                     field.id, state.id
+                )));
+            }
+        }
+        if field.role == SemanticStorageFieldRoleV1::Value
+            && let Some(row) = field.row
+        {
+            let path = storage_field_row_path(resources, &graph.fields, field)?;
+            if let Some(previous) = value_fields_by_row_path.insert((row, path.clone()), field.id) {
+                return Err(SemanticScopeStorageError::new(format!(
+                    "semantic row {}/{} path `{}` has duplicate value fields {} and {}",
+                    row.list,
+                    row.scope,
+                    path.join("."),
+                    previous,
+                    field.id,
                 )));
             }
         }
@@ -4669,7 +4774,7 @@ fn validate_storage_shape(
 fn validate_named_value_storage_shape(
     graph: &SemanticScopeStorageGraphV1,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV2,
 ) -> Result<(), SemanticScopeStorageError> {
@@ -4842,7 +4947,7 @@ fn require_expression(
 }
 
 fn require_source(
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     id: SemanticSourceId,
 ) -> Result<&crate::SemanticSourceResourceV1, SemanticScopeStorageError> {
     resources
@@ -4857,9 +4962,9 @@ fn require_source(
 }
 
 fn require_state(
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     id: SemanticStateId,
-) -> Result<&crate::SemanticStateResourceV1, SemanticScopeStorageError> {
+) -> Result<&crate::SemanticStateResourceV2, SemanticScopeStorageError> {
     resources
         .states
         .get(id.as_usize())
@@ -5169,6 +5274,184 @@ store: [
         assert!(value.declaration.is_some());
         assert!(value.producer.is_some());
         assert_eq!(authority.parent, value.parent);
+    }
+
+    #[test]
+    fn materialized_hold_field_has_one_value_for_its_exact_row_path() {
+        let (graph, semantic) = graph_for_source(
+            r#"
+store: [
+    tick: SOURCE
+    rows:
+        LIST { [name: TEXT { one }] }
+        |> List/map(item, new: stateful_row(row: item))
+]
+
+FUNCTION stateful_row(row) {
+    [
+        name: row.name
+        selected:
+            False |> HOLD selected {
+                store.tick |> THEN { True }
+            }
+        alias:
+            TEXT { initial } |> HOLD alias {
+                store.tick |> THEN { TEXT { changed } }
+            }
+    ]
+}
+"#,
+        );
+        let list = semantic
+            .resource_graph()
+            .lists
+            .iter()
+            .find(|list| list.local_name == "rows")
+            .expect("rows list");
+        let row = SemanticRowBinding {
+            list: list.id,
+            scope: list.row_scope,
+        };
+        let alias_path = vec!["alias".to_owned()];
+        let alias_values = graph
+            .fields
+            .iter()
+            .filter(|field| {
+                field.row == Some(row)
+                    && field.role == SemanticStorageFieldRoleV1::Value
+                    && storage_field_row_path(semantic.resource_graph(), &graph.fields, field)
+                        .expect("alias field has valid row ancestry")
+                        == alias_path
+            })
+            .collect::<Vec<_>>();
+        let [alias] = alias_values.as_slice() else {
+            panic!(
+                "mapped HOLD alias resolves to {} value fields: {alias_values:#?}",
+                alias_values.len(),
+            );
+        };
+        assert!(matches!(
+            alias.origin,
+            SemanticStorageFieldOriginV1::Reactive { .. }
+        ));
+        assert!(alias.statement.is_some());
+        assert!(alias.producer.is_some());
+    }
+
+    #[test]
+    fn nested_row_fields_with_the_same_leaf_name_keep_distinct_structural_paths() {
+        let (graph, semantic) = graph_for_source(
+            r#"
+store: [
+    rows:
+        LIST {
+            [left_name: TEXT { left }, right_name: TEXT { right }]
+        }
+        |> List/map(item, new: [
+            left: [alias: item.left_name]
+            right: [alias: item.right_name]
+        ])
+]
+"#,
+        );
+        let list = semantic
+            .resource_graph()
+            .lists
+            .iter()
+            .find(|list| list.local_name == "rows")
+            .expect("rows list");
+        let row = SemanticRowBinding {
+            list: list.id,
+            scope: list.row_scope,
+        };
+        let alias_paths = graph
+            .fields
+            .iter()
+            .filter(|field| {
+                field.row == Some(row)
+                    && field.role == SemanticStorageFieldRoleV1::Value
+                    && field.name == "alias"
+            })
+            .map(|field| {
+                storage_field_row_path(semantic.resource_graph(), &graph.fields, field)
+                    .expect("nested field has valid row ancestry")
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            alias_paths,
+            BTreeSet::from([
+                vec!["left".to_owned(), "alias".to_owned()],
+                vec!["right".to_owned(), "alias".to_owned()],
+            ])
+        );
+    }
+
+    #[test]
+    fn list_root_and_same_named_item_have_distinct_row_paths() {
+        let (graph, semantic) = graph_for_source(
+            r#"
+store: [
+    same:
+        List/range(from: 0, to: 1)
+        |> List/map(item, new: [same: item])
+]
+"#,
+        );
+        let list = semantic
+            .resource_graph()
+            .lists
+            .iter()
+            .find(|list| list.local_name == "same")
+            .expect("same list");
+        let row = SemanticRowBinding {
+            list: list.id,
+            scope: list.row_scope,
+        };
+        let row_values = graph
+            .fields
+            .iter()
+            .filter(|field| {
+                field.row == Some(row) && field.role == SemanticStorageFieldRoleV1::Value
+            })
+            .map(|field| {
+                (
+                    field,
+                    storage_field_row_path(semantic.resource_graph(), &graph.fields, field)
+                        .expect("same field has valid row ancestry"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let roots = row_values
+            .iter()
+            .filter(|(_, path)| path.is_empty())
+            .collect::<Vec<_>>();
+        let [root] = roots.as_slice() else {
+            panic!(
+                "same list resolves to {} row roots: {roots:#?}",
+                roots.len()
+            );
+        };
+        assert!(matches!(
+            root.0.origin,
+            SemanticStorageFieldOriginV1::Reactive { .. }
+        ));
+        let item_path = vec!["same".to_owned()];
+        let item_values = row_values
+            .iter()
+            .filter(|(_, path)| path == &item_path)
+            .collect::<Vec<_>>();
+        let [item] = item_values.as_slice() else {
+            panic!(
+                "same item path resolves to {} values: {item_values:#?}",
+                item_values.len(),
+            );
+        };
+        assert_ne!(root.0.id, item.0.id);
+        assert!(matches!(
+            item.0.origin,
+            SemanticStorageFieldOriginV1::RecordProjection { .. }
+        ));
+        assert!(item.0.statement.is_none());
     }
 
     #[test]

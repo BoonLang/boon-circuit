@@ -20,7 +20,7 @@ use crate::{
     SemanticDependencyLifetimeV1, SemanticDependencyRoleV1, SemanticDependencySemanticsV1,
     SemanticDependencySubjectKindV1, SemanticDependencyVisibilityV1,
     SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpressionKind, SemanticFieldId,
-    SemanticListId, SemanticLocalBindingId, SemanticReactiveGraphV1, SemanticResourceGraphV1,
+    SemanticListId, SemanticLocalBindingId, SemanticReactiveGraphV1, SemanticResourceGraphV2,
     SemanticRootKindV1, SemanticSourceId, SemanticSourceOrigin, SemanticStateId,
     SemanticStatementId, SemanticStatementOrigin, SemanticValueId, SemanticValueListAuthorityId,
     checked_semantic_root_specs_v1,
@@ -474,7 +474,7 @@ impl std::error::Error for SemanticLoweringContractError {}
 pub(crate) fn build_semantic_lowering_contract(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     out_net: &ResolvedOutGraph,
 ) -> Result<SemanticLoweringContractV2, SemanticLoweringContractError> {
@@ -495,7 +495,7 @@ pub(crate) fn build_semantic_lowering_contract(
 pub(crate) fn build_semantic_lowering_contract_with_dependency_rows(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<SemanticLoweringContractBuildV2, SemanticLoweringContractError> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
@@ -973,7 +973,7 @@ impl SemanticLoweringContractV2 {
         &self,
         checked: &CheckedProgramFields,
         execution: &SemanticExecutionImageColumnsV1,
-        resources: &SemanticResourceGraphV1,
+        resources: &SemanticResourceGraphV2,
         reactive: &SemanticReactiveGraphV1,
         out_net: &ResolvedOutGraph,
     ) -> Result<(), SemanticLoweringContractError> {
@@ -991,7 +991,7 @@ impl SemanticLoweringContractV2 {
 fn build_lowering_metadata(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<SemanticLoweringMetadataV2, SemanticLoweringContractError> {
     let lowering = &checked.lowering_metadata;
@@ -1075,7 +1075,7 @@ fn validate_source_units(
 fn build_named_value_types(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<Vec<SemanticNamedValueTypeV1>, SemanticLoweringContractError> {
     let table = &checked.lowering_metadata.named_value_type_table;
@@ -1175,7 +1175,7 @@ fn build_named_value_types(
 fn build_named_value_origin(
     origin: &NamedValueTypeOrigin,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<SemanticNamedValueTypeOriginV1, SemanticLoweringContractError> {
     let mut statements = origin
@@ -1461,48 +1461,10 @@ fn build_render_slots(
 
 fn build_source_payload_shapes(
     checked: &CheckedProgramFields,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
 ) -> Result<Vec<SemanticSourcePayloadShapeV1>, SemanticLoweringContractError> {
     let entries = &checked.lowering_metadata.source_payload_shape_table;
     validate_source_payload_shape_identity_coverage(checked, entries)?;
-    let expected_checked_sources = checked
-        .sources
-        .iter()
-        .map(|source| source.id)
-        .collect::<Vec<_>>();
-    let mut covered_checked_sources = Vec::new();
-    let mut previous_first = None;
-    for entry in entries {
-        if entry.checked_sources.is_empty() {
-            return Err(SemanticLoweringContractError::new(
-                "source payload shape entry has no exact checked source identities",
-            ));
-        }
-        if !entry
-            .checked_sources
-            .windows(2)
-            .all(|pair| pair[0] < pair[1])
-        {
-            return Err(SemanticLoweringContractError::new(format!(
-                "source payload shape `{}` checked source identities are not strictly ordered",
-                entry.diagnostic_path
-            )));
-        }
-        let first = entry.checked_sources[0];
-        if previous_first.is_some_and(|previous| previous >= first) {
-            return Err(SemanticLoweringContractError::new(
-                "source payload shape entries are not ordered by exact checked source identity",
-            ));
-        }
-        previous_first = Some(first);
-        covered_checked_sources.extend(entry.checked_sources.iter().copied());
-    }
-    if covered_checked_sources != expected_checked_sources {
-        return Err(SemanticLoweringContractError::new(format!(
-            "source payload shapes do not exactly cover checked source identities: table {:?}, checked {:?}",
-            covered_checked_sources, expected_checked_sources
-        )));
-    }
 
     entries
         .iter()
@@ -1655,6 +1617,16 @@ fn validate_source_payload_shape_identity_coverage(
         }
         previous_first = Some(first);
         actual.extend(entry.checked_sources.iter().copied());
+    }
+    // Entries are grouped by diagnostic path. Equal paths need not be
+    // adjacent in the dense checked-source arena, so flattening those groups
+    // is not itself a global source order. Compare the canonical identity set
+    // while still rejecting duplicate coverage explicitly.
+    actual.sort_unstable();
+    if actual.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(SemanticLoweringContractError::new(format!(
+            "source payload shapes cover a checked source more than once: {actual:?}"
+        )));
     }
     if actual != expected {
         return Err(SemanticLoweringContractError::new(format!(
@@ -1887,7 +1859,7 @@ fn bind_output_contract(
 
 fn build_host_ports(
     checked: &CheckedProgramFields,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     outputs: &[SemanticOutputContractV1],
 ) -> Result<Vec<SemanticHostPortBindingV1>, SemanticLoweringContractError> {
     let table = &checked.lowering_metadata.host_port_table;
@@ -1927,7 +1899,7 @@ fn build_host_ports(
 
 fn resolve_host_source(
     checked: &CheckedProgramFields,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     binding: &boon_checked::CheckedHostSourcePortBinding,
 ) -> Result<SemanticHostSourceBindingV1, SemanticLoweringContractError> {
     let checked_matches = checked
@@ -2345,7 +2317,7 @@ fn reachable_lowering_expressions(
 
 fn build_transient_collections(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
 ) -> Result<Vec<SemanticTransientCollectionV1>, SemanticLoweringContractError> {
     let local_values = transient_local_values(execution)?;
     let reachable = reachable_lowering_expressions(execution, &local_values)?;
@@ -3306,6 +3278,81 @@ outputs: [
                     semantic.resolved_out_graph(),
                 )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn source_payload_shape_identity_coverage_accepts_nonadjacent_path_groups() {
+        let (checked, _) = checked_and_semantic(
+            "nonadjacent-source-path-groups.bn",
+            r#"
+store: [
+    alpha: alpha()
+    beta: beta()
+    gamma: gamma()
+]
+
+FUNCTION alpha() {
+    [row_elements: [remove: SOURCE]]
+}
+FUNCTION beta() {
+    [other_elements: [select: SOURCE]]
+}
+FUNCTION gamma() {
+    [row_elements: [remove: SOURCE]]
+}
+"#,
+        );
+        let entry = checked
+            .lowering_metadata
+            .source_payload_shape_table
+            .iter()
+            .find(|entry| entry.diagnostic_path == "row_elements.remove")
+            .expect("equal source paths must share one payload shape");
+        assert_eq!(entry.checked_sources.len(), 2);
+        assert!(entry.checked_sources[1].0 > entry.checked_sources[0].0 + 1);
+
+        let flattened = checked
+            .lowering_metadata
+            .source_payload_shape_table
+            .iter()
+            .flat_map(|entry| entry.checked_sources.iter().copied())
+            .collect::<Vec<_>>();
+        assert!(flattened.windows(2).any(|pair| pair[0] > pair[1]));
+        validate_source_payload_shape_identity_coverage(
+            &checked,
+            &checked.lowering_metadata.source_payload_shape_table,
+        )
+        .expect("path groups may cover nonadjacent checked source identities");
+
+        // Keep every individual path group strictly ordered while repeating
+        // one identity across two groups. This reaches the global-bijection
+        // guard rather than the earlier per-entry ordering guard.
+        let repeated = entry.checked_sources[1];
+        let mut duplicate_across_groups =
+            checked.lowering_metadata.source_payload_shape_table.clone();
+        let intervening = duplicate_across_groups
+            .iter_mut()
+            .find(|candidate| {
+                candidate.diagnostic_path != "row_elements.remove"
+                    && candidate
+                        .checked_sources
+                        .last()
+                        .is_some_and(|source| *source < repeated)
+            })
+            .expect("the distinct beta source must lie between the repeated path identities");
+        intervening.checked_sources.push(repeated);
+        assert!(
+            intervening
+                .checked_sources
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "the cross-entry mutation must preserve each entry's local ordering"
+        );
+        assert!(
+            validate_source_payload_shape_identity_coverage(&checked, &duplicate_across_groups)
+                .is_err(),
+            "one checked source identity cannot belong to two path groups"
         );
     }
 

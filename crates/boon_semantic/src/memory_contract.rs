@@ -10,7 +10,7 @@ use crate::{
     SemanticBindingId, SemanticBindingTargetV1, SemanticContextualOperationKind,
     SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpression, SemanticExpressionKind,
     SemanticListId, SemanticLoweringContractV2, SemanticMaterializationId, SemanticMigrationId,
-    SemanticReactiveGraphV1, SemanticReadTargetV1, SemanticResourceGraphV1, SemanticRowBinding,
+    SemanticReactiveGraphV1, SemanticReadTargetV1, SemanticResourceGraphV2, SemanticRowBinding,
     SemanticScopeStorageGraphV1, SemanticSelectKind, SemanticSourceUnitId, SemanticStateId,
     SemanticStatementKind, SemanticStorageBindingTargetV1, SemanticStorageFieldId,
     SemanticValueOrigin, StaticOwnerId,
@@ -285,7 +285,7 @@ struct DrainUse {
 pub(crate) fn build_semantic_memory_graph(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     lowering: &SemanticLoweringContractV2,
@@ -330,7 +330,7 @@ impl SemanticMemoryGraphV1 {
         &self,
         checked: &CheckedProgramFields,
         execution: &SemanticExecutionImageColumnsV1,
-        resources: &SemanticResourceGraphV1,
+        resources: &SemanticResourceGraphV2,
         reactive: &SemanticReactiveGraphV1,
         storage: &SemanticScopeStorageGraphV1,
         lowering: &SemanticLoweringContractV2,
@@ -350,7 +350,7 @@ impl SemanticMemoryGraphV1 {
 fn build_memories(
     execution: &SemanticExecutionImageColumnsV1,
     reachable: &BTreeSet<SemanticExprId>,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     lowering: &SemanticLoweringContractV2,
@@ -601,7 +601,7 @@ fn build_memories(
 
 fn collection_structural_owner_rows(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     target: SemanticExprId,
 ) -> Result<Vec<SemanticRowBinding>, SemanticMemoryError> {
@@ -900,7 +900,7 @@ fn require_storage_field(
 }
 
 fn require_list(
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     list: SemanticListId,
 ) -> Result<&crate::SemanticListResourceV1, SemanticMemoryError> {
     resources
@@ -911,9 +911,9 @@ fn require_list(
 }
 
 fn require_state(
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     state: SemanticStateId,
-) -> Result<&crate::SemanticStateResourceV1, SemanticMemoryError> {
+) -> Result<&crate::SemanticStateResourceV2, SemanticMemoryError> {
     resources
         .states
         .get(state.as_usize())
@@ -1361,7 +1361,7 @@ fn expression_subtree(
 
 fn collect_drains(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     reachable: &BTreeSet<SemanticExprId>,
@@ -1604,7 +1604,7 @@ struct DestinationCandidate {
 
 fn exact_drain_destination_candidates(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     memories: &[SemanticMemoryV1],
     drain: SemanticExprId,
 ) -> Result<Vec<DestinationCandidate>, SemanticMemoryError> {
@@ -1877,7 +1877,7 @@ fn validate_no_ordinary_draining_reads(
 
 fn lower_migration_edges(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     memories: &[SemanticMemoryV1],
     drains: &[DrainUse],
 ) -> Result<Vec<SemanticMigrationEdgeV1>, SemanticMemoryError> {
@@ -2168,7 +2168,7 @@ fn migration_variant_assignable(source: &Variant, target: &Variant) -> bool {
 }
 
 fn validate_list_owner_change(
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     memories: &[SemanticMemoryV1],
     source: &SemanticMemoryV1,
     destination: &SemanticMemoryV1,
@@ -2655,7 +2655,7 @@ fn migration_cycle_from(
 fn validate_memory_shape(
     graph: &SemanticMemoryGraphV1,
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
 ) -> Result<(), SemanticMemoryError> {

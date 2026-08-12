@@ -4609,59 +4609,9 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyEntryV3"
-fields = [
-  { name = "callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "checked_callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "public_shape_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "implementation_dependency_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
 name = "CallableDependencyManifestError"
 fields = [
   { name = "message", disposition = "n-i-diag-n-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyManifestV3"
-fields = [
-  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
-  { name = "checked_program_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dependency_classifier_schema_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "component_digests", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "program_root", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "callable_entries", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "proof_digests", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "manifest_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "sealed_manifest_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyProofDigestsV1"
-fields = [
-  { name = "program_root_entry_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "callable_entries_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dependency_records_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "coverage_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dependency_record_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "coverage_record_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "ProgramRootDependencyEntryV3"
-fields = [
-  { name = "public_shape_digest", disposition = "a-ca-priv-sp-id-pc-n", reviewed = true },
-  { name = "implementation_dependency_digest", disposition = "a-ca-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -9276,6 +9226,8 @@ fields = [
   { name = "nets", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "static_owners", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "call_instance_by_checked_frame", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
+  { name = "intentionally_elided_calls", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
+  { name = "intentionally_elided_frames", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "output_net_by_frame_target", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "concrete_producers_by_checked", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "producer_roots", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
@@ -10589,7 +10541,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/resource.rs"
-name = "SemanticResourceGraphDigestV1"
+name = "SemanticResourceGraphDigestV2"
 fields = [
   { name = "0", disposition = "r-ra-priv-sp-id-pc-n", reviewed = true },
 ]
@@ -10597,7 +10549,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/resource.rs"
-name = "SemanticResourceGraphV1"
+name = "SemanticResourceGraphV2"
 fields = [
   { name = "schema", disposition = "r-ra-priv-sp-id-pc-n", reviewed = true },
   { name = "row_scopes", disposition = "r-rc-priv-sp-id-pc-n", reviewed = true },
@@ -10661,11 +10613,12 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/resource.rs"
-name = "SemanticStateResourceV1"
+name = "SemanticStateResourceV2"
 fields = [
   { name = "id", disposition = "r-rc-priv-sp-id-pc-n", reviewed = true },
   { name = "checked_state", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "declaration", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
+  { name = "binding_declaration", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "statement", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "checked_statement", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "expression", disposition = "r-fr-priv-sp-id-pc-n", reviewed = true },
@@ -12903,6 +12856,7 @@ source = "crates/boon_checked/src/lib.rs"
 name = "CheckedState"
 fields = [
   { name = "id", disposition = "r-rc-priv-sp-id-n", reviewed = true },
+  { name = "binding_declaration", disposition = "r-r-priv-sp-id-n", reviewed = true },
   { name = "declaration", disposition = "r-r-priv-sp-id-n", reviewed = true },
   { name = "statement", disposition = "r-r-priv-sp-id-n", reviewed = true },
   { name = "expression", disposition = "r-fr-priv-sp-id-n", reviewed = true },
@@ -14761,7 +14715,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_checked/src/lib.rs"
-name = "CheckedImageHandoffV2"
+name = "CheckedImageHandoffV3"
 fields = [
   { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },

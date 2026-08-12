@@ -1184,6 +1184,7 @@ dependencies = [
  "boon_effect_schema",
  "boon_parser",
  "boon_syntax",
+ "ciborium",
  "serde",
  "serde_json",
  "sha2",

@@ -12,16 +12,16 @@ use crate::{
     SemanticLocalBindingId, SemanticLoweringContractV2, SemanticMaterializationId,
     SemanticMaterializationLocalId, SemanticMaterializationResultKind, SemanticParameterId,
     SemanticPatternBinding, SemanticReactiveGraphV1, SemanticReadId, SemanticReadTargetV1,
-    SemanticRecordField, SemanticResourceGraphV1, SemanticRoot, SemanticRowBinding,
+    SemanticRecordField, SemanticResourceGraphV2, SemanticRoot, SemanticRowBinding,
     SemanticRowScopeId, SemanticScopeStorageGraphV1, SemanticSelectArm, SemanticSourceDef,
     SemanticSourceId, SemanticSourceOrigin, SemanticSourceRead, SemanticStateDef, SemanticStateId,
     SemanticStatement, SemanticStatementId, SemanticStatementKind, SemanticStorageBindingTargetV1,
     SemanticStorageExternalReferenceId, SemanticStorageExternalReferenceKindV1,
     SemanticStorageFieldId, SemanticStorageFieldOriginV1, SemanticStorageFieldRoleV1,
-    SemanticStorageFieldV1, SemanticStorageLocalMemberForwardingV1,
-    SemanticStorageLocalMemberTargetV1, SemanticTextSegment, SemanticTriggerArmId, SemanticValueId,
-    SemanticValueListAuthorityId, SemanticValueMember, SemanticValueOrigin,
-    SemanticValueProvenance, StaticOwnerDef, StaticOwnerId,
+    SemanticStorageLocalMemberForwardingV1, SemanticStorageLocalMemberTargetV1,
+    SemanticTextSegment, SemanticTriggerArmId, SemanticValueId, SemanticValueListAuthorityId,
+    SemanticValueMember, SemanticValueOrigin, SemanticValueProvenance, StaticOwnerDef,
+    StaticOwnerId,
 };
 use boon_checked::{
     CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind, DeclId, FlowMode,
@@ -657,7 +657,7 @@ pub(super) struct MappedSemanticStorage {
 impl SemanticToExecutableMap {
     fn allocate_with_external_events(
         graph: &SemanticExecutionImageColumnsV1,
-        resources: &SemanticResourceGraphV1,
+        resources: &SemanticResourceGraphV2,
         external_event_identities: &[CheckedExternalDeclarationIdentityV1],
     ) -> Result<Self, String> {
         require_dense(
@@ -1377,7 +1377,7 @@ fn require_semantic_owner(
 
 fn allocate_runtime_resource_ids(
     graph: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
 ) -> Result<AllocatedRuntimeResourceIds, String> {
     if resources.sources.len() != graph.sources.len() {
         return Err(format!(
@@ -1536,7 +1536,7 @@ fn allocate_external_event_source_ids(
 
 pub(super) fn map_semantic_execution_with_reactive(
     graph: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<MappedSemanticExecution, String> {
     map_semantic_execution_with_external_events(
@@ -1548,7 +1548,7 @@ pub(super) fn map_semantic_execution_with_reactive(
 
 fn map_semantic_execution_with_external_events(
     graph: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
 ) -> Result<MappedSemanticExecution, String> {
     let id_map = SemanticToExecutableMap::allocate_with_external_events(
@@ -1654,7 +1654,7 @@ fn map_semantic_execution_with_external_events(
 
 pub(super) fn map_semantic_resources(
     execution: &SemanticExecutionImageColumnsV1,
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
     ids: &SemanticToExecutableMap,
 ) -> Result<MappedSemanticResources, String> {
     for authority in &graph.value_list_authorities {
@@ -1890,7 +1890,7 @@ impl SemanticReactiveToMappedMap {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn map_semantic_reactive(
     execution: &SemanticExecutionImageColumnsV1,
-    resource_graph: &SemanticResourceGraphV1,
+    resource_graph: &SemanticResourceGraphV2,
     graph: &SemanticReactiveGraphV1,
     ids: &SemanticToExecutableMap,
     resources: &MappedSemanticResources,
@@ -2076,7 +2076,7 @@ fn semantic_execution_expression(
 }
 
 fn semantic_source_resource(
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
     id: SemanticSourceId,
 ) -> Result<&crate::SemanticSourceResourceV1, String> {
     graph
@@ -2087,9 +2087,9 @@ fn semantic_source_resource(
 }
 
 fn semantic_state_resource(
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
     id: SemanticStateId,
-) -> Result<&crate::SemanticStateResourceV1, String> {
+) -> Result<&crate::SemanticStateResourceV2, String> {
     graph
         .states
         .get(id.as_usize())
@@ -2124,6 +2124,122 @@ fn mapped_owner_ancestry(
     Ok(ancestry)
 }
 
+fn first_type_difference(
+    left: &boon_checked::Type,
+    right: &boon_checked::Type,
+    path: &str,
+) -> Option<String> {
+    use boon_checked::Type;
+    if left == right {
+        return None;
+    }
+    let child_path = |segment: &str| {
+        if path.is_empty() {
+            segment.to_owned()
+        } else {
+            format!("{path}.{segment}")
+        }
+    };
+    match (left, right) {
+        (Type::Object(left), Type::Object(right)) => {
+            if left.open != right.open {
+                return Some(format!(
+                    "{path}: object openness {} != {}",
+                    left.open, right.open
+                ));
+            }
+            let names = left
+                .fields
+                .keys()
+                .chain(right.fields.keys())
+                .collect::<BTreeSet<_>>();
+            for name in names {
+                match (left.fields.get(name), right.fields.get(name)) {
+                    (Some(left), Some(right)) => {
+                        if let Some(difference) =
+                            first_type_difference(left, right, &child_path(name))
+                        {
+                            return Some(difference);
+                        }
+                    }
+                    (left, right) => {
+                        return Some(format!(
+                            "{}: field presence {} != {}",
+                            child_path(name),
+                            left.is_some(),
+                            right.is_some()
+                        ));
+                    }
+                }
+            }
+            Some(format!(
+                "{path}: object field order {:?} != {:?}",
+                left.field_order, right.field_order
+            ))
+        }
+        (Type::List(left), Type::List(right)) | (Type::Set(left), Type::Set(right)) => {
+            first_type_difference(left, right, &format!("{path}[]"))
+        }
+        (
+            Type::Map {
+                key: left_key,
+                value: left_value,
+            },
+            Type::Map {
+                key: right_key,
+                value: right_value,
+            },
+        ) => first_type_difference(left_key, right_key, &format!("{path}.key"))
+            .or_else(|| first_type_difference(left_value, right_value, &format!("{path}.value"))),
+        (Type::Union(left), Type::Union(right)) => {
+            if left.len() != right.len() {
+                return Some(format!(
+                    "{path}: union member count {} != {}",
+                    left.len(),
+                    right.len()
+                ));
+            }
+            left.iter()
+                .zip(right)
+                .enumerate()
+                .find_map(|(index, (left, right))| {
+                    first_type_difference(left, right, &format!("{path}|{index}"))
+                })
+        }
+        (Type::VariantSet(left), Type::VariantSet(right)) => {
+            if left.len() != right.len() {
+                return Some(format!(
+                    "{path}: variant count {} != {}",
+                    left.len(),
+                    right.len()
+                ));
+            }
+            left.iter()
+                .zip(right)
+                .enumerate()
+                .find_map(|(index, (left, right))| match (left, right) {
+                    (
+                        boon_checked::Variant::Tagged {
+                            tag: left_tag,
+                            fields: left_fields,
+                        },
+                        boon_checked::Variant::Tagged {
+                            tag: right_tag,
+                            fields: right_fields,
+                        },
+                    ) if left_tag == right_tag => first_type_difference(
+                        &Type::Object(left_fields.clone()),
+                        &Type::Object(right_fields.clone()),
+                        &format!("{path}.{left_tag}"),
+                    ),
+                    (left, right) if left == right => None,
+                    (left, right) => Some(format!("{path}#{index}: variant {left:?} != {right:?}")),
+                })
+        }
+        (left, right) => Some(format!("{path}: {left:?} != {right:?}")),
+    }
+}
+
 fn map_reactive_field(
     execution: &SemanticExecutionImageColumnsV1,
     ids: &SemanticToExecutableMap,
@@ -2140,15 +2256,21 @@ fn map_reactive_field(
         )?
         || statement.flow_type.as_ref() != Some(&field.flow_type)
     {
+        let type_difference = statement
+            .flow_type
+            .as_ref()
+            .map(|flow| {
+                if flow.mode != field.flow_type.mode {
+                    format!("mode {:?} != {:?}", flow.mode, field.flow_type.mode)
+                } else {
+                    first_type_difference(&flow.ty, &field.flow_type.ty, "$")
+                        .unwrap_or_else(|| "none".to_owned())
+                }
+            })
+            .unwrap_or_else(|| "statement has no flow type".to_owned());
         return Err(format!(
-            "semantic field {} has stale statement/declaration/value/type provenance: statement declaration {:?}, value {:?}, flow {:?}; field declaration {}, producer {}, flow {:?}",
-            field.id,
-            statement.declaration,
-            statement.value,
-            statement.flow_type,
-            field.declaration.0,
-            field.producer,
-            field.flow_type,
+            "semantic field {} has stale statement/declaration/value/type provenance: statement declaration {:?}, value {:?}; field declaration {}, producer {}; first type difference: {type_difference}",
+            field.id, statement.declaration, statement.value, field.declaration.0, field.producer,
         ));
     }
     let expression = semantic_execution_expression(execution, field.producer)?;
@@ -2251,7 +2373,7 @@ fn unique_mapped_field_for_statement<'a>(
 
 fn map_reactive_binding(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
     fields: &[MappedSemanticField],
@@ -2272,19 +2394,28 @@ fn map_reactive_binding(
         )?,
         SemanticBindingTargetV1::List { .. } => statement.value == Some(binding.producer),
     };
-    if statement.declaration != Some(binding.declaration)
+    let statement_declaration = match binding.target {
+        SemanticBindingTargetV1::State { state } => {
+            semantic_state_resource(resources, state)?.declaration
+        }
+        SemanticBindingTargetV1::Field { .. }
+        | SemanticBindingTargetV1::Source { .. }
+        | SemanticBindingTargetV1::List { .. } => binding.declaration,
+    };
+    if statement.declaration != Some(statement_declaration)
         || !producer_matches_statement
         || expression.value_id != binding.value
         || expression.owner != binding.owner
         || expression.flow_type != binding.flow_type
     {
         return Err(format!(
-            "semantic binding {} has stale statement/producer/value/owner/type provenance: target={:?}, producer_matches_statement={}, statement={} declaration={:?}/{}, value={:?}/{}, expression_value={}/{}, owner={:?}/{:?}, flow={:?}/{:?}",
+            "semantic binding {} has stale statement/producer/value/owner/type provenance: target={:?}, producer_matches_statement={}, statement={} declaration={:?}/{}, lexical_binding_declaration={}, value={:?}/{}, expression_value={}/{}, owner={:?}/{:?}, flow={:?}/{:?}",
             binding.id,
             binding.target,
             producer_matches_statement,
             binding.statement,
             statement.declaration,
+            statement_declaration.0,
             binding.declaration.0,
             statement.value,
             binding.producer,
@@ -2439,7 +2570,7 @@ fn map_reactive_binding(
 
 fn map_reactive_sources(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     ids: &SemanticToExecutableMap,
     bindings: &[MappedSemanticBinding],
 ) -> Result<Vec<MappedSemanticSource>, String> {
@@ -2503,7 +2634,7 @@ fn mapped_binding(
 
 fn map_reactive_read(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
     read: &crate::SemanticReadBindingV1,
@@ -2870,7 +3001,7 @@ fn map_reactive_list_mutation(
 
 struct ReactiveDerivedMappingContext<'a> {
     execution: &'a SemanticExecutionImageColumnsV1,
-    resource_graph: &'a SemanticResourceGraphV1,
+    resource_graph: &'a SemanticResourceGraphV2,
     graph: &'a SemanticReactiveGraphV1,
     ids: &'a SemanticToExecutableMap,
     reactive_ids: &'a SemanticReactiveToMappedMap,
@@ -3198,7 +3329,7 @@ fn map_reactive_dependency_use(
 
 fn map_reactive_producer_instance(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     ids: &SemanticToExecutableMap,
     fields: &[MappedSemanticField],
     instance: &crate::SemanticProducerInstanceV1,
@@ -3355,7 +3486,7 @@ fn map_reactive_producer_instance(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn map_semantic_storage_join(
     execution: &SemanticExecutionImageColumnsV1,
-    resource_graph: &SemanticResourceGraphV1,
+    resource_graph: &SemanticResourceGraphV2,
     reactive_graph: &SemanticReactiveGraphV1,
     storage_graph: &SemanticScopeStorageGraphV1,
     ids: &SemanticToExecutableMap,
@@ -3908,7 +4039,7 @@ const fn map_storage_field_role(role: SemanticStorageFieldRoleV1) -> ErasedField
 
 fn map_storage_fields(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     storage: &SemanticScopeStorageGraphV1,
     ids: &SemanticToExecutableMap,
     reactive: &MappedSemanticReactive,
@@ -3919,7 +4050,12 @@ fn map_storage_fields(
         .iter()
         .map(|field| {
             let id = storage_ids.storage_field(field.id)?;
-            let row_path = semantic_storage_row_path(resources, storage, field)?;
+            let row_path = crate::storage_contract::storage_field_row_path(
+                resources,
+                &storage.fields,
+                field,
+            )
+            .map_err(|error| error.to_string())?;
             if let Some(owner) = field.owner {
                 storage
                     .owners
@@ -4049,102 +4185,6 @@ fn map_storage_fields(
         .collect()
 }
 
-fn semantic_storage_row_path(
-    resources: &SemanticResourceGraphV1,
-    storage: &SemanticScopeStorageGraphV1,
-    field: &SemanticStorageFieldV1,
-) -> Result<Vec<String>, String> {
-    let Some(row) = field.row else {
-        return Ok(Vec::new());
-    };
-    match &field.origin {
-        SemanticStorageFieldOriginV1::ListAuthority { item_path, .. } => {
-            return Ok(item_path.clone());
-        }
-        SemanticStorageFieldOriginV1::RecordProjection { projection, .. } => {
-            return Ok(projection.clone());
-        }
-        SemanticStorageFieldOriginV1::DetachedCapture { .. }
-        | SemanticStorageFieldOriginV1::ValueListAuthority { .. } => {
-            return Ok(Vec::new());
-        }
-        SemanticStorageFieldOriginV1::Reactive { .. }
-        | SemanticStorageFieldOriginV1::StateAuthority { .. } => {}
-    }
-    if resources.lists.iter().any(|list| {
-        list.id == row.list
-            && list.row_scope == row.scope
-            && field.statement == Some(list.statement)
-            && matches!(field.origin, SemanticStorageFieldOriginV1::Reactive { .. })
-    }) {
-        return Ok(Vec::new());
-    }
-
-    let structural = semantic_storage_structural_row_path(storage, field)?;
-    if structural.is_empty() {
-        Ok(vec![field.name.clone()])
-    } else {
-        Ok(structural)
-    }
-}
-
-fn semantic_storage_structural_row_path(
-    storage: &SemanticScopeStorageGraphV1,
-    field: &SemanticStorageFieldV1,
-) -> Result<Vec<String>, String> {
-    let Some(row) = field.row else {
-        return Ok(Vec::new());
-    };
-    let Some(parent) = field.parent else {
-        return Ok(Vec::new());
-    };
-    let mut parent = storage
-        .fields
-        .get(parent.as_usize())
-        .filter(|candidate| candidate.id == parent)
-        .ok_or_else(|| {
-            format!(
-                "semantic storage field {} references missing parent {parent}",
-                field.id
-            )
-        })?;
-    if parent.row != Some(row) {
-        return Ok(Vec::new());
-    }
-
-    let mut reversed = vec![field.name.clone()];
-    let mut remaining = storage.fields.len().saturating_add(1);
-    loop {
-        if remaining == 0 {
-            return Err(format!(
-                "semantic storage field {} has cyclic structural row ancestry",
-                field.id
-            ));
-        }
-        remaining -= 1;
-        let Some(grandparent_id) = parent.parent else {
-            break;
-        };
-        let grandparent = storage
-            .fields
-            .get(grandparent_id.as_usize())
-            .filter(|candidate| candidate.id == grandparent_id)
-            .ok_or_else(|| {
-                format!(
-                    "semantic storage field {} ancestry references missing field {grandparent_id}",
-                    field.id
-                )
-            })?;
-        if grandparent.row != Some(row) {
-            break;
-        }
-        reversed.push(parent.name.clone());
-        parent = grandparent;
-    }
-    reversed.reverse();
-    Ok(reversed)
-}
-
 fn map_storage_local_member_target(
     target: &SemanticStorageLocalMemberTargetV1,
     ids: &SemanticToExecutableMap,
@@ -4189,7 +4229,7 @@ fn map_storage_local_member_forwarding(
 
 fn map_storage_locals(
     execution: &SemanticExecutionImageColumnsV1,
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     storage: &SemanticScopeStorageGraphV1,
     ids: &SemanticToExecutableMap,
     storage_ids: &SemanticStorageToErasedMap,
@@ -4624,7 +4664,7 @@ fn map_storage_bindings(
 }
 
 fn map_storage_sources(
-    resources: &SemanticResourceGraphV1,
+    resources: &SemanticResourceGraphV2,
     storage: &SemanticScopeStorageGraphV1,
     ids: &SemanticToExecutableMap,
     reactive: &MappedSemanticReactive,
@@ -5525,7 +5565,7 @@ fn finalize_derived_values(
 }
 
 fn semantic_list_resource(
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
     id: SemanticListId,
 ) -> Result<&crate::SemanticListResourceV1, String> {
     graph
@@ -5712,7 +5752,7 @@ fn map_source_payload_schema(source: &crate::SemanticSourceResourceV1) -> Source
 fn map_state_resource(
     execution: &SemanticExecutionImageColumnsV1,
     ids: &SemanticToExecutableMap,
-    state: &crate::SemanticStateResourceV1,
+    state: &crate::SemanticStateResourceV2,
 ) -> Result<StateCell, String> {
     ids.expression(state.expression)?;
     ids.expression(state.initial)?;
@@ -7138,7 +7178,7 @@ fn map_pulse_batches(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_canonical_program_core(
     execution_graph: &SemanticExecutionImageColumnsV1,
-    resource_graph: &SemanticResourceGraphV1,
+    resource_graph: &SemanticResourceGraphV2,
     reactive_graph: &SemanticReactiveGraphV1,
     lowering_contract: &SemanticLoweringContractV2,
     view_binding_graph: &crate::SemanticViewBindingGraphV1,
@@ -7164,7 +7204,7 @@ pub(crate) fn build_canonical_program_core(
 #[allow(clippy::too_many_arguments)]
 fn finish_canonical_program_core(
     execution_graph: &SemanticExecutionImageColumnsV1,
-    resource_graph: &SemanticResourceGraphV1,
+    resource_graph: &SemanticResourceGraphV2,
     reactive_graph: &SemanticReactiveGraphV1,
     lowering_contract: &SemanticLoweringContractV2,
     view_binding_graph: &crate::SemanticViewBindingGraphV1,

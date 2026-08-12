@@ -12555,6 +12555,83 @@ impl CheckedProgramDatabase {
         })
     }
 
+    fn checked_state_binding_declaration(
+        &self,
+        expression: CheckedExprId,
+        kind: CheckedStateKind,
+        declaration: DeclId,
+    ) -> Result<DeclId, String> {
+        if kind != CheckedStateKind::Hold {
+            return Ok(declaration);
+        }
+        let syntax_expression = self
+            .program
+            .expression_id_for_slot(expression.0 as usize)
+            .ok_or_else(|| {
+                format!(
+                    "checked HOLD expression {} has no syntax projection",
+                    expression.0
+                )
+            })?;
+        let statement = exact_expression_statement(self.program.statements(), syntax_expression)
+            .map(Some)
+            .or_else(|| {
+                // Inline record-field HOLDs have no standalone HOLD statement.
+                // Accept only the exact field/value declaration already
+                // assigned to this expression; a containing statement is not
+                // an alias authority for a nested state.
+                self.declarations
+                    .iter()
+                    .find(|candidate| {
+                        candidate.id == declaration
+                            && candidate.kind == CheckedDeclarationKind::Field
+                            && candidate.value == Some(expression)
+                            && self.expression_declarations.get(&syntax_expression).copied()
+                                == Some(declaration)
+                    })
+                    .map(|_| None)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "checked HOLD expression {} has neither a direct syntax statement nor an exact record-field authority",
+                    expression.0
+                )
+            })?;
+        let Some(statement) = statement else {
+            return Ok(declaration);
+        };
+        let AstStatementKind::Hold { name, .. } = &statement.kind else {
+            return Err(format!(
+                "checked HOLD expression {} belongs to a non-HOLD syntax statement",
+                expression.0
+            ));
+        };
+        let Some(alias) = name else {
+            return Ok(declaration);
+        };
+        let Some(body_scope) = self.statement_body_scopes.get(&statement.id).copied() else {
+            return Ok(declaration);
+        };
+        if let Some(binding_declaration) = self
+            .scope_declarations_by_scope
+            .get(body_scope.0 as usize)
+            .and_then(|declarations| declarations.get(alias))
+            .copied()
+        {
+            return Ok(binding_declaration);
+        }
+        self.declarations
+            .iter()
+            .find(|candidate| candidate.id == declaration && candidate.name == *alias)
+            .map(|_| declaration)
+            .ok_or_else(|| {
+                format!(
+                    "checked HOLD alias `{alias}` has no declaration in update-body scope {}",
+                    body_scope.0
+                )
+            })
+    }
+
     fn checked_initializer_is_startup_safe(
         &self,
         expressions: &[CheckedExpression],
@@ -12882,6 +12959,20 @@ impl CheckedProgramDatabase {
                 });
                 continue;
             };
+            let binding_declaration =
+                match self.checked_state_binding_declaration(expression.id, kind, declaration) {
+                    Ok(binding_declaration) => binding_declaration,
+                    Err(message) => {
+                        self.diagnostics.push(TypeDiagnostic {
+                            severity: DiagnosticSeverity::Error,
+                            line: expression.span.line,
+                            start: expression.span.start,
+                            end: expression.span.end,
+                            message,
+                        });
+                        continue;
+                    }
+                };
             let mut projection = checked_declaration_resource_projection(
                 &callables_by_id,
                 &declaration_values,
@@ -12913,6 +13004,7 @@ impl CheckedProgramDatabase {
             }
             let state = CheckedState {
                 id: CheckedStateId(states.len() as u32),
+                binding_declaration,
                 declaration,
                 statement,
                 expression: expression.id,
@@ -12955,6 +13047,7 @@ impl CheckedProgramDatabase {
             };
             let state = CheckedState {
                 id: CheckedStateId(states.len() as u32),
+                binding_declaration: declaration,
                 declaration,
                 statement: statement.id,
                 expression: initial,
@@ -15432,11 +15525,11 @@ fn checked_declaration_canonical_path(
     Some(segments.join("."))
 }
 
-const CHECKED_IMAGE_PROJECTION_KEY_DOMAIN_V2: &[u8] = b"boon.checked-image-projection-key.v2\0";
-const CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V2: &[u8] = b"boon.checked-image-row-payload.v2\0";
-const CHECKED_IMAGE_ROW_DIGEST_DOMAIN_V2: &[u8] = b"boon.checked-image-row.v2\0";
-const CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V2: &[u8] = b"boon.checked-image-shard.v2\0";
-const CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V2: &[u8] = b"boon.checked-image-handoff.v2\0";
+const CHECKED_IMAGE_PROJECTION_KEY_DOMAIN_V3: &[u8] = b"boon.checked-image-projection-key.v3\0";
+const CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V3: &[u8] = b"boon.checked-image-row-payload.v3\0";
+const CHECKED_IMAGE_ROW_DIGEST_DOMAIN_V3: &[u8] = b"boon.checked-image-row.v3\0";
+const CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V3: &[u8] = b"boon.checked-image-shard.v3\0";
+const CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V3: &[u8] = b"boon.checked-image-handoff.v3\0";
 const CHECKED_STRUCTURAL_CALL_SITE_DOMAIN_V3: &[u8] = b"boon.checked-structural-call-site.v3\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -15483,13 +15576,13 @@ struct CheckedImageRowFingerprintV2<'a> {
     relocation_stable_key_digests: &'a [[u8; 32]],
 }
 
-struct CheckedImageHandoffBuilderV2 {
+struct CheckedImageHandoffBuilderV3 {
     ids: BTreeMap<CheckedShardProjectionKeyV2, PendingCheckedProjectionIdV2>,
     projections: Vec<PendingCheckedProjectionV2>,
     entity_routes: Vec<(CheckedImageRowDomainV2, u32, PendingCheckedProjectionIdV2)>,
 }
 
-impl CheckedImageHandoffBuilderV2 {
+impl CheckedImageHandoffBuilderV3 {
     fn new() -> Self {
         Self {
             ids: BTreeMap::new(),
@@ -15510,7 +15603,7 @@ impl CheckedImageHandoffBuilderV2 {
                 .map_err(|_| "checked image projection registry exceeds u32".to_owned())?,
         );
         let stable_key_digest = boon_contract::canonical_serde_hash_v1(
-            CHECKED_IMAGE_PROJECTION_KEY_DOMAIN_V2,
+            CHECKED_IMAGE_PROJECTION_KEY_DOMAIN_V3,
             &projection,
         )
         .map_err(|error| format!("failed to hash checked projection key: {error}"))?;
@@ -15536,7 +15629,7 @@ impl CheckedImageHandoffBuilderV2 {
         relocations.retain(|target| target != &projection);
         let projection = self.intern(projection)?;
         let payload_digest = boon_contract::canonical_serde_hash_v1(
-            CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V2,
+            CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V3,
             payload,
         )
         .map_err(|error| format!("failed to hash checked image row: {error}"))?;
@@ -15551,7 +15644,7 @@ impl CheckedImageHandoffBuilderV2 {
         let projection_stable_key_digest =
             self.projections[projection.as_usize()].stable_key_digest;
         let row_digest = boon_contract::canonical_serde_hash_v1(
-            CHECKED_IMAGE_ROW_DIGEST_DOMAIN_V2,
+            CHECKED_IMAGE_ROW_DIGEST_DOMAIN_V3,
             &CheckedImageRowFingerprintV2 {
                 projection_stable_key_digest,
                 domain,
@@ -15589,7 +15682,7 @@ impl CheckedImageHandoffBuilderV2 {
         self,
         source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
-    ) -> Result<CheckedImageHandoffV2, String> {
+    ) -> Result<CheckedImageHandoffV3, String> {
         let Self {
             ids,
             mut projections,
@@ -15647,7 +15740,7 @@ impl CheckedImageHandoffBuilderV2 {
                     .map(|target| canonical_by_pending_id[target.as_usize()]),
             );
             let local_content_digest = boon_contract::canonical_serde_hash_v1(
-                CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V2,
+                CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V3,
                 &(pending.stable_key_digest, &pending.row_digests),
             )
             .map_err(|error| format!("failed to hash checked image shard: {error}"))?;
@@ -15687,9 +15780,9 @@ impl CheckedImageHandoffBuilderV2 {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let local_image_digest = boon_contract::canonical_serde_hash_v1(
-            CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V2,
+            CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V3,
             &(
-                CHECKED_IMAGE_HANDOFF_SCHEMA_V2,
+                CHECKED_IMAGE_HANDOFF_SCHEMA_V3,
                 source_bundle_digest_v1,
                 role,
                 &sealed_projections,
@@ -15698,8 +15791,8 @@ impl CheckedImageHandoffBuilderV2 {
             ),
         )
         .map_err(|error| format!("failed to hash checked image handoff: {error}"))?;
-        Ok(CheckedImageHandoffV2 {
-            schema: CHECKED_IMAGE_HANDOFF_SCHEMA_V2.to_owned(),
+        Ok(CheckedImageHandoffV3 {
+            schema: CHECKED_IMAGE_HANDOFF_SCHEMA_V3.to_owned(),
             source_bundle_digest_v1,
             role,
             projections: sealed_projections,
@@ -15784,7 +15877,7 @@ fn checked_authority_projection(
 fn checked_image_handoff(
     program: &CheckedProgramFields,
     parsed: &TypecheckSyntaxProgram,
-) -> Result<CheckedImageHandoffV2, String> {
+) -> Result<CheckedImageHandoffV3, String> {
     let root_owner = CheckedShardOwnerKeyV2::ProgramTopLevel { role: program.role };
     let root_definition = checked_definition_projection(root_owner.clone());
     let root_interface = checked_interface_projection(root_owner.clone());
@@ -15832,7 +15925,7 @@ fn checked_image_handoff(
         })
         .collect::<Result<BTreeMap<_, _>, String>>()?;
 
-    let mut builder = CheckedImageHandoffBuilderV2::new();
+    let mut builder = CheckedImageHandoffBuilderV3::new();
     builder.push_row(
         root_interface,
         CheckedImageRowDomainV2::Header,
@@ -16112,6 +16205,12 @@ fn checked_image_handoff(
         let relocations = [state.expression, state.initial]
             .into_iter()
             .filter_map(|expression| expression_projections.get(&expression).cloned())
+            .chain(
+                declaration_owners
+                    .get(&state.binding_declaration)
+                    .cloned()
+                    .map(checked_definition_projection),
+            )
             .collect();
         builder.push_row(
             projection.clone(),
@@ -39700,6 +39799,66 @@ fn object_shape(fields: &[AstRecordField]) -> ObjectShape {
             .map(|field| (field.name.clone(), open_object_type())),
         false,
     )
+}
+
+#[cfg(test)]
+#[test]
+fn assembled_hold_state_carries_the_predeclared_alias_binding() {
+    let parsed = boon_parser::parse_source(
+        "hold-binding.bn",
+        r#"
+store: [
+    pulse: SOURCE
+    value:
+        0 |> HOLD previous {
+            pulse |> THEN { previous + 1 }
+        }
+]
+"#,
+    )
+    .expect("HOLD binding fixture parses");
+    let checked = check_program(&parsed);
+    assert!(
+        !checked.report.has_errors(),
+        "HOLD binding diagnostics: {:#?}",
+        checked.report.diagnostics
+    );
+    let fields = checked
+        .checked_program_fields()
+        .expect("HOLD binding fixture checks");
+    let hold_states = fields
+        .states
+        .iter()
+        .filter(|state| state.kind == CheckedStateKind::Hold)
+        .collect::<Vec<_>>();
+    let [state] = hold_states.as_slice() else {
+        panic!("fixture must have one HOLD state: {hold_states:#?}");
+    };
+    let binding_declaration = fields
+        .declarations
+        .iter()
+        .find(|declaration| declaration.id == state.binding_declaration)
+        .expect("state binding declaration");
+    assert_eq!(binding_declaration.name, "value");
+    let self_reads = fields
+        .expressions
+        .iter()
+        .filter(|expression| {
+            matches!(
+                &expression.kind,
+                CheckedExpressionKind::Read {
+                    target,
+                    projection,
+                    ..
+                } if *target == state.binding_declaration && projection.is_empty()
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        self_reads.len(),
+        1,
+        "the authored `previous` alias must resolve to the carried state binding: {self_reads:#?}"
+    );
 }
 
 #[cfg(test)]

@@ -1124,7 +1124,7 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         "mod semantic_mapping",
         "SemanticExecutionGraphV1",
         "SemanticExecutionImageColumnsV1",
-        "SemanticResourceGraphV1",
+        "SemanticResourceGraphV2",
         "SemanticReactiveGraphV1",
         "map_semantic_execution",
         "map_semantic_resources",

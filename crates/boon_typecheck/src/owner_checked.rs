@@ -15,8 +15,8 @@ use std::error::Error;
 use std::fmt;
 
 const OWNER_CHECKED_STABLE_ROW_DOMAIN_V1: &[u8] = b"boon.owner-checked-stable-row.v1\0";
-const OWNER_CHECKED_ROW_PAYLOAD_DOMAIN_V2: &[u8] = b"boon.owner-checked-row-payload.v2\0";
-const OWNER_CHECKED_LOCAL_CONTENT_DOMAIN_V2: &[u8] = b"boon.owner-checked-local-content.v2\0";
+const OWNER_CHECKED_ROW_PAYLOAD_DOMAIN_V3: &[u8] = b"boon.owner-checked-row-payload.v3\0";
+const OWNER_CHECKED_LOCAL_CONTENT_DOMAIN_V3: &[u8] = b"boon.owner-checked-local-content.v3\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerCheckedReceiptError {
@@ -88,7 +88,7 @@ impl OwnerCheckedReceiptSink {
         })?;
         let canonical_stable_key = self.hash_scratch.clone();
         let payload_digest_v1 = boon_contract::canonical_serde_hash_v1_with_buffer(
-            OWNER_CHECKED_ROW_PAYLOAD_DOMAIN_V2,
+            OWNER_CHECKED_ROW_PAYLOAD_DOMAIN_V3,
             &(domain, normalized_payload),
             &mut self.hash_scratch,
         )
@@ -172,7 +172,7 @@ impl OwnerCheckedReceiptSink {
         let relocation_count =
             checked_receipt_u32(relocations.len(), "owner checked relocation count")?;
         let local_content_digest_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_CHECKED_LOCAL_CONTENT_DOMAIN_V2,
+            OWNER_CHECKED_LOCAL_CONTENT_DOMAIN_V3,
             &(&domain_counts, &row_receipts, &relocations),
         )
         .map_err(|error| {
@@ -263,7 +263,7 @@ pub fn validate_owner_checked_receipts(
         ));
     }
     let local_content_digest_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_CHECKED_LOCAL_CONTENT_DOMAIN_V2,
+        OWNER_CHECKED_LOCAL_CONTENT_DOMAIN_V3,
         &(
             &domain_counts,
             &receipts.row_receipts,
@@ -698,7 +698,7 @@ impl OwnerSyntaxGraph {
         }
     }
 
-    fn child_owner_value(
+    pub(crate) fn child_owner_value(
         &self,
         syntax: &OwnerSyntaxInput,
         child: &OwnerStatementChild,

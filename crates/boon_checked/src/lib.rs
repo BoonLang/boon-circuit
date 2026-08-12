@@ -1647,6 +1647,10 @@ fn substitute_checked_type_inner(
                 active,
                 recurse_replacements,
             ) {
+                // One checked-call frame crosses two independently normalized
+                // alpha namespaces. Keep its union shape and ordering intact:
+                // a replacement variable and an untouched variable with the
+                // same raw ordinal do not necessarily denote the same alpha.
                 (Type::Union(members), true)
             } else {
                 (ty.clone(), false)
@@ -1750,7 +1754,7 @@ pub fn type_is_recursively_closed(ty: &Type) -> bool {
 ///     CheckedProgram { fields }
 /// }
 /// ```
-pub const CHECKED_IMAGE_HANDOFF_SCHEMA_V2: &str = "boon.checked-image-handoff.v2";
+pub const CHECKED_IMAGE_HANDOFF_SCHEMA_V3: &str = "boon.checked-image-handoff.v3";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1880,7 +1884,7 @@ pub struct CheckedImageEntityRouteV2 {
 /// Consuming typechecker handoff. Semantic elaboration imports these receipts
 /// directly; it must not rescan the rich checked DTO to rediscover them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CheckedImageHandoffV2 {
+pub struct CheckedImageHandoffV3 {
     pub schema: String,
     pub source_bundle_digest_v1: SourceBundleDigestV1,
     pub role: ProgramRole,
@@ -1890,7 +1894,7 @@ pub struct CheckedImageHandoffV2 {
     pub local_image_digest: [u8; 32],
 }
 
-impl CheckedImageHandoffV2 {
+impl CheckedImageHandoffV3 {
     pub fn projection(&self, id: CheckedImageProjectionIdV2) -> Option<&CheckedImageProjectionV2> {
         self.projections.get(id.as_usize())
     }
@@ -1924,7 +1928,7 @@ pub struct CheckedProgram {
     #[serde(flatten)]
     fields: CheckedProgramFields,
     #[serde(skip)]
-    image_handoff: CheckedImageHandoffV2,
+    image_handoff: CheckedImageHandoffV3,
 }
 
 /// Completed typechecker construction before a runtime handoff is requested.
@@ -2174,7 +2178,7 @@ impl CheckedProgram {
     /// must never synthesize an empty or sentinel digest.
     pub unsafe fn from_typechecker_parts_unchecked(
         fields: CheckedProgramFields,
-        image_handoff: CheckedImageHandoffV2,
+        image_handoff: CheckedImageHandoffV3,
     ) -> Self {
         Self {
             fields,
@@ -2186,11 +2190,11 @@ impl CheckedProgram {
     ///
     /// This does not create another proof-bearing product; resealing modified
     /// fields still requires the unsafe typechecker invariant boundary.
-    pub fn into_parts(self) -> (CheckedProgramFields, CheckedImageHandoffV2) {
+    pub fn into_parts(self) -> (CheckedProgramFields, CheckedImageHandoffV3) {
         (self.fields, self.image_handoff)
     }
 
-    pub fn image_handoff(&self) -> &CheckedImageHandoffV2 {
+    pub fn image_handoff(&self) -> &CheckedImageHandoffV3 {
         &self.image_handoff
     }
 }
@@ -2257,6 +2261,9 @@ pub enum CheckedStateKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckedState {
     pub id: CheckedStateId,
+    /// Exact lexical HOLD declaration used by self-reads. The canonical
+    /// storage/path authority remains `declaration`.
+    pub binding_declaration: DeclId,
     pub declaration: DeclId,
     pub statement: CheckedStatementId,
     pub expression: CheckedExprId,
@@ -3171,6 +3178,37 @@ mod tests {
             apply_checked_type_substitutions(&Type::Var(TypeVar(2)), &substitutions),
             object([("row", Type::Text)], false),
             "transitive same-namespace environments retain their existing semantics"
+        );
+    }
+
+    #[test]
+    fn one_layer_substitution_preserves_union_frame_shape() {
+        let ty = Type::Union(vec![Type::Var(TypeVar(0)), Type::Var(TypeVar(1))]);
+        let substitutions = [
+            CheckedTypeSubstitution {
+                variable: TypeVar(0),
+                value: Type::Text,
+            },
+            CheckedTypeSubstitution {
+                variable: TypeVar(1),
+                value: Type::Text,
+            },
+        ];
+
+        assert_eq!(
+            apply_checked_type_substitutions_once(&ty, &substitutions),
+            Type::Union(vec![Type::Text, Type::Text]),
+            "a one-layer call frame must preserve the scheme's positional union shape"
+        );
+
+        let cross_namespace = [CheckedTypeSubstitution {
+            variable: TypeVar(0),
+            value: Type::Var(TypeVar(1)),
+        }];
+        assert_eq!(
+            apply_checked_type_substitutions_once(&ty, &cross_namespace),
+            Type::Union(vec![Type::Var(TypeVar(1)), Type::Var(TypeVar(1))]),
+            "equal raw ordinals across caller and callee namespaces must not be deduplicated"
         );
     }
 

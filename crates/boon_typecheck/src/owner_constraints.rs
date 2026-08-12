@@ -1,6 +1,6 @@
 use crate::{
-    OwnerContainingScopeInput, OwnerExpressionInput, OwnerExternalExpressionInput,
-    OwnerSyntaxInput, stable_check_owner_key_fingerprint_v2,
+    OwnerChildResultPlacementInput, OwnerContainingScopeInput, OwnerExpressionInput,
+    OwnerExternalExpressionInput, OwnerSyntaxInput, stable_check_owner_key_fingerprint_v2,
 };
 use boon_checked::{
     OwnerDeclarationStableKey, OwnerExpressionId, OwnerExpressionRef, OwnerExpressionScopeRole,
@@ -23,7 +23,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
-const OWNER_CONSTRAINT_SEED_DOMAIN_V5: &[u8] = b"boon.owner-constraint-seed.v5\0";
+const OWNER_CONSTRAINT_SEED_DOMAIN_V6: &[u8] = b"boon.owner-constraint-seed.v6\0";
 const OWNER_CONSTRAINT_TOPOLOGY_DOMAIN_V2: &[u8] = b"boon.owner-constraint-topology.v2\0";
 const OWNER_DECLARATION_SURFACE_DOMAIN_V1: &[u8] = b"boon.owner-declaration-surface.v1\0";
 const OWNER_LEXICAL_PLAN_DOMAIN_V4: &[u8] = b"boon.owner-lexical-plan.v4\0";
@@ -605,6 +605,10 @@ pub enum OwnerConstraintEdgeRole {
     PipeArm,
     DrainingInput,
     HoldInitial,
+    /// Exact value yielded by one authored HOLD update statement. Updates can
+    /// live in child owners, so this edge uses the shared local/external
+    /// expression namespace just like FLUSH escape plans.
+    HoldUpdate,
     LatestBranch,
     WhenInput,
     WhenArm,
@@ -1457,6 +1461,7 @@ fn append_callable_interface_dependencies(
             | OwnerConstraintEdgeRole::PipeArm
             | OwnerConstraintEdgeRole::DrainingInput
             | OwnerConstraintEdgeRole::HoldInitial
+            | OwnerConstraintEdgeRole::HoldUpdate
             | OwnerConstraintEdgeRole::LatestBranch
             | OwnerConstraintEdgeRole::WhenInput
             | OwnerConstraintEdgeRole::WhenArm
@@ -4428,6 +4433,98 @@ fn flush_statement_update_values(
         .collect()
 }
 
+fn hold_child_update_values(
+    input: &OwnerSyntaxInput,
+    graph: &crate::OwnerSyntaxGraph,
+    child: &OwnerStatementChild,
+) -> Vec<OwnerExpressionRef> {
+    match child {
+        OwnerStatementChild::Local { statement } => {
+            hold_statement_update_values(input, graph, *statement)
+        }
+        OwnerStatementChild::Owner { .. } => {
+            graph.child_owner_value(input, child).into_iter().collect()
+        }
+    }
+}
+
+fn hold_statement_update_values(
+    input: &OwnerSyntaxInput,
+    graph: &crate::OwnerSyntaxGraph,
+    statement: OwnerStatementId,
+) -> Vec<OwnerExpressionRef> {
+    let Some(statement) = graph.statement(statement) else {
+        return Vec::new();
+    };
+    if let Some(value) = &statement.canonical_value {
+        return vec![value.clone()];
+    }
+    statement
+        .children
+        .iter()
+        .flat_map(|child| hold_child_update_values(input, graph, child))
+        .collect()
+}
+
+fn hold_update_expressions(
+    input: &OwnerSyntaxInput,
+    graph: &crate::OwnerSyntaxGraph,
+    expression: OwnerExpressionId,
+) -> Vec<OwnerExpressionRef> {
+    let Some(statement) = input
+        .statements
+        .iter()
+        .find(|statement| statement.expression == Some(expression.0))
+        .map(|statement| OwnerStatementId(statement.id))
+    else {
+        return Vec::new();
+    };
+    let Some(statement) = graph.statement(statement) else {
+        return Vec::new();
+    };
+    let mut updates = Vec::new();
+    for child in &statement.children {
+        let OwnerStatementChild::Local { statement: child } = child else {
+            updates.extend(hold_child_update_values(input, graph, child));
+            continue;
+        };
+        let Some(child_node) = graph.statement(*child) else {
+            continue;
+        };
+        let continuation = input
+            .statements
+            .get(child.0 as usize)
+            .and_then(|statement| statement.expression)
+            .and_then(|expression| input.expressions.get(expression as usize))
+            .is_some_and(|expression| expression.linked_input.is_some());
+        let update_start = updates.len();
+        let child_is_latest = child_node
+            .direct_value
+            .as_ref()
+            .and_then(|value| match value {
+                OwnerExpressionRef::Local { expression } => {
+                    input.expressions.get(expression.0 as usize)
+                }
+                OwnerExpressionRef::Child { .. } => None,
+            })
+            .is_some_and(|expression| matches!(expression.kind, AstExprKind::Latest { .. }));
+        if child_is_latest {
+            updates.extend(
+                child_node
+                    .children
+                    .iter()
+                    .flat_map(|grandchild| hold_child_update_values(input, graph, grandchild)),
+            );
+        } else {
+            updates.extend(hold_statement_update_values(input, graph, *child));
+        }
+        if continuation && update_start > 0 && updates.len() > update_start {
+            updates.remove(update_start - 1);
+        }
+    }
+    updates
+}
+
 fn hold_flush_update_expressions(
     input: &OwnerSyntaxInput,
     graph: &crate::OwnerSyntaxGraph,
@@ -4539,6 +4636,267 @@ fn project_expression_flush_plans(
         .into_boxed_slice()
 }
 
+fn attach_hold_update_constraints(
+    input: &OwnerSyntaxInput,
+    graph: &crate::OwnerSyntaxGraph,
+    expressions: &mut [OwnerExpressionConstraint],
+) -> Result<(), OwnerConstraintSeedError> {
+    for index in 0..expressions.len() {
+        if !matches!(
+            expressions[index].kind,
+            OwnerConstraintNodeKind::Hold { .. }
+        ) {
+            continue;
+        }
+        let expression = OwnerExpressionId(
+            u32::try_from(index)
+                .map_err(|_| OwnerConstraintSeedError::new("owner HOLD expression exceeds u32"))?,
+        );
+        let mut inputs = expressions[index].inputs.to_vec();
+        for update in hold_update_expressions(input, graph, expression) {
+            let update = flush_reference_index(input, &update).ok_or_else(|| {
+                OwnerConstraintSeedError::new(
+                    "owner HOLD update is absent from the local/external expression namespace",
+                )
+            })?;
+            inputs.push(OwnerConstraintEdge {
+                role: OwnerConstraintEdgeRole::HoldUpdate,
+                expression: update,
+            });
+        }
+        expressions[index].inputs = inputs.into_boxed_slice();
+    }
+    Ok(())
+}
+
+/// Restore the record carried by a nonempty multiline `[...]` delimiter.
+///
+/// The parser represents the opening delimiter as the match-arm result while
+/// its named values live in child statements. The dense checker reconstructs
+/// that exact record before inference; owner projection must retain the same
+/// value edges or a selected arm degenerates into an unconstrained alpha.
+fn attach_structured_delimiter_record_constraints(
+    input: &OwnerSyntaxInput,
+    graph: &crate::OwnerSyntaxGraph,
+    expressions: &mut [OwnerExpressionConstraint],
+) -> Result<(), OwnerConstraintSeedError> {
+    let mut externals_by_expression =
+        BTreeMap::<StableExpressionKey, Vec<&OwnerExternalExpressionInput>>::new();
+    let mut external_indices = BTreeMap::<(StableCheckOwnerKey, StableExpressionKey), u32>::new();
+    for (external, expression) in input.external_expressions.iter().enumerate() {
+        externals_by_expression
+            .entry(expression.expression.clone())
+            .or_default()
+            .push(expression);
+        let reference = input
+            .expressions
+            .len()
+            .checked_add(external)
+            .and_then(|reference| u32::try_from(reference).ok())
+            .ok_or_else(|| {
+                OwnerConstraintSeedError::new(
+                    "structured delimiter external expression namespace exceeds u32",
+                )
+            })?;
+        if external_indices
+            .insert(
+                (expression.owner.clone(), expression.expression.clone()),
+                reference,
+            )
+            .is_some()
+        {
+            return Err(OwnerConstraintSeedError::new(
+                "structured delimiter sees a duplicate external expression",
+            ));
+        }
+    }
+    let mut child_fields = BTreeMap::new();
+    for child in &input.child_owners {
+        let Some(name) = child.field_name.clone() else {
+            continue;
+        };
+        let value = match &child.result_placement {
+            OwnerChildResultPlacementInput::ExpressionEdge { edge } => OwnerExpressionRef::Child {
+                owner: edge.child_owner.clone(),
+                expression: edge.child_expression.clone(),
+            },
+            OwnerChildResultPlacementInput::StatementLane => {
+                let result = child.result_expression.as_ref().ok_or_else(|| {
+                    OwnerConstraintSeedError::new(
+                        "field-bearing child has no statement-lane result expression",
+                    )
+                })?;
+                let mut matches = externals_by_expression
+                    .get(result)
+                    .into_iter()
+                    .flatten()
+                    .filter(|external| {
+                        external.owner == child.owner
+                            || crate::owner_syntax::is_descendant_owner(
+                                &child.owner,
+                                &external.owner,
+                            )
+                    });
+                let exact = *matches.next().ok_or_else(|| {
+                        OwnerConstraintSeedError::new(
+                            "field-bearing child result is absent from the external expression namespace",
+                        )
+                    })?;
+                if matches.next().is_some() {
+                    return Err(OwnerConstraintSeedError::new(
+                        "field-bearing child result has multiple external expression providers",
+                    ));
+                }
+                OwnerExpressionRef::Child {
+                    owner: exact.owner.clone(),
+                    expression: exact.expression.clone(),
+                }
+            }
+            OwnerChildResultPlacementInput::Valueless => {
+                continue;
+            }
+        };
+        if child_fields
+            .insert(child.owner.clone(), (name, value))
+            .is_some()
+        {
+            return Err(OwnerConstraintSeedError::new(
+                "structured delimiter sees a duplicate child owner",
+            ));
+        }
+    }
+
+    let mut pending = graph
+        .roots()
+        .iter()
+        .rev()
+        .cloned()
+        .map(|child| (child, false))
+        .collect::<Vec<_>>();
+    let mut claimed = BTreeSet::new();
+    while let Some((child, exiting)) = pending.pop() {
+        let OwnerStatementChild::Local { statement } = child else {
+            continue;
+        };
+        let node = graph.statement(statement).ok_or_else(|| {
+            OwnerConstraintSeedError::new(
+                "structured delimiter traversal references a missing statement",
+            )
+        })?;
+        if !exiting {
+            pending.push((OwnerStatementChild::Local { statement }, true));
+            pending.extend(
+                node.children
+                    .iter()
+                    .rev()
+                    .cloned()
+                    .map(|child| (child, false)),
+            );
+            continue;
+        }
+
+        let Some(direct) = node.direct_value.as_ref() else {
+            continue;
+        };
+        let mut delimiters = Vec::new();
+        if let OwnerExpressionRef::Local { expression } = direct
+            && input
+                .expressions
+                .get(expression.0 as usize)
+                .is_some_and(|expression| matches!(expression.kind, AstExprKind::Delimiter))
+        {
+            delimiters.push(*expression);
+        }
+        if let OwnerExpressionRef::Local { expression } = direct {
+            delimiters.extend(
+                graph
+                    .expression_inputs(*expression)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|child| {
+                        let OwnerExpressionRef::Local { expression } = child else {
+                            return None;
+                        };
+                        input
+                            .expressions
+                            .get(expression.0 as usize)
+                            .is_some_and(|expression| {
+                                matches!(expression.kind, AstExprKind::Delimiter)
+                            })
+                            .then_some(*expression)
+                    }),
+            );
+        }
+        if delimiters.is_empty() {
+            continue;
+        }
+        let fields = node
+            .children
+            .iter()
+            .filter_map(|child| match child {
+                OwnerStatementChild::Local { statement } => {
+                    let statement_input = input.statements.get(statement.0 as usize)?;
+                    let name = match &statement_input.kind {
+                        AstStatementKind::Field { name } => Some(name.clone()),
+                        AstStatementKind::Source { field, .. }
+                        | AstStatementKind::Hold { field, .. }
+                        | AstStatementKind::List { field, .. } => field.clone(),
+                        AstStatementKind::Function { .. }
+                        | AstStatementKind::Block
+                        | AstStatementKind::Spread
+                        | AstStatementKind::Expression => None,
+                    }?;
+                    let value = graph.statement(*statement)?.canonical_value.clone()?;
+                    Some((name, value))
+                }
+                OwnerStatementChild::Owner { owner } => child_fields.get(owner).cloned(),
+            })
+            .collect::<Vec<_>>();
+        if fields.is_empty() {
+            continue;
+        }
+        for delimiter in delimiters {
+            if !claimed.insert(delimiter) {
+                continue;
+            }
+            let projected = expressions.get_mut(delimiter.0 as usize).ok_or_else(|| {
+                OwnerConstraintSeedError::new(
+                    "structured delimiter is outside the local expression namespace",
+                )
+            })?;
+            if !matches!(projected.kind, OwnerConstraintNodeKind::Delimiter) {
+                return Err(OwnerConstraintSeedError::new(
+                    "structured delimiter projection has a non-delimiter node kind",
+                ));
+            }
+            projected.kind = OwnerConstraintNodeKind::Record { tag: None };
+            projected.inputs = fields
+                .iter()
+                .map(|(name, value)| {
+                    Ok(OwnerConstraintEdge {
+                        role: OwnerConstraintEdgeRole::RecordField {
+                            name: name.clone(),
+                            spread: false,
+                        },
+                        expression: match value {
+                            OwnerExpressionRef::Local { expression } => expression.0,
+                            OwnerExpressionRef::Child { owner, expression } => *external_indices
+                                .get(&(owner.clone(), expression.clone()))
+                                .ok_or_else(|| {
+                                    OwnerConstraintSeedError::new(
+                                        "structured delimiter field value is absent from the local/external expression namespace",
+                                    )
+                                })?,
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, OwnerConstraintSeedError>>()?
+                .into_boxed_slice();
+        }
+    }
+    Ok(())
+}
+
 pub fn project_owner_constraint_seed_with_lexical_plan(
     input: &OwnerSyntaxInput,
     lexical_plan: &OwnerLexicalPlan,
@@ -4575,7 +4933,9 @@ pub fn project_owner_constraint_seed_with_lexical_plan(
         .iter()
         .map(project_expression)
         .collect::<Result<Vec<_>, _>>()?;
+    attach_structured_delimiter_record_constraints(input, lexical_plan.graph(), &mut expressions)?;
     attach_pattern_binding_constraints(&mut expressions, lexical_plan)?;
+    attach_hold_update_constraints(input, lexical_plan.graph(), &mut expressions)?;
     let expression_flush_plans = project_expression_flush_plans(input, lexical_plan.graph());
     let source_payload_queries =
         project_source_payload_queries(input, &statement_values, &expressions)?;
@@ -4610,7 +4970,7 @@ pub fn project_owner_constraint_seed_with_lexical_plan(
         ),
     )?;
     let fingerprint_v1 = fingerprint(
-        OWNER_CONSTRAINT_SEED_DOMAIN_V5,
+        OWNER_CONSTRAINT_SEED_DOMAIN_V6,
         &(
             stable_check_owner_key_fingerprint_v2(&input.owner),
             lexical_plan.reads_fingerprint_v1(),
@@ -4832,6 +5192,190 @@ mod tests {
                 .iter()
                 .all(|reference| reference.parts.as_ref() != ["state"]),
             "the HOLD state alias must not become a project-symbol candidate"
+        );
+    }
+
+    #[test]
+    fn constraint_seed_carries_hold_update_values() {
+        let unit = link(concat!(
+            "state:\n",
+            "    NotStarted |> HOLD state {\n",
+            "        True |> THEN { WaveformOpened[timescale_unit: TEXT { ns }] }\n",
+            "    }\n",
+        ));
+        let (seed, hold) = unit
+            .stable_check_owner_keys()
+            .map(|owner| summary(&unit, &owner))
+            .find_map(|seed| {
+                let hold = seed
+                    .expressions
+                    .iter()
+                    .find(|expression| {
+                        matches!(expression.kind, OwnerConstraintNodeKind::Hold { .. })
+                    })?
+                    .clone();
+                Some((seed, hold))
+            })
+            .expect("state owner HOLD expression");
+
+        assert_eq!(
+            hold.inputs
+                .iter()
+                .filter(|input| matches!(input.role, OwnerConstraintEdgeRole::HoldInitial))
+                .count(),
+            1,
+        );
+        assert!(
+            hold.inputs
+                .iter()
+                .any(|input| matches!(input.role, OwnerConstraintEdgeRole::HoldUpdate)),
+            "HOLD update values must cross the owner constraint boundary: {hold:#?}",
+        );
+        assert!(hold.inputs.iter().all(|input| {
+            (input.expression as usize) < seed.expressions.len() + seed.external_expressions.len()
+        }));
+    }
+
+    #[test]
+    fn multiline_match_records_project_delimiter_fields_but_empty_delimiters_stay_contextual() {
+        let unit = link(concat!(
+            "FUNCTION choose(kind) {\n",
+            "    kind |> WHEN {\n",
+            "        Record => [\n",
+            "            value: 1\n",
+            "            label: TEXT { chosen }\n",
+            "        ]\n",
+            "        Empty => [\n",
+            "        ]\n",
+            "        __ => LIST { 1 }\n",
+            "    }\n",
+            "}\n",
+        ));
+        let seed = summary(&unit, &owner_named(&unit, "choose"));
+        let arm_output = |tag: &str| {
+            seed.expressions
+                .iter()
+                .find(|expression| {
+                    matches!(
+                        &expression.kind,
+                        OwnerConstraintNodeKind::MatchArm {
+                            pattern: OwnerPatternConstraint::Tag { name, .. },
+                        } if name == tag
+                    )
+                })
+                .and_then(|arm| {
+                    arm.inputs.iter().find_map(|input| {
+                        matches!(input.role, OwnerConstraintEdgeRole::MatchOutput)
+                            .then_some(input.expression)
+                    })
+                })
+                .expect("tagged match arm output")
+        };
+
+        let record = &seed.expressions[arm_output("Record") as usize];
+        assert_eq!(
+            record.kind,
+            OwnerConstraintNodeKind::Record { tag: None },
+            "a nonempty multiline record delimiter must retain its value structure",
+        );
+        assert_eq!(
+            record
+                .inputs
+                .iter()
+                .filter_map(|input| match &input.role {
+                    OwnerConstraintEdgeRole::RecordField {
+                        name,
+                        spread: false,
+                    } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["value", "label"],
+        );
+        assert!(record.inputs.iter().all(|input| {
+            (input.expression as usize) < seed.expressions.len() + seed.external_expressions.len()
+        }));
+
+        let empty = &seed.expressions[arm_output("Empty") as usize];
+        assert_eq!(empty.kind, OwnerConstraintNodeKind::Delimiter);
+        assert!(empty.inputs.is_empty());
+    }
+
+    #[test]
+    fn structured_delimiter_child_fields_use_authored_names_not_item_route_aliases() {
+        let unit = link(concat!(
+            "store: [\n",
+            "    control: [press: SOURCE]\n",
+            "    held: 0 |> HOLD state {\n",
+            "        True |> THEN { 1 }\n",
+            "    }\n",
+            "    0 |> HOLD anonymous {\n",
+            "        True |> THEN { 1 }\n",
+            "    }\n",
+            "]\n",
+        ));
+        let owner = owner_named(&unit, "store");
+        let syntax = project_owner_syntax_input(unit.owner_view_for_key(&owner).unwrap()).unwrap();
+        assert!(syntax.child_owners.iter().any(|child| {
+            child.field_name.as_deref() == Some("control")
+                && matches!(
+                    child.owner,
+                    StableCheckOwnerKey::Item(ref owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| {
+                            segment.kind == UnitItemKind::Source
+                                && segment.names.as_ref() == ["control", "press"]
+                        })
+                )
+        }));
+        assert!(syntax.child_owners.iter().any(|child| {
+            child.field_name.as_deref() == Some("held")
+                && matches!(
+                    child.owner,
+                    StableCheckOwnerKey::Item(ref owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| {
+                            segment.kind == UnitItemKind::Hold
+                                && segment.names.as_ref() == ["held", "state"]
+                        })
+                )
+        }));
+        assert!(syntax.child_owners.iter().any(|child| {
+            child.field_name.is_none()
+                && matches!(
+                    child.owner,
+                    StableCheckOwnerKey::Item(ref owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| {
+                            segment.kind == UnitItemKind::Hold
+                                && segment.names.as_ref() == ["anonymous"]
+                        })
+                )
+        }));
+
+        let seed = project_owner_constraint_seed(&syntax).unwrap();
+        let record = seed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(expression.kind, OwnerConstraintNodeKind::Record { tag: None })
+                    && expression
+                        .inputs
+                        .iter()
+                        .any(|input| matches!(&input.role, OwnerConstraintEdgeRole::RecordField { name, .. } if name == "control"))
+            })
+            .expect("store multiline record constraint");
+        assert_eq!(
+            record
+                .inputs
+                .iter()
+                .filter_map(|input| match &input.role {
+                    OwnerConstraintEdgeRole::RecordField {
+                        name,
+                        spread: false,
+                    } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["control", "held"],
+            "fieldless HOLD aliases must not become record fields",
         );
     }
 

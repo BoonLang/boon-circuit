@@ -45,8 +45,8 @@ use std::sync::Arc;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0xc8, 0xaa, 0x63, 0x4d, 0x4e, 0x3d, 0xd2, 0xc6, 0x3c, 0x10, 0x5b, 0xdb, 0xab, 0x62, 0xc7, 0xe8,
-    0x2f, 0x40, 0x76, 0x2f, 0x04, 0x2f, 0x40, 0xcb, 0x71, 0x78, 0x99, 0xfe, 0x8f, 0x6a, 0x0c, 0xab,
+    0x5d, 0x6e, 0x99, 0xcf, 0x20, 0xa7, 0x9b, 0x22, 0xcb, 0x5d, 0xb2, 0x01, 0x50, 0x3c, 0x77, 0xa5,
+    0xe5, 0xc6, 0x3d, 0x36, 0xbd, 0x7e, 0xa0, 0xec, 0x8d, 0xb2, 0x14, 0x0c, 0x3b, 0xe8, 0x64, 0xbe,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -627,7 +627,7 @@ pub struct SemanticProgram {
     execution_graph: SemanticExecutionImageColumnsV1,
     producer_materializations: Vec<ProducerMaterializationRequest>,
     resolved_out_graph: ResolvedOutGraph,
-    resource_graph: SemanticResourceGraphV1,
+    resource_graph: SemanticResourceGraphV2,
     reactive_graph: SemanticReactiveGraphV1,
     lowering_contract: SemanticLoweringContractV2,
     view_binding_graph: SemanticViewBindingGraphV1,
@@ -815,7 +815,7 @@ impl SemanticProgram {
         }
     }
 
-    pub const fn resource_graph(&self) -> &SemanticResourceGraphV1 {
+    pub const fn resource_graph(&self) -> &SemanticResourceGraphV2 {
         &self.resource_graph
     }
 
@@ -5948,10 +5948,7 @@ result:
         {
             eprintln!(
                 "compact PASSED field declaration id={} kind={:?} flow={:?} value={:?}",
-                declaration.id.0,
-                declaration.kind,
-                declaration.flow_type,
-                declaration.value,
+                declaration.id.0, declaration.kind, declaration.flow_type, declaration.value,
             );
         }
         for expression_id in [1230, 9596, 9597] {

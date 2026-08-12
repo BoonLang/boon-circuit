@@ -487,7 +487,7 @@ impl RequestFamily for OwnerInputRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerSyntaxInput>;
 
-    const NAME: &'static str = "boon.compiler.owner-input.v3";
+    const NAME: &'static str = "boon.compiler.owner-input.v4";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -506,7 +506,7 @@ impl RequestFamily for OwnerSourceMapRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerSourceMap>;
 
-    const NAME: &'static str = "boon.compiler.owner-source-map.v2";
+    const NAME: &'static str = "boon.compiler.owner-source-map.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -563,7 +563,7 @@ impl RequestFamily for OwnerConstraintSeedRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerConstraintSeed>;
 
-    const NAME: &'static str = "boon.compiler.owner-constraint-seed.v5";
+    const NAME: &'static str = "boon.compiler.owner-constraint-seed.v6";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -1222,7 +1222,7 @@ impl RequestFamily for OwnerInterfaceSccEvaluationRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceComponentEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v8";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v9";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1241,7 +1241,7 @@ impl RequestFamily for OwnerInterfaceSccRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceSccResult>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v6";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v7";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1260,7 +1260,7 @@ impl RequestFamily for OwnerInterfaceTransferModuleRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceTransferModule>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-transfer-module.v2";
+    const NAME: &'static str = "boon.compiler.owner-interface-transfer-module.v3";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1315,7 +1315,7 @@ impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v11";
+    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v12";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -1334,7 +1334,7 @@ impl RequestFamily for OwnerBodyInferenceRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceShard>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference.v8";
+    const NAME: &'static str = "boon.compiler.owner-body-inference.v9";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -1391,7 +1391,7 @@ impl RequestFamily for CheckedOwnerShardRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<CheckedOwnerShard>;
 
-    const NAME: &'static str = "boon.compiler.checked-owner-shard.v8";
+    const NAME: &'static str = "boon.compiler.checked-owner-shard.v9";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -1551,7 +1551,7 @@ impl RequestFamily for CheckedOwnerProjectAssemblyRequest {
     type Key = CheckedOwnerProjectAssemblyKey;
     type Value = Arc<CheckedOwnerProjectAssembly>;
 
-    const NAME: &'static str = "boon.compiler.checked-owner-project-assembly.v6";
+    const NAME: &'static str = "boon.compiler.checked-owner-project-assembly.v7";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -4300,7 +4300,7 @@ fn evaluate_owner_constraint_requests(
         std::iter::empty(),
     ));
     let seed_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-constraint-seed-dependencies.v5\0",
+        b"boon.compiler.owner-constraint-seed-dependencies.v6\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -4826,15 +4826,15 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
     trace.checkpoint("interface-scc-plans", topology.sccs.len());
 
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v8\0",
+        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v9\0",
         std::iter::empty(),
     ));
     let result_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-result-projection-dependencies.v5\0",
+        b"boon.compiler.owner-interface-scc-result-projection-dependencies.v6\0",
         std::iter::empty(),
     ));
     let transfer_module_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-transfer-module-dependencies.v2\0",
+        b"boon.compiler.owner-interface-transfer-module-dependencies.v3\0",
         std::iter::empty(),
     ));
     for expected in &topology.sccs {
@@ -5038,7 +5038,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                             .map(|dependency| dependency.fingerprint_v1()),
                     );
                     let fingerprint_v1 = request_fingerprint(
-                        b"boon.compiler.owner-interface-component-evaluation.v2\0",
+                        b"boon.compiler.owner-interface-component-evaluation.v3\0",
                         component_inputs.iter().map(<[u8; 32]>::as_slice),
                     );
                     Ok(Arc::new(OwnerInterfaceComponentEvaluation {
@@ -5158,7 +5158,7 @@ fn evaluate_owner_body_inference_requests(
         .flat_map(|scc| scc.key.members.iter().cloned())
         .collect::<Vec<_>>();
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-body-inference-evaluation-dependencies.v11\0",
+        b"boon.compiler.owner-body-inference-evaluation-dependencies.v12\0",
         std::iter::empty(),
     ));
     let mut planning_ms = 0.0;
@@ -5311,7 +5311,7 @@ fn evaluate_owner_body_inference_requests(
         result_transfer_edges =
             result_transfer_edges.saturating_add(body_work.interface_plan_transfer_edges);
         let result_input = RequestInputFingerprint(request_fingerprint(
-            b"boon.compiler.owner-body-inference-result-projection-dependencies.v7\0",
+            b"boon.compiler.owner-body-inference-result-projection-dependencies.v8\0",
             std::iter::empty(),
         ));
         match state.owner_body_inference_requests.begin(
@@ -6155,7 +6155,7 @@ fn evaluate_checked_owner_shard_requests(
     trace.checkpoint("construction-abi", owners.len());
 
     let shard_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.checked-owner-shard-dependencies.v8\0",
+        b"boon.compiler.checked-owner-shard-dependencies.v9\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -6281,7 +6281,7 @@ fn evaluate_checked_owner_project_assembly_request(
     evaluate_owner_diagnostics_aggregate_request(state, project)?;
     let key = CheckedOwnerProjectAssemblyKey;
     let input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.checked-owner-project-assembly-dependencies.v6\0",
+        b"boon.compiler.checked-owner-project-assembly-dependencies.v7\0",
         [program_role_request_tag(state.source.program_role)],
     ));
     match state.checked_owner_project_assembly_requests.begin(
@@ -7753,6 +7753,19 @@ mod tests {
             }
         }
 
+        fn type_at_object_path<'a>(
+            mut ty: &'a boon_checked::Type,
+            path: &[&str],
+        ) -> Option<&'a boon_checked::Type> {
+            for field in path {
+                let boon_checked::Type::Object(shape) = ty else {
+                    return None;
+                };
+                ty = shape.fields.get(*field)?;
+            }
+            Some(ty)
+        }
+
         fn unresolved_type_paths(ty: &boon_checked::Type) -> Vec<String> {
             fn visit(ty: &boon_checked::Type, path: &str, unresolved: &mut Vec<String>) {
                 match ty {
@@ -7860,6 +7873,8 @@ mod tests {
         let new_signal_lane_row = owner_named("new_signal_lane_row");
         let store = owner_named("store");
         let bridge_request_compact_label = owner_named("bridge_request_compact_label");
+        let root = owner_named("root");
+        let material = owner_named("material");
         {
             let state = session.projects.get(&project).unwrap();
             let current_interface = |owner: &StableCheckOwnerKey| {
@@ -7966,6 +7981,14 @@ mod tests {
                 Some(&boon_checked::Type::Text),
                 "the parent store boundary must observe the child's closed public result",
             );
+            assert_eq!(
+                type_at_object_path(
+                    &store_interface.result.ty,
+                    &["bridge_request_descriptor", "identity", "time_unit"],
+                ),
+                Some(&boon_checked::Type::Text),
+                "the store interface must carry the closed HOLD update type through bridge_request_descriptor.identity.time_unit",
+            );
             let provider = state
                 .owner_interface_provider_requests
                 .current_value(&state.syntax_evaluator, &new_signal_lane_row)
@@ -7991,6 +8014,76 @@ mod tests {
                 "new_signal_lane_row parameter fields must remain generic variables, never ABI placeholders: {interface:#?}",
             );
         }
+        let root_body = session
+            .owner_body_inference(project, &root)
+            .unwrap()
+            .expect("NovyWave root body inference");
+        let app_background_material = root_body
+            .calls
+            .iter()
+            .find(|call| {
+                call.function == "NovyTheme/material"
+                    && matches!(
+                        &call.target,
+                        boon_typecheck::InferredOwnerCallableTarget::Owner { owner }
+                            if owner == &material
+                    )
+                    && call.inputs.iter().any(|input| {
+                        matches!(
+                            &input.role,
+                            boon_typecheck::OwnerConstraintEdgeRole::CallArgument {
+                                name,
+                                ..
+                            } if name == "of"
+                        ) && matches!(
+                            &input.actual_type,
+                            boon_checked::Type::VariantSet(variants)
+                                if variants.len() == 1
+                                    && matches!(
+                                        variants.first(),
+                                        Some(boon_checked::Variant::Tag(tag))
+                                            if tag == "AppBackground"
+                                    )
+                        )
+                    })
+            })
+            .expect("root NovyTheme/material(of: AppBackground) occurrence");
+        assert!(
+            app_background_material.valid,
+            "root material occurrence must be valid: {app_background_material:#?}",
+        );
+        assert!(
+            app_background_material.syntax_discriminated_result,
+            "AppBackground must select its exact material arm: {app_background_material:#?}",
+        );
+        let boon_checked::Type::Object(material_result) = &app_background_material.result.ty else {
+            panic!(
+                "AppBackground material must be one closed object: {app_background_material:#?}"
+            );
+        };
+        assert!(
+            !material_result.open,
+            "AppBackground material must be closed: {app_background_material:#?}",
+        );
+        assert_eq!(
+            material_result.fields.len(),
+            2,
+            "AppBackground material fields: {app_background_material:#?}",
+        );
+        assert_eq!(
+            material_result.fields.get("color"),
+            Some(&boon_checked::Type::Text),
+            "AppBackground material color",
+        );
+        assert_eq!(
+            material_result.fields.get("gloss"),
+            Some(&boon_checked::Type::Number),
+            "AppBackground material gloss",
+        );
+        assert!(
+            boon_checked::type_is_recursively_closed(&app_background_material.result.ty),
+            "AppBackground material result must be recursively closed: {app_background_material:#?}",
+        );
         let (_, assembly, _, _, _) =
             parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
         let fields = assembly.fields();
@@ -8002,6 +8095,45 @@ mod tests {
             )
             .unwrap();
         }
+        let store_declaration = fields
+            .declarations
+            .iter()
+            .find(|declaration| {
+                declaration.name == "store"
+                    && type_at_object_path(
+                        &declaration.flow_type.ty,
+                        &["bridge_request_descriptor", "identity", "time_unit"],
+                    )
+                    .is_some()
+            })
+            .expect("NovyWave assembled public store declaration");
+        assert_eq!(
+            type_at_object_path(
+                &store_declaration.flow_type.ty,
+                &["bridge_request_descriptor", "identity", "time_unit"],
+            ),
+            Some(&boon_checked::Type::Text),
+            "assembled store must preserve the exact closed HOLD update type",
+        );
+        let default_file = fields
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == "default_file_tree_selected_file")
+            .expect("NovyWave default file-tree selection declaration");
+        assert_eq!(
+            default_file.flow_type.ty,
+            boon_checked::Type::Text,
+            "the public default file-tree selection must remain Text",
+        );
+        let default_file_value = default_file
+            .value
+            .and_then(|expression| fields.expressions.get(expression.0 as usize))
+            .expect("default file-tree selection value expression");
+        assert_eq!(
+            default_file_value.flow_type.ty,
+            boon_checked::Type::Text,
+            "the owner-body List/latest occurrence must retain its closed Text FreshOut projection",
+        );
         let declaration = fields
             .declarations
             .iter()

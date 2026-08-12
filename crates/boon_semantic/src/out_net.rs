@@ -293,6 +293,28 @@ fn apply_type_substitution_frames(
     ty
 }
 
+/// Chooses the already-finalized checked occurrence when the instantiated
+/// callable result denotes exactly the same fully concrete value set.
+///
+/// Call-frame substitution must retain transient union shape because its
+/// members can still belong to independently normalized alpha namespaces.
+/// After both sides are recursively closed, mutual assignability proves that
+/// the checked occurrence is an equivalent representation supplied by the
+/// typechecker rather than a narrowing guess. This prevents a redundant
+/// instantiated `Text | Text` from escaping instead of the exact checked
+/// occurrence `Text` without inventing a new representation in OutNet.
+fn specialize_checked_occurrence_result(instantiated: &Type, occurrence: &Type) -> Type {
+    if boon_checked::type_is_recursively_closed(instantiated)
+        && boon_checked::type_is_recursively_closed(occurrence)
+        && boon_checked::resolved_type_is_assignable_to(instantiated, occurrence)
+        && boon_checked::resolved_type_is_assignable_to(occurrence, instantiated)
+    {
+        occurrence.clone()
+    } else {
+        boon_checked::specialize_checked_call_result(instantiated, occurrence)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct ConcreteOutProducer {
     pub call: OutCallInstanceId,
@@ -302,6 +324,24 @@ pub struct ConcreteOutProducer {
 }
 
 impl<Contract> OutNet<Contract> {
+    #[cfg(test)]
+    pub(crate) fn empty_for_tests() -> Self {
+        Self {
+            call_instances: Vec::new(),
+            ports: Vec::new(),
+            nets: Vec::new(),
+            static_owners: Vec::new(),
+            call_instance_by_checked_frame: BTreeMap::new(),
+            intentionally_elided_calls: BTreeSet::new(),
+            intentionally_elided_frames: BTreeSet::new(),
+            output_net_by_frame_target: BTreeMap::new(),
+            concrete_producers_by_checked: BTreeMap::new(),
+            producer_roots: Vec::new(),
+            producer_root_by_identity: BTreeMap::new(),
+            producer_root_calls: BTreeSet::new(),
+        }
+    }
+
     pub fn producer_root_result_path(&self, call: OutCallInstanceId) -> Option<&str> {
         self.producer_roots
             .iter()
@@ -1801,7 +1841,7 @@ where
                 // expansion.
                 checked_occurrence_result
             } else {
-                boon_checked::specialize_checked_call_result(
+                specialize_checked_occurrence_result(
                     &instantiated_result,
                     &checked_occurrence_result,
                 )
@@ -3060,6 +3100,86 @@ converted: 255 |> Number/to_bits(width: 8, interpretation: Unsigned)
                 .ty,
             boon_checked::Type::Bits { width: 3 }
         );
+    }
+
+    #[test]
+    fn closed_equivalent_checked_occurrence_is_the_result_authority() {
+        assert_eq!(
+            specialize_checked_occurrence_result(
+                &Type::Union(vec![Type::Text, Type::Text]),
+                &Type::Text,
+            ),
+            Type::Text
+        );
+        assert_eq!(
+            specialize_checked_occurrence_result(
+                &Type::Union(vec![Type::Text, Type::Number]),
+                &Type::Text,
+            ),
+            Type::Union(vec![Type::Text, Type::Number]),
+            "a non-equivalent occurrence must not narrow a closed callable result"
+        );
+    }
+
+    #[test]
+    fn call_frame_substitution_uses_equivalent_closed_checked_occurrence() {
+        let (mut program, _) = checked_program(
+            "out-net-collapsed-result-union.bn",
+            r#"
+FUNCTION identity(value) {
+    value
+}
+result: identity(value: TEXT { alpha })
+"#,
+        )
+        .into_parts();
+        let call_id = program
+            .calls
+            .iter()
+            .find(|call| call.function == "identity")
+            .expect("identity call")
+            .id;
+        let callable_id = program
+            .calls
+            .iter()
+            .find(|call| call.id == call_id)
+            .expect("identity call")
+            .callable;
+        let first = TypeVar(10_000);
+        let second = TypeVar(10_001);
+        program
+            .callables
+            .iter_mut()
+            .find(|callable| callable.decl_id == callable_id)
+            .expect("identity callable")
+            .result
+            .ty = Type::Union(vec![Type::Var(first), Type::Var(second)]);
+        let call = program
+            .calls
+            .iter_mut()
+            .find(|call| call.id == call_id)
+            .expect("identity call");
+        call.type_substitutions = vec![
+            boon_checked::CheckedTypeSubstitution {
+                variable: first,
+                value: Type::Text,
+            },
+            boon_checked::CheckedTypeSubstitution {
+                variable: second,
+                value: Type::Text,
+            },
+        ];
+        call.result.ty = Type::Text;
+
+        let built = OutNet::build(&program);
+        assert!(!built.has_errors(), "{:#?}", built.diagnostics);
+        let instance = built
+            .graph
+            .call_instances
+            .iter()
+            .find(|instance| instance.provenance.call_id == Some(call_id))
+            .expect("identity call instance");
+        assert_eq!(instance.result.ty, Type::Text);
     }
 
     #[test]

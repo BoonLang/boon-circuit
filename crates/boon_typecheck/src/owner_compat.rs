@@ -2192,7 +2192,7 @@ pub fn assemble_checked_owner_project<'a>(
     // basis instead; every semantic row, source position, ABI contract, role,
     // and source revision is covered by one of these compact fingerprints.
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        b"boon.checked-owner-project-assembly-basis.v5\0",
+        b"boon.checked-owner-project-assembly-basis.v6\0",
         &(
             project.source_bundle_digest_v1(),
             role,
@@ -2684,6 +2684,7 @@ pub fn assemble_checked_owner_project<'a>(
                 id.0 as usize,
                 CheckedState {
                     id,
+                    binding_declaration: layout.declaration(owner, &row.binding_declaration)?,
                     declaration: layout.declaration(owner, &row.declaration)?,
                     statement: layout.local_statement(owner, row.statement)?,
                     expression: layout.local_expression(owner, row.expression)?,

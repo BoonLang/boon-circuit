@@ -23,10 +23,10 @@ use crate::{
 use boon_checked::{
     CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedContextBinding,
     CheckedContextualOperation, CheckedDeclarationKind, CheckedExprId, CheckedExpression,
-    CheckedExpressionKind, CheckedImageHandoffV2, CheckedMatchPattern, CheckedParameterKind,
+    CheckedExpressionKind, CheckedImageHandoffV3, CheckedMatchPattern, CheckedParameterKind,
     CheckedParameterRequirement, CheckedPassedAccess, CheckedProgramFields, CheckedResourceBinding,
-    CheckedTextSegment, CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, Type,
-    is_renderable_type,
+    CheckedStateKind, CheckedTextSegment, CheckedValueUse, ContextFormalId, DeclId, FlowMode,
+    FlowType, Type, is_renderable_type,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1038,7 +1038,20 @@ pub(crate) fn erase_runtime_type_vars(ty: &Type) -> Type {
     }
 }
 
-fn refine_runtime_occurrence_type(existing: &Type, expected: &Type) -> Result<Type, String> {
+fn runtime_flush_boundary_flow_type(mut success: FlowType, flush_type: Type) -> FlowType {
+    success.ty = erase_runtime_type_vars(&boon_checked::canonical_union_type(vec![
+        success.ty, flush_type,
+    ]));
+    if success.mode == FlowMode::Absent {
+        success.mode = FlowMode::Continuous;
+    }
+    success
+}
+
+pub(crate) fn refine_runtime_occurrence_type(
+    existing: &Type,
+    expected: &Type,
+) -> Result<Type, String> {
     let existing = erase_runtime_type_vars(existing);
     let expected = erase_runtime_type_vars(expected);
     let existing_closed = boon_checked::type_is_recursively_closed(&existing);
@@ -1083,6 +1096,147 @@ fn refine_runtime_call_boundary_type(
         return Ok(existing.clone());
     }
     refine_runtime_occurrence_type(existing, instantiated_formal)
+}
+
+fn exact_expression_in_call_frame<'a>(
+    expressions: &'a [SemanticExpression],
+    origins: &[SemanticExpressionOrigin],
+    expression: SemanticExprId,
+    frame: OutCallInstanceId,
+) -> Result<Option<&'a SemanticExpression>, String> {
+    let definition = expressions
+        .get(expression.as_usize())
+        .filter(|candidate| candidate.id == expression)
+        .ok_or_else(|| {
+            format!("call-result refinement references missing expression {expression}")
+        })?;
+    let origin = origins
+        .get(expression.as_usize())
+        .filter(|origin| {
+            origin.expression == expression
+                && origin.checked_expression == definition.checked_expr_id
+        })
+        .ok_or_else(|| {
+            format!("call-result refinement expression {expression} has no exact checked origin")
+        })?;
+    Ok((origin.call_instance == Some(frame)).then_some(definition))
+}
+
+/// Pushes one closed, concrete user-call result back into state occurrences
+/// that structurally contribute to that same result.
+///
+/// Checked type variables are definition-local ordinals, so a frame-wide
+/// substitution by raw `TypeVar` would alias unrelated nested call schemes.
+/// This walk instead follows only exact, transparent result structure in the
+/// same call frame. Unsupported or ambiguous carriers are not authorities and
+/// therefore stop the walk without following their dependency edges.
+fn refine_call_result_state_occurrences(
+    expressions: &mut [SemanticExpression],
+    origins: &[SemanticExpressionOrigin],
+    hold_owners: &BTreeMap<CheckedExprId, DeclId>,
+    root: SemanticExprId,
+    frame: OutCallInstanceId,
+    callable: DeclId,
+    expected: &Type,
+) -> Result<(), String> {
+    if !boon_checked::type_is_recursively_closed(expected) {
+        return Ok(());
+    }
+
+    let mut pending = vec![(root, expected.clone())];
+    let mut structural_authorities = BTreeMap::<SemanticExprId, Type>::new();
+    let mut state_refinements = BTreeMap::<SemanticExprId, Type>::new();
+    while let Some((expression, expected)) = pending.pop() {
+        let Some(definition) =
+            exact_expression_in_call_frame(expressions, origins, expression, frame)?
+        else {
+            continue;
+        };
+        if let Some(previous) = structural_authorities.get(&expression) {
+            if previous == &expected {
+                continue;
+            }
+            return Err(format!(
+                "call frame {frame} expression {expression} is reached by incompatible result authorities {previous:?} and {expected:?}",
+            ));
+        }
+        structural_authorities.insert(expression, expected.clone());
+
+        if let Some(owner) = hold_owners.get(&definition.checked_expr_id).copied() {
+            if owner != callable {
+                return Err(format!(
+                    "call frame {frame} callable {} reached HOLD expression {expression} owned by callable {}",
+                    callable.0, owner.0,
+                ));
+            }
+            if !matches!(&definition.kind, SemanticExpressionKind::Hold { .. }) {
+                return Err(format!(
+                    "call frame {frame} HOLD expression {expression} checked {} has non-HOLD semantic kind {:?}",
+                    definition.checked_expr_id.0, definition.kind,
+                ));
+            }
+            refine_runtime_occurrence_type(&definition.flow_type.ty, &expected).map_err(
+                |error| {
+                    format!(
+                        "call frame {frame} cannot refine state expression {expression} checked {} from {:?} to {expected:?}: {error}",
+                        definition.checked_expr_id.0, definition.flow_type.ty,
+                    )
+                },
+            )?;
+            // The exact call-result field is the occurrence authority for the
+            // returned state. Compatibility above rejects a stale/disjoint
+            // checked state, but a narrower definition-local state must not
+            // override the concrete invocation's widened memory domain.
+            let refined = expected;
+            if !boon_checked::type_is_recursively_closed(&refined) {
+                return Err(format!(
+                    "call frame {frame} state expression {expression} refinement remained unresolved: {refined:?}",
+                ));
+            }
+            state_refinements.insert(expression, refined);
+            continue;
+        }
+
+        match (&definition.kind, expected) {
+            (SemanticExpressionKind::Object(fields), Type::Object(shape)) => {
+                if fields.len() != shape.fields.len() || fields.iter().any(|field| field.spread) {
+                    continue;
+                }
+                let mut names = BTreeSet::new();
+                let Some(fields) = fields
+                    .iter()
+                    .map(|field| {
+                        if !names.insert(field.name.as_str()) {
+                            return None;
+                        }
+                        shape
+                            .fields
+                            .get(&field.name)
+                            .cloned()
+                            .map(|expected| (field.value, expected))
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                pending.extend(fields);
+            }
+            (SemanticExpressionKind::Block { result, .. }, expected) => {
+                pending.push((*result, expected));
+            }
+            (SemanticExpressionKind::Draining { input }, expected) => {
+                pending.push((*input, expected));
+            }
+            (SemanticExpressionKind::Project { input, fields }, expected) if fields.is_empty() => {
+                pending.push((*input, expected))
+            }
+            _ => {}
+        }
+    }
+    for (expression, refined) in state_refinements {
+        expressions[expression.as_usize()].flow_type.ty = refined;
+    }
+    Ok(())
 }
 
 fn project_concrete_type(mut ty: Type, fields: &[String]) -> Option<Type> {
@@ -1580,7 +1734,7 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
 
 pub(crate) fn derive_semantic_execution_graph(
     program: &CheckedProgramFields,
-    checked_handoff: CheckedImageHandoffV2,
+    checked_handoff: CheckedImageHandoffV3,
     out_net: &OutNet,
     materializations: &[SemanticContextualMaterialization],
     mut arena: SemanticExpressionArena,
@@ -1751,6 +1905,18 @@ pub(crate) fn derive_semantic_execution_graph(
             | boon_checked::CheckedStatementKind::Spread
             | boon_checked::CheckedStatementKind::Expression => None,
         };
+        // Checked declaration alphas belong to definition/owner-local inference
+        // namespaces. Semantic expressions deliberately erase any alpha that
+        // survives occurrence contextualization because those raw ordinals
+        // have no runtime identity. Keep the named statement boundary in the
+        // same canonical runtime namespace as its value; exact SOURCE/event
+        // payloads remain owned independently by resource and view contracts.
+        let statement_flow_type = declaration
+            .and_then(|declaration| lookup.declaration(program, declaration))
+            .map(|declaration| FlowType {
+                mode: declaration.flow_type.mode,
+                ty: erase_runtime_type_vars(&declaration.flow_type.ty),
+            });
         let value = statement
             .value
             .map(|expression| {
@@ -1765,14 +1931,9 @@ pub(crate) fn derive_semantic_execution_graph(
                 )?;
                 let is_host_root = !semantic_statement_parents.contains_key(&semantic_statement);
                 if declaration.is_some() || is_host_root {
-                    let flow_type = declaration.and_then(|declaration| {
-                        lookup
-                            .declaration(program, declaration)
-                            .map(|declaration| declaration.flow_type.clone())
-                    });
                     let boundary_expression =
                         builder.flush_boundary_origin_for_value(expression, value);
-                    builder.wrap_flush_boundary(boundary_expression, value, None, flow_type)
+                    builder.wrap_flush_boundary(boundary_expression, value, None)
                 } else {
                     Ok(value)
                 }
@@ -1851,9 +2012,7 @@ pub(crate) fn derive_semantic_execution_graph(
             span: statement.span,
             checked_resources: statement.resources.clone(),
             declaration,
-            flow_type: declaration
-                .and_then(|declaration| lookup.declaration(program, declaration))
-                .map(|declaration| declaration.flow_type.clone()),
+            flow_type: statement_flow_type,
             kind,
             value,
             value_use: match statement.value_use {
@@ -4341,16 +4500,15 @@ impl<'a> LocalProvenanceResolver<'a> {
                         }
                         | SemanticExpressionKind::Drain {
                             target, projection, ..
-                        } => match self.projected_declaration_dependency(
-                            target,
-                            owner,
-                            &projection,
-                        ) {
-                            Some((value, consumed)) if value != id => {
-                                cached(value)?.projected(&projection[consumed..])
+                        } => {
+                            match self.projected_declaration_dependency(target, owner, &projection)
+                            {
+                                Some((value, consumed)) if value != id => {
+                                    cached(value)?.projected(&projection[consumed..])
+                                }
+                                _ => expression.provenance,
                             }
-                            _ => expression.provenance,
-                        },
+                        }
                         SemanticExpressionKind::Latest { branches } => {
                             let mut members = Vec::new();
                             for branch in branches {
@@ -4463,6 +4621,8 @@ pub(crate) struct SemanticExpressionBuilderIndexes {
     call_ids: BTreeMap<CheckedCallId, SemanticCallId>,
     producer_callable_ids: BTreeMap<crate::ProducerFunctionId, SemanticCallableId>,
     ordinary_callable_ids: BTreeSet<SemanticCallableId>,
+    hold_owners: BTreeMap<CheckedExprId, DeclId>,
+    callables_with_holds: BTreeSet<DeclId>,
 }
 
 fn ordinary_template_boundary_type(ty: &Type) -> bool {
@@ -4933,11 +5093,25 @@ impl SemanticExpressionBuilderIndexes {
             .copied()
             .filter_map(|callable| callable_ids.get(&callable).copied())
             .collect();
+        let lookup = CheckedProgramLookup::new(program);
+        let hold_owners: BTreeMap<CheckedExprId, DeclId> = program
+            .states
+            .iter()
+            .filter(|state| state.kind == CheckedStateKind::Hold)
+            .filter_map(|state| {
+                let expression = lookup.expression(program, state.expression)?;
+                enclosing_function_owner(program, &lookup, expression.scope_id)
+                    .map(|owner| (state.expression, owner))
+            })
+            .collect();
+        let callables_with_holds = hold_owners.values().copied().collect();
         Self {
             callable_ids,
             call_ids,
             producer_callable_ids,
             ordinary_callable_ids,
+            hold_owners,
+            callables_with_holds,
         }
     }
 }
@@ -5065,10 +5239,8 @@ impl<'a> SemanticExpressionBuilder<'a> {
             );
             self.current_ordinary_definition = previous_definition;
             let root = root?;
-            let flow_type = self.expressions[root.as_usize()].flow_type.clone();
             let boundary_expression = self.flush_boundary_origin_for_value(checked_root, root);
-            let root =
-                self.wrap_flush_boundary(boundary_expression, root, None, Some(flow_type))?;
+            let root = self.wrap_flush_boundary(boundary_expression, root, None)?;
             self.ordinary_definition_roots
                 .insert(semantic_callable, root);
         }
@@ -6095,14 +6267,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                         })?;
                         let boundary_expression =
                             self.flush_boundary_origin_for_value(binding.value, value);
-                        let value = self.wrap_flush_boundary(
-                            boundary_expression,
-                            value,
-                            owner,
-                            self.lookup
-                                .declaration(self.program, binding.declaration)
-                                .map(|declaration| declaration.flow_type.clone()),
-                        )?;
+                        let value = self.wrap_flush_boundary(boundary_expression, value, owner)?;
                         Ok(SemanticBlockBinding {
                             id: binding_ids[&binding.declaration],
                             declaration: binding.declaration,
@@ -6119,12 +6284,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 })?;
                 let boundary_expression =
                     self.flush_boundary_origin_for_value(result_expression, result);
-                let result = self.wrap_flush_boundary(
-                    boundary_expression,
-                    result,
-                    owner,
-                    Some(expression.flow_type.clone()),
-                )?;
+                let result = self.wrap_flush_boundary(boundary_expression, result, owner)?;
                 SemanticExpressionKind::Block { bindings, result }
             }
             CheckedExpressionKind::Object { fields } => SemanticExpressionKind::Object(
@@ -6330,15 +6490,32 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 mode: concrete_result.mode,
                 ty: refined_result_type,
             };
-            let concrete_result = self.expressions[result.as_usize()].flow_type.clone();
+            let frame_callable = self.out_net.call_instances[instance.as_usize()]
+                .provenance
+                .callable;
+            if frame_callable != callable.decl_id {
+                return Err(ExpansionError::InvalidLocalBindings(format!(
+                    "user call {instance} expands callable {} through a frame owned by callable {}",
+                    callable.decl_id.0, frame_callable.0,
+                )));
+            }
+            if self.indexes.callables_with_holds.contains(&frame_callable) {
+                let occurrence_result_type =
+                    self.expressions[result.as_usize()].flow_type.ty.clone();
+                refine_call_result_state_occurrences(
+                    &mut self.expressions,
+                    &self.checked_expression_origins,
+                    &self.indexes.hold_owners,
+                    result,
+                    instance,
+                    frame_callable,
+                    &occurrence_result_type,
+                )
+                .map_err(ExpansionError::InvalidLocalBindings)?;
+            }
             let boundary_expression =
                 self.flush_boundary_origin_for_value(result_expression, result);
-            return self.wrap_flush_boundary(
-                boundary_expression,
-                result,
-                call_owner,
-                Some(concrete_result),
-            );
+            return self.wrap_flush_boundary(boundary_expression, result, call_owner);
         }
         if !retained_user_call
             && !matches!(checked_call.context_binding, CheckedContextBinding::None)
@@ -6620,12 +6797,9 @@ impl<'a> SemanticExpressionBuilder<'a> {
             let checked_root = callable
                 .result_expression
                 .ok_or(ExpansionError::MissingFunctionResult(callable.decl_id))?;
-            let flow_type = self.expressions[call_expression.as_usize()]
-                .flow_type
-                .clone();
             let boundary_expression =
                 self.flush_boundary_origin_for_value(checked_root, call_expression);
-            self.wrap_flush_boundary(boundary_expression, call_expression, owner, Some(flow_type))
+            self.wrap_flush_boundary(boundary_expression, call_expression, owner)
         } else {
             Ok(call_expression)
         }
@@ -6748,11 +6922,6 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     boundary_expression,
                     value,
                     self.owner_stack.last().copied().flatten(),
-                    field.declaration.and_then(|declaration| {
-                        self.lookup
-                            .declaration(self.program, declaration)
-                            .map(|declaration| declaration.flow_type.clone())
-                    }),
                 )?;
                 Ok(SemanticRecordField {
                     declaration: field.declaration,
@@ -6809,7 +6978,6 @@ impl<'a> SemanticExpressionBuilder<'a> {
         checked_expression: CheckedExprId,
         input: SemanticExprId,
         owner: Option<StaticOwnerId>,
-        flow_type: Option<FlowType>,
     ) -> Result<SemanticExprId, ExpansionError> {
         let origin = self
             .lookup
@@ -6819,11 +6987,18 @@ impl<'a> SemanticExpressionBuilder<'a> {
         let Some(flush_type) = origin.flush_type.clone() else {
             return Ok(input);
         };
-        let mut flow_type = flow_type.unwrap_or_else(|| origin.flow_type.clone());
-        flow_type.ty = boon_checked::canonical_union_type(vec![flow_type.ty, flush_type]);
-        if flow_type.mode == boon_checked::FlowMode::Absent {
-            flow_type.mode = boon_checked::FlowMode::Continuous;
-        }
+        let mut flow_type = self
+            .expressions
+            .get(input.as_usize())
+            .filter(|expression| expression.id == input)
+            .map(|expression| expression.flow_type.clone())
+            .ok_or_else(|| {
+                ExpansionError::InvalidLocalBindings(format!(
+                    "FLUSH boundary for checked expression {} references missing semantic input {input}",
+                    checked_expression.0,
+                ))
+            })?;
+        flow_type = runtime_flush_boundary_flow_type(flow_type, flush_type);
         let boundary = self.push(
             &origin,
             owner,
@@ -7643,6 +7818,57 @@ mod tests {
         .clone()
     }
 
+    fn semantic_execution_before_resources(
+        source: &str,
+    ) -> (CheckedProgramFields, SemanticExecutionImageColumnsV1) {
+        let parsed = boon_parser::parse_source("semantic-contextual-expansion.bn", source).unwrap();
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            !checked.report.has_errors(),
+            "diagnostics: {:#?}",
+            checked.report.diagnostics
+        );
+        let (program, checked_handoff) = checked
+            .program
+            .expect("valid fixture has a checked program")
+            .into_parts();
+        crate::validate_contextual_bindings(&program)
+            .expect("valid fixture has exact contextual bindings");
+        let producer_roots =
+            crate::resolve_producer_roots(&program, &[]).expect("fixture has no producer errors");
+        let retained = ordinary_callable_declarations(&program);
+        let out = crate::out_net::OutNet::<crate::OutPortContractV1>::
+            try_build_with_retained_definitions(
+                &program,
+                producer_roots,
+                &retained,
+                |call, _, entry| crate::provisional_out_port_contract(&program, call, entry),
+                |kind, _, _, _, _| kind == CheckedCallableKind::Builtin,
+            )
+            .expect("valid fixture has an OUT graph");
+        assert!(!out.has_errors(), "OUT diagnostics: {:#?}", out.diagnostics);
+        let mut out = out.graph;
+        crate::resolve_out_contracts(&program, &mut out)
+            .expect("valid fixture resolves OUT contracts");
+        crate::validate_out_contracts(&program, &out)
+            .expect("valid fixture validates OUT contracts");
+        let (materializations, arena, indexes, required) =
+            derive_contextual_materializations(&program, &out, &retained, true)
+                .expect("valid fixture derives contextual materializations");
+        let builder = derive_semantic_execution_graph(
+            &program,
+            checked_handoff,
+            &out,
+            &materializations,
+            arena,
+            &indexes,
+            &required,
+            true,
+        )
+        .expect("valid fixture derives the pending execution graph");
+        (program, builder.execution().clone())
+    }
+
     fn body_shape(
         graph: &SemanticExecutionImageColumnsV1,
         expression: SemanticExprId,
@@ -7839,6 +8065,366 @@ mod tests {
     }
 
     #[test]
+    fn closed_call_result_refines_only_its_exact_structural_state_occurrence() {
+        let frame = OutCallInstanceId(7);
+        let callable = DeclId(41);
+        let formatter = Type::VariantSet(
+            vec![
+                boon_checked::Variant::Tag("Binary".to_owned()),
+                boon_checked::Variant::Tag("Hexadecimal".to_owned()),
+            ]
+            .into(),
+        );
+        let expected = Type::object(boon_checked::ObjectShape::from_ordered_fields(
+            [("formatter".to_owned(), formatter.clone())],
+            false,
+        ));
+        let mut expressions = vec![
+            provenance_test_expression(
+                0,
+                SemanticExpressionKind::Tag("Binary".to_owned()),
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                1,
+                SemanticExpressionKind::Hold {
+                    initial: SemanticExprId(0),
+                    name: "formatter".to_owned(),
+                    binding_path: "formatter".to_owned(),
+                    updates: Vec::new(),
+                },
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                2,
+                SemanticExpressionKind::Object(vec![SemanticRecordField {
+                    declaration: None,
+                    name: "formatter".to_owned(),
+                    value: SemanticExprId(1),
+                    spread: false,
+                }]),
+                runtime_value_provenance(),
+            ),
+        ];
+        expressions[1].flow_type.ty =
+            Type::VariantSet(vec![boon_checked::Variant::Tag("Binary".to_owned())].into());
+        expressions[2].flow_type.ty = expected.clone();
+        let origins = expressions
+            .iter()
+            .map(|expression| SemanticExpressionOrigin {
+                expression: expression.id,
+                checked_expression: expression.checked_expr_id,
+                checked_scope: boon_checked::LexicalScopeId(0),
+                checked_span: boon_checked::CheckedSpan::default(),
+                owning_statement: None,
+                call_instance: Some(frame),
+            })
+            .collect::<Vec<_>>();
+
+        refine_call_result_state_occurrences(
+            &mut expressions,
+            &origins,
+            &BTreeMap::from([(CheckedExprId(1), callable)]),
+            SemanticExprId(2),
+            frame,
+            callable,
+            &expected,
+        )
+        .expect("closed result field must refine its exact HOLD occurrence");
+
+        assert_eq!(expressions[1].flow_type.ty, formatter);
+        assert_eq!(
+            expressions[0].flow_type.ty,
+            Type::Text,
+            "the state initializer is not a result-field authority"
+        );
+    }
+
+    #[test]
+    fn closed_call_result_does_not_treat_a_spread_as_state_authority() {
+        let frame = OutCallInstanceId(9);
+        let callable = DeclId(43);
+        let mut expressions = vec![
+            provenance_test_expression(
+                0,
+                SemanticExpressionKind::Tag("Binary".to_owned()),
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                1,
+                SemanticExpressionKind::Hold {
+                    initial: SemanticExprId(0),
+                    name: "formatter".to_owned(),
+                    binding_path: "formatter".to_owned(),
+                    updates: Vec::new(),
+                },
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                2,
+                SemanticExpressionKind::Object(vec![SemanticRecordField {
+                    declaration: None,
+                    name: String::new(),
+                    value: SemanticExprId(1),
+                    spread: true,
+                }]),
+                runtime_value_provenance(),
+            ),
+        ];
+        expressions[1].flow_type.ty = Type::Unknown;
+        let expected = Type::object(boon_checked::ObjectShape::from_ordered_fields(
+            [("formatter".to_owned(), Type::Text)],
+            false,
+        ));
+        let origins = expressions
+            .iter()
+            .map(|expression| SemanticExpressionOrigin {
+                expression: expression.id,
+                checked_expression: expression.checked_expr_id,
+                checked_scope: boon_checked::LexicalScopeId(0),
+                checked_span: boon_checked::CheckedSpan::default(),
+                owning_statement: None,
+                call_instance: Some(frame),
+            })
+            .collect::<Vec<_>>();
+
+        refine_call_result_state_occurrences(
+            &mut expressions,
+            &origins,
+            &BTreeMap::from([(CheckedExprId(1), callable)]),
+            SemanticExprId(2),
+            frame,
+            callable,
+            &expected,
+        )
+        .expect("a spread is not an exact structural authority");
+        assert_eq!(
+            expressions[1].flow_type.ty,
+            Type::Unknown,
+            "the HOLD beneath a spread must remain unchanged",
+        );
+    }
+
+    #[test]
+    fn closed_call_result_ignores_block_dependency_edges() {
+        let frame = OutCallInstanceId(10);
+        let callable = DeclId(44);
+        let mut expressions = vec![
+            provenance_test_expression(
+                0,
+                SemanticExpressionKind::Tag("Binary".to_owned()),
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                1,
+                SemanticExpressionKind::Hold {
+                    initial: SemanticExprId(0),
+                    name: "formatter".to_owned(),
+                    binding_path: "formatter".to_owned(),
+                    updates: Vec::new(),
+                },
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                2,
+                SemanticExpressionKind::Text("visible".to_owned()),
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                3,
+                SemanticExpressionKind::Block {
+                    bindings: vec![SemanticBlockBinding {
+                        id: SemanticLocalBindingId(0),
+                        declaration: DeclId(45),
+                        value: SemanticExprId(1),
+                    }],
+                    result: SemanticExprId(2),
+                },
+                runtime_value_provenance(),
+            ),
+        ];
+        expressions[1].flow_type.ty = Type::Unknown;
+        expressions[3].flow_type.ty = Type::Text;
+        let origins = expressions
+            .iter()
+            .map(|expression| SemanticExpressionOrigin {
+                expression: expression.id,
+                checked_expression: expression.checked_expr_id,
+                checked_scope: boon_checked::LexicalScopeId(0),
+                checked_span: boon_checked::CheckedSpan::default(),
+                owning_statement: None,
+                call_instance: Some(frame),
+            })
+            .collect::<Vec<_>>();
+
+        refine_call_result_state_occurrences(
+            &mut expressions,
+            &origins,
+            &BTreeMap::from([(CheckedExprId(1), callable)]),
+            SemanticExprId(3),
+            frame,
+            callable,
+            &Type::Text,
+        )
+        .expect("block result authority must not follow binding dependencies");
+
+        assert_eq!(expressions[1].flow_type.ty, Type::Unknown);
+    }
+
+    #[test]
+    fn closed_call_result_deduplicates_identical_shared_state_authority() {
+        let frame = OutCallInstanceId(11);
+        let callable = DeclId(46);
+        let mut expressions = vec![
+            provenance_test_expression(
+                0,
+                SemanticExpressionKind::Tag("Binary".to_owned()),
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                1,
+                SemanticExpressionKind::Hold {
+                    initial: SemanticExprId(0),
+                    name: "formatter".to_owned(),
+                    binding_path: "formatter".to_owned(),
+                    updates: Vec::new(),
+                },
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                2,
+                SemanticExpressionKind::Object(vec![
+                    SemanticRecordField {
+                        declaration: None,
+                        name: "primary".to_owned(),
+                        value: SemanticExprId(1),
+                        spread: false,
+                    },
+                    SemanticRecordField {
+                        declaration: None,
+                        name: "secondary".to_owned(),
+                        value: SemanticExprId(1),
+                        spread: false,
+                    },
+                ]),
+                runtime_value_provenance(),
+            ),
+        ];
+        expressions[1].flow_type.ty = Type::Unknown;
+        let expected = Type::object(boon_checked::ObjectShape::from_ordered_fields(
+            [
+                ("primary".to_owned(), Type::Text),
+                ("secondary".to_owned(), Type::Text),
+            ],
+            false,
+        ));
+        expressions[2].flow_type.ty = expected.clone();
+        let origins = expressions
+            .iter()
+            .map(|expression| SemanticExpressionOrigin {
+                expression: expression.id,
+                checked_expression: expression.checked_expr_id,
+                checked_scope: boon_checked::LexicalScopeId(0),
+                checked_span: boon_checked::CheckedSpan::default(),
+                owning_statement: None,
+                call_instance: Some(frame),
+            })
+            .collect::<Vec<_>>();
+
+        refine_call_result_state_occurrences(
+            &mut expressions,
+            &origins,
+            &BTreeMap::from([(CheckedExprId(1), callable)]),
+            SemanticExprId(2),
+            frame,
+            callable,
+            &expected,
+        )
+        .expect("identical authorities for a shared HOLD must deduplicate");
+
+        assert_eq!(expressions[1].flow_type.ty, Type::Text);
+    }
+
+    #[test]
+    fn closed_call_result_refinement_is_atomic_on_incompatible_authority() {
+        let frame = OutCallInstanceId(12);
+        let callable = DeclId(47);
+        let mut expressions = vec![
+            provenance_test_expression(
+                0,
+                SemanticExpressionKind::Tag("Binary".to_owned()),
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                1,
+                SemanticExpressionKind::Hold {
+                    initial: SemanticExprId(0),
+                    name: "first".to_owned(),
+                    binding_path: "first".to_owned(),
+                    updates: Vec::new(),
+                },
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                2,
+                SemanticExpressionKind::Object(vec![
+                    SemanticRecordField {
+                        declaration: None,
+                        name: "first".to_owned(),
+                        value: SemanticExprId(1),
+                        spread: false,
+                    },
+                    SemanticRecordField {
+                        declaration: None,
+                        name: "second".to_owned(),
+                        value: SemanticExprId(1),
+                        spread: false,
+                    },
+                ]),
+                runtime_value_provenance(),
+            ),
+        ];
+        expressions[1].flow_type.ty = Type::Unknown;
+        let expected = Type::object(boon_checked::ObjectShape::from_ordered_fields(
+            [
+                ("first".to_owned(), Type::Text),
+                ("second".to_owned(), Type::Number),
+            ],
+            false,
+        ));
+        expressions[2].flow_type.ty = expected.clone();
+        let origins = expressions
+            .iter()
+            .map(|expression| SemanticExpressionOrigin {
+                expression: expression.id,
+                checked_expression: expression.checked_expr_id,
+                checked_scope: boon_checked::LexicalScopeId(0),
+                checked_span: boon_checked::CheckedSpan::default(),
+                owning_statement: None,
+                call_instance: Some(frame),
+            })
+            .collect::<Vec<_>>();
+
+        let error = refine_call_result_state_occurrences(
+            &mut expressions,
+            &origins,
+            &BTreeMap::from([(CheckedExprId(1), callable)]),
+            SemanticExprId(2),
+            frame,
+            callable,
+            &expected,
+        )
+        .expect_err("one shared HOLD cannot have incompatible result authorities");
+
+        assert!(error.contains("incompatible result authorities"), "{error}");
+        assert_eq!(
+            expressions[1].flow_type.ty,
+            Type::Unknown,
+            "the first collected authority must not commit before full validation",
+        );
+    }
+
+    #[test]
     fn retained_context_template_includes_missing_child_owned_passed_paths() {
         let parsed = boon_parser::parse_source(
             "semantic-retained-context-child.bn",
@@ -7921,6 +8507,122 @@ mod tests {
             )
             .is_some(),
             "the retained template must recover exact child-owned PASSED demand paths",
+        );
+    }
+
+    #[test]
+    fn named_statement_erases_child_owned_passed_alphas_like_its_semantic_value() {
+        let (checked, graph) = semantic_execution_before_resources(
+            r#"
+store: [
+    elements: [
+        focus_probe: SOURCE
+        text_input: SOURCE
+    ]
+]
+
+panel: view(PASS: [store: store])
+
+FUNCTION view() {
+    [
+        event: [
+            click: PASSED.store.elements.focus_probe
+            change: PASSED.store.elements.text_input
+        ]
+    ]
+}
+"#,
+        );
+        let statement = graph
+            .statements
+            .iter()
+            .find(|statement| {
+                matches!(
+                    &statement.kind,
+                    SemanticStatementKind::Field { name, .. } if name == "panel"
+                )
+            })
+            .expect("top-level panel statement");
+        let declaration = statement.declaration.expect("panel declaration");
+        let checked_declaration = checked
+            .declarations
+            .iter()
+            .find(|candidate| candidate.id == declaration)
+            .expect("checked panel declaration");
+        let canonical_checked_flow = FlowType {
+            mode: checked_declaration.flow_type.mode,
+            ty: erase_runtime_type_vars(&checked_declaration.flow_type.ty),
+        };
+        let Type::Object(checked_panel) = &checked_declaration.flow_type.ty else {
+            panic!(
+                "checked panel declaration is not an object: {:?}",
+                checked_declaration.flow_type,
+            );
+        };
+        let Some(Type::Object(checked_event)) = checked_panel.fields.get("event") else {
+            panic!(
+                "checked panel declaration has no event object: {:?}",
+                checked_declaration.flow_type,
+            );
+        };
+        assert!(matches!(
+            checked_event.fields.get("click"),
+            Some(Type::Var(_))
+        ));
+        assert!(matches!(
+            checked_event.fields.get("change"),
+            Some(Type::Var(_))
+        ));
+        assert_ne!(
+            checked_declaration.flow_type, canonical_checked_flow,
+            "the regression requires a definition-local alpha at the checked statement boundary",
+        );
+        let value = statement.value.expect("panel statement expression");
+        let statement_flow = statement.flow_type.as_ref().expect("panel statement flow");
+        let value_flow = &graph.expressions[value.as_usize()].flow_type;
+        assert_eq!(statement_flow, &canonical_checked_flow);
+        assert_eq!(statement_flow, value_flow);
+
+        let Type::Object(panel) = &statement_flow.ty else {
+            panic!("panel statement is not an object: {statement_flow:?}");
+        };
+        let Some(Type::Object(event)) = panel.fields.get("event") else {
+            panic!("panel statement has no event object: {statement_flow:?}");
+        };
+        assert_eq!(event.fields.get("click"), Some(&Type::Unknown));
+        assert_eq!(event.fields.get("change"), Some(&Type::Unknown));
+    }
+
+    #[test]
+    fn flush_boundary_flow_uses_runtime_success_authority_and_erases_checked_alphas() {
+        let rejected =
+            Type::VariantSet(vec![boon_checked::Variant::Tag("Rejected".to_owned())].into());
+        let concrete = runtime_flush_boundary_flow_type(
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Number,
+            },
+            rejected.clone(),
+        );
+        assert_eq!(
+            concrete,
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: boon_checked::canonical_union_type(vec![Type::Number, rejected.clone()]),
+            },
+            "a concrete semantic occurrence remains the successful-value authority",
+        );
+        let generic = runtime_flush_boundary_flow_type(
+            FlowType {
+                mode: FlowMode::Absent,
+                ty: Type::Var(boon_checked::TypeVar(71)),
+            },
+            rejected.clone(),
+        );
+        assert_eq!(generic.mode, FlowMode::Continuous);
+        assert_eq!(
+            generic.ty,
+            boon_checked::canonical_union_type(vec![Type::Unknown, rejected]),
         );
     }
 

@@ -4,6 +4,7 @@
 //! identities and records every storage/resource choice needed by verification.
 //! Executable lowering may map these identities, but must not rediscover them.
 
+use crate::contextual_expansion::{erase_runtime_type_vars, refine_runtime_occurrence_type};
 use crate::dependency_manifest::{
     ConstructionDependencyDomainV1, ConstructionDependencyOwnerV1,
     ConstructionDependencyRowBuilderV1, ConstructionDependencyRowsV1, PendingDependencyReference,
@@ -32,14 +33,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-pub const SEMANTIC_RESOURCE_GRAPH_SCHEMA_V1: &str = "boon.semantic-resource-graph.v1";
-const SEMANTIC_RESOURCE_GRAPH_DIGEST_DOMAIN: &[u8] = b"boon.semantic-resource-graph.v1\0";
+pub const SEMANTIC_RESOURCE_GRAPH_SCHEMA_V2: &str = "boon.semantic-resource-graph.v2";
+const SEMANTIC_RESOURCE_GRAPH_DIGEST_DOMAIN_V2: &[u8] = b"boon.semantic-resource-graph.v2\0";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct SemanticResourceGraphDigestV1([u8; 32]);
+pub struct SemanticResourceGraphDigestV2([u8; 32]);
 
-impl SemanticResourceGraphDigestV1 {
+impl SemanticResourceGraphDigestV2 {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -49,21 +50,21 @@ impl SemanticResourceGraphDigestV1 {
     }
 }
 
-impl fmt::Display for SemanticResourceGraphDigestV1 {
+impl fmt::Display for SemanticResourceGraphDigestV2 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.to_hex())
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticResourceGraphV1 {
+pub struct SemanticResourceGraphV2 {
     pub schema: String,
     pub row_scopes: Vec<SemanticRowScopeV1>,
     pub lists: Vec<SemanticListResourceV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub value_list_authorities: Vec<SemanticValueListAuthorityV1>,
     pub sources: Vec<SemanticSourceResourceV1>,
-    pub states: Vec<SemanticStateResourceV1>,
+    pub states: Vec<SemanticStateResourceV2>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub aliases: Vec<SemanticResourceAliasV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -72,7 +73,7 @@ pub struct SemanticResourceGraphV1 {
     pub list_projections: Vec<SemanticListProjectionV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub producer_resources: Vec<SemanticProducerResourceV1>,
-    pub digest: SemanticResourceGraphDigestV1,
+    pub digest: SemanticResourceGraphDigestV2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -274,7 +275,7 @@ pub struct SemanticPayloadFieldV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticStateResourceV1 {
+pub struct SemanticStateResourceV2 {
     pub id: SemanticStateId,
     pub checked_state: CheckedStateId,
     /// Canonical storage anchor from the checked state path. Function-local
@@ -392,7 +393,24 @@ pub struct SemanticProducerResourceV1 {
     pub invocation_source: Option<SemanticSourceId>,
 }
 
-impl SemanticResourceGraphV1 {
+impl SemanticResourceGraphV2 {
+    #[cfg(test)]
+    pub(crate) fn empty_for_tests() -> Self {
+        Self {
+            schema: SEMANTIC_RESOURCE_GRAPH_SCHEMA_V2.to_owned(),
+            row_scopes: Vec::new(),
+            lists: Vec::new(),
+            value_list_authorities: Vec::new(),
+            sources: Vec::new(),
+            states: Vec::new(),
+            aliases: Vec::new(),
+            materialization_bindings: Vec::new(),
+            list_projections: Vec::new(),
+            producer_resources: Vec::new(),
+            digest: SemanticResourceGraphDigestV2([0; 32]),
+        }
+    }
+
     pub fn materialization_binding(
         &self,
         id: SemanticMaterializationId,
@@ -407,7 +425,7 @@ impl SemanticResourceGraphV1 {
         execution: &SemanticExecutionImageColumnsV1,
         out_net: &ResolvedOutGraph,
     ) -> Result<(), String> {
-        if self.schema != SEMANTIC_RESOURCE_GRAPH_SCHEMA_V1 {
+        if self.schema != SEMANTIC_RESOURCE_GRAPH_SCHEMA_V2 {
             return Err(format!(
                 "unsupported semantic resource graph schema `{}`",
                 self.schema
@@ -435,7 +453,7 @@ pub(crate) struct PreparedSemanticResourceInputs {
 }
 
 pub(crate) struct SemanticResourceGraphBuildV2 {
-    pub(crate) graph: SemanticResourceGraphV1,
+    pub(crate) graph: SemanticResourceGraphV2,
     pub(crate) dependency_rows: ConstructionDependencyRowsV1,
 }
 
@@ -520,8 +538,8 @@ pub(crate) fn build_semantic_resource_graph(
         "build_producer_resources",
         build_producer_resources(out_net, execution)
     )?;
-    let mut graph = SemanticResourceGraphV1 {
-        schema: SEMANTIC_RESOURCE_GRAPH_SCHEMA_V1.to_owned(),
+    let mut graph = SemanticResourceGraphV2 {
+        schema: SEMANTIC_RESOURCE_GRAPH_SCHEMA_V2.to_owned(),
         row_scopes,
         lists,
         value_list_authorities,
@@ -531,7 +549,7 @@ pub(crate) fn build_semantic_resource_graph(
         materialization_bindings,
         list_projections,
         producer_resources,
-        digest: SemanticResourceGraphDigestV1([0; 32]),
+        digest: SemanticResourceGraphDigestV2([0; 32]),
     };
     graph.digest = resource_phase!("resource_graph_digest", resource_graph_digest(&graph))?;
     resource_phase!("validate", graph.validate(execution, out_net))?;
@@ -722,6 +740,7 @@ fn typed_list_targets(
     targets.sort_by_key(|target| target.statement);
     let mut classified = BTreeSet::new();
     for checked_list in &checked.lists {
+        let runtime_checked_item_type = erase_runtime_type_vars(&checked_list.item_type);
         let path = checked.semantic_path(&checked_list.path).ok_or_else(|| {
             format!(
                 "checked list {} declaration {} has no canonical semantic path from anchor {} projection {:?}",
@@ -744,9 +763,13 @@ fn typed_list_targets(
             }
         }
         if matches.is_empty() {
-            for target in
-                synthesize_inline_checked_list_targets(checked, execution, checked_list, &path)?
-            {
+            for target in synthesize_inline_checked_list_targets(
+                checked,
+                execution,
+                checked_list,
+                &path,
+                &runtime_checked_item_type,
+            )? {
                 matches.push(targets.len());
                 targets.push(target);
             }
@@ -849,16 +872,16 @@ fn typed_list_targets(
             let authority = inline_list_authority(execution, target.producer)?;
             let mapped_item_authority = authority.is_some_and(|authority| authority.maps_items);
             if !authority.is_some_and(|authority| {
-                authority.accepts_item_type(&checked_list.item_type, &target.item_type)
-            })
-                || target.capacity != checked_list.capacity
+                authority.accepts_item_type(&runtime_checked_item_type, &target.item_type)
+            }) || target.capacity != checked_list.capacity
                 || target.alias.is_some()
             {
                 return Err(format!(
-                    "checked list {} differs from semantic list target {}: item type {:?} vs {:?}, mapped item authority {}, capacity {:?} vs {:?}, alias {:?}",
+                    "checked list {} differs from semantic list target {}: checked item type {:?}, runtime item type {:?} vs target {:?}, mapped item authority {}, capacity {:?} vs {:?}, alias {:?}",
                     checked_list.id.0,
                     target.statement,
                     checked_list.item_type,
+                    runtime_checked_item_type,
                     target.item_type,
                     mapped_item_authority,
                     checked_list.capacity,
@@ -1030,6 +1053,7 @@ fn synthesize_inline_checked_list_targets(
     execution: &mut SemanticExecutionImageColumnsV1,
     checked_list: &boon_checked::CheckedList,
     path: &str,
+    runtime_checked_item_type: &Type,
 ) -> Result<Vec<ListTarget>, String> {
     let binding = CheckedResourceBinding::ListAuthority {
         list: checked_list.id,
@@ -1190,6 +1214,21 @@ fn synthesize_inline_checked_list_targets(
     let mut targets = Vec::with_capacity(selected.len());
     for candidate in selected {
         let definition = expression(execution, candidate.expression)?.clone();
+        let Type::List(definition_item_type) = &definition.flow_type.ty else {
+            return Err(format!(
+                "checked inline list {} semantic authority is not list-typed",
+                checked_list.id.0
+            ));
+        };
+        let runtime_item_type =
+            runtime_inline_list_item_type(definition_item_type, runtime_checked_item_type).map_err(
+                |error| {
+            format!(
+                "checked inline list {} runtime item authority {:?} cannot refine semantic occurrence {:?}: {error}",
+                checked_list.id.0, runtime_checked_item_type, definition_item_type,
+            )
+                },
+            )?;
         let origin = execution
             .checked_expression_origins
             .get(candidate.expression.as_usize())
@@ -1231,7 +1270,7 @@ fn synthesize_inline_checked_list_targets(
             let mut concrete = definition.clone();
             concrete.id = producer;
             concrete.value_id = SemanticValueId(producer.as_usize());
-            concrete.flow_type.ty = Type::List(Type::shared(checked_list.item_type.clone()));
+            concrete.flow_type.ty = Type::List(Type::shared(runtime_item_type.clone()));
             let concrete_flow_type = concrete.flow_type.clone();
             execution.expressions.push(concrete);
             let mut concrete_origin = origin.clone();
@@ -1287,17 +1326,12 @@ fn synthesize_inline_checked_list_targets(
             }
             (producer, statement)
         };
-        let Type::List(_) = &definition.flow_type.ty else {
-            return Err(format!(
-                "checked inline list {} semantic authority is not list-typed",
-                checked_list.id.0
-            ));
-        };
         // The literal's local type can intentionally be open (most notably for
         // an empty fallback arm). The checked list owns the contextual item
-        // type inferred from the complete declaration, so that is the exact
-        // authority type that must survive into semantic storage.
-        let mut item_fields = ordered_object_fields(&checked_list.item_type);
+        // schema inferred from the complete declaration, while runtime
+        // semantic rows must not retain definition-local type-variable
+        // ordinals. Preserve that checked authority in runtime-canonical form.
+        let mut item_fields = ordered_object_fields(&runtime_item_type);
         for field in expression_record_field_names(execution, producer)? {
             if !item_fields.contains(&field) {
                 item_fields.push(field);
@@ -1310,7 +1344,7 @@ fn synthesize_inline_checked_list_targets(
             path: path.to_owned(),
             local_name: local_name.clone(),
             capacity: checked_list.capacity,
-            item_type: checked_list.item_type.clone(),
+            item_type: runtime_item_type,
             item_fields,
             span: checked_list.span.into(),
             alias: None,
@@ -2210,8 +2244,14 @@ struct InlineListAuthority {
 
 impl InlineListAuthority {
     fn accepts_item_type(self, checked: &Type, target: &Type) -> bool {
-        checked == target || self.maps_items
+        self.maps_items
+            || runtime_inline_list_item_type(target, checked)
+                .is_ok_and(|refined| refined == *target)
     }
+}
+
+fn runtime_inline_list_item_type(definition: &Type, checked: &Type) -> Result<Type, String> {
+    refine_runtime_occurrence_type(definition, checked)
 }
 
 fn inline_list_authority(
@@ -2243,9 +2283,7 @@ fn inline_list_authority(
             }
             SemanticExpressionKind::Call {
                 name, arguments, ..
-            }
-                if matches!(value.flow_type.ty, Type::List(_)) =>
-            {
+            } if matches!(value.flow_type.ty, Type::List(_)) => {
                 maps_items |= name == "List/map";
                 let mut inputs = Vec::new();
                 for argument in arguments {
@@ -3572,7 +3610,7 @@ fn bind_list_lineage(
 }
 
 fn validate_list_lineage(
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
     let mut expected = graph.lists.clone();
@@ -4214,7 +4252,7 @@ fn build_state_resources(
     lists: &[SemanticListResourceV1],
     materialization_bindings: &[SemanticMaterializationResourceBindingV1],
     aliases: &mut Vec<SemanticResourceAliasV1>,
-) -> Result<Vec<SemanticStateResourceV1>, String> {
+) -> Result<Vec<SemanticStateResourceV2>, String> {
     let mut resources = Vec::with_capacity(execution.states.len());
     let mut published = BTreeSet::new();
     for state in &execution.states {
@@ -4245,12 +4283,7 @@ fn build_state_resources(
             )
         })?;
         let value = expression(execution, state.expression)?;
-        let binding_declaration = checked
-            .expressions
-            .get(checked_state.expression.0 as usize)
-            .filter(|candidate| candidate.id == checked_state.expression)
-            .and_then(|expression| expression.declaration)
-            .unwrap_or(state.declaration);
+        let binding_declaration = checked_state.binding_declaration;
         checked
             .declarations
             .iter()
@@ -4325,7 +4358,7 @@ fn build_state_resources(
             .clone()
             .unwrap_or_else(|| format!("$state.s{}", state.id.as_usize()));
         let hold_name = semantic_state_hold_name(execution, state, statement, is_published)?;
-        resources.push(SemanticStateResourceV1 {
+        resources.push(SemanticStateResourceV2 {
             id: state.id,
             checked_state: state.checked_state,
             declaration: state.declaration,
@@ -4804,7 +4837,7 @@ pub(super) fn semantic_list_id(
 }
 
 fn validate_dense_resource_ids(
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
     if graph.row_scopes.len() != graph.lists.len() {
@@ -5162,7 +5195,7 @@ fn validate_dense_resource_ids(
 pub(crate) fn validate_checked_list_classification(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
 ) -> Result<(), String> {
     let mut snapshot = execution.clone();
     let prepared = prepare_semantic_resource_inputs(checked, &mut snapshot)?;
@@ -5184,7 +5217,7 @@ pub(crate) fn validate_checked_list_classification(
 pub(crate) fn validate_checked_resource_provenance(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
 ) -> Result<(), String> {
     let mut expected_aliases = Vec::new();
     let expected_sources = build_source_resources(
@@ -5224,7 +5257,7 @@ pub(crate) fn validate_checked_resource_provenance(
 }
 
 fn validate_materialization_bindings(
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
     verify_semantic_materialization_lineage(&graph.materialization_bindings)?;
@@ -5281,7 +5314,7 @@ fn validate_materialization_bindings(
 }
 
 fn validate_row_binding(
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
     row: SemanticRowBinding,
     context: &str,
 ) -> Result<(), String> {
@@ -5306,7 +5339,7 @@ fn validate_row_binding(
 }
 
 fn validate_list_projections(
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
     let expected =
@@ -5331,7 +5364,7 @@ fn validate_list_projections(
 }
 
 fn validate_resource_owners(
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
     for (owner, ancestry, label) in graph
@@ -5381,7 +5414,7 @@ fn validate_resource_owners(
 }
 
 fn validate_scoped_resource_binding(
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
     owner: Option<StaticOwnerId>,
     target_list: Option<SemanticListId>,
     row_scope: Option<SemanticRowScopeId>,
@@ -5402,7 +5435,7 @@ fn validate_scoped_resource_binding(
     }
 }
 
-fn validate_resource_aliases(graph: &SemanticResourceGraphV1) -> Result<(), String> {
+fn validate_resource_aliases(graph: &SemanticResourceGraphV2) -> Result<(), String> {
     if graph.aliases.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err("semantic resource aliases are not strictly sorted and unique".to_owned());
     }
@@ -5447,7 +5480,7 @@ fn validate_resource_aliases(graph: &SemanticResourceGraphV1) -> Result<(), Stri
 }
 
 fn validate_producer_resources(
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
     execution: &SemanticExecutionImageColumnsV1,
     out_net: &ResolvedOutGraph,
 ) -> Result<(), String> {
@@ -5556,8 +5589,8 @@ fn validate_producer_resources(
 }
 
 fn resource_graph_digest(
-    graph: &SemanticResourceGraphV1,
-) -> Result<SemanticResourceGraphDigestV1, String> {
+    graph: &SemanticResourceGraphV2,
+) -> Result<SemanticResourceGraphDigestV2, String> {
     #[derive(Serialize)]
     struct Payload<'a> {
         schema: &'a str,
@@ -5565,14 +5598,14 @@ fn resource_graph_digest(
         lists: &'a [SemanticListResourceV1],
         value_list_authorities: &'a [SemanticValueListAuthorityV1],
         sources: &'a [SemanticSourceResourceV1],
-        states: &'a [SemanticStateResourceV1],
+        states: &'a [SemanticStateResourceV2],
         aliases: &'a [SemanticResourceAliasV1],
         materialization_bindings: &'a [SemanticMaterializationResourceBindingV1],
         list_projections: &'a [SemanticListProjectionV1],
         producer_resources: &'a [SemanticProducerResourceV1],
     }
     boon_contract::canonical_serde_hash_v1(
-        SEMANTIC_RESOURCE_GRAPH_DIGEST_DOMAIN,
+        SEMANTIC_RESOURCE_GRAPH_DIGEST_DOMAIN_V2,
         &Payload {
             schema: &graph.schema,
             row_scopes: &graph.row_scopes,
@@ -5586,7 +5619,7 @@ fn resource_graph_digest(
             producer_resources: &graph.producer_resources,
         },
     )
-    .map(SemanticResourceGraphDigestV1)
+    .map(SemanticResourceGraphDigestV2)
     .map_err(|error| format!("canonical semantic resource encoding failed: {error}"))
 }
 
@@ -5603,7 +5636,7 @@ fn construction_owner_with_static(
 }
 
 fn resource_dependency_rows(
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
 ) -> Result<ConstructionDependencyRowsV1, crate::CallableDependencyManifestError> {
     let mut builder = ConstructionDependencyRowBuilderV1::new();
     let row_count = 1
@@ -5949,7 +5982,7 @@ fn resource_dependency_rows(
 
 #[cfg(test)]
 pub(crate) fn resource_dependency_rows_for_test(
-    graph: &SemanticResourceGraphV1,
+    graph: &SemanticResourceGraphV2,
 ) -> Result<ConstructionDependencyRowsV1, crate::CallableDependencyManifestError> {
     resource_dependency_rows(graph)
 }
@@ -6320,6 +6353,44 @@ mod tests {
             canonical_inline_list_authority_candidate(&with_concrete),
             Err((3, 2))
         );
+    }
+
+    #[test]
+    fn inline_list_runtime_item_erases_definition_alphas_without_losing_shape() {
+        let checked = Type::object(boon_checked::ObjectShape::from_ordered_fields(
+            [(
+                "event".to_owned(),
+                Type::object(boon_checked::ObjectShape::from_ordered_fields(
+                    [("press".to_owned(), Type::Var(boon_checked::TypeVar(7)))],
+                    false,
+                )),
+            )],
+            false,
+        ));
+        let definition = erase_runtime_type_vars(&checked);
+        let runtime = runtime_inline_list_item_type(&definition, &checked)
+            .expect("definition-local item alpha has a runtime representation");
+        assert_eq!(runtime, definition);
+        assert_eq!(erase_runtime_type_vars(&runtime), runtime);
+    }
+
+    #[test]
+    fn inline_list_runtime_item_preserves_concrete_occurrence_specialization() {
+        let checked = Type::object(boon_checked::ObjectShape::from_ordered_fields(
+            [("value".to_owned(), Type::Var(boon_checked::TypeVar(3)))],
+            false,
+        ));
+        for exact_value in [Type::Number, Type::Text] {
+            let exact = Type::object(boon_checked::ObjectShape::from_ordered_fields(
+                [("value".to_owned(), exact_value)],
+                false,
+            ));
+            assert_eq!(
+                runtime_inline_list_item_type(&exact, &checked)
+                    .expect("generic checked item accepts its concrete occurrence"),
+                exact,
+            );
+        }
     }
 
     #[test]
@@ -6703,6 +6774,129 @@ FUNCTION stateful_row(row) {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["first", "second"])
         );
+        for state in contextual_states {
+            let binding_declaration = semantic
+                .checked_program
+                .declarations
+                .iter()
+                .find(|candidate| candidate.id == state.binding_declaration)
+                .expect("state lexical binding declaration");
+            let checked_state = semantic
+                .checked_program
+                .states
+                .get(state.checked_state.0 as usize)
+                .filter(|candidate| candidate.id == state.checked_state)
+                .expect("checked state");
+            assert_eq!(state.binding_declaration, checked_state.binding_declaration);
+            assert_eq!(
+                binding_declaration.value,
+                Some(checked_state.expression),
+                "the HOLD binding must be the declaration that owns the exact state expression, whether or not it is also the canonical storage anchor"
+            );
+            let state_bindings = semantic
+                .reactive_graph()
+                .bindings
+                .iter()
+                .filter(|binding| {
+                    matches!(
+                        binding.target,
+                        crate::SemanticBindingTargetV1::State { state: candidate }
+                            if candidate == state.id
+                    )
+                })
+                .collect::<Vec<_>>();
+            let [binding] = state_bindings.as_slice() else {
+                panic!(
+                    "state {} must have one exact reactive binding: {state_bindings:#?}",
+                    state.id
+                );
+            };
+            assert_eq!(binding.declaration, state.binding_declaration);
+        }
+    }
+
+    #[test]
+    fn contextual_state_trigger_slices_an_exact_source_from_an_aggregate_argument() {
+        let semantic = elaborate_source(
+            r#"
+store: [
+    elements: [
+        toggle: SOURCE
+        reset: SOURCE
+        ignored: SOURCE
+    ]
+    count: 0
+    descriptor: [count: store.count]
+    rows:
+        LIST { [initial: False] }
+        |> List/map(item, new: stateful_row(row: item, store: store))
+]
+
+FUNCTION stateful_row(row, store) {
+    [
+        initial: row.initial
+        active:
+            row.initial |> HOLD active {
+                LATEST {
+                    store.elements.toggle |> THEN { True }
+                    store.elements.reset |> THEN { False }
+                }
+            }
+    ]
+}
+"#,
+        );
+        let source = |path: &str| {
+            semantic
+                .resource_graph
+                .sources
+                .iter()
+                .find(|source| source.semantic_path == path)
+                .unwrap_or_else(|| panic!("missing source {path}"))
+        };
+        let toggle = source("store.elements.toggle");
+        let reset = source("store.elements.reset");
+        let ignored = source("store.elements.ignored");
+        let states = semantic
+            .resource_graph
+            .states
+            .iter()
+            .filter(|state| {
+                state.owner.is_some()
+                    && state.published
+                    && state.hold_name == "active"
+                    && state.kind == CheckedStateKind::Hold
+            })
+            .collect::<Vec<_>>();
+        let [active] = states.as_slice() else {
+            panic!("expected one contextual active HOLD: {states:#?}");
+        };
+        let reactive = semantic.reactive_graph();
+        let updates = reactive
+            .state_update_arms
+            .iter()
+            .filter(|arm| arm.state == active.id)
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2, "{updates:#?}");
+        let causes = updates
+            .iter()
+            .map(|update| {
+                reactive
+                    .trigger_arms
+                    .get(update.trigger.as_usize())
+                    .filter(|trigger| trigger.id == update.trigger)
+                    .expect("state update trigger")
+                    .cause
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            causes,
+            BTreeSet::from([
+                crate::SemanticEventCauseV1::Source(toggle.id),
+                crate::SemanticEventCauseV1::Source(reset.id),
+            ])
+        );
+        assert!(!causes.contains(&crate::SemanticEventCauseV1::Source(ignored.id)));
     }
 
     #[test]
@@ -7515,39 +7709,39 @@ store: [
             }};
         }
 
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.sources[0].origin = SemanticSourceOrigin::Checked {
                 source: CheckedSourceId(u32::MAX),
             };
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.sources[0].checked_statement = Some(CheckedStatementId(u32::MAX));
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.sources[0].statement = SemanticStatementId(usize::MAX);
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.sources[0].declaration = DeclId(u32::MAX);
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.sources[0].expression = SemanticExprId(usize::MAX);
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.sources[0].declared_binding_path.push_str(".mutated");
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.sources[0].semantic_path.push_str(".mutated");
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.sources[0].binding_path.push_str(".mutated");
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.sources[0].interval_ms = Some(999);
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.sources[0].payload_type = Type::Unknown;
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.sources[0]
                 .payload_fields
                 .push(SemanticPayloadFieldV1 {
@@ -7555,59 +7749,62 @@ store: [
                     data_type: Type::Unknown,
                 });
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.sources[0].span.line = usize::MAX;
         });
 
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].checked_state = CheckedStateId(u32::MAX);
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].checked_statement = CheckedStatementId(u32::MAX);
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].statement = SemanticStatementId(usize::MAX);
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].declaration = DeclId(u32::MAX);
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
+            graph.states[0].binding_declaration = DeclId(u32::MAX);
+        });
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].expression = SemanticExprId(usize::MAX);
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].initial = SemanticExprId(usize::MAX);
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].expression_members.clear();
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].flow_type.ty = Type::Unknown;
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].kind = CheckedStateKind::StatefulCall;
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].binding_path.push_str(".mutated");
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].declared_path.push_str(".mutated");
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].path.push_str(".mutated");
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].semantic_path = Some("mutated".to_owned());
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].published = !graph.states[0].published;
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].hold_name.push_str(".mutated");
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].checked_span.line = usize::MAX;
         });
-        reject_mutation!(|graph: &mut SemanticResourceGraphV1| {
+        reject_mutation!(|graph: &mut SemanticResourceGraphV2| {
             graph.states[0].span.line = usize::MAX;
         });
     }

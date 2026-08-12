@@ -1,5 +1,7 @@
 use crate::owner_body::{
-    EvaluatedResultValue, OwnerInterfaceTransferModule, OwnerResultTransferArguments,
+    EvaluatedResultValue, OwnerInterfaceTransferModule, OwnerResidualAbiContract,
+    OwnerResidualCallTarget, OwnerResidualDraft, OwnerResidualDraftArguments,
+    OwnerResidualExpressionRef, OwnerResidualInput, OwnerResidualNode, OwnerResidualParameterRead,
     evaluate_owner_result_transfer_occurrence, owner_interface_transfer_dependency_owners,
     project_owner_interface_transfer_module,
 };
@@ -28,11 +30,11 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
 
-const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V7: &[u8] = b"boon.owner-interface-scc-result.v7\0";
+const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V8: &[u8] = b"boon.owner-interface-scc-result.v8\0";
 const OWNER_INTERFACE_SCC_KEY_DOMAIN_V1: &[u8] = b"boon.owner-interface-scc-key.v1\0";
-const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V8: &[u8] =
-    b"boon.owner-interface-scc-currentness.v8\0";
-const OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V5: &[u8] = b"boon.owner-body-interface-import.v5\0";
+const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V9: &[u8] =
+    b"boon.owner-interface-scc-currentness.v9\0";
+const OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V6: &[u8] = b"boon.owner-body-interface-import.v6\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerInterfaceParameter {
@@ -55,120 +57,6 @@ pub enum OwnerInterfaceEvaluationScope {
 pub struct OwnerContextInterface {
     pub flow_type: FlowType,
     pub projections: Box<[Box<[String]>]>,
-}
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum OwnerResultExpressionRef {
-    Local {
-        expression: StableExpressionKey,
-    },
-    Child {
-        owner: StableCheckOwnerKey,
-        expression: StableExpressionKey,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct OwnerResultTransferInput {
-    pub role: OwnerConstraintEdgeRole,
-    pub expression: OwnerResultExpressionRef,
-    pub formal_ordinal: Option<u32>,
-    pub explicit_pass: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct OwnerResultParameterRead {
-    pub parameter_ordinal: u32,
-    pub projection: Box<[String]>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct OwnerResultAbiParameterContract {
-    pub name: String,
-    pub kind: CheckedParameterKind,
-    pub ordinal: u32,
-    pub flow_type: FlowType,
-}
-
-/// Minimal authoritative contract required to specialize an imported result
-/// transfer. Identity, role, intrinsic, effect, context, requirement, and
-/// construction metadata remain outside this public inference boundary.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct OwnerResultAbiContract {
-    pub kind: boon_checked::CheckedCallableKind,
-    pub parameters: Box<[OwnerResultAbiParameterContract]>,
-    pub result: FlowType,
-    pub result_specialization: crate::OwnerAbiResultSpecialization,
-}
-
-impl From<&crate::OwnerInferenceCallableContract> for OwnerResultAbiContract {
-    fn from(contract: &crate::OwnerInferenceCallableContract) -> Self {
-        Self {
-            kind: contract.kind,
-            parameters: contract
-                .parameters
-                .iter()
-                .map(|parameter| OwnerResultAbiParameterContract {
-                    name: parameter.name.clone(),
-                    kind: parameter.kind,
-                    ordinal: parameter.ordinal,
-                    flow_type: parameter.flow_type.clone(),
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            result: contract.result.clone(),
-            result_specialization: contract.result_specialization,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum OwnerResultCallTarget {
-    Owner {
-        owner: StableCheckOwnerKey,
-    },
-    Abi {
-        canonical_name: String,
-        contract: OwnerResultAbiContract,
-    },
-    Unresolved,
-    Ambiguous {
-        candidates: Box<[StableCheckOwnerKey]>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct OwnerResultTransferNode {
-    pub expression: StableExpressionKey,
-    pub flow_type: FlowType,
-    pub static_number: Option<String>,
-    pub kind: OwnerConstraintNodeKind,
-    pub inputs: Box<[OwnerResultTransferInput]>,
-    pub parameter_read: Option<OwnerResultParameterRead>,
-    pub call_target: Option<OwnerResultCallTarget>,
-}
-
-/// Minimal stable expression slice required to instantiate one callable result.
-///
-/// Non-callable owners publish `Principal`: their result cannot be instantiated
-/// at another call site. A callable publishes only the backwards-reachable
-/// result slice, expressed with stable identities and frozen ABI/owner targets.
-/// This is the public specialization boundary: callers never copy or inspect an
-/// unrelated part of the callee body to determine result mode or a
-/// syntax-selected result shape.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum OwnerResultTransfer {
-    Principal,
-    Parameter {
-        read: OwnerResultParameterRead,
-    },
-    Expression {
-        root: OwnerResultExpressionRef,
-        nodes: Box<[OwnerResultTransferNode]>,
-    },
 }
 
 /// Exact enclosing expression captured by one child-owner interface.
@@ -203,10 +91,11 @@ pub struct OwnerInterfaceLexicalCapture {
 
 /// Alpha-normalized public currentness surface of one authored check owner.
 ///
-/// Source positions, body-only literal payloads, dense IDs, and implementation
-/// fingerprints are absent. Parameters, exact context projections, effects,
-/// and the minimal result-specialization transfer are frozen against the
-/// project ABI, so callers never inspect the callee body.
+/// Source positions, body-only literal payloads, dense IDs, implementation
+/// fingerprints, and result-transfer instructions are absent. Parameters,
+/// exact context projections, results, captures, and effects are the complete
+/// public surface. Occurrence specialization lives only in the separately
+/// sealed [`OwnerInterfaceTransferModule`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerPublicInterface {
     pub owner: StableCheckOwnerKey,
@@ -218,7 +107,6 @@ pub struct OwnerPublicInterface {
     /// unioned into `result`. Kept separately so occurrence-specialized result
     /// transfers cannot accidentally discard a FLUSH alternative.
     pub result_flush_type: Option<Type>,
-    pub result_transfer: OwnerResultTransfer,
     pub captures: Box<[OwnerInterfaceCapture]>,
     pub lexical_captures: Box<[OwnerInterfaceLexicalCapture]>,
     pub context: Option<OwnerContextInterface>,
@@ -291,6 +179,18 @@ pub struct OwnerInterfaceSccResult {
     fingerprint_v1: [u8; 32],
 }
 
+/// Atomic two-pass projection from one converged interface solver state.
+///
+/// `result` freezes the public alpha prefix. `residuals` continue in the same
+/// component alpha namespace but remain private drafts consumed immediately by
+/// the transfer-module compiler.
+#[derive(Clone)]
+pub(crate) struct OwnerInterfaceSccProjection {
+    pub(crate) result: Arc<OwnerInterfaceSccResult>,
+    pub(crate) residuals: Box<[OwnerResidualDraft]>,
+    pub(crate) residual_type_variable_count: u32,
+}
+
 impl OwnerInterfaceSccResult {
     pub const fn key_fingerprint_v1(&self) -> [u8; 32] {
         self.key_fingerprint_v1
@@ -344,7 +244,7 @@ impl OwnerInterfaceSccCurrentnessReceipt {
         }
         let result_fingerprint_v1 = result.fingerprint_v1();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V8,
+            OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V9,
             &(&basis, result_fingerprint_v1),
         )
         .map_err(|error| {
@@ -4511,10 +4411,10 @@ fn owner_result_expression(state: &OwnerSolveState<'_>) -> Option<u32> {
 fn owner_result_expression_ref(
     state: &OwnerSolveState<'_>,
     reference: u32,
-) -> Result<OwnerResultExpressionRef, OwnerConstraintSeedError> {
+) -> Result<OwnerResidualExpressionRef, OwnerConstraintSeedError> {
     let reference = reference as usize;
     if let Some(expression) = state.seed.expressions.get(reference) {
-        return Ok(OwnerResultExpressionRef::Local {
+        return Ok(OwnerResidualExpressionRef::Local {
             expression: expression.expression.clone(),
         });
     }
@@ -4528,7 +4428,7 @@ fn owner_result_expression_ref(
                 state.seed.owner
             ))
         })?;
-    Ok(OwnerResultExpressionRef::Child {
+    Ok(OwnerResidualExpressionRef::Child {
         owner: external.owner.clone(),
         expression: external.expression.clone(),
     })
@@ -4537,7 +4437,7 @@ fn owner_result_expression_ref(
 fn owner_result_parameter_read(
     state: &OwnerSolveState<'_>,
     expression: &crate::OwnerExpressionConstraint,
-) -> Option<OwnerResultParameterRead> {
+) -> Option<OwnerResidualParameterRead> {
     let index = state
         .expression_by_key
         .get(&expression.expression)
@@ -4549,7 +4449,7 @@ fn owner_result_parameter_read(
     else {
         return None;
     };
-    Some(OwnerResultParameterRead {
+    Some(OwnerResidualParameterRead {
         parameter_ordinal: *ordinal,
         projection: read.projection.clone(),
     })
@@ -4559,7 +4459,7 @@ fn owner_result_call_target(
     state: &OwnerSolveState<'_>,
     abi: &OwnerInferenceAbiEnvironment,
     expression: &crate::OwnerExpressionConstraint,
-) -> Result<Option<OwnerResultCallTarget>, OwnerConstraintSeedError> {
+) -> Result<Option<OwnerResidualCallTarget>, OwnerConstraintSeedError> {
     let function = match &expression.kind {
         OwnerConstraintNodeKind::Call { function }
         | OwnerConstraintNodeKind::Pipe {
@@ -4585,7 +4485,7 @@ fn owner_result_call_target(
             )
         })?;
     let target = match &call.target {
-        crate::OwnerSignatureCallTarget::Owner { owner } => OwnerResultCallTarget::Owner {
+        crate::OwnerSignatureCallTarget::Owner { owner } => OwnerResidualCallTarget::Owner {
             owner: owner.clone(),
         },
         crate::OwnerSignatureCallTarget::Authoritative => {
@@ -4595,17 +4495,17 @@ fn owner_result_call_target(
                     state.seed.owner
                 ))
             })?;
-            OwnerResultCallTarget::Abi {
+            OwnerResidualCallTarget::Abi {
                 canonical_name: function.clone(),
-                contract: OwnerResultAbiContract::from(contract),
+                contract: OwnerResidualAbiContract::from(contract),
             }
         }
         crate::OwnerSignatureCallTarget::Ambiguous { candidates } => {
-            OwnerResultCallTarget::Ambiguous {
+            OwnerResidualCallTarget::Ambiguous {
                 candidates: candidates.clone(),
             }
         }
-        crate::OwnerSignatureCallTarget::Unresolved => OwnerResultCallTarget::Unresolved,
+        crate::OwnerSignatureCallTarget::Unresolved => OwnerResidualCallTarget::Unresolved,
     };
     Ok(Some(target))
 }
@@ -4613,11 +4513,11 @@ fn owner_result_call_target(
 fn owner_result_parameter_alias(
     state: &OwnerSolveState<'_>,
     reference: u32,
-) -> Option<OwnerResultParameterRead> {
+) -> Option<OwnerResidualParameterRead> {
     fn append_projection(
-        mut read: OwnerResultParameterRead,
+        mut read: OwnerResidualParameterRead,
         projection: &[String],
-    ) -> OwnerResultParameterRead {
+    ) -> OwnerResidualParameterRead {
         let mut path = read.projection.into_vec();
         path.extend(projection.iter().cloned());
         read.projection = path.into_boxed_slice();
@@ -4628,7 +4528,7 @@ fn owner_result_parameter_alias(
         state: &OwnerSolveState<'_>,
         reference: u32,
         active: &mut BTreeSet<u32>,
-    ) -> Option<OwnerResultParameterRead> {
+    ) -> Option<OwnerResidualParameterRead> {
         let expression = state.seed.expressions.get(reference as usize)?;
         if !active.insert(reference) {
             return None;
@@ -4642,7 +4542,7 @@ fn owner_result_parameter_alias(
             let target = match &read.target {
                 OwnerEffectiveLexicalTarget::Static {
                     target: OwnerLexicalDeclarationTarget::Parameter { ordinal },
-                } => Some(OwnerResultParameterRead {
+                } => Some(OwnerResidualParameterRead {
                     parameter_ordinal: *ordinal,
                     projection: Box::new([]),
                 }),
@@ -4708,15 +4608,15 @@ fn build_owner_result_transfer(
     unifier: &mut TypeUnifier,
     alpha_variables: &mut BTreeMap<TypeVar, TypeVar>,
     next_alpha: &mut u32,
-) -> Result<OwnerResultTransfer, OwnerConstraintSeedError> {
+) -> Result<OwnerResidualDraft, OwnerConstraintSeedError> {
     if state.declaration_kind != Some(OwnerDeclarationKind::Function) {
-        return Ok(OwnerResultTransfer::Principal);
+        return Ok(OwnerResidualDraft::Principal);
     }
     let Some(root) = owner_result_expression(state) else {
-        return Ok(OwnerResultTransfer::Principal);
+        return Ok(OwnerResidualDraft::Principal);
     };
     if let Some(read) = owner_result_parameter_alias(state, root) {
-        return Ok(OwnerResultTransfer::Parameter { read });
+        return Ok(OwnerResidualDraft::Parameter { read });
     }
     let root_ref = owner_result_expression_ref(state, root)?;
     let mut pending = vec![root];
@@ -4781,7 +4681,7 @@ fn build_owner_result_transfer(
                         }
                         _ => None,
                     };
-                    Ok(OwnerResultTransferInput {
+                    Ok(OwnerResidualInput {
                         role: input.role.clone(),
                         expression: owner_result_expression_ref(state, input.expression)?,
                         formal_ordinal: source.and_then(|source| {
@@ -4797,7 +4697,7 @@ fn build_owner_result_transfer(
                 })
                 .collect::<Result<Vec<_>, OwnerConstraintSeedError>>()?;
             let variable = state.expressions[reference as usize];
-            Ok(OwnerResultTransferNode {
+            Ok(OwnerResidualNode {
                 expression: expression.expression.clone(),
                 flow_type: FlowType {
                     mode: state.modes[reference as usize].unwrap_or(FlowMode::Continuous),
@@ -4821,7 +4721,7 @@ fn build_owner_result_transfer(
             })
         })
         .collect::<Result<Vec<_>, OwnerConstraintSeedError>>()?;
-    Ok(OwnerResultTransfer::Expression {
+    Ok(OwnerResidualDraft::Expression {
         root: root_ref,
         nodes: nodes.into_boxed_slice(),
     })
@@ -4999,7 +4899,7 @@ fn project_owner_interface_scc_result(
     states: &BTreeMap<StableCheckOwnerKey, OwnerSolveState<'_>>,
     unifier: &mut TypeUnifier,
     mut work: OwnerInterfaceSolveWork,
-) -> Result<Arc<OwnerInterfaceSccResult>, OwnerConstraintSeedError> {
+) -> Result<OwnerInterfaceSccProjection, OwnerConstraintSeedError> {
     let mut interfaces = Vec::with_capacity(states.len());
     let mut alpha_variables = BTreeMap::new();
     let mut next_alpha = 0;
@@ -5081,13 +4981,6 @@ fn project_owner_interface_scc_result(
                 flow_type,
             }
         });
-        let result_transfer = build_owner_result_transfer(
-            state,
-            abi,
-            unifier,
-            &mut alpha_variables,
-            &mut next_alpha,
-        )?;
         let captures = state
             .seed
             .external_expressions
@@ -5186,11 +5079,6 @@ fn project_owner_interface_scc_result(
         for capture in &lexical_captures {
             collect_type_variables(&capture.flow_type.ty, &mut type_variables);
         }
-        if let OwnerResultTransfer::Expression { nodes, .. } = &result_transfer {
-            for node in nodes {
-                collect_type_variables(&node.flow_type.ty, &mut type_variables);
-            }
-        }
         let mut interface = OwnerPublicInterface {
             owner: owner.clone(),
             declaration_kind: state.declaration_kind,
@@ -5198,7 +5086,6 @@ fn project_owner_interface_scc_result(
             parameters: parameters.into_boxed_slice(),
             result,
             result_flush_type,
-            result_transfer,
             captures: captures.into_boxed_slice(),
             lexical_captures: lexical_captures.into_boxed_slice(),
             context,
@@ -5210,7 +5097,7 @@ fn project_owner_interface_scc_result(
             fingerprint_v1: [0; 32],
         };
         interface.fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V5,
+            OWNER_BODY_INTERFACE_IMPORT_DOMAIN_V6,
             &interface,
         )
         .map_err(|error| {
@@ -5220,14 +5107,19 @@ fn project_owner_interface_scc_result(
         })?;
         interfaces.push(interface);
     }
+    let public_type_variable_count = next_alpha;
     work.unification_steps = unifier.steps;
     let interface_fingerprints = interfaces
         .iter()
         .map(OwnerPublicInterface::fingerprint_v1)
         .collect::<Vec<_>>();
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_INTERFACE_SCC_RESULT_DOMAIN_V7,
-        &(&scc.key, &interface_fingerprints, next_alpha),
+        OWNER_INTERFACE_SCC_RESULT_DOMAIN_V8,
+        &(
+            &scc.key,
+            &interface_fingerprints,
+            public_type_variable_count,
+        ),
     )
     .map_err(|error| {
         OwnerConstraintSeedError::new(format!(
@@ -5241,14 +5133,34 @@ fn project_owner_interface_scc_result(
                     "cannot fingerprint owner interface SCC key: {error}"
                 ))
             })?;
-    Ok(Arc::new(OwnerInterfaceSccResult {
+    let result = Arc::new(OwnerInterfaceSccResult {
         key: scc.key.clone(),
         owners: interfaces.into_boxed_slice(),
-        type_variable_count: next_alpha,
+        type_variable_count: public_type_variable_count,
         work,
         key_fingerprint_v1,
         fingerprint_v1,
-    }))
+    });
+    let residuals = scc
+        .key
+        .members
+        .iter()
+        .map(|owner| {
+            build_owner_result_transfer(
+                &states[owner],
+                abi,
+                unifier,
+                &mut alpha_variables,
+                &mut next_alpha,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_boxed_slice();
+    Ok(OwnerInterfaceSccProjection {
+        result,
+        residuals,
+        residual_type_variable_count: next_alpha,
+    })
 }
 
 pub(crate) fn authoritative_signature(
@@ -5610,6 +5522,50 @@ where
         module: output.module.ok_or_else(|| {
             OwnerConstraintSeedError::new(
                 "component interface solve did not publish its transfer module",
+            )
+        })?,
+        transfer_iterations: output.transfer_iterations,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn evaluate_owner_interface_scc_component_for_tests<'a>(
+    scc: &OwnerInterfaceScc,
+    abi: &OwnerInferenceAbiEnvironment,
+    seeds: impl IntoIterator<Item = &'a OwnerConstraintSeed>,
+    summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
+    dependency_results: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
+    dependency_modules: impl IntoIterator<Item = Arc<OwnerInterfaceTransferModule>>,
+) -> Result<OwnerInterfaceSccComponentEvaluation, OwnerConstraintSeedError> {
+    let dependency_modules = dependency_modules.into_iter().collect::<Vec<_>>();
+    let output = evaluate_owner_interface_scc_impl(
+        scc,
+        abi,
+        seeds,
+        summaries,
+        dependency_results,
+        None,
+        Some(&mut |owners: &[StableCheckOwnerKey]| {
+            let modules = dependency_modules
+                .iter()
+                .filter(|module| owners.iter().any(|owner| module.owns_owner(owner)))
+                .cloned()
+                .collect::<Vec<_>>();
+            if owners
+                .iter()
+                .all(|owner| modules.iter().any(|module| module.owns_owner(owner)))
+            {
+                Ok(modules)
+            } else {
+                Err("test component resolver is missing a requested owner".to_owned())
+            }
+        }),
+    )?;
+    Ok(OwnerInterfaceSccComponentEvaluation {
+        evaluation: output.evaluation,
+        module: output.module.ok_or_else(|| {
+            OwnerConstraintSeedError::new(
+                "test component solve did not publish its residual module",
             )
         })?,
         transfer_iterations: output.transfer_iterations,
@@ -7048,7 +7004,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
     let mut external_transfer_modules = None::<Vec<Arc<OwnerInterfaceTransferModule>>>;
     let mut resolved_transfer_owners = None::<Box<[StableCheckOwnerKey]>>;
     let mut final_transfer_module = None::<Arc<OwnerInterfaceTransferModule>>;
-    let mut final_result = None::<Arc<OwnerInterfaceSccResult>>;
+    let mut final_projection = None::<OwnerInterfaceSccProjection>;
     let mut transfer_iterations = 0_u32;
     let mut seen_transfer_surfaces = HashSet::new();
     let mut committed_transfer_results = vec![None::<Type>; calls.len()];
@@ -7294,12 +7250,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                     states.get(*target).is_some_and(|state| {
                         !recursive_owner_calls[call_index]
                             && owner_result_requires_occurrence_transfer(state)
-                    }) || dependency_interfaces.get(*target).is_some_and(|interface| {
-                        matches!(
-                            &interface.result_transfer,
-                            OwnerResultTransfer::Expression { .. }
-                        )
-                    })
+                    }) || dependency_interfaces.contains_key(*target)
                 })
                 .cloned();
             if call_valid {
@@ -7752,7 +7703,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
             let own_module = Arc::new(
                 project_owner_interface_transfer_module(
                     scc,
-                    Arc::clone(&provisional),
+                    provisional.clone(),
                     module_dependencies.into_values(),
                 )
                 .map_err(|error| {
@@ -7802,7 +7753,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 }
             }
             let residual_key = (
-                provisional.fingerprint_v1(),
+                provisional.result.fingerprint_v1(),
                 own_module.fingerprint_v1(),
                 residual_types,
             );
@@ -7839,7 +7790,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                             "interface transfer call disappeared from its signature plan",
                         )
                     })?;
-                let mut arguments = OwnerResultTransferArguments::default();
+                let mut arguments = OwnerResidualDraftArguments::default();
                 for input in &signature_call.matched_inputs {
                     if let Some(value) =
                         interface_transfer_expression_value(caller, input.expression, &mut unifier)
@@ -7904,7 +7855,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
             write_solver_surface_snapshot(&mut unifier, &states, &mut current_surface);
             transfer_surface_changed |= current_surface != pre_transfer_surface;
             if !transfer_surface_changed {
-                final_result = Some(provisional);
+                final_projection = Some(provisional);
                 converged = true;
                 break;
             }
@@ -7945,7 +7896,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 final_transfer_module = Some(Arc::new(
                     project_owner_interface_transfer_module(
                         scc,
-                        Arc::clone(&projected),
+                        projected.clone(),
                         final_dependencies.into_values(),
                     )
                     .map_err(|error| {
@@ -7955,7 +7906,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         ))
                     })?,
                 ));
-                final_result = Some(projected);
+                final_projection = Some(projected);
                 converged = true;
                 break;
             }
@@ -7979,10 +7930,11 @@ fn evaluate_owner_interface_scc_impl<'a>(
         )));
     }
 
-    let result = match final_result {
-        Some(result) => result,
+    let projection = match final_projection {
+        Some(projection) => projection,
         None => project_owner_interface_scc_result(scc, abi, &states, &mut unifier, work)?,
     };
+    let result = projection.result;
     let currentness = OwnerInterfaceSccCurrentnessReceipt::from_current_evaluation(basis, &result)?;
     Ok(OwnerInterfaceSccSolveOutput {
         evaluation: OwnerInterfaceSccEvaluation {
@@ -10958,15 +10910,6 @@ mod tests {
         assert_eq!(interface.parameters[0].flow_type.ty, Type::Var(TypeVar(0)));
         assert_eq!(interface.result.ty, Type::Var(TypeVar(0)));
         assert_eq!(interface.type_variables.as_ref(), [TypeVar(0)]);
-        assert_eq!(
-            interface.result_transfer,
-            OwnerResultTransfer::Parameter {
-                read: OwnerResultParameterRead {
-                    parameter_ordinal: 0,
-                    projection: Box::new([]),
-                },
-            }
-        );
     }
 
     #[test]
@@ -11019,15 +10962,6 @@ mod tests {
         assert_eq!(interface.parameters[0].flow_type.ty, Type::Var(TypeVar(0)));
         assert_eq!(interface.result.ty, Type::Var(TypeVar(0)));
         assert_eq!(interface.type_variables.as_ref(), [TypeVar(0)]);
-        assert_eq!(
-            interface.result_transfer,
-            OwnerResultTransfer::Parameter {
-                read: OwnerResultParameterRead {
-                    parameter_ordinal: 0,
-                    projection: Box::new([]),
-                },
-            }
-        );
     }
 
     #[test]

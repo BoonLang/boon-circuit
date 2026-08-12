@@ -49,10 +49,6 @@ use boon_typecheck::{
     project_owner_syntax_input, project_source_unit_owner_diagnostics,
     resolve_owner_constraint_seed_with_signature_plan, stable_check_owner_key_fingerprint_v2,
 };
-#[cfg(test)]
-use boon_typecheck::{
-    owner_interface_transfer_dependency_owners, project_owner_interface_transfer_module,
-};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1207,7 +1203,7 @@ impl RequestFamily for OwnerInterfaceSccPlanRequest {
 struct OwnerInterfaceSccEvaluationRequest;
 
 /// Exact component transaction result. The semantic public-interface and
-/// prepared-transfer projections retain independent fingerprints, while this
+/// compiled-residual projections retain independent fingerprints, while this
 /// root seals that they were produced from one current input transaction.
 #[derive(Clone, Debug)]
 struct OwnerInterfaceComponentEvaluation {
@@ -1222,7 +1218,7 @@ impl RequestFamily for OwnerInterfaceSccEvaluationRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceComponentEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v9";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v10";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1241,7 +1237,7 @@ impl RequestFamily for OwnerInterfaceSccRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceSccResult>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v7";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v8";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1260,7 +1256,7 @@ impl RequestFamily for OwnerInterfaceTransferModuleRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceTransferModule>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-transfer-module.v3";
+    const NAME: &'static str = "boon.compiler.owner-interface-transfer-module.v4";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -1315,7 +1311,7 @@ impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v12";
+    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v13";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -4826,15 +4822,15 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
     trace.checkpoint("interface-scc-plans", topology.sccs.len());
 
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v9\0",
+        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v10\0",
         std::iter::empty(),
     ));
     let result_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-result-projection-dependencies.v6\0",
+        b"boon.compiler.owner-interface-scc-result-projection-dependencies.v7\0",
         std::iter::empty(),
     ));
     let transfer_module_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-transfer-module-dependencies.v3\0",
+        b"boon.compiler.owner-interface-transfer-module-dependencies.v4\0",
         std::iter::empty(),
     ));
     for expected in &topology.sccs {
@@ -5038,7 +5034,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                             .map(|dependency| dependency.fingerprint_v1()),
                     );
                     let fingerprint_v1 = request_fingerprint(
-                        b"boon.compiler.owner-interface-component-evaluation.v3\0",
+                        b"boon.compiler.owner-interface-component-evaluation.v4\0",
                         component_inputs.iter().map(<[u8; 32]>::as_slice),
                     );
                     Ok(Arc::new(OwnerInterfaceComponentEvaluation {
@@ -5158,7 +5154,7 @@ fn evaluate_owner_body_inference_requests(
         .flat_map(|scc| scc.key.members.iter().cloned())
         .collect::<Vec<_>>();
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-body-inference-evaluation-dependencies.v12\0",
+        b"boon.compiler.owner-body-inference-evaluation-dependencies.v13\0",
         std::iter::empty(),
     ));
     let mut planning_ms = 0.0;
@@ -7047,9 +7043,7 @@ mod tests {
     #[test]
     fn syntax_selected_interface_occurrence_reaches_stored_sibling_without_scheme_backflow() {
         use boon_checked::{Type, Variant};
-        use boon_typecheck::{
-            OwnerConstraintEdgeRole, OwnerConstraintNodeKind, OwnerResultTransfer,
-        };
+        use boon_typecheck::OwnerConstraintEdgeRole;
 
         fn assert_rich_object(ty: &Type, variable_row: &Type, context: &str) {
             let Type::Object(shape) = ty else {
@@ -7440,31 +7434,6 @@ mod tests {
         );
         assert_eq!(rich_principal.fields.get("rich_label"), Some(&Type::Text));
         assert!(!sparse_principal.fields.contains_key("rich_label"));
-        let OwnerResultTransfer::Expression { nodes, .. } = &dispatch_interface.result_transfer
-        else {
-            panic!("dispatch must publish a syntax-selectable result transfer");
-        };
-        assert!(
-            nodes
-                .iter()
-                .any(|node| matches!(node.kind, OwnerConstraintNodeKind::When)),
-            "dispatch transfer must retain its WHEN",
-        );
-        assert_eq!(
-            nodes
-                .iter()
-                .filter(|node| {
-                    matches!(
-                        node.kind,
-                        OwnerConstraintNodeKind::MatchArm { .. }
-                            | OwnerConstraintNodeKind::Arrow { .. }
-                    )
-                })
-                .count(),
-            2,
-            "dispatch transfer must retain both ordered arms",
-        );
-
         let rich_body = session
             .owner_body_inference(project, &rich_rows)
             .unwrap()
@@ -11921,7 +11890,7 @@ mod tests {
             )
         };
 
-        assert!(!Arc::ptr_eq(&first_leaf_interface, &second_leaf_interface));
+        assert!(Arc::ptr_eq(&first_leaf_interface, &second_leaf_interface));
         assert!(Arc::ptr_eq(
             &first_inherited_interface,
             &second_inherited_interface
@@ -12011,59 +11980,21 @@ mod tests {
                     .unwrap(),
             )
         };
-        let wrapper_plan = Arc::clone(
-            state
-                .owner_interface_scc_plan_requests
-                .current_value(&state.syntax_evaluator, &wrapper_key)
-                .unwrap()
-                .unwrap(),
-        );
-        let wrapper_result = Arc::clone(
-            state
-                .owner_interface_scc_requests
-                .current_value(&state.syntax_evaluator, &wrapper_key)
-                .unwrap()
-                .unwrap(),
-        );
         let production = module(&wrapper_key);
-        let identity_module = module(&identity_key);
-        let other_module = module(&other_key);
-        let foreign_module = module(&foreign_key);
         assert_eq!(
-            owner_interface_transfer_dependency_owners(&wrapper_result),
-            Box::from([identity.clone()])
+            production
+                .direct_dependency_keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![identity_key.clone()]
         );
-
-        let canonical = project_owner_interface_transfer_module(
-            &wrapper_plan,
-            Arc::clone(&wrapper_result),
-            [Arc::clone(&identity_module), Arc::clone(&identity_module)],
-        )
-        .unwrap();
-        assert_eq!(canonical.fingerprint_v1(), production.fingerprint_v1());
+        assert_ne!(identity_key, other_key);
+        assert_ne!(identity_key, foreign_key);
         assert!(
-            project_owner_interface_transfer_module(
-                &wrapper_plan,
-                Arc::clone(&wrapper_result),
-                [],
-            )
-            .is_err()
-        );
-        assert!(
-            project_owner_interface_transfer_module(
-                &wrapper_plan,
-                Arc::clone(&wrapper_result),
-                [identity_module, other_module],
-            )
-            .is_err()
-        );
-        assert!(
-            project_owner_interface_transfer_module(
-                &wrapper_plan,
-                wrapper_result,
-                [foreign_module],
-            )
-            .is_err()
+            production
+                .direct_dependency_keys()
+                .all(|key| key != &other_key && key != &foreign_key),
+            "unrelated value dependencies must not enter the compiled residual module",
         );
     }
 

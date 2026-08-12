@@ -6281,14 +6281,15 @@ pub fn build_checked_owner_shard<'a>(
 mod tests {
     use super::*;
     use crate::{
-        OwnerConstraintEdgeRole, OwnerPatternConstraint, OwnerSignatureCallLexicalError,
-        OwnerSourceAnchorRole, build_owner_callable_scope_topology, build_owner_interface_topology,
-        evaluate_owner_body_with_signature_plan, evaluate_owner_callable_scope_scc,
-        evaluate_owner_interface_scc_with_signature_scopes, plan_owner_body_interfaces,
+        OwnerConstraintEdgeRole, OwnerInterfaceSccComponentEvaluation, OwnerPatternConstraint,
+        OwnerSignatureCallLexicalError, OwnerSourceAnchorRole, build_owner_callable_scope_topology,
+        build_owner_interface_topology, evaluate_owner_body_with_signature_plan,
+        evaluate_owner_callable_scope_scc, evaluate_owner_interface_scc_component,
+        evaluate_owner_interface_scc_component_for_tests, plan_owner_body_interfaces,
         project_owner_abi_environment, project_owner_callable_resolution_plan,
         project_owner_constraint_seed_with_lexical_plan, project_owner_lexical_plan,
         project_owner_syntax_input, resolve_owner_constraint_seed,
-        resolve_owner_constraint_seed_with_signature_plan, solve_owner_interface_scc,
+        resolve_owner_constraint_seed_with_signature_plan,
     };
     use boon_checked::{ExternalTypeEnvironment, OwnerAbiMemberRef};
     use boon_parser::{ProjectSyntaxSnapshot, parse_project_source_unit, project_unit_link_keys};
@@ -6504,8 +6505,8 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
         let topology = build_owner_interface_topology(summaries.values()).unwrap();
-        let mut interface_results =
-            BTreeMap::<crate::OwnerInterfaceSccKey, Arc<OwnerInterfaceSccResult>>::new();
+        let mut interface_components =
+            BTreeMap::<crate::OwnerInterfaceSccKey, OwnerInterfaceSccComponentEvaluation>::new();
         for scc in &topology.sccs {
             let parameter_requirements = scc
                 .key
@@ -6545,18 +6546,39 @@ mod tests {
             let dependencies = scc
                 .dependencies
                 .iter()
-                .map(|dependency| interface_results[dependency].as_ref())
+                .map(|dependency| &interface_components[dependency])
                 .collect::<Vec<_>>();
-            let evaluation = evaluate_owner_interface_scc_with_signature_scopes(
+            let component = evaluate_owner_interface_scc_component(
                 scc,
                 &interface_abi,
                 scc.key.members.iter().map(|member| &seeds[member]),
                 scc.key.members.iter().map(|member| &summaries[member]),
-                dependencies,
+                dependencies
+                    .iter()
+                    .map(|component| component.evaluation.result.as_ref()),
                 scc.key.members.iter().map(|member| callable_scopes[member]),
+                |owners| {
+                    let modules = dependencies
+                        .iter()
+                        .filter(|component| {
+                            owners
+                                .iter()
+                                .any(|owner| component.module.owns_owner(owner))
+                        })
+                        .map(|component| Arc::clone(&component.module))
+                        .collect::<Vec<_>>();
+                    if owners
+                        .iter()
+                        .all(|owner| modules.iter().any(|module| module.owns_owner(owner)))
+                    {
+                        Ok(modules)
+                    } else {
+                        Err("fixture resolver is missing a transfer module".to_owned())
+                    }
+                },
             )
             .unwrap();
-            interface_results.insert(scc.key.clone(), evaluation.result);
+            interface_components.insert(scc.key.clone(), component);
         }
         let syntax = syntaxes[&owner].clone();
         let lexical_plan = lexical_plans[&owner].clone();
@@ -6584,29 +6606,33 @@ mod tests {
             )
             .unwrap();
         let own_scc = topology.scc_for_owner(&owner).unwrap();
-        let interface = interface_results[&own_scc.key].clone();
+        let interface = Arc::clone(&interface_components[&own_scc.key].evaluation.result);
         let interface_plan = plan_owner_body_interfaces(
             &seed,
             &summary,
-            interface_results.values().map(AsRef::as_ref),
+            interface_components
+                .values()
+                .map(|component| component.module.as_ref()),
         )
         .unwrap();
-        let imported = interface_results
+        let imported = interface_components
             .values()
-            .map(AsRef::as_ref)
-            .filter(|result| {
+            .filter(|component| {
                 interface_plan
                     .imports()
                     .iter()
-                    .any(|import| import.key() == &result.key)
+                    .any(|import| import.key() == &component.evaluation.result.key)
             })
             .collect::<Vec<_>>();
         let imported_interfaces = imported
             .iter()
-            .flat_map(|result| result.owners.iter())
+            .flat_map(|component| component.evaluation.result.owners.iter())
             .map(|interface| (interface.owner.clone(), interface.clone()))
             .collect::<BTreeMap<_, _>>();
-        let imported_sccs = imported.iter().map(|result| (*result).clone()).collect();
+        let imported_sccs = imported
+            .iter()
+            .map(|component| component.evaluation.result.as_ref().clone())
+            .collect();
         let body_evaluation = evaluate_owner_body_with_signature_plan(
             &syntax,
             &lexical_plan,
@@ -6676,16 +6702,18 @@ mod tests {
         )
         .unwrap();
         let topology = build_owner_interface_topology([&summary]).unwrap();
-        let interface = solve_owner_interface_scc(
+        let component = evaluate_owner_interface_scc_component_for_tests(
             topology.sccs.first().unwrap(),
             &base.inference_abi,
             [&base.seed],
             [&summary],
             [],
+            [],
         )
         .unwrap();
+        let interface = Arc::unwrap_or_clone(component.evaluation.result);
         let interface_plan =
-            plan_owner_body_interfaces(&base.seed, &summary, [&interface]).unwrap();
+            plan_owner_body_interfaces(&base.seed, &summary, [component.module.as_ref()]).unwrap();
         let body_evaluation = evaluate_owner_body_with_signature_plan(
             &base.syntax,
             &base.lexical_plan,

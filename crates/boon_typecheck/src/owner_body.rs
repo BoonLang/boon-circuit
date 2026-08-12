@@ -1,6 +1,6 @@
 use crate::owner_interface::{
-    OwnerFlowConstraint, OwnerInheritedPatternNarrowing, OwnerPatternNarrowing, TypeUnifier,
-    alpha_normalize_type, bind_and_record_flow_variables,
+    OwnerFlowConstraint, OwnerInheritedPatternNarrowing, OwnerInterfaceSccProjection,
+    OwnerPatternNarrowing, TypeUnifier, alpha_normalize_type, bind_and_record_flow_variables,
     bind_and_record_structural_flow_variables, bind_projection, flow_mode_join,
     inherited_pattern_read_plans, initialize_owner_hold_constraints,
     instantiate_owner_inherited_pattern_narrowings, instantiate_type, mark_owner_derived_providers,
@@ -16,13 +16,12 @@ use crate::{
     OwnerEffectiveLexicalTarget, OwnerInferenceAbiEnvironment, OwnerInterfaceEvaluationScope,
     OwnerInterfaceScc, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
     OwnerLexicalDeclarationTarget, OwnerLexicalPlan, OwnerParameterKind, OwnerPublicInterface,
-    OwnerReferenceKind, OwnerResultAbiContract, OwnerResultCallTarget, OwnerResultExpressionRef,
-    OwnerResultTransfer, OwnerResultTransferNode, OwnerSignatureCallLexicalError,
-    OwnerSignatureCallPlan, OwnerSignatureDeclarationTarget, OwnerSignatureLexicalPlan,
-    OwnerSignatureMatchedInputSource, OwnerSignaturePassSource, OwnerSourceAnchorRole,
-    OwnerSourceAnchorSite, OwnerSourceMap, OwnerSymbolResolution, OwnerSyntaxInput,
-    OwnerValueAbiForbiddenReason, OwnerValueAbiLookupOutcome, infix_requires_number_operands,
-    infix_returns_bool, project_owner_signature_lexical_plan,
+    OwnerReferenceKind, OwnerSignatureCallLexicalError, OwnerSignatureCallPlan,
+    OwnerSignatureDeclarationTarget, OwnerSignatureLexicalPlan, OwnerSignatureMatchedInputSource,
+    OwnerSignaturePassSource, OwnerSourceAnchorRole, OwnerSourceAnchorSite, OwnerSourceMap,
+    OwnerSymbolResolution, OwnerSyntaxInput, OwnerValueAbiForbiddenReason,
+    OwnerValueAbiLookupOutcome, infix_requires_number_operands, infix_returns_bool,
+    project_owner_signature_lexical_plan,
 };
 use boon_checked::{
     BytesType, CheckedCallableKind, CheckedEffectSummary, CheckedParameterKind,
@@ -46,11 +45,12 @@ use std::sync::Arc;
 
 const OWNER_BODY_INFERENCE_DOMAIN_V9: &[u8] = b"boon.owner-body-inference.v9\0";
 const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V7: &[u8] = b"boon.owner-body-inference-content.v7\0";
-const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V11: &[u8] =
-    b"boon.owner-body-inference-currentness.v11\0";
-const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V4: &[u8] = b"boon.owner-body-interface-plan.v4\0";
-const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V2: &[u8] =
-    b"boon.owner-interface-transfer-module.v2\0";
+const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V12: &[u8] =
+    b"boon.owner-body-inference-currentness.v12\0";
+const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V5: &[u8] = b"boon.owner-body-interface-plan.v5\0";
+const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V3: &[u8] =
+    b"boon.owner-interface-transfer-module.v3\0";
+const OWNER_RESIDUAL_PROGRAM_DOMAIN_V1: &[u8] = b"boon.owner-residual-program.v1\0";
 const SOURCE_UNIT_OWNER_DIAGNOSTICS_DOMAIN_V1: &[u8] = b"boon.source-unit-owner-diagnostics.v1\0";
 const OWNER_DIAGNOSTICS_AGGREGATE_DOMAIN_V8: &[u8] = b"boon.owner-diagnostics-aggregate.v8\0";
 
@@ -75,50 +75,327 @@ impl fmt::Display for OwnerBodyInferenceError {
 
 impl Error for OwnerBodyInferenceError {}
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum OwnerResidualExpressionRef {
+    Local {
+        expression: StableExpressionKey,
+    },
+    Child {
+        owner: StableCheckOwnerKey,
+        expression: StableExpressionKey,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct OwnerResidualInput {
+    pub(crate) role: OwnerConstraintEdgeRole,
+    pub(crate) expression: OwnerResidualExpressionRef,
+    pub(crate) formal_ordinal: Option<u32>,
+    pub(crate) explicit_pass: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct OwnerResidualParameterRead {
+    pub(crate) parameter_ordinal: u32,
+    pub(crate) projection: Box<[String]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct OwnerResidualAbiParameter {
+    pub(crate) name: String,
+    pub(crate) kind: CheckedParameterKind,
+    pub(crate) ordinal: u32,
+    pub(crate) flow_type: FlowType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct OwnerResidualAbiContract {
+    pub(crate) kind: CheckedCallableKind,
+    pub(crate) parameters: Box<[OwnerResidualAbiParameter]>,
+    pub(crate) result: FlowType,
+    pub(crate) result_specialization: crate::OwnerAbiResultSpecialization,
+}
+
+impl From<&crate::OwnerInferenceCallableContract> for OwnerResidualAbiContract {
+    fn from(contract: &crate::OwnerInferenceCallableContract) -> Self {
+        Self {
+            kind: contract.kind,
+            parameters: contract
+                .parameters
+                .iter()
+                .map(|parameter| OwnerResidualAbiParameter {
+                    name: parameter.name.clone(),
+                    kind: parameter.kind,
+                    ordinal: parameter.ordinal,
+                    flow_type: parameter.flow_type.clone(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            result: contract.result.clone(),
+            result_specialization: contract.result_specialization,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum OwnerResidualCallTarget {
+    Owner {
+        owner: StableCheckOwnerKey,
+    },
+    Abi {
+        canonical_name: String,
+        contract: OwnerResidualAbiContract,
+    },
+    Unresolved,
+    Ambiguous {
+        candidates: Box<[StableCheckOwnerKey]>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct OwnerResidualNode {
+    pub(crate) expression: StableExpressionKey,
+    pub(crate) flow_type: FlowType,
+    pub(crate) static_number: Option<String>,
+    pub(crate) kind: OwnerConstraintNodeKind,
+    pub(crate) inputs: Box<[OwnerResidualInput]>,
+    pub(crate) parameter_read: Option<OwnerResidualParameterRead>,
+    pub(crate) call_target: Option<OwnerResidualCallTarget>,
+}
+
+/// Unsealed result-semantics draft produced beside one public interface.
+/// Stable syntax identities and generic constraint roles are consumed by the
+/// residual compiler and never survive in a published transfer module.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum OwnerResidualDraft {
+    Principal,
+    Parameter {
+        read: OwnerResidualParameterRead,
+    },
+    Expression {
+        root: OwnerResidualExpressionRef,
+        nodes: Box<[OwnerResidualNode]>,
+    },
+}
+
+type OwnerResidualOpId = u32;
+type OwnerResidualFrameId = u32;
+type OwnerResidualNamespaceId = u32;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum OwnerResidualFrameInput {
+    ExternalArgument { ordinal: u32 },
+    ExternalContext,
+    Value { op: OwnerResidualOpId },
+    InheritedContext { frame: OwnerResidualFrameId },
+    Missing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerResidualFrameParameter {
+    ordinal: u32,
+    flow_type: FlowType,
+    input: OwnerResidualFrameInput,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerResidualFrameContext {
+    flow_type: FlowType,
+    input: OwnerResidualFrameInput,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerResidualFrame {
+    namespace: OwnerResidualNamespaceId,
+    parameters: Box<[OwnerResidualFrameParameter]>,
+    context: Option<OwnerResidualFrameContext>,
+    result: FlowType,
+    result_flush_type: Option<Type>,
+    type_variables: Box<[TypeVar]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum OwnerResidualRoot {
+    Principal {
+        frame: OwnerResidualFrameId,
+    },
+    Parameter {
+        frame: OwnerResidualFrameId,
+        read: OwnerResidualParameterRead,
+    },
+    Value {
+        frame: OwnerResidualFrameId,
+        op: OwnerResidualOpId,
+    },
+}
+
+impl OwnerResidualRoot {
+    const fn frame(&self) -> OwnerResidualFrameId {
+        match self {
+            Self::Principal { frame }
+            | Self::Parameter { frame, .. }
+            | Self::Value { frame, .. } => *frame,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerResidualActual {
+    formal_ordinal: u32,
+    value: OwnerResidualOpId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerResidualRecordField {
+    name: String,
+    value: OwnerResidualOpId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerResidualWhenArm {
+    pattern: crate::OwnerPatternConstraint,
+    output: OwnerResidualOpId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerResidualBlockBinding {
+    name: String,
+    value: OwnerResidualOpId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum OwnerResidualOpKind {
+    Fallback,
+    Surface {
+        namespace: OwnerResidualNamespaceId,
+    },
+    ParameterRead {
+        parameter_ordinal: u32,
+        projection: Box<[String]>,
+    },
+    LexicalRead {
+        parts: Box<[String]>,
+    },
+    InlinedRoot {
+        root: OwnerResidualRoot,
+    },
+    RecursiveCall {
+        root: OwnerResidualRoot,
+    },
+    AbiCall {
+        canonical_name: String,
+        contract: OwnerResidualAbiContract,
+        actuals: Box<[OwnerResidualActual]>,
+    },
+    Infix {
+        operation: String,
+        left: OwnerResidualOpId,
+        right: OwnerResidualOpId,
+    },
+    Record {
+        tag: Option<String>,
+        fields: Box<[OwnerResidualRecordField]>,
+    },
+    When {
+        selector: OwnerResidualOpId,
+        arms: Box<[OwnerResidualWhenArm]>,
+    },
+    Forward {
+        output: Option<OwnerResidualOpId>,
+    },
+    Block {
+        bindings: Box<[OwnerResidualBlockBinding]>,
+        result: Option<OwnerResidualOpId>,
+    },
+    Collection {
+        collection: OwnerCollectionKind,
+        items: Box<[OwnerResidualOpId]>,
+    },
+    Latest {
+        branches: Box<[OwnerResidualOpId]>,
+    },
+    Draining {
+        input: Option<OwnerResidualOpId>,
+    },
+    Hold {
+        initial: Option<OwnerResidualOpId>,
+        updates: Box<[OwnerResidualOpId]>,
+    },
+    Then {
+        value: Option<OwnerResidualOpId>,
+    },
+    MapEntry {
+        key: Option<OwnerResidualOpId>,
+        value: Option<OwnerResidualOpId>,
+    },
+    Source,
+    Skip,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerResidualOp {
+    frame: OwnerResidualFrameId,
+    fallback: FlowType,
+    static_number: Option<ExactNumber>,
+    kind: OwnerResidualOpKind,
+}
+
+impl OwnerResidualOpKind {
+    fn edge_count(&self) -> u64 {
+        match self {
+            Self::Fallback
+            | Self::Surface { .. }
+            | Self::ParameterRead { .. }
+            | Self::LexicalRead { .. }
+            | Self::Source
+            | Self::Skip => 0,
+            Self::InlinedRoot { .. } | Self::RecursiveCall { .. } => 1,
+            Self::AbiCall { actuals, .. } => actuals.len() as u64,
+            Self::Infix { .. } | Self::MapEntry { .. } => 2,
+            Self::Record { fields, .. } => fields.len() as u64,
+            Self::When { arms, .. } => 1_u64.saturating_add(arms.len() as u64),
+            Self::Forward { output }
+            | Self::Draining { input: output }
+            | Self::Then { value: output } => u64::from(output.is_some()),
+            Self::Block { bindings, result } => {
+                (bindings.len() as u64).saturating_add(u64::from(result.is_some()))
+            }
+            Self::Collection { items, .. } => items.len() as u64,
+            Self::Latest { branches } => branches.len() as u64,
+            Self::Hold { initial, updates } => {
+                u64::from(initial.is_some()).saturating_add(updates.len() as u64)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct OwnerResidualOwnerProgram {
+    namespaces: Box<[u32]>,
+    frames: Box<[OwnerResidualFrame]>,
+    ops: Box<[OwnerResidualOp]>,
+    root: OwnerResidualRoot,
+    invocation_invariant: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnerResidualProgram {
+    owners: Box<[OwnerResidualOwnerProgram]>,
+    op_count: u64,
+    edge_count: u64,
+    fingerprint_v1: [u8; 32],
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OwnerInterfaceTransferRoute {
     Own,
     Dependency(u32),
-}
-
-/// Dense, module-sealed route used only by the result-transfer interpreter.
-/// Stable owners remain the serialized/public identity; the module resolves
-/// them once instead of comparing full routes at every nested call.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PreparedOwnerInterfaceTransferRoute {
-    Own(u32),
-    Dependency { dependency: u32, owner: u32 },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PreparedOwnerResultExpressionRef {
-    Local(u32),
-    Child(PreparedOwnerInterfaceTransferRoute),
-}
-
-#[derive(Clone)]
-struct PreparedOwnerResultTransferNode {
-    input_start: u32,
-    input_len: u32,
-    call_owner: Option<PreparedOwnerInterfaceTransferRoute>,
-}
-
-#[derive(Clone)]
-struct PreparedOwnerResultTransfer {
-    root: Option<PreparedOwnerResultExpressionRef>,
-    nodes: Box<[PreparedOwnerResultTransferNode]>,
-    inputs: Box<[PreparedOwnerResultExpressionRef]>,
-}
-
-impl PreparedOwnerResultTransfer {
-    fn node_inputs(
-        &self,
-        node: &PreparedOwnerResultTransferNode,
-    ) -> Option<&[PreparedOwnerResultExpressionRef]> {
-        let start = node.input_start as usize;
-        let end = start.checked_add(node.input_len as usize)?;
-        self.inputs.get(start..end)
-    }
 }
 
 /// Shared result-specialization module for one interface SCC.
@@ -131,8 +408,7 @@ pub struct OwnerInterfaceTransferModule {
     key: OwnerInterfaceSccKey,
     result: Arc<OwnerInterfaceSccResult>,
     dependencies: Box<[Arc<OwnerInterfaceTransferModule>]>,
-    routes: BTreeMap<StableCheckOwnerKey, OwnerInterfaceTransferRoute>,
-    prepared: Box<[PreparedOwnerResultTransfer]>,
+    program: Arc<OwnerResidualProgram>,
     constant_results: Box<[Option<EvaluatedResultValue>]>,
     fingerprint_v1: [u8; 32],
 }
@@ -163,6 +439,14 @@ impl PartialEq for OwnerInterfaceTransferModule {
 
 impl Eq for OwnerInterfaceTransferModule {}
 
+impl std::ops::Deref for OwnerInterfaceTransferModule {
+    type Target = OwnerInterfaceSccResult;
+
+    fn deref(&self) -> &Self::Target {
+        &self.result
+    }
+}
+
 impl OwnerInterfaceTransferModule {
     pub fn key(&self) -> &OwnerInterfaceSccKey {
         &self.key
@@ -170,6 +454,10 @@ impl OwnerInterfaceTransferModule {
 
     pub const fn fingerprint_v1(&self) -> [u8; 32] {
         self.fingerprint_v1
+    }
+
+    pub fn direct_dependency_keys(&self) -> impl Iterator<Item = &OwnerInterfaceSccKey> {
+        self.dependencies.iter().map(|dependency| &dependency.key)
     }
 
     pub(crate) fn owns_owner(&self, owner: &StableCheckOwnerKey) -> bool {
@@ -180,193 +468,31 @@ impl OwnerInterfaceTransferModule {
         &self.result
     }
 
-    fn prepared_route(
-        &self,
-        owner: &StableCheckOwnerKey,
-    ) -> Option<PreparedOwnerInterfaceTransferRoute> {
-        match self.routes.get(owner)? {
-            OwnerInterfaceTransferRoute::Own => {
-                let owner = self.result.key.members.binary_search(owner).ok()?;
-                Some(PreparedOwnerInterfaceTransferRoute::Own(
-                    u32::try_from(owner).ok()?,
-                ))
-            }
-            OwnerInterfaceTransferRoute::Dependency(dependency) => {
-                let module = self.dependencies.get(*dependency as usize)?;
-                let owner = module.result.key.members.binary_search(owner).ok()?;
-                Some(PreparedOwnerInterfaceTransferRoute::Dependency {
-                    dependency: *dependency,
-                    owner: u32::try_from(owner).ok()?,
-                })
-            }
-        }
-    }
-
-    fn resolve_prepared_owner(
-        &self,
-        route: PreparedOwnerInterfaceTransferRoute,
-    ) -> Option<(
-        &OwnerInterfaceTransferModule,
-        usize,
-        &OwnerPublicInterface,
-        &PreparedOwnerResultTransfer,
-    )> {
-        let (module, owner) = match route {
-            PreparedOwnerInterfaceTransferRoute::Own(owner) => (self, owner as usize),
-            PreparedOwnerInterfaceTransferRoute::Dependency { dependency, owner } => (
-                self.dependencies.get(dependency as usize)?.as_ref(),
-                owner as usize,
-            ),
-        };
-        Some((
-            module,
-            owner,
-            module.result.owners.get(owner)?,
-            module.prepared.get(owner)?,
-        ))
-    }
-
-    #[cfg(test)]
-    fn own_prepared_owner(
-        &self,
-        owner: &StableCheckOwnerKey,
-    ) -> Option<(usize, &OwnerPublicInterface, &PreparedOwnerResultTransfer)> {
-        let owner = self.result.key.members.binary_search(owner).ok()?;
-        Some((
-            owner,
-            self.result.owners.get(owner)?,
-            self.prepared.get(owner)?,
-        ))
-    }
-
     fn constant_result_at(&self, owner: usize) -> Option<&EvaluatedResultValue> {
         self.constant_results.get(owner)?.as_ref()
     }
 
+    fn residual_work_for_owner(&self, owner: &StableCheckOwnerKey) -> Option<(u64, u64)> {
+        let owner = self.result.key.members.binary_search(owner).ok()?;
+        let program = self.program.owners.get(owner)?;
+        Some((
+            program.ops.len() as u64,
+            program.ops.iter().map(|op| op.kind.edge_count()).sum(),
+        ))
+    }
+
     #[cfg(test)]
     fn constant_result(&self, owner: &StableCheckOwnerKey) -> Option<&EvaluatedResultValue> {
-        let route = self.prepared_route(owner)?;
-        let (module, owner, _, _) = self.resolve_prepared_owner(route)?;
-        module.constant_result_at(owner)
+        let owner = self.result.key.members.binary_search(owner).ok()?;
+        self.constant_result_at(owner)
     }
 }
 
-fn prepare_owner_result_expression_ref(
-    module: &OwnerInterfaceTransferModule,
-    local_nodes: &BTreeMap<StableExpressionKey, u32>,
-    reference: &OwnerResultExpressionRef,
-) -> Result<PreparedOwnerResultExpressionRef, OwnerBodyInferenceError> {
-    match reference {
-        OwnerResultExpressionRef::Local { expression } => local_nodes
-            .get(expression)
-            .copied()
-            .map(PreparedOwnerResultExpressionRef::Local)
-            .ok_or_else(|| {
-                OwnerBodyInferenceError::new(format!(
-                    "owner result transfer references missing local expression {expression:?}"
-                ))
-            }),
-        OwnerResultExpressionRef::Child { owner, .. } => module
-            .prepared_route(owner)
-            .map(PreparedOwnerResultExpressionRef::Child)
-            .ok_or_else(|| {
-                OwnerBodyInferenceError::new(format!(
-                    "owner result transfer references missing child owner {owner:?}"
-                ))
-            }),
-    }
-}
-
-fn prepare_owner_result_transfer(
-    module: &OwnerInterfaceTransferModule,
+fn owner_result_transfer_is_invocation_invariant(
     interface: &OwnerPublicInterface,
-) -> Result<PreparedOwnerResultTransfer, OwnerBodyInferenceError> {
-    let OwnerResultTransfer::Expression { root, nodes } = &interface.result_transfer else {
-        return Ok(PreparedOwnerResultTransfer {
-            root: None,
-            nodes: Box::new([]),
-            inputs: Box::new([]),
-        });
-    };
-    let mut local_nodes = BTreeMap::new();
-    for (index, node) in nodes.iter().enumerate() {
-        let index = u32::try_from(index).map_err(|_| {
-            OwnerBodyInferenceError::new("owner result transfer node count exceeds u32")
-        })?;
-        if local_nodes.insert(node.expression.clone(), index).is_some() {
-            return Err(OwnerBodyInferenceError::new(format!(
-                "owner result transfer for {:?} repeats a local expression",
-                interface.owner
-            )));
-        }
-    }
-    let root = Some(prepare_owner_result_expression_ref(
-        module,
-        &local_nodes,
-        root,
-    )?);
-    let mut prepared_inputs = Vec::new();
-    let nodes = nodes
-        .iter()
-        .map(|node| {
-            let input_start = u32::try_from(prepared_inputs.len()).map_err(|_| {
-                OwnerBodyInferenceError::new("owner result transfer input count exceeds u32")
-            })?;
-            for input in &node.inputs {
-                prepared_inputs.push(prepare_owner_result_expression_ref(
-                    module,
-                    &local_nodes,
-                    &input.expression,
-                )?);
-            }
-            let input_len = u32::try_from(node.inputs.len()).map_err(|_| {
-                OwnerBodyInferenceError::new("owner result transfer node input count exceeds u32")
-            })?;
-            let call_owner = match &node.call_target {
-                Some(OwnerResultCallTarget::Owner { owner }) => {
-                    Some(module.prepared_route(owner).ok_or_else(|| {
-                        OwnerBodyInferenceError::new(format!(
-                            "owner result transfer for {:?} calls missing owner {owner:?}",
-                            interface.owner
-                        ))
-                    })?)
-                }
-                Some(
-                    OwnerResultCallTarget::Abi { .. }
-                    | OwnerResultCallTarget::Unresolved
-                    | OwnerResultCallTarget::Ambiguous { .. },
-                )
-                | None => None,
-            };
-            Ok(PreparedOwnerResultTransferNode {
-                input_start,
-                input_len,
-                call_owner,
-            })
-        })
-        .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
-        .into_boxed_slice();
-    Ok(PreparedOwnerResultTransfer {
-        root,
-        nodes,
-        inputs: prepared_inputs.into_boxed_slice(),
-    })
-}
-
-fn prepare_owner_result_transfers(
-    module: &OwnerInterfaceTransferModule,
-) -> Result<Box<[PreparedOwnerResultTransfer]>, OwnerBodyInferenceError> {
-    module
-        .result
-        .owners
-        .iter()
-        .map(|interface| prepare_owner_result_transfer(module, interface))
-        .collect::<Result<Vec<_>, _>>()
-        .map(Vec::into_boxed_slice)
-}
-
-fn owner_result_transfer_is_invocation_invariant(interface: &OwnerPublicInterface) -> bool {
-    let OwnerResultTransfer::Expression { nodes, .. } = &interface.result_transfer else {
+    draft: &OwnerResidualDraft,
+) -> bool {
+    let OwnerResidualDraft::Expression { nodes, .. } = draft else {
         return false;
     };
     if nodes.iter().any(|node| node.parameter_read.is_some()) {
@@ -432,55 +558,1007 @@ fn owner_result_transfer_type_variables_are_declared(ty: &Type, declared: &[Type
 
 fn owner_result_transfer_interface_variables_are_complete(
     interface: &OwnerPublicInterface,
+    draft: &OwnerResidualDraft,
+    residual_type_variable_count: u32,
 ) -> bool {
-    let declared = &interface.type_variables;
-    declared.windows(2).all(|pair| pair[0] < pair[1])
+    let declared = (0..residual_type_variable_count)
+        .map(TypeVar)
+        .collect::<Vec<_>>();
+    interface
+        .type_variables
+        .windows(2)
+        .all(|pair| pair[0] < pair[1])
         && interface.parameters.iter().all(|parameter| {
-            owner_result_transfer_type_variables_are_declared(&parameter.flow_type.ty, declared)
+            owner_result_transfer_type_variables_are_declared(&parameter.flow_type.ty, &declared)
         })
         && interface.context.as_ref().is_none_or(|context| {
-            owner_result_transfer_type_variables_are_declared(&context.flow_type.ty, declared)
+            owner_result_transfer_type_variables_are_declared(&context.flow_type.ty, &declared)
         })
-        && owner_result_transfer_type_variables_are_declared(&interface.result.ty, declared)
+        && owner_result_transfer_type_variables_are_declared(&interface.result.ty, &declared)
         && interface
             .result_flush_type
             .as_ref()
-            .is_none_or(|ty| owner_result_transfer_type_variables_are_declared(ty, declared))
+            .is_none_or(|ty| owner_result_transfer_type_variables_are_declared(ty, &declared))
         && interface.captures.iter().all(|capture| {
-            owner_result_transfer_type_variables_are_declared(&capture.flow_type.ty, declared)
+            owner_result_transfer_type_variables_are_declared(&capture.flow_type.ty, &declared)
                 && capture.flush_type.as_ref().is_none_or(|ty| {
-                    owner_result_transfer_type_variables_are_declared(ty, declared)
+                    owner_result_transfer_type_variables_are_declared(ty, &declared)
                 })
         })
         && interface.lexical_captures.iter().all(|capture| {
-            owner_result_transfer_type_variables_are_declared(&capture.flow_type.ty, declared)
+            owner_result_transfer_type_variables_are_declared(&capture.flow_type.ty, &declared)
         })
-        && match &interface.result_transfer {
-            OwnerResultTransfer::Principal | OwnerResultTransfer::Parameter { .. } => true,
-            OwnerResultTransfer::Expression { nodes, .. } => nodes.iter().all(|node| {
-                owner_result_transfer_type_variables_are_declared(&node.flow_type.ty, declared)
+        && match draft {
+            OwnerResidualDraft::Principal | OwnerResidualDraft::Parameter { .. } => true,
+            OwnerResidualDraft::Expression { nodes, .. } => nodes.iter().all(|node| {
+                owner_result_transfer_type_variables_are_declared(&node.flow_type.ty, &declared)
             }),
         }
 }
 
+struct OwnerResidualProgramBuilder<'a> {
+    result: &'a OwnerInterfaceSccResult,
+    drafts: &'a [OwnerResidualDraft],
+    residual_type_variable_count: u32,
+    dependencies: &'a [Arc<OwnerInterfaceTransferModule>],
+    routes: &'a BTreeMap<StableCheckOwnerKey, OwnerInterfaceTransferRoute>,
+    namespaces: Vec<u32>,
+    frames: Vec<OwnerResidualFrame>,
+    ops: Vec<Option<OwnerResidualOp>>,
+    surfaces: BTreeMap<(OwnerResidualFrameId, StableCheckOwnerKey), OwnerResidualOpId>,
+    dependency_surface_namespaces: BTreeMap<(OwnerResidualFrameId, u32), OwnerResidualNamespaceId>,
+}
+
+impl<'a> OwnerResidualProgramBuilder<'a> {
+    fn new(
+        result: &'a OwnerInterfaceSccResult,
+        drafts: &'a [OwnerResidualDraft],
+        residual_type_variable_count: u32,
+        dependencies: &'a [Arc<OwnerInterfaceTransferModule>],
+        routes: &'a BTreeMap<StableCheckOwnerKey, OwnerInterfaceTransferRoute>,
+    ) -> Self {
+        Self {
+            result,
+            drafts,
+            residual_type_variable_count,
+            dependencies,
+            routes,
+            namespaces: Vec::new(),
+            frames: Vec::new(),
+            ops: Vec::new(),
+            surfaces: BTreeMap::new(),
+            dependency_surface_namespaces: BTreeMap::new(),
+        }
+    }
+
+    fn push_namespace(
+        &mut self,
+        count: u32,
+    ) -> Result<OwnerResidualNamespaceId, OwnerBodyInferenceError> {
+        let id = checked_u32(self.namespaces.len(), "owner residual namespace count")?;
+        self.namespaces.push(count);
+        Ok(id)
+    }
+
+    fn push_frame(
+        &mut self,
+        interface: &OwnerPublicInterface,
+        namespace: OwnerResidualNamespaceId,
+        argument_inputs: Option<&BTreeMap<u32, OwnerResidualOpId>>,
+        context_input: Option<OwnerResidualFrameInput>,
+    ) -> Result<OwnerResidualFrameId, OwnerBodyInferenceError> {
+        let frame = checked_u32(self.frames.len(), "owner residual frame count")?;
+        let parameters = interface
+            .parameters
+            .iter()
+            .map(|parameter| OwnerResidualFrameParameter {
+                ordinal: parameter.ordinal,
+                flow_type: parameter.flow_type.clone(),
+                input: argument_inputs.map_or(
+                    OwnerResidualFrameInput::ExternalArgument {
+                        ordinal: parameter.ordinal,
+                    },
+                    |inputs| {
+                        inputs
+                            .get(&parameter.ordinal)
+                            .copied()
+                            .map_or(OwnerResidualFrameInput::Missing, |op| {
+                                OwnerResidualFrameInput::Value { op }
+                            })
+                    },
+                ),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let context = interface
+            .context
+            .as_ref()
+            .map(|context| OwnerResidualFrameContext {
+                flow_type: context.flow_type.clone(),
+                input: context_input.unwrap_or(OwnerResidualFrameInput::ExternalContext),
+            });
+        self.frames.push(OwnerResidualFrame {
+            namespace,
+            parameters,
+            context,
+            result: interface.result.clone(),
+            result_flush_type: interface.result_flush_type.clone(),
+            type_variables: interface.type_variables.clone(),
+        });
+        Ok(frame)
+    }
+
+    fn push_op(
+        &mut self,
+        op: OwnerResidualOp,
+    ) -> Result<OwnerResidualOpId, OwnerBodyInferenceError> {
+        let id = checked_u32(self.ops.len(), "owner residual op count")?;
+        self.ops.push(Some(op));
+        Ok(id)
+    }
+
+    fn reserve_op(&mut self) -> Result<OwnerResidualOpId, OwnerBodyInferenceError> {
+        let id = checked_u32(self.ops.len(), "owner residual op count")?;
+        self.ops.push(None);
+        Ok(id)
+    }
+
+    fn dependency_owner(
+        &self,
+        dependency: u32,
+        owner: &StableCheckOwnerKey,
+    ) -> Result<(&OwnerInterfaceTransferModule, usize), OwnerBodyInferenceError> {
+        let module = self.dependencies.get(dependency as usize).ok_or_else(|| {
+            OwnerBodyInferenceError::new("owner residual references a missing dependency module")
+        })?;
+        let owner_index = module
+            .result
+            .key
+            .members
+            .binary_search(owner)
+            .map_err(|_| {
+                OwnerBodyInferenceError::new(format!(
+                    "owner residual dependency {:?} does not own {owner:?}",
+                    module.key
+                ))
+            })?;
+        Ok((module, owner_index))
+    }
+
+    fn compile_reference(
+        &mut self,
+        frame: OwnerResidualFrameId,
+        local_ops: &BTreeMap<StableExpressionKey, OwnerResidualOpId>,
+        reference: &OwnerResidualExpressionRef,
+    ) -> Result<OwnerResidualOpId, OwnerBodyInferenceError> {
+        match reference {
+            OwnerResidualExpressionRef::Local { expression } => {
+                local_ops.get(expression).copied().ok_or_else(|| {
+                    OwnerBodyInferenceError::new(format!(
+                        "owner residual references missing local expression {expression:?}"
+                    ))
+                })
+            }
+            OwnerResidualExpressionRef::Child { owner, .. } => {
+                if let Some(op) = self.surfaces.get(&(frame, owner.clone())).copied() {
+                    return Ok(op);
+                }
+                let (namespace, flow_type) = match self.routes.get(owner).copied() {
+                    Some(OwnerInterfaceTransferRoute::Own) => {
+                        let interface = self.result.owner(owner).ok_or_else(|| {
+                            OwnerBodyInferenceError::new(format!(
+                                "owner residual lost same-component child {owner:?}"
+                            ))
+                        })?;
+                        let namespace = self
+                            .frames
+                            .get(frame as usize)
+                            .ok_or_else(|| {
+                                OwnerBodyInferenceError::new("owner residual child has no frame")
+                            })?
+                            .namespace;
+                        (namespace, interface.result.clone())
+                    }
+                    Some(OwnerInterfaceTransferRoute::Dependency(dependency)) => {
+                        let (module, owner_index) = self.dependency_owner(dependency, owner)?;
+                        let flow_type = module.result.owners[owner_index].result.clone();
+                        let key = (frame, dependency);
+                        let namespace = if let Some(namespace) =
+                            self.dependency_surface_namespaces.get(&key).copied()
+                        {
+                            namespace
+                        } else {
+                            let namespace =
+                                self.push_namespace(module.result.type_variable_count)?;
+                            self.dependency_surface_namespaces.insert(key, namespace);
+                            namespace
+                        };
+                        (namespace, flow_type)
+                    }
+                    None => {
+                        return Err(OwnerBodyInferenceError::new(format!(
+                            "owner residual references undeclared child owner {owner:?}"
+                        )));
+                    }
+                };
+                let op = self.push_op(OwnerResidualOp {
+                    frame,
+                    fallback: flow_type,
+                    static_number: None,
+                    kind: OwnerResidualOpKind::Surface { namespace },
+                })?;
+                self.surfaces.insert((frame, owner.clone()), op);
+                Ok(op)
+            }
+        }
+    }
+
+    fn remap_op(
+        op: OwnerResidualOpId,
+        offset: OwnerResidualOpId,
+    ) -> Result<OwnerResidualOpId, OwnerBodyInferenceError> {
+        op.checked_add(offset)
+            .ok_or_else(|| OwnerBodyInferenceError::new("owner residual op relocation overflowed"))
+    }
+
+    fn remap_frame(
+        frame: OwnerResidualFrameId,
+        offset: OwnerResidualFrameId,
+    ) -> Result<OwnerResidualFrameId, OwnerBodyInferenceError> {
+        frame.checked_add(offset).ok_or_else(|| {
+            OwnerBodyInferenceError::new("owner residual frame relocation overflowed")
+        })
+    }
+
+    fn remap_namespace(
+        namespace: OwnerResidualNamespaceId,
+        offset: OwnerResidualNamespaceId,
+    ) -> Result<OwnerResidualNamespaceId, OwnerBodyInferenceError> {
+        namespace.checked_add(offset).ok_or_else(|| {
+            OwnerBodyInferenceError::new("owner residual namespace relocation overflowed")
+        })
+    }
+
+    fn remap_root(
+        root: &OwnerResidualRoot,
+        op_offset: OwnerResidualOpId,
+        frame_offset: OwnerResidualFrameId,
+    ) -> Result<OwnerResidualRoot, OwnerBodyInferenceError> {
+        Ok(match root {
+            OwnerResidualRoot::Principal { frame } => OwnerResidualRoot::Principal {
+                frame: Self::remap_frame(*frame, frame_offset)?,
+            },
+            OwnerResidualRoot::Parameter { frame, read } => OwnerResidualRoot::Parameter {
+                frame: Self::remap_frame(*frame, frame_offset)?,
+                read: read.clone(),
+            },
+            OwnerResidualRoot::Value { frame, op } => OwnerResidualRoot::Value {
+                frame: Self::remap_frame(*frame, frame_offset)?,
+                op: Self::remap_op(*op, op_offset)?,
+            },
+        })
+    }
+
+    fn remap_input(
+        input: &OwnerResidualFrameInput,
+        op_offset: OwnerResidualOpId,
+        frame_offset: OwnerResidualFrameId,
+    ) -> Result<OwnerResidualFrameInput, OwnerBodyInferenceError> {
+        Ok(match input {
+            OwnerResidualFrameInput::ExternalArgument { ordinal } => {
+                OwnerResidualFrameInput::ExternalArgument { ordinal: *ordinal }
+            }
+            OwnerResidualFrameInput::ExternalContext => OwnerResidualFrameInput::ExternalContext,
+            OwnerResidualFrameInput::Value { op } => OwnerResidualFrameInput::Value {
+                op: Self::remap_op(*op, op_offset)?,
+            },
+            OwnerResidualFrameInput::InheritedContext { frame } => {
+                OwnerResidualFrameInput::InheritedContext {
+                    frame: Self::remap_frame(*frame, frame_offset)?,
+                }
+            }
+            OwnerResidualFrameInput::Missing => OwnerResidualFrameInput::Missing,
+        })
+    }
+
+    fn remap_kind(
+        kind: &OwnerResidualOpKind,
+        op_offset: OwnerResidualOpId,
+        frame_offset: OwnerResidualFrameId,
+        namespace_offset: OwnerResidualNamespaceId,
+    ) -> Result<OwnerResidualOpKind, OwnerBodyInferenceError> {
+        let op = |value| Self::remap_op(value, op_offset);
+        Ok(match kind {
+            OwnerResidualOpKind::Fallback => OwnerResidualOpKind::Fallback,
+            OwnerResidualOpKind::Surface { namespace } => OwnerResidualOpKind::Surface {
+                namespace: Self::remap_namespace(*namespace, namespace_offset)?,
+            },
+            OwnerResidualOpKind::ParameterRead {
+                parameter_ordinal,
+                projection,
+            } => OwnerResidualOpKind::ParameterRead {
+                parameter_ordinal: *parameter_ordinal,
+                projection: projection.clone(),
+            },
+            OwnerResidualOpKind::LexicalRead { parts } => OwnerResidualOpKind::LexicalRead {
+                parts: parts.clone(),
+            },
+            OwnerResidualOpKind::InlinedRoot { root } => OwnerResidualOpKind::InlinedRoot {
+                root: Self::remap_root(root, op_offset, frame_offset)?,
+            },
+            OwnerResidualOpKind::RecursiveCall { root } => OwnerResidualOpKind::RecursiveCall {
+                root: Self::remap_root(root, op_offset, frame_offset)?,
+            },
+            OwnerResidualOpKind::AbiCall {
+                canonical_name,
+                contract,
+                actuals,
+            } => OwnerResidualOpKind::AbiCall {
+                canonical_name: canonical_name.clone(),
+                contract: contract.clone(),
+                actuals: actuals
+                    .iter()
+                    .map(|actual| {
+                        Ok(OwnerResidualActual {
+                            formal_ordinal: actual.formal_ordinal,
+                            value: op(actual.value)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
+                    .into_boxed_slice(),
+            },
+            OwnerResidualOpKind::Infix {
+                operation,
+                left,
+                right,
+            } => OwnerResidualOpKind::Infix {
+                operation: operation.clone(),
+                left: op(*left)?,
+                right: op(*right)?,
+            },
+            OwnerResidualOpKind::Record { tag, fields } => OwnerResidualOpKind::Record {
+                tag: tag.clone(),
+                fields: fields
+                    .iter()
+                    .map(|field| {
+                        Ok(OwnerResidualRecordField {
+                            name: field.name.clone(),
+                            value: op(field.value)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
+                    .into_boxed_slice(),
+            },
+            OwnerResidualOpKind::When { selector, arms } => OwnerResidualOpKind::When {
+                selector: op(*selector)?,
+                arms: arms
+                    .iter()
+                    .map(|arm| {
+                        Ok(OwnerResidualWhenArm {
+                            pattern: arm.pattern.clone(),
+                            output: op(arm.output)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
+                    .into_boxed_slice(),
+            },
+            OwnerResidualOpKind::Forward { output } => OwnerResidualOpKind::Forward {
+                output: output.map(op).transpose()?,
+            },
+            OwnerResidualOpKind::Block { bindings, result } => OwnerResidualOpKind::Block {
+                bindings: bindings
+                    .iter()
+                    .map(|binding| {
+                        Ok(OwnerResidualBlockBinding {
+                            name: binding.name.clone(),
+                            value: op(binding.value)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
+                    .into_boxed_slice(),
+                result: result.map(op).transpose()?,
+            },
+            OwnerResidualOpKind::Collection { collection, items } => {
+                OwnerResidualOpKind::Collection {
+                    collection: *collection,
+                    items: items
+                        .iter()
+                        .copied()
+                        .map(op)
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_boxed_slice(),
+                }
+            }
+            OwnerResidualOpKind::Latest { branches } => OwnerResidualOpKind::Latest {
+                branches: branches
+                    .iter()
+                    .copied()
+                    .map(op)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_boxed_slice(),
+            },
+            OwnerResidualOpKind::Draining { input } => OwnerResidualOpKind::Draining {
+                input: input.map(op).transpose()?,
+            },
+            OwnerResidualOpKind::Hold { initial, updates } => OwnerResidualOpKind::Hold {
+                initial: initial.map(op).transpose()?,
+                updates: updates
+                    .iter()
+                    .copied()
+                    .map(op)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_boxed_slice(),
+            },
+            OwnerResidualOpKind::Then { value } => OwnerResidualOpKind::Then {
+                value: value.map(op).transpose()?,
+            },
+            OwnerResidualOpKind::MapEntry { key, value } => OwnerResidualOpKind::MapEntry {
+                key: key.map(op).transpose()?,
+                value: value.map(op).transpose()?,
+            },
+            OwnerResidualOpKind::Source => OwnerResidualOpKind::Source,
+            OwnerResidualOpKind::Skip => OwnerResidualOpKind::Skip,
+        })
+    }
+
+    fn inline_program(
+        &mut self,
+        source: &OwnerResidualOwnerProgram,
+        actuals: &BTreeMap<u32, OwnerResidualOpId>,
+        context: OwnerResidualFrameInput,
+    ) -> Result<OwnerResidualRoot, OwnerBodyInferenceError> {
+        let namespace_offset =
+            checked_u32(self.namespaces.len(), "owner residual namespace count")?;
+        let frame_offset = checked_u32(self.frames.len(), "owner residual frame count")?;
+        let op_offset = checked_u32(self.ops.len(), "owner residual op count")?;
+        self.namespaces.extend(source.namespaces.iter().copied());
+        let source_root_frame = source.root.frame();
+        for (index, source_frame) in source.frames.iter().enumerate() {
+            let is_root = index == source_root_frame as usize;
+            let parameters = source_frame
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    let input = if is_root {
+                        match parameter.input {
+                            OwnerResidualFrameInput::ExternalArgument { ordinal } => actuals
+                                .get(&ordinal)
+                                .copied()
+                                .map_or(OwnerResidualFrameInput::Missing, |op| {
+                                    OwnerResidualFrameInput::Value { op }
+                                }),
+                            _ => Self::remap_input(&parameter.input, op_offset, frame_offset)?,
+                        }
+                    } else {
+                        Self::remap_input(&parameter.input, op_offset, frame_offset)?
+                    };
+                    Ok(OwnerResidualFrameParameter {
+                        ordinal: parameter.ordinal,
+                        flow_type: parameter.flow_type.clone(),
+                        input,
+                    })
+                })
+                .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
+                .into_boxed_slice();
+            let frame_context = source_frame
+                .context
+                .as_ref()
+                .map(|source_context| {
+                    let input = if is_root
+                        && matches!(
+                            source_context.input,
+                            OwnerResidualFrameInput::ExternalContext
+                        ) {
+                        context.clone()
+                    } else {
+                        Self::remap_input(&source_context.input, op_offset, frame_offset)?
+                    };
+                    Ok(OwnerResidualFrameContext {
+                        flow_type: source_context.flow_type.clone(),
+                        input,
+                    })
+                })
+                .transpose()?;
+            self.frames.push(OwnerResidualFrame {
+                namespace: Self::remap_namespace(source_frame.namespace, namespace_offset)?,
+                parameters,
+                context: frame_context,
+                result: source_frame.result.clone(),
+                result_flush_type: source_frame.result_flush_type.clone(),
+                type_variables: source_frame.type_variables.clone(),
+            });
+        }
+        for source_op in &source.ops {
+            self.ops.push(Some(OwnerResidualOp {
+                frame: Self::remap_frame(source_op.frame, frame_offset)?,
+                fallback: source_op.fallback.clone(),
+                static_number: source_op.static_number.clone(),
+                kind: Self::remap_kind(&source_op.kind, op_offset, frame_offset, namespace_offset)?,
+            }));
+        }
+        Self::remap_root(&source.root, op_offset, frame_offset)
+    }
+
+    fn compile_call(
+        &mut self,
+        frame: OwnerResidualFrameId,
+        node: &OwnerResidualNode,
+        local_ops: &BTreeMap<StableExpressionKey, OwnerResidualOpId>,
+    ) -> Result<OwnerResidualOpKind, OwnerBodyInferenceError> {
+        let mut actuals = node
+            .inputs
+            .iter()
+            .filter_map(|input| {
+                input
+                    .formal_ordinal
+                    .map(|ordinal| (ordinal, &input.expression))
+            })
+            .map(|(ordinal, expression)| {
+                Ok((
+                    ordinal,
+                    self.compile_reference(frame, local_ops, expression)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, OwnerBodyInferenceError>>()?;
+        let explicit_context = node
+            .inputs
+            .iter()
+            .find(|input| input.explicit_pass)
+            .map(|input| self.compile_reference(frame, local_ops, &input.expression))
+            .transpose()?;
+        match node.call_target.as_ref() {
+            Some(OwnerResidualCallTarget::Owner { owner }) => {
+                let context = explicit_context
+                    .map_or(OwnerResidualFrameInput::InheritedContext { frame }, |op| {
+                        OwnerResidualFrameInput::Value { op }
+                    });
+                let kind = match self.routes.get(owner).copied() {
+                    Some(OwnerInterfaceTransferRoute::Own) => {
+                        let owner_index =
+                            self.result.key.members.binary_search(owner).map_err(|_| {
+                                OwnerBodyInferenceError::new(format!(
+                                    "owner residual recursive call lost target {owner:?}"
+                                ))
+                            })?;
+                        let interface = &self.result.owners[owner_index];
+                        let namespace = self.push_namespace(self.residual_type_variable_count)?;
+                        let frame =
+                            self.push_frame(interface, namespace, Some(&actuals), Some(context))?;
+                        OwnerResidualOpKind::RecursiveCall {
+                            root: OwnerResidualRoot::Principal { frame },
+                        }
+                    }
+                    Some(OwnerInterfaceTransferRoute::Dependency(dependency)) => {
+                        let (module, owner_index) = self.dependency_owner(dependency, owner)?;
+                        let source = module.program.owners.get(owner_index).cloned().ok_or_else(
+                            || {
+                                OwnerBodyInferenceError::new(format!(
+                                    "owner residual dependency {:?} has no program for {owner:?}",
+                                    module.key
+                                ))
+                            },
+                        )?;
+                        OwnerResidualOpKind::InlinedRoot {
+                            root: self.inline_program(&source, &actuals, context)?,
+                        }
+                    }
+                    None => {
+                        return Err(OwnerBodyInferenceError::new(format!(
+                            "owner residual call references undeclared owner {owner:?}"
+                        )));
+                    }
+                };
+                Ok(kind)
+            }
+            Some(OwnerResidualCallTarget::Abi {
+                canonical_name,
+                contract,
+            }) => Ok(OwnerResidualOpKind::AbiCall {
+                canonical_name: canonical_name.clone(),
+                contract: contract.clone(),
+                actuals: std::mem::take(&mut actuals)
+                    .into_iter()
+                    .map(|(formal_ordinal, value)| OwnerResidualActual {
+                        formal_ordinal,
+                        value,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            }),
+            Some(
+                OwnerResidualCallTarget::Unresolved | OwnerResidualCallTarget::Ambiguous { .. },
+            )
+            | None => Ok(OwnerResidualOpKind::Fallback),
+        }
+    }
+
+    fn compile_node(
+        &mut self,
+        frame: OwnerResidualFrameId,
+        node: &OwnerResidualNode,
+        source_nodes: &BTreeMap<StableExpressionKey, &OwnerResidualNode>,
+        local_ops: &BTreeMap<StableExpressionKey, OwnerResidualOpId>,
+    ) -> Result<OwnerResidualOp, OwnerBodyInferenceError> {
+        let reference = |builder: &mut Self, input: &OwnerResidualInput| {
+            builder.compile_reference(frame, local_ops, &input.expression)
+        };
+        let find = |builder: &mut Self,
+                    role: fn(&OwnerConstraintEdgeRole) -> bool|
+         -> Result<Option<OwnerResidualOpId>, OwnerBodyInferenceError> {
+            node.inputs
+                .iter()
+                .find(|input| role(&input.role))
+                .map(|input| reference(builder, input))
+                .transpose()
+        };
+        let kind = if let Some(read) = &node.parameter_read {
+            OwnerResidualOpKind::ParameterRead {
+                parameter_ordinal: read.parameter_ordinal,
+                projection: read.projection.clone(),
+            }
+        } else if let OwnerConstraintNodeKind::Reference { parts }
+        | OwnerConstraintNodeKind::Drain { parts } = &node.kind
+        {
+            OwnerResidualOpKind::LexicalRead {
+                parts: parts.clone(),
+            }
+        } else {
+            match &node.kind {
+                OwnerConstraintNodeKind::Call { .. } | OwnerConstraintNodeKind::Pipe { .. } => {
+                    self.compile_call(frame, node, local_ops)?
+                }
+                OwnerConstraintNodeKind::Infix { operation } => {
+                    let Some(left) = find(self, |role| {
+                        matches!(role, OwnerConstraintEdgeRole::InfixLeft)
+                    })?
+                    else {
+                        return Ok(OwnerResidualOp {
+                            frame,
+                            fallback: node.flow_type.clone(),
+                            static_number: None,
+                            kind: OwnerResidualOpKind::Fallback,
+                        });
+                    };
+                    let Some(right) = find(self, |role| {
+                        matches!(role, OwnerConstraintEdgeRole::InfixRight)
+                    })?
+                    else {
+                        return Ok(OwnerResidualOp {
+                            frame,
+                            fallback: node.flow_type.clone(),
+                            static_number: None,
+                            kind: OwnerResidualOpKind::Fallback,
+                        });
+                    };
+                    OwnerResidualOpKind::Infix {
+                        operation: operation.clone(),
+                        left,
+                        right,
+                    }
+                }
+                OwnerConstraintNodeKind::Record { tag } => OwnerResidualOpKind::Record {
+                    tag: tag.clone(),
+                    fields: node
+                        .inputs
+                        .iter()
+                        .filter_map(|input| match &input.role {
+                            OwnerConstraintEdgeRole::RecordField {
+                                name,
+                                spread: false,
+                            } => Some((name.clone(), &input.expression)),
+                            _ => None,
+                        })
+                        .map(|(name, expression)| {
+                            Ok(OwnerResidualRecordField {
+                                name,
+                                value: self.compile_reference(frame, local_ops, expression)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
+                        .into_boxed_slice(),
+                },
+                OwnerConstraintNodeKind::When => {
+                    let Some(selector) = find(self, |role| {
+                        matches!(role, OwnerConstraintEdgeRole::WhenInput)
+                    })?
+                    else {
+                        return Ok(OwnerResidualOp {
+                            frame,
+                            fallback: node.flow_type.clone(),
+                            static_number: None,
+                            kind: OwnerResidualOpKind::Fallback,
+                        });
+                    };
+                    let mut arms = Vec::new();
+                    for input in node
+                        .inputs
+                        .iter()
+                        .filter(|input| matches!(input.role, OwnerConstraintEdgeRole::WhenArm))
+                    {
+                        let OwnerResidualExpressionRef::Local { expression } = &input.expression
+                        else {
+                            continue;
+                        };
+                        let Some(arm) = source_nodes.get(expression).copied() else {
+                            continue;
+                        };
+                        let pattern = match &arm.kind {
+                            OwnerConstraintNodeKind::MatchArm { pattern }
+                            | OwnerConstraintNodeKind::Arrow { pattern } => pattern.clone(),
+                            _ => continue,
+                        };
+                        let Some(output) = arm.inputs.iter().find(|input| {
+                            matches!(
+                                input.role,
+                                OwnerConstraintEdgeRole::MatchOutput
+                                    | OwnerConstraintEdgeRole::ArrowOutput
+                            )
+                        }) else {
+                            continue;
+                        };
+                        arms.push(OwnerResidualWhenArm {
+                            pattern,
+                            output: self.compile_reference(frame, local_ops, &output.expression)?,
+                        });
+                    }
+                    OwnerResidualOpKind::When {
+                        selector,
+                        arms: arms.into_boxed_slice(),
+                    }
+                }
+                OwnerConstraintNodeKind::MatchArm { .. }
+                | OwnerConstraintNodeKind::Arrow { .. } => OwnerResidualOpKind::Forward {
+                    output: node
+                        .inputs
+                        .iter()
+                        .find(|input| {
+                            matches!(
+                                input.role,
+                                OwnerConstraintEdgeRole::MatchOutput
+                                    | OwnerConstraintEdgeRole::ArrowOutput
+                            )
+                        })
+                        .map(|input| reference(self, input))
+                        .transpose()?,
+                },
+                OwnerConstraintNodeKind::Block => OwnerResidualOpKind::Block {
+                    bindings: node
+                        .inputs
+                        .iter()
+                        .filter_map(|input| match &input.role {
+                            OwnerConstraintEdgeRole::BlockBinding { name } => {
+                                Some((name.clone(), input))
+                            }
+                            _ => None,
+                        })
+                        .map(|(name, input)| {
+                            Ok(OwnerResidualBlockBinding {
+                                name,
+                                value: reference(self, input)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
+                        .into_boxed_slice(),
+                    result: find(self, |role| {
+                        matches!(role, OwnerConstraintEdgeRole::BlockResult)
+                    })?,
+                },
+                OwnerConstraintNodeKind::Collection { collection, .. } => {
+                    OwnerResidualOpKind::Collection {
+                        collection: *collection,
+                        items: node
+                            .inputs
+                            .iter()
+                            .filter(|input| {
+                                matches!(
+                                    input.role,
+                                    OwnerConstraintEdgeRole::CollectionItem
+                                        | OwnerConstraintEdgeRole::MapEntry
+                                )
+                            })
+                            .map(|input| reference(self, input))
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into_boxed_slice(),
+                    }
+                }
+                OwnerConstraintNodeKind::Latest => OwnerResidualOpKind::Latest {
+                    branches: node
+                        .inputs
+                        .iter()
+                        .filter(|input| matches!(input.role, OwnerConstraintEdgeRole::LatestBranch))
+                        .map(|input| reference(self, input))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_boxed_slice(),
+                },
+                OwnerConstraintNodeKind::Draining => OwnerResidualOpKind::Draining {
+                    input: node
+                        .inputs
+                        .first()
+                        .map(|input| reference(self, input))
+                        .transpose()?,
+                },
+                OwnerConstraintNodeKind::Hold { .. } => OwnerResidualOpKind::Hold {
+                    initial: find(self, |role| {
+                        matches!(role, OwnerConstraintEdgeRole::HoldInitial)
+                    })?,
+                    updates: node
+                        .inputs
+                        .iter()
+                        .filter(|input| matches!(input.role, OwnerConstraintEdgeRole::HoldUpdate))
+                        .map(|input| reference(self, input))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_boxed_slice(),
+                },
+                OwnerConstraintNodeKind::Then => OwnerResidualOpKind::Then {
+                    value: find(self, |role| {
+                        matches!(role, OwnerConstraintEdgeRole::ThenOutput)
+                    })?
+                    .or(find(self, |role| {
+                        matches!(role, OwnerConstraintEdgeRole::ThenInput)
+                    })?),
+                },
+                OwnerConstraintNodeKind::MapEntry => OwnerResidualOpKind::MapEntry {
+                    key: find(self, |role| matches!(role, OwnerConstraintEdgeRole::MapKey))?,
+                    value: find(self, |role| {
+                        matches!(role, OwnerConstraintEdgeRole::MapValue)
+                    })?,
+                },
+                OwnerConstraintNodeKind::Source => OwnerResidualOpKind::Source,
+                OwnerConstraintNodeKind::Tag { name } if name == "SKIP" => {
+                    OwnerResidualOpKind::Skip
+                }
+                _ => OwnerResidualOpKind::Fallback,
+            }
+        };
+        let static_number = node
+            .static_number
+            .as_deref()
+            .map(|literal| {
+                ExactNumber::parse_strict(literal, None).map_err(|error| {
+                    OwnerBodyInferenceError::new(format!(
+                        "owner residual has invalid static number {literal:?}: {error}"
+                    ))
+                })
+            })
+            .transpose()?;
+        Ok(OwnerResidualOp {
+            frame,
+            fallback: node.flow_type.clone(),
+            static_number,
+            kind,
+        })
+    }
+
+    fn compile_owner(
+        mut self,
+        owner: usize,
+    ) -> Result<OwnerResidualOwnerProgram, OwnerBodyInferenceError> {
+        let interface = self.result.owners.get(owner).ok_or_else(|| {
+            OwnerBodyInferenceError::new("owner residual program lost its public interface")
+        })?;
+        let draft = self.drafts.get(owner).ok_or_else(|| {
+            OwnerBodyInferenceError::new("owner residual program lost its unsealed draft")
+        })?;
+        let namespace = self.push_namespace(self.residual_type_variable_count)?;
+        let frame = self.push_frame(interface, namespace, None, None)?;
+        let root = match draft {
+            OwnerResidualDraft::Principal => OwnerResidualRoot::Principal { frame },
+            OwnerResidualDraft::Parameter { read } => OwnerResidualRoot::Parameter {
+                frame,
+                read: read.clone(),
+            },
+            OwnerResidualDraft::Expression { root, nodes } => {
+                let mut local_ops = BTreeMap::new();
+                for node in nodes {
+                    let op = self.reserve_op()?;
+                    if local_ops.insert(node.expression.clone(), op).is_some() {
+                        return Err(OwnerBodyInferenceError::new(format!(
+                            "owner residual for {:?} repeats a local expression",
+                            interface.owner
+                        )));
+                    }
+                }
+                let source_nodes = nodes
+                    .iter()
+                    .map(|node| (node.expression.clone(), node))
+                    .collect::<BTreeMap<_, _>>();
+                for node in nodes {
+                    let op = local_ops[&node.expression] as usize;
+                    let compiled = self.compile_node(frame, node, &source_nodes, &local_ops)?;
+                    if self.ops[op].replace(compiled).is_some() {
+                        return Err(OwnerBodyInferenceError::new(
+                            "owner residual compiler filled one op twice",
+                        ));
+                    }
+                }
+                OwnerResidualRoot::Value {
+                    frame,
+                    op: self.compile_reference(frame, &local_ops, root)?,
+                }
+            }
+        };
+        let ops = self
+            .ops
+            .into_iter()
+            .enumerate()
+            .map(|(index, op)| {
+                op.ok_or_else(|| {
+                    OwnerBodyInferenceError::new(format!(
+                        "owner residual compiler left op {index} unsealed"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_boxed_slice();
+        Ok(OwnerResidualOwnerProgram {
+            namespaces: self.namespaces.into_boxed_slice(),
+            frames: self.frames.into_boxed_slice(),
+            ops,
+            root,
+            invocation_invariant: owner_result_transfer_is_invocation_invariant(interface, draft),
+        })
+    }
+}
+
+fn compile_owner_residual_program(
+    result: &OwnerInterfaceSccResult,
+    drafts: &[OwnerResidualDraft],
+    residual_type_variable_count: u32,
+    dependencies: &[Arc<OwnerInterfaceTransferModule>],
+    routes: &BTreeMap<StableCheckOwnerKey, OwnerInterfaceTransferRoute>,
+) -> Result<OwnerResidualProgram, OwnerBodyInferenceError> {
+    let owners = (0..result.owners.len())
+        .map(|owner| {
+            OwnerResidualProgramBuilder::new(
+                result,
+                drafts,
+                residual_type_variable_count,
+                dependencies,
+                routes,
+            )
+            .compile_owner(owner)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_boxed_slice();
+    let op_count = owners.iter().map(|owner| owner.ops.len() as u64).sum();
+    let edge_count = owners
+        .iter()
+        .flat_map(|owner| owner.ops.iter())
+        .map(|op| op.kind.edge_count())
+        .sum();
+    let fingerprint_v1 = fingerprint(OWNER_RESIDUAL_PROGRAM_DOMAIN_V1, &owners)?;
+    Ok(OwnerResidualProgram {
+        owners,
+        op_count,
+        edge_count,
+        fingerprint_v1,
+    })
+}
+
 fn precompute_owner_interface_transfer_constants(module: &mut OwnerInterfaceTransferModule) {
     let candidates = module
-        .result
+        .program
         .owners
         .iter()
         .enumerate()
-        .filter(|(_, interface)| owner_result_transfer_is_invocation_invariant(interface))
+        .filter(|(_, program)| program.invocation_invariant)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let mut constants = vec![None; module.result.owners.len()];
     for owner in candidates {
         let mut unifier = TypeUnifier::default();
         let providers = BTreeMap::new();
-        let mut evaluator = OwnerResultTransferEvaluator::new(&providers, &mut unifier);
+        let mut evaluator = CompiledOwnerResidualEvaluator::new(&providers, &mut unifier);
+        let owner_key = module
+            .result
+            .key
+            .members
+            .get(owner)
+            .expect("candidate owner exists");
         let Some(result) = evaluator.evaluate_owner_in_module(
             module,
-            owner,
-            &OwnerResultTransferArguments::default(),
+            owner_key,
+            &OwnerResidualDraftArguments::default(),
             None,
         ) else {
             continue;
@@ -496,9 +1574,19 @@ fn precompute_owner_interface_transfer_constants(module: &mut OwnerInterfaceTran
 
 fn seal_owner_interface_transfer_module(
     result: Arc<OwnerInterfaceSccResult>,
+    drafts: Box<[OwnerResidualDraft]>,
+    residual_type_variable_count: u32,
     expected_dependencies: &[OwnerInterfaceSccKey],
     dependencies: impl IntoIterator<Item = Arc<OwnerInterfaceTransferModule>>,
 ) -> Result<OwnerInterfaceTransferModule, OwnerBodyInferenceError> {
+    if drafts.len() != result.owners.len() {
+        return Err(OwnerBodyInferenceError::new(format!(
+            "interface transfer module {:?} has {} residual drafts for {} owners",
+            result.key,
+            drafts.len(),
+            result.owners.len()
+        )));
+    }
     if result
         .owners
         .iter()
@@ -567,14 +1655,18 @@ fn seal_owner_interface_transfer_module(
         }
     }
     let mut used_dependencies = BTreeSet::new();
-    for interface in &result.owners {
-        if !owner_result_transfer_interface_variables_are_complete(interface) {
+    for (interface, draft) in result.owners.iter().zip(drafts.iter()) {
+        if !owner_result_transfer_interface_variables_are_complete(
+            interface,
+            draft,
+            residual_type_variable_count,
+        ) {
             return Err(OwnerBodyInferenceError::new(format!(
                 "interface transfer for {:?} has an incomplete alpha-variable namespace",
                 interface.owner
             )));
         }
-        for dependency in owner_result_transfer_dependencies(&interface.result_transfer) {
+        for dependency in owner_result_transfer_dependencies(draft) {
             match routes.get(&dependency) {
                 Some(OwnerInterfaceTransferRoute::Own) => {}
                 Some(OwnerInterfaceTransferRoute::Dependency(index)) => {
@@ -599,11 +1691,19 @@ fn seal_owner_interface_transfer_module(
         .iter()
         .map(|dependency| (&dependency.key, dependency.fingerprint_v1))
         .collect::<Vec<_>>();
+    let program = Arc::new(compile_owner_residual_program(
+        &result,
+        &drafts,
+        residual_type_variable_count,
+        &dependencies,
+        &routes,
+    )?);
     let fingerprint_v1 = fingerprint(
-        OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V2,
+        OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V3,
         &(
             &result.key,
             result.fingerprint_v1(),
+            program.fingerprint_v1,
             dependency_fingerprints,
         ),
     )?;
@@ -611,21 +1711,24 @@ fn seal_owner_interface_transfer_module(
         key: result.key.clone(),
         result,
         dependencies,
-        routes,
-        prepared: Box::new([]),
+        program,
         constant_results: Box::new([]),
         fingerprint_v1,
     };
-    module.prepared = prepare_owner_result_transfers(&module)?;
     precompute_owner_interface_transfer_constants(&mut module);
     Ok(module)
 }
 
-pub fn project_owner_interface_transfer_module(
+pub(crate) fn project_owner_interface_transfer_module(
     scc: &OwnerInterfaceScc,
-    result: Arc<OwnerInterfaceSccResult>,
+    projection: OwnerInterfaceSccProjection,
     dependencies: impl IntoIterator<Item = Arc<OwnerInterfaceTransferModule>>,
 ) -> Result<OwnerInterfaceTransferModule, OwnerBodyInferenceError> {
+    let OwnerInterfaceSccProjection {
+        result,
+        residuals,
+        residual_type_variable_count,
+    } = projection;
     if result.key != scc.key {
         return Err(OwnerBodyInferenceError::new(format!(
             "interface transfer module expected {:?}, got {:?}",
@@ -660,17 +1763,23 @@ pub fn project_owner_interface_transfer_module(
     }
     let dependency_keys = dependencies_by_key.keys().cloned().collect::<Vec<_>>();
     let dependencies = dependencies_by_key.into_values().collect::<Vec<_>>();
-    seal_owner_interface_transfer_module(result, &dependency_keys, dependencies)
+    seal_owner_interface_transfer_module(
+        result,
+        residuals,
+        residual_type_variable_count,
+        &dependency_keys,
+        dependencies,
+    )
 }
 
-pub fn owner_interface_transfer_dependency_owners(
-    result: &OwnerInterfaceSccResult,
+pub(crate) fn owner_interface_transfer_dependency_owners(
+    projection: &OwnerInterfaceSccProjection,
 ) -> Box<[StableCheckOwnerKey]> {
-    result
-        .owners
+    projection
+        .residuals
         .iter()
-        .flat_map(|interface| owner_result_transfer_dependencies(&interface.result_transfer))
-        .filter(|owner| result.key.members.binary_search(owner).is_err())
+        .flat_map(owner_result_transfer_dependencies)
+        .filter(|owner| projection.result.key.members.binary_search(owner).is_err())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>()
@@ -830,18 +1939,17 @@ impl OwnerBodyInterfacePlanner {
             )));
         }
         self.work.result_transfers = self.work.result_transfers.saturating_add(1);
-        if let OwnerResultTransfer::Expression { nodes, .. } = &interface.result_transfer {
-            self.work.result_transfer_nodes = self
-                .work
-                .result_transfer_nodes
-                .saturating_add(nodes.len() as u64);
-            self.work.result_transfer_edges = self.work.result_transfer_edges.saturating_add(
-                nodes
-                    .iter()
-                    .map(|node| node.inputs.len() as u64 + u64::from(node.call_target.is_some()))
-                    .sum::<u64>(),
-            );
-        }
+        let (nodes, edges) = module
+            .residual_work_for_owner(&interface.owner)
+            .ok_or_else(|| {
+                OwnerBodyInferenceError::new(format!(
+                    "owner body interface module {:?} has no residual program for {:?}",
+                    module.key(),
+                    interface.owner
+                ))
+            })?;
+        self.work.result_transfer_nodes = self.work.result_transfer_nodes.saturating_add(nodes);
+        self.work.result_transfer_edges = self.work.result_transfer_edges.saturating_add(edges);
         Ok(())
     }
 
@@ -913,7 +2021,7 @@ impl OwnerBodyInterfacePlanner {
         self.work.required_owners = self.required.len() as u64;
         self.work.provider_sccs = imports.len() as u64 + 1;
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INTERFACE_PLAN_DOMAIN_V4,
+            OWNER_BODY_INTERFACE_PLAN_DOMAIN_V5,
             &(&self.owner, &own_scc, &imports),
         )?;
         Ok(OwnerBodyInterfacePlan {
@@ -1253,7 +2361,7 @@ impl OwnerBodyInferenceCurrentnessReceipt {
             result_fingerprint_v1,
         );
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V11,
+            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V12,
             &compact_currentness,
         )?;
         Ok(Self {
@@ -2725,24 +3833,24 @@ fn directly_required_interface_owners(
 }
 
 fn collect_result_expression_ref_owner(
-    reference: &OwnerResultExpressionRef,
+    reference: &OwnerResidualExpressionRef,
     dependencies: &mut BTreeSet<StableCheckOwnerKey>,
 ) {
-    if let OwnerResultExpressionRef::Child { owner, .. } = reference {
+    if let OwnerResidualExpressionRef::Child { owner, .. } = reference {
         dependencies.insert(owner.clone());
     }
 }
 
 fn owner_result_transfer_dependencies(
-    transfer: &OwnerResultTransfer,
+    transfer: &OwnerResidualDraft,
 ) -> BTreeSet<StableCheckOwnerKey> {
-    let OwnerResultTransfer::Expression { root, nodes } = transfer else {
+    let OwnerResidualDraft::Expression { root, nodes } = transfer else {
         return BTreeSet::new();
     };
     let mut dependencies = BTreeSet::new();
     collect_result_expression_ref_owner(root, &mut dependencies);
     for node in nodes {
-        if let Some(OwnerResultCallTarget::Owner { owner }) = &node.call_target {
+        if let Some(OwnerResidualCallTarget::Owner { owner }) = &node.call_target {
             dependencies.insert(owner.clone());
         }
         for input in &node.inputs {
@@ -2752,7 +3860,7 @@ fn owner_result_transfer_dependencies(
     dependencies
 }
 
-/// Build an exact body-interface plan from already available SCC results.
+/// Build an exact body-interface plan from already sealed SCC modules.
 ///
 /// Persistent evaluators should normally drive [`OwnerBodyInterfacePlanner`]
 /// directly so each provider lookup becomes an exact request dependency. This
@@ -2760,78 +3868,29 @@ fn owner_result_transfer_dependencies(
 pub fn plan_owner_body_interfaces<'a>(
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
-    available_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
+    available_modules: impl IntoIterator<Item = &'a OwnerInterfaceTransferModule>,
 ) -> Result<OwnerBodyInterfacePlan, OwnerBodyInferenceError> {
     let mut provider_by_owner = BTreeMap::<StableCheckOwnerKey, OwnerInterfaceSccKey>::new();
-    let mut result_by_key = BTreeMap::<OwnerInterfaceSccKey, Arc<OwnerInterfaceSccResult>>::new();
-    for result in available_sccs {
-        if let Some(previous) = result_by_key.insert(result.key.clone(), Arc::new(result.clone()))
-            && previous.as_ref() != result
+    let mut modules = BTreeMap::<OwnerInterfaceSccKey, Arc<OwnerInterfaceTransferModule>>::new();
+    for module in available_modules {
+        if let Some(previous) = modules.insert(module.key.clone(), Arc::new(module.clone()))
+            && previous.fingerprint_v1() != module.fingerprint_v1()
         {
             return Err(OwnerBodyInferenceError::new(format!(
-                "owner body interface planning received conflicting SCC {:?}",
-                result.key
+                "owner body interface planning received conflicting SCC modules {:?}",
+                module.key
             )));
         }
-        for interface in &result.owners {
+        for interface in &module.result.owners {
             if let Some(previous) =
-                provider_by_owner.insert(interface.owner.clone(), result.key.clone())
-                && previous != result.key
+                provider_by_owner.insert(interface.owner.clone(), module.key.clone())
+                && previous != module.key
             {
                 return Err(OwnerBodyInferenceError::new(format!(
                     "owner body interface planning received multiple providers for {:?}",
                     interface.owner
                 )));
             }
-        }
-    }
-    let mut dependencies_by_key = BTreeMap::new();
-    for (key, result) in &result_by_key {
-        let mut dependencies = BTreeSet::new();
-        for interface in &result.owners {
-            for owner in owner_result_transfer_dependencies(&interface.result_transfer) {
-                let dependency = provider_by_owner.get(&owner).ok_or_else(|| {
-                    OwnerBodyInferenceError::new(format!(
-                        "owner body interface planning is missing transfer dependency {owner:?}"
-                    ))
-                })?;
-                if dependency != key {
-                    dependencies.insert(dependency.clone());
-                }
-            }
-        }
-        dependencies_by_key.insert(key.clone(), dependencies.into_iter().collect::<Vec<_>>());
-    }
-    let mut modules = BTreeMap::<OwnerInterfaceSccKey, Arc<OwnerInterfaceTransferModule>>::new();
-    while modules.len() != result_by_key.len() {
-        let mut progress = false;
-        for (key, result) in &result_by_key {
-            if modules.contains_key(key) {
-                continue;
-            }
-            let dependency_keys = &dependencies_by_key[key];
-            if dependency_keys
-                .iter()
-                .any(|dependency| !modules.contains_key(dependency))
-            {
-                continue;
-            }
-            let dependencies = dependency_keys
-                .iter()
-                .map(|dependency| Arc::clone(&modules[dependency]))
-                .collect::<Vec<_>>();
-            let module = seal_owner_interface_transfer_module(
-                Arc::clone(result),
-                dependency_keys,
-                dependencies,
-            )?;
-            modules.insert(key.clone(), Arc::new(module));
-            progress = true;
-        }
-        if !progress {
-            return Err(OwnerBodyInferenceError::new(
-                "owner body interface transfer modules contain a dependency cycle",
-            ));
         }
     }
     let mut planner = OwnerBodyInterfacePlanner::new(seed, summary)?;
@@ -3584,11 +4643,11 @@ pub(crate) struct EvaluatedResultValue {
 /// Keep them inline while retaining the deterministic replace-and-sort
 /// semantics of the former `BTreeMap` representation.
 #[derive(Clone, Default, Eq, PartialEq)]
-pub(crate) struct OwnerResultTransferArguments {
+pub(crate) struct OwnerResidualDraftArguments {
     entries: SmallVec<[(u32, EvaluatedResultValue); 4]>,
 }
 
-impl OwnerResultTransferArguments {
+impl OwnerResidualDraftArguments {
     pub(crate) fn insert(&mut self, ordinal: u32, value: EvaluatedResultValue) {
         match self
             .entries
@@ -3612,7 +4671,7 @@ impl OwnerResultTransferArguments {
     }
 }
 
-impl<const N: usize> From<[(u32, EvaluatedResultValue); N]> for OwnerResultTransferArguments {
+impl<const N: usize> From<[(u32, EvaluatedResultValue); N]> for OwnerResidualDraftArguments {
     fn from(entries: [(u32, EvaluatedResultValue); N]) -> Self {
         let mut result = Self::default();
         for (ordinal, value) in entries {
@@ -3624,7 +4683,7 @@ impl<const N: usize> From<[(u32, EvaluatedResultValue); N]> for OwnerResultTrans
 
 #[derive(Clone, Eq, PartialEq)]
 struct OwnerCallTransferInvocation {
-    arguments: OwnerResultTransferArguments,
+    arguments: OwnerResidualDraftArguments,
     context: Option<EvaluatedResultValue>,
 }
 
@@ -3642,17 +4701,11 @@ struct EvaluatedOwnerResult {
     owned_variables: Vec<TypeVar>,
 }
 
-struct OwnerResultTransferFallbacks {
-    variables: OwnerResultTransferVariables,
-    dependency_variables: BTreeMap<u32, OwnerResultTransferVariables>,
-    substitutions: crate::InlineTypeSubstitutions,
-}
-
-struct OwnerResultTransferVariables {
+struct OwnerResidualDraftVariables {
     entries: SmallVec<[(TypeVar, TypeVar); 8]>,
 }
 
-impl OwnerResultTransferVariables {
+impl OwnerResidualDraftVariables {
     fn new() -> Self {
         Self {
             entries: SmallVec::new(),
@@ -3814,7 +4867,7 @@ fn owner_result_transfer_type_has_variable(ty: &Type) -> bool {
     }
 }
 
-type OwnerResultTransferActiveNodes = SmallVec<[usize; 16]>;
+type OwnerResidualDraftActiveNodes = SmallVec<[usize; 16]>;
 
 fn reinstantiate_owner_call_transfer(
     cached: &EvaluatedOwnerResult,
@@ -3846,156 +4899,115 @@ fn reinstantiate_owner_call_transfer(
     }
 }
 
-impl OwnerResultTransferFallbacks {
-    fn new(
-        variables: OwnerResultTransferVariables,
-        substitutions: crate::InlineTypeSubstitutions,
-    ) -> Self {
-        Self {
-            variables,
-            dependency_variables: BTreeMap::new(),
-            substitutions,
-        }
-    }
-
-    fn resolve_child(
-        &mut self,
-        route: PreparedOwnerInterfaceTransferRoute,
-        result: &FlowType,
-        unifier: &mut TypeUnifier,
-        owned_variables: &mut Vec<TypeVar>,
-    ) -> EvaluatedResultValue {
-        // A Child reference is a structural continuation of the current
-        // owner, not a callable invocation. Owners in one interface SCC share
-        // one stable alpha namespace, so their child surfaces must be
-        // instantiated through the current invocation frame. Returning the
-        // child's raw public TypeVars leaks SCC-local ordinals into the caller
-        // unifier and detaches fields that the parent arguments already
-        // specialized.
-        let ty = match route {
-            PreparedOwnerInterfaceTransferRoute::Own(_) => {
-                let ty = self
-                    .variables
-                    .instantiate(&result.ty, unifier, owned_variables);
-                apply_checked_type_substitution_lookup(&ty, &self.substitutions)
-            }
-            PreparedOwnerInterfaceTransferRoute::Dependency { dependency, .. } => {
-                // Dependency SCCs own distinct alpha namespaces. Give every
-                // dependency module one shared child frame for this
-                // invocation so repeated child reads retain correlation
-                // without aliasing equal raw ordinals from the current SCC.
-                self.dependency_variables
-                    .entry(dependency)
-                    .or_insert_with(OwnerResultTransferVariables::new)
-                    .instantiate(&result.ty, unifier, owned_variables)
-            }
-        };
-        EvaluatedResultValue {
-            flow_type: FlowType {
-                mode: result.mode,
-                ty: unifier.resolve(&ty),
-            },
-            parameter_derived: false,
-            syntax_selected: false,
-            static_number: None,
-        }
-    }
-
-    fn resolve(
-        &mut self,
-        node: &OwnerResultTransferNode,
-        unifier: &mut TypeUnifier,
-        owned_variables: &mut Vec<TypeVar>,
-    ) -> Option<EvaluatedResultValue> {
-        let ty = self
-            .variables
-            .instantiate(&node.flow_type.ty, unifier, owned_variables);
-        let ty = apply_checked_type_substitution_lookup(&ty, &self.substitutions);
-        let value = EvaluatedResultValue {
-            flow_type: FlowType {
-                mode: node.flow_type.mode,
-                ty,
-            },
-            parameter_derived: false,
-            syntax_selected: false,
-            static_number: node
-                .static_number
-                .as_deref()
-                .and_then(|literal| ExactNumber::parse_strict(literal, None).ok()),
-        };
-        Some(value)
-    }
+#[derive(Clone)]
+struct OwnerResidualFrameRuntime {
+    arguments: OwnerResidualDraftArguments,
+    context: Option<EvaluatedResultValue>,
+    substitutions: crate::InlineTypeSubstitutions,
+    principal: FlowType,
+    result_flush_type: Option<Type>,
+    type_substitutions: Vec<(TypeVar, Type)>,
+    contextual_type_variables: Vec<TypeVar>,
 }
 
-struct OwnerResultTransferEvaluator<'a, 'unifier> {
-    providers: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerInterfaceTransferModule>,
+struct CompiledOwnerResidualProgramEvaluator<'program, 'unifier> {
+    program: &'program OwnerResidualOwnerProgram,
+    external_arguments: &'program OwnerResidualDraftArguments,
+    external_context: Option<&'program EvaluatedResultValue>,
     unifier: &'unifier mut TypeUnifier,
-    active_owners: BTreeSet<StableCheckOwnerKey>,
+    namespaces: Vec<OwnerResidualDraftVariables>,
+    frames: Vec<Option<OwnerResidualFrameRuntime>>,
+    initializing_frames: BTreeSet<OwnerResidualFrameId>,
     owned_variables: Vec<TypeVar>,
 }
 
-impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
+impl<'program, 'unifier> CompiledOwnerResidualProgramEvaluator<'program, 'unifier> {
     fn new(
-        providers: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerInterfaceTransferModule>,
+        program: &'program OwnerResidualOwnerProgram,
+        arguments: &'program OwnerResidualDraftArguments,
+        context: Option<&'program EvaluatedResultValue>,
         unifier: &'unifier mut TypeUnifier,
     ) -> Self {
         Self {
-            providers,
+            program,
+            external_arguments: arguments,
+            external_context: context,
             unifier,
-            active_owners: BTreeSet::new(),
+            namespaces: program
+                .namespaces
+                .iter()
+                .map(|_| OwnerResidualDraftVariables::new())
+                .collect(),
+            frames: vec![None; program.frames.len()],
+            initializing_frames: BTreeSet::new(),
             owned_variables: Vec::new(),
         }
     }
 
-    fn evaluate_owner(
+    fn frame_input(
         &mut self,
-        owner: &StableCheckOwnerKey,
-        arguments: &OwnerResultTransferArguments,
-        context: Option<&EvaluatedResultValue>,
-    ) -> Option<EvaluatedOwnerResult> {
-        let module = *self.providers.get(owner)?;
-        self.evaluate_owner_from_root_module(module, owner, arguments, context)
+        input: &OwnerResidualFrameInput,
+        lexical: &BTreeMap<String, EvaluatedResultValue>,
+        active: &mut OwnerResidualDraftActiveNodes,
+    ) -> Option<EvaluatedResultValue> {
+        match input {
+            OwnerResidualFrameInput::ExternalArgument { ordinal } => {
+                self.external_arguments.get(ordinal).cloned()
+            }
+            OwnerResidualFrameInput::ExternalContext => self.external_context.cloned(),
+            OwnerResidualFrameInput::Value { op } => self.evaluate_op(*op, lexical, active),
+            OwnerResidualFrameInput::InheritedContext { frame } => self
+                .frames
+                .get(*frame as usize)
+                .and_then(Option::as_ref)
+                .and_then(|runtime| runtime.context.clone()),
+            OwnerResidualFrameInput::Missing => None,
+        }
     }
 
-    fn evaluate_owner_from_root_module(
+    fn initialize_frame(
         &mut self,
-        module: &OwnerInterfaceTransferModule,
-        owner: &StableCheckOwnerKey,
-        arguments: &OwnerResultTransferArguments,
-        context: Option<&EvaluatedResultValue>,
-    ) -> Option<EvaluatedOwnerResult> {
-        let route = module.prepared_route(owner)?;
-        let (module, owner, _, _) = module.resolve_prepared_owner(route)?;
-        let mut result = self.evaluate_owner_in_module(module, owner, arguments, context)?;
-        result.owned_variables = std::mem::take(&mut self.owned_variables);
-        Some(result)
-    }
-
-    fn evaluate_owner_in_module(
-        &mut self,
-        module: &OwnerInterfaceTransferModule,
-        owner: usize,
-        arguments: &OwnerResultTransferArguments,
-        context: Option<&EvaluatedResultValue>,
-    ) -> Option<EvaluatedOwnerResult> {
-        let interface = module.result.owners.get(owner)?;
-        let prepared = module.prepared.get(owner)?;
-        // Interface type variables live in an SCC-local alpha namespace. Give
-        // every invocation its own variables in the caller's unifier so raw
-        // TypeVar ordinals from unrelated SCCs can never alias each other or
-        // the caller's local variables.
-        // Module sealing has already proved that every transfer type variable
-        // belongs to this interface namespace. Freshen each stable alpha on
-        // first use rather than manufacturing caller-unifier slots for nodes
-        // in branches this invocation never reaches. The sorted map preserves
-        // identity within the invocation, and every published result is alpha
-        // normalized before it can leave the body.
-        let mut variables = OwnerResultTransferVariables::new();
-        let mut substitutions = crate::InlineTypeSubstitutions::default();
-        for parameter in &interface.parameters {
-            if let Some(actual) = arguments.get(&parameter.ordinal) {
+        frame: OwnerResidualFrameId,
+        lexical: &BTreeMap<String, EvaluatedResultValue>,
+        active: &mut OwnerResidualDraftActiveNodes,
+    ) -> Option<()> {
+        if self.frames.get(frame as usize)?.is_some() {
+            return Some(());
+        }
+        if !self.initializing_frames.insert(frame) {
+            return None;
+        }
+        let descriptor = self.program.frames.get(frame as usize)?.clone();
+        let runtime = (|| {
+            let mut arguments = OwnerResidualDraftArguments::default();
+            for parameter in &descriptor.parameters {
+                if let Some(value) = self.frame_input(&parameter.input, lexical, active) {
+                    arguments.insert(parameter.ordinal, value);
+                }
+            }
+            let context = descriptor
+                .context
+                .as_ref()
+                .and_then(|context| self.frame_input(&context.input, lexical, active));
+            let namespace = descriptor.namespace as usize;
+            let variables = self.namespaces.get_mut(namespace)?;
+            let mut substitutions = crate::InlineTypeSubstitutions::default();
+            for parameter in &descriptor.parameters {
+                if let Some(actual) = arguments.get(&parameter.ordinal) {
+                    let formal = variables.instantiate(
+                        &parameter.flow_type.ty,
+                        self.unifier,
+                        &mut self.owned_variables,
+                    );
+                    let actual = self.unifier.resolve(&actual.flow_type.ty);
+                    if !self.unifier.bind_call_pattern_input(&actual, &formal) {
+                        crate::unify_checked_type_pattern(&formal, &actual, &mut substitutions);
+                    }
+                }
+            }
+            if let (Some(formal), Some(actual)) = (&descriptor.context, &context) {
                 let formal = variables.instantiate(
-                    &parameter.flow_type.ty,
+                    &formal.flow_type.ty,
                     self.unifier,
                     &mut self.owned_variables,
                 );
@@ -4004,130 +5016,169 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     crate::unify_checked_type_pattern(&formal, &actual, &mut substitutions);
                 }
             }
-        }
-        if let (Some(formal), Some(actual)) = (&interface.context, context) {
-            let formal = variables.instantiate(
-                &formal.flow_type.ty,
+            let instantiated_result = variables.instantiate(
+                &descriptor.result.ty,
                 self.unifier,
                 &mut self.owned_variables,
             );
-            let actual = self.unifier.resolve(&actual.flow_type.ty);
-            if !self.unifier.bind_call_pattern_input(&actual, &formal) {
-                crate::unify_checked_type_pattern(&formal, &actual, &mut substitutions);
+            for variable in &descriptor.type_variables {
+                let Some(instantiated) = variables.replacement(*variable) else {
+                    continue;
+                };
+                if substitutions.replacement(instantiated).is_some() {
+                    continue;
+                }
+                let resolved = self.unifier.resolve(&Type::Var(instantiated));
+                if resolved != Type::Var(instantiated) {
+                    substitutions.insert(instantiated, resolved);
+                }
             }
-        }
-        let instantiated_result = variables.instantiate(
-            &interface.result.ty,
-            self.unifier,
-            &mut self.owned_variables,
-        );
-        // Closed record unions bind open formal holes directionally in the
-        // caller unifier rather than through the first-concrete substitution
-        // matcher. Fold those resolved roots back into the invocation
-        // substitution surface so result nodes and diagnostics observe the
-        // complete structural aggregate, not one arbitrary union member.
-        for variable in &interface.type_variables {
-            let Some(instantiated) = variables.replacement(*variable) else {
-                continue;
+            let principal = FlowType {
+                mode: descriptor.result.mode,
+                ty: apply_checked_type_substitution_lookup(&instantiated_result, &substitutions),
             };
-            if substitutions.replacement(instantiated).is_some() {
-                continue;
+            let result_flush_type = descriptor.result_flush_type.as_ref().map(|flush_type| {
+                let flush_type =
+                    variables.instantiate(flush_type, self.unifier, &mut self.owned_variables);
+                apply_checked_type_substitution_lookup(&flush_type, &substitutions)
+            });
+            let mut contextual_type_variables = BTreeSet::new();
+            if let Some(context) = &descriptor.context {
+                crate::collect_type_vars(&context.flow_type.ty, &mut contextual_type_variables);
             }
-            let resolved = self.unifier.resolve(&Type::Var(instantiated));
-            if resolved != Type::Var(instantiated) {
-                substitutions.insert(instantiated, resolved);
-            }
-        }
-        let principal = FlowType {
-            mode: interface.result.mode,
-            ty: apply_checked_type_substitution_lookup(&instantiated_result, &substitutions),
-        };
-        let result_flush_type = interface.result_flush_type.as_ref().map(|flush_type| {
-            let flush_type =
-                variables.instantiate(flush_type, self.unifier, &mut self.owned_variables);
-            apply_checked_type_substitution_lookup(&flush_type, &substitutions)
-        });
-        let mut contextual_type_variables = BTreeSet::new();
-        if let Some(context) = &interface.context {
-            crate::collect_type_vars(&context.flow_type.ty, &mut contextual_type_variables);
-        }
-        let type_substitutions = interface
-            .type_variables
-            .iter()
-            .filter_map(|variable| {
-                let instantiated = variables.replacement(*variable)?;
-                substitutions.replacement(instantiated).map(|value| {
-                    (
-                        *variable,
-                        apply_checked_type_substitution_lookup(value, &substitutions),
-                    )
+            let type_substitutions = descriptor
+                .type_variables
+                .iter()
+                .filter_map(|variable| {
+                    let instantiated = variables.replacement(*variable)?;
+                    substitutions.replacement(instantiated).map(|value| {
+                        (
+                            *variable,
+                            apply_checked_type_substitution_lookup(value, &substitutions),
+                        )
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-
-        if !self.active_owners.insert(interface.owner.clone()) {
-            return Some(EvaluatedOwnerResult {
-                value: EvaluatedResultValue {
-                    flow_type: principal,
-                    parameter_derived: arguments.values().any(|value| value.parameter_derived),
-                    syntax_selected: false,
-                    static_number: None,
-                },
+                .collect();
+            Some(OwnerResidualFrameRuntime {
+                arguments,
+                context,
+                substitutions,
+                principal,
+                result_flush_type,
                 type_substitutions,
                 contextual_type_variables: contextual_type_variables.into_iter().collect(),
-                owned_variables: Vec::new(),
-            });
-        }
-        let evaluated = if let Some(value) = module.constant_result_at(owner) {
-            Some(value.clone())
+            })
+        })();
+        self.initializing_frames.remove(&frame);
+        let runtime = runtime?;
+        *self.frames.get_mut(frame as usize)? = Some(runtime);
+        Some(())
+    }
+
+    fn parameter_value(
+        &self,
+        frame: OwnerResidualFrameId,
+        parameter_ordinal: u32,
+        projection: &[String],
+    ) -> Option<EvaluatedResultValue> {
+        let actual = self
+            .frames
+            .get(frame as usize)?
+            .as_ref()?
+            .arguments
+            .get(&parameter_ordinal)?;
+        let ty = if projection.is_empty() {
+            Some(actual.flow_type.ty.clone())
         } else {
-            match &interface.result_transfer {
-                OwnerResultTransfer::Principal => None,
-                OwnerResultTransfer::Parameter { read } => {
-                    arguments.get(&read.parameter_ordinal).and_then(|actual| {
-                        let ty = if read.projection.is_empty() {
-                            Some(actual.flow_type.ty.clone())
-                        } else {
-                            crate::type_for_nested_path(&actual.flow_type.ty, &read.projection)
-                        }?;
-                        Some(EvaluatedResultValue {
-                            flow_type: FlowType {
-                                mode: actual.flow_type.mode,
-                                ty,
-                            },
-                            parameter_derived: true,
-                            syntax_selected: actual.syntax_selected,
-                            static_number: read
-                                .projection
-                                .is_empty()
-                                .then(|| actual.static_number.clone())
-                                .flatten(),
-                        })
-                    })
+            crate::type_for_nested_path(&actual.flow_type.ty, projection)
+        }?;
+        Some(EvaluatedResultValue {
+            flow_type: FlowType {
+                mode: actual.flow_type.mode,
+                ty,
+            },
+            parameter_derived: true,
+            syntax_selected: actual.syntax_selected,
+            static_number: projection
+                .is_empty()
+                .then(|| actual.static_number.clone())
+                .flatten(),
+        })
+    }
+
+    fn resolve_type(
+        &mut self,
+        namespace: OwnerResidualNamespaceId,
+        ty: &Type,
+        substitutions: Option<&crate::InlineTypeSubstitutions>,
+    ) -> Option<Type> {
+        let variables = self.namespaces.get_mut(namespace as usize)?;
+        let ty = variables.instantiate(ty, self.unifier, &mut self.owned_variables);
+        Some(substitutions.map_or(ty.clone(), |substitutions| {
+            apply_checked_type_substitution_lookup(&ty, substitutions)
+        }))
+    }
+
+    fn fallback(&mut self, op: &OwnerResidualOp) -> Option<EvaluatedResultValue> {
+        let frame = self.program.frames.get(op.frame as usize)?;
+        let substitutions = self
+            .frames
+            .get(op.frame as usize)?
+            .as_ref()?
+            .substitutions
+            .clone();
+        let ty = self.resolve_type(frame.namespace, &op.fallback.ty, Some(&substitutions))?;
+        Some(EvaluatedResultValue {
+            flow_type: FlowType {
+                mode: op.fallback.mode,
+                ty,
+            },
+            parameter_derived: false,
+            syntax_selected: false,
+            static_number: op.static_number.clone(),
+        })
+    }
+
+    fn surface(
+        &mut self,
+        op: &OwnerResidualOp,
+        namespace: OwnerResidualNamespaceId,
+    ) -> Option<EvaluatedResultValue> {
+        let ty = self.resolve_type(namespace, &op.fallback.ty, None)?;
+        Some(EvaluatedResultValue {
+            flow_type: FlowType {
+                mode: op.fallback.mode,
+                ty: self.unifier.resolve(&ty),
+            },
+            parameter_derived: false,
+            syntax_selected: false,
+            static_number: None,
+        })
+    }
+
+    fn evaluate_root(
+        &mut self,
+        root: &OwnerResidualRoot,
+        caller_lexical: &BTreeMap<String, EvaluatedResultValue>,
+        active: &mut OwnerResidualDraftActiveNodes,
+        constant: Option<&EvaluatedResultValue>,
+    ) -> Option<EvaluatedOwnerResult> {
+        let frame = root.frame();
+        self.initialize_frame(frame, caller_lexical, active)?;
+        let evaluated = if let Some(constant) = constant {
+            Some(constant.clone())
+        } else {
+            match root {
+                OwnerResidualRoot::Principal { .. } => None,
+                OwnerResidualRoot::Parameter { read, .. } => {
+                    self.parameter_value(frame, read.parameter_ordinal, &read.projection)
                 }
-                OwnerResultTransfer::Expression { root: _, nodes } => {
-                    // Instantiate node fallback types and their alpha variables
-                    // only if the selected transfer walk reaches them. Concrete
-                    // WHEN arms commonly leave most of a large result-transfer
-                    // graph untouched.
-                    let mut fallbacks = OwnerResultTransferFallbacks::new(variables, substitutions);
-                    let root = prepared.root?;
-                    self.evaluate_expression_ref(
-                        module,
-                        root,
-                        nodes,
-                        prepared,
-                        arguments,
-                        context,
-                        &mut fallbacks,
-                        &BTreeMap::new(),
-                        &mut OwnerResultTransferActiveNodes::new(),
-                    )
+                OwnerResidualRoot::Value { op, .. } => {
+                    self.evaluate_op(*op, &BTreeMap::new(), active)
                 }
             }
         };
-        self.active_owners.remove(&interface.owner);
-
+        let runtime = self.frames.get(frame as usize)?.as_ref()?.clone();
         let mut value = if let Some(mut evaluated) = evaluated {
             let selected = evaluated.syntax_selected
                 && crate::type_has_concrete_outer_shape(&evaluated.flow_type.ty);
@@ -4136,19 +5187,22 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             evaluated.flow_type.ty = if selected || evaluated_is_closed {
                 evaluated.flow_type.ty
             } else {
-                specialize_checked_call_result(&principal.ty, &evaluated.flow_type.ty)
+                specialize_checked_call_result(&runtime.principal.ty, &evaluated.flow_type.ty)
             };
             evaluated.syntax_selected = selected;
             evaluated
         } else {
             EvaluatedResultValue {
-                flow_type: principal,
-                parameter_derived: arguments.values().any(|value| value.parameter_derived),
+                flow_type: runtime.principal,
+                parameter_derived: runtime
+                    .arguments
+                    .values()
+                    .any(|value| value.parameter_derived),
                 syntax_selected: false,
                 static_number: None,
             }
         };
-        if let Some(flush_type) = result_flush_type {
+        if let Some(flush_type) = runtime.result_flush_type {
             value.flow_type.ty =
                 boon_checked::canonical_union_type(vec![value.flow_type.ty, flush_type]);
             if value.flow_type.mode == FlowMode::Absent {
@@ -4157,163 +5211,93 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         }
         Some(EvaluatedOwnerResult {
             value,
-            type_substitutions,
-            contextual_type_variables: contextual_type_variables.into_iter().collect(),
+            type_substitutions: runtime.type_substitutions,
+            contextual_type_variables: runtime.contextual_type_variables,
             owned_variables: Vec::new(),
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_expression_ref(
+    fn evaluate_op(
         &mut self,
-        module: &OwnerInterfaceTransferModule,
-        reference: PreparedOwnerResultExpressionRef,
-        nodes: &[OwnerResultTransferNode],
-        prepared: &PreparedOwnerResultTransfer,
-        arguments: &OwnerResultTransferArguments,
-        context: Option<&EvaluatedResultValue>,
-        fallbacks: &mut OwnerResultTransferFallbacks,
+        op: OwnerResidualOpId,
         lexical: &BTreeMap<String, EvaluatedResultValue>,
-        active: &mut OwnerResultTransferActiveNodes,
+        active: &mut OwnerResidualDraftActiveNodes,
     ) -> Option<EvaluatedResultValue> {
-        match reference {
-            PreparedOwnerResultExpressionRef::Child(route) => {
-                let (_, _, interface, _) = module.resolve_prepared_owner(route)?;
-                Some(fallbacks.resolve_child(
-                    route,
-                    &interface.result,
-                    self.unifier,
-                    &mut self.owned_variables,
-                ))
-            }
-            PreparedOwnerResultExpressionRef::Local(expression) => {
-                let index = expression as usize;
-                let node = &nodes[index];
-                if active.contains(&index) {
-                    return fallbacks.resolve(node, self.unifier, &mut self.owned_variables);
-                }
-                active.push(index);
-                let value = self.evaluate_node(
-                    module, index, nodes, prepared, arguments, context, fallbacks, lexical, active,
-                );
-                debug_assert_eq!(active.pop(), Some(index));
-                value
-            }
+        let index = op as usize;
+        let op = self.program.ops.get(index)?.clone();
+        if active.contains(&index) {
+            return self.fallback(&op);
         }
+        active.push(index);
+        let value = self.evaluate_op_inner(&op, lexical, active);
+        debug_assert_eq!(active.pop(), Some(index));
+        value
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_node(
+    fn evaluate_op_inner(
         &mut self,
-        module: &OwnerInterfaceTransferModule,
-        node_index: usize,
-        nodes: &[OwnerResultTransferNode],
-        prepared: &PreparedOwnerResultTransfer,
-        arguments: &OwnerResultTransferArguments,
-        context: Option<&EvaluatedResultValue>,
-        fallbacks: &mut OwnerResultTransferFallbacks,
+        op: &OwnerResidualOp,
         lexical: &BTreeMap<String, EvaluatedResultValue>,
-        active: &mut OwnerResultTransferActiveNodes,
+        active: &mut OwnerResidualDraftActiveNodes,
     ) -> Option<EvaluatedResultValue> {
-        let node = nodes.get(node_index)?;
-        let prepared_node = prepared.nodes.get(node_index)?;
-        let prepared_inputs = prepared.node_inputs(prepared_node)?;
-        if prepared_inputs.len() != node.inputs.len() {
-            return None;
-        }
-        let mut evaluate =
-            |evaluator: &mut Self,
-             reference: PreparedOwnerResultExpressionRef,
-             lexical: &BTreeMap<String, EvaluatedResultValue>,
-             active: &mut OwnerResultTransferActiveNodes| {
-                evaluator.evaluate_expression_ref(
-                    module, reference, nodes, prepared, arguments, context, fallbacks, lexical,
-                    active,
-                )
-            };
-        if let Some(read) = &node.parameter_read
-            && let Some(actual) = arguments.get(&read.parameter_ordinal)
-        {
-            let ty = if read.projection.is_empty() {
-                Some(actual.flow_type.ty.clone())
-            } else {
-                crate::type_for_nested_path(&actual.flow_type.ty, &read.projection)
-            };
-            if let Some(ty) = ty {
-                return Some(EvaluatedResultValue {
-                    flow_type: FlowType {
-                        mode: actual.flow_type.mode,
-                        ty,
-                    },
-                    parameter_derived: true,
-                    syntax_selected: actual.syntax_selected,
-                    static_number: read
-                        .projection
-                        .is_empty()
-                        .then(|| actual.static_number.clone())
-                        .flatten(),
+        match &op.kind {
+            OwnerResidualOpKind::Fallback => self.fallback(op),
+            OwnerResidualOpKind::Surface { namespace } => self.surface(op, *namespace),
+            OwnerResidualOpKind::ParameterRead {
+                parameter_ordinal,
+                projection,
+            } => self
+                .parameter_value(op.frame, *parameter_ordinal, projection)
+                .or_else(|| self.fallback(op)),
+            OwnerResidualOpKind::LexicalRead { parts } => {
+                let value = parts.split_first().and_then(|(name, projection)| {
+                    lexical.get(name).and_then(|value| {
+                        let ty = if projection.is_empty() {
+                            Some(value.flow_type.ty.clone())
+                        } else {
+                            crate::type_for_nested_path(&value.flow_type.ty, projection)
+                        }?;
+                        Some(EvaluatedResultValue {
+                            flow_type: FlowType {
+                                mode: value.flow_type.mode,
+                                ty,
+                            },
+                            parameter_derived: value.parameter_derived,
+                            syntax_selected: value.syntax_selected,
+                            static_number: projection
+                                .is_empty()
+                                .then(|| value.static_number.clone())
+                                .flatten(),
+                        })
+                    })
                 });
+                value.or_else(|| self.fallback(op))
             }
-        }
-        if let OwnerConstraintNodeKind::Reference { parts }
-        | OwnerConstraintNodeKind::Drain { parts } = &node.kind
-            && let Some((name, projection)) = parts.split_first()
-            && let Some(value) = lexical.get(name)
-        {
-            let ty = if projection.is_empty() {
-                Some(value.flow_type.ty.clone())
-            } else {
-                crate::type_for_nested_path(&value.flow_type.ty, projection)
-            };
-            if let Some(ty) = ty {
-                return Some(EvaluatedResultValue {
-                    flow_type: FlowType {
-                        mode: value.flow_type.mode,
-                        ty,
-                    },
-                    parameter_derived: value.parameter_derived,
-                    syntax_selected: value.syntax_selected,
-                    static_number: projection
-                        .is_empty()
-                        .then(|| value.static_number.clone())
-                        .flatten(),
-                });
-            }
-        }
-
-        match &node.kind {
-            OwnerConstraintNodeKind::Call { .. } | OwnerConstraintNodeKind::Pipe { .. } => self
-                .evaluate_call_node(
-                    module,
-                    node,
-                    prepared_node,
-                    nodes,
-                    prepared,
-                    arguments,
-                    context,
-                    fallbacks,
-                    lexical,
-                    active,
-                ),
-            OwnerConstraintNodeKind::Infix { operation } => {
-                let left = node
-                    .inputs
-                    .iter()
-                    .zip(prepared_inputs)
-                    .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::InfixLeft))
-                    .and_then(|(_, expression)| evaluate(self, *expression, lexical, active))?;
-                let right = node
-                    .inputs
-                    .iter()
-                    .zip(prepared_inputs)
-                    .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::InfixRight))
-                    .and_then(|(_, expression)| evaluate(self, *expression, lexical, active))?;
+            OwnerResidualOpKind::InlinedRoot { root }
+            | OwnerResidualOpKind::RecursiveCall { root } => self
+                .evaluate_root(root, lexical, active, None)
+                .map(|result| result.value)
+                .or_else(|| self.fallback(op)),
+            OwnerResidualOpKind::AbiCall {
+                canonical_name,
+                contract,
+                actuals,
+            } => self
+                .evaluate_abi_call(canonical_name, contract, actuals, lexical, active)
+                .or_else(|| self.fallback(op)),
+            OwnerResidualOpKind::Infix {
+                operation,
+                left,
+                right,
+            } => {
+                let left = self.evaluate_op(*left, lexical, active)?;
+                let right = self.evaluate_op(*right, lexical, active)?;
                 let static_number = left
                     .static_number
                     .as_ref()
                     .zip(right.static_number.as_ref())
                     .and_then(|(left, right)| static_number_infix(left, operation, right));
-                let fallback = fallbacks.resolve(node, self.unifier, &mut self.owned_variables)?;
+                let fallback = self.fallback(op)?;
                 Some(EvaluatedResultValue {
                     static_number,
                     parameter_derived: left.parameter_derived || right.parameter_derived,
@@ -4321,24 +5305,17 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     ..fallback
                 })
             }
-            OwnerConstraintNodeKind::Record { tag } => {
-                let mut fields = Vec::new();
+            OwnerResidualOpKind::Record { tag, fields } => {
+                let mut resolved = Vec::with_capacity(fields.len());
                 let mut parameter_derived = false;
                 let mut syntax_selected = false;
-                for (input, expression) in node.inputs.iter().zip(prepared_inputs) {
-                    let OwnerConstraintEdgeRole::RecordField {
-                        name,
-                        spread: false,
-                    } = &input.role
-                    else {
-                        continue;
-                    };
-                    let value = evaluate(self, *expression, lexical, active)?;
+                for field in fields {
+                    let value = self.evaluate_op(field.value, lexical, active)?;
                     parameter_derived |= value.parameter_derived;
                     syntax_selected |= value.syntax_selected;
-                    fields.push((name.clone(), value.flow_type.ty));
+                    resolved.push((field.name.clone(), value.flow_type.ty));
                 }
-                let shape: ObjectShape = ObjectShape::from_ordered_fields(fields, false);
+                let shape: ObjectShape = ObjectShape::from_ordered_fields(resolved, false);
                 Some(EvaluatedResultValue {
                     flow_type: FlowType {
                         mode: FlowMode::Continuous,
@@ -4360,69 +5337,77 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     static_number: None,
                 })
             }
-            OwnerConstraintNodeKind::When => self.evaluate_when_node(
-                module,
-                node,
-                prepared_node,
-                nodes,
-                prepared,
-                arguments,
-                context,
-                fallbacks,
-                lexical,
-                active,
-            ),
-            OwnerConstraintNodeKind::MatchArm { .. } | OwnerConstraintNodeKind::Arrow { .. } => {
-                let output = node.inputs.iter().zip(prepared_inputs).find(|(input, _)| {
-                    matches!(
-                        input.role,
-                        OwnerConstraintEdgeRole::MatchOutput | OwnerConstraintEdgeRole::ArrowOutput
-                    )
-                });
-                if let Some((_, output)) = output {
-                    evaluate(self, *output, lexical, active)
-                } else {
-                    fallbacks.resolve(node, self.unifier, &mut self.owned_variables)
+            OwnerResidualOpKind::When { selector, arms } => {
+                let selector = self.evaluate_op(*selector, lexical, active)?;
+                let selector_is_concrete =
+                    crate::type_is_singleton_syntax_discriminant(&selector.flow_type.ty);
+                let mut outputs = Vec::new();
+                for arm in arms {
+                    if selector_is_concrete
+                        && !owner_pattern_accepts(&selector.flow_type.ty, &arm.pattern)
+                    {
+                        continue;
+                    }
+                    let mut arm_lexical = lexical.clone();
+                    extend_owner_pattern_bindings(&mut arm_lexical, &selector, &arm.pattern);
+                    if let Some(output) = self.evaluate_op(arm.output, &arm_lexical, active)
+                        && !matches!(output.flow_type.ty, Type::Absent)
+                    {
+                        outputs.push(output);
+                        if selector_is_concrete {
+                            break;
+                        }
+                    }
                 }
+                let mut outputs = outputs.into_iter();
+                let first = outputs.next()?;
+                let result = outputs.fold(first, |mut result, next| {
+                    result.flow_type.ty =
+                        widen_structural_type(&result.flow_type.ty, &next.flow_type.ty);
+                    result.parameter_derived |= next.parameter_derived;
+                    result.syntax_selected |= next.syntax_selected;
+                    if result.static_number != next.static_number {
+                        result.static_number = None;
+                    }
+                    result
+                });
+                Some(EvaluatedResultValue {
+                    flow_type: FlowType {
+                        mode: selector.flow_type.mode,
+                        ty: result.flow_type.ty,
+                    },
+                    parameter_derived: selector.parameter_derived || result.parameter_derived,
+                    syntax_selected: result.syntax_selected
+                        || (selector.parameter_derived && selector_is_concrete),
+                    static_number: result.static_number,
+                })
             }
-            OwnerConstraintNodeKind::Block => {
+            OwnerResidualOpKind::Forward { output } => output
+                .and_then(|output| self.evaluate_op(output, lexical, active))
+                .or_else(|| self.fallback(op)),
+            OwnerResidualOpKind::Block { bindings, result } => {
                 let mut lexical = lexical.clone();
                 let mut parameter_derived = false;
                 let mut syntax_selected = false;
-                for (input, expression) in node.inputs.iter().zip(prepared_inputs) {
-                    if let OwnerConstraintEdgeRole::BlockBinding { name } = &input.role {
-                        let value = evaluate(self, *expression, &lexical, active)?;
-                        parameter_derived |= value.parameter_derived;
-                        syntax_selected |= value.syntax_selected;
-                        lexical.insert(name.clone(), value);
-                    }
+                for binding in bindings {
+                    let value = self.evaluate_op(binding.value, &lexical, active)?;
+                    parameter_derived |= value.parameter_derived;
+                    syntax_selected |= value.syntax_selected;
+                    lexical.insert(binding.name.clone(), value);
                 }
-                if let Some(result) =
-                    node.inputs.iter().zip(prepared_inputs).find(|(input, _)| {
-                        matches!(input.role, OwnerConstraintEdgeRole::BlockResult)
-                    })
-                {
-                    let mut value = evaluate(self, *result.1, &lexical, active)?;
+                if let Some(result) = result {
+                    let mut value = self.evaluate_op(*result, &lexical, active)?;
                     value.parameter_derived |= parameter_derived;
                     value.syntax_selected |= syntax_selected;
                     Some(value)
                 } else {
-                    fallbacks.resolve(node, self.unifier, &mut self.owned_variables)
+                    self.fallback(op)
                 }
             }
-            OwnerConstraintNodeKind::Collection { collection, .. } => {
-                let values = node
-                    .inputs
+            OwnerResidualOpKind::Collection { collection, items } => {
+                let values = items
                     .iter()
-                    .zip(prepared_inputs)
-                    .filter(|(input, _)| {
-                        matches!(
-                            input.role,
-                            OwnerConstraintEdgeRole::CollectionItem
-                                | OwnerConstraintEdgeRole::MapEntry
-                        )
-                    })
-                    .map(|(_, expression)| evaluate(self, *expression, lexical, active))
+                    .map(|item| self.evaluate_op(*item, lexical, active))
                     .collect::<Option<Vec<_>>>()?;
                 let parameter_derived = values.iter().any(|value| value.parameter_derived);
                 let syntax_selected = values.iter().any(|value| value.syntax_selected);
@@ -4442,10 +5427,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                             .unwrap_or(Type::Unknown),
                     )),
                     OwnerCollectionKind::Bytes | OwnerCollectionKind::Map => {
-                        fallbacks
-                            .resolve(node, self.unifier, &mut self.owned_variables)?
-                            .flow_type
-                            .ty
+                        self.fallback(op)?.flow_type.ty
                     }
                 };
                 Some(EvaluatedResultValue {
@@ -4458,30 +5440,17 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     static_number: None,
                 })
             }
-            OwnerConstraintNodeKind::Latest => {
-                let values = node
-                    .inputs
+            OwnerResidualOpKind::Latest { branches } => {
+                let values = branches
                     .iter()
-                    .zip(prepared_inputs)
-                    .filter(|(input, _)| {
-                        matches!(input.role, OwnerConstraintEdgeRole::LatestBranch)
-                    })
-                    .map(|(_, expression)| evaluate(self, *expression, lexical, active))
+                    .map(|branch| self.evaluate_op(*branch, lexical, active))
                     .collect::<Option<Vec<_>>>()?;
                 let ty = values
                     .iter()
                     .filter(|value| !matches!(value.flow_type.ty, Type::Absent))
                     .map(|value| value.flow_type.ty.clone())
-                    .reduce(|left, right| widen_structural_type(&left, &right));
-                let ty = match ty {
-                    Some(ty) => ty,
-                    None => {
-                        fallbacks
-                            .resolve(node, self.unifier, &mut self.owned_variables)?
-                            .flow_type
-                            .ty
-                    }
-                };
+                    .reduce(|left, right| widen_structural_type(&left, &right))
+                    .unwrap_or(self.fallback(op)?.flow_type.ty);
                 Some(EvaluatedResultValue {
                     flow_type: FlowType {
                         mode: crate::latest_flow_mode(
@@ -4495,27 +5464,17 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     static_number: None,
                 })
             }
-            OwnerConstraintNodeKind::Draining => node
-                .inputs
-                .first()
-                .zip(prepared_inputs.first())
-                .and_then(|(_, expression)| evaluate(self, *expression, lexical, active))
-                .or_else(|| fallbacks.resolve(node, self.unifier, &mut self.owned_variables)),
-            OwnerConstraintNodeKind::Hold { .. } => {
-                let initial = node
-                    .inputs
-                    .iter()
-                    .zip(prepared_inputs)
-                    .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::HoldInitial))
-                    .and_then(|(_, expression)| evaluate(self, *expression, lexical, active));
-                let Some(mut value) = initial else {
-                    return fallbacks.resolve(node, self.unifier, &mut self.owned_variables);
+            OwnerResidualOpKind::Draining { input } => input
+                .and_then(|input| self.evaluate_op(input, lexical, active))
+                .or_else(|| self.fallback(op)),
+            OwnerResidualOpKind::Hold { initial, updates } => {
+                let Some(mut value) =
+                    initial.and_then(|initial| self.evaluate_op(initial, lexical, active))
+                else {
+                    return self.fallback(op);
                 };
-                for (input, expression) in node.inputs.iter().zip(prepared_inputs) {
-                    if !matches!(input.role, OwnerConstraintEdgeRole::HoldUpdate) {
-                        continue;
-                    }
-                    let update = evaluate(self, *expression, lexical, active)?;
+                for update in updates {
+                    let update = self.evaluate_op(*update, lexical, active)?;
                     if !matches!(update.flow_type.ty, Type::Absent) {
                         value.flow_type.ty = crate::widen_checked_hold_type(
                             &value.flow_type.ty,
@@ -4529,36 +5488,15 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 value.static_number = None;
                 Some(value)
             }
-            OwnerConstraintNodeKind::Then => {
-                let value = node
-                    .inputs
-                    .iter()
-                    .zip(prepared_inputs)
-                    .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::ThenOutput))
-                    .or_else(|| {
-                        node.inputs.iter().zip(prepared_inputs).find(|(input, _)| {
-                            matches!(input.role, OwnerConstraintEdgeRole::ThenInput)
-                        })
-                    })
-                    .and_then(|(_, expression)| evaluate(self, *expression, lexical, active));
-                value.map(|mut value| {
+            OwnerResidualOpKind::Then { value } => value
+                .and_then(|value| self.evaluate_op(value, lexical, active))
+                .map(|mut value| {
                     value.flow_type.mode = FlowMode::PresentOrAbsent;
                     value
-                })
-            }
-            OwnerConstraintNodeKind::MapEntry => {
-                let key = node
-                    .inputs
-                    .iter()
-                    .zip(prepared_inputs)
-                    .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::MapKey))
-                    .and_then(|(_, expression)| evaluate(self, *expression, lexical, active))?;
-                let value = node
-                    .inputs
-                    .iter()
-                    .zip(prepared_inputs)
-                    .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::MapValue))
-                    .and_then(|(_, expression)| evaluate(self, *expression, lexical, active))?;
+                }),
+            OwnerResidualOpKind::MapEntry { key, value } => {
+                let key = self.evaluate_op((*key)?, lexical, active)?;
+                let value = self.evaluate_op((*value)?, lexical, active)?;
                 Some(EvaluatedResultValue {
                     flow_type: FlowType {
                         mode: FlowMode::Continuous,
@@ -4575,8 +5513,8 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     static_number: None,
                 })
             }
-            OwnerConstraintNodeKind::Source => {
-                let fallback = fallbacks.resolve(node, self.unifier, &mut self.owned_variables)?;
+            OwnerResidualOpKind::Source => {
+                let fallback = self.fallback(op)?;
                 Some(EvaluatedResultValue {
                     flow_type: FlowType {
                         mode: FlowMode::PresentOrAbsent,
@@ -4585,7 +5523,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     ..fallback
                 })
             }
-            OwnerConstraintNodeKind::Tag { name } if name == "SKIP" => Some(EvaluatedResultValue {
+            OwnerResidualOpKind::Skip => Some(EvaluatedResultValue {
                 flow_type: FlowType {
                     mode: FlowMode::Absent,
                     ty: Type::Absent,
@@ -4594,263 +5532,26 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 syntax_selected: false,
                 static_number: None,
             }),
-            _ => fallbacks.resolve(node, self.unifier, &mut self.owned_variables),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_when_node(
-        &mut self,
-        module: &OwnerInterfaceTransferModule,
-        node: &OwnerResultTransferNode,
-        prepared_node: &PreparedOwnerResultTransferNode,
-        nodes: &[OwnerResultTransferNode],
-        prepared: &PreparedOwnerResultTransfer,
-        arguments: &OwnerResultTransferArguments,
-        context: Option<&EvaluatedResultValue>,
-        fallbacks: &mut OwnerResultTransferFallbacks,
-        lexical: &BTreeMap<String, EvaluatedResultValue>,
-        active: &mut OwnerResultTransferActiveNodes,
-    ) -> Option<EvaluatedResultValue> {
-        let prepared_inputs = prepared.node_inputs(prepared_node)?;
-        if prepared_inputs.len() != node.inputs.len() {
-            return None;
-        }
-        let selector = node
-            .inputs
-            .iter()
-            .zip(prepared_inputs)
-            .find(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::WhenInput))?;
-        let selector = self.evaluate_expression_ref(
-            module,
-            *selector.1,
-            nodes,
-            prepared,
-            arguments,
-            context,
-            fallbacks,
-            lexical,
-            active,
-        )?;
-        let selector_is_concrete =
-            crate::type_is_singleton_syntax_discriminant(&selector.flow_type.ty);
-        let mut outputs = Vec::new();
-        for arm in node
-            .inputs
-            .iter()
-            .zip(prepared_inputs)
-            .filter(|(input, _)| matches!(input.role, OwnerConstraintEdgeRole::WhenArm))
-        {
-            let PreparedOwnerResultExpressionRef::Local(expression) = *arm.1 else {
-                continue;
-            };
-            let arm = nodes.get(expression as usize)?;
-            let prepared_arm = prepared.nodes.get(expression as usize)?;
-            let prepared_arm_inputs = prepared.node_inputs(prepared_arm)?;
-            if prepared_arm_inputs.len() != arm.inputs.len() {
-                return None;
-            }
-            let pattern = match &arm.kind {
-                OwnerConstraintNodeKind::MatchArm { pattern }
-                | OwnerConstraintNodeKind::Arrow { pattern } => pattern,
-                _ => continue,
-            };
-            if selector_is_concrete && !owner_pattern_accepts(&selector.flow_type.ty, pattern) {
-                continue;
-            }
-            let mut arm_lexical = lexical.clone();
-            extend_owner_pattern_bindings(&mut arm_lexical, &selector, pattern);
-            let Some(output) = arm
-                .inputs
-                .iter()
-                .zip(prepared_arm_inputs)
-                .find(|(input, _)| {
-                    matches!(
-                        input.role,
-                        OwnerConstraintEdgeRole::MatchOutput | OwnerConstraintEdgeRole::ArrowOutput
-                    )
-                })
-            else {
-                continue;
-            };
-            if let Some(output) = self.evaluate_expression_ref(
-                module,
-                *output.1,
-                nodes,
-                prepared,
-                arguments,
-                context,
-                fallbacks,
-                &arm_lexical,
-                active,
-            ) && !matches!(output.flow_type.ty, Type::Absent)
-            {
-                outputs.push(output);
-                if selector_is_concrete {
-                    // WHEN is ordered. Once a concrete selector accepts one
-                    // arm, a later wildcard is unreachable and must not widen
-                    // the selected occurrence result.
-                    break;
-                }
-            }
-        }
-        let mut outputs = outputs.into_iter();
-        let first = outputs.next()?;
-        let result = outputs.fold(first, |mut result, next| {
-            result.flow_type.ty = widen_structural_type(&result.flow_type.ty, &next.flow_type.ty);
-            result.parameter_derived |= next.parameter_derived;
-            result.syntax_selected |= next.syntax_selected;
-            if result.static_number != next.static_number {
-                result.static_number = None;
-            }
-            result
-        });
-        Some(EvaluatedResultValue {
-            flow_type: FlowType {
-                mode: selector.flow_type.mode,
-                ty: result.flow_type.ty,
-            },
-            parameter_derived: selector.parameter_derived || result.parameter_derived,
-            syntax_selected: result.syntax_selected
-                || (selector.parameter_derived && selector_is_concrete),
-            static_number: result.static_number,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn evaluate_call_node(
-        &mut self,
-        module: &OwnerInterfaceTransferModule,
-        node: &OwnerResultTransferNode,
-        prepared_node: &PreparedOwnerResultTransferNode,
-        nodes: &[OwnerResultTransferNode],
-        prepared: &PreparedOwnerResultTransfer,
-        arguments: &OwnerResultTransferArguments,
-        context: Option<&EvaluatedResultValue>,
-        fallbacks: &mut OwnerResultTransferFallbacks,
-        lexical: &BTreeMap<String, EvaluatedResultValue>,
-        active: &mut OwnerResultTransferActiveNodes,
-    ) -> Option<EvaluatedResultValue> {
-        let prepared_inputs = prepared.node_inputs(prepared_node)?;
-        if prepared_inputs.len() != node.inputs.len() {
-            return None;
-        }
-        match node.call_target.as_ref()? {
-            OwnerResultCallTarget::Owner { .. } => {
-                let (callee_module, callee_owner, _, _) =
-                    module.resolve_prepared_owner(prepared_node.call_owner?)?;
-                let mut actuals = OwnerResultTransferArguments::default();
-                for (input, expression) in node.inputs.iter().zip(prepared_inputs) {
-                    let Some(formal_ordinal) = input.formal_ordinal else {
-                        continue;
-                    };
-                    let value = self.evaluate_expression_ref(
-                        module,
-                        *expression,
-                        nodes,
-                        prepared,
-                        arguments,
-                        context,
-                        fallbacks,
-                        lexical,
-                        active,
-                    )?;
-                    actuals.insert(formal_ordinal, value);
-                }
-                let explicit_context = node
-                    .inputs
-                    .iter()
-                    .zip(prepared_inputs)
-                    .find(|(input, _)| input.explicit_pass)
-                    .and_then(|(_, expression)| {
-                        self.evaluate_expression_ref(
-                            module,
-                            *expression,
-                            nodes,
-                            prepared,
-                            arguments,
-                            context,
-                            fallbacks,
-                            lexical,
-                            active,
-                        )
-                    });
-                self.evaluate_owner_in_module(
-                    callee_module,
-                    callee_owner,
-                    &actuals,
-                    explicit_context.as_ref().or(context),
-                )
-                .map(|result| result.value)
-                .or_else(|| fallbacks.resolve(node, self.unifier, &mut self.owned_variables))
-            }
-            OwnerResultCallTarget::Abi {
-                canonical_name,
-                contract,
-            } => self
-                .evaluate_abi_call(
-                    module,
-                    node,
-                    canonical_name,
-                    contract,
-                    prepared_node,
-                    nodes,
-                    prepared,
-                    arguments,
-                    context,
-                    fallbacks,
-                    lexical,
-                    active,
-                )
-                .or_else(|| fallbacks.resolve(node, self.unifier, &mut self.owned_variables)),
-            OwnerResultCallTarget::Unresolved | OwnerResultCallTarget::Ambiguous { .. } => {
-                fallbacks.resolve(node, self.unifier, &mut self.owned_variables)
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn evaluate_abi_call(
         &mut self,
-        module: &OwnerInterfaceTransferModule,
-        node: &OwnerResultTransferNode,
         function: &str,
-        contract: &OwnerResultAbiContract,
-        prepared_node: &PreparedOwnerResultTransferNode,
-        nodes: &[OwnerResultTransferNode],
-        prepared: &PreparedOwnerResultTransfer,
-        arguments: &OwnerResultTransferArguments,
-        context: Option<&EvaluatedResultValue>,
-        fallbacks: &mut OwnerResultTransferFallbacks,
+        contract: &OwnerResidualAbiContract,
+        inputs: &[OwnerResidualActual],
         lexical: &BTreeMap<String, EvaluatedResultValue>,
-        active: &mut OwnerResultTransferActiveNodes,
+        active: &mut OwnerResidualDraftActiveNodes,
     ) -> Option<EvaluatedResultValue> {
-        let prepared_inputs = prepared.node_inputs(prepared_node)?;
-        if prepared_inputs.len() != node.inputs.len() {
-            return None;
-        }
-        let mut actuals = OwnerResultTransferArguments::default();
+        let mut actuals = OwnerResidualDraftArguments::default();
         let mut instantiation = crate::InlineTypeSubstitutions::default();
-        for (input, expression) in node.inputs.iter().zip(prepared_inputs) {
-            let Some(formal_ordinal) = input.formal_ordinal else {
-                continue;
-            };
+        for input in inputs {
             let parameter = contract
                 .parameters
-                .binary_search_by_key(&formal_ordinal, |parameter| parameter.ordinal)
+                .binary_search_by_key(&input.formal_ordinal, |parameter| parameter.ordinal)
                 .ok()
                 .and_then(|index| contract.parameters.get(index))?;
-            let actual = self.evaluate_expression_ref(
-                module,
-                *expression,
-                nodes,
-                prepared,
-                arguments,
-                context,
-                fallbacks,
-                lexical,
-                active,
-            )?;
+            let actual = self.evaluate_op(input.value, lexical, active)?;
             crate::unify_checked_type_pattern(
                 &parameter.flow_type.ty,
                 &actual.flow_type.ty,
@@ -4900,7 +5601,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             abi_actual_by_name(contract, &actuals, "list")
                 .map(|value| value.flow_type.mode)
                 .unwrap_or(contract.result.mode)
-        } else if contract.kind == boon_checked::CheckedCallableKind::External {
+        } else if contract.kind == CheckedCallableKind::External {
             actuals.values().fold(contract.result.mode, |mode, actual| {
                 crate::merge_flow_modes(mode, actual.flow_type.mode)
             })
@@ -4914,6 +5615,55 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             static_number: None,
         })
     }
+
+    fn evaluate(mut self, constant: Option<&EvaluatedResultValue>) -> Option<EvaluatedOwnerResult> {
+        let root = self.program.root.clone();
+        let mut result = self.evaluate_root(
+            &root,
+            &BTreeMap::new(),
+            &mut OwnerResidualDraftActiveNodes::new(),
+            constant,
+        )?;
+        result.owned_variables = self.owned_variables;
+        Some(result)
+    }
+}
+
+struct CompiledOwnerResidualEvaluator<'a, 'unifier> {
+    providers: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerInterfaceTransferModule>,
+    unifier: &'unifier mut TypeUnifier,
+}
+
+impl<'a, 'unifier> CompiledOwnerResidualEvaluator<'a, 'unifier> {
+    fn new(
+        providers: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerInterfaceTransferModule>,
+        unifier: &'unifier mut TypeUnifier,
+    ) -> Self {
+        Self { providers, unifier }
+    }
+
+    fn evaluate_owner(
+        &mut self,
+        owner: &StableCheckOwnerKey,
+        arguments: &OwnerResidualDraftArguments,
+        context: Option<&EvaluatedResultValue>,
+    ) -> Option<EvaluatedOwnerResult> {
+        let module = *self.providers.get(owner)?;
+        self.evaluate_owner_in_module(module, owner, arguments, context)
+    }
+
+    fn evaluate_owner_in_module(
+        &mut self,
+        module: &OwnerInterfaceTransferModule,
+        owner: &StableCheckOwnerKey,
+        arguments: &OwnerResidualDraftArguments,
+        context: Option<&EvaluatedResultValue>,
+    ) -> Option<EvaluatedOwnerResult> {
+        let owner = module.result.key.members.binary_search(owner).ok()?;
+        let program = module.program.owners.get(owner)?;
+        CompiledOwnerResidualProgramEvaluator::new(program, arguments, context, self.unifier)
+            .evaluate(module.constant_result_at(owner))
+    }
 }
 
 /// Evaluate one call occurrence against an SCC-sealed result-transfer module.
@@ -4925,14 +5675,14 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
 pub(crate) fn evaluate_owner_result_transfer_occurrence(
     module: &OwnerInterfaceTransferModule,
     owner: &StableCheckOwnerKey,
-    arguments: &OwnerResultTransferArguments,
+    arguments: &OwnerResidualDraftArguments,
     context: Option<&EvaluatedResultValue>,
     unifier: &mut TypeUnifier,
 ) -> Option<EvaluatedResultValue> {
     let providers = BTreeMap::new();
-    let mut evaluator = OwnerResultTransferEvaluator::new(&providers, unifier);
+    let mut evaluator = CompiledOwnerResidualEvaluator::new(&providers, unifier);
     evaluator
-        .evaluate_owner_from_root_module(module, owner, arguments, context)
+        .evaluate_owner_in_module(module, owner, arguments, context)
         .map(|result| result.value)
 }
 
@@ -5015,8 +5765,8 @@ fn extend_owner_pattern_bindings(
 }
 
 fn abi_actual_by_name<'a>(
-    contract: &OwnerResultAbiContract,
-    actuals: &'a OwnerResultTransferArguments,
+    contract: &OwnerResidualAbiContract,
+    actuals: &'a OwnerResidualDraftArguments,
     name: &str,
 ) -> Option<&'a EvaluatedResultValue> {
     contract
@@ -5979,7 +6729,7 @@ fn refine_owner_call_at(
         states[call_index] = 2;
         return;
     }
-    let mut arguments = OwnerResultTransferArguments::default();
+    let mut arguments = OwnerResidualDraftArguments::default();
     for input in &matched_inputs {
         let reference = input.expression;
         if let Some(actual) = body_expression_result_value(
@@ -6033,7 +6783,7 @@ fn refine_owner_call_at(
         Some(replayed)
     } else {
         let evaluated = {
-            let mut evaluator = OwnerResultTransferEvaluator::new(providers, unifier);
+            let mut evaluator = CompiledOwnerResidualEvaluator::new(providers, unifier);
             evaluator.evaluate_owner(
                 target_owner,
                 &invocation.arguments,
@@ -7549,14 +8299,14 @@ pub fn infer_owner_body<'a>(
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     abi: &OwnerInferenceAbiEnvironment,
-    own_scc: &'a OwnerInterfaceSccResult,
-    imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
+    own_module: &'a OwnerInterfaceTransferModule,
+    imported_modules: impl IntoIterator<Item = &'a OwnerInterfaceTransferModule>,
 ) -> Result<OwnerBodyInferenceShard, OwnerBodyInferenceError> {
-    let imported_sccs = imported_sccs.into_iter().collect::<Vec<_>>();
+    let imported_modules = imported_modules.into_iter().collect::<Vec<_>>();
     let interface_plan = plan_owner_body_interfaces(
         seed,
         summary,
-        std::iter::once(own_scc).chain(imported_sccs.iter().copied()),
+        std::iter::once(own_module).chain(imported_modules.iter().copied()),
     )?;
     evaluate_owner_body(syntax, lexical_plan, seed, summary, abi, &interface_plan)
         .map(|evaluation| Arc::unwrap_or_clone(evaluation.result))
@@ -7567,8 +8317,9 @@ mod tests {
     use super::*;
     use crate::{
         ResolvedOwnerSymbolReference, build_owner_interface_topology,
-        project_owner_constraint_seed, project_owner_lexical_plan, project_owner_source_map,
-        project_owner_syntax_input, resolve_owner_constraint_seed, solve_owner_interface_scc,
+        evaluate_owner_interface_scc_component_for_tests, project_owner_constraint_seed,
+        project_owner_lexical_plan, project_owner_source_map, project_owner_syntax_input,
+        resolve_owner_constraint_seed,
     };
     use boon_parser::{
         ProjectSyntaxSnapshot, UnitSyntaxSnapshot, parse_project_source_unit,
@@ -7649,7 +8400,7 @@ mod tests {
     fn solve(
         seeds: &[OwnerConstraintSeed],
         summaries: &[OwnerConstraintSummary],
-    ) -> Vec<crate::OwnerInterfaceSccResult> {
+    ) -> Vec<OwnerInterfaceTransferModule> {
         let abi_provider = test_abi();
         solve_with_abi(seeds, summaries, &abi_provider)
     }
@@ -7658,7 +8409,7 @@ mod tests {
         seeds: &[OwnerConstraintSeed],
         summaries: &[OwnerConstraintSummary],
         abi_provider: &crate::OwnerAbiEnvironment,
-    ) -> Vec<crate::OwnerInterfaceSccResult> {
+    ) -> Vec<OwnerInterfaceTransferModule> {
         let topology = build_owner_interface_topology(summaries.iter()).unwrap();
         let seeds = seeds
             .iter()
@@ -7668,7 +8419,8 @@ mod tests {
             .iter()
             .map(|summary| (summary.owner.clone(), summary))
             .collect::<BTreeMap<_, _>>();
-        let mut results = BTreeMap::new();
+        let mut modules =
+            BTreeMap::<OwnerInterfaceSccKey, Arc<OwnerInterfaceTransferModule>>::new();
         for scc in &topology.sccs {
             let requirements = parameter_requirement_lookups(
                 abi_provider,
@@ -7694,22 +8446,23 @@ mod tests {
             let dependencies = scc
                 .dependencies
                 .iter()
-                .map(|dependency| results.get(dependency).unwrap())
+                .map(|dependency| modules.get(dependency).unwrap())
                 .collect::<Vec<_>>();
-            let result = solve_owner_interface_scc(
+            let component = evaluate_owner_interface_scc_component_for_tests(
                 scc,
                 &abi,
                 scc.key.members.iter().map(|owner| seeds[owner]),
                 scc.key.members.iter().map(|owner| summaries[owner]),
-                dependencies,
+                dependencies.iter().map(|module| module.result()),
+                dependencies.iter().map(|module| Arc::clone(module)),
             )
             .unwrap();
-            results.insert(scc.key.clone(), result);
+            modules.insert(scc.key.clone(), component.module);
         }
         topology
             .sccs
             .iter()
-            .map(|scc| results.remove(&scc.key).unwrap())
+            .map(|scc| Arc::unwrap_or_clone(modules.remove(&scc.key).unwrap()))
             .collect()
     }
 
@@ -7717,7 +8470,7 @@ mod tests {
         syntax: &OwnerSyntaxInput,
         seed: &OwnerConstraintSeed,
         summary: &OwnerConstraintSummary,
-        results: &[OwnerInterfaceSccResult],
+        results: &[OwnerInterfaceTransferModule],
     ) -> OwnerBodyInferenceShard {
         let abi_provider = test_abi();
         infer_with_abi(syntax, seed, summary, results, &abi_provider)
@@ -7727,7 +8480,7 @@ mod tests {
         syntax: &OwnerSyntaxInput,
         seed: &OwnerConstraintSeed,
         summary: &OwnerConstraintSummary,
-        results: &[OwnerInterfaceSccResult],
+        results: &[OwnerInterfaceTransferModule],
         abi_provider: &crate::OwnerAbiEnvironment,
     ) -> OwnerBodyInferenceShard {
         let requirements = parameter_requirement_lookups(abi_provider, [seed]);
@@ -7936,7 +8689,7 @@ mod tests {
         assert_eq!(label.flow_type.ty, Type::Text);
         assert_eq!(label.static_number, None);
         let providers = BTreeMap::from([(label_owner.clone(), label_plan.own_scc.module.as_ref())]);
-        let arguments = OwnerResultTransferArguments::from([(
+        let arguments = OwnerResidualDraftArguments::from([(
             0,
             EvaluatedResultValue {
                 flow_type: FlowType {
@@ -7949,7 +8702,7 @@ mod tests {
             },
         )]);
         let mut unifier = TypeUnifier::default();
-        let mut evaluator = OwnerResultTransferEvaluator::new(&providers, &mut unifier);
+        let mut evaluator = CompiledOwnerResidualEvaluator::new(&providers, &mut unifier);
         let evaluated = evaluator
             .evaluate_owner(&label_owner, &arguments, None)
             .expect("constant result must retain occurrence metadata");
@@ -8184,6 +8937,103 @@ mod tests {
             )
         }));
         assert!(boon_checked::type_is_recursively_closed(&call.result.ty));
+    }
+
+    #[test]
+    fn wrapper_call_closes_a_nested_producer_record_with_a_hold() {
+        let source = concat!(
+            "FUNCTION stateful(row) {\n",
+            "    [\n",
+            "        formatter: row.formatter |> HOLD formatter {}\n",
+            "        segments: row.segments\n",
+            "    ]\n",
+            "}\n",
+            "FUNCTION wrapper(row) {\n",
+            "    row.item_kind |> WHEN {\n",
+            "        VariableRow => stateful(row: row)\n",
+            "        __ => row\n",
+            "    }\n",
+            "}\n",
+            "FUNCTION producer(raw) {\n",
+            "    [\n",
+            "        item_kind: VariableRow\n",
+            "        formatter: Hexadecimal\n",
+            "        segments: raw.segments\n",
+            "    ]\n",
+            "}\n",
+            "value: wrapper(row: producer(raw: [segments: TEXT { closed }]))\n",
+        );
+        let unit = link(source);
+        let stateful = owner_named(&unit, "stateful");
+        let wrapper = owner_named(&unit, "wrapper");
+        let producer = owner_named(&unit, "producer");
+        let value = owner_named(&unit, "value");
+        let owners = unit.stable_check_owner_keys().collect::<Vec<_>>();
+        let inputs = owners
+            .iter()
+            .map(|owner| (owner.clone(), self::inputs(&unit, owner)))
+            .collect::<BTreeMap<_, _>>();
+        let parameters = |owner: &StableCheckOwnerKey| {
+            inputs[owner]
+                .2
+                .declarations
+                .iter()
+                .find(|declaration| declaration.public)
+                .expect("callable declaration")
+                .parameters
+                .clone()
+        };
+        let summaries = owners
+            .iter()
+            .map(|owner| {
+                let seed = &inputs[owner].2;
+                let resolutions = seed.references.iter().filter_map(|reference| {
+                    if reference.kind != OwnerReferenceKind::Callable {
+                        return None;
+                    }
+                    let target = if reference.parts.as_ref() == ["stateful"] {
+                        &stateful
+                    } else if reference.parts.as_ref() == ["wrapper"] {
+                        &wrapper
+                    } else if reference.parts.as_ref() == ["producer"] {
+                        &producer
+                    } else {
+                        return None;
+                    };
+                    Some(ResolvedOwnerSymbolReference {
+                        reference: reference.clone(),
+                        owner: target.clone(),
+                        projection: Box::new([]),
+                        parameters: parameters(target),
+                    })
+                });
+                resolve_owner_constraint_seed(seed, resolutions).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let seeds = owners
+            .iter()
+            .map(|owner| inputs[owner].2.clone())
+            .collect::<Vec<_>>();
+        let modules = solve(&seeds, &summaries);
+        let interface = modules
+            .iter()
+            .find_map(|module| module.owner(&value))
+            .expect("value public interface");
+
+        assert!(
+            boon_checked::type_is_recursively_closed(&interface.result.ty),
+            "wrapper occurrence must close every generic field: {interface:#?}",
+        );
+        let Type::Object(value) = &interface.result.ty else {
+            panic!("wrapper occurrence must publish a record: {interface:#?}");
+        };
+        assert_eq!(
+            value.fields.get("formatter"),
+            Some(&Type::VariantSet(
+                vec![Variant::Tag("Hexadecimal".to_owned())].into()
+            )),
+        );
+        assert_eq!(value.fields.get("segments"), Some(&Type::Text),);
     }
 
     #[test]
@@ -8435,7 +9285,7 @@ mod tests {
     }
 
     #[test]
-    fn result_transfer_fallbacks_reuse_the_invocation_alpha_namespace() {
+    fn sealed_residual_program_keeps_private_alphas_out_of_the_public_interface() {
         let unit = link(concat!(
             "FUNCTION choose(kind) {\n",
             "    kind |> WHEN {\n",
@@ -8447,58 +9297,31 @@ mod tests {
         let choose = owner_named(&unit, "choose");
         let (_, _, seed) = inputs(&unit, &choose);
         let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
-        let interfaces = solve(&[seed.clone()], &[summary.clone()]);
-        let interface = interfaces
+        let modules = solve(&[seed.clone()], &[summary.clone()]);
+        let module = modules
             .iter()
-            .find_map(|result| result.owner(&choose))
-            .unwrap();
-        let OwnerResultTransfer::Expression { nodes, .. } = &interface.result_transfer else {
-            panic!("choose must publish an expression result transfer");
-        };
-        assert!(nodes.len() > 1);
+            .find(|module| module.owns_owner(&choose))
+            .expect("choose residual module");
+        let owner = module.key.members.binary_search(&choose).unwrap();
+        let program = &module.program.owners[owner];
 
-        let plan = plan_owner_body_interfaces(&seed, &summary, &interfaces).unwrap();
-        let module = plan.own_scc.module.as_ref();
-        let (_, _, prepared) = module.own_prepared_owner(&choose).unwrap();
-        assert_eq!(prepared.nodes.len(), nodes.len());
+        assert!(!program.ops.is_empty());
+        assert_eq!(program.frames[program.root.frame() as usize].namespace, 0);
+        assert!(program.namespaces[0] >= module.type_variable_count);
+        assert_eq!(module.program.op_count, program.ops.len() as u64);
         assert_eq!(
-            prepared.inputs.len(),
-            nodes.iter().map(|node| node.inputs.len()).sum::<usize>()
+            module.program.edge_count,
+            program
+                .ops
+                .iter()
+                .map(|op| op.kind.edge_count())
+                .sum::<u64>()
         );
-        let local_nodes = nodes
-            .iter()
-            .enumerate()
-            .map(|(index, node)| (node.expression.clone(), index as u32))
-            .collect::<BTreeMap<_, _>>();
-        for (node, prepared_node) in nodes.iter().zip(&prepared.nodes) {
-            let prepared_inputs = prepared.node_inputs(prepared_node).unwrap();
-            assert_eq!(prepared_inputs.len(), node.inputs.len());
-            for (input, prepared_input) in node.inputs.iter().zip(prepared_inputs) {
-                let OwnerResultExpressionRef::Local { expression } = &input.expression else {
-                    panic!("callable transfer input unexpectedly crosses an owner boundary");
-                };
-                assert_eq!(
-                    *prepared_input,
-                    PreparedOwnerResultExpressionRef::Local(local_nodes[expression])
-                );
-            }
-        }
-        let mut forged = interface.clone();
-        let OwnerResultTransfer::Expression { root, nodes } = &interface.result_transfer else {
-            unreachable!();
-        };
-        let mut duplicate_nodes = nodes.to_vec();
-        duplicate_nodes.push(nodes[0].clone());
-        forged.result_transfer = OwnerResultTransfer::Expression {
-            root: root.clone(),
-            nodes: duplicate_nodes.into_boxed_slice(),
-        };
-        assert!(prepare_owner_result_transfer(module, &forged).is_err());
 
-        let mut forged_capture = interface.clone();
-        forged_capture.lexical_captures = vec![crate::OwnerInterfaceLexicalCapture {
+        let mut forged = module.result.owners[owner].clone();
+        forged.lexical_captures = vec![crate::OwnerInterfaceLexicalCapture {
             target: OwnerLexicalTargetRef::Declaration {
-                owner: choose.clone(),
+                owner: choose,
                 declaration: boon_checked::OwnerDeclarationStableKey::Public,
                 capability: boon_checked::OwnerLexicalDeclarationCapability::Value,
             },
@@ -8509,96 +9332,212 @@ mod tests {
             },
         }]
         .into_boxed_slice();
-        assert!(
-            !owner_result_transfer_interface_variables_are_complete(&forged_capture),
-            "transfer sealing must reject undeclared lexical-capture alphas",
-        );
-
-        let mut unifier = TypeUnifier::default();
-        let mut owned_variables = Vec::new();
-        let variables = OwnerResultTransferVariables::new();
-        let mut fallbacks =
-            OwnerResultTransferFallbacks::new(variables, crate::InlineTypeSubstitutions::default());
-        let demanded = &nodes[0];
-        let first = fallbacks
-            .resolve(demanded, &mut unifier, &mut owned_variables)
-            .unwrap();
-        let demanded_variables = owned_variables.len();
-        let second = fallbacks
-            .resolve(demanded, &mut unifier, &mut owned_variables)
-            .unwrap();
-
-        assert!(first == second);
-        assert!(demanded_variables < interface.type_variables.len());
-        assert_eq!(owned_variables.len(), demanded_variables);
+        assert!(!owner_result_transfer_interface_variables_are_complete(
+            &forged,
+            &OwnerResidualDraft::Principal,
+            program.namespaces[0],
+        ));
     }
 
     #[test]
-    fn child_transfer_uses_the_current_scc_frame_and_isolates_dependency_alphas() {
-        let stable = TypeVar(0);
-        let result = FlowType {
-            mode: FlowMode::PresentOrAbsent,
-            ty: Type::Var(stable),
+    fn residual_linker_is_exact_and_composes_acyclic_calls() {
+        let unit = link(concat!(
+            "FUNCTION leaf(input) {\n",
+            "    input\n",
+            "}\n",
+            "FUNCTION wrapper(input) {\n",
+            "    leaf(input: input)\n",
+            "}\n",
+            "spare: 2\n",
+        ));
+        let leaf = owner_named(&unit, "leaf");
+        let wrapper = owner_named(&unit, "wrapper");
+        let spare = owner_named(&unit, "spare");
+        let (_, _, leaf_seed) = inputs(&unit, &leaf);
+        let (_, _, wrapper_seed) = inputs(&unit, &wrapper);
+        let (_, _, spare_seed) = inputs(&unit, &spare);
+        let leaf_summary = resolve_owner_constraint_seed(&leaf_seed, []).unwrap();
+        let callable = wrapper_seed
+            .references
+            .iter()
+            .find(|reference| reference.kind == OwnerReferenceKind::Callable)
+            .cloned()
+            .expect("wrapper callable reference");
+        let parameters = leaf_seed
+            .declarations
+            .iter()
+            .find(|declaration| declaration.public)
+            .expect("leaf public declaration")
+            .parameters
+            .clone();
+        let wrapper_summary = resolve_owner_constraint_seed(
+            &wrapper_seed,
+            [ResolvedOwnerSymbolReference {
+                reference: callable,
+                owner: leaf.clone(),
+                projection: Box::new([]),
+                parameters,
+            }],
+        )
+        .unwrap();
+        let spare_summary = resolve_owner_constraint_seed(&spare_seed, []).unwrap();
+        let modules = solve(
+            &[leaf_seed.clone(), wrapper_seed, spare_seed],
+            &[leaf_summary, wrapper_summary, spare_summary],
+        );
+        let leaf_module = modules
+            .iter()
+            .find(|module| module.owns_owner(&leaf))
+            .expect("leaf residual module");
+        let wrapper_module = modules
+            .iter()
+            .find(|module| module.owns_owner(&wrapper))
+            .expect("wrapper residual module");
+        let spare_module = modules
+            .iter()
+            .find(|module| module.owns_owner(&spare))
+            .expect("spare residual module");
+        let wrapper_program = &wrapper_module.program.owners[0];
+
+        assert!(
+            wrapper_program
+                .ops
+                .iter()
+                .any(|op| matches!(op.kind, OwnerResidualOpKind::InlinedRoot { .. })),
+            "the dependency call must be represented by its composed residual root",
+        );
+        assert!(
+            wrapper_program
+                .ops
+                .iter()
+                .all(|op| !matches!(op.kind, OwnerResidualOpKind::RecursiveCall { .. })),
+            "an acyclic dependency call must not survive sealing as a recursive call",
+        );
+
+        let child_draft = OwnerResidualDraft::Expression {
+            root: OwnerResidualExpressionRef::Child {
+                owner: leaf.clone(),
+                expression: leaf_seed.expressions[0].expression.clone(),
+            },
+            nodes: Box::new([]),
         };
+        let residual_type_variable_count = wrapper_program.namespaces[0];
+        let error = seal_owner_interface_transfer_module(
+            Arc::clone(&wrapper_module.result),
+            vec![child_draft.clone()].into_boxed_slice(),
+            residual_type_variable_count,
+            &[],
+            [],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("non-direct dependency"));
+
+        let leaf_key = leaf_module.key.clone();
+        let error = seal_owner_interface_transfer_module(
+            Arc::clone(&wrapper_module.result),
+            vec![child_draft.clone()].into_boxed_slice(),
+            residual_type_variable_count,
+            std::slice::from_ref(&leaf_key),
+            [Arc::new(spare_module.clone())],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("wrong direct dependencies"));
+
+        let error = seal_owner_interface_transfer_module(
+            Arc::clone(&wrapper_module.result),
+            vec![OwnerResidualDraft::Principal].into_boxed_slice(),
+            residual_type_variable_count,
+            std::slice::from_ref(&leaf_key),
+            [Arc::new(leaf_module.clone())],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unused dependency"));
+
+        let exact = seal_owner_interface_transfer_module(
+            Arc::clone(&wrapper_module.result),
+            vec![child_draft].into_boxed_slice(),
+            residual_type_variable_count,
+            std::slice::from_ref(&leaf_key),
+            [Arc::new(leaf_module.clone())],
+        )
+        .expect("exact direct dependency seals");
+        assert_eq!(
+            exact.direct_dependency_keys().collect::<Vec<_>>(),
+            [&leaf_key]
+        );
+    }
+
+    #[test]
+    fn residual_linker_rejects_an_undeclared_alpha() {
+        let unit = link("value: 1\n");
+        let value = owner_named(&unit, "value");
+        let (_, _, seed) = inputs(&unit, &value);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let modules = solve(&[seed], &[summary]);
+        let module = modules
+            .iter()
+            .find(|module| module.owns_owner(&value))
+            .expect("value residual module");
+        let residual_type_variable_count = module.program.owners[0].namespaces[0];
+        let mut forged = (*module.result).clone();
+        forged.owners[0].result.ty = Type::Var(TypeVar(residual_type_variable_count));
+
+        let error = seal_owner_interface_transfer_module(
+            Arc::new(forged),
+            vec![OwnerResidualDraft::Principal].into_boxed_slice(),
+            residual_type_variable_count,
+            &[],
+            [],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("incomplete alpha-variable namespace")
+        );
+    }
+
+    #[test]
+    fn residual_surface_namespaces_share_within_one_dependency_and_isolate_peers() {
+        let fallback = FlowType {
+            mode: FlowMode::PresentOrAbsent,
+            ty: Type::Var(TypeVar(0)),
+        };
+        let surface = |namespace| OwnerResidualOp {
+            frame: 0,
+            fallback: fallback.clone(),
+            static_number: None,
+            kind: OwnerResidualOpKind::Surface { namespace },
+        };
+        let program = OwnerResidualOwnerProgram {
+            namespaces: vec![1, 1, 1].into_boxed_slice(),
+            frames: Box::new([]),
+            ops: vec![surface(0), surface(1), surface(1), surface(2)].into_boxed_slice(),
+            root: OwnerResidualRoot::Principal { frame: 0 },
+            invocation_invariant: false,
+        };
+        let arguments = OwnerResidualDraftArguments::default();
         let mut unifier = TypeUnifier::default();
-        let mut owned_variables = Vec::new();
-        let mut variables = OwnerResultTransferVariables::new();
-        let Type::Var(local) =
-            variables.instantiate(&Type::Var(stable), &mut unifier, &mut owned_variables)
+        let mut evaluator =
+            CompiledOwnerResidualProgramEvaluator::new(&program, &arguments, None, &mut unifier);
+        let Type::Var(own) = evaluator
+            .resolve_type(0, &Type::Var(TypeVar(0)), None)
+            .unwrap()
         else {
             unreachable!();
         };
-        unifier.bind_var(local, Type::Text);
-        let mut fallbacks =
-            OwnerResultTransferFallbacks::new(variables, crate::InlineTypeSubstitutions::default());
+        evaluator.unifier.bind_var(own, Type::Text);
+        let mut active = OwnerResidualDraftActiveNodes::new();
+        let lexical = BTreeMap::new();
+        let own = evaluator.evaluate_op(0, &lexical, &mut active).unwrap();
+        let dependency = evaluator.evaluate_op(1, &lexical, &mut active).unwrap();
+        let repeated = evaluator.evaluate_op(2, &lexical, &mut active).unwrap();
+        let peer = evaluator.evaluate_op(3, &lexical, &mut active).unwrap();
 
-        let own = fallbacks.resolve_child(
-            PreparedOwnerInterfaceTransferRoute::Own(1),
-            &result,
-            &mut unifier,
-            &mut owned_variables,
-        );
-        assert_eq!(
-            own.flow_type,
-            FlowType {
-                mode: result.mode,
-                ty: Type::Text,
-            }
-        );
-
-        let first_dependency = fallbacks.resolve_child(
-            PreparedOwnerInterfaceTransferRoute::Dependency {
-                dependency: 0,
-                owner: 0,
-            },
-            &result,
-            &mut unifier,
-            &mut owned_variables,
-        );
-        let repeated_dependency = fallbacks.resolve_child(
-            PreparedOwnerInterfaceTransferRoute::Dependency {
-                dependency: 0,
-                owner: 1,
-            },
-            &result,
-            &mut unifier,
-            &mut owned_variables,
-        );
-        let second_dependency = fallbacks.resolve_child(
-            PreparedOwnerInterfaceTransferRoute::Dependency {
-                dependency: 1,
-                owner: 0,
-            },
-            &result,
-            &mut unifier,
-            &mut owned_variables,
-        );
-        assert!(first_dependency == repeated_dependency);
-        assert_ne!(first_dependency.flow_type.ty, Type::Text);
-        assert_ne!(
-            first_dependency.flow_type.ty,
-            second_dependency.flow_type.ty
-        );
+        assert_eq!(own.flow_type.ty, Type::Text);
+        assert!(dependency == repeated);
+        assert_ne!(dependency.flow_type.ty, Type::Text);
+        assert_ne!(dependency.flow_type.ty, peer.flow_type.ty);
     }
 
     #[test]
@@ -8646,7 +9585,7 @@ mod tests {
             ]
             .into(),
         );
-        let arguments = OwnerResultTransferArguments::from([(
+        let arguments = OwnerResidualDraftArguments::from([(
             0,
             EvaluatedResultValue {
                 flow_type: FlowType {
@@ -8659,7 +9598,7 @@ mod tests {
             },
         )]);
         let mut unifier = TypeUnifier::default();
-        let mut evaluator = OwnerResultTransferEvaluator::new(&providers, &mut unifier);
+        let mut evaluator = CompiledOwnerResidualEvaluator::new(&providers, &mut unifier);
         let evaluated = evaluator
             .evaluate_owner(&label, &arguments, None)
             .expect("label transfer result");
@@ -8733,12 +9672,12 @@ mod tests {
         assert_eq!(
             call.result,
             oracle.result,
-            "choose transfer: {:#?}",
+            "choose residual: {:#?}",
             interfaces
                 .iter()
-                .find_map(|result| result.owner(&choose))
+                .find(|module| module.owns_owner(&choose))
                 .unwrap()
-                .result_transfer
+                .program
         );
         assert_eq!(
             call.syntax_discriminated_result,
@@ -9413,11 +10352,12 @@ mod tests {
         )
         .unwrap();
         let topology = build_owner_interface_topology([&summary]).unwrap();
-        let interface = solve_owner_interface_scc(
+        let component = evaluate_owner_interface_scc_component_for_tests(
             topology.sccs.first().unwrap(),
             &abi,
             [&seed],
             [&summary],
+            [],
             [],
         )
         .unwrap();
@@ -9427,7 +10367,7 @@ mod tests {
             &seed,
             &summary,
             &abi,
-            &interface,
+            &component.module,
             [],
         )
         .unwrap();

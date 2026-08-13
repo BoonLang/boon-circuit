@@ -42,11 +42,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
-const OWNER_BODY_INFERENCE_DOMAIN_V9: &[u8] = b"boon.owner-body-inference.v9\0";
-const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V7: &[u8] = b"boon.owner-body-inference-content.v7\0";
-const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V12: &[u8] =
-    b"boon.owner-body-inference-currentness.v12\0";
+const OWNER_BODY_INFERENCE_DOMAIN_V10: &[u8] = b"boon.owner-body-inference.v10\0";
+const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V8: &[u8] = b"boon.owner-body-inference-content.v8\0";
+const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V13: &[u8] =
+    b"boon.owner-body-inference-currentness.v13\0";
 const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V5: &[u8] = b"boon.owner-body-interface-plan.v5\0";
 const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V5: &[u8] =
     b"boon.owner-interface-transfer-module.v5\0";
@@ -398,6 +402,31 @@ struct OwnerResidualProgram {
     op_count: u64,
     edge_count: u64,
     fingerprint_v1: [u8; 32],
+}
+
+/// Allocation-free work counters for one or more compiled residual evaluations.
+///
+/// These counters are evaluator telemetry only. They do not participate in any
+/// semantic fingerprint or currentness receipt.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OwnerResidualEvaluationWork {
+    pub occurrences: u64,
+    pub owner_dispatches: u64,
+    pub compiled_call_dispatches: u64,
+    pub op_visits: u64,
+    pub maximum_owner_depth: u64,
+}
+
+impl OwnerResidualEvaluationWork {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.occurrences = self.occurrences.saturating_add(other.occurrences);
+        self.owner_dispatches = self.owner_dispatches.saturating_add(other.owner_dispatches);
+        self.compiled_call_dispatches = self
+            .compiled_call_dispatches
+            .saturating_add(other.compiled_call_dispatches);
+        self.op_visits = self.op_visits.saturating_add(other.op_visits);
+        self.maximum_owner_depth = self.maximum_owner_depth.max(other.maximum_owner_depth);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1305,6 +1334,9 @@ fn seal_owner_interface_transfer_module(
     expected_dependencies: &[OwnerInterfaceSccKey],
     dependencies: impl IntoIterator<Item = Arc<OwnerInterfaceTransferModule>>,
 ) -> Result<OwnerInterfaceTransferModule, OwnerBodyInferenceError> {
+    let trace =
+        std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && result.key.members.len() >= 100;
+    let total_started = Instant::now();
     if drafts.len() != result.owners.len() {
         return Err(OwnerBodyInferenceError::new(format!(
             "interface transfer module {:?} has {} residual drafts for {} owners",
@@ -1417,6 +1449,7 @@ fn seal_owner_interface_transfer_module(
         .iter()
         .map(|dependency| (&dependency.key, dependency.fingerprint_v1))
         .collect::<Vec<_>>();
+    let program_started = Instant::now();
     let program = Arc::new(compile_owner_residual_program(
         &result,
         &drafts,
@@ -1424,6 +1457,8 @@ fn seal_owner_interface_transfer_module(
         &dependencies,
         &routes,
     )?);
+    let program_ms = program_started.elapsed().as_secs_f64() * 1_000.0;
+    let fingerprint_started = Instant::now();
     let fingerprint_v1 = fingerprint(
         OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V5,
         &(
@@ -1433,6 +1468,7 @@ fn seal_owner_interface_transfer_module(
             dependency_fingerprints,
         ),
     )?;
+    let fingerprint_ms = fingerprint_started.elapsed().as_secs_f64() * 1_000.0;
     let mut module = OwnerInterfaceTransferModule {
         key: result.key.clone(),
         result,
@@ -1441,7 +1477,16 @@ fn seal_owner_interface_transfer_module(
         constant_results: Box::new([]),
         fingerprint_v1,
     };
+    let constants_started = Instant::now();
     precompute_owner_interface_transfer_constants(&mut module);
+    let constants_ms = constants_started.elapsed().as_secs_f64() * 1_000.0;
+    if trace {
+        eprintln!(
+            "boon owner transfer module members={} program_ms={program_ms:.3} fingerprint_ms={fingerprint_ms:.3} constants_ms={constants_ms:.3} total_ms={:.3}",
+            module.key.members.len(),
+            total_started.elapsed().as_secs_f64() * 1_000.0,
+        );
+    }
     Ok(module)
 }
 
@@ -1987,6 +2032,7 @@ pub struct OwnerBodyInferenceReceipt {
     pub call_rows: u32,
     pub relocation_rows: u32,
     pub diagnostic_rows: u32,
+    pub diagnostic_facts_fingerprint_v1: [u8; 32],
     pub signature_lexical_plan_fingerprint_v1: [u8; 32],
     pub local_content_digest_v1: [u8; 32],
 }
@@ -2008,6 +2054,10 @@ pub struct OwnerBodyInferenceShard {
     pub calls: Box<[InferredOwnerCall]>,
     pub relocations: Box<[OwnerBodyRelocation]>,
     pub diagnostics: Box<[OwnerDiagnosticTemplate]>,
+    /// Span-free diagnostic/global-reducer contribution emitted atomically by
+    /// owner evaluation. Downstream requests project this authenticated fact;
+    /// they do not rescan the owner body to reconstruct it.
+    pub diagnostic_facts: crate::OwnerDiagnosticContribution,
     pub signature_lexical_plan: OwnerSignatureLexicalPlan,
     pub effect: CheckedEffectSummary,
     pub receipt: OwnerBodyInferenceReceipt,
@@ -2087,7 +2137,7 @@ impl OwnerBodyInferenceCurrentnessReceipt {
             result_fingerprint_v1,
         );
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V12,
+            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V13,
             &compact_currentness,
         )?;
         Ok(Self {
@@ -4643,6 +4693,7 @@ struct CompiledOwnerResidualProgramEvaluator<'program, 'unifier> {
     external_context: Option<&'program EvaluatedResultValue>,
     unifier: &'unifier mut TypeUnifier,
     active_owners: &'unifier mut SmallVec<[StableCheckOwnerKey; 16]>,
+    work: &'unifier mut OwnerResidualEvaluationWork,
     namespaces: Vec<OwnerResidualDraftVariables>,
     frames: Vec<Option<OwnerResidualFrameRuntime>>,
     initializing_frames: BTreeSet<OwnerResidualFrameId>,
@@ -4657,6 +4708,7 @@ impl<'program, 'unifier> CompiledOwnerResidualProgramEvaluator<'program, 'unifie
         context: Option<&'program EvaluatedResultValue>,
         unifier: &'unifier mut TypeUnifier,
         active_owners: &'unifier mut SmallVec<[StableCheckOwnerKey; 16]>,
+        work: &'unifier mut OwnerResidualEvaluationWork,
     ) -> Self {
         Self {
             module,
@@ -4665,6 +4717,7 @@ impl<'program, 'unifier> CompiledOwnerResidualProgramEvaluator<'program, 'unifie
             external_context: context,
             unifier,
             active_owners,
+            work,
             namespaces: program
                 .namespaces
                 .iter()
@@ -4928,6 +4981,7 @@ impl<'program, 'unifier> CompiledOwnerResidualProgramEvaluator<'program, 'unifie
         lexical: &BTreeMap<String, EvaluatedResultValue>,
         active: &mut OwnerResidualDraftActiveNodes,
     ) -> Option<EvaluatedResultValue> {
+        self.work.op_visits = self.work.op_visits.saturating_add(1);
         let index = op as usize;
         let op = self.program.ops.get(index)?.clone();
         if active.contains(&index) {
@@ -4983,6 +5037,8 @@ impl<'program, 'unifier> CompiledOwnerResidualProgramEvaluator<'program, 'unifie
                 actuals,
                 context,
             } => {
+                self.work.compiled_call_dispatches =
+                    self.work.compiled_call_dispatches.saturating_add(1);
                 let mut arguments = OwnerResidualDraftArguments::default();
                 for actual in actuals {
                     arguments.insert(
@@ -5020,6 +5076,7 @@ impl<'program, 'unifier> CompiledOwnerResidualProgramEvaluator<'program, 'unifie
                     context.as_ref(),
                     self.unifier,
                     self.active_owners,
+                    self.work,
                 )?;
                 self.owned_variables.extend(result.owned_variables);
                 Some(result.value)
@@ -5391,6 +5448,7 @@ fn evaluate_compiled_owner_in_module(
     context: Option<&EvaluatedResultValue>,
     unifier: &mut TypeUnifier,
     active_owners: &mut SmallVec<[StableCheckOwnerKey; 16]>,
+    work: &mut OwnerResidualEvaluationWork,
 ) -> Option<EvaluatedOwnerResult> {
     let owner_key = module.result.key.members.get(owner)?;
     let program = module.program.owners.get(owner)?;
@@ -5398,6 +5456,8 @@ fn evaluate_compiled_owner_in_module(
     if !principal_only {
         active_owners.push(owner_key.clone());
     }
+    work.owner_dispatches = work.owner_dispatches.saturating_add(1);
+    work.maximum_owner_depth = work.maximum_owner_depth.max(active_owners.len() as u64);
     let result = {
         CompiledOwnerResidualProgramEvaluator::new(
             Some(module),
@@ -5406,6 +5466,7 @@ fn evaluate_compiled_owner_in_module(
             context,
             unifier,
             active_owners,
+            work,
         )
         .evaluate(module.constant_result_at(owner), principal_only)
     };
@@ -5419,6 +5480,7 @@ struct CompiledOwnerResidualEvaluator<'a, 'unifier> {
     providers: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerInterfaceTransferModule>,
     unifier: &'unifier mut TypeUnifier,
     active_owners: SmallVec<[StableCheckOwnerKey; 16]>,
+    work: OwnerResidualEvaluationWork,
 }
 
 impl<'a, 'unifier> CompiledOwnerResidualEvaluator<'a, 'unifier> {
@@ -5430,6 +5492,7 @@ impl<'a, 'unifier> CompiledOwnerResidualEvaluator<'a, 'unifier> {
             providers,
             unifier,
             active_owners: SmallVec::new(),
+            work: OwnerResidualEvaluationWork::default(),
         }
     }
 
@@ -5458,8 +5521,14 @@ impl<'a, 'unifier> CompiledOwnerResidualEvaluator<'a, 'unifier> {
             context,
             self.unifier,
             &mut self.active_owners,
+            &mut self.work,
         )
     }
+}
+
+pub(crate) struct OwnerResidualOccurrenceEvaluation {
+    pub(crate) value: EvaluatedResultValue,
+    pub(crate) work: OwnerResidualEvaluationWork,
 }
 
 /// Evaluate one call occurrence against an SCC-sealed result-transfer module.
@@ -5474,12 +5543,17 @@ pub(crate) fn evaluate_owner_result_transfer_occurrence(
     arguments: &OwnerResidualDraftArguments,
     context: Option<&EvaluatedResultValue>,
     unifier: &mut TypeUnifier,
-) -> Option<EvaluatedResultValue> {
+) -> Option<OwnerResidualOccurrenceEvaluation> {
     let providers = BTreeMap::new();
     let mut evaluator = CompiledOwnerResidualEvaluator::new(&providers, unifier);
-    evaluator
+    let value = evaluator
         .evaluate_owner_in_module(module, owner, arguments, context)
-        .map(|result| result.value)
+        .map(|result| result.value)?;
+    evaluator.work.occurrences = 1;
+    Some(OwnerResidualOccurrenceEvaluation {
+        value,
+        work: evaluator.work,
+    })
 }
 
 fn static_number_infix(
@@ -8033,8 +8107,24 @@ fn evaluate_owner_body_impl(
         .collect::<Vec<_>>();
     let relocations = collect_relocations(seed, summary, &signature_lexical_plan);
 
+    let diagnostic_facts =
+        crate::owner_diagnostics::project_owner_diagnostic_contribution_from_rows(
+            syntax,
+            lexical_plan,
+            &inferred_statements,
+            &inferred_expressions,
+            &inferred_calls,
+            &signature_lexical_plan,
+            abi,
+        )
+        .map_err(|error| {
+            OwnerBodyInferenceError::new(format!(
+                "cannot publish owner diagnostic facts for {:?}: {error}",
+                seed.owner
+            ))
+        })?;
     let local_content_digest_v1 = fingerprint(
-        OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V7,
+        OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V8,
         &(
             &inferred_statements,
             &inferred_children,
@@ -8042,6 +8132,7 @@ fn evaluate_owner_body_impl(
             &inferred_calls,
             &relocations,
             &diagnostics,
+            diagnostic_facts.fingerprint_v1(),
             signature_lexical_plan.fingerprint_v1(),
             own_interface.effect,
         ),
@@ -8053,13 +8144,14 @@ fn evaluate_owner_body_impl(
         call_rows: checked_u32(inferred_calls.len(), "inferred call row count")?,
         relocation_rows: checked_u32(relocations.len(), "inferred relocation row count")?,
         diagnostic_rows: checked_u32(diagnostics.len(), "inferred diagnostic row count")?,
+        diagnostic_facts_fingerprint_v1: diagnostic_facts.fingerprint_v1(),
         signature_lexical_plan_fingerprint_v1: signature_lexical_plan.fingerprint_v1(),
         local_content_digest_v1,
     };
     // The construction receipt already commits every semantic row, diagnostic,
     // effect, and row count above. Bind the stable owner to that compact seal
     // instead of serializing the same rich body a second time.
-    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V9, &(&seed.owner, &receipt))?;
+    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V10, &(&seed.owner, &receipt))?;
     work.unification_steps = unifier.steps();
     let result = Arc::new(OwnerBodyInferenceShard {
         owner: seed.owner.clone(),
@@ -8069,6 +8161,7 @@ fn evaluate_owner_body_impl(
         calls: inferred_calls.into_boxed_slice(),
         relocations,
         diagnostics: diagnostics.into_boxed_slice(),
+        diagnostic_facts,
         signature_lexical_plan,
         effect: own_interface.effect,
         receipt,
@@ -9399,6 +9492,7 @@ mod tests {
         let arguments = OwnerResidualDraftArguments::default();
         let mut unifier = TypeUnifier::default();
         let mut active_owners = SmallVec::new();
+        let mut work = OwnerResidualEvaluationWork::default();
         let mut evaluator = CompiledOwnerResidualProgramEvaluator::new(
             None,
             &program,
@@ -9406,6 +9500,7 @@ mod tests {
             None,
             &mut unifier,
             &mut active_owners,
+            &mut work,
         );
         let Type::Var(own) = evaluator
             .resolve_type(0, &Type::Var(TypeVar(0)), None)

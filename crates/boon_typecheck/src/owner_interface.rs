@@ -1,9 +1,9 @@
 use crate::owner_body::{
     EvaluatedResultValue, OwnerInterfaceTransferModule, OwnerResidualAbiContract,
     OwnerResidualCallTarget, OwnerResidualDraft, OwnerResidualDraftArguments,
-    OwnerResidualExpressionRef, OwnerResidualInput, OwnerResidualNode, OwnerResidualParameterRead,
-    evaluate_owner_result_transfer_occurrence, owner_interface_transfer_dependency_owners,
-    project_owner_interface_transfer_module,
+    OwnerResidualEvaluationWork, OwnerResidualExpressionRef, OwnerResidualInput, OwnerResidualNode,
+    OwnerResidualParameterRead, evaluate_owner_result_transfer_occurrence,
+    owner_interface_transfer_dependency_owners, project_owner_interface_transfer_module,
 };
 use crate::owner_signature_lexical::effective_narrowed_selector_read_matches;
 use crate::{
@@ -29,6 +29,11 @@ use boon_syntax::{StableCheckOwnerKey, StableExpressionKey};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V8: &[u8] = b"boon.owner-interface-scc-result.v8\0";
 const OWNER_INTERFACE_SCC_KEY_DOMAIN_V1: &[u8] = b"boon.owner-interface-scc-key.v1\0";
@@ -281,12 +286,14 @@ pub struct OwnerInterfaceSccComponentEvaluation {
     pub evaluation: OwnerInterfaceSccEvaluation,
     pub module: Arc<OwnerInterfaceTransferModule>,
     pub transfer_iterations: u32,
+    pub transfer_work: OwnerResidualEvaluationWork,
 }
 
 struct OwnerInterfaceSccSolveOutput {
     evaluation: OwnerInterfaceSccEvaluation,
     module: Option<Arc<OwnerInterfaceTransferModule>>,
     transfer_iterations: u32,
+    transfer_work: OwnerResidualEvaluationWork,
 }
 
 fn type_contains_inference_variable(ty: &Type) -> bool {
@@ -2939,7 +2946,9 @@ pub(crate) fn replay_flow_constraints(
     unifier: &mut TypeUnifier,
     constraints: &[OwnerFlowConstraint],
 ) -> bool {
-    for _ in 0..constraints.len().saturating_add(1) {
+    let trace = std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && constraints.len() >= 100;
+    let started = Instant::now();
+    for sweep in 0..constraints.len().saturating_add(1) {
         let changes_before = unifier.changes();
         for constraint in constraints {
             let provider = match constraint.kind {
@@ -2957,8 +2966,24 @@ pub(crate) fn replay_flow_constraints(
             unifier.replace_derived_provider(constraint.output, provider);
         }
         if unifier.changes() == changes_before {
+            if trace {
+                eprintln!(
+                    "boon owner flow replay constraints={} sweeps={} replay_ms={:.3}",
+                    constraints.len(),
+                    sweep.saturating_add(1),
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
             return true;
         }
+    }
+    if trace {
+        eprintln!(
+            "boon owner flow replay constraints={} sweeps={} replay_ms={:.3} converged=false",
+            constraints.len(),
+            constraints.len().saturating_add(1),
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
     }
     false
 }
@@ -3811,6 +3836,9 @@ fn propagate_lexical_capture_types(
     allow_requirement_backflow: bool,
     unifier: &mut TypeUnifier,
 ) -> Result<(), OwnerConstraintSeedError> {
+    let trace =
+        std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && internal_providers.len() >= 100;
+    let started = Instant::now();
     // A readable public declaration is projected from its exact result
     // expression boundary, while its persistent lexical root (`state.result`)
     // also receives consumer requirements from same-component captures. A
@@ -4156,6 +4184,14 @@ fn propagate_lexical_capture_types(
                 }
             }
         }
+    }
+    if trace {
+        eprintln!(
+            "boon owner capture replay providers={} backflow={} replay_ms={:.3}",
+            internal_providers.len(),
+            allow_requirement_backflow,
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
     }
     Ok(())
 }
@@ -4900,11 +4936,16 @@ fn project_owner_interface_scc_result(
     unifier: &mut TypeUnifier,
     mut work: OwnerInterfaceSolveWork,
 ) -> Result<OwnerInterfaceSccProjection, OwnerConstraintSeedError> {
+    let trace =
+        std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && scc.key.members.len() >= 100;
+    let total_started = Instant::now();
     let mut interfaces = Vec::with_capacity(states.len());
     let mut alpha_variables = BTreeMap::new();
     let mut next_alpha = 0;
     let (projection_authorities, closed_owner_results) =
         closed_public_result_projection_authorities(states, unifier);
+    let authorities_ms = total_started.elapsed().as_secs_f64() * 1_000.0;
+    let interfaces_started = Instant::now();
     for owner in &scc.key.members {
         let state = &states[owner];
         let parameters = state
@@ -5107,6 +5148,8 @@ fn project_owner_interface_scc_result(
         })?;
         interfaces.push(interface);
     }
+    let interfaces_ms = interfaces_started.elapsed().as_secs_f64() * 1_000.0;
+    let result_started = Instant::now();
     let public_type_variable_count = next_alpha;
     work.unification_steps = unifier.steps;
     let interface_fingerprints = interfaces
@@ -5141,6 +5184,8 @@ fn project_owner_interface_scc_result(
         key_fingerprint_v1,
         fingerprint_v1,
     });
+    let result_ms = result_started.elapsed().as_secs_f64() * 1_000.0;
+    let residuals_started = Instant::now();
     let residuals = scc
         .key
         .members
@@ -5156,6 +5201,14 @@ fn project_owner_interface_scc_result(
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_boxed_slice();
+    let residuals_ms = residuals_started.elapsed().as_secs_f64() * 1_000.0;
+    if trace {
+        eprintln!(
+            "boon owner interface projection members={} authorities_ms={authorities_ms:.3} interfaces_ms={interfaces_ms:.3} result_ms={result_ms:.3} residuals_ms={residuals_ms:.3} total_ms={:.3}",
+            scc.key.members.len(),
+            total_started.elapsed().as_secs_f64() * 1_000.0,
+        );
+    }
     Ok(OwnerInterfaceSccProjection {
         result,
         residuals,
@@ -5525,6 +5578,7 @@ where
             )
         })?,
         transfer_iterations: output.transfer_iterations,
+        transfer_work: output.transfer_work,
     })
 }
 
@@ -5569,6 +5623,7 @@ pub(crate) fn evaluate_owner_interface_scc_component_for_tests<'a>(
             )
         })?,
         transfer_iterations: output.transfer_iterations,
+        transfer_work: output.transfer_work,
     })
 }
 
@@ -7006,9 +7061,24 @@ fn evaluate_owner_interface_scc_impl<'a>(
     let mut final_transfer_module = None::<Arc<OwnerInterfaceTransferModule>>;
     let mut final_projection = None::<OwnerInterfaceSccProjection>;
     let mut transfer_iterations = 0_u32;
+    let mut transfer_work = OwnerResidualEvaluationWork::default();
     let mut seen_transfer_surfaces = HashSet::new();
     let mut committed_transfer_results = vec![None::<Type>; calls.len()];
+    let trace_rounds =
+        std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && scc.key.members.len() >= 100;
+    let rounds_started = Instant::now();
+    let mut call_round_elapsed = Duration::ZERO;
+    let mut provider_replay_elapsed = Duration::ZERO;
+    let mut dynamic_replay_elapsed = Duration::ZERO;
+    let mut stable_surface_elapsed = Duration::ZERO;
+    let mut dependency_resolution_elapsed = Duration::ZERO;
+    let mut residual_key_elapsed = Duration::ZERO;
+    let mut residual_argument_elapsed = Duration::ZERO;
+    let mut residual_evaluation_elapsed = Duration::ZERO;
+    let mut residual_publication_elapsed = Duration::ZERO;
+    let mut residual_post_replay_elapsed = Duration::ZERO;
     for round in 0..maximum_rounds {
+        let call_round_started = Instant::now();
         work.solve_rounds = work.solve_rounds.saturating_add(1);
         let changes_before = unifier.changes();
         let mut surface_changed = false;
@@ -7463,6 +7533,8 @@ fn evaluate_owner_interface_scc_impl<'a>(
             let _ = call.stable_expression;
             work.cross_owner_constraints = work.cross_owner_constraints.saturating_add(1);
         }
+        call_round_elapsed += call_round_started.elapsed();
+        let provider_replay_started = Instant::now();
         // Every local output declaration for this round is now published.
         // Forward those provider surfaces across child-owner capture seams
         // before any producer-dependent consumer formal can shape them. This
@@ -7514,6 +7586,8 @@ fn evaluate_owner_interface_scc_impl<'a>(
             )));
         }
         unifier.refine_contextual_flow_holes();
+        provider_replay_elapsed += provider_replay_started.elapsed();
+        let dynamic_replay_started = Instant::now();
 
         // Apply producer-dependent inputs child-before-parent within each
         // caller. Keep authored argument and PASS order within each call.
@@ -7561,6 +7635,8 @@ fn evaluate_owner_interface_scc_impl<'a>(
             )));
         }
         surface_changed |= propagate_lexical_capture_modes(&mut states)?;
+        dynamic_replay_elapsed += dynamic_replay_started.elapsed();
+        let stable_surface_started = Instant::now();
 
         // A committed transfer result can still contain live occurrence
         // alphas. Later input replay must be allowed to constrain those holes,
@@ -7592,6 +7668,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
         let semantic_stable_before_transfer =
             current_surface == previous_surface && !surface_changed;
         let stable_before_transfer = raw_stable_before_transfer || semantic_stable_before_transfer;
+        stable_surface_elapsed += stable_surface_started.elapsed();
 
         if stable_before_transfer && !live_component {
             converged = true;
@@ -7622,6 +7699,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                     )));
                 }
             } else {
+                let dependency_resolution_started = Instant::now();
                 let resolver = transfer_module_resolver.as_mut().ok_or_else(|| {
                     OwnerConstraintSeedError::new(
                         "live interface component has no transfer-module resolver",
@@ -7681,6 +7759,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 }
                 resolved_transfer_owners = Some(requested_owners.clone().into_boxed_slice());
                 external_transfer_modules = Some(modules);
+                dependency_resolution_elapsed += dependency_resolution_started.elapsed();
             }
 
             let external_modules = external_transfer_modules
@@ -7714,6 +7793,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 })?,
             );
 
+            let residual_key_started = Instant::now();
             let mut residual_types = Vec::new();
             let mut residual_variables = BTreeMap::new();
             let mut next_residual_variable = 0;
@@ -7758,6 +7838,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 residual_types,
             );
             let repeated_residual = !seen_transfer_surfaces.insert(residual_key);
+            residual_key_elapsed += residual_key_started.elapsed();
             let pre_transfer_surface = current_surface.clone();
             let mut transfer_surface_changed = false;
             let mut evaluated_any = false;
@@ -7790,6 +7871,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                             "interface transfer call disappeared from its signature plan",
                         )
                     })?;
+                let residual_argument_started = Instant::now();
                 let mut arguments = OwnerResidualDraftArguments::default();
                 for input in &signature_call.matched_inputs {
                     if let Some(value) =
@@ -7814,6 +7896,8 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 } else {
                     None
                 };
+                residual_argument_elapsed += residual_argument_started.elapsed();
+                let residual_evaluation_started = Instant::now();
                 let evaluated = evaluate_owner_result_transfer_occurrence(
                     module,
                     target,
@@ -7827,9 +7911,12 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         module.key()
                     ))
                 })?;
+                residual_evaluation_elapsed += residual_evaluation_started.elapsed();
+                let residual_publication_started = Instant::now();
+                transfer_work.merge(evaluated.work);
                 evaluated_any = true;
                 let call_variable = caller.expressions[call.expression];
-                let provider = evaluated.flow_type.ty;
+                let provider = evaluated.value.flow_type.ty;
                 unifier.mark_authoritative_provider(call_variable);
                 unifier.replace_derived_provider(call_variable, provider.clone());
                 committed_transfer_results[call_index] = Some(provider);
@@ -7838,15 +7925,19 @@ fn evaluate_owner_interface_scc_impl<'a>(
                         "interface transfer call lost its mutable caller state",
                     )
                 })?;
-                let mode =
-                    flow_mode_join(state.modes[call.expression], Some(evaluated.flow_type.mode));
+                let mode = flow_mode_join(
+                    state.modes[call.expression],
+                    Some(evaluated.value.flow_type.mode),
+                );
                 transfer_surface_changed |= mode != state.modes[call.expression];
                 state.modes[call.expression] = mode;
+                residual_publication_elapsed += residual_publication_started.elapsed();
             }
             if evaluated_any {
                 transfer_iterations = transfer_iterations.saturating_add(1);
             }
             final_transfer_module = Some(Arc::clone(&own_module));
+            let residual_post_replay_started = Instant::now();
             // Residual evaluation is another provider epoch: a transfer call
             // may be the value of an authored HOLD update. Replay before the
             // acyclic fast path projects and seals the public interface.
@@ -7854,6 +7945,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 replay_interface_hold_constraints(&mut unifier, &mut hold_authorities, &states);
             write_solver_surface_snapshot(&mut unifier, &states, &mut current_surface);
             transfer_surface_changed |= current_surface != pre_transfer_surface;
+            residual_post_replay_elapsed += residual_post_replay_started.elapsed();
             if !transfer_surface_changed {
                 final_projection = Some(provisional);
                 converged = true;
@@ -7923,6 +8015,23 @@ fn evaluate_owner_interface_scc_impl<'a>(
         write_solver_surface_snapshot(&mut unifier, &states, &mut current_surface);
         std::mem::swap(&mut previous_surface, &mut current_surface);
     }
+    if trace_rounds {
+        eprintln!(
+            "boon owner interface rounds members={} total_ms={:.3} calls_ms={:.3} provider_replay_ms={:.3} dynamic_replay_ms={:.3} stable_surface_ms={:.3} dependency_resolution_ms={:.3} residual_key_ms={:.3} residual_arguments_ms={:.3} residual_evaluation_ms={:.3} residual_publication_ms={:.3} residual_post_replay_ms={:.3}",
+            scc.key.members.len(),
+            rounds_started.elapsed().as_secs_f64() * 1_000.0,
+            call_round_elapsed.as_secs_f64() * 1_000.0,
+            provider_replay_elapsed.as_secs_f64() * 1_000.0,
+            dynamic_replay_elapsed.as_secs_f64() * 1_000.0,
+            stable_surface_elapsed.as_secs_f64() * 1_000.0,
+            dependency_resolution_elapsed.as_secs_f64() * 1_000.0,
+            residual_key_elapsed.as_secs_f64() * 1_000.0,
+            residual_argument_elapsed.as_secs_f64() * 1_000.0,
+            residual_evaluation_elapsed.as_secs_f64() * 1_000.0,
+            residual_publication_elapsed.as_secs_f64() * 1_000.0,
+            residual_post_replay_elapsed.as_secs_f64() * 1_000.0,
+        );
+    }
     if !converged {
         return Err(OwnerConstraintSeedError::new(format!(
             "owner interface SCC {:?} did not converge in {maximum_rounds} rounds",
@@ -7943,6 +8052,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
         },
         module: final_transfer_module,
         transfer_iterations,
+        transfer_work,
     })
 }
 

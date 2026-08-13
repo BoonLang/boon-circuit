@@ -30,24 +30,23 @@ use boon_typecheck::{
     OwnerCallableScopeTopology, OwnerConstraintSeed, OwnerConstraintSummary,
     OwnerConstructionAbiEnvironment, OwnerConstructionCallableAbiLookup,
     OwnerConstructionValueAbiLookup, OwnerDeclarationKind, OwnerDeclarationSurface,
-    OwnerDiagnosticReplayFacts, OwnerDiagnosticReplayFactsEvaluation, OwnerDiagnosticsAggregate,
-    OwnerInferenceAbiEnvironment, OwnerInterfaceScc, OwnerInterfaceSccCurrentnessReceipt,
-    OwnerInterfaceSccKey, OwnerInterfaceSccResult, OwnerInterfaceTopology,
-    OwnerInterfaceTransferModule, OwnerLexicalPlan, OwnerParameterRequirementKey,
-    OwnerParameterRequirementLookup, OwnerReferenceKind, OwnerSourceMap,
-    OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput,
-    OwnerValueAbiLookup, ProjectDiagnosticFacts, ProjectOutputFlowFacts,
+    OwnerDiagnosticsAggregate, OwnerInferenceAbiEnvironment, OwnerInterfaceScc,
+    OwnerInterfaceSccCurrentnessReceipt, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
+    OwnerInterfaceTopology, OwnerInterfaceTransferModule, OwnerLexicalPlan,
+    OwnerParameterRequirementKey, OwnerParameterRequirementLookup, OwnerReferenceKind,
+    OwnerSourceMap, OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution,
+    OwnerSyntaxInput, OwnerValueAbiLookup, ProjectDiagnosticFacts, ProjectOutputFlowFacts,
     SourceUnitOwnerDiagnostics, SourceUnitProjectDiagnostics,
     SourceUnitProjectDiagnosticsEvaluation, aggregate_source_unit_diagnostics,
     assemble_checked_owner_project, build_checked_owner_shard, build_owner_callable_scope_topology,
     build_owner_interface_topology, evaluate_owner_body_with_signature_plan,
-    evaluate_owner_callable_scope_scc, evaluate_owner_diagnostic_replay_facts,
-    evaluate_owner_interface_scc_component, evaluate_source_unit_project_diagnostics,
-    project_diagnostic_facts, project_output_flow_facts, project_owner_abi_environment,
-    project_owner_callable_resolution_plan, project_owner_constraint_seed_with_lexical_plan,
-    project_owner_declaration_surface, project_owner_lexical_plan, project_owner_source_map,
-    project_owner_syntax_input, project_source_unit_owner_diagnostics,
-    resolve_owner_constraint_seed_with_signature_plan, stable_check_owner_key_fingerprint_v2,
+    evaluate_owner_callable_scope_scc, evaluate_owner_interface_scc_component,
+    evaluate_source_unit_project_diagnostics, project_diagnostic_facts, project_output_flow_facts,
+    project_owner_abi_environment, project_owner_callable_resolution_plan,
+    project_owner_constraint_seed_with_lexical_plan, project_owner_declaration_surface,
+    project_owner_lexical_plan, project_owner_source_map, project_owner_syntax_input,
+    project_source_unit_owner_diagnostics, resolve_owner_constraint_seed_with_signature_plan,
+    stable_check_owner_key_fingerprint_v2,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -294,9 +293,6 @@ struct ProjectState {
     owner_body_inference_evaluation_requests:
         TypedRequestTable<OwnerBodyInferenceEvaluationRequest>,
     owner_body_inference_requests: TypedRequestTable<OwnerBodyInferenceRequest>,
-    owner_diagnostic_replay_facts_evaluation_requests:
-        TypedRequestTable<OwnerDiagnosticReplayFactsEvaluationRequest>,
-    owner_diagnostic_replay_facts_requests: TypedRequestTable<OwnerDiagnosticReplayFactsRequest>,
     project_output_flow_facts_requests: TypedRequestTable<ProjectOutputFlowFactsRequest>,
     project_diagnostic_facts_requests: TypedRequestTable<ProjectDiagnosticFactsRequest>,
     source_unit_owner_diagnostics_requests: TypedRequestTable<SourceUnitOwnerDiagnosticsRequest>,
@@ -1330,45 +1326,7 @@ impl RequestFamily for OwnerBodyInferenceRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceShard>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference.v9";
-
-    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v2(key)
-    }
-
-    fn output_fingerprint(
-        value: &Self::Value,
-    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
-        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
-    }
-}
-
-struct OwnerDiagnosticReplayFactsRequest;
-
-struct OwnerDiagnosticReplayFactsEvaluationRequest;
-
-impl RequestFamily for OwnerDiagnosticReplayFactsEvaluationRequest {
-    type Key = StableCheckOwnerKey;
-    type Value = Arc<OwnerDiagnosticReplayFactsEvaluation>;
-
-    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts-evaluation.v5";
-
-    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
-        stable_check_owner_key_fingerprint_v2(key)
-    }
-
-    fn output_fingerprint(
-        value: &Self::Value,
-    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
-        Ok(RequestOutputFingerprint(value.currentness.fingerprint_v1()))
-    }
-}
-
-impl RequestFamily for OwnerDiagnosticReplayFactsRequest {
-    type Key = StableCheckOwnerKey;
-    type Value = Arc<OwnerDiagnosticReplayFacts>;
-
-    const NAME: &'static str = "boon.compiler.owner-diagnostic-replay-facts.v5";
+    const NAME: &'static str = "boon.compiler.owner-body-inference.v10";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -1497,7 +1455,7 @@ impl RequestFamily for ProjectOutputFlowFactsRequest {
     type Key = ProjectOutputFlowFactsKey;
     type Value = Arc<ProjectOutputFlowFacts>;
 
-    const NAME: &'static str = "boon.compiler.project-output-flow-facts.v2";
+    const NAME: &'static str = "boon.compiler.project-output-flow-facts.v3";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -1522,7 +1480,7 @@ impl RequestFamily for ProjectDiagnosticFactsRequest {
     type Key = ProjectDiagnosticFactsKey;
     type Value = Arc<ProjectDiagnosticFacts>;
 
-    const NAME: &'static str = "boon.compiler.project-diagnostic-facts.v14";
+    const NAME: &'static str = "boon.compiler.project-diagnostic-facts.v15";
 
     fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
         request_fingerprint(
@@ -1619,8 +1577,6 @@ impl CompilerSession {
                 owner_interface_provider_requests: TypedRequestTable::new(),
                 owner_body_inference_evaluation_requests: TypedRequestTable::new(),
                 owner_body_inference_requests: TypedRequestTable::new(),
-                owner_diagnostic_replay_facts_evaluation_requests: TypedRequestTable::new(),
-                owner_diagnostic_replay_facts_requests: TypedRequestTable::new(),
                 project_output_flow_facts_requests: TypedRequestTable::new(),
                 project_diagnostic_facts_requests: TypedRequestTable::new(),
                 source_unit_owner_diagnostics_requests: TypedRequestTable::new(),
@@ -1973,16 +1929,6 @@ impl CompilerSession {
             })?;
         state
             .owner_body_inference_requests
-            .retain(&mut state.syntax_evaluator, |owner| {
-                surviving_sources.contains(owner.source_unit_id())
-            })?;
-        state
-            .owner_diagnostic_replay_facts_evaluation_requests
-            .retain(&mut state.syntax_evaluator, |owner| {
-                surviving_sources.contains(owner.source_unit_id())
-            })?;
-        state
-            .owner_diagnostic_replay_facts_requests
             .retain(&mut state.syntax_evaluator, |owner| {
                 surviving_sources.contains(owner.source_unit_id())
             })?;
@@ -2843,16 +2789,6 @@ fn evaluate_owner_body_requests(
         })?;
     state
         .owner_body_inference_requests
-        .retain(&mut state.syntax_evaluator, |owner| {
-            live_owners.contains(owner)
-        })?;
-    state
-        .owner_diagnostic_replay_facts_evaluation_requests
-        .retain(&mut state.syntax_evaluator, |owner| {
-            live_owners.contains(owner)
-        })?;
-    state
-        .owner_diagnostic_replay_facts_requests
         .retain(&mut state.syntax_evaluator, |owner| {
             live_owners.contains(owner)
         })?;
@@ -5003,6 +4939,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                     let evaluation = component.evaluation;
                     let module = component.module;
                     let iterations = component.transfer_iterations;
+                    let transfer_work = component.transfer_work;
                     let solve_ms = solve_started.elapsed().as_secs_f64() * 1_000.0;
                     if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && solve_ms >= 10.0 {
                         let members = plan.key.members.iter().collect::<BTreeSet<_>>();
@@ -5015,10 +4952,15 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                             *internal_edge_kinds.entry(edge.kind).or_insert(0usize) += 1;
                         }
                         eprintln!(
-                            "boon owner interface scc members={} dependencies={} residual_iterations={} rounds={} expressions={} unifications={} internal_edges={internal_edge_kinds:?} sample_members={:?} solve_ms={solve_ms:.3}",
+                            "boon owner interface scc members={} dependencies={} residual_iterations={} residual_occurrences={} residual_owner_dispatches={} residual_calls={} residual_op_visits={} residual_max_depth={} rounds={} expressions={} unifications={} internal_edges={internal_edge_kinds:?} sample_members={:?} solve_ms={solve_ms:.3}",
                             plan.key.members.len(),
                             plan.dependencies.len(),
                             iterations,
+                            transfer_work.occurrences,
+                            transfer_work.owner_dispatches,
+                            transfer_work.compiled_call_dispatches,
+                            transfer_work.op_visits,
+                            transfer_work.maximum_owner_depth,
                             evaluation.result.work.solve_rounds,
                             evaluation.result.work.expressions,
                             evaluation.result.work.unification_steps,
@@ -5134,12 +5076,6 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
         topology.sccs.len(),
     );
     evaluate_owner_body_inference_requests(state, &topology)?;
-    let owners = topology
-        .sccs
-        .iter()
-        .flat_map(|scc| scc.key.members.iter().cloned())
-        .collect::<Vec<_>>();
-    evaluate_owner_diagnostic_replay_facts_requests(state, &owners)?;
     Ok(())
 }
 
@@ -5360,107 +5296,6 @@ fn evaluate_owner_body_inference_requests(
     Ok(())
 }
 
-fn evaluate_owner_diagnostic_replay_facts_requests(
-    state: &mut ProjectState,
-    owners: &[StableCheckOwnerKey],
-) -> CompilerResult<()> {
-    let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-diagnostic-replay-facts-evaluation-dependencies.v5\0",
-        std::iter::empty(),
-    ));
-    for owner in owners {
-        match state
-            .owner_diagnostic_replay_facts_evaluation_requests
-            .begin(&mut state.syntax_evaluator, owner.clone(), evaluation_input)?
-        {
-            RequestStart::Reused => {}
-            RequestStart::Execute(mut ticket) => {
-                let evaluation = (|| -> CompilerResult<_> {
-                    let syntax = state.owner_input_requests.require(
-                        &state.syntax_evaluator,
-                        &mut ticket,
-                        owner,
-                    )?;
-                    let lexical_plan = state.owner_lexical_plan_requests.require(
-                        &state.syntax_evaluator,
-                        &mut ticket,
-                        owner,
-                    )?;
-                    let body = Arc::clone(state.owner_body_inference_requests.require(
-                        &state.syntax_evaluator,
-                        &mut ticket,
-                        owner,
-                    )?);
-                    let abi = state.owner_callable_inference_abi_requests.require(
-                        &state.syntax_evaluator,
-                        &mut ticket,
-                        owner,
-                    )?;
-                    Ok(Arc::new(evaluate_owner_diagnostic_replay_facts(
-                        syntax,
-                        lexical_plan,
-                        body,
-                        abi,
-                    )?))
-                })();
-                let evaluation = match evaluation {
-                    Ok(evaluation) => evaluation,
-                    Err(error) => {
-                        state
-                            .owner_diagnostic_replay_facts_evaluation_requests
-                            .abort(
-                                &mut state.syntax_evaluator,
-                                ticket,
-                                RequestAbortReason::Failed,
-                            )?;
-                        return Err(error);
-                    }
-                };
-                state
-                    .owner_diagnostic_replay_facts_evaluation_requests
-                    .publish(&mut state.syntax_evaluator, ticket, evaluation)?;
-            }
-        }
-    }
-
-    let result_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-diagnostic-replay-facts-result-projection-dependencies.v5\0",
-        std::iter::empty(),
-    ));
-    for owner in owners {
-        match state.owner_diagnostic_replay_facts_requests.begin(
-            &mut state.syntax_evaluator,
-            owner.clone(),
-            result_input,
-        )? {
-            RequestStart::Reused => {}
-            RequestStart::Execute(mut ticket) => {
-                let result = state
-                    .owner_diagnostic_replay_facts_evaluation_requests
-                    .require(&state.syntax_evaluator, &mut ticket, owner)
-                    .map(|evaluation| Arc::clone(&evaluation.result));
-                let result = match result {
-                    Ok(result) => result,
-                    Err(error) => {
-                        state.owner_diagnostic_replay_facts_requests.abort(
-                            &mut state.syntax_evaluator,
-                            ticket,
-                            RequestAbortReason::Failed,
-                        )?;
-                        return Err(error.into());
-                    }
-                };
-                state.owner_diagnostic_replay_facts_requests.publish(
-                    &mut state.syntax_evaluator,
-                    ticket,
-                    result,
-                )?;
-            }
-        }
-    }
-    Ok(())
-}
-
 fn evaluate_project_output_flow_facts_request(
     state: &mut ProjectState,
     project: &ProjectSyntaxSnapshot,
@@ -5471,7 +5306,7 @@ fn evaluate_project_output_flow_facts_request(
         .map(stable_check_owner_key_fingerprint_v2)
         .collect::<Vec<_>>();
     let input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.project-output-flow-facts-dependencies.v2\0",
+        b"boon.compiler.project-output-flow-facts-dependencies.v3\0",
         owner_fingerprints.iter().map(<[u8; 32]>::as_slice),
     ));
     let key = ProjectOutputFlowFactsKey;
@@ -5487,20 +5322,18 @@ fn evaluate_project_output_flow_facts_request(
                     &mut ticket,
                     &ProjectOwnerAbiKey,
                 )?);
-                let mut replay_facts = Vec::with_capacity(owners.len());
+                let mut bodies = Vec::with_capacity(owners.len());
                 for owner in &owners {
-                    replay_facts.push(Arc::clone(
-                        state.owner_diagnostic_replay_facts_requests.require(
-                            &state.syntax_evaluator,
-                            &mut ticket,
-                            owner,
-                        )?,
-                    ));
+                    bodies.push(Arc::clone(state.owner_body_inference_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?));
                 }
                 Ok(Arc::new(project_output_flow_facts(
                     &abi,
                     owners.iter(),
-                    replay_facts.iter().map(Arc::as_ref),
+                    bodies.iter().map(Arc::as_ref),
                 )?))
             })();
             let facts = match facts {
@@ -5536,7 +5369,7 @@ fn evaluate_project_diagnostic_facts_request(
         .collect::<Vec<_>>();
     let source_digest = project.source_bundle_digest_v1().to_string();
     let input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.project-diagnostic-facts-dependencies.v14\0",
+        b"boon.compiler.project-diagnostic-facts-dependencies.v15\0",
         std::iter::once(source_digest.as_bytes())
             .chain(std::iter::once(program_role_request_tag(
                 state.source.program_role,
@@ -5565,8 +5398,7 @@ fn evaluate_project_diagnostic_facts_request(
                 let mut lexical_plans = Vec::with_capacity(owners.len());
                 let mut summaries = Vec::with_capacity(owners.len());
                 let mut interfaces = Vec::with_capacity(owners.len());
-                let mut replay_evaluations = Vec::with_capacity(owners.len());
-                let mut replay_facts = Vec::with_capacity(owners.len());
+                let mut bodies = Vec::with_capacity(owners.len());
                 let mut inference_abis = Vec::with_capacity(owners.len());
                 let mut source_maps = Vec::with_capacity(owners.len());
                 let mut interface_results = BTreeMap::new();
@@ -5607,18 +5439,11 @@ fn evaluate_project_diagnostic_facts_request(
                             "project diagnostics interface SCC has no owner {owner:?}"
                         ))
                     })?);
-                    replay_evaluations.push(Arc::clone(
-                        state
-                            .owner_diagnostic_replay_facts_evaluation_requests
-                            .require(&state.syntax_evaluator, &mut ticket, owner)?,
-                    ));
-                    replay_facts.push(Arc::clone(
-                        state.owner_diagnostic_replay_facts_requests.require(
-                            &state.syntax_evaluator,
-                            &mut ticket,
-                            owner,
-                        )?,
-                    ));
+                    bodies.push(Arc::clone(state.owner_body_inference_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?));
                     inference_abis.push(Arc::clone(
                         state.owner_callable_inference_abi_requests.require(
                             &state.syntax_evaluator,
@@ -5641,8 +5466,7 @@ fn evaluate_project_diagnostic_facts_request(
                     lexical_plans.iter().map(Arc::as_ref),
                     summaries.iter().map(Arc::as_ref),
                     interfaces.iter(),
-                    replay_evaluations.iter().map(Arc::as_ref),
-                    replay_facts.iter().map(Arc::as_ref),
+                    bodies.iter().map(Arc::as_ref),
                     owners.iter().zip(inference_abis.iter().map(Arc::as_ref)),
                     source_maps.iter().map(Arc::as_ref),
                 )?))
@@ -9717,13 +9541,7 @@ mod tests {
             let state = session.projects.get(&project).unwrap();
             assert_eq!(state.project_diagnostic_facts_requests.request_count(), 1);
             assert_eq!(
-                state.owner_diagnostic_replay_facts_requests.request_count(),
-                state.owner_input_requests.request_count()
-            );
-            assert_eq!(
-                state
-                    .owner_diagnostic_replay_facts_evaluation_requests
-                    .request_count(),
+                state.owner_body_inference_requests.request_count(),
                 state.owner_input_requests.request_count()
             );
             assert_eq!(state.owner_construction_abi_requests.request_count(), 0);
@@ -10222,26 +10040,6 @@ mod tests {
             .owner_body_inference(project, &right)
             .unwrap()
             .unwrap();
-        let first_left_replay = {
-            let state = session.projects.get(&project).unwrap();
-            Arc::clone(
-                state
-                    .owner_diagnostic_replay_facts_requests
-                    .current_value(&state.syntax_evaluator, &left)
-                    .unwrap()
-                    .unwrap(),
-            )
-        };
-        let first_left_replay_evaluation = {
-            let state = session.projects.get(&project).unwrap();
-            Arc::clone(
-                state
-                    .owner_diagnostic_replay_facts_evaluation_requests
-                    .current_value(&state.syntax_evaluator, &left)
-                    .unwrap()
-                    .unwrap(),
-            )
-        };
         let first_output_flow = {
             let state = session.projects.get(&project).unwrap();
             Arc::clone(
@@ -10310,26 +10108,6 @@ mod tests {
             .owner_body_inference(project, &right)
             .unwrap()
             .unwrap();
-        let second_left_replay = {
-            let state = session.projects.get(&project).unwrap();
-            Arc::clone(
-                state
-                    .owner_diagnostic_replay_facts_requests
-                    .current_value(&state.syntax_evaluator, &left)
-                    .unwrap()
-                    .unwrap(),
-            )
-        };
-        let second_left_replay_evaluation = {
-            let state = session.projects.get(&project).unwrap();
-            Arc::clone(
-                state
-                    .owner_diagnostic_replay_facts_evaluation_requests
-                    .current_value(&state.syntax_evaluator, &left)
-                    .unwrap()
-                    .unwrap(),
-            )
-        };
         let second_output_flow = {
             let state = session.projects.get(&project).unwrap();
             Arc::clone(
@@ -10356,36 +10134,14 @@ mod tests {
         assert!(Arc::ptr_eq(&first_right_interface, &second_right_interface));
         assert!(!Arc::ptr_eq(&first_left_body, &second_left_body));
         assert!(Arc::ptr_eq(&first_right_body, &second_right_body));
-        assert!(Arc::ptr_eq(&first_left_replay, &second_left_replay));
-        assert!(!Arc::ptr_eq(
-            &first_left_replay_evaluation,
-            &second_left_replay_evaluation
-        ));
+        assert_eq!(
+            first_left_body.diagnostic_facts.fingerprint_v1(),
+            second_left_body.diagnostic_facts.fingerprint_v1(),
+            "owner-local diagnostic facts remain semantically stable inside the changed body",
+        );
         assert!(Arc::ptr_eq(&first_output_flow, &second_output_flow));
 
         let state = session.projects.get(&project).unwrap();
-        let current_left_lexical = state
-            .owner_lexical_plan_requests
-            .current_value(&state.syntax_evaluator, &left)
-            .unwrap()
-            .unwrap();
-        let current_left_abi = state
-            .owner_callable_inference_abi_requests
-            .current_value(&state.syntax_evaluator, &left)
-            .unwrap()
-            .unwrap();
-        assert!(!first_left_replay_evaluation.matches_inputs(
-            &second_left_input,
-            current_left_lexical,
-            &second_left_body,
-            current_left_abi,
-        ));
-        assert!(second_left_replay_evaluation.matches_inputs(
-            &second_left_input,
-            current_left_lexical,
-            &second_left_body,
-            current_left_abi,
-        ));
         assert_eq!(
             state
                 .owner_input_requests
@@ -10420,15 +10176,7 @@ mod tests {
         );
         assert_eq!(
             state
-                .owner_diagnostic_replay_facts_requests
-                .memo(&state.syntax_evaluator, &left)
-                .unwrap()
-                .changed_at,
-            EvaluationRevision(0)
-        );
-        assert_eq!(
-            state
-                .owner_diagnostic_replay_facts_evaluation_requests
+                .owner_body_inference_requests
                 .memo(&state.syntax_evaluator, &left)
                 .unwrap()
                 .changed_at,
@@ -12280,13 +12028,7 @@ mod tests {
         {
             let state = session.projects.get(&project).unwrap();
             assert_eq!(
-                state.owner_diagnostic_replay_facts_requests.request_count(),
-                state.owner_input_requests.request_count()
-            );
-            assert_eq!(
-                state
-                    .owner_diagnostic_replay_facts_evaluation_requests
-                    .request_count(),
+                state.owner_body_inference_requests.request_count(),
                 state.owner_input_requests.request_count()
             );
         }

@@ -2092,6 +2092,23 @@ render/host reducers, and retain a small project currentness/ordering receipt.
 Source-unit projections own spans and presentation. Compatibility assembly may
 relocate authenticated facts but may not independently derive them.
 
+The first owner-core ownership slice is now local and verified. Owner body
+evaluation publishes its span-free diagnostic/global-reducer contribution in
+the authenticated `OwnerBodyInferenceShard`; the separate per-owner diagnostic
+replay evaluation and result request families, their currentness wrapper, and
+their retention paths are deleted. On NovyWave this removes 2,794 request rows
+from the graph and the source change is net smaller, while focused diagnostic,
+backdating, topology, and exact ignored NovyWave verified-plan tests pass. A
+single debug timing sample is deliberately not a speed claim: it measured
+25.15 seconds and 409,160 KiB versus the compact-residual checkpoint's 23.287
+seconds and 413,688 KiB, with the dominant 360-owner SCC varying upward from
+roughly 14.1--14.4 seconds to 14.85 seconds. The contribution still clones and
+fingerprints canonical call/flow/read rows already owned by the body, so this
+is only the ownership prerequisite. Continue by deleting that duplicate
+representation and making global reducers consume canonical owner rows plus
+compact output/order/render/host facts; do not tune or cache the duplicate
+projection.
+
 The post-checkpoint `unsafe` review remains deferred. Large safe work is still
 measured and scheduled for deletion, while this tranche exposes no dominant
 allocation-free kernel. Reassess only after residual-transfer compilation,

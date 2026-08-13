@@ -38,9 +38,7 @@ use std::fmt;
 use std::sync::Arc;
 
 const PROJECT_DIAGNOSTIC_FACTS_DOMAIN_V10: &[u8] = b"boon.project-diagnostic-facts.v10\0";
-const OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V5: &[u8] = b"boon.owner-diagnostic-replay-facts.v5\0";
-const OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V5: &[u8] =
-    b"boon.owner-diagnostic-replay-currentness.v5\0";
+const OWNER_DIAGNOSTIC_CONTRIBUTION_DOMAIN_V1: &[u8] = b"boon.owner-diagnostic-contribution.v1\0";
 const PROJECT_OUTPUT_FLOW_FACTS_DOMAIN_V1: &[u8] = b"boon.project-output-flow-facts.v1\0";
 const SOURCE_UNIT_PROJECT_DIAGNOSTICS_DOMAIN_V1: &[u8] =
     b"boon.source-unit-project-diagnostics.v1\0";
@@ -612,14 +610,13 @@ struct OwnerDiagnosticOutputCallFact {
     outputs: Box<[OwnerDiagnosticOutputBindingFact]>,
 }
 
-/// Stable, span-free replay inputs projected once for one owner.
+/// Stable, span-free diagnostic and global-reducer contribution for one owner.
 ///
-/// Expression-flow and effective-read rows stay on the paired current body
-/// evaluation. `fingerprint_v1` commits their complete normalized projection,
-/// so a backdated fact can consume a newer body only when those omitted rows
-/// are semantically identical.
+/// This is emitted atomically with the canonical owner body. Source-unit maps
+/// add presentation spans later; project reducers consume this authenticated
+/// contribution without reconstructing it from the owner graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OwnerDiagnosticReplayFacts {
+pub struct OwnerDiagnosticContribution {
     owner: StableCheckOwnerKey,
     containing_scope: OwnerContainingScopeInput,
     function_name: Option<String>,
@@ -630,94 +627,13 @@ pub struct OwnerDiagnosticReplayFacts {
     fingerprint_v1: [u8; 32],
 }
 
-impl OwnerDiagnosticReplayFacts {
+impl OwnerDiagnosticContribution {
     pub const fn owner(&self) -> &StableCheckOwnerKey {
         &self.owner
     }
 
     pub const fn fingerprint_v1(&self) -> [u8; 32] {
         self.fingerprint_v1
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct OwnerDiagnosticReplayFactsBasis {
-    owner: StableCheckOwnerKey,
-    syntax_fingerprint_v1: [u8; 32],
-    lexical_plan_fingerprint_v1: [u8; 32],
-    body_fingerprint_v1: [u8; 32],
-    inference_abi_fingerprint_v1: [u8; 32],
-}
-
-impl OwnerDiagnosticReplayFactsBasis {
-    fn matches_inputs(
-        &self,
-        syntax: &OwnerSyntaxInput,
-        lexical_plan: &OwnerLexicalPlan,
-        body: &OwnerBodyInferenceShard,
-        abi: &OwnerInferenceAbiEnvironment,
-    ) -> bool {
-        self.owner == syntax.owner
-            && self.owner == body.owner
-            && self.syntax_fingerprint_v1 == syntax.fingerprint_v1()
-            && self.lexical_plan_fingerprint_v1 == lexical_plan.fingerprint_v1()
-            && self.body_fingerprint_v1 == body.fingerprint_v1()
-            && self.inference_abi_fingerprint_v1 == abi.fingerprint_v1()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct OwnerDiagnosticReplayFactsCurrentness {
-    basis: OwnerDiagnosticReplayFactsBasis,
-    result_fingerprint_v1: [u8; 32],
-    fingerprint_v1: [u8; 32],
-}
-
-impl OwnerDiagnosticReplayFactsCurrentness {
-    pub const fn fingerprint_v1(&self) -> [u8; 32] {
-        self.fingerprint_v1
-    }
-
-    fn matches_inputs(
-        &self,
-        syntax: &OwnerSyntaxInput,
-        lexical_plan: &OwnerLexicalPlan,
-        body: &OwnerBodyInferenceShard,
-        abi: &OwnerInferenceAbiEnvironment,
-    ) -> bool {
-        self.basis.matches_inputs(syntax, lexical_plan, body, abi)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OwnerDiagnosticReplayFactsEvaluation {
-    pub currentness: OwnerDiagnosticReplayFactsCurrentness,
-    pub result: Arc<OwnerDiagnosticReplayFacts>,
-    body: Arc<OwnerBodyInferenceShard>,
-}
-
-impl OwnerDiagnosticReplayFactsEvaluation {
-    pub fn matches_inputs(
-        &self,
-        syntax: &OwnerSyntaxInput,
-        lexical_plan: &OwnerLexicalPlan,
-        body: &OwnerBodyInferenceShard,
-        abi: &OwnerInferenceAbiEnvironment,
-    ) -> bool {
-        self.currentness
-            .matches_inputs(syntax, lexical_plan, body, abi)
-            && self.currentness.result_fingerprint_v1 == self.result.fingerprint_v1()
-    }
-
-    fn matches_project_inputs(
-        &self,
-        syntax: &OwnerSyntaxInput,
-        lexical_plan: &OwnerLexicalPlan,
-        summary: &OwnerConstraintSummary,
-        abi: &OwnerInferenceAbiEnvironment,
-    ) -> bool {
-        self.matches_inputs(syntax, lexical_plan, &self.body, abi)
-            && summary.matches_signature_plan(&self.body.signature_lexical_plan)
     }
 }
 
@@ -762,33 +678,35 @@ fn owner_diagnostic_stable_dense_expression(
     })
 }
 
-fn project_owner_diagnostic_replay_facts_with_lookup(
+fn project_owner_diagnostic_contribution_with_lookup(
     syntax: &OwnerSyntaxInput,
     lexical_plan: &OwnerLexicalPlan,
-    body: &OwnerBodyInferenceShard,
+    statements: &[crate::InferredOwnerStatement],
+    expressions: &[crate::InferredOwnerExpression],
+    calls: &[crate::InferredOwnerCall],
+    signature_lexical_plan: &crate::OwnerSignatureLexicalPlan,
     callable_kind: impl Fn(&str) -> Option<CheckedCallableKind>,
-) -> Result<OwnerDiagnosticReplayFacts, ProjectDiagnosticFactsError> {
+) -> Result<OwnerDiagnosticContribution, ProjectDiagnosticFactsError> {
     if !lexical_plan.matches_input(syntax) {
         return Err(ProjectDiagnosticFactsError::new(format!(
-            "owner diagnostic replay lexical plan does not match syntax for {:?}",
+            "owner diagnostic contribution lexical plan does not match syntax for {:?}",
             syntax.owner
         )));
     }
-    if body.owner != syntax.owner || !body.signature_lexical_plan.matches_base(lexical_plan) {
+    if !signature_lexical_plan.matches_base(lexical_plan) {
         return Err(ProjectDiagnosticFactsError::new(format!(
-            "owner diagnostic replay body does not match the lexical plan for {:?}",
+            "owner diagnostic contribution body does not match the lexical plan for {:?}",
             syntax.owner
         )));
     }
-    if body.statements.len() != syntax.statements.len()
-        || body.expressions.len() != syntax.expressions.len()
+    if statements.len() != syntax.statements.len() || expressions.len() != syntax.expressions.len()
     {
         return Err(ProjectDiagnosticFactsError::new(format!(
-            "owner diagnostic replay body row coverage differs from syntax for {:?}",
+            "owner diagnostic contribution body row coverage differs from syntax for {:?}",
             syntax.owner
         )));
     }
-    for (index, (statement, input)) in body.statements.iter().zip(&syntax.statements).enumerate() {
+    for (index, (statement, input)) in statements.iter().zip(&syntax.statements).enumerate() {
         if statement.id.0 as usize != index
             || input.id as usize != index
             || statement.stable_key != input.stable_key
@@ -796,20 +714,19 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
             || statement.expression.map(|expression| expression.0) != input.expression
         {
             return Err(ProjectDiagnosticFactsError::new(format!(
-                "owner diagnostic replay statement row differs from syntax for {:?}",
+                "owner diagnostic contribution statement row differs from syntax for {:?}",
                 syntax.owner
             )));
         }
     }
     let mut stable_expressions = BTreeMap::new();
-    for (index, (expression, input)) in body.expressions.iter().zip(&syntax.expressions).enumerate()
-    {
+    for (index, (expression, input)) in expressions.iter().zip(&syntax.expressions).enumerate() {
         if expression.id.0 as usize != index
             || expression.stable_key != input.stable_key
             || expression.kind != input.kind
         {
             return Err(ProjectDiagnosticFactsError::new(format!(
-                "owner diagnostic replay expression row differs from syntax for {:?}",
+                "owner diagnostic contribution expression row differs from syntax for {:?}",
                 syntax.owner
             )));
         }
@@ -818,7 +735,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
             .is_some()
         {
             return Err(ProjectDiagnosticFactsError::new(format!(
-                "owner diagnostic replay contains duplicate expression identities for {:?}",
+                "owner diagnostic contribution contains duplicate expression identities for {:?}",
                 syntax.owner
             )));
         }
@@ -861,7 +778,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         }),
     };
     let mut statement_values = Vec::new();
-    for statement in &body.statements {
+    for statement in statements {
         let Some(value) = lexical_plan
             .graph()
             .statement(OwnerStatementId(statement.id.0))
@@ -871,7 +788,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         };
         let value = stable_reference(value).ok_or_else(|| {
             ProjectDiagnosticFactsError::new(
-                "owner diagnostic replay statement value has no exact stable expression",
+                "owner diagnostic contribution statement value has no exact stable expression",
             )
         })?;
         statement_values.push(OwnerDiagnosticStableStatementValue {
@@ -880,12 +797,12 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         });
     }
 
-    let mut calls = Vec::with_capacity(body.calls.len());
+    let mut stable_calls = Vec::with_capacity(calls.len());
     let mut output_calls = Vec::new();
-    for call in &body.calls {
+    for call in calls {
         let Some(expression_index) = stable_expressions.get(&call.expression).copied() else {
             return Err(ProjectDiagnosticFactsError::new(
-                "owner diagnostic replay call has no exact owner expression",
+                "owner diagnostic contribution call has no exact owner expression",
             ));
         };
         let disposition = match &call.target {
@@ -897,7 +814,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
             crate::InferredOwnerCallableTarget::Authoritative => {
                 let kind = callable_kind(&call.function).ok_or_else(|| {
                     ProjectDiagnosticFactsError::new(
-                        "authoritative owner diagnostic replay call has no exact ABI contract",
+                        "authoritative owner diagnostic contribution call has no exact ABI contract",
                     )
                 })?;
                 crate::OwnerDiagnosticCallDisposition::Abi { kind }
@@ -914,7 +831,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
             crate::InferredOwnerCallableTarget::Unresolved
             | crate::InferredOwnerCallableTarget::Ambiguous { .. } => {
                 return Err(ProjectDiagnosticFactsError::new(
-                    "valid owner diagnostic replay call has an unresolved or ambiguous target",
+                    "valid owner diagnostic contribution call has an unresolved or ambiguous target",
                 ));
             }
         };
@@ -930,7 +847,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
                 let stable_input = owner_diagnostic_stable_expression(syntax, &input.expression)
                     .ok_or_else(|| {
                         ProjectDiagnosticFactsError::new(
-                            "owner diagnostic replay call input has no exact stable expression",
+                            "owner diagnostic contribution call input has no exact stable expression",
                         )
                     })?;
                 Ok(OwnerDiagnosticStableCallActualFact {
@@ -940,12 +857,11 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
             })
             .collect::<Result<Vec<_>, ProjectDiagnosticFactsError>>()?;
         let plan = if call.valid {
-            let plan = body
-                .signature_lexical_plan
+            let plan = signature_lexical_plan
                 .call(expression_index)
                 .ok_or_else(|| {
                     ProjectDiagnosticFactsError::new(
-                        "valid owner diagnostic replay call has no signature lexical row",
+                        "valid owner diagnostic contribution call has no signature lexical row",
                     )
                 })?;
             if !plan.valid
@@ -953,7 +869,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
                 || plan.function != call.function
             {
                 return Err(ProjectDiagnosticFactsError::new(
-                    "valid owner diagnostic replay call differs from its signature lexical row",
+                    "valid owner diagnostic contribution call differs from its signature lexical row",
                 ));
             }
             Some(plan)
@@ -967,7 +883,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
                 let expression = owner_diagnostic_stable_dense_expression(syntax, input.expression)
                     .ok_or_else(|| {
                         ProjectDiagnosticFactsError::new(
-                            "valid owner diagnostic replay matched input has no stable expression",
+                            "valid owner diagnostic contribution matched input has no stable expression",
                         )
                     })?;
                 Ok(OwnerDiagnosticStableMatchedInputFact {
@@ -984,12 +900,12 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
             .map(|pass| {
                 owner_diagnostic_stable_dense_expression(syntax, pass.expression).ok_or_else(|| {
                     ProjectDiagnosticFactsError::new(
-                        "valid owner diagnostic replay PASS has no stable expression",
+                        "valid owner diagnostic contribution PASS has no stable expression",
                     )
                 })
             })
             .transpose()?;
-        calls.push(OwnerDiagnosticStableCallFact {
+        stable_calls.push(OwnerDiagnosticStableCallFact {
             expression: call.expression.clone(),
             function: call.function.clone(),
             target: call.target.clone(),
@@ -1016,7 +932,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
                 }
                 crate::OwnerDiagnosticCallDisposition::Invalid => {
                     return Err(ProjectDiagnosticFactsError::new(
-                        "valid owner diagnostic replay call has an invalid disposition",
+                        "valid owner diagnostic contribution call has an invalid disposition",
                     ));
                 }
             };
@@ -1027,7 +943,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
                     let target = effective_output_target(&syntax.owner, &output.effective_target())
                         .ok_or_else(|| {
                             ProjectDiagnosticFactsError::new(
-                                "valid owner diagnostic replay output has no stable target",
+                                "valid owner diagnostic contribution output has no stable target",
                             )
                         })?;
                     Ok(OwnerDiagnosticOutputBindingFact {
@@ -1059,7 +975,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
                         )
                         .ok_or_else(|| {
                             ProjectDiagnosticFactsError::new(
-                                "valid owner diagnostic replay call input has no stable expression",
+                                "valid owner diagnostic contribution call input has no stable expression",
                             )
                         })?;
                         Ok(OwnerDiagnosticOutputCallInputFact {
@@ -1079,13 +995,13 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
             });
         }
     }
-    calls.sort_by(|left, right| left.expression.cmp(&right.expression));
-    if calls
+    stable_calls.sort_by(|left, right| left.expression.cmp(&right.expression));
+    if stable_calls
         .windows(2)
         .any(|rows| rows[0].expression == rows[1].expression)
     {
         return Err(ProjectDiagnosticFactsError::new(
-            "owner diagnostic replay contains duplicate call expressions",
+            "owner diagnostic contribution contains duplicate call expressions",
         ));
     }
     output_declarations.sort_by(|left, right| left.target.cmp(&right.target));
@@ -1094,7 +1010,7 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         .any(|rows| rows[0].target == rows[1].target)
     {
         return Err(ProjectDiagnosticFactsError::new(
-            "owner diagnostic replay contains duplicate OUT declarations",
+            "owner diagnostic contribution contains duplicate OUT declarations",
         ));
     }
     output_calls.sort_by(|left, right| left.expression.cmp(&right.expression));
@@ -1103,26 +1019,23 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         .any(|rows| rows[0].expression == rows[1].expression)
     {
         return Err(ProjectDiagnosticFactsError::new(
-            "owner diagnostic replay contains duplicate output call expressions",
+            "owner diagnostic contribution contains duplicate output call expressions",
         ));
     }
 
-    if body.signature_lexical_plan.reads().len() != body.expressions.len() {
+    if signature_lexical_plan.reads().len() != expressions.len() {
         return Err(ProjectDiagnosticFactsError::new(format!(
-            "owner diagnostic replay lexical read coverage differs from expressions for {:?}",
+            "owner diagnostic contribution lexical read coverage differs from expressions for {:?}",
             syntax.owner
         )));
     }
 
-    let expression_flows = OwnerDiagnosticExpressionFlowRows {
-        expressions: &body.expressions,
-    };
+    let expression_flows = OwnerDiagnosticExpressionFlowRows { expressions };
     let reads = OwnerDiagnosticReadRows {
-        expressions: &body.expressions,
-        reads: body.signature_lexical_plan.reads(),
+        expressions,
+        reads: signature_lexical_plan.reads(),
     };
-    let function_name = body
-        .statements
+    let function_name = statements
         .first()
         .and_then(|statement| match &statement.kind {
             AstStatementKind::Function { name, .. } => Some(name.clone()),
@@ -1130,14 +1043,14 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
         });
     let containing_scope = syntax.containing_scope.clone();
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_DIAGNOSTIC_REPLAY_FACTS_DOMAIN_V5,
+        OWNER_DIAGNOSTIC_CONTRIBUTION_DOMAIN_V1,
         &(
             &syntax.owner,
             &containing_scope,
             &function_name,
             &expression_flows,
             &statement_values,
-            &calls,
+            &stable_calls,
             &reads,
             &output_declarations,
             &output_calls,
@@ -1145,70 +1058,56 @@ fn project_owner_diagnostic_replay_facts_with_lookup(
     )
     .map_err(|error| {
         ProjectDiagnosticFactsError::new(format!(
-            "cannot fingerprint owner diagnostic replay facts: {error}"
+            "cannot fingerprint owner diagnostic contribution: {error}"
         ))
     })?;
-    Ok(OwnerDiagnosticReplayFacts {
+    Ok(OwnerDiagnosticContribution {
         owner: syntax.owner.clone(),
         containing_scope,
         function_name,
         statement_values: statement_values.into_boxed_slice(),
-        calls: calls.into_boxed_slice(),
+        calls: stable_calls.into_boxed_slice(),
         output_declarations: output_declarations.into_boxed_slice(),
         output_calls: output_calls.into_boxed_slice(),
         fingerprint_v1,
     })
 }
 
-pub fn project_owner_diagnostic_replay_facts(
+pub fn project_owner_diagnostic_contribution(
     syntax: &OwnerSyntaxInput,
     lexical_plan: &OwnerLexicalPlan,
     body: &OwnerBodyInferenceShard,
     abi: &OwnerInferenceAbiEnvironment,
-) -> Result<OwnerDiagnosticReplayFacts, ProjectDiagnosticFactsError> {
-    project_owner_diagnostic_replay_facts_with_lookup(syntax, lexical_plan, body, |name| {
-        abi.callable(name).map(|contract| contract.kind)
-    })
-}
-
-pub fn evaluate_owner_diagnostic_replay_facts(
-    syntax: &OwnerSyntaxInput,
-    lexical_plan: &OwnerLexicalPlan,
-    body: Arc<OwnerBodyInferenceShard>,
-    abi: &OwnerInferenceAbiEnvironment,
-) -> Result<OwnerDiagnosticReplayFactsEvaluation, ProjectDiagnosticFactsError> {
-    let basis = OwnerDiagnosticReplayFactsBasis {
-        owner: syntax.owner.clone(),
-        syntax_fingerprint_v1: syntax.fingerprint_v1(),
-        lexical_plan_fingerprint_v1: lexical_plan.fingerprint_v1(),
-        body_fingerprint_v1: body.fingerprint_v1(),
-        inference_abi_fingerprint_v1: abi.fingerprint_v1(),
-    };
-    let result = Arc::new(project_owner_diagnostic_replay_facts(
+) -> Result<OwnerDiagnosticContribution, ProjectDiagnosticFactsError> {
+    project_owner_diagnostic_contribution_from_rows(
         syntax,
         lexical_plan,
-        &body,
+        &body.statements,
+        &body.expressions,
+        &body.calls,
+        &body.signature_lexical_plan,
         abi,
-    )?);
-    let result_fingerprint_v1 = result.fingerprint_v1();
-    let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_DIAGNOSTIC_REPLAY_CURRENTNESS_DOMAIN_V5,
-        &(&basis, result_fingerprint_v1),
     )
-    .map_err(|error| {
-        ProjectDiagnosticFactsError::new(format!(
-            "cannot fingerprint owner diagnostic replay currentness: {error}"
-        ))
-    })?;
-    Ok(OwnerDiagnosticReplayFactsEvaluation {
-        currentness: OwnerDiagnosticReplayFactsCurrentness {
-            basis,
-            result_fingerprint_v1,
-            fingerprint_v1,
-        },
-        result,
-        body,
-    })
+}
+
+pub(crate) fn project_owner_diagnostic_contribution_from_rows(
+    syntax: &OwnerSyntaxInput,
+    lexical_plan: &OwnerLexicalPlan,
+    statements: &[crate::InferredOwnerStatement],
+    expressions: &[crate::InferredOwnerExpression],
+    calls: &[crate::InferredOwnerCall],
+    signature_lexical_plan: &crate::OwnerSignatureLexicalPlan,
+    abi: &OwnerInferenceAbiEnvironment,
+) -> Result<OwnerDiagnosticContribution, ProjectDiagnosticFactsError> {
+    project_owner_diagnostic_contribution_with_lookup(
+        syntax,
+        lexical_plan,
+        statements,
+        expressions,
+        calls,
+        signature_lexical_plan,
+        |name| abi.callable(name).map(|contract| contract.kind),
+    )
 }
 
 struct OwnerFactView<'a> {
@@ -1216,7 +1115,7 @@ struct OwnerFactView<'a> {
     graph: &'a OwnerSyntaxGraph,
     interface: &'a crate::OwnerPublicInterface,
     body: &'a OwnerBodyInferenceShard,
-    replay: &'a OwnerDiagnosticReplayFacts,
+    diagnostics: &'a OwnerDiagnosticContribution,
     inference_abi: &'a OwnerInferenceAbiEnvironment,
     source_map: &'a OwnerSourceMap,
 }
@@ -1262,8 +1161,7 @@ impl<'a> ProjectFactIndex<'a> {
         lexical_plans: impl IntoIterator<Item = &'a OwnerLexicalPlan>,
         summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
         interfaces: impl IntoIterator<Item = &'a crate::OwnerPublicInterface>,
-        replay_evaluations: impl IntoIterator<Item = &'a OwnerDiagnosticReplayFactsEvaluation>,
-        replay_facts: impl IntoIterator<Item = &'a OwnerDiagnosticReplayFacts>,
+        bodies: impl IntoIterator<Item = &'a OwnerBodyInferenceShard>,
         inference_abis: impl IntoIterator<
             Item = (&'a StableCheckOwnerKey, &'a OwnerInferenceAbiEnvironment),
         >,
@@ -1308,15 +1206,9 @@ impl<'a> ProjectFactIndex<'a> {
                 .map(|syntax| (&syntax.owner, syntax)),
             "syntax input",
         )?;
-        let replay_facts = unique_by_owner(
-            replay_facts.into_iter().map(|facts| (facts.owner(), facts)),
-            "diagnostic replay facts",
-        )?;
-        let replay_evaluations = unique_by_owner(
-            replay_evaluations
-                .into_iter()
-                .map(|evaluation| (evaluation.result.owner(), evaluation)),
-            "diagnostic replay evaluation",
+        let bodies = unique_by_owner(
+            bodies.into_iter().map(|body| (body.owner(), body)),
+            "owner body diagnostic facts",
         )?;
         let inference_abis = unique_by_owner(inference_abis, "diagnostic inference ABI")?;
         let interfaces = unique_by_owner(
@@ -1345,12 +1237,8 @@ impl<'a> ProjectFactIndex<'a> {
             ("syntax input", syntax_inputs.keys().eq(expected.iter())),
             ("public interface", interfaces.keys().eq(expected.iter())),
             (
-                "diagnostic replay facts",
-                replay_facts.keys().eq(expected.iter()),
-            ),
-            (
-                "diagnostic replay evaluation",
-                replay_evaluations.keys().eq(expected.iter()),
+                "owner body diagnostic facts",
+                bodies.keys().eq(expected.iter()),
             ),
             (
                 "diagnostic inference ABI",
@@ -1395,8 +1283,8 @@ impl<'a> ProjectFactIndex<'a> {
             let lexical_plan = lexical_plans[owner];
             let summary = summaries[owner];
             let interface = interfaces[owner];
-            let replay_evaluation = replay_evaluations[owner];
-            let replay = replay_facts[owner];
+            let body = bodies[owner];
+            let replay = &body.diagnostic_facts;
             let inference_abi = inference_abis[owner];
             let source_map = source_maps[owner];
             let (layout_start_line, layout_start_byte) = source_layouts
@@ -1414,24 +1302,21 @@ impl<'a> ProjectFactIndex<'a> {
             }
             if replay.owner != *owner || replay.containing_scope != syntax.containing_scope {
                 return Err(ProjectDiagnosticFactsError::new(format!(
-                    "project diagnostic replay facts do not match owner inputs for {owner:?}"
+                    "project diagnostic contribution does not match owner inputs for {owner:?}"
                 )));
             }
-            if !replay_evaluation.matches_project_inputs(
-                syntax,
-                lexical_plan,
-                summary,
-                inference_abi,
-            ) || replay_evaluation.currentness.result_fingerprint_v1 != replay.fingerprint_v1()
+            if body.owner != *owner
+                || !body.signature_lexical_plan.matches_base(lexical_plan)
+                || !summary.matches_signature_plan(&body.signature_lexical_plan)
+                || body.receipt.diagnostic_facts_fingerprint_v1 != replay.fingerprint_v1()
             {
                 return Err(ProjectDiagnosticFactsError::new(format!(
-                    "project diagnostic replay currentness does not match owner inputs for {owner:?}"
+                    "project diagnostic contribution seal does not match owner inputs for {owner:?}"
                 )));
             }
-            let body = replay_evaluation.body.as_ref();
             if body.expressions.len() != syntax.expressions.len() {
                 return Err(ProjectDiagnosticFactsError::new(format!(
-                    "project diagnostic replay expression coverage differs from syntax for {owner:?}"
+                    "project diagnostic contribution expression coverage differs from syntax for {owner:?}"
                 )));
             }
             for (index, input) in syntax.statements.iter().enumerate() {
@@ -1444,7 +1329,7 @@ impl<'a> ProjectFactIndex<'a> {
             for (flow, input) in body.expressions.iter().zip(&syntax.expressions) {
                 if flow.stable_key != input.stable_key {
                     return Err(ProjectDiagnosticFactsError::new(format!(
-                        "project diagnostic replay expression row differs from syntax for {owner:?}"
+                        "project diagnostic contribution expression row differs from syntax for {owner:?}"
                     )));
                 }
             }
@@ -1550,7 +1435,7 @@ impl<'a> ProjectFactIndex<'a> {
                     graph,
                     interface,
                     body,
-                    replay,
+                    diagnostics: replay,
                     inference_abi,
                     source_map,
                 },
@@ -1626,10 +1511,10 @@ impl<'a> ProjectFactIndex<'a> {
                     "owner diagnostic containment references a missing owner",
                 )
             })?;
-            let callable = if view.replay.function_name.is_some() {
+            let callable = if view.diagnostics.function_name.is_some() {
                 Some(owner.clone())
             } else {
-                match &view.replay.containing_scope {
+                match &view.diagnostics.containing_scope {
                     OwnerContainingScopeInput::ProjectRoot => None,
                     OwnerContainingScopeInput::OwnerStatement {
                         owner: parent,
@@ -1678,7 +1563,7 @@ impl<'a> ProjectFactIndex<'a> {
             };
             if !call.valid {
                 return Err(ProjectDiagnosticFactsError::new(
-                    "valid owner call index contains an invalid replay row",
+                    "valid owner call index contains an invalid contribution row",
                 ));
             }
             for input in call
@@ -2732,7 +2617,7 @@ fn recursive_function_diagnostics(
     let mut names = BTreeMap::new();
     let mut spans = BTreeMap::new();
     for (owner, view) in &index.owners {
-        let Some(name) = &view.replay.function_name else {
+        let Some(name) = &view.diagnostics.function_name else {
             continue;
         };
         let statement = view
@@ -2758,7 +2643,7 @@ fn recursive_function_diagnostics(
         let Some(caller) = index.callable_owner(owner).cloned() else {
             continue;
         };
-        for call in &view.replay.calls {
+        for call in &view.diagnostics.calls {
             let crate::OwnerDiagnosticCallDisposition::User { owner: callee } =
                 &call.diagnostic.disposition
             else {
@@ -3745,7 +3630,12 @@ fn style_diagnostics(
     let function_owners = index
         .owners
         .iter()
-        .filter_map(|(owner, view)| view.replay.function_name.is_some().then(|| owner.clone()))
+        .filter_map(|(owner, view)| {
+            view.diagnostics
+                .function_name
+                .is_some()
+                .then(|| owner.clone())
+        })
         .collect::<BTreeSet<_>>();
     let mut constraints_by_owner = BTreeMap::<
         StableCheckOwnerKey,
@@ -5890,7 +5780,7 @@ impl<'index, 'project> ProjectAuthorityAnalyzer<'index, 'project> {
     ) -> Result<Vec<(u32, StableOrderExpression)>, ProjectDiagnosticFactsError> {
         let Some(call) = self.index.call(expression) else {
             return Err(ProjectDiagnosticFactsError::new(
-                "valid collection authority call has no exact replay row",
+                "valid collection authority call has no exact contribution row",
             ));
         };
         call.matched_inputs
@@ -6601,7 +6491,7 @@ fn contextual_list_and_row(operation: crate::OwnerAbiContextualOperation) -> (u3
 pub fn project_output_flow_facts<'a>(
     abi: &OwnerAbiEnvironment,
     expected_owners: impl IntoIterator<Item = &'a StableCheckOwnerKey>,
-    replay_facts: impl IntoIterator<Item = &'a OwnerDiagnosticReplayFacts>,
+    bodies: impl IntoIterator<Item = &'a OwnerBodyInferenceShard>,
 ) -> Result<ProjectOutputFlowFacts, ProjectDiagnosticFactsError> {
     let expected_owners = expected_owners.into_iter().collect::<Vec<_>>();
     let unique_owners = expected_owners
@@ -6615,13 +6505,13 @@ pub fn project_output_flow_facts<'a>(
         ));
     }
     let owners = unique_owners.into_iter().collect::<Vec<_>>();
-    let replay_facts = unique_by_owner(
-        replay_facts.into_iter().map(|facts| (facts.owner(), facts)),
-        "output-flow replay facts",
+    let bodies = unique_by_owner(
+        bodies.into_iter().map(|body| (body.owner(), body)),
+        "output-flow owner bodies",
     )?;
-    if replay_facts.keys().ne(owners.iter()) {
+    if bodies.keys().ne(owners.iter()) {
         return Err(ProjectDiagnosticFactsError::new(
-            "project output flow replay coverage differs from the project owner set",
+            "project output flow contribution coverage differs from the project owner set",
         ));
     }
 
@@ -6633,7 +6523,7 @@ pub fn project_output_flow_facts<'a>(
         BTreeMap::<ProjectOutputTargetFact, BTreeSet<ProjectOutputTargetFact>>::new();
 
     for owner in &owners {
-        let replay = replay_facts[owner];
+        let replay = &bodies[owner].diagnostic_facts;
         for declaration in &replay.output_declarations {
             if !matches!(
                 &declaration.target,
@@ -6697,7 +6587,7 @@ pub fn project_output_flow_facts<'a>(
                         })?;
                         if contract.kind != *kind {
                             return Err(ProjectDiagnosticFactsError::new(
-                                "owner output-flow ABI kind differs from its replay fact",
+                                "owner output-flow ABI kind differs from its contribution",
                             ));
                         }
                         if *kind != CheckedCallableKind::Builtin {
@@ -8671,8 +8561,7 @@ pub fn project_diagnostic_facts<'a>(
     lexical_plans: impl IntoIterator<Item = &'a OwnerLexicalPlan>,
     summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
     interfaces: impl IntoIterator<Item = &'a crate::OwnerPublicInterface>,
-    replay_evaluations: impl IntoIterator<Item = &'a OwnerDiagnosticReplayFactsEvaluation>,
-    replay_facts: impl IntoIterator<Item = &'a OwnerDiagnosticReplayFacts>,
+    bodies: impl IntoIterator<Item = &'a OwnerBodyInferenceShard>,
     inference_abis: impl IntoIterator<
         Item = (&'a StableCheckOwnerKey, &'a OwnerInferenceAbiEnvironment),
     >,
@@ -8691,8 +8580,7 @@ pub fn project_diagnostic_facts<'a>(
         lexical_plans,
         summaries,
         interfaces,
-        replay_evaluations,
-        replay_facts,
+        bodies,
         inference_abis,
         source_maps,
     )?;

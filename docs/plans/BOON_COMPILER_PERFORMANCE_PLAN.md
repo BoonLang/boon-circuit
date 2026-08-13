@@ -2133,19 +2133,27 @@ the exact ignored NovyWave verified-plan gate pass; the latter takes 151.83
 seconds in the debug test build. No standalone speed claim is attached to this
 ownership deletion.
 
-A dependency-indexed interface flow worklist was measured but deliberately not
-landed. It reduced one directional diagnostics observation, yet the exact
-NovyWave gate exposed a stale `WHEN`/list join after a residual transfer epoch.
-The experiment proved that root-value changes alone are not a complete wakeup
-contract: transfer evaluation can refine live occurrence alphas and the
-acyclic sealing path can project before every dependent equation has observed
-that provider epoch. Do not resume by adding more local wakeup exceptions.
-First define one phase-complete mutation/authority epoch journal shared by
-flow, capture, call transfer, narrowing, and HOLD publication; then prove the
-dependency scheduler against the full-sweep oracle and exact NovyWave gate
-before accepting its timing. The measured capture/provider scans remain the
-next large cost, but they must consume that common scheduler rather than gain a
-second partial invalidation mechanism.
+The first root-only dependency worklist was rejected rather than patched with
+local wakeup exceptions: the exact NovyWave gate exposed a stale `WHEN`/list
+join after a residual-transfer epoch. Its replacement is now a persistent flow
+program driven by a phase-complete append-only mutation/authority journal.
+Binding, union, and same-live-root authority publications produce independent
+epochs; reverse dependencies include nested live alphas and are refreshed after
+each equation evaluation; residual transfer publishes into the same journal
+before acyclic sealing. All 83 owner-interface tests and the exact ignored
+NovyWave verified-plan gate pass, with the latter taking 148.96 seconds in the
+debug test build. In the comparable single-threaded debug diagnostics sample,
+wall time fell from 23.62 to 21.50 seconds, the dominant 360-owner SCC from
+14,299.954 to 12,396.475 ms, interface unification steps from 239,454 to
+207,375, and allocated bytes from about 188.47 to 166.13 GB. Peak RSS remained
+essentially flat at 407,020 KiB and allocation calls slightly increased to
+46,138,231, so this is a bounded scheduling gain rather than the desired
+representation breakthrough. The measured capture/provider scans remain the
+next large cost and must consume this common journal instead of gaining a
+second invalidation mechanism. After that, compile owner result semantics once
+into packed typed residual programs and delete recursive source-transfer
+interpretation; that ownership/representation cut is the path to materially
+lower allocation counts and Jai-like latency.
 
 The post-checkpoint `unsafe` review remains deferred. Large safe work is still
 measured and scheduled for deletion, while this tranche exposes no dominant

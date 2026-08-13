@@ -1214,7 +1214,7 @@ impl RequestFamily for OwnerInterfaceSccEvaluationRequest {
     type Key = OwnerInterfaceSccKey;
     type Value = Arc<OwnerInterfaceComponentEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v10";
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v11";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         OwnerInterfaceSccPlanRequest::key_fingerprint(key)
@@ -4758,7 +4758,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
     trace.checkpoint("interface-scc-plans", topology.sccs.len());
 
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v10\0",
+        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v11\0",
         std::iter::empty(),
     ));
     let result_input = RequestInputFingerprint(request_fingerprint(
@@ -4976,7 +4976,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                             .map(|dependency| dependency.fingerprint_v1()),
                     );
                     let fingerprint_v1 = request_fingerprint(
-                        b"boon.compiler.owner-interface-component-evaluation.v4\0",
+                        b"boon.compiler.owner-interface-component-evaluation.v5\0",
                         component_inputs.iter().map(<[u8; 32]>::as_slice),
                     );
                     Ok(Arc::new(OwnerInterfaceComponentEvaluation {

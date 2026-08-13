@@ -27,7 +27,7 @@ use boon_checked::{
 use boon_data::ExactNumber;
 use boon_syntax::{StableCheckOwnerKey, StableExpressionKey};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
@@ -810,9 +810,26 @@ pub(crate) struct TypeUnifier {
     authoritative_providers: Vec<bool>,
     provider_projections: BTreeMap<TypeVar, Vec<AuthoritativeProviderProjection>>,
     call_input_requirements: BTreeMap<TypeVar, Vec<Type>>,
+    mutation_events: Vec<TypeMutationEvent>,
     steps: u64,
     changes: u64,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TypeMutationKind {
+    Binding,
+    Union,
+    Authority,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TypeMutationEvent {
+    variable: TypeVar,
+    kind: TypeMutationKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TypeMutationCursor(usize);
 
 #[derive(Clone)]
 struct AuthoritativeProviderProjection {
@@ -821,6 +838,24 @@ struct AuthoritativeProviderProjection {
 }
 
 impl TypeUnifier {
+    fn mutation_cursor(&self) -> TypeMutationCursor {
+        TypeMutationCursor(self.mutation_events.len())
+    }
+
+    fn mutations_since(&self, cursor: TypeMutationCursor) -> &[TypeMutationEvent] {
+        &self.mutation_events[cursor.0..]
+    }
+
+    fn record_mutation(&mut self, variable: TypeVar, kind: TypeMutationKind) {
+        self.mutation_events
+            .push(TypeMutationEvent { variable, kind });
+    }
+
+    fn publish_authority_epoch(&mut self, variable: TypeVar) {
+        let variable = self.root_readonly(variable);
+        self.record_mutation(variable, TypeMutationKind::Authority);
+    }
+
     pub(crate) fn fresh(&mut self) -> TypeVar {
         let id = u32::try_from(self.parents.len()).expect("interface type-variable bound");
         self.parents.push(id);
@@ -1481,6 +1516,8 @@ impl TypeUnifier {
             std::mem::swap(&mut left, &mut right);
         }
         self.parents[right.0 as usize] = left.0;
+        self.record_mutation(left, TypeMutationKind::Union);
+        self.record_mutation(right, TypeMutationKind::Union);
         self.contextual_holes[left.0 as usize] |= self.contextual_holes[right.0 as usize];
         self.contextual_holes[right.0 as usize] = false;
         self.authoritative_providers[left.0 as usize] |=
@@ -1603,6 +1640,7 @@ impl TypeUnifier {
         };
         self.bindings[variable.0 as usize] = Some(merged);
         if changed {
+            self.record_mutation(variable, TypeMutationKind::Binding);
             self.changes = self.changes.saturating_add(1);
         }
     }
@@ -1634,6 +1672,7 @@ impl TypeUnifier {
         };
         self.bindings[variable.0 as usize] = Some(merged);
         if changed {
+            self.record_mutation(variable, TypeMutationKind::Binding);
             self.changes = self.changes.saturating_add(1);
         }
     }
@@ -1652,6 +1691,7 @@ impl TypeUnifier {
     pub(crate) fn publish_authoritative_provider(&mut self, variable: TypeVar, provider: Type) {
         self.steps = self.steps.saturating_add(1);
         let variable = self.root(variable);
+        self.publish_authority_epoch(variable);
         if self.bindings[variable.0 as usize]
             .as_ref()
             .is_some_and(|current| self.same_live_type(current, &provider))
@@ -1689,6 +1729,7 @@ impl TypeUnifier {
             return;
         }
         self.bindings[variable.0 as usize] = Some(provider);
+        self.record_mutation(variable, TypeMutationKind::Binding);
         self.changes = self.changes.saturating_add(1);
     }
 
@@ -1737,6 +1778,11 @@ impl TypeUnifier {
                 pending.push((consumer, projected));
             }
         }
+    }
+
+    fn publish_derived_provider_epoch(&mut self, variable: TypeVar, provider: Type) {
+        self.publish_authority_epoch(variable);
+        self.replace_derived_provider(variable, provider);
     }
 
     fn merge_resolved(&mut self, left: Type, right: Type) -> Type {
@@ -2933,59 +2979,171 @@ fn structural_flow_provider(unifier: &mut TypeUnifier, inputs: &[TypeVar]) -> Ty
         .unwrap_or(Type::Absent)
 }
 
+fn flow_constraint_provider(unifier: &mut TypeUnifier, constraint: &OwnerFlowConstraint) -> Type {
+    match constraint.kind {
+        OwnerFlowConstraintKind::Union => boon_checked::canonical_union_type(
+            constraint
+                .inputs
+                .iter()
+                .map(|input| unifier.resolve(&Type::Var(*input)))
+                .collect(),
+        ),
+        OwnerFlowConstraintKind::StructuralWiden => {
+            structural_flow_provider(unifier, &constraint.inputs)
+        }
+    }
+}
+
+fn flow_constraint_dependency_roots(
+    unifier: &mut TypeUnifier,
+    constraint: &OwnerFlowConstraint,
+) -> Vec<TypeVar> {
+    let mut dependencies = BTreeSet::from([constraint.output]);
+    for input in &constraint.inputs {
+        dependencies.insert(*input);
+        let resolved = unifier.resolve(&Type::Var(*input));
+        collect_type_variables(&resolved, &mut dependencies);
+    }
+    dependencies
+        .into_iter()
+        .map(|variable| unifier.root_readonly(variable))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+struct OwnerFlowConstraintProgram {
+    constraints: Vec<OwnerFlowConstraint>,
+    consumers: HashMap<TypeVar, Vec<u32>>,
+    cursor: TypeMutationCursor,
+    initialized: bool,
+}
+
+impl OwnerFlowConstraintProgram {
+    fn new(unifier: &mut TypeUnifier, constraints: Vec<OwnerFlowConstraint>) -> Self {
+        let cursor = unifier.mutation_cursor();
+        let mut program = Self {
+            constraints,
+            consumers: HashMap::new(),
+            cursor,
+            initialized: false,
+        };
+        for index in 0..program.constraints.len() {
+            program.refresh_dependencies(unifier, index);
+        }
+        program
+    }
+
+    fn refresh_dependencies(&mut self, unifier: &mut TypeUnifier, index: usize) {
+        let dependencies = flow_constraint_dependency_roots(unifier, &self.constraints[index]);
+        let index = u32::try_from(index).expect("owner flow constraint index exceeds u32");
+        for dependency in dependencies {
+            let consumers = self.consumers.entry(dependency).or_default();
+            if !consumers.contains(&index) {
+                consumers.push(index);
+            }
+        }
+    }
+
+    fn enqueue_mutations(
+        &mut self,
+        unifier: &TypeUnifier,
+        pending: &mut VecDeque<usize>,
+        queued: &mut [bool],
+    ) {
+        let events = unifier
+            .mutations_since(self.cursor)
+            .iter()
+            .map(|event| event.variable)
+            .collect::<Vec<_>>();
+        self.cursor = unifier.mutation_cursor();
+        for variable in events {
+            let root = unifier.root_readonly(variable);
+            for dependency in [variable, root] {
+                for consumer in self
+                    .consumers
+                    .get(&dependency)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                {
+                    let consumer = consumer as usize;
+                    if !queued[consumer] {
+                        queued[consumer] = true;
+                        pending.push_back(consumer);
+                    }
+                }
+            }
+        }
+    }
+
+    fn replay(&mut self, unifier: &mut TypeUnifier) -> bool {
+        let trace =
+            std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && self.constraints.len() >= 100;
+        let started = Instant::now();
+        if self.constraints.is_empty() {
+            self.cursor = unifier.mutation_cursor();
+            self.initialized = true;
+            return true;
+        }
+        let mut pending = VecDeque::new();
+        let mut queued = vec![false; self.constraints.len()];
+        if self.initialized {
+            self.enqueue_mutations(unifier, &mut pending, &mut queued);
+        } else {
+            self.cursor = unifier.mutation_cursor();
+            pending.extend(0..self.constraints.len());
+            queued.fill(true);
+            self.initialized = true;
+        }
+        let maximum_evaluations = self
+            .constraints
+            .len()
+            .saturating_mul(self.constraints.len().saturating_add(1));
+        let mut evaluations = 0usize;
+        while let Some(index) = pending.pop_front() {
+            queued[index] = false;
+            evaluations = evaluations.saturating_add(1);
+            if evaluations > maximum_evaluations {
+                if trace {
+                    eprintln!(
+                        "boon owner flow replay constraints={} evaluations={} replay_ms={:.3} converged=false",
+                        self.constraints.len(),
+                        evaluations,
+                        started.elapsed().as_secs_f64() * 1_000.0,
+                    );
+                }
+                return false;
+            }
+            self.refresh_dependencies(unifier, index);
+            let provider = flow_constraint_provider(unifier, &self.constraints[index]);
+            unifier.replace_derived_provider(self.constraints[index].output, provider);
+            self.enqueue_mutations(unifier, &mut pending, &mut queued);
+        }
+        if trace {
+            eprintln!(
+                "boon owner flow replay constraints={} evaluations={} replay_ms={:.3}",
+                self.constraints.len(),
+                evaluations,
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
+        true
+    }
+}
+
 /// Re-evaluate covariant expression-flow equations after a provider epoch.
 ///
-/// Each output is owned by its exact input set, so a replay replaces an older
-/// provider snapshot instead of accumulating stale alternatives. Flow nodes
-/// are allocated in syntax order, which is not guaranteed to be
-/// dependency order (a WHEN can precede its arm nodes). Repeated sweeps up to
-/// the finite local graph size propagate every newly published leaf through
-/// the longest acyclic path; an unchanged sweep proves quiescence. Returning
-/// false keeps recursive/growing value-flow graphs fail-closed.
+/// The persistent production program consumes the unifier's complete mutation
+/// and authority journal through an independent cursor. Each equation indexes
+/// its inputs, nested live alphas, and its authoritative output, so external
+/// provider epochs and later output overwrites both wake the exact dependency
+/// cone. The former full-sweep evaluation budget remains the fail-closed cap.
 pub(crate) fn replay_flow_constraints(
     unifier: &mut TypeUnifier,
     constraints: &[OwnerFlowConstraint],
 ) -> bool {
-    let trace = std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() && constraints.len() >= 100;
-    let started = Instant::now();
-    for sweep in 0..constraints.len().saturating_add(1) {
-        let changes_before = unifier.changes();
-        for constraint in constraints {
-            let provider = match constraint.kind {
-                OwnerFlowConstraintKind::Union => boon_checked::canonical_union_type(
-                    constraint
-                        .inputs
-                        .iter()
-                        .map(|input| unifier.resolve(&Type::Var(*input)))
-                        .collect(),
-                ),
-                OwnerFlowConstraintKind::StructuralWiden => {
-                    structural_flow_provider(unifier, &constraint.inputs)
-                }
-            };
-            unifier.replace_derived_provider(constraint.output, provider);
-        }
-        if unifier.changes() == changes_before {
-            if trace {
-                eprintln!(
-                    "boon owner flow replay constraints={} sweeps={} replay_ms={:.3}",
-                    constraints.len(),
-                    sweep.saturating_add(1),
-                    started.elapsed().as_secs_f64() * 1_000.0,
-                );
-            }
-            return true;
-        }
-    }
-    if trace {
-        eprintln!(
-            "boon owner flow replay constraints={} sweeps={} replay_ms={:.3} converged=false",
-            constraints.len(),
-            constraints.len().saturating_add(1),
-            started.elapsed().as_secs_f64() * 1_000.0,
-        );
-    }
-    false
+    OwnerFlowConstraintProgram::new(unifier, constraints.to_vec()).replay(unifier)
 }
 
 pub(crate) fn bind_hold_variables(
@@ -3032,7 +3190,7 @@ pub(crate) fn bind_hold_variables(
     // HOLD's prior value is an input to the fold, never a consumer requirement
     // on the newly computed state. Replacing directly prevents a generic
     // initializer alias from being specialized by the first concrete update.
-    unifier.replace_derived_provider(output, ty);
+    unifier.publish_derived_provider_epoch(output, ty);
     authority_changed
 }
 
@@ -3146,7 +3304,7 @@ pub(crate) fn initialize_owner_hold_constraints(
         // one-way authoritative replacement as well, so a generic initializer
         // cannot receive constraints from an update epoch.
         unifier.mark_authoritative_provider(expressions[index]);
-        unifier.replace_derived_provider(expressions[index], initial);
+        unifier.publish_derived_provider_epoch(expressions[index], initial);
     }
     authority_changed
 }
@@ -6957,7 +7115,8 @@ fn evaluate_owner_interface_scc_impl<'a>(
 
     refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
     refine_owner_inherited_pattern_narrowings(&mut unifier, &inherited_pattern_narrowings);
-    if !replay_flow_constraints(&mut unifier, &flow_constraints) {
+    let mut flow_program = OwnerFlowConstraintProgram::new(&mut unifier, flow_constraints);
+    if !flow_program.replay(&mut unifier) {
         return Err(OwnerConstraintSeedError::new(format!(
             "interface component {:?} has a non-convergent local value-flow graph",
             scc.key
@@ -7579,7 +7738,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
         )?;
         refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
         refine_owner_inherited_pattern_narrowings(&mut unifier, &inherited_pattern_narrowings);
-        if !replay_flow_constraints(&mut unifier, &flow_constraints) {
+        if !flow_program.replay(&mut unifier) {
             return Err(OwnerConstraintSeedError::new(format!(
                 "interface component {:?} has a non-convergent local value-flow graph",
                 scc.key
@@ -7616,7 +7775,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
             let (call_variable, input, field) = staged;
             let projected = bind_projection(&mut unifier, input, &[field]);
             unifier.mark_authoritative_provider(call_variable);
-            unifier.replace_derived_provider(call_variable, Type::Var(projected));
+            unifier.publish_derived_provider_epoch(call_variable, Type::Var(projected));
         }
         refine_owner_pattern_narrowings(&mut unifier, &pattern_narrowings);
         propagate_lexical_capture_types(
@@ -7628,7 +7787,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
             &mut unifier,
         )?;
         refine_owner_inherited_pattern_narrowings(&mut unifier, &inherited_pattern_narrowings);
-        if !replay_flow_constraints(&mut unifier, &flow_constraints) {
+        if !flow_program.replay(&mut unifier) {
             return Err(OwnerConstraintSeedError::new(format!(
                 "interface component {:?} has a non-convergent local value-flow graph",
                 scc.key
@@ -7653,7 +7812,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
             })?;
             let call_variable = caller.expressions[calls[call_index].expression];
             unifier.mark_authoritative_provider(call_variable);
-            unifier.replace_derived_provider(call_variable, provider.clone());
+            unifier.publish_derived_provider_epoch(call_variable, provider.clone());
         }
 
         // Calls, captures, pattern reads, and committed result transfers can
@@ -7918,7 +8077,7 @@ fn evaluate_owner_interface_scc_impl<'a>(
                 let call_variable = caller.expressions[call.expression];
                 let provider = evaluated.value.flow_type.ty;
                 unifier.mark_authoritative_provider(call_variable);
-                unifier.replace_derived_provider(call_variable, provider.clone());
+                unifier.publish_derived_provider_epoch(call_variable, provider.clone());
                 committed_transfer_results[call_index] = Some(provider);
                 let state = states.get_mut(&call.caller).ok_or_else(|| {
                     OwnerConstraintSeedError::new(
@@ -7939,8 +8098,15 @@ fn evaluate_owner_interface_scc_impl<'a>(
             final_transfer_module = Some(Arc::clone(&own_module));
             let residual_post_replay_started = Instant::now();
             // Residual evaluation is another provider epoch: a transfer call
-            // may be the value of an authored HOLD update. Replay before the
-            // acyclic fast path projects and seals the public interface.
+            // may feed an ordinary flow equation or be the value of an
+            // authored HOLD update. Replay both before the acyclic fast path
+            // projects and seals the public interface.
+            if !flow_program.replay(&mut unifier) {
+                return Err(OwnerConstraintSeedError::new(format!(
+                    "interface component {:?} has a non-convergent post-transfer value-flow graph",
+                    scc.key
+                )));
+            }
             transfer_surface_changed |=
                 replay_interface_hold_constraints(&mut unifier, &mut hold_authorities, &states);
             write_solver_surface_snapshot(&mut unifier, &states, &mut current_surface);
@@ -8948,6 +9114,128 @@ mod tests {
             Type::Var(_)
         ));
         assert_eq!(unifier.resolve(&Type::Var(projected)), Type::Text);
+    }
+
+    #[test]
+    fn mutation_journal_retains_binding_union_and_same_live_authority_epochs() {
+        let mut unifier = TypeUnifier::default();
+        let left = unifier.fresh();
+        let right = unifier.fresh();
+        let first_cursor = unifier.mutation_cursor();
+        let second_cursor = unifier.mutation_cursor();
+
+        unifier.bind_var(left, Type::Text);
+        unifier.union(left, right);
+        let after_union = unifier.mutation_cursor();
+        let changes = unifier.changes();
+        unifier.publish_authoritative_provider(left, Type::Text);
+
+        let first = unifier.mutations_since(first_cursor);
+        let second = unifier.mutations_since(second_cursor);
+        assert_eq!(first, second, "independent consumers must see one journal");
+        assert!(
+            first
+                .iter()
+                .any(|event| { event.variable == left && event.kind == TypeMutationKind::Binding })
+        );
+        assert!(
+            first
+                .iter()
+                .any(|event| event.variable == left && event.kind == TypeMutationKind::Union)
+        );
+        assert!(
+            first
+                .iter()
+                .any(|event| event.variable == right && event.kind == TypeMutationKind::Union)
+        );
+        assert_eq!(
+            unifier.mutations_since(after_union),
+            &[TypeMutationEvent {
+                variable: unifier.root_readonly(left),
+                kind: TypeMutationKind::Authority,
+            }],
+        );
+        assert_eq!(
+            unifier.changes(),
+            changes,
+            "same-live authority epochs must wake dependents without changing convergence",
+        );
+    }
+
+    #[test]
+    fn flow_worklist_propagates_a_late_provider_through_reverse_order_constraints() {
+        let tag = |name: &str| Type::VariantSet(vec![Variant::Tag(name.to_owned())].into());
+        let mut unifier = TypeUnifier::default();
+        let source = unifier.fresh();
+        unifier.replace_authoritative_binding(source, tag("Initial"));
+        let first = unifier.fresh();
+        let second = unifier.fresh();
+        let third = unifier.fresh();
+        let mut constraints = Vec::new();
+        bind_and_record_flow_variables(&mut unifier, &mut constraints, first, [source]);
+        bind_and_record_flow_variables(&mut unifier, &mut constraints, second, [first]);
+        bind_and_record_flow_variables(&mut unifier, &mut constraints, third, [second]);
+        constraints.reverse();
+        let mut program = OwnerFlowConstraintProgram::new(&mut unifier, constraints);
+        assert!(program.replay(&mut unifier));
+
+        unifier.replace_authoritative_binding(source, tag("Final"));
+        assert!(program.replay(&mut unifier));
+        assert_eq!(unifier.resolve(&Type::Var(first)), tag("Final"));
+        assert_eq!(unifier.resolve(&Type::Var(second)), tag("Final"));
+        assert_eq!(unifier.resolve(&Type::Var(third)), tag("Final"));
+    }
+
+    #[test]
+    fn flow_worklist_watches_nested_dependencies_discovered_during_initial_replay() {
+        let mut unifier = TypeUnifier::default();
+        let nested = unifier.fresh();
+        let left = unifier.fresh();
+        let right = unifier.fresh();
+        let output = unifier.fresh();
+        let constraint = OwnerFlowConstraint {
+            output,
+            inputs: vec![left, right].into_boxed_slice(),
+            kind: OwnerFlowConstraintKind::StructuralWiden,
+        };
+        let mut program = OwnerFlowConstraintProgram::new(&mut unifier, vec![constraint]);
+        unifier.replace_authoritative_binding(left, Type::List(Type::shared(Type::Var(nested))));
+        unifier.replace_authoritative_binding(right, Type::List(Type::shared(Type::Number)));
+        assert!(program.replay(&mut unifier));
+        assert_eq!(
+            unifier.resolve(&Type::Var(output)),
+            Type::List(Type::shared(Type::Number))
+        );
+
+        unifier.replace_authoritative_binding(nested, Type::Text);
+        assert!(program.replay(&mut unifier));
+        assert_eq!(
+            unifier.resolve(&Type::Var(output)),
+            Type::List(Type::shared(boon_checked::widen_structural_type(
+                &Type::Text,
+                &Type::Number,
+            )))
+        );
+    }
+
+    #[test]
+    fn flow_worklist_reasserts_an_equation_after_its_output_is_overwritten() {
+        let mut unifier = TypeUnifier::default();
+        let source = unifier.fresh();
+        let output = unifier.fresh();
+        unifier.replace_authoritative_binding(source, Type::Text);
+        let constraint = OwnerFlowConstraint {
+            output,
+            inputs: vec![source].into_boxed_slice(),
+            kind: OwnerFlowConstraintKind::Union,
+        };
+        let mut program = OwnerFlowConstraintProgram::new(&mut unifier, vec![constraint]);
+        assert!(program.replay(&mut unifier));
+        assert_eq!(unifier.resolve(&Type::Var(output)), Type::Text);
+
+        unifier.replace_authoritative_binding(output, Type::Number);
+        assert!(program.replay(&mut unifier));
+        assert_eq!(unifier.resolve(&Type::Var(output)), Type::Text);
     }
 
     #[test]
@@ -11856,6 +12144,58 @@ mod tests {
         };
         let Type::Object(item) = item.as_ref() else {
             panic!("visible must retain record items")
+        };
+        assert!(!item.open);
+        assert_eq!(item.fields.get("id"), Some(&Type::Text));
+        assert_eq!(item.fields.get("payload"), Some(&Type::Text));
+    }
+
+    #[test]
+    fn post_transfer_replay_refreshes_an_enclosing_branch_flow() {
+        let unit = link(concat!(
+            "store: [\n",
+            "    rows:\n",
+            "        selected |> THEN {\n",
+            "            LIST { [id: TEXT { one }, payload: TEXT { rich }] }\n",
+            "        }\n",
+            "    selected:\n",
+            "        True |> WHEN {\n",
+            "            True => rows |> List/filter(item, if: item.id == TEXT { one })\n",
+            "            False => rows\n",
+            "        }\n",
+            "]\n",
+        ));
+        let rows = owner_named(&unit, "rows");
+        let selected = owner_named(&unit, "selected");
+        let seeds = unit
+            .stable_check_owner_keys()
+            .filter(|owner| matches!(owner, StableCheckOwnerKey::Item(_)))
+            .map(|owner| seed(&unit, &owner))
+            .collect::<Vec<_>>();
+        let summaries = seeds
+            .iter()
+            .map(|seed| resolve_owner_constraint_seed(seed, []).unwrap())
+            .collect::<Vec<_>>();
+        let results = solve(&seeds, &summaries);
+        let component = results
+            .iter()
+            .find(|result| result.owner(&selected).is_some())
+            .expect("selected interface component");
+        assert!(component.owner(&rows).is_some());
+        let interfaces = results
+            .iter()
+            .flat_map(|result| result.owners.iter())
+            .map(|interface| (interface.owner.clone(), interface))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(interfaces[&selected].result.ty, interfaces[&rows].result.ty);
+        assert!(boon_checked::type_is_recursively_closed(
+            &interfaces[&selected].result.ty
+        ));
+        let Type::List(item) = &interfaces[&selected].result.ty else {
+            panic!("selected must publish a list")
+        };
+        let Type::Object(item) = item.as_ref() else {
+            panic!("selected must retain record items")
         };
         assert!(!item.open);
         assert_eq!(item.fields.get("id"), Some(&Type::Text));

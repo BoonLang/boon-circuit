@@ -30,15 +30,14 @@ use boon_syntax::{
     AstExprKind, AstParameterKind, AstStatementKind, BytesSizeSyntax, SourceUnitId,
     StableCheckOwnerKey, StableExpressionKey, StableStatementKey,
 };
-use serde::ser::SerializeSeq;
-use serde::{Serialize, Serializer};
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 
 const PROJECT_DIAGNOSTIC_FACTS_DOMAIN_V10: &[u8] = b"boon.project-diagnostic-facts.v10\0";
-const OWNER_DIAGNOSTIC_CONTRIBUTION_DOMAIN_V1: &[u8] = b"boon.owner-diagnostic-contribution.v1\0";
+const OWNER_DIAGNOSTIC_CONTRIBUTION_DOMAIN_V2: &[u8] = b"boon.owner-diagnostic-contribution.v2\0";
 const PROJECT_OUTPUT_FLOW_FACTS_DOMAIN_V1: &[u8] = b"boon.project-output-flow-facts.v1\0";
 const SOURCE_UNIT_PROJECT_DIAGNOSTICS_DOMAIN_V1: &[u8] =
     b"boon.source-unit-project-diagnostics.v1\0";
@@ -492,34 +491,6 @@ pub fn evaluate_source_unit_project_diagnostics(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct OwnerDiagnosticStableStatementValue {
-    statement: StableStatementKey,
-    value: ProjectOrderExpressionFact,
-}
-
-struct OwnerDiagnosticExpressionFlowRows<'a> {
-    expressions: &'a [crate::InferredOwnerExpression],
-}
-
-impl Serialize for OwnerDiagnosticExpressionFlowRows<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut sequence = serializer.serialize_seq(Some(self.expressions.len()))?;
-        for expression in self.expressions {
-            sequence.serialize_element(&(
-                &expression.stable_key,
-                &expression.flow_type,
-                &expression.flush_type,
-                expression.direct_effect,
-            ))?;
-        }
-        sequence.end()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct OwnerDiagnosticStableCallActualFact {
     input: ProjectOrderExpressionFact,
     actual_type: Type,
@@ -545,27 +516,6 @@ struct OwnerDiagnosticStableCallFact {
     diagnostic: crate::OwnerDiagnosticCallFact,
     matched_inputs: Box<[OwnerDiagnosticStableMatchedInputFact]>,
     explicit_pass: Option<ProjectOrderExpressionFact>,
-}
-
-struct OwnerDiagnosticReadRows<'a> {
-    expressions: &'a [crate::InferredOwnerExpression],
-    reads: &'a [Option<crate::OwnerEffectiveLexicalReadPlan>],
-}
-
-impl Serialize for OwnerDiagnosticReadRows<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let row_count = self.reads.iter().filter(|read| read.is_some()).count();
-        let mut sequence = serializer.serialize_seq(Some(row_count))?;
-        for (expression, read) in self.expressions.iter().zip(self.reads) {
-            if let Some(read) = read {
-                sequence.serialize_element(&(&expression.stable_key, read))?;
-            }
-        }
-        sequence.end()
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -620,8 +570,6 @@ pub struct OwnerDiagnosticContribution {
     owner: StableCheckOwnerKey,
     containing_scope: OwnerContainingScopeInput,
     function_name: Option<String>,
-    statement_values: Box<[OwnerDiagnosticStableStatementValue]>,
-    calls: Box<[OwnerDiagnosticStableCallFact]>,
     output_declarations: Box<[OwnerDiagnosticOutputDeclarationFact]>,
     output_calls: Box<[OwnerDiagnosticOutputCallFact]>,
     fingerprint_v1: [u8; 32],
@@ -678,67 +626,52 @@ fn owner_diagnostic_stable_dense_expression(
     })
 }
 
+fn owner_diagnostic_call_disposition(
+    call: &crate::InferredOwnerCall,
+    callable_kind: &impl Fn(&str) -> Option<CheckedCallableKind>,
+) -> Result<crate::OwnerDiagnosticCallDisposition, ProjectDiagnosticFactsError> {
+    match &call.target {
+        crate::InferredOwnerCallableTarget::Owner { owner } if call.valid => {
+            Ok(crate::OwnerDiagnosticCallDisposition::User {
+                owner: owner.clone(),
+            })
+        }
+        crate::InferredOwnerCallableTarget::Authoritative => callable_kind(&call.function)
+            .map(|kind| crate::OwnerDiagnosticCallDisposition::Abi { kind })
+            .ok_or_else(|| {
+                ProjectDiagnosticFactsError::new(
+                    "authoritative owner diagnostic call has no exact ABI contract",
+                )
+            }),
+        crate::InferredOwnerCallableTarget::Owner { .. } => {
+            Ok(crate::OwnerDiagnosticCallDisposition::Invalid)
+        }
+        crate::InferredOwnerCallableTarget::Unresolved
+        | crate::InferredOwnerCallableTarget::Ambiguous { .. }
+            if !call.valid =>
+        {
+            Ok(crate::OwnerDiagnosticCallDisposition::Invalid)
+        }
+        crate::InferredOwnerCallableTarget::Unresolved
+        | crate::InferredOwnerCallableTarget::Ambiguous { .. } => {
+            Err(ProjectDiagnosticFactsError::new(
+                "valid owner diagnostic call has an unresolved or ambiguous target",
+            ))
+        }
+    }
+}
+
 fn project_owner_diagnostic_contribution_with_lookup(
     syntax: &OwnerSyntaxInput,
-    lexical_plan: &OwnerLexicalPlan,
-    statements: &[crate::InferredOwnerStatement],
-    expressions: &[crate::InferredOwnerExpression],
     calls: &[crate::InferredOwnerCall],
     signature_lexical_plan: &crate::OwnerSignatureLexicalPlan,
     callable_kind: impl Fn(&str) -> Option<CheckedCallableKind>,
 ) -> Result<OwnerDiagnosticContribution, ProjectDiagnosticFactsError> {
-    if !lexical_plan.matches_input(syntax) {
+    if signature_lexical_plan.owner() != &syntax.owner {
         return Err(ProjectDiagnosticFactsError::new(format!(
-            "owner diagnostic contribution lexical plan does not match syntax for {:?}",
+            "owner diagnostic contribution signature plan belongs to another owner than {:?}",
             syntax.owner
         )));
-    }
-    if !signature_lexical_plan.matches_base(lexical_plan) {
-        return Err(ProjectDiagnosticFactsError::new(format!(
-            "owner diagnostic contribution body does not match the lexical plan for {:?}",
-            syntax.owner
-        )));
-    }
-    if statements.len() != syntax.statements.len() || expressions.len() != syntax.expressions.len()
-    {
-        return Err(ProjectDiagnosticFactsError::new(format!(
-            "owner diagnostic contribution body row coverage differs from syntax for {:?}",
-            syntax.owner
-        )));
-    }
-    for (index, (statement, input)) in statements.iter().zip(&syntax.statements).enumerate() {
-        if statement.id.0 as usize != index
-            || input.id as usize != index
-            || statement.stable_key != input.stable_key
-            || statement.kind != input.kind
-            || statement.expression.map(|expression| expression.0) != input.expression
-        {
-            return Err(ProjectDiagnosticFactsError::new(format!(
-                "owner diagnostic contribution statement row differs from syntax for {:?}",
-                syntax.owner
-            )));
-        }
-    }
-    let mut stable_expressions = BTreeMap::new();
-    for (index, (expression, input)) in expressions.iter().zip(&syntax.expressions).enumerate() {
-        if expression.id.0 as usize != index
-            || expression.stable_key != input.stable_key
-            || expression.kind != input.kind
-        {
-            return Err(ProjectDiagnosticFactsError::new(format!(
-                "owner diagnostic contribution expression row differs from syntax for {:?}",
-                syntax.owner
-            )));
-        }
-        if stable_expressions
-            .insert(expression.stable_key.clone(), index)
-            .is_some()
-        {
-            return Err(ProjectDiagnosticFactsError::new(format!(
-                "owner diagnostic contribution contains duplicate expression identities for {:?}",
-                syntax.owner
-            )));
-        }
     }
 
     let mut output_declarations = Vec::new();
@@ -764,98 +697,18 @@ fn project_owner_diagnostic_contribution_with_lookup(
         }
     }
 
-    let stable_reference = |reference: &OwnerExpressionRef| match reference {
-        OwnerExpressionRef::Local { expression } => syntax
-            .expressions
-            .get(expression.0 as usize)
-            .map(|row| ProjectOrderExpressionFact {
-                owner: syntax.owner.clone(),
-                expression: row.stable_key.clone(),
-            }),
-        OwnerExpressionRef::Child { owner, expression } => Some(ProjectOrderExpressionFact {
-            owner: owner.clone(),
-            expression: expression.clone(),
-        }),
-    };
-    let mut statement_values = Vec::new();
-    for statement in statements {
-        let Some(value) = lexical_plan
-            .graph()
-            .statement(OwnerStatementId(statement.id.0))
-            .and_then(|statement| statement.canonical_value.as_ref())
-        else {
-            continue;
-        };
-        let value = stable_reference(value).ok_or_else(|| {
-            ProjectDiagnosticFactsError::new(
-                "owner diagnostic contribution statement value has no exact stable expression",
-            )
-        })?;
-        statement_values.push(OwnerDiagnosticStableStatementValue {
-            statement: statement.stable_key.clone(),
-            value,
-        });
-    }
-
-    let mut stable_calls = Vec::with_capacity(calls.len());
     let mut output_calls = Vec::new();
     for call in calls {
-        let Some(expression_index) = stable_expressions.get(&call.expression).copied() else {
+        let expression_index = call.expression_id.0 as usize;
+        if syntax
+            .expressions
+            .get(expression_index)
+            .is_none_or(|expression| expression.stable_key != call.expression)
+        {
             return Err(ProjectDiagnosticFactsError::new(
                 "owner diagnostic contribution call has no exact owner expression",
             ));
-        };
-        let disposition = match &call.target {
-            crate::InferredOwnerCallableTarget::Owner { owner } if call.valid => {
-                crate::OwnerDiagnosticCallDisposition::User {
-                    owner: owner.clone(),
-                }
-            }
-            crate::InferredOwnerCallableTarget::Authoritative => {
-                let kind = callable_kind(&call.function).ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "authoritative owner diagnostic contribution call has no exact ABI contract",
-                    )
-                })?;
-                crate::OwnerDiagnosticCallDisposition::Abi { kind }
-            }
-            crate::InferredOwnerCallableTarget::Owner { .. } => {
-                crate::OwnerDiagnosticCallDisposition::Invalid
-            }
-            crate::InferredOwnerCallableTarget::Unresolved
-            | crate::InferredOwnerCallableTarget::Ambiguous { .. }
-                if !call.valid =>
-            {
-                crate::OwnerDiagnosticCallDisposition::Invalid
-            }
-            crate::InferredOwnerCallableTarget::Unresolved
-            | crate::InferredOwnerCallableTarget::Ambiguous { .. } => {
-                return Err(ProjectDiagnosticFactsError::new(
-                    "valid owner diagnostic contribution call has an unresolved or ambiguous target",
-                ));
-            }
-        };
-        let diagnostic = crate::OwnerDiagnosticCallFact {
-            disposition,
-            effect: call.effect,
-            type_substitutions: call.type_substitutions.clone(),
-        };
-        let inputs = call
-            .inputs
-            .iter()
-            .map(|input| {
-                let stable_input = owner_diagnostic_stable_expression(syntax, &input.expression)
-                    .ok_or_else(|| {
-                        ProjectDiagnosticFactsError::new(
-                            "owner diagnostic contribution call input has no exact stable expression",
-                        )
-                    })?;
-                Ok(OwnerDiagnosticStableCallActualFact {
-                    input: stable_input,
-                    actual_type: input.actual_type.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, ProjectDiagnosticFactsError>>()?;
+        }
         let plan = if call.valid {
             let plan = signature_lexical_plan
                 .call(expression_index)
@@ -876,49 +729,11 @@ fn project_owner_diagnostic_contribution_with_lookup(
         } else {
             None
         };
-        let matched_inputs = plan
-            .into_iter()
-            .flat_map(|plan| plan.matched_inputs.iter())
-            .map(|input| {
-                let expression = owner_diagnostic_stable_dense_expression(syntax, input.expression)
-                    .ok_or_else(|| {
-                        ProjectDiagnosticFactsError::new(
-                            "valid owner diagnostic contribution matched input has no stable expression",
-                        )
-                    })?;
-                Ok(OwnerDiagnosticStableMatchedInputFact {
-                    formal_ordinal: input.formal_ordinal,
-                    formal_name: input.formal_name.clone(),
-                    formal_kind: input.formal_kind,
-                    expression,
-                    from_pipe: input.from_pipe,
-                })
-            })
-            .collect::<Result<Vec<_>, ProjectDiagnosticFactsError>>()?;
-        let explicit_pass = plan
-            .and_then(|plan| plan.explicit_pass.as_ref())
-            .map(|pass| {
-                owner_diagnostic_stable_dense_expression(syntax, pass.expression).ok_or_else(|| {
-                    ProjectDiagnosticFactsError::new(
-                        "valid owner diagnostic contribution PASS has no stable expression",
-                    )
-                })
-            })
-            .transpose()?;
-        stable_calls.push(OwnerDiagnosticStableCallFact {
-            expression: call.expression.clone(),
-            function: call.function.clone(),
-            target: call.target.clone(),
-            inputs: inputs.into_boxed_slice(),
-            valid: call.valid,
-            result: call.result.clone(),
-            diagnostic: diagnostic.clone(),
-            matched_inputs: matched_inputs.into_boxed_slice(),
-            explicit_pass,
-        });
-
-        if let Some(plan) = plan {
-            let target = match &diagnostic.disposition {
+        if let Some(plan) = plan
+            && !plan.outputs.is_empty()
+        {
+            let disposition = owner_diagnostic_call_disposition(call, &callable_kind)?;
+            let target = match &disposition {
                 crate::OwnerDiagnosticCallDisposition::User { owner } => {
                     OwnerDiagnosticOutputCallTargetFact::Owner {
                         owner: owner.clone(),
@@ -995,15 +810,6 @@ fn project_owner_diagnostic_contribution_with_lookup(
             });
         }
     }
-    stable_calls.sort_by(|left, right| left.expression.cmp(&right.expression));
-    if stable_calls
-        .windows(2)
-        .any(|rows| rows[0].expression == rows[1].expression)
-    {
-        return Err(ProjectDiagnosticFactsError::new(
-            "owner diagnostic contribution contains duplicate call expressions",
-        ));
-    }
     output_declarations.sort_by(|left, right| left.target.cmp(&right.target));
     if output_declarations
         .windows(2)
@@ -1023,19 +829,8 @@ fn project_owner_diagnostic_contribution_with_lookup(
         ));
     }
 
-    if signature_lexical_plan.reads().len() != expressions.len() {
-        return Err(ProjectDiagnosticFactsError::new(format!(
-            "owner diagnostic contribution lexical read coverage differs from expressions for {:?}",
-            syntax.owner
-        )));
-    }
-
-    let expression_flows = OwnerDiagnosticExpressionFlowRows { expressions };
-    let reads = OwnerDiagnosticReadRows {
-        expressions,
-        reads: signature_lexical_plan.reads(),
-    };
-    let function_name = statements
+    let function_name = syntax
+        .statements
         .first()
         .and_then(|statement| match &statement.kind {
             AstStatementKind::Function { name, .. } => Some(name.clone()),
@@ -1043,15 +838,11 @@ fn project_owner_diagnostic_contribution_with_lookup(
         });
     let containing_scope = syntax.containing_scope.clone();
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        OWNER_DIAGNOSTIC_CONTRIBUTION_DOMAIN_V1,
+        OWNER_DIAGNOSTIC_CONTRIBUTION_DOMAIN_V2,
         &(
             &syntax.owner,
             &containing_scope,
             &function_name,
-            &expression_flows,
-            &statement_values,
-            &stable_calls,
-            &reads,
             &output_declarations,
             &output_calls,
         ),
@@ -1065,45 +856,133 @@ fn project_owner_diagnostic_contribution_with_lookup(
         owner: syntax.owner.clone(),
         containing_scope,
         function_name,
-        statement_values: statement_values.into_boxed_slice(),
-        calls: stable_calls.into_boxed_slice(),
         output_declarations: output_declarations.into_boxed_slice(),
         output_calls: output_calls.into_boxed_slice(),
         fingerprint_v1,
     })
 }
 
-pub fn project_owner_diagnostic_contribution(
+fn project_owner_diagnostic_calls(
     syntax: &OwnerSyntaxInput,
-    lexical_plan: &OwnerLexicalPlan,
     body: &OwnerBodyInferenceShard,
     abi: &OwnerInferenceAbiEnvironment,
-) -> Result<OwnerDiagnosticContribution, ProjectDiagnosticFactsError> {
-    project_owner_diagnostic_contribution_from_rows(
-        syntax,
-        lexical_plan,
-        &body.statements,
-        &body.expressions,
-        &body.calls,
-        &body.signature_lexical_plan,
-        abi,
-    )
+) -> Result<Vec<OwnerDiagnosticStableCallFact>, ProjectDiagnosticFactsError> {
+    let callable_kind = |name: &str| abi.callable(name).map(|contract| contract.kind);
+    let mut calls = Vec::with_capacity(body.calls.len());
+    for call in &body.calls {
+        let expression_index = call.expression_id.0 as usize;
+        if body
+            .expressions
+            .get(expression_index)
+            .is_none_or(|expression| expression.stable_key != call.expression)
+        {
+            return Err(ProjectDiagnosticFactsError::new(
+                "owner diagnostic call view has no exact owner expression",
+            ));
+        }
+        let disposition = owner_diagnostic_call_disposition(call, &callable_kind)?;
+        let inputs = call
+            .inputs
+            .iter()
+            .map(|input| {
+                let stable_input = owner_diagnostic_stable_expression(syntax, &input.expression)
+                    .ok_or_else(|| {
+                        ProjectDiagnosticFactsError::new(
+                            "owner diagnostic call input has no exact stable expression",
+                        )
+                    })?;
+                Ok(OwnerDiagnosticStableCallActualFact {
+                    input: stable_input,
+                    actual_type: input.actual_type.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, ProjectDiagnosticFactsError>>()?;
+        let plan = if call.valid {
+            let plan = body
+                .signature_lexical_plan
+                .call(expression_index)
+                .ok_or_else(|| {
+                    ProjectDiagnosticFactsError::new(
+                        "valid owner diagnostic call has no signature lexical row",
+                    )
+                })?;
+            if !plan.valid
+                || plan.stable_expression != call.expression
+                || plan.function != call.function
+            {
+                return Err(ProjectDiagnosticFactsError::new(
+                    "valid owner diagnostic call differs from its signature lexical row",
+                ));
+            }
+            Some(plan)
+        } else {
+            None
+        };
+        let matched_inputs = plan
+            .into_iter()
+            .flat_map(|plan| plan.matched_inputs.iter())
+            .map(|input| {
+                let expression = owner_diagnostic_stable_dense_expression(syntax, input.expression)
+                    .ok_or_else(|| {
+                        ProjectDiagnosticFactsError::new(
+                            "valid owner diagnostic matched input has no stable expression",
+                        )
+                    })?;
+                Ok(OwnerDiagnosticStableMatchedInputFact {
+                    formal_ordinal: input.formal_ordinal,
+                    formal_name: input.formal_name.clone(),
+                    formal_kind: input.formal_kind,
+                    expression,
+                    from_pipe: input.from_pipe,
+                })
+            })
+            .collect::<Result<Vec<_>, ProjectDiagnosticFactsError>>()?;
+        let explicit_pass = plan
+            .and_then(|plan| plan.explicit_pass.as_ref())
+            .map(|pass| {
+                owner_diagnostic_stable_dense_expression(syntax, pass.expression).ok_or_else(|| {
+                    ProjectDiagnosticFactsError::new(
+                        "valid owner diagnostic PASS has no stable expression",
+                    )
+                })
+            })
+            .transpose()?;
+        calls.push(OwnerDiagnosticStableCallFact {
+            expression: call.expression.clone(),
+            function: call.function.clone(),
+            target: call.target.clone(),
+            inputs: inputs.into_boxed_slice(),
+            valid: call.valid,
+            result: call.result.clone(),
+            diagnostic: crate::OwnerDiagnosticCallFact {
+                disposition,
+                effect: call.effect,
+                type_substitutions: call.type_substitutions.clone(),
+            },
+            matched_inputs: matched_inputs.into_boxed_slice(),
+            explicit_pass,
+        });
+    }
+    calls.sort_by(|left, right| left.expression.cmp(&right.expression));
+    if calls
+        .windows(2)
+        .any(|rows| rows[0].expression == rows[1].expression)
+    {
+        return Err(ProjectDiagnosticFactsError::new(
+            "owner diagnostic call view contains duplicate call expressions",
+        ));
+    }
+    Ok(calls)
 }
 
-pub(crate) fn project_owner_diagnostic_contribution_from_rows(
+pub(crate) fn build_owner_diagnostic_contribution(
     syntax: &OwnerSyntaxInput,
-    lexical_plan: &OwnerLexicalPlan,
-    statements: &[crate::InferredOwnerStatement],
-    expressions: &[crate::InferredOwnerExpression],
     calls: &[crate::InferredOwnerCall],
     signature_lexical_plan: &crate::OwnerSignatureLexicalPlan,
     abi: &OwnerInferenceAbiEnvironment,
 ) -> Result<OwnerDiagnosticContribution, ProjectDiagnosticFactsError> {
     project_owner_diagnostic_contribution_with_lookup(
         syntax,
-        lexical_plan,
-        statements,
-        expressions,
         calls,
         signature_lexical_plan,
         |name| abi.callable(name).map(|contract| contract.kind),
@@ -1146,8 +1025,9 @@ struct ProjectFactIndex<'a> {
     hold_syntax_expressions: BTreeMap<StableOrderExpression, usize>,
     statement_spans: BTreeMap<StableStatementKey, TypeDiagnosticSpan>,
     expression_spans: BTreeMap<StableOrderExpression, TypeDiagnosticSpan>,
-    calls: BTreeMap<StableOrderExpression, &'a OwnerDiagnosticStableCallFact>,
-    all_calls: BTreeMap<StableOrderExpression, &'a OwnerDiagnosticStableCallFact>,
+    call_rows: Box<[OwnerDiagnosticStableCallFact]>,
+    calls: BTreeMap<StableOrderExpression, usize>,
+    all_calls: BTreeMap<StableOrderExpression, usize>,
     value_resolutions: BTreeMap<StableOrderExpression, &'a crate::OwnerSymbolResolution>,
     value_actuals_by_parameter: BTreeMap<(StableCheckOwnerKey, u32), Vec<StableOrderExpression>>,
     callable_owner_by_owner: BTreeMap<StableCheckOwnerKey, Option<StableCheckOwnerKey>>,
@@ -1275,6 +1155,7 @@ impl<'a> ProjectFactIndex<'a> {
         }
         let mut statement_spans = BTreeMap::new();
         let mut expression_spans = BTreeMap::new();
+        let mut call_rows = Vec::new();
         let mut calls = BTreeMap::new();
         let mut all_calls = BTreeMap::new();
         let mut value_resolutions = BTreeMap::new();
@@ -1399,19 +1280,21 @@ impl<'a> ProjectFactIndex<'a> {
                     ));
                 }
             }
-            for call in &replay.calls {
+            for call in project_owner_diagnostic_calls(syntax, body, inference_abi)? {
                 let expression = StableOrderExpression {
                     owner: owner.clone(),
                     expression: call.expression.clone(),
                 };
-                if all_calls.insert(expression.clone(), call).is_some() {
+                let call_index = call_rows.len();
+                if all_calls.insert(expression.clone(), call_index).is_some() {
                     return Err(ProjectDiagnosticFactsError::new(
                         "project diagnostic facts received duplicate call expression",
                     ));
                 }
                 if call.valid {
-                    calls.insert(expression, call);
+                    calls.insert(expression, call_index);
                 }
+                call_rows.push(call);
             }
             for resolution in &summary.symbol_resolutions {
                 let reference = resolution.reference();
@@ -1479,6 +1362,7 @@ impl<'a> ProjectFactIndex<'a> {
             hold_syntax_expressions,
             statement_spans,
             expression_spans,
+            call_rows: call_rows.into_boxed_slice(),
             calls,
             all_calls,
             value_resolutions,
@@ -1557,7 +1441,11 @@ impl<'a> ProjectFactIndex<'a> {
 
     fn index_parameter_actuals(&mut self) -> Result<(), ProjectDiagnosticFactsError> {
         let mut values = BTreeMap::<(StableCheckOwnerKey, u32), Vec<StableOrderExpression>>::new();
-        for call in self.calls.values() {
+        for call in self
+            .calls
+            .values()
+            .filter_map(|index| self.call_rows.get(*index))
+        {
             let crate::InferredOwnerCallableTarget::Owner { owner: callee } = &call.target else {
                 continue;
             };
@@ -1677,7 +1565,18 @@ impl<'a> ProjectFactIndex<'a> {
     }
 
     fn call(&self, expression: &StableOrderExpression) -> Option<&OwnerDiagnosticStableCallFact> {
-        self.calls.get(expression).copied()
+        self.calls
+            .get(expression)
+            .and_then(|index| self.call_rows.get(*index))
+    }
+
+    fn all_call(
+        &self,
+        expression: &StableOrderExpression,
+    ) -> Option<&OwnerDiagnosticStableCallFact> {
+        self.all_calls
+            .get(expression)
+            .and_then(|index| self.call_rows.get(*index))
     }
 
     fn deferred_style_stable_origin(
@@ -2639,11 +2538,19 @@ fn recursive_function_diagnostics(
         .cloned()
         .map(|owner| (owner, BTreeSet::new()))
         .collect::<BTreeMap<_, _>>();
-    for (owner, view) in &index.owners {
+    for (owner, _) in &index.owners {
         let Some(caller) = index.callable_owner(owner).cloned() else {
             continue;
         };
-        for call in &view.diagnostics.calls {
+        for expression in index
+            .calls
+            .keys()
+            .filter(|expression| &expression.owner == owner)
+        {
+            debug_assert_eq!(&expression.owner, owner);
+            let call = index.call(expression).ok_or_else(|| {
+                ProjectDiagnosticFactsError::new("valid owner call index has no canonical call row")
+            })?;
             let crate::OwnerDiagnosticCallDisposition::User { owner: callee } =
                 &call.diagnostic.disposition
             else {
@@ -2711,7 +2618,7 @@ fn host_effect_diagnostics(
         let Some(stable_call) = stable_syntax_expression(index, expression.id) else {
             continue;
         };
-        let Some(call) = index.all_calls.get(&stable_call).copied() else {
+        let Some(call) = index.all_call(&stable_call) else {
             continue;
         };
         if !matches!(
@@ -2934,7 +2841,7 @@ fn builtin_call_diagnostics(
         let Some(stable) = stable_syntax_expression(index, expression.id) else {
             continue;
         };
-        let Some(call) = index.all_calls.get(&stable).copied() else {
+        let Some(call) = index.all_call(&stable) else {
             continue;
         };
         if !matches!(
@@ -3529,7 +3436,6 @@ fn style_diagnostics(
         call_expression: &StableOrderExpression,
         frames: &mut Vec<ProjectOrderFrame>,
         exact_types: &mut ProjectFlowTypeAnalyzer<'_, '_>,
-        calls: &BTreeMap<StableOrderExpression, &OwnerDiagnosticStableCallFact>,
         calls_by_owner: &BTreeMap<StableCheckOwnerKey, Vec<StableOrderExpression>>,
         constraints_by_owner: &BTreeMap<
             StableCheckOwnerKey,
@@ -3542,7 +3448,7 @@ fn style_diagnostics(
         active: &mut BTreeSet<StableCheckOwnerKey>,
         diagnostics: &mut Vec<TypeDiagnostic>,
     ) {
-        let Some(call) = calls.get(call_expression) else {
+        let Some(call) = index.all_call(call_expression) else {
             return;
         };
         let crate::OwnerDiagnosticCallDisposition::User { owner } = &call.diagnostic.disposition
@@ -3574,7 +3480,6 @@ fn style_diagnostics(
                     nested,
                     frames,
                     exact_types,
-                    calls,
                     calls_by_owner,
                     constraints_by_owner,
                     active,
@@ -3608,8 +3513,7 @@ fn style_diagnostics(
         };
         if !matches!(
             index
-                .all_calls
-                .get(&stable)
+                .all_call(&stable)
                 .map(|call| &call.diagnostic.disposition),
             Some(crate::OwnerDiagnosticCallDisposition::Abi {
                 kind: CheckedCallableKind::Builtin
@@ -3712,7 +3616,6 @@ fn style_diagnostics(
             call,
             &mut frames,
             &mut exact_types,
-            &index.all_calls,
             &calls_by_owner,
             &constraints_by_owner,
             &mut BTreeSet::new(),
@@ -3839,8 +3742,7 @@ impl<'index, 'project> ProjectFlowTypeAnalyzer<'index, 'project> {
     fn call_type(&mut self, expression: &StableOrderExpression, fallback: Type) -> Type {
         let function = self
             .index
-            .all_calls
-            .get(expression)
+            .all_call(expression)
             .map(|call| call.function.clone());
         match function.as_deref() {
             Some("List/find") => {
@@ -4250,8 +4152,7 @@ impl<'index, 'project> ProjectFlowTypeAnalyzer<'index, 'project> {
                     } else {
                         let fallback = self
                             .index
-                            .all_calls
-                            .get(expression)
+                            .all_call(expression)
                             .map(|call| call.result.ty.clone())
                             .unwrap_or(fallback.clone());
                         self.call_type(expression, fallback)

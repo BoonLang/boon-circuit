@@ -47,10 +47,10 @@ use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 
-const OWNER_BODY_INFERENCE_DOMAIN_V10: &[u8] = b"boon.owner-body-inference.v10\0";
-const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V8: &[u8] = b"boon.owner-body-inference-content.v8\0";
-const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V13: &[u8] =
-    b"boon.owner-body-inference-currentness.v13\0";
+const OWNER_BODY_INFERENCE_DOMAIN_V11: &[u8] = b"boon.owner-body-inference.v11\0";
+const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V9: &[u8] = b"boon.owner-body-inference-content.v9\0";
+const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V14: &[u8] =
+    b"boon.owner-body-inference-currentness.v14\0";
 const OWNER_BODY_INTERFACE_PLAN_DOMAIN_V5: &[u8] = b"boon.owner-body-interface-plan.v5\0";
 const OWNER_INTERFACE_TRANSFER_MODULE_DOMAIN_V5: &[u8] =
     b"boon.owner-interface-transfer-module.v5\0";
@@ -1952,6 +1952,7 @@ pub enum OwnerInferenceExpressionRef {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InferredOwnerCall {
+    pub expression_id: OwnerInferenceExpressionId,
     pub expression: StableExpressionKey,
     pub function: String,
     pub target: InferredOwnerCallableTarget,
@@ -2137,7 +2138,7 @@ impl OwnerBodyInferenceCurrentnessReceipt {
             result_fingerprint_v1,
         );
         let fingerprint_v1 = fingerprint(
-            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V13,
+            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V14,
             &compact_currentness,
         )?;
         Ok(Self {
@@ -8037,7 +8038,12 @@ fn evaluate_owner_body_impl(
         .into_iter()
         .map(|draft| {
             let actual_inputs = &draft.actual_inputs;
+            let expression_id = OwnerInferenceExpressionId(checked_u32(
+                draft.plan.expression,
+                "inferred call expression id",
+            )?);
             Ok(InferredOwnerCall {
+                expression_id,
                 expression: draft.plan.stable_expression,
                 function: draft.plan.function,
                 target: draft.target,
@@ -8107,24 +8113,20 @@ fn evaluate_owner_body_impl(
         .collect::<Vec<_>>();
     let relocations = collect_relocations(seed, summary, &signature_lexical_plan);
 
-    let diagnostic_facts =
-        crate::owner_diagnostics::project_owner_diagnostic_contribution_from_rows(
-            syntax,
-            lexical_plan,
-            &inferred_statements,
-            &inferred_expressions,
-            &inferred_calls,
-            &signature_lexical_plan,
-            abi,
-        )
-        .map_err(|error| {
-            OwnerBodyInferenceError::new(format!(
-                "cannot publish owner diagnostic facts for {:?}: {error}",
-                seed.owner
-            ))
-        })?;
+    let diagnostic_facts = crate::owner_diagnostics::build_owner_diagnostic_contribution(
+        syntax,
+        &inferred_calls,
+        &signature_lexical_plan,
+        abi,
+    )
+    .map_err(|error| {
+        OwnerBodyInferenceError::new(format!(
+            "cannot publish owner diagnostic facts for {:?}: {error}",
+            seed.owner
+        ))
+    })?;
     let local_content_digest_v1 = fingerprint(
-        OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V8,
+        OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V9,
         &(
             &inferred_statements,
             &inferred_children,
@@ -8151,7 +8153,7 @@ fn evaluate_owner_body_impl(
     // The construction receipt already commits every semantic row, diagnostic,
     // effect, and row count above. Bind the stable owner to that compact seal
     // instead of serializing the same rich body a second time.
-    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V10, &(&seed.owner, &receipt))?;
+    let fingerprint_v1 = fingerprint(OWNER_BODY_INFERENCE_DOMAIN_V11, &(&seed.owner, &receipt))?;
     work.unification_steps = unifier.steps();
     let result = Arc::new(OwnerBodyInferenceShard {
         owner: seed.owner.clone(),

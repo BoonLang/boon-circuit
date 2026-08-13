@@ -2109,6 +2109,20 @@ representation and making global reducers consume canonical owner rows plus
 compact output/order/render/host facts; do not tune or cache the duplicate
 projection.
 
+The follow-up deletes the remaining duplicated expression-flow, lexical-read,
+statement-value, and general call rows from that contribution. Calls now carry
+their canonical dense expression ID, avoiding a per-owner stable-expression
+index; diagnostics build one transient call view only when demanded. In a
+comparable single-threaded debug NovyWave sample, owner-body work fell from
+3,618.015 to 3,402.465 ms, wall time from 25.15 to 23.62 seconds, and peak RSS
+from 409,160 to 405,696 KiB. The 360-owner interface SCC remained the noisy
+dominant owner at 14,299.954 ms, so no interface claim is attached to this
+slice. Counter remained small at 0.05 seconds/28,708 KiB; focused diagnostics,
+currentness, and topology tests pass, and the exact ignored NovyWave
+verified-plan gate passes in 156.21 seconds. Continue with the component-
+transaction/currentness simplification and the remaining genuinely global
+reducers; these debug observations are directional, not Clear End evidence.
+
 The post-checkpoint `unsafe` review remains deferred. Large safe work is still
 measured and scheduled for deletion, while this tranche exposes no dominant
 allocation-free kernel. Reassess only after residual-transfer compilation,

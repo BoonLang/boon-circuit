@@ -2123,6 +2123,30 @@ verified-plan gate passes in 156.21 seconds. Continue with the component-
 transaction/currentness simplification and the remaining genuinely global
 reducers; these debug observations are directional, not Clear End evidence.
 
+The next component-transaction ownership cut is complete. Body evaluation now
+retains by `Arc` the exact authenticated interface/module plan it evaluated,
+and checked-shard construction consumes that plan instead of reopening the own
+and imported SCC result requests and reconstructing their provider map. The
+plan also reads its SCC key from its already-owned transfer module instead of
+cloning the large component key per owner. The focused checked-shard proof and
+the exact ignored NovyWave verified-plan gate pass; the latter takes 151.83
+seconds in the debug test build. No standalone speed claim is attached to this
+ownership deletion.
+
+A dependency-indexed interface flow worklist was measured but deliberately not
+landed. It reduced one directional diagnostics observation, yet the exact
+NovyWave gate exposed a stale `WHEN`/list join after a residual transfer epoch.
+The experiment proved that root-value changes alone are not a complete wakeup
+contract: transfer evaluation can refine live occurrence alphas and the
+acyclic sealing path can project before every dependent equation has observed
+that provider epoch. Do not resume by adding more local wakeup exceptions.
+First define one phase-complete mutation/authority epoch journal shared by
+flow, capture, call transfer, narrowing, and HOLD publication; then prove the
+dependency scheduler against the full-sweep oracle and exact NovyWave gate
+before accepting its timing. The measured capture/provider scans remain the
+next large cost, but they must consume that common scheduler rather than gain a
+second partial invalidation mechanism.
+
 The post-checkpoint `unsafe` review remains deferred. Large safe work is still
 measured and scheduled for deletion, while this tranche exposes no dominant
 allocation-free kernel. Reassess only after residual-transfer compilation,

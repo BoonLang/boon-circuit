@@ -1307,7 +1307,7 @@ impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerBodyInferenceEvaluation>;
 
-    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v13";
+    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v14";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v2(key)
@@ -5090,7 +5090,7 @@ fn evaluate_owner_body_inference_requests(
         .flat_map(|scc| scc.key.members.iter().cloned())
         .collect::<Vec<_>>();
     let evaluation_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-body-inference-evaluation-dependencies.v13\0",
+        b"boon.compiler.owner-body-inference-evaluation-dependencies.v14\0",
         std::iter::empty(),
     ));
     let mut planning_ms = 0.0;
@@ -5160,7 +5160,7 @@ fn evaluate_owner_body_inference_requests(
                         };
                         planner.provide_interface_module(module)?;
                     }
-                    let interface_plan = planner.finish()?;
+                    let interface_plan = Arc::new(planner.finish()?);
                     owner_planning_ms = planning_started.elapsed().as_secs_f64() * 1_000.0;
                     let callable_scope_provider =
                         Arc::clone(state.owner_callable_scope_provider_requests.require(
@@ -5189,7 +5189,7 @@ fn evaluate_owner_body_inference_requests(
                         &seed,
                         &summary,
                         &abi,
-                        &interface_plan,
+                        Arc::clone(&interface_plan),
                         signature_lexical_plan,
                     )?;
                     let solve_ms = solve_started.elapsed().as_secs_f64() * 1_000.0;
@@ -5975,7 +5975,7 @@ fn evaluate_checked_owner_shard_requests(
     trace.checkpoint("construction-abi", owners.len());
 
     let shard_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.checked-owner-shard-dependencies.v9\0",
+        b"boon.compiler.checked-owner-shard-dependencies.v10\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -6029,29 +6029,6 @@ fn evaluate_checked_owner_shard_requests(
                             &mut ticket,
                             &owner,
                         )?);
-                    let own_key = &evaluation.currentness.basis().own_scc.key;
-                    let own_scc = Arc::clone(state.owner_interface_scc_requests.require(
-                        &state.syntax_evaluator,
-                        &mut ticket,
-                        own_key,
-                    )?);
-                    let import_keys = evaluation
-                        .currentness
-                        .basis()
-                        .imports
-                        .iter()
-                        .map(|frozen| frozen.key.clone())
-                        .collect::<Vec<_>>();
-                    let imports = import_keys
-                        .iter()
-                        .map(|key| {
-                            state
-                                .owner_interface_scc_requests
-                                .require(&state.syntax_evaluator, &mut ticket, key)
-                                .map(Arc::clone)
-                                .map_err(Into::into)
-                        })
-                        .collect::<CompilerResult<Vec<_>>>()?;
                     let shard = build_checked_owner_shard(
                         &syntax,
                         &lexical_plan,
@@ -6061,8 +6038,7 @@ fn evaluate_checked_owner_shard_requests(
                         &evaluation.currentness,
                         &inference_abi,
                         &construction_abi,
-                        &own_scc,
-                        imports.iter().map(Arc::as_ref),
+                        evaluation.interface_plan(),
                     )
                     .map_err(|error| {
                         session_error(format!(

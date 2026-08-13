@@ -11,10 +11,9 @@ use crate::{
     OwnerCheckedReceiptSink, OwnerConstraintSeed, OwnerConstraintSummary,
     OwnerConstructionAbiEnvironment, OwnerContainingScopeInput, OwnerDeclarationKind,
     OwnerEffectiveLexicalTarget, OwnerInferenceAbiEnvironment, OwnerInterfaceEvaluationScope,
-    OwnerInterfaceSccResult, OwnerLexicalDeclarationTarget, OwnerLexicalPlan,
-    OwnerLexicalScopeOrigin, OwnerParameterKind, OwnerPublicInterface, OwnerReferenceKind,
-    OwnerSignatureCallPlan, OwnerSignatureCallTarget, OwnerSignatureDeclarationKind,
-    OwnerSignatureDeclarationPlan, OwnerSignatureDeclarationTarget,
+    OwnerLexicalDeclarationTarget, OwnerLexicalPlan, OwnerLexicalScopeOrigin, OwnerParameterKind,
+    OwnerPublicInterface, OwnerReferenceKind, OwnerSignatureCallPlan, OwnerSignatureCallTarget,
+    OwnerSignatureDeclarationKind, OwnerSignatureDeclarationPlan, OwnerSignatureDeclarationTarget,
     OwnerSignatureMatchedInputSource, OwnerSignatureOutputBindingPlan, OwnerSignaturePassSource,
     OwnerSourceAnchorSite, OwnerSymbolResolution, OwnerSyntaxGraph, OwnerSyntaxInput,
     hold_alias_declaration_target, owner_abi_value_declaration_key,
@@ -241,13 +240,15 @@ fn validate_inputs(
     body_currentness: &OwnerBodyInferenceCurrentnessReceipt,
     inference_abi: &OwnerInferenceAbiEnvironment,
     construction_abi: &OwnerConstructionAbiEnvironment,
-    own_scc: &OwnerInterfaceSccResult,
+    interface_plan: &crate::OwnerBodyInterfacePlan,
 ) -> Result<(), CheckedOwnerBuildError> {
     let owner = &syntax.owner;
+    let own_scc = interface_plan.own_scc().result();
     if !lexical_plan.matches_input(syntax)
         || &seed.owner != owner
         || &summary.owner != owner
         || body.owner() != owner
+        || interface_plan.owner() != owner
         || !own_scc.key.members.contains(owner)
     {
         return Err(CheckedOwnerBuildError::new(format!(
@@ -350,48 +351,22 @@ fn validate_inputs(
 fn validated_frozen_interfaces<'a>(
     body: &OwnerBodyInferenceShard,
     body_currentness: &OwnerBodyInferenceCurrentnessReceipt,
-    own_scc: &'a OwnerInterfaceSccResult,
-    imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
+    interface_plan: &'a crate::OwnerBodyInterfacePlan,
 ) -> Result<BTreeMap<StableCheckOwnerKey, &'a OwnerPublicInterface>, CheckedOwnerBuildError> {
     let body_basis = body_currentness.basis();
-    let mut expected = BTreeMap::new();
-    if expected
-        .insert(body_basis.own_scc.key.clone(), &body_basis.own_scc)
-        .is_some()
-    {
-        return Err(CheckedOwnerBuildError::new(
-            "checked owner body repeats its own frozen interface SCC",
-        ));
-    }
-    for frozen in &body_basis.imports {
-        if expected.insert(frozen.key.clone(), frozen).is_some() {
-            return Err(CheckedOwnerBuildError::new(format!(
-                "checked owner body repeats frozen interface SCC {:?}",
-                frozen.key
-            )));
-        }
-    }
-
-    if own_scc.key != body_basis.own_scc.key
-        || own_scc.key_fingerprint_v1() != body_basis.own_scc.key_fingerprint_v1
+    if interface_plan.owner() != body.owner()
+        || interface_plan.fingerprint_v1() != body_basis.interface_plan_fingerprint_v1
     {
         return Err(CheckedOwnerBuildError::new(format!(
-            "checked owner {:?} received the wrong own interface SCC",
+            "checked owner {:?} received the wrong frozen interface plan",
             body.owner()
         )));
     }
-    let mut actual = BTreeMap::new();
-    actual.insert(own_scc.key.clone(), own_scc);
-    for result in imported_sccs {
-        if actual.insert(result.key.clone(), result).is_some() {
-            return Err(CheckedOwnerBuildError::new(format!(
-                "checked owner {:?} received duplicate interface SCC {:?}",
-                body.owner(),
-                result.key
-            )));
-        }
-    }
-    if actual.keys().collect::<Vec<_>>() != expected.keys().collect::<Vec<_>>() {
+    let frozen_providers = std::iter::once(&body_basis.own_scc)
+        .chain(body_basis.imports.iter())
+        .collect::<Vec<_>>();
+    let actual_providers = interface_plan.sccs().collect::<Vec<_>>();
+    if actual_providers.len() != frozen_providers.len() {
         return Err(CheckedOwnerBuildError::new(format!(
             "checked owner {:?} did not receive its exact frozen interface SCC set",
             body.owner()
@@ -399,20 +374,23 @@ fn validated_frozen_interfaces<'a>(
     }
 
     let mut expected_owners = BTreeSet::new();
-    for (key, frozen) in &expected {
-        let result = actual[key];
-        if result.key_fingerprint_v1() != frozen.key_fingerprint_v1
+    for (frozen, provider) in frozen_providers.iter().zip(&actual_providers) {
+        let result = provider.result();
+        if provider.key() != &frozen.key
+            || result.key_fingerprint_v1() != frozen.key_fingerprint_v1
             || result.fingerprint_v1() != frozen.result_fingerprint_v1
+            || provider.module().fingerprint_v1() != frozen.transfer_module_fingerprint_v1
             || result.type_variable_count != frozen.type_variable_count
         {
             return Err(CheckedOwnerBuildError::new(format!(
-                "checked owner {:?} interface SCC {key:?} differs from its frozen body basis",
-                body.owner()
+                "checked owner {:?} interface SCC {:?} differs from its frozen body basis",
+                body.owner(),
+                frozen.key
             )));
         }
         let mut referenced = BTreeSet::new();
         for member in &frozen.referenced_members {
-            let owner = key.members.get(*member as usize).ok_or_else(|| {
+            let owner = frozen.key.members.get(*member as usize).ok_or_else(|| {
                 CheckedOwnerBuildError::new(format!(
                     "checked owner {:?} has an out-of-range frozen interface member {member}",
                     body.owner()
@@ -450,13 +428,6 @@ fn validated_frozen_interfaces<'a>(
         )));
     }
 
-    let frozen_providers = std::iter::once(&body_basis.own_scc)
-        .chain(body_basis.imports.iter())
-        .collect::<Vec<_>>();
-    let actual_providers = frozen_providers
-        .iter()
-        .map(|frozen| actual[&frozen.key])
-        .collect::<Vec<_>>();
     let mut interfaces = BTreeMap::new();
     for (owner, import) in imports {
         let provider = usize::try_from(import.provider_scc).map_err(|_| {
@@ -485,7 +456,7 @@ fn validated_frozen_interfaces<'a>(
                 body.owner()
             )));
         }
-        let result = actual_providers[provider];
+        let result = actual_providers[provider].result();
         let interface = result.owner(&owner).ok_or_else(|| {
             CheckedOwnerBuildError::new(format!(
                 "checked owner {:?} provider does not publish interface {owner:?}",
@@ -6208,8 +6179,7 @@ pub fn build_checked_owner_shard<'a>(
     body_currentness: &OwnerBodyInferenceCurrentnessReceipt,
     inference_abi: &OwnerInferenceAbiEnvironment,
     construction_abi: &OwnerConstructionAbiEnvironment,
-    own_scc: &'a OwnerInterfaceSccResult,
-    imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
+    interface_plan: &'a crate::OwnerBodyInterfacePlan,
 ) -> Result<CheckedOwnerShard, CheckedOwnerBuildError> {
     validate_inputs(
         syntax,
@@ -6220,11 +6190,10 @@ pub fn build_checked_owner_shard<'a>(
         body_currentness,
         inference_abi,
         construction_abi,
-        own_scc,
+        interface_plan,
     )?;
 
-    let mut interfaces =
-        validated_frozen_interfaces(body, body_currentness, own_scc, imported_sccs)?;
+    let mut interfaces = validated_frozen_interfaces(body, body_currentness, interface_plan)?;
     let own_interface = interfaces.remove(&syntax.owner).ok_or_else(|| {
         CheckedOwnerBuildError::new(format!(
             "checked owner {:?} has no frozen public interface",
@@ -6240,7 +6209,7 @@ pub fn build_checked_owner_shard<'a>(
         summary_fingerprint_v1: summary.fingerprint_v1(),
         body_fingerprint_v1: body.fingerprint_v1(),
         body_currentness_fingerprint_v1: body_currentness.fingerprint_v1(),
-        own_interface_scc_fingerprint_v1: own_scc.fingerprint_v1(),
+        own_interface_scc_fingerprint_v1: interface_plan.own_scc().result().fingerprint_v1(),
         construction_abi_fingerprint_v1: construction_abi.fingerprint_v1(),
     };
 
@@ -6281,14 +6250,14 @@ pub fn build_checked_owner_shard<'a>(
 mod tests {
     use super::*;
     use crate::{
-        OwnerConstraintEdgeRole, OwnerInterfaceSccComponentEvaluation, OwnerPatternConstraint,
-        OwnerSignatureCallLexicalError, OwnerSourceAnchorRole, build_owner_callable_scope_topology,
-        build_owner_interface_topology, evaluate_owner_body_with_signature_plan,
-        evaluate_owner_callable_scope_scc, evaluate_owner_interface_scc_component,
-        evaluate_owner_interface_scc_component_for_tests, plan_owner_body_interfaces,
-        project_owner_abi_environment, project_owner_callable_resolution_plan,
-        project_owner_constraint_seed_with_lexical_plan, project_owner_lexical_plan,
-        project_owner_syntax_input, resolve_owner_constraint_seed,
+        OwnerConstraintEdgeRole, OwnerInterfaceSccComponentEvaluation, OwnerInterfaceSccResult,
+        OwnerPatternConstraint, OwnerSignatureCallLexicalError, OwnerSourceAnchorRole,
+        build_owner_callable_scope_topology, build_owner_interface_topology,
+        evaluate_owner_body_with_signature_plan, evaluate_owner_callable_scope_scc,
+        evaluate_owner_interface_scc_component, evaluate_owner_interface_scc_component_for_tests,
+        plan_owner_body_interfaces, project_owner_abi_environment,
+        project_owner_callable_resolution_plan, project_owner_constraint_seed_with_lexical_plan,
+        project_owner_lexical_plan, project_owner_syntax_input, resolve_owner_constraint_seed,
         resolve_owner_constraint_seed_with_signature_plan,
     };
     use boon_checked::{ExternalTypeEnvironment, OwnerAbiMemberRef};
@@ -6303,7 +6272,7 @@ mod tests {
         inference_abi: OwnerInferenceAbiEnvironment,
         construction_abi: OwnerConstructionAbiEnvironment,
         interface: OwnerInterfaceSccResult,
-        imported_sccs: Vec<OwnerInterfaceSccResult>,
+        interface_plan: Arc<crate::OwnerBodyInterfacePlan>,
         imported_interfaces: BTreeMap<StableCheckOwnerKey, OwnerPublicInterface>,
         body: OwnerBodyInferenceShard,
         body_currentness: OwnerBodyInferenceCurrentnessReceipt,
@@ -6607,14 +6576,16 @@ mod tests {
             .unwrap();
         let own_scc = topology.scc_for_owner(&owner).unwrap();
         let interface = Arc::clone(&interface_components[&own_scc.key].evaluation.result);
-        let interface_plan = plan_owner_body_interfaces(
-            &seed,
-            &summary,
-            interface_components
-                .values()
-                .map(|component| component.module.as_ref()),
-        )
-        .unwrap();
+        let interface_plan = Arc::new(
+            plan_owner_body_interfaces(
+                &seed,
+                &summary,
+                interface_components
+                    .values()
+                    .map(|component| component.module.as_ref()),
+            )
+            .unwrap(),
+        );
         let imported = interface_components
             .values()
             .filter(|component| {
@@ -6629,17 +6600,13 @@ mod tests {
             .flat_map(|component| component.evaluation.result.owners.iter())
             .map(|interface| (interface.owner.clone(), interface.clone()))
             .collect::<BTreeMap<_, _>>();
-        let imported_sccs = imported
-            .iter()
-            .map(|component| component.evaluation.result.as_ref().clone())
-            .collect();
         let body_evaluation = evaluate_owner_body_with_signature_plan(
             &syntax,
             &lexical_plan,
             &seed,
             &summary,
             &inference_abi,
-            &interface_plan,
+            Arc::clone(&interface_plan),
             callable_scopes[&owner].lexical_plan(),
         )
         .unwrap();
@@ -6659,7 +6626,7 @@ mod tests {
             inference_abi,
             construction_abi,
             interface: Arc::unwrap_or_clone(interface),
-            imported_sccs,
+            interface_plan,
             imported_interfaces,
             body,
             body_currentness: body_evaluation.currentness,
@@ -6712,21 +6679,23 @@ mod tests {
         )
         .unwrap();
         let interface = Arc::unwrap_or_clone(component.evaluation.result);
-        let interface_plan =
-            plan_owner_body_interfaces(&base.seed, &summary, [component.module.as_ref()]).unwrap();
+        let interface_plan = Arc::new(
+            plan_owner_body_interfaces(&base.seed, &summary, [component.module.as_ref()]).unwrap(),
+        );
         let body_evaluation = evaluate_owner_body_with_signature_plan(
             &base.syntax,
             &base.lexical_plan,
             &base.seed,
             &summary,
             &base.inference_abi,
-            &interface_plan,
+            Arc::clone(&interface_plan),
             &signature_plan,
         )
         .unwrap();
         Fixture {
             summary,
             interface,
+            interface_plan,
             body: Arc::unwrap_or_clone(body_evaluation.result),
             body_currentness: body_evaluation.currentness,
             ..base
@@ -6745,8 +6714,7 @@ mod tests {
             &fixture.body_currentness,
             &fixture.inference_abi,
             &fixture.construction_abi,
-            &fixture.interface,
-            fixture.imported_sccs.iter(),
+            &fixture.interface_plan,
         )
         .unwrap();
 
@@ -6783,8 +6751,7 @@ mod tests {
                 &fixture.body_currentness,
                 &fixture.inference_abi,
                 &fixture.construction_abi,
-                &fixture.interface,
-                [],
+                &fixture.interface_plan,
             )
             .unwrap()
         };
@@ -6813,8 +6780,7 @@ mod tests {
                 &fixture.body_currentness,
                 &fixture.inference_abi,
                 &fixture.construction_abi,
-                &fixture.interface,
-                [],
+                &fixture.interface_plan,
             )
             .unwrap()
         };
@@ -6872,8 +6838,7 @@ mod tests {
             &fixture.body_currentness,
             &fixture.inference_abi,
             &incomplete,
-            &fixture.interface,
-            [],
+            &fixture.interface_plan,
         )
         .unwrap_err();
 
@@ -9501,8 +9466,7 @@ mod tests {
             &fixture.body_currentness,
             &fixture.inference_abi,
             &fixture.construction_abi,
-            &fixture.interface,
-            fixture.imported_sccs.iter(),
+            &fixture.interface_plan,
         )
         .unwrap();
         let rows = shard.rows();

@@ -1560,8 +1560,6 @@ pub(crate) fn owner_interface_transfer_dependency_owners(
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerBodyInterfaceSccPlan {
     #[serde(skip)]
-    key: OwnerInterfaceSccKey,
-    #[serde(skip)]
     module: Arc<OwnerInterfaceTransferModule>,
     key_fingerprint_v1: [u8; 32],
     module_fingerprint_v1: [u8; 32],
@@ -1573,13 +1571,21 @@ pub struct OwnerBodyInterfaceSccPlan {
 
 impl OwnerBodyInterfaceSccPlan {
     pub fn key(&self) -> &OwnerInterfaceSccKey {
-        &self.key
+        self.module.key()
     }
 
     pub fn referenced_owners(&self) -> impl Iterator<Item = &StableCheckOwnerKey> {
         self.referenced_members
             .iter()
-            .map(|index| &self.key.members[*index as usize])
+            .map(|index| &self.module.key().members[*index as usize])
+    }
+
+    pub(crate) fn module(&self) -> &OwnerInterfaceTransferModule {
+        &self.module
+    }
+
+    pub(crate) fn result(&self) -> &OwnerInterfaceSccResult {
+        self.module.result()
     }
 }
 
@@ -1751,18 +1757,19 @@ impl OwnerBodyInterfacePlanner {
             let module = provider_sccs.get(provider).cloned().ok_or_else(|| {
                 OwnerBodyInferenceError::new("owner body interface plan lost a provider SCC")
             })?;
-            let key = module.key().clone();
             let key_fingerprint_v1 = module.result().key_fingerprint_v1();
             let module_fingerprint_v1 = module.fingerprint_v1();
             let referenced_members = referenced_owners
                 .iter()
                 .map(|owner| {
-                    key.members
+                    module
+                        .key()
+                        .members
                         .binary_search(owner)
                         .map_err(|_| {
                             OwnerBodyInferenceError::new(format!(
                                 "owner body interface provider {:?} does not contain {owner:?}",
-                                key
+                                module.key()
                             ))
                         })
                         .and_then(|index| {
@@ -1775,7 +1782,6 @@ impl OwnerBodyInterfacePlanner {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(OwnerBodyInterfaceSccPlan {
-                key,
                 module,
                 key_fingerprint_v1,
                 module_fingerprint_v1,
@@ -1787,7 +1793,7 @@ impl OwnerBodyInterfacePlanner {
             .into_iter()
             .map(|(provider, referenced_owners)| seal_scc(provider, referenced_owners))
             .collect::<Result<Vec<_>, _>>()?;
-        imports.sort_by(|left, right| left.key.cmp(&right.key));
+        imports.sort_by(|left, right| left.key().cmp(right.key()));
         let imports = imports.into_boxed_slice();
         self.work.required_owners = self.required.len() as u64;
         self.work.provider_sccs = imports.len() as u64 + 1;
@@ -2154,6 +2160,17 @@ impl OwnerBodyInferenceCurrentnessReceipt {
 pub struct OwnerBodyInferenceEvaluation {
     pub currentness: OwnerBodyInferenceCurrentnessReceipt,
     pub result: Arc<OwnerBodyInferenceShard>,
+    interface_plan: Arc<OwnerBodyInterfacePlan>,
+}
+
+impl OwnerBodyInferenceEvaluation {
+    /// Exact interface/module transaction consumed by this body evaluation.
+    ///
+    /// Checked and verified projections use this retained plan instead of
+    /// reopening every SCC result and reconstructing the provider map.
+    pub fn interface_plan(&self) -> &OwnerBodyInterfacePlan {
+        &self.interface_plan
+    }
 }
 
 fn fingerprint<T: Serialize>(
@@ -3688,13 +3705,14 @@ fn frozen_scc_ref(
 ) -> Result<FrozenOwnerInterfaceSccRef, OwnerBodyInferenceError> {
     let module = plan.module.as_ref();
     let result = module.result();
-    if result.key != plan.key
+    if &result.key != plan.key()
         || result.key_fingerprint_v1() != plan.key_fingerprint_v1
         || module.fingerprint_v1() != plan.module_fingerprint_v1
     {
         return Err(OwnerBodyInferenceError::new(format!(
             "owner body interface plan expected SCC {:?}, got {:?}",
-            plan.key, result.key
+            plan.key(),
+            result.key
         )));
     }
     if plan.referenced_members.is_empty() {
@@ -7193,7 +7211,7 @@ pub fn evaluate_owner_body(
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     abi: &OwnerInferenceAbiEnvironment,
-    interface_plan: &OwnerBodyInterfacePlan,
+    interface_plan: Arc<OwnerBodyInterfacePlan>,
 ) -> Result<OwnerBodyInferenceEvaluation, OwnerBodyInferenceError> {
     evaluate_owner_body_impl(
         syntax,
@@ -7212,7 +7230,7 @@ pub fn evaluate_owner_body_with_signature_plan(
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     abi: &OwnerInferenceAbiEnvironment,
-    interface_plan: &OwnerBodyInterfacePlan,
+    interface_plan: Arc<OwnerBodyInterfacePlan>,
     signature_lexical_plan: &OwnerSignatureLexicalPlan,
 ) -> Result<OwnerBodyInferenceEvaluation, OwnerBodyInferenceError> {
     evaluate_owner_body_impl(
@@ -7232,7 +7250,7 @@ fn evaluate_owner_body_impl(
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     abi: &OwnerInferenceAbiEnvironment,
-    interface_plan: &OwnerBodyInterfacePlan,
+    interface_plan: Arc<OwnerBodyInterfacePlan>,
     supplied_signature_lexical_plan: Option<&OwnerSignatureLexicalPlan>,
 ) -> Result<OwnerBodyInferenceEvaluation, OwnerBodyInferenceError> {
     let own_scc = interface_plan.own_scc().module.result();
@@ -7242,7 +7260,7 @@ fn evaluate_owner_body_impl(
             "owner body inference received an interface plan for another owner",
         ));
     }
-    if interface_plan.own_scc().key != own_scc.key {
+    if interface_plan.own_scc().key() != &own_scc.key {
         return Err(OwnerBodyInferenceError::new(format!(
             "owner body inference {:?} received the wrong own interface SCC",
             seed.owner
@@ -8178,6 +8196,7 @@ fn evaluate_owner_body_impl(
     Ok(OwnerBodyInferenceEvaluation {
         currentness,
         result,
+        interface_plan,
     })
 }
 
@@ -8199,8 +8218,15 @@ pub fn infer_owner_body<'a>(
         summary,
         std::iter::once(own_module).chain(imported_modules.iter().copied()),
     )?;
-    evaluate_owner_body(syntax, lexical_plan, seed, summary, abi, &interface_plan)
-        .map(|evaluation| Arc::unwrap_or_clone(evaluation.result))
+    evaluate_owner_body(
+        syntax,
+        lexical_plan,
+        seed,
+        summary,
+        abi,
+        Arc::new(interface_plan),
+    )
+    .map(|evaluation| Arc::unwrap_or_clone(evaluation.result))
 }
 
 #[cfg(test)]

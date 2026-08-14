@@ -2871,6 +2871,39 @@ baseline. All 54 kernel unit tests, 84 non-ignored compiler unit tests, and 16
 compiler integration tests pass; the ignored complete NovyWave call/effect and
 flow differential also passes explicitly.
 
+The next artifact cut replaces the flow-only expression vector with compact
+solved expression rows. Each row now owns its dense expression ID, authored
+kernel kind, ordered typed input edges, and final `FlowType`. Local and external
+providers use different enum cases throughout the artifact, and project solve
+consumes the pending rows instead of cloning their kinds and edges a second
+time. SOURCE remains a distinct expression kind carrying its closed payload ABI
+rather than being erased to a generic known value. LIST and BYTES rows retain
+their authored capacity/fixed-size metadata; SET and MAP retain their exact
+collection kind and structural inputs.
+
+The complete NovyWave artifact now contains 15,575 expression rows. Its 133
+collection occurrences match the checked expression inventory exactly in kind,
+capacity, ordered edge roles, and stable providers; its 117 literal SOURCE
+occurrences match exactly in stable identity, payload, flow, and cardinality.
+The existing whole-flow comparison remains the type authority, including its
+narrow documented legacy compatibility cones, so collection structure parity
+does not accidentally reintroduce a second stricter type oracle. Statement,
+declaration, path, interval, state, and persistent list-resource rows are still
+the next fact layer; source/list expression parity is not presented as full
+resource-table parity.
+
+Three debug samples record 1,848.111, 1,869.499, and 1,886.962 ms kernel time
+(median 1,869.499 ms). Parse plus SOURCE ABI plus kernel records a 2,021.778 ms
+median. Three fresh optimized samples record 382.407, 385.574, and 391.411 ms
+kernel time (median 385.574 ms); complete candidate time is 470.100, 472.884,
+and 477.308 ms (median 472.884 ms). Median compile/link is 101.158 ms and median
+solve is 221.594 ms. The two-job optimized rebuild took 1m46s. This is roughly
+4% below the prior optimized medians, but all solver/work counters are identical,
+so it is retained as the new complete-artifact receipt without attributing an
+algorithmic speedup. All 54 kernel unit tests, 85 non-ignored compiler unit
+tests, and 16 compiler integration tests pass; the full ignored NovyWave
+expression/collection/source/call/effect/flow differential passes explicitly.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not

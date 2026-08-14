@@ -78,6 +78,9 @@ pub enum KernelOwnerNodeKind {
     /// A closed ABI value supplied at the kernel boundary (for example a
     /// SOURCE payload contract). It is imported once into the type DAG.
     Known(Type),
+    /// A source occurrence with its closed payload ABI. This solves exactly
+    /// like a known value while remaining explicit in the checked artifact.
+    Source(Type),
     Absent,
     Text,
     TextTemplate,
@@ -89,7 +92,10 @@ pub enum KernelOwnerNodeKind {
         tag: Option<Box<str>>,
     },
     Block,
-    Collection(KernelCollectionKind),
+    Collection {
+        kind: KernelCollectionKind,
+        capacity: Option<usize>,
+    },
     MapEntry,
     /// One detached occurrence read from an invocation-local formal.
     FormalRead {
@@ -259,6 +265,7 @@ pub struct KernelOwnerProgram {
     result_output: OutputId,
     expression_outputs: Box<[OutputId]>,
     expression_modes: Box<[FlowMode]>,
+    expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
 }
@@ -317,8 +324,16 @@ struct KernelProjectOwnerOutputs {
     result: OutputId,
     expressions: Box<[OutputId]>,
     expression_modes: Box<[FlowMode]>,
+    expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingKernelExpressionArtifact {
+    id: KernelExpressionId,
+    kind: KernelOwnerNodeKind,
+    inputs: Box<[KernelExpressionInputArtifact]>,
 }
 
 #[derive(Clone, Debug)]
@@ -354,7 +369,7 @@ pub enum KernelCallInputRole {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCallInputArtifact {
     pub role: KernelCallInputRole,
-    pub value: KernelCallValueReference,
+    pub value: KernelValueReference,
 }
 
 /// A call input names either an expression in the call's definition or an
@@ -362,9 +377,28 @@ pub struct KernelCallInputArtifact {
 /// the namespaces distinct prevents linked external providers from masquerading
 /// as out-of-range local expression IDs.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum KernelCallValueReference {
+pub enum KernelValueReference {
     Local(KernelExpressionId),
     External(KernelExternalExpression),
+}
+
+pub type KernelCallValueReference = KernelValueReference;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelExpressionInputArtifact {
+    pub role: KernelOwnerEdgeRole,
+    pub value: KernelValueReference,
+}
+
+/// One solved expression row in a definition artifact. The compact authored
+/// kind and typed input edges survive solving, so downstream stages consume
+/// immutable definition facts instead of reconstructing source graphs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelExpressionArtifact {
+    pub id: KernelExpressionId,
+    pub kind: KernelOwnerNodeKind,
+    pub inputs: Box<[KernelExpressionInputArtifact]>,
+    pub flow_type: FlowType,
 }
 
 /// One source-authored call occurrence with its compact input edges and solved
@@ -400,7 +434,7 @@ pub struct KernelHostEffectArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DefinitionArtifact {
     pub result: FlowType,
-    pub expressions: Box<[FlowType]>,
+    pub expressions: Box<[KernelExpressionArtifact]>,
     pub calls: Box<[KernelCallArtifact]>,
     pub effects: Box<[KernelHostEffectArtifact]>,
 }
@@ -434,7 +468,7 @@ impl KernelOwnerProgram {
             .expect("owner result output belongs to its component")
             .flow_type
             .clone();
-        let expressions = self
+        let expression_flows = self
             .expression_outputs
             .iter()
             .zip(self.expression_modes.iter().copied())
@@ -455,7 +489,9 @@ impl KernelOwnerProgram {
             .position(|output| *output == self.result_output)
             .expect("owner result belongs to its expression outputs");
         result.mode = self.expression_modes[result_index];
-        let calls = materialize_call_artifacts(&self.calls, &expressions);
+        let calls = materialize_call_artifacts(self.calls, &expression_flows);
+        let expressions =
+            materialize_expression_artifacts(self.expression_artifacts, expression_flows);
         Ok(KernelDefinitionSnapshot {
             definition: DefinitionArtifact {
                 result,
@@ -477,14 +513,15 @@ impl KernelProjectProgram {
         let artifact = solve_component(self.component)?;
         let definitions = self
             .owners
-            .iter()
+            .into_vec()
+            .into_iter()
             .map(|owner| {
                 let mut result = artifact
                     .output(owner.result)
                     .expect("project owner result belongs to its component")
                     .flow_type
                     .clone();
-                let expressions = owner
+                let expression_flows = owner
                     .expressions
                     .iter()
                     .zip(owner.expression_modes.iter().copied())
@@ -505,12 +542,14 @@ impl KernelProjectProgram {
                     .position(|output| *output == owner.result)
                     .expect("project owner result belongs to its expression outputs");
                 result.mode = owner.expression_modes[result_index];
-                let calls = materialize_call_artifacts(&owner.calls, &expressions);
+                let calls = materialize_call_artifacts(owner.calls, &expression_flows);
+                let expressions =
+                    materialize_expression_artifacts(owner.expression_artifacts, expression_flows);
                 DefinitionArtifact {
                     result,
                     expressions,
                     calls,
-                    effects: owner.effects.clone(),
+                    effects: owner.effects,
                 }
             })
             .collect::<Vec<_>>()
@@ -622,21 +661,97 @@ pub fn compile_owner_program(
         result_output,
         expression_outputs: expression_outputs.into_boxed_slice(),
         expression_modes,
+        expression_artifacts: collect_expression_artifacts(input)?,
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
     })
 }
 
+fn materialize_expression_artifacts(
+    pending: Box<[PendingKernelExpressionArtifact]>,
+    flows: Box<[FlowType]>,
+) -> Box<[KernelExpressionArtifact]> {
+    assert_eq!(
+        pending.len(),
+        flows.len(),
+        "every solved expression must retain one compact artifact row"
+    );
+    pending
+        .into_vec()
+        .into_iter()
+        .zip(flows)
+        .map(|(expression, flow_type)| KernelExpressionArtifact {
+            id: expression.id,
+            kind: expression.kind,
+            inputs: expression.inputs,
+            flow_type,
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn collect_expression_artifacts(
+    input: &KernelOwnerProgramInput,
+) -> Result<Box<[PendingKernelExpressionArtifact]>, KernelOwnerBuildError> {
+    input
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            Ok(PendingKernelExpressionArtifact {
+                id: KernelExpressionId(
+                    u32::try_from(index).expect("kernel owner expression count exceeds u32"),
+                ),
+                kind: node.kind.clone(),
+                inputs: node
+                    .inputs
+                    .iter()
+                    .map(|edge| {
+                        Ok(KernelExpressionInputArtifact {
+                            role: edge.role.clone(),
+                            value: kernel_value_reference(input, edge.expression, index)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?
+                    .into_boxed_slice(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
+}
+
+fn kernel_value_reference(
+    input: &KernelOwnerProgramInput,
+    expression: KernelExpressionId,
+    consumer: usize,
+) -> Result<KernelValueReference, KernelOwnerBuildError> {
+    let reference = expression.0 as usize;
+    if reference < input.nodes.len() {
+        return Ok(KernelValueReference::Local(expression));
+    }
+    input
+        .external_expressions
+        .get(reference - input.nodes.len())
+        .copied()
+        .map(KernelValueReference::External)
+        .ok_or_else(|| {
+            KernelOwnerBuildError::new(format!(
+                "kernel expression {consumer} input references expression {reference} outside the local and external namespaces"
+            ))
+        })
+}
+
 fn materialize_call_artifacts(
-    pending: &[PendingKernelCallArtifact],
+    pending: Box<[PendingKernelCallArtifact]>,
     expressions: &[FlowType],
 ) -> Box<[KernelCallArtifact]> {
     pending
-        .iter()
+        .into_vec()
+        .into_iter()
         .map(|call| KernelCallArtifact {
             expression: call.expression,
-            target: call.target.clone(),
-            inputs: call.inputs.clone(),
+            target: call.target,
+            inputs: call.inputs,
             result: expressions[call.expression.0 as usize].clone(),
         })
         .collect::<Vec<_>>()
@@ -693,25 +808,8 @@ fn collect_call_artifacts(
                             )));
                         }
                     };
-                    let reference = edge.expression.0 as usize;
-                    let value = if reference < input.nodes.len() {
-                        KernelCallValueReference::Local(edge.expression)
-                    } else {
-                        let external = input
-                            .external_expressions
-                            .get(reference - input.nodes.len())
-                            .copied()
-                            .ok_or_else(|| {
-                                KernelOwnerBuildError::new(format!(
-                                    "kernel call node {expression} input references expression {reference} outside the local and external namespaces"
-                                ))
-                            })?;
-                        KernelCallValueReference::External(external)
-                    };
-                    inputs.push(KernelCallInputArtifact {
-                        role,
-                        value,
-                    });
+                    let value = kernel_value_reference(input, edge.expression, expression)?;
+                    inputs.push(KernelCallInputArtifact { role, value });
                 }
                 Ok(PendingKernelCallArtifact {
                     expression: KernelExpressionId(
@@ -936,6 +1034,7 @@ pub fn compile_project_program(
                     .map(|mode| modes[mode.0 as usize])
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
+                expression_artifacts: collect_expression_artifacts(owner)?,
                 calls: collect_call_artifacts(owner)?,
                 effects: collect_host_effect_artifacts(owner)?,
             })
@@ -1441,7 +1540,8 @@ fn infer_static_variants(
     let mut variants = vec![None; owner.nodes.len()];
     for (index, node) in owner.nodes.iter().enumerate() {
         variants[index] = match &node.kind {
-            KernelOwnerNodeKind::Known(Type::VariantSet(values)) => values
+            KernelOwnerNodeKind::Known(Type::VariantSet(values))
+            | KernelOwnerNodeKind::Source(Type::VariantSet(values)) => values
                 .iter()
                 .map(|variant| match variant {
                     Variant::Tag(tag) | Variant::Tagged { tag, .. } => {
@@ -2297,7 +2397,9 @@ fn direct_result_summary_supported(
         direct_result_summary_supported(project, owner_id, edge.expression.0 as usize, active)
     };
     let supported = match &node.kind {
-        KernelOwnerNodeKind::Known(ty) => type_is_recursively_closed(ty),
+        KernelOwnerNodeKind::Known(ty) | KernelOwnerNodeKind::Source(ty) => {
+            type_is_recursively_closed(ty)
+        }
         KernelOwnerNodeKind::Absent
         | KernelOwnerNodeKind::Text
         | KernelOwnerNodeKind::Number
@@ -2311,7 +2413,7 @@ fn direct_result_summary_supported(
         KernelOwnerNodeKind::Record { .. } => node.inputs.iter().all(|edge| {
             matches!(edge.role, KernelOwnerEdgeRole::RecordField { .. }) && child(edge, active)
         }),
-        KernelOwnerNodeKind::Collection(kind) => match kind {
+        KernelOwnerNodeKind::Collection { kind, .. } => match kind {
             KernelCollectionKind::List
             | KernelCollectionKind::Bytes
             | KernelCollectionKind::Set => node.inputs.iter().all(|edge| {
@@ -2718,7 +2820,9 @@ impl DirectSummaryPlanCompiler<'_> {
                 formal_projection_input: None,
             };
             match &node.kind {
-                KernelOwnerNodeKind::Known(ty) if type_is_recursively_closed(ty) => {
+                KernelOwnerNodeKind::Known(ty) | KernelOwnerNodeKind::Source(ty)
+                    if type_is_recursively_closed(ty) =>
+                {
                     let value = self.builder.terms_mut().import_checked_type(ty, &mut |_| {
                         unreachable!("compiled direct-summary ABI type is closed")
                     });
@@ -2826,7 +2930,7 @@ impl DirectSummaryPlanCompiler<'_> {
                         formal_projection_input: None,
                     })
                 }
-                KernelOwnerNodeKind::Collection(kind) => match kind {
+                KernelOwnerNodeKind::Collection { kind, .. } => match kind {
                     KernelCollectionKind::List | KernelCollectionKind::Set => {
                         let mut inputs = Vec::with_capacity(node.inputs.len());
                         for edge in &node.inputs {
@@ -3671,7 +3775,7 @@ fn compile_node(
     compile_mode: bool,
 ) -> Result<(), KernelOwnerBuildError> {
     match &node.kind {
-        KernelOwnerNodeKind::Known(ty) => {
+        KernelOwnerNodeKind::Known(ty) | KernelOwnerNodeKind::Source(ty) => {
             if !type_is_recursively_closed(ty) {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} imports a non-closed ABI type {ty:?}"
@@ -3728,7 +3832,7 @@ fn compile_node(
             let provider = edge_variable(context, index, result)?;
             builder.add_projection_into(provider, [], output);
         }
-        KernelOwnerNodeKind::Collection(kind) => match kind {
+        KernelOwnerNodeKind::Collection { kind, .. } => match kind {
             KernelCollectionKind::List | KernelCollectionKind::Set => {
                 let items = selected_edge_terms(builder, context, index, node, |role| {
                     matches!(role, KernelOwnerEdgeRole::CollectionItem)
@@ -4759,6 +4863,7 @@ fn node_mode_equation(
             "kernel owner node {node_index} user-call mode must come from its invocation"
         ))),
         KernelOwnerNodeKind::Known(_)
+        | KernelOwnerNodeKind::Source(_)
         | KernelOwnerNodeKind::Absent
         | KernelOwnerNodeKind::Text
         | KernelOwnerNodeKind::TextTemplate
@@ -4767,7 +4872,7 @@ fn node_mode_equation(
         | KernelOwnerNodeKind::Bits(_)
         | KernelOwnerNodeKind::Tag(_)
         | KernelOwnerNodeKind::Record { .. }
-        | KernelOwnerNodeKind::Collection(_)
+        | KernelOwnerNodeKind::Collection { .. }
         | KernelOwnerNodeKind::MapEntry
         | KernelOwnerNodeKind::RenderConstructor { .. }
         | KernelOwnerNodeKind::PureBuiltin { .. }
@@ -5850,7 +5955,10 @@ fn projected_collection_item_mode_variable(
         mode_source_for_edge(context, *owner, expression_modes, formal_sources, edge)
     };
     let result = match &node.kind {
-        KernelOwnerNodeKind::Collection(KernelCollectionKind::List | KernelCollectionKind::Set) => {
+        KernelOwnerNodeKind::Collection {
+            kind: KernelCollectionKind::List | KernelCollectionKind::Set,
+            ..
+        } => {
             let projected = node
                 .inputs
                 .iter()
@@ -6289,7 +6397,7 @@ mod tests {
         let artifact = compile_project_program(&input).unwrap().solve().unwrap();
 
         assert_eq!(
-            artifact.definitions[1].expressions[1].mode,
+            artifact.definitions[1].expressions[1].flow_type.mode,
             FlowMode::Continuous,
             "the builtin's ordinary checked surface remains fixed"
         );
@@ -6398,7 +6506,7 @@ mod tests {
             "a closed branch without the projected field contributes no continuous provider",
         );
         assert_eq!(
-            artifact.definition.expressions[6].mode,
+            artifact.definition.expressions[6].flow_type.mode,
             FlowMode::Continuous,
             "a direct missing-field occurrence retains its declared/root mode",
         );
@@ -6507,12 +6615,12 @@ mod tests {
         let artifact = compile_owner_program(&input).unwrap().solve().unwrap();
 
         assert_eq!(
-            artifact.definition.expressions[5].mode,
+            artifact.definition.expressions[5].flow_type.mode,
             FlowMode::PresentOrAbsent,
             "an unguarded projection retains the eventful update surface",
         );
         assert_eq!(
-            artifact.definition.expressions[6].mode,
+            artifact.definition.expressions[6].flow_type.mode,
             FlowMode::Continuous,
             "the matching tag makes the retained selector mode authoritative",
         );
@@ -6666,7 +6774,10 @@ mod tests {
                     mode: FlowMode::Continuous,
                 },
                 KernelOwnerNode {
-                    kind: KernelOwnerNodeKind::Collection(KernelCollectionKind::List),
+                    kind: KernelOwnerNodeKind::Collection {
+                        kind: KernelCollectionKind::List,
+                        capacity: None,
+                    },
                     inputs: vec![
                         edge(KernelOwnerEdgeRole::CollectionItem, 1),
                         edge(KernelOwnerEdgeRole::CollectionItem, 3),
@@ -6699,7 +6810,7 @@ mod tests {
             )
         );
         assert_eq!(
-            artifact.definition.expressions[1].ty,
+            artifact.definition.expressions[1].flow_type.ty,
             Type::object(ObjectShape::from_ordered_fields(
                 [(
                     "kind".to_owned(),
@@ -6743,9 +6854,12 @@ mod tests {
 
         let artifact = compile_owner_program(&input).unwrap().solve().unwrap();
 
-        assert_eq!(artifact.definition.expressions[1].ty, Type::Unknown);
         assert_eq!(
-            artifact.definition.expressions[1].mode,
+            artifact.definition.expressions[1].flow_type.ty,
+            Type::Unknown
+        );
+        assert_eq!(
+            artifact.definition.expressions[1].flow_type.mode,
             FlowMode::Continuous
         );
         assert_eq!(artifact.definition.result.ty, Type::Number);
@@ -6784,7 +6898,7 @@ mod tests {
             }
         );
         assert!(call.inputs.is_empty());
-        assert_eq!(call.result, artifact.definition.expressions[0]);
+        assert_eq!(call.result, artifact.definition.expressions[0].flow_type);
         assert_eq!(effect.expression, KernelExpressionId(0));
         assert_eq!(effect.operation.as_ref(), spec.operation);
         assert_eq!(effect.replay, spec.replay);
@@ -6798,7 +6912,10 @@ mod tests {
         let solve = |kind| {
             compile_owner_program(&KernelOwnerProgramInput {
                 nodes: vec![KernelOwnerNode {
-                    kind: KernelOwnerNodeKind::Collection(kind),
+                    kind: KernelOwnerNodeKind::Collection {
+                        kind,
+                        capacity: None,
+                    },
                     inputs: Box::new([]),
                     mode: FlowMode::Continuous,
                 }]
@@ -7079,8 +7196,14 @@ mod tests {
             )),
             "repeated calls must not share or specialize one formal frame"
         );
-        assert_eq!(artifact.definitions[1].expressions[2].ty, Type::Number);
-        assert_eq!(artifact.definitions[1].expressions[3].ty, Type::Text);
+        assert_eq!(
+            artifact.definitions[1].expressions[2].flow_type.ty,
+            Type::Number
+        );
+        assert_eq!(
+            artifact.definitions[1].expressions[3].flow_type.ty,
+            Type::Text
+        );
         let [number_call, text_call] = artifact.definitions[1].calls.as_ref() else {
             panic!("caller definition must publish both call occurrences")
         };
@@ -7102,6 +7225,23 @@ mod tests {
         );
         assert_eq!(number_call.result.ty, Type::Number);
         assert_eq!(text_call.result.ty, Type::Text);
+        let number_expression = &artifact.definitions[1].expressions[2];
+        assert_eq!(number_expression.id, KernelExpressionId(2));
+        assert_eq!(
+            number_expression.kind,
+            KernelOwnerNodeKind::UserCall {
+                target: KernelOwnerId(0),
+                inherited_formal: None,
+            }
+        );
+        assert_eq!(
+            number_expression.inputs.as_ref(),
+            [KernelExpressionInputArtifact {
+                role: KernelOwnerEdgeRole::CallArgument { ordinal: 0 },
+                value: KernelValueReference::Local(KernelExpressionId(0)),
+            }]
+        );
+        assert_eq!(number_expression.flow_type, number_call.result);
         assert!(artifact.definitions[0].calls.is_empty());
     }
 
@@ -7684,7 +7824,10 @@ mod tests {
         }
         let result = u32::try_from(caller_nodes.len()).unwrap();
         caller_nodes.push(KernelOwnerNode {
-            kind: KernelOwnerNodeKind::Collection(KernelCollectionKind::List),
+            kind: KernelOwnerNodeKind::Collection {
+                kind: KernelCollectionKind::List,
+                capacity: None,
+            },
             inputs: items.into_boxed_slice(),
             mode: FlowMode::Continuous,
         });
@@ -8097,8 +8240,8 @@ mod tests {
         assert_eq!(program.compile_work().reused_invocation_frames, 0);
         let artifact = program.solve().unwrap();
         let definition = &artifact.definitions[0].result.ty;
-        let first_call = &artifact.definitions[1].expressions[0].ty;
-        let second_call = &artifact.definitions[1].expressions[1].ty;
+        let first_call = &artifact.definitions[1].expressions[0].flow_type.ty;
+        let second_call = &artifact.definitions[1].expressions[1].flow_type.ty;
         let state_type = |ty: &Type| {
             let Type::Object(shape) = ty else {
                 panic!("stateful call result is not an object: {ty:?}");
@@ -8303,12 +8446,18 @@ mod tests {
             .into(),
         );
         assert_eq!(state_type(&artifact.definitions[0].result.ty), full);
-        assert_eq!(state_type(&artifact.definitions[1].expressions[1].ty), full);
         assert_eq!(
-            state_type(&artifact.definitions[2].expressions[1].ty),
+            state_type(&artifact.definitions[1].expressions[1].flow_type.ty),
+            full
+        );
+        assert_eq!(
+            state_type(&artifact.definitions[2].expressions[1].flow_type.ty),
             Type::VariantSet(vec![Variant::Tag("Closed".to_owned())].into()),
         );
-        assert_eq!(state_type(&artifact.definitions[2].expressions[2].ty), full);
+        assert_eq!(
+            state_type(&artifact.definitions[2].expressions[2].flow_type.ty),
+            full
+        );
     }
 
     #[test]
@@ -8496,9 +8645,12 @@ mod tests {
 
         let artifact = compile_project_program(&input).unwrap().solve().unwrap();
         assert_eq!(artifact.definitions[1].result.mode, FlowMode::Continuous);
-        assert_eq!(artifact.definitions[2].expressions[0].ty, Type::Text);
         assert_eq!(
-            artifact.definitions[2].expressions[0].mode,
+            artifact.definitions[2].expressions[0].flow_type.ty,
+            Type::Text
+        );
+        assert_eq!(
+            artifact.definitions[2].expressions[0].flow_type.mode,
             FlowMode::Continuous,
             "an ordinary cross-owner read retains the public declaration mode"
         );

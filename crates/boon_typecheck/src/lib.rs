@@ -29879,6 +29879,16 @@ impl Default for BuiltinSignatureRegistry {
 }
 
 impl BuiltinSignatureRegistry {
+    /// Returns whether this registry owns a callable contract for `name`.
+    ///
+    /// This intentionally exposes only name ownership, not the legacy
+    /// signature DTO. Dense compiler frontends use it to distinguish an
+    /// unresolved project call from a valid authoritative call whose compact
+    /// implementation has not migrated yet.
+    pub fn is_authoritative_callable(&self, name: &str) -> bool {
+        self.authoritative_signature(name).is_some()
+    }
+
     fn authoritative_signatures(
         &self,
     ) -> impl Iterator<Item = (&str, AuthoritativeCallableSignature)> + '_ {

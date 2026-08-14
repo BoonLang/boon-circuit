@@ -11,14 +11,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
-const KERNEL_DEFINITION_BASIS_DOMAIN_V2: &[u8] = b"boon.compiler-kernel.definition-basis.v2\0";
+const KERNEL_DEFINITION_BASIS_DOMAIN_V3: &[u8] = b"boon.compiler-kernel.definition-basis.v3\0";
 const KERNEL_PUBLIC_RESULT_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.public-result.v1\0";
 const KERNEL_EXPRESSION_SURFACE_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.expression-surface.v1\0";
-const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V4: &[u8] =
-    b"boon.compiler-kernel.definition-artifact.v4\0";
+const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V5: &[u8] =
+    b"boon.compiler-kernel.definition-artifact.v5\0";
 const KERNEL_DEPENDENCY_IMPORTS_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.dependency-imports.v1\0";
-const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V4: &[u8] =
-    b"boon.compiler-kernel.definition-currentness.v4\0";
+const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V5: &[u8] =
+    b"boon.compiler-kernel.definition-currentness.v5\0";
 
 /// Exact definition-local origin of one dependency edge.
 ///
@@ -189,11 +189,11 @@ impl KernelDefinitionDependencyGraph {
 /// exact imported authority set produced it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelDefinitionCurrentnessReceipt {
-    pub basis_fingerprint_v2: [u8; 32],
+    pub basis_fingerprint_v3: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v4: [u8; 32],
+    pub artifact_fingerprint_v5: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v4: [u8; 32],
+    pub fingerprint_v5: [u8; 32],
 }
 
 pub(crate) fn definition_basis_fingerprint(
@@ -209,7 +209,7 @@ pub(crate) fn definition_basis_fingerprint_with_buffer(
     scratch: &mut Vec<u8>,
 ) -> Result<[u8; 32], KernelOwnerBuildError> {
     Ok(stable_fingerprint(
-        KERNEL_DEFINITION_BASIS_DOMAIN_V2,
+        KERNEL_DEFINITION_BASIS_DOMAIN_V3,
         &(input, facts),
         scratch,
     ))
@@ -253,7 +253,7 @@ pub(crate) fn build_snapshot_receipts(
             &mut hash_scratch,
         )?);
         artifact_fingerprints.push(stable_fingerprint(
-            KERNEL_DEFINITION_ARTIFACT_DOMAIN_V4,
+            KERNEL_DEFINITION_ARTIFACT_DOMAIN_V5,
             definition,
             &mut hash_scratch,
         ));
@@ -315,24 +315,24 @@ pub(crate) fn build_snapshot_receipts(
             &(dependencies, imported_authorities),
             &mut hash_scratch,
         );
-        let basis_fingerprint_v2 = basis_fingerprints[definition_index];
+        let basis_fingerprint_v3 = basis_fingerprints[definition_index];
         let public_result_fingerprint_v1 = public_result_fingerprints[definition_index];
-        let artifact_fingerprint_v4 = artifact_fingerprints[definition_index];
-        let fingerprint_v4 = stable_fingerprint(
-            KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V4,
+        let artifact_fingerprint_v5 = artifact_fingerprints[definition_index];
+        let fingerprint_v5 = stable_fingerprint(
+            KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V5,
             &(
-                basis_fingerprint_v2,
-                artifact_fingerprint_v4,
+                basis_fingerprint_v3,
+                artifact_fingerprint_v5,
                 dependency_fingerprint_v1,
             ),
             &mut hash_scratch,
         );
         receipts.push(KernelDefinitionCurrentnessReceipt {
-            basis_fingerprint_v2,
+            basis_fingerprint_v3,
             public_result_fingerprint_v1,
-            artifact_fingerprint_v4,
+            artifact_fingerprint_v5,
             dependency_fingerprint_v1,
-            fingerprint_v4,
+            fingerprint_v5,
         });
     }
     Ok((dependency_graph, receipts.into_boxed_slice()))
@@ -416,6 +416,19 @@ fn validate_definition_diagnostics(
                     return Err(KernelSolveError::new(format!(
                         "kernel definition {owner_index} diagnostic references missing expression {}",
                         expression.0
+                    )));
+                }
+            }
+            crate::KernelDiagnosticSite::CallArgument { call, .. }
+            | crate::KernelDiagnosticSite::CallPass { call, .. } => {
+                if definition
+                    .expressions
+                    .get(call.0 as usize)
+                    .is_none_or(|candidate| candidate.id != call)
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition {owner_index} diagnostic references missing call expression {}",
+                        call.0
                     )));
                 }
             }
@@ -773,7 +786,16 @@ fn alpha_normalize_diagnostics(
             | KernelDiagnosticKind::InvalidPattern
             | KernelDiagnosticKind::InvalidNumberLiteral { .. }
             | KernelDiagnosticKind::InvalidBitsLiteral { .. }
-            | KernelDiagnosticKind::ByteLiteralOutsideBytes => {}
+            | KernelDiagnosticKind::ByteLiteralOutsideBytes
+            | KernelDiagnosticKind::UnresolvedCallable { .. }
+            | KernelDiagnosticKind::AmbiguousCallable { .. }
+            | KernelDiagnosticKind::PipeWithoutValueInput { .. }
+            | KernelDiagnosticKind::UnexpectedCallEntry { .. }
+            | KernelDiagnosticKind::MisorderedCallEntry { .. }
+            | KernelDiagnosticKind::MissingCallEntry { .. }
+            | KernelDiagnosticKind::BareOrdinaryInput { .. }
+            | KernelDiagnosticKind::PassOnAuthoritativeCallable { .. }
+            | KernelDiagnosticKind::MissingPassContext { .. } => {}
         }
     }
 }
@@ -977,8 +999,10 @@ fn stable_fingerprint<T: Hash + ?Sized>(
 mod tests {
     use super::*;
     use crate::{
-        KernelDefinitionFactsInput, KernelOwnerEdgeRole, KernelOwnerInputEdge, KernelOwnerNode,
-        KernelProjectProgramInput, compile_project_program_with_definition_facts,
+        KernelDefinitionFactsInput, KernelDiagnosticInput, KernelDiagnosticSeverity,
+        KernelDiagnosticSite, KernelOwnerEdgeRole, KernelOwnerInputEdge, KernelOwnerNode,
+        KernelProjectProgramInput, compile_owner_program_with_definition_facts,
+        compile_project_program_with_definition_facts,
     };
     use boon_checked::FlowMode;
 
@@ -1103,11 +1127,11 @@ mod tests {
             "an unused implementation edit must preserve the public type identity"
         );
         assert_ne!(
-            first.currentness[0].artifact_fingerprint_v4,
-            second.currentness[0].artifact_fingerprint_v4
+            first.currentness[0].artifact_fingerprint_v5,
+            second.currentness[0].artifact_fingerprint_v5
         );
         assert_ne!(
-            first.currentness[0].fingerprint_v4, second.currentness[0].fingerprint_v4,
+            first.currentness[0].fingerprint_v5, second.currentness[0].fingerprint_v5,
             "the edited definition must not claim the old exact evaluation receipt"
         );
         assert_eq!(
@@ -1158,22 +1182,22 @@ mod tests {
             second[0].public_result_fingerprint_v1
         );
         assert_eq!(
-            first[0].artifact_fingerprint_v4,
-            second[0].artifact_fingerprint_v4
+            first[0].artifact_fingerprint_v5,
+            second[0].artifact_fingerprint_v5
         );
         assert_eq!(
-            first[0].artifact_fingerprint_v4,
+            first[0].artifact_fingerprint_v5,
             [
-                39, 217, 32, 136, 160, 209, 149, 242, 132, 143, 240, 147, 220, 185, 202, 69, 9, 82,
-                48, 216, 13, 31, 174, 217, 146, 130, 248, 118, 92, 48, 46, 145,
+                111, 39, 52, 127, 166, 14, 216, 96, 49, 239, 209, 120, 234, 242, 172, 164, 33, 245,
+                72, 22, 118, 165, 212, 140, 164, 177, 119, 238, 174, 241, 37, 91,
             ],
-            "the V4 direct structural fingerprint byte contract changed"
+            "the V5 direct structural fingerprint byte contract changed"
         );
         assert_ne!(
-            first[0].basis_fingerprint_v2,
-            second[0].basis_fingerprint_v2
+            first[0].basis_fingerprint_v3,
+            second[0].basis_fingerprint_v3
         );
-        assert_ne!(first[0].fingerprint_v4, second[0].fingerprint_v4);
+        assert_ne!(first[0].fingerprint_v5, second[0].fingerprint_v5);
     }
 
     #[test]
@@ -1245,12 +1269,69 @@ mod tests {
             diagnosed_currentness[1].public_result_fingerprint_v1
         );
         assert_ne!(
-            clean_currentness[1].artifact_fingerprint_v4,
-            diagnosed_currentness[1].artifact_fingerprint_v4
+            clean_currentness[1].artifact_fingerprint_v5,
+            diagnosed_currentness[1].artifact_fingerprint_v5
         );
         assert_ne!(
-            clean_currentness[1].fingerprint_v4,
-            diagnosed_currentness[1].fingerprint_v4
+            clean_currentness[1].fingerprint_v5,
+            diagnosed_currentness[1].fingerprint_v5
+        );
+    }
+
+    #[test]
+    fn typed_call_diagnostics_change_basis_and_exact_currentness_not_public_type() {
+        let input = value_owner(vec![KernelOwnerNode {
+            kind: KernelOwnerNodeKind::Unknown,
+            inputs: Box::new([]),
+            mode: FlowMode::Continuous,
+        }]);
+        let facts = |kind| KernelDefinitionFactsInput {
+            diagnostics: vec![KernelDiagnosticInput {
+                severity: KernelDiagnosticSeverity::Error,
+                site: KernelDiagnosticSite::Expression {
+                    expression: KernelExpressionId(0),
+                },
+                kind,
+            }]
+            .into_boxed_slice(),
+            ..KernelDefinitionFactsInput::default()
+        };
+        let first = compile_owner_program_with_definition_facts(
+            &input,
+            &facts(KernelDiagnosticKind::UnresolvedCallable {
+                function: "first".into(),
+            }),
+        )
+        .expect("first call diagnostic compiles")
+        .solve()
+        .expect("first call diagnostic solves");
+        let second = compile_owner_program_with_definition_facts(
+            &input,
+            &facts(KernelDiagnosticKind::MissingCallEntry {
+                function: "second".into(),
+                name: "value".into(),
+            }),
+        )
+        .expect("second call diagnostic compiles")
+        .solve()
+        .expect("second call diagnostic solves");
+
+        assert_eq!(first.definition.result, second.definition.result);
+        assert_eq!(
+            first.currentness.public_result_fingerprint_v1,
+            second.currentness.public_result_fingerprint_v1
+        );
+        assert_ne!(
+            first.currentness.basis_fingerprint_v3,
+            second.currentness.basis_fingerprint_v3
+        );
+        assert_ne!(
+            first.currentness.artifact_fingerprint_v5,
+            second.currentness.artifact_fingerprint_v5
+        );
+        assert_ne!(
+            first.currentness.fingerprint_v5,
+            second.currentness.fingerprint_v5
         );
     }
 }

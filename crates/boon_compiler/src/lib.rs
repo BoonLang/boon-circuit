@@ -35,7 +35,7 @@ pub use distributed_compiler::{
 pub use kernel_oracle::{
     KernelOwnerOracleDiagnostic, KernelOwnerOracleDiagnosticSite, KernelOwnerOracleEntry,
     KernelOwnerOracleReport, KernelOwnerOracleTimings, kernel_owner_oracle,
-    kernel_owner_oracle_with_source_payloads, present_kernel_source_expression_diagnostic,
+    kernel_owner_oracle_with_source_payloads, present_kernel_source_diagnostic,
     profile_kernel_owner_oracle_with_source_payloads,
 };
 pub use session::{

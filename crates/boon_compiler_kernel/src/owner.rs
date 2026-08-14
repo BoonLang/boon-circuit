@@ -441,9 +441,9 @@ pub struct KernelDefinitionFactsInput {
     pub sources: Box<[KernelSourceInput]>,
     pub states: Box<[KernelStateInput]>,
     pub lists: Box<[KernelListInput]>,
-    /// Source-shape failures projected directly from the immutable syntax
-    /// model. These facts are definition-local and require neither type solve
-    /// replay nor checked-row materialization.
+    /// Typed failures projected directly from immutable syntax and resolved
+    /// call contracts. These facts are definition-local and require neither
+    /// type-solve replay nor checked-row materialization.
     pub diagnostics: Box<[KernelDiagnosticInput]>,
 }
 
@@ -501,7 +501,7 @@ pub struct KernelOwnerProgram {
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
-    basis_fingerprint_v2: [u8; 32],
+    basis_fingerprint_v3: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -587,8 +587,8 @@ struct KernelProjectOwnerOutputs {
     resources: PendingKernelResources,
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
-    source_diagnostics: Box<[KernelDiagnosticArtifact]>,
-    basis_fingerprint_v2: [u8; 32],
+    diagnostics: Box<[KernelDiagnosticArtifact]>,
+    basis_fingerprint_v3: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -786,6 +786,14 @@ pub enum KernelDiagnosticSite {
     Expression {
         expression: KernelExpressionId,
     },
+    CallArgument {
+        call: KernelExpressionId,
+        source: KernelCallArgumentSource,
+    },
+    CallPass {
+        call: KernelExpressionId,
+        pipe: bool,
+    },
     CallInput {
         call: KernelExpressionId,
         target: KernelOwnerId,
@@ -799,6 +807,79 @@ pub enum KernelTypeMismatch {
     MissingField(Box<str>),
     IncompatibleField(Box<str>),
     Type,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum KernelCallArgumentSource {
+    PipeInput,
+    CallArgument { ordinal: u32 },
+    PipeArgument { ordinal: u32 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelCallArgumentKind {
+    Named,
+    BareBinding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelCallableKind {
+    User,
+    Builtin,
+    External,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelCallShapeArgument {
+    pub source: KernelCallArgumentSource,
+    pub kind: KernelCallArgumentKind,
+    pub name: Box<str>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelCallShapeParameter {
+    pub ordinal: u32,
+    pub kind: KernelParameterKind,
+    pub name: Box<str>,
+    pub optional: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelCallShapeInput {
+    pub expression: KernelExpressionId,
+    pub function: Box<str>,
+    pub pipe: bool,
+    pub arguments: Box<[KernelCallShapeArgument]>,
+    pub pass: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelCallShapeResolution {
+    Callable {
+        kind: KernelCallableKind,
+        parameters: Box<[KernelCallShapeParameter]>,
+        context_ordinal: Option<u32>,
+        caller_context_ordinal: Option<u32>,
+    },
+    Ambiguous {
+        candidate_count: u32,
+    },
+    Unresolved,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelMatchedCallInput {
+    pub source: KernelCallArgumentSource,
+    pub formal_ordinal: u32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelCallShapeProjection {
+    pub matched_inputs: Box<[KernelMatchedCallInput]>,
+    pub explicit_context_ordinal: Option<u32>,
+    pub inherited_formal: Option<KernelInheritedFormal>,
+    pub diagnostics: Box<[KernelDiagnosticInput]>,
+    pub valid: bool,
 }
 
 /// Stable reason for rejecting one exact Number token. The source text and
@@ -858,6 +939,41 @@ pub enum KernelDiagnosticKind {
         detail: Box<str>,
     },
     ByteLiteralOutsideBytes,
+    UnresolvedCallable {
+        function: Box<str>,
+    },
+    AmbiguousCallable {
+        function: Box<str>,
+        candidate_count: u32,
+    },
+    PipeWithoutValueInput {
+        function: Box<str>,
+    },
+    UnexpectedCallEntry {
+        function: Box<str>,
+        name: Box<str>,
+    },
+    MisorderedCallEntry {
+        function: Box<str>,
+        position: u32,
+        expected_name: Box<str>,
+        actual_name: Box<str>,
+    },
+    MissingCallEntry {
+        function: Box<str>,
+        name: Box<str>,
+    },
+    BareOrdinaryInput {
+        name: Box<str>,
+    },
+    PassOnAuthoritativeCallable {
+        function: Box<str>,
+        callable_kind: KernelCallableKind,
+    },
+    MissingPassContext {
+        function: Box<str>,
+        root_call: bool,
+    },
     CallInputType {
         actual: Type,
         expected: Type,
@@ -1024,6 +1140,256 @@ pub fn project_kernel_source_expression_diagnostics<'a>(
     }
     diagnostics.sort_unstable_by(|left, right| left.site.cmp(&right.site));
     Ok(diagnostics.into_boxed_slice())
+}
+
+/// Match one normalized call surface against one resolved callable contract.
+///
+/// This is the permanent lexical call-shape authority. It deliberately does
+/// not inspect types or legacy owner plans: valid inputs are returned as dense
+/// formal/source pairs, while resolution and arity failures become typed facts
+/// and leave the caller free to publish an `Unknown` result node.
+pub fn project_kernel_call_shape(
+    input: &KernelCallShapeInput,
+    resolution: &KernelCallShapeResolution,
+) -> Result<KernelCallShapeProjection, KernelOwnerBuildError> {
+    let argument_site = |source| KernelDiagnosticSite::CallArgument {
+        call: input.expression,
+        source,
+    };
+    let expression_site = || KernelDiagnosticSite::Expression {
+        expression: input.expression,
+    };
+    let mut diagnostics = Vec::new();
+    let mut push = |site, kind| {
+        diagnostics.push(KernelDiagnosticInput {
+            severity: KernelDiagnosticSeverity::Error,
+            site,
+            kind,
+        });
+    };
+    for (ordinal, argument) in input.arguments.iter().enumerate() {
+        let ordinal = u32::try_from(ordinal).map_err(|_| {
+            KernelOwnerBuildError::new(format!(
+                "kernel call `{}` argument count exceeds the u32 namespace",
+                input.function
+            ))
+        })?;
+        let expected = if input.pipe {
+            KernelCallArgumentSource::PipeArgument { ordinal }
+        } else {
+            KernelCallArgumentSource::CallArgument { ordinal }
+        };
+        if argument.source != expected {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel call `{}` argument {ordinal} has source {:?}, expected {expected:?}",
+                input.function, argument.source
+            )));
+        }
+    }
+
+    let (callable_kind, parameters, context_ordinal, caller_context_ordinal) = match resolution {
+        KernelCallShapeResolution::Unresolved => {
+            push(
+                expression_site(),
+                KernelDiagnosticKind::UnresolvedCallable {
+                    function: input.function.clone(),
+                },
+            );
+            return Ok(KernelCallShapeProjection {
+                matched_inputs: Box::new([]),
+                explicit_context_ordinal: None,
+                inherited_formal: None,
+                diagnostics: diagnostics.into_boxed_slice(),
+                valid: false,
+            });
+        }
+        KernelCallShapeResolution::Ambiguous { candidate_count } => {
+            if *candidate_count < 2 {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel ambiguous call `{}` has fewer than two candidates",
+                    input.function
+                )));
+            }
+            push(
+                expression_site(),
+                KernelDiagnosticKind::AmbiguousCallable {
+                    function: input.function.clone(),
+                    candidate_count: *candidate_count,
+                },
+            );
+            return Ok(KernelCallShapeProjection {
+                matched_inputs: Box::new([]),
+                explicit_context_ordinal: None,
+                inherited_formal: None,
+                diagnostics: diagnostics.into_boxed_slice(),
+                valid: false,
+            });
+        }
+        KernelCallShapeResolution::Callable {
+            kind,
+            parameters,
+            context_ordinal,
+            caller_context_ordinal,
+        } => (*kind, parameters, *context_ordinal, *caller_context_ordinal),
+    };
+
+    let mut parameters = parameters.iter().collect::<Vec<_>>();
+    parameters.sort_unstable_by_key(|parameter| parameter.ordinal);
+    let mut parameter_ordinals = HashSet::with_capacity(parameters.len());
+    let mut parameter_names = HashSet::with_capacity(parameters.len());
+    for parameter in &parameters {
+        if !parameter_ordinals.insert(parameter.ordinal)
+            || !parameter_names.insert(parameter.name.as_ref())
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel callable `{}` has duplicate formal identity `{}`/{}",
+                input.function, parameter.name, parameter.ordinal
+            )));
+        }
+    }
+    if context_ordinal.is_some_and(|context| parameter_ordinals.contains(&context)) {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel callable `{}` context overlaps an ordinary formal",
+            input.function
+        )));
+    }
+
+    let piped_parameter = input.pipe.then(|| {
+        parameters
+            .iter()
+            .copied()
+            .filter(|parameter| parameter.kind == KernelParameterKind::Value)
+            .min_by_key(|parameter| parameter.ordinal)
+    });
+    if matches!(piped_parameter, Some(None)) {
+        push(
+            expression_site(),
+            KernelDiagnosticKind::PipeWithoutValueInput {
+                function: input.function.clone(),
+            },
+        );
+    }
+    let piped_parameter = piped_parameter.flatten();
+    let mut matched_inputs = Vec::new();
+    if let Some(parameter) = piped_parameter {
+        matched_inputs.push(KernelMatchedCallInput {
+            source: KernelCallArgumentSource::PipeInput,
+            formal_ordinal: parameter.ordinal,
+        });
+    }
+    let expected = parameters
+        .iter()
+        .copied()
+        .filter(|parameter| piped_parameter.is_none_or(|piped| parameter.ordinal != piped.ordinal))
+        .collect::<Vec<_>>();
+    let mut expected_index = 0usize;
+    for (call_index, argument) in input.arguments.iter().enumerate() {
+        while let Some(parameter) = expected.get(expected_index).copied()
+            && parameter.name != argument.name
+            && parameter.optional
+        {
+            expected_index += 1;
+        }
+        let Some(parameter) = expected.get(expected_index).copied() else {
+            push(
+                argument_site(argument.source),
+                KernelDiagnosticKind::UnexpectedCallEntry {
+                    function: input.function.clone(),
+                    name: argument.name.clone(),
+                },
+            );
+            continue;
+        };
+        if parameter.name != argument.name {
+            let position = u32::try_from(call_index + 1).map_err(|_| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel call `{}` argument count exceeds the u32 namespace",
+                    input.function
+                ))
+            })?;
+            push(
+                argument_site(argument.source),
+                KernelDiagnosticKind::MisorderedCallEntry {
+                    function: input.function.clone(),
+                    position,
+                    expected_name: parameter.name.clone(),
+                    actual_name: argument.name.clone(),
+                },
+            );
+            expected_index += 1;
+            continue;
+        }
+        expected_index += 1;
+        if parameter.kind == KernelParameterKind::Value
+            && argument.kind == KernelCallArgumentKind::BareBinding
+        {
+            push(
+                argument_site(argument.source),
+                KernelDiagnosticKind::BareOrdinaryInput {
+                    name: argument.name.clone(),
+                },
+            );
+        }
+        matched_inputs.push(KernelMatchedCallInput {
+            source: argument.source,
+            formal_ordinal: parameter.ordinal,
+        });
+    }
+    for parameter in expected.iter().skip(expected_index) {
+        if !parameter.optional {
+            push(
+                expression_site(),
+                KernelDiagnosticKind::MissingCallEntry {
+                    function: input.function.clone(),
+                    name: parameter.name.clone(),
+                },
+            );
+        }
+    }
+
+    if callable_kind != KernelCallableKind::User && input.pass {
+        push(
+            KernelDiagnosticSite::CallPass {
+                call: input.expression,
+                pipe: input.pipe,
+            },
+            KernelDiagnosticKind::PassOnAuthoritativeCallable {
+                function: input.function.clone(),
+                callable_kind,
+            },
+        );
+    }
+    let mut explicit_context_ordinal = None;
+    let mut inherited_formal = None;
+    if callable_kind == KernelCallableKind::User
+        && let Some(target_ordinal) = context_ordinal
+    {
+        if input.pass {
+            explicit_context_ordinal = Some(target_ordinal);
+        } else if let Some(caller_ordinal) = caller_context_ordinal {
+            inherited_formal = Some(KernelInheritedFormal {
+                target_ordinal,
+                caller_ordinal,
+            });
+        } else {
+            push(
+                expression_site(),
+                KernelDiagnosticKind::MissingPassContext {
+                    function: input.function.clone(),
+                    root_call: true,
+                },
+            );
+        }
+    }
+    matched_inputs.sort_unstable_by_key(|input| input.formal_ordinal);
+    let valid = diagnostics.is_empty();
+    Ok(KernelCallShapeProjection {
+        matched_inputs: matched_inputs.into_boxed_slice(),
+        explicit_context_ordinal,
+        inherited_formal,
+        diagnostics: diagnostics.into_boxed_slice(),
+        valid,
+    })
 }
 
 /// One source-authored host-effect occurrence in a definition artifact.
@@ -1250,9 +1616,15 @@ pub fn is_kernel_host_effect(operation: &str) -> bool {
     })
 }
 
+/// Returns whether the stable host-effect registry owns `operation`, even
+/// when its compact result policy has not migrated into this kernel yet.
+pub fn is_registered_kernel_host_effect(operation: &str) -> bool {
+    host_effect_spec(operation).is_some()
+}
+
 impl KernelOwnerProgram {
     pub fn solve(self) -> Result<KernelDefinitionSnapshot, KernelSolveError> {
-        let basis_fingerprint_v2 = self.basis_fingerprint_v2;
+        let basis_fingerprint_v3 = self.basis_fingerprint_v3;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
             .output(self.result_output)
@@ -1322,7 +1694,7 @@ impl KernelOwnerProgram {
         };
         let (dependencies, currentness) = build_snapshot_receipts(
             std::slice::from_mut(&mut definition),
-            &[basis_fingerprint_v2],
+            &[basis_fingerprint_v3],
         )?;
         let [currentness] = currentness.as_ref() else {
             unreachable!("one standalone kernel definition produces one receipt")
@@ -1451,7 +1823,7 @@ impl KernelSolvedProject {
         let basis_fingerprints = self
             .owners
             .iter()
-            .map(|owner| owner.basis_fingerprint_v2)
+            .map(|owner| owner.basis_fingerprint_v3)
             .collect::<Vec<_>>();
         let mut definitions = self
             .owners
@@ -1624,7 +1996,7 @@ fn project_call_facts_and_diagnostics(
                 .expect("kernel diagnostic owner count exceeds the dense u32 namespace"),
         );
         let mut owner_call_facts = Vec::with_capacity(owner.calls.len());
-        let mut diagnostics = owner.source_diagnostics.to_vec();
+        let mut diagnostics = owner.diagnostics.to_vec();
         for call in owner.calls.iter() {
             let substitutions = if let KernelCallTarget::User { target, .. } = call.target {
                 let target_formals = public_formals
@@ -2089,7 +2461,7 @@ pub fn compile_owner_program_with_definition_facts(
     input: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
-    let basis_fingerprint_v2 = definition_basis_fingerprint(input, facts)?;
+    let basis_fingerprint_v3 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
@@ -2247,8 +2619,8 @@ pub fn compile_owner_program_with_definition_facts(
         resources,
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
-        diagnostics: collect_source_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
-        basis_fingerprint_v2,
+        diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
+        basis_fingerprint_v3,
     })
 }
 
@@ -3319,7 +3691,7 @@ fn collect_call_artifacts(
         .map(Vec::into_boxed_slice)
 }
 
-fn collect_source_diagnostic_artifacts(
+fn collect_definition_diagnostic_artifacts(
     owner: KernelOwnerId,
     input: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
@@ -3334,6 +3706,14 @@ fn collect_source_diagnostic_artifacts(
                         expression,
                         input.nodes.len(),
                         "source diagnostic expression",
+                    )?;
+                }
+                KernelDiagnosticSite::CallArgument { call, .. }
+                | KernelDiagnosticSite::CallPass { call, .. } => {
+                    checked_expression_index(
+                        call,
+                        input.nodes.len(),
+                        "call diagnostic expression",
                     )?;
                 }
                 KernelDiagnosticSite::CallInput { .. } => {
@@ -3683,12 +4063,12 @@ pub fn compile_project_program_with_definition_facts(
                 resources,
                 calls: collect_call_artifacts(owner)?,
                 effects: collect_host_effect_artifacts(owner)?,
-                source_diagnostics: collect_source_diagnostic_artifacts(
+                diagnostics: collect_definition_diagnostic_artifacts(
                     owner_id,
                     owner,
                     &facts[owner_index],
                 )?,
-                basis_fingerprint_v2: definition_basis_fingerprint_with_buffer(
+                basis_fingerprint_v3: definition_basis_fingerprint_with_buffer(
                     owner,
                     &facts[owner_index],
                     &mut basis_fingerprint_scratch,
@@ -10106,6 +10486,162 @@ mod tests {
             .expect("source diagnostics seal into checked image");
         assert_eq!(checked.definitions[0].diagnostics, interfaces.diagnostics);
         assert!(checked.definitions[0].statements.is_empty());
+    }
+
+    #[test]
+    fn call_shape_failures_are_typed_without_constructing_a_call_node() {
+        let parameters = vec![
+            KernelCallShapeParameter {
+                ordinal: 0,
+                kind: KernelParameterKind::Value,
+                name: "first".into(),
+                optional: false,
+            },
+            KernelCallShapeParameter {
+                ordinal: 1,
+                kind: KernelParameterKind::Value,
+                name: "second".into(),
+                optional: false,
+            },
+        ]
+        .into_boxed_slice();
+        let resolution = KernelCallShapeResolution::Callable {
+            kind: KernelCallableKind::User,
+            parameters: parameters.clone(),
+            context_ordinal: None,
+            caller_context_ordinal: None,
+        };
+        let missing = project_kernel_call_shape(
+            &KernelCallShapeInput {
+                expression: KernelExpressionId(4),
+                function: "needs".into(),
+                pipe: false,
+                arguments: vec![KernelCallShapeArgument {
+                    source: KernelCallArgumentSource::CallArgument { ordinal: 0 },
+                    kind: KernelCallArgumentKind::Named,
+                    name: "first".into(),
+                }]
+                .into_boxed_slice(),
+                pass: false,
+            },
+            &resolution,
+        )
+        .expect("missing call entry is a diagnostic, not a build failure");
+        assert!(!missing.valid);
+        assert!(matches!(
+            missing.diagnostics.as_ref(),
+            [KernelDiagnosticInput {
+                site: KernelDiagnosticSite::Expression {
+                    expression: KernelExpressionId(4)
+                },
+                kind: KernelDiagnosticKind::MissingCallEntry { function, name },
+                ..
+            }] if function.as_ref() == "needs" && name.as_ref() == "second"
+        ));
+
+        let pipe = project_kernel_call_shape(
+            &KernelCallShapeInput {
+                expression: KernelExpressionId(8),
+                function: "needs".into(),
+                pipe: true,
+                arguments: vec![KernelCallShapeArgument {
+                    source: KernelCallArgumentSource::PipeArgument { ordinal: 0 },
+                    kind: KernelCallArgumentKind::Named,
+                    name: "second".into(),
+                }]
+                .into_boxed_slice(),
+                pass: false,
+            },
+            &resolution,
+        )
+        .expect("piped call shape");
+        assert!(pipe.valid);
+        assert_eq!(
+            pipe.matched_inputs.as_ref(),
+            [
+                KernelMatchedCallInput {
+                    source: KernelCallArgumentSource::PipeInput,
+                    formal_ordinal: 0,
+                },
+                KernelMatchedCallInput {
+                    source: KernelCallArgumentSource::PipeArgument { ordinal: 0 },
+                    formal_ordinal: 1,
+                },
+            ]
+        );
+
+        let unresolved = project_kernel_call_shape(
+            &KernelCallShapeInput {
+                expression: KernelExpressionId(9),
+                function: "mystery".into(),
+                pipe: false,
+                arguments: Box::new([]),
+                pass: false,
+            },
+            &KernelCallShapeResolution::Unresolved,
+        )
+        .expect("unresolved call is a typed fact");
+        assert!(!unresolved.valid);
+        assert!(matches!(
+            unresolved.diagnostics.as_ref(),
+            [KernelDiagnosticInput {
+                kind: KernelDiagnosticKind::UnresolvedCallable { function },
+                ..
+            }] if function.as_ref() == "mystery"
+        ));
+
+        let authoritative = project_kernel_call_shape(
+            &KernelCallShapeInput {
+                expression: KernelExpressionId(10),
+                function: "builtin".into(),
+                pipe: true,
+                arguments: Box::new([]),
+                pass: true,
+            },
+            &KernelCallShapeResolution::Callable {
+                kind: KernelCallableKind::Builtin,
+                parameters: vec![KernelCallShapeParameter {
+                    ordinal: 0,
+                    kind: KernelParameterKind::Out,
+                    name: "output".into(),
+                    optional: false,
+                }]
+                .into_boxed_slice(),
+                context_ordinal: None,
+                caller_context_ordinal: None,
+            },
+        )
+        .expect("authoritative call failures are typed facts");
+        assert!(!authoritative.valid);
+        assert!(matches!(
+            authoritative.diagnostics.as_ref(),
+            [
+                KernelDiagnosticInput {
+                    site: KernelDiagnosticSite::Expression {
+                        expression: KernelExpressionId(10)
+                    },
+                    kind: KernelDiagnosticKind::PipeWithoutValueInput { function },
+                    ..
+                },
+                KernelDiagnosticInput {
+                    kind: KernelDiagnosticKind::MissingCallEntry { name, .. },
+                    ..
+                },
+                KernelDiagnosticInput {
+                    site: KernelDiagnosticSite::CallPass {
+                        call: KernelExpressionId(10),
+                        pipe: true,
+                    },
+                    kind: KernelDiagnosticKind::PassOnAuthoritativeCallable {
+                        function: pass_function,
+                        callable_kind: KernelCallableKind::Builtin,
+                    },
+                    ..
+                },
+            ] if function.as_ref() == "builtin"
+                && pass_function.as_ref() == "builtin"
+                && name.as_ref() == "output"
+        ));
     }
 
     #[test]

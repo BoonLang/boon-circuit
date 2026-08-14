@@ -3314,6 +3314,53 @@ accepted for ownership and parity; in the permanent input model these syntax
 facts should be projected once with the immutable syntax revision rather than
 rescanned by a solver demand.
 
+The ordinary user-call target and lexical-shape diagnostic cut is now complete.
+The kernel owns one normalized matcher for direct and piped calls: resolved
+target kind, ordered VALUE/OUT formals, optionality, authored argument sources,
+explicit PASS, and inherited context are compact inputs. It publishes dense
+formal/source pairs only for a valid call. Unknown or ambiguous targets,
+missing/extra/misordered entries, bare VALUE bindings, pipes without a VALUE
+input, authoritative PASS misuse, and missing PASS context are typed diagnostic
+facts. An invalid user call remains a supported `Unknown` expression with no
+call artifact; it no longer ejects its entire owner from the dense project.
+Invalid arity is diagnosed even when the resolved user signature contains OUT
+parameters, while a shape-valid OUT or callback-arm frame remains explicitly
+unsupported until its lexical declaration equations migrate.
+
+The differential bridge now retains every same-spelling project callable
+candidate instead of overwriting one target in a map, so ambiguity is
+deterministic and never guessed. It also consults only cheap authoritative-name
+ownership from the builtin, render, and host-effect registries. This distinction
+is important: a valid authoritative call outside the current compact ABI remains
+explicitly unsupported and is not mislabeled as an unknown user function. The
+first implementation rebuilt the complete legacy owner ABI merely to obtain
+that name set; the measured debug projection cost rejected that design, and it
+was replaced with direct registry membership. The permanent
+`KernelProjectInput` must carry the same resolved link/ABI overlay without a
+dependency on the legacy typechecker.
+
+Parser-backed regressions prove exact production diagnostic equality, including
+argument and PASS anchors, for missing, extra, misordered, unresolved,
+ambiguous, missing-context, piped, and OUT-arity cases. A separate adversarial
+case proves a valid but unmigrated `Text/space` call remains unsupported. Typed
+call diagnostics participate in both definition basis and exact artifact
+currentness while preserving the public result fingerprint. The definition
+basis receipt is therefore V3 and artifact/currentness receipts are V5.
+
+The full NovyWave differential remains exact for all 1,389 owners with zero
+unsupported owners. Graph work is unchanged at 12,856 summary nodes, 448,132
+summary evaluations, 48,281 graph operations, and 85,159 activations. One fresh
+no-rebuild debug receipt records 2,556.920 ms diagnostics candidate time,
+including 2,383.917 ms kernel time, 989.565 ms graph solve, and 18.681 ms
+interface projection. The complete candidate records 3,001.830 ms, including
+2,828.827 ms kernel time, 508.869 ms owner projection, 802.684 ms program
+compile, and 417.271 ms checked-image publication. Machine load was also higher
+in this sample, so these numbers are not attributed as a call-matcher
+regression or a speed improvement. No optimized rebuild was spent on this
+semantic subcut; the preceding source-diagnostic checkpoint remains the latest
+release receipt. All 78 kernel tests, 93 non-ignored compiler unit tests, and 16
+compiler integration tests pass.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not
@@ -3336,13 +3383,16 @@ checker-wide flag day:
 2. Complete exact diagnostics in `KernelCheckedSnapshot`. Public callable
    substitutions, currentness receipts, dependency-cone rows, and the first
    call-input diagnostic family are complete. Source-expression syntax and
-   literal diagnostics plus their exact source presentation are also complete;
-   add pipeline/link, name-resolution, call-target/arity, builtin, and remaining
-   presentation facts. Owners containing an invalid call must still produce a
-   bounded artifact with an unknown result instead of becoming globally
-   unsupported. Extend Counter, TodoMVC, and NovyWave differential gates over
-   each new family before moving to the next one; collect whole mismatch
-   inventories instead of repairing one serialized failure per run.
+   literal diagnostics plus their exact source presentation are also complete,
+   as are ordinary user target resolution and lexical call-shape diagnostics.
+   Next project authoritative builtin/render/host signatures into the same
+   matcher, then add valid OUT/callback lexical equations, pipeline/link and
+   remaining name-resolution/presentation facts. Owners containing an invalid
+   call must still produce a bounded artifact with an unknown result instead of
+   becoming globally unsupported. Extend Counter, TodoMVC, and NovyWave
+   differential gates over each new family before moving to the next one;
+   collect whole mismatch inventories instead of repairing one serialized
+   failure per run.
 3. Freeze each public interface separately from its private compiled definition
    and fingerprint both once. Finish the permanent `KernelProjectInput`,
    one-revision `KernelSession`, and `CheckDemand` boundary without importing

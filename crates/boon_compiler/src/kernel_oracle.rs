@@ -9,20 +9,22 @@ use boon_checked::{
     Type, TypeDiagnostic, Variant, type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
-    KernelCallInputRole, KernelCallTarget, KernelCallTypeSubstitution, KernelCollectionKind,
-    KernelCompileWork, KernelDeclarationId, KernelDeclarationInput, KernelDeclarationKind,
-    KernelDeclarationOrigin, KernelDeclarationReference, KernelDefinitionFactsInput,
-    KernelDiagnosticKind, KernelDiagnosticSeverity, KernelDiagnosticSite, KernelExpressionId,
-    KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
-    KernelInheritedFormal, KernelLexicalAccess, KernelLexicalBindingInput,
-    KernelLexicalBindingTarget, KernelLexicalBindingTargetInput, KernelListId, KernelListInput,
-    KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
-    KernelOwnerProgramInput, KernelParameterKind, KernelPattern, KernelProjectInput,
-    KernelProjectProgramInput, KernelPureBuiltinKind, KernelRenderConstructorKind, KernelSolveWork,
-    KernelSourceId, KernelSourceInput, KernelStateId, KernelStateInput,
-    KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
-    KernelStatementParameter, KernelStatementReference, KernelValueReference,
-    is_kernel_host_effect, project_kernel_source_expression_diagnostics,
+    KernelCallArgumentKind, KernelCallArgumentSource, KernelCallInputRole, KernelCallShapeArgument,
+    KernelCallShapeInput, KernelCallShapeParameter, KernelCallShapeResolution, KernelCallTarget,
+    KernelCallTypeSubstitution, KernelCallableKind, KernelCollectionKind, KernelCompileWork,
+    KernelDeclarationId, KernelDeclarationInput, KernelDeclarationKind, KernelDeclarationOrigin,
+    KernelDeclarationReference, KernelDefinitionFactsInput, KernelDiagnosticKind,
+    KernelDiagnosticSeverity, KernelDiagnosticSite, KernelExpressionId, KernelExternalExpression,
+    KernelExternalTarget, KernelHostEffectArtifact, KernelInheritedFormal, KernelLexicalAccess,
+    KernelLexicalBindingInput, KernelLexicalBindingTarget, KernelLexicalBindingTargetInput,
+    KernelListId, KernelListInput, KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge,
+    KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelParameterKind,
+    KernelPattern, KernelProjectInput, KernelProjectProgramInput, KernelPureBuiltinKind,
+    KernelRenderConstructorKind, KernelSolveWork, KernelSourceId, KernelSourceInput, KernelStateId,
+    KernelStateInput, KernelStatementChildReference, KernelStatementId, KernelStatementInput,
+    KernelStatementKind, KernelStatementParameter, KernelStatementReference, KernelValueReference,
+    is_kernel_host_effect, is_registered_kernel_host_effect, project_kernel_call_shape,
+    project_kernel_source_expression_diagnostics,
 };
 use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
 use boon_syntax::{
@@ -73,6 +75,14 @@ pub struct KernelOwnerOracleDiagnostic {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KernelOwnerOracleDiagnosticSite {
     Expression(StableExpressionKey),
+    CallArgument {
+        call: StableExpressionKey,
+        source: KernelCallArgumentSource,
+    },
+    CallPass {
+        call: StableExpressionKey,
+        pipe: bool,
+    },
     CallInput {
         call: StableExpressionKey,
         target: StableCheckOwnerKey,
@@ -80,18 +90,25 @@ pub enum KernelOwnerOracleDiagnosticSite {
     },
 }
 
-/// Relocate and present the kernel-owned source-expression diagnostic family.
+/// Relocate and present kernel-owned source and lexical call diagnostics.
 ///
 /// Source positions remain unit-local in parser arenas. The compiler facade
 /// applies the immutable project layout exactly once; neither the kernel nor a
 /// legacy checked-program database needs globalized syntax rows.
-pub fn present_kernel_source_expression_diagnostic(
+pub fn present_kernel_source_diagnostic(
     project: &ProjectSyntaxSnapshot,
     owner: &StableCheckOwnerKey,
     diagnostic: &KernelOwnerOracleDiagnostic,
 ) -> Result<TypeDiagnostic, String> {
-    let KernelOwnerOracleDiagnosticSite::Expression(site) = &diagnostic.site else {
-        return Err("source-expression presentation received a non-expression site".to_owned());
+    let site = match &diagnostic.site {
+        KernelOwnerOracleDiagnosticSite::Expression(site)
+        | KernelOwnerOracleDiagnosticSite::CallArgument { call: site, .. }
+        | KernelOwnerOracleDiagnosticSite::CallPass { call: site, .. } => site,
+        KernelOwnerOracleDiagnosticSite::CallInput { .. } => {
+            return Err(
+                "source diagnostic presentation received a solved call-input site".to_owned(),
+            );
+        }
     };
     let view = project
         .owner_view(owner)
@@ -130,11 +147,102 @@ pub fn present_kernel_source_expression_diagnostic(
         KernelDiagnosticKind::ByteLiteralOutsideBytes => {
             "byte literals are only valid as direct BYTES constructor items".to_owned()
         }
+        KernelDiagnosticKind::UnresolvedCallable { function } => {
+            format!("unknown function `{function}`")
+        }
+        KernelDiagnosticKind::AmbiguousCallable {
+            function,
+            candidate_count,
+        } => format!(
+            "ambiguous function `{function}` has {candidate_count} equally ranked project targets"
+        ),
+        KernelDiagnosticKind::PipeWithoutValueInput { function } => {
+            format!("`{function}` has no ordinary input for the pipe")
+        }
+        KernelDiagnosticKind::UnexpectedCallEntry { function, name } => {
+            format!("`{function}` has an unexpected extra call entry `{name}`")
+        }
+        KernelDiagnosticKind::MisorderedCallEntry {
+            function,
+            position,
+            expected_name,
+            actual_name,
+        } => format!(
+            "`{function}` call entry {position} must be `{expected_name}`, found `{actual_name}`; arguments keep declaration names and order"
+        ),
+        KernelDiagnosticKind::MissingCallEntry { function, name } => {
+            format!("`{function}` is missing call entry `{name}`")
+        }
+        KernelDiagnosticKind::BareOrdinaryInput { name } => {
+            format!("bare `{name}` cannot fill ordinary input `{name}`; write `{name}: expression`")
+        }
+        KernelDiagnosticKind::PassOnAuthoritativeCallable {
+            function,
+            callable_kind,
+        } => format!(
+            "`PASS:` is only valid on user callable calls; `{function}` is {}",
+            match callable_kind {
+                KernelCallableKind::Builtin => "a built-in callable",
+                KernelCallableKind::External => "an external callable",
+                KernelCallableKind::User => "authoritative",
+            }
+        ),
+        KernelDiagnosticKind::MissingPassContext {
+            function,
+            root_call,
+        } => {
+            if *root_call {
+                format!("root call to `FUNCTION {function}` requires a final `PASS:` clause")
+            } else {
+                format!("call to `FUNCTION {function}` requires explicit or inherited PASS context")
+            }
+        }
         KernelDiagnosticKind::CallInputType { .. } => {
             return Err(
                 "source-expression presentation received a call-input diagnostic".to_owned(),
             );
         }
+    };
+    let (line, start, end) = match &diagnostic.site {
+        KernelOwnerOracleDiagnosticSite::Expression(_) => {
+            (expression.line, expression.start, expression.end)
+        }
+        KernelOwnerOracleDiagnosticSite::CallArgument { source, .. } => {
+            let argument = match (&expression.kind, source) {
+                (
+                    AstExprKind::Call { args, .. },
+                    KernelCallArgumentSource::CallArgument { ordinal },
+                )
+                | (
+                    AstExprKind::Pipe { args, .. },
+                    KernelCallArgumentSource::PipeArgument { ordinal },
+                ) => args.get(*ordinal as usize),
+                (_, KernelCallArgumentSource::PipeInput) => None,
+                _ => None,
+            }
+            .ok_or_else(|| "kernel call diagnostic has no exact argument anchor".to_owned())?;
+            (
+                view.physical_line_for_byte(argument.start)
+                    .ok_or_else(|| "kernel call argument has no physical source line".to_owned())?,
+                argument.start,
+                argument.end,
+            )
+        }
+        KernelOwnerOracleDiagnosticSite::CallPass { pipe, .. } => {
+            let pass = match &expression.kind {
+                AstExprKind::Call { pass, .. } if !*pipe => pass.as_ref(),
+                AstExprKind::Pipe { pass, .. } if *pipe => pass.as_ref(),
+                _ => None,
+            }
+            .ok_or_else(|| "kernel call diagnostic has no exact PASS anchor".to_owned())?;
+            (
+                view.physical_line_for_byte(pass.start)
+                    .ok_or_else(|| "kernel call PASS has no physical source line".to_owned())?,
+                pass.start,
+                pass.end,
+            )
+        }
+        KernelOwnerOracleDiagnosticSite::CallInput { .. } => unreachable!(),
     };
     Ok(TypeDiagnostic {
         severity: match diagnostic.severity {
@@ -143,15 +251,15 @@ pub fn present_kernel_source_expression_diagnostic(
         },
         line: layout
             .start_line
-            .checked_add(expression.line.saturating_sub(1))
+            .checked_add(line.saturating_sub(1))
             .ok_or_else(|| "kernel diagnostic global line overflowed".to_owned())?,
         start: layout
             .start_byte
-            .checked_add(expression.start)
+            .checked_add(start)
             .ok_or_else(|| "kernel diagnostic global start overflowed".to_owned())?,
         end: layout
             .start_byte
-            .checked_add(expression.end)
+            .checked_add(end)
             .ok_or_else(|| "kernel diagnostic global end overflowed".to_owned())?,
         message,
     })
@@ -332,11 +440,11 @@ pub struct KernelOwnerOracleReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
-    pub basis_fingerprint_v2: [u8; 32],
+    pub basis_fingerprint_v3: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v4: [u8; 32],
+    pub artifact_fingerprint_v5: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v4: [u8; 32],
+    pub fingerprint_v5: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -399,6 +507,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     let input_owners = owner_order.len();
     let callable_surfaces = project_callable_surfaces(project);
     let value_surfaces = project_value_surfaces(project);
+    let authoritative_builtins = boon_typecheck::BuiltinSignatureRegistry::default();
     let owner_projection_started = Instant::now();
     let mut direct_projection_elapsed = Duration::ZERO;
     let mut prepared = Vec::<PreparedOwner>::new();
@@ -415,8 +524,13 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         }
         let outcome = (|| {
             let direct_projection_started = Instant::now();
-            let compact =
-                compact_owner_view(view, source_payloads, &callable_surfaces, &value_surfaces);
+            let compact = compact_owner_view(
+                view,
+                source_payloads,
+                &callable_surfaces,
+                &authoritative_builtins,
+                &value_surfaces,
+            );
             direct_projection_elapsed += direct_projection_started.elapsed();
             compact
         })();
@@ -896,11 +1010,11 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 .zip(&artifact.currentness)
                 .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
                     owner: prepared[*prepared_index].owner.clone(),
-                    basis_fingerprint_v2: receipt.basis_fingerprint_v2,
+                    basis_fingerprint_v3: receipt.basis_fingerprint_v3,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v4: receipt.artifact_fingerprint_v4,
+                    artifact_fingerprint_v5: receipt.artifact_fingerprint_v5,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v4: receipt.fingerprint_v4,
+                    fingerprint_v5: receipt.fingerprint_v5,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -1236,6 +1350,18 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                                     KernelOwnerOracleDiagnosticSite::Expression(
                                         owner.expressions[expression.0 as usize].clone(),
                                     )
+                                }
+                                KernelDiagnosticSite::CallArgument { call, source } => {
+                                    KernelOwnerOracleDiagnosticSite::CallArgument {
+                                        call: owner.expressions[call.0 as usize].clone(),
+                                        source: *source,
+                                    }
+                                }
+                                KernelDiagnosticSite::CallPass { call, pipe } => {
+                                    KernelOwnerOracleDiagnosticSite::CallPass {
+                                        call: owner.expressions[call.0 as usize].clone(),
+                                        pipe: *pipe,
+                                    }
                                 }
                                 KernelDiagnosticSite::CallInput {
                                     call,
@@ -1641,10 +1767,12 @@ struct CallableSurface {
 struct CallableParameter {
     name: String,
     ordinal: usize,
-    value: bool,
+    kind: KernelParameterKind,
 }
 
-fn project_callable_surfaces(project: &ProjectSyntaxSnapshot) -> BTreeMap<String, CallableSurface> {
+fn project_callable_surfaces(
+    project: &ProjectSyntaxSnapshot,
+) -> BTreeMap<String, Box<[CallableSurface]>> {
     let definitions = project
         .item_index()
         .definitions()
@@ -1660,17 +1788,20 @@ fn project_callable_surfaces(project: &ProjectSyntaxSnapshot) -> BTreeMap<String
                 .then_some(owner)
         })
         .collect::<BTreeSet<_>>();
-    let callable_owner_by_name = definitions
-        .iter()
-        .flat_map(|entry| {
-            let owner = StableCheckOwnerKey::Item(entry.owner_key.clone());
-            entry
-                .names
-                .iter()
-                .cloned()
-                .map(move |name| (name, owner.clone()))
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut callable_owner_by_name = BTreeMap::<String, Vec<StableCheckOwnerKey>>::new();
+    for entry in &definitions {
+        let owner = StableCheckOwnerKey::Item(entry.owner_key.clone());
+        for name in &entry.names {
+            callable_owner_by_name
+                .entry(name.clone())
+                .or_default()
+                .push(owner.clone());
+        }
+    }
+    for candidates in callable_owner_by_name.values_mut() {
+        candidates.sort();
+        candidates.dedup();
+    }
     let mut callers_by_callee =
         BTreeMap::<StableCheckOwnerKey, BTreeSet<StableCheckOwnerKey>>::new();
     for entry in &definitions {
@@ -1686,7 +1817,11 @@ fn project_callable_surfaces(project: &ProjectSyntaxSnapshot) -> BTreeMap<String
                 } if pass.is_none() => function,
                 _ => return None,
             };
-            callable_owner_by_name.get(function).cloned()
+            let candidates = callable_owner_by_name.get(function)?;
+            let [callee] = candidates.as_slice() else {
+                return None;
+            };
+            Some(callee.clone())
         }) {
             callers_by_callee
                 .entry(callee)
@@ -1703,30 +1838,39 @@ fn project_callable_surfaces(project: &ProjectSyntaxSnapshot) -> BTreeMap<String
         }
     }
 
-    definitions
+    let mut surfaces = BTreeMap::<String, Vec<CallableSurface>>::new();
+    for entry in definitions {
+        let owner = StableCheckOwnerKey::Item(entry.owner_key.clone());
+        let context_ordinal = contexts.contains(&owner).then_some(entry.parameters.len());
+        for name in &entry.names {
+            surfaces
+                .entry(name.clone())
+                .or_default()
+                .push(CallableSurface {
+                    owner: owner.clone(),
+                    parameters: entry
+                        .parameters
+                        .iter()
+                        .map(|parameter| CallableParameter {
+                            name: parameter.name.clone(),
+                            ordinal: parameter.ordinal,
+                            kind: match parameter.kind {
+                                AstParameterKind::Value => KernelParameterKind::Value,
+                                AstParameterKind::Out => KernelParameterKind::Out,
+                            },
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                    context_ordinal,
+                });
+        }
+    }
+    surfaces
         .into_iter()
-        .flat_map(|entry| {
-            let owner = StableCheckOwnerKey::Item(entry.owner_key.clone());
-            let context_ordinal = contexts.contains(&owner).then_some(entry.parameters.len());
-            entry.names.iter().cloned().map(move |name| {
-                (
-                    name,
-                    CallableSurface {
-                        owner: owner.clone(),
-                        parameters: entry
-                            .parameters
-                            .iter()
-                            .map(|parameter| CallableParameter {
-                                name: parameter.name.clone(),
-                                ordinal: parameter.ordinal,
-                                value: parameter.kind == AstParameterKind::Value,
-                            })
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice(),
-                        context_ordinal,
-                    },
-                )
-            })
+        .map(|(name, mut candidates)| {
+            candidates.sort_by(|left, right| left.owner.cmp(&right.owner));
+            candidates.dedup_by(|left, right| left.owner == right.owner);
+            (name, candidates.into_boxed_slice())
         })
         .collect()
 }
@@ -1737,6 +1881,119 @@ fn owner_uses_passed_context(view: UnitOwnerSyntaxView<'_>) -> bool {
         AstExprKind::Path(path) => path.first().is_some_and(|root| root == "PASSED"),
         _ => false,
     })
+}
+
+fn compact_call_shape_input(
+    expression: KernelExpressionId,
+    syntax: &boon_syntax::AstExpr,
+) -> Result<KernelCallShapeInput, String> {
+    let (function, pipe, arguments, pass) = match &syntax.kind {
+        AstExprKind::Call {
+            function,
+            args,
+            pass,
+        } => (function, false, args, pass.as_ref()),
+        AstExprKind::Pipe { op, args, pass, .. } => (op, true, args, pass.as_ref()),
+        _ => return Err("call-shape projection received a non-call expression".to_owned()),
+    };
+    Ok(KernelCallShapeInput {
+        expression,
+        function: function.clone().into_boxed_str(),
+        pipe,
+        arguments: arguments
+            .iter()
+            .enumerate()
+            .map(|(ordinal, argument)| {
+                Ok(KernelCallShapeArgument {
+                    source: if pipe {
+                        KernelCallArgumentSource::PipeArgument {
+                            ordinal: checked_u32(ordinal, "pipe argument ordinal")?,
+                        }
+                    } else {
+                        KernelCallArgumentSource::CallArgument {
+                            ordinal: checked_u32(ordinal, "call argument ordinal")?,
+                        }
+                    },
+                    kind: match argument.kind {
+                        AstCallArgKind::Named => KernelCallArgumentKind::Named,
+                        AstCallArgKind::BareBinding => KernelCallArgumentKind::BareBinding,
+                    },
+                    name: argument.name.clone().into_boxed_str(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .into_boxed_slice(),
+        pass: pass.is_some(),
+    })
+}
+
+fn compact_call_shape_parameters(
+    surface: &CallableSurface,
+) -> Result<Box<[KernelCallShapeParameter]>, String> {
+    Ok(surface
+        .parameters
+        .iter()
+        .map(|parameter| {
+            Ok(KernelCallShapeParameter {
+                ordinal: checked_u32(parameter.ordinal, "callable parameter ordinal")?,
+                kind: parameter.kind,
+                name: parameter.name.clone().into_boxed_str(),
+                optional: false,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_boxed_slice())
+}
+
+fn prepared_call_shape_edges(
+    projection: &boon_compiler_kernel::KernelCallShapeProjection,
+    syntax: &boon_syntax::AstExpr,
+) -> Result<Vec<(KernelOwnerEdgeRole, PreparedInputReference)>, String> {
+    let (pipe_input, arguments, pass) = match &syntax.kind {
+        AstExprKind::Call { args, pass, .. } => (None, args, pass.as_ref()),
+        AstExprKind::Pipe {
+            input, args, pass, ..
+        } => (
+            Some(syntax.linked_input.unwrap_or(*input)),
+            args,
+            pass.as_ref(),
+        ),
+        _ => return Err("call-shape edges received a non-call expression".to_owned()),
+    };
+    let mut edges = projection
+        .matched_inputs
+        .iter()
+        .map(|matched| {
+            let value = match matched.source {
+                KernelCallArgumentSource::PipeInput => {
+                    pipe_input.ok_or_else(|| "direct call matched a pipe input".to_owned())?
+                }
+                KernelCallArgumentSource::CallArgument { ordinal }
+                | KernelCallArgumentSource::PipeArgument { ordinal } => arguments
+                    .get(ordinal as usize)
+                    .map(|argument| argument.value)
+                    .ok_or_else(|| {
+                        format!("call-shape matched missing argument ordinal {ordinal}")
+                    })?,
+            };
+            Ok((
+                KernelOwnerEdgeRole::CallArgument {
+                    ordinal: matched.formal_ordinal,
+                },
+                PreparedInputReference::Syntax(value),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if let Some(formal_ordinal) = projection.explicit_context_ordinal {
+        let pass = pass.ok_or_else(|| "call-shape selected an absent PASS value".to_owned())?;
+        edges.push((
+            KernelOwnerEdgeRole::CallArgument {
+                ordinal: formal_ordinal,
+            },
+            PreparedInputReference::Syntax(pass.value),
+        ));
+    }
+    Ok(edges)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1920,7 +2177,8 @@ fn local_value_surface_provider(
 fn compact_owner_view(
     view: UnitOwnerSyntaxView<'_>,
     source_payloads: &BTreeMap<String, Type>,
-    callable_surfaces: &BTreeMap<String, CallableSurface>,
+    callable_surfaces: &BTreeMap<String, Box<[CallableSurface]>>,
+    authoritative_builtins: &boon_typecheck::BuiltinSignatureRegistry,
     value_surfaces: &BTreeMap<String, Vec<ValueSurface>>,
 ) -> Result<PreparedOwner, String> {
     let owner = view.stable_key();
@@ -1932,6 +2190,7 @@ fn compact_owner_view(
     };
     let owner_context_ordinal = callable_surfaces
         .values()
+        .flatten()
         .find(|surface| surface.owner == owner)
         .and_then(|surface| surface.context_ordinal);
     let (root_statement_id, root_statement) = view
@@ -2237,6 +2496,7 @@ fn compact_owner_view(
     let mut external_by_key = BTreeMap::new();
     let mut external_expressions = Vec::new();
     let mut call_targets = Vec::new();
+    let mut call_shape_diagnostics = Vec::new();
     let node_count = raw_expressions.len() + usize::from(synthetic_result.is_some());
     let mut nodes = Vec::with_capacity(node_count);
     for (index, expression) in raw_expressions.iter().enumerate() {
@@ -2584,96 +2844,106 @@ fn compact_owner_view(
                         None,
                     )
                 }
-                AstExprKind::Call {
-                    function,
-                    args,
-                    pass,
+                AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
+                    if is_authoritative_callable_name(authoritative_builtins, function) =>
+                {
+                    return Err(format!(
+                        "authoritative callable `{function}` is not in the current compact ABI slice"
+                    ));
+                }
+                AstExprKind::Call { function, .. }
+                | AstExprKind::Pipe {
+                    op: function,
+                    arms: _,
+                    ..
                 } if callable_surfaces.contains_key(function) => {
-                    let surface = &callable_surfaces[function];
-                    if surface.parameters.iter().any(|parameter| !parameter.value) {
-                        return Err(
-                            "OUT call frames are not in the first call-composition slice"
-                                .to_owned(),
-                        );
-                    }
-                    let mut raw_edges = Vec::with_capacity(args.len());
-                    let mut supplied = BTreeSet::new();
-                    for argument in args {
-                        let parameter = surface
-                            .parameters
-                            .iter()
-                            .find(|parameter| parameter.name == argument.name)
-                            .ok_or_else(|| {
-                                format!(
-                                    "user call `{function}` has no formal named `{}`",
-                                    argument.name
-                                )
-                            })?;
-                        if !supplied.insert(parameter.ordinal) {
+                    let candidates = &callable_surfaces[function];
+                    let unique = match candidates.as_ref() {
+                        [surface] => Some(surface),
+                        [] => {
+                            return Err(format!("callable surface `{function}` has no candidates"));
+                        }
+                        _ => None,
+                    };
+                    let shape =
+                        compact_call_shape_input(checked_kernel_expression(index)?, expression)?;
+                    let resolution = match unique {
+                        Some(surface) => KernelCallShapeResolution::Callable {
+                            kind: KernelCallableKind::User,
+                            parameters: compact_call_shape_parameters(surface)?,
+                            context_ordinal: surface
+                                .context_ordinal
+                                .map(|ordinal| checked_u32(ordinal, "call context ordinal"))
+                                .transpose()?,
+                            caller_context_ordinal: owner_context_ordinal
+                                .map(|ordinal| checked_u32(ordinal, "caller context ordinal"))
+                                .transpose()?,
+                        },
+                        None => KernelCallShapeResolution::Ambiguous {
+                            candidate_count: checked_u32(
+                                candidates.len(),
+                                "ambiguous callable candidate count",
+                            )?,
+                        },
+                    };
+                    let projection = project_kernel_call_shape(&shape, &resolution)
+                        .map_err(|error| error.to_string())?;
+                    call_shape_diagnostics.extend(projection.diagnostics.iter().cloned());
+                    match (projection.valid, unique) {
+                        (true, Some(surface)) => {
+                            if matches!(&expression.kind, AstExprKind::Pipe { arms, .. } if !arms.is_empty())
+                            {
+                                return Err(
+                                    "valid user callable pipes with arms are not in the current call-composition slice"
+                                        .to_owned(),
+                                );
+                            }
+                            if surface
+                                .parameters
+                                .iter()
+                                .any(|parameter| parameter.kind == KernelParameterKind::Out)
+                            {
+                                return Err(
+                                    "valid OUT call frames are not in the current call-composition slice"
+                                        .to_owned(),
+                                );
+                            }
+                            let raw_edges = prepared_call_shape_edges(&projection, expression)?;
+                            (
+                                KernelOwnerNodeKind::UserCall {
+                                    target: KernelOwnerId(0),
+                                    inherited_formal: projection.inherited_formal,
+                                },
+                                raw_edges,
+                                Some(surface.owner.clone()),
+                                None,
+                            )
+                        }
+                        (true, None) => {
                             return Err(format!(
-                                "user call `{function}` repeats formal `{}`",
-                                parameter.name
+                                "ambiguous call `{function}` was accepted without one target"
                             ));
                         }
-                        raw_edges.push((
-                            KernelOwnerEdgeRole::CallArgument {
-                                ordinal: checked_u32(parameter.ordinal, "call argument ordinal")?,
-                            },
-                            PreparedInputReference::Syntax(argument.value),
-                        ));
+                        (false, _) => (KernelOwnerNodeKind::Unknown, Vec::new(), None, None),
                     }
-                    if supplied.len() != surface.parameters.len() {
-                        return Err(format!(
-                            "user call `{function}` supplies {} of {} formals",
-                            supplied.len(),
-                            surface.parameters.len()
-                        ));
-                    }
-                    let inherited_formal = match surface.context_ordinal {
-                        Some(target_ordinal) => match pass {
-                            Some(pass) => {
-                                raw_edges.push((
-                                    KernelOwnerEdgeRole::CallArgument {
-                                        ordinal: checked_u32(
-                                            target_ordinal,
-                                            "call context ordinal",
-                                        )?,
-                                    },
-                                    PreparedInputReference::Syntax(pass.value),
-                                ));
-                                None
-                            }
-                            None => {
-                                let caller_ordinal = formal_by_name.get("PASSED").copied().ok_or_else(
-                                || {
-                                    format!(
-                                        "root call to `{function}` requires an explicit PASS context"
-                                    )
-                                },
-                            )?;
-                                Some(KernelInheritedFormal {
-                                    target_ordinal: checked_u32(
-                                        target_ordinal,
-                                        "inherited target context ordinal",
-                                    )?,
-                                    caller_ordinal: checked_u32(
-                                        caller_ordinal,
-                                        "inherited caller context ordinal",
-                                    )?,
-                                })
-                            }
-                        },
-                        None => None,
-                    };
-                    (
-                        KernelOwnerNodeKind::UserCall {
-                            target: KernelOwnerId(0),
-                            inherited_formal,
-                        },
-                        raw_edges,
-                        Some(surface.owner.clone()),
-                        None,
-                    )
+                }
+                AstExprKind::Call { .. } => {
+                    let shape =
+                        compact_call_shape_input(checked_kernel_expression(index)?, expression)?;
+                    let projection =
+                        project_kernel_call_shape(&shape, &KernelCallShapeResolution::Unresolved)
+                            .map_err(|error| error.to_string())?;
+                    call_shape_diagnostics.extend(projection.diagnostics.iter().cloned());
+                    (KernelOwnerNodeKind::Unknown, Vec::new(), None, None)
+                }
+                AstExprKind::Pipe { op, arms, .. } if !(op == "WHILE" && !arms.is_empty()) => {
+                    let shape =
+                        compact_call_shape_input(checked_kernel_expression(index)?, expression)?;
+                    let projection =
+                        project_kernel_call_shape(&shape, &KernelCallShapeResolution::Unresolved)
+                            .map_err(|error| error.to_string())?;
+                    call_shape_diagnostics.extend(projection.diagnostics.iter().cloned());
+                    (KernelOwnerNodeKind::Unknown, Vec::new(), None, None)
                 }
                 _ => (
                     compact_ast_kind(
@@ -3012,7 +3282,7 @@ fn compact_owner_view(
         )?;
     definition_facts.declarations = declarations;
     definition_facts.lexical_bindings = lexical_bindings;
-    definition_facts.diagnostics =
+    let mut diagnostics =
         project_kernel_source_expression_diagnostics(raw_expressions.iter().enumerate().map(
             |(index, expression)| {
                 (
@@ -3023,7 +3293,10 @@ fn compact_owner_view(
                 )
             },
         ))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .into_vec();
+    diagnostics.extend(call_shape_diagnostics);
+    definition_facts.diagnostics = diagnostics.into_boxed_slice();
     let (resource_owner_targets, resource_synthetic_paths) = compact_resource_facts(
         view,
         &owner,
@@ -5969,6 +6242,16 @@ fn render_constructor_kind(function: &str) -> Option<KernelRenderConstructorKind
         "Scene/Element/button" => KernelRenderConstructorKind::Fixed("Button".into()),
         _ => return None,
     })
+}
+
+fn is_authoritative_callable_name(
+    builtins: &boon_typecheck::BuiltinSignatureRegistry,
+    function: &str,
+) -> bool {
+    builtins.is_authoritative_callable(function)
+        || boon_checked::is_registered_render_constructor(function)
+        || is_registered_kernel_host_effect(function)
+        || matches!(function, "SessionInfo/status" | "SessionInfo/principal")
 }
 
 fn pure_builtin_kind(function: &str) -> Option<KernelPureBuiltinKind> {
@@ -9642,9 +9925,8 @@ mod tests {
                     .expect("byte diagnostic remains available"),
             ),
         ] {
-            let presented =
-                present_kernel_source_expression_diagnostic(&project, &owner.owner, diagnostic)
-                    .expect("kernel source diagnostic presentation");
+            let presented = present_kernel_source_diagnostic(&project, &owner.owner, diagnostic)
+                .expect("kernel source diagnostic presentation");
             assert!(
                 checked
                     .report
@@ -9655,6 +9937,240 @@ mod tests {
                 checked.report.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn invalid_user_calls_remain_supported_unknown_owners_with_exact_diagnostics() {
+        let source = concat!(
+            "FUNCTION needs(first, second) {\n",
+            "    first\n",
+            "}\n",
+            "FUNCTION contextual() {\n",
+            "    PASSED.value\n",
+            "}\n",
+            "FUNCTION out_only(item: OUT) {\n",
+            "    1\n",
+            "}\n",
+            "missing: needs(first: 1)\n",
+            "extra: needs(first: 1, second: 2, extra: 3)\n",
+            "misordered: needs(second: 2, first: 1)\n",
+            "unknown: mystery(value: 1)\n",
+            "missing_pass: contextual()\n",
+            "missing_out: out_only()\n",
+            "piped: 1 |> needs(second: 2)\n",
+            "authoritative_unmigrated: Text/space()\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse invalid-call diagnostic fixture");
+        let oracle = kernel_owner_oracle(&project);
+        let parsed = parse_source("app/RUN.bn", source).expect("parse legacy invalid-call fixture");
+        let whole_checked = boon_typecheck::check_program(&parsed);
+        let mut session = crate::CompilerSession::new();
+        let project_id = session
+            .open_project(crate::CompilerProject::new(
+                "app/RUN.bn",
+                vec![crate::CompilerSourceUnit {
+                    path: "app/RUN.bn".to_owned(),
+                    source: source.to_owned(),
+                }],
+                crate::TargetProfile::SoftwareDefault,
+                crate::ProgramRole::Server,
+                crate::ApplicationIdentity::compiler_default(),
+            ))
+            .expect("open invalid-call diagnostic project");
+        let revision = session.revision(project_id).expect("diagnostic revision");
+        let checked = session
+            .request(
+                project_id,
+                revision,
+                crate::CompileIntent::Diagnostics,
+                &crate::CancellationToken::new(),
+            )
+            .expect("production diagnostics check invalid calls");
+        let checked = checked
+            .diagnostics()
+            .expect("diagnostics request publishes diagnostics");
+        let owner_named = |name: &str| {
+            oracle
+                .supported
+                .iter()
+                .find(|owner| {
+                    matches!(&owner.owner, StableCheckOwnerKey::Item(key) if key.item_route.segments().last().is_some_and(|segment| segment.names.as_ref() == [name]))
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "invalid-call owner `{name}` must remain supported: {:#?}",
+                        oracle.unsupported
+                    )
+                })
+        };
+
+        assert!(
+            oracle.unsupported.iter().any(|(owner, reason)| {
+                matches!(owner, StableCheckOwnerKey::Item(key) if key.item_route.segments().last().is_some_and(|segment| segment.names.as_ref() == ["authoritative_unmigrated"]))
+                    && reason.contains("authoritative callable `Text/space`")
+            }),
+            "a valid authoritative call outside the compact ABI must remain explicitly unsupported, not become an unknown user call: {:#?}",
+            oracle.unsupported
+        );
+
+        for name in [
+            "missing",
+            "extra",
+            "misordered",
+            "unknown",
+            "missing_pass",
+            "missing_out",
+        ] {
+            let owner = owner_named(name);
+            assert_eq!(owner.result.ty, Type::Unknown, "{name} result");
+            assert!(
+                owner.calls.is_empty(),
+                "invalid call must not publish a checked call artifact: {name}"
+            );
+            assert!(
+                !owner.diagnostics.is_empty(),
+                "invalid call must publish typed diagnostics: {name}"
+            );
+            for diagnostic in &owner.diagnostics {
+                let presented =
+                    present_kernel_source_diagnostic(&project, &owner.owner, diagnostic)
+                        .expect("invalid call diagnostic presentation");
+                assert!(
+                    checked
+                        .diagnostics()
+                        .iter()
+                        .any(|legacy| legacy == &presented),
+                    "kernel call diagnostic must equal one legacy diagnostic exactly\n  owner: {name}\n  kernel: {presented:#?}\n  legacy: {:#?}",
+                    checked.diagnostics()
+                );
+            }
+        }
+        assert!(
+            whole_checked.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.message == "`needs` is missing call entry `second`"
+            }),
+            "independent whole checker must retain the same missing-input authority"
+        );
+        assert!(matches!(
+            owner_named("missing").diagnostics.as_ref(),
+            [KernelOwnerOracleDiagnostic {
+                kind: KernelDiagnosticKind::MissingCallEntry { function, name },
+                ..
+            }] if function.as_ref() == "needs" && name.as_ref() == "second"
+        ));
+        assert!(matches!(
+            owner_named("extra").diagnostics.as_ref(),
+            [KernelOwnerOracleDiagnostic {
+                site: KernelOwnerOracleDiagnosticSite::CallArgument {
+                    source: KernelCallArgumentSource::CallArgument { ordinal: 2 },
+                    ..
+                },
+                kind: KernelDiagnosticKind::UnexpectedCallEntry { function, name },
+                ..
+            }] if function.as_ref() == "needs" && name.as_ref() == "extra"
+        ));
+        assert!(matches!(
+            owner_named("unknown").diagnostics.as_ref(),
+            [KernelOwnerOracleDiagnostic {
+                kind: KernelDiagnosticKind::UnresolvedCallable { function },
+                ..
+            }] if function.as_ref() == "mystery"
+        ));
+        assert!(matches!(
+            owner_named("missing_pass").diagnostics.as_ref(),
+            [KernelOwnerOracleDiagnostic {
+                kind: KernelDiagnosticKind::MissingPassContext {
+                    function,
+                    root_call: true,
+                },
+                ..
+            }] if function.as_ref() == "contextual"
+        ));
+        assert!(matches!(
+            owner_named("missing_out").diagnostics.as_ref(),
+            [KernelOwnerOracleDiagnostic {
+                kind: KernelDiagnosticKind::MissingCallEntry { function, name },
+                ..
+            }] if function.as_ref() == "out_only" && name.as_ref() == "item"
+        ));
+        let piped = owner_named("piped");
+        assert_eq!(piped.result.ty, Type::Number);
+        assert!(piped.diagnostics.is_empty());
+        assert!(matches!(piped.calls.as_ref(), [_]));
+    }
+
+    #[test]
+    fn ambiguous_user_call_is_a_typed_unknown_result_without_target_guessing() {
+        let source = concat!(
+            "FUNCTION choose(value) {\n",
+            "    value\n",
+            "}\n",
+            "FUNCTION choose(value) {\n",
+            "    value\n",
+            "}\n",
+            "result: choose(value: 1)\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse ambiguous callable fixture");
+        let oracle = kernel_owner_oracle(&project);
+        let result = oracle
+            .supported
+            .iter()
+            .find(|owner| {
+                matches!(&owner.owner, StableCheckOwnerKey::Item(key) if key.item_route.segments().last().is_some_and(|segment| segment.names.as_ref() == ["result"]))
+            })
+            .unwrap_or_else(|| panic!("ambiguous caller must remain supported: {:#?}", oracle.unsupported));
+        assert_eq!(result.result.ty, Type::Unknown);
+        assert!(result.calls.is_empty());
+        let [diagnostic] = result.diagnostics.as_ref() else {
+            panic!("ambiguous call must emit one typed diagnostic")
+        };
+        assert!(matches!(
+            &diagnostic.kind,
+            KernelDiagnosticKind::AmbiguousCallable {
+                function,
+                candidate_count: 2,
+            } if function.as_ref() == "choose"
+        ));
+
+        let mut session = crate::CompilerSession::new();
+        let project_id = session
+            .open_project(crate::CompilerProject::new(
+                "app/RUN.bn",
+                vec![crate::CompilerSourceUnit {
+                    path: "app/RUN.bn".to_owned(),
+                    source: source.to_owned(),
+                }],
+                crate::TargetProfile::SoftwareDefault,
+                crate::ProgramRole::Server,
+                crate::ApplicationIdentity::compiler_default(),
+            ))
+            .expect("open ambiguous diagnostic project");
+        let revision = session
+            .revision(project_id)
+            .expect("ambiguous diagnostic revision");
+        let checked = session
+            .request(
+                project_id,
+                revision,
+                crate::CompileIntent::Diagnostics,
+                &crate::CancellationToken::new(),
+            )
+            .expect("production ambiguous diagnostics");
+        let presented = present_kernel_source_diagnostic(&project, &result.owner, diagnostic)
+            .expect("ambiguous diagnostic presentation");
+        assert!(
+            checked
+                .diagnostics()
+                .expect("ambiguous diagnostics product")
+                .diagnostics()
+                .iter()
+                .any(|legacy| legacy == &presented),
+            "kernel ambiguity must equal the production diagnostic: {presented:#?}"
+        );
     }
 
     #[test]
@@ -10940,7 +11456,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v4 != [0; 32]),
+                        && receipt.fingerprint_v5 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(

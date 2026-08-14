@@ -19457,6 +19457,34 @@ pub fn check_project_runtime_program_profiled_with_external_types(
     )
 }
 
+/// Projects the parser-owned SOURCE payload ABI without constructing a
+/// checker database or running either type solver.
+///
+/// SOURCE payload shape is a whole-project syntax/host contract. Keeping this
+/// pass separate lets dense compiler components consume the closed ABI without
+/// paying for legacy owner inference merely to discover event fields.
+pub fn project_source_payload_abi_types(
+    program: &ProjectSyntaxSnapshot,
+) -> Result<BTreeMap<String, Type>, Box<[TypeDiagnostic]>> {
+    let program = TypecheckSyntaxProgram::UnitNative(program.clone());
+    let source_sites = syntax_source_sites(&program);
+    let source_paths = source_sites
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<BTreeSet<_>>();
+    let source_payload_lookup = SourcePayloadPathLookup::new(&source_paths);
+    let (host_ports, diagnostics) = host_port_table(&program, &source_payload_lookup);
+    if !diagnostics.is_empty() {
+        return Err(diagnostics.into_boxed_slice());
+    }
+    Ok(
+        source_payload_shape_table(&program, &source_sites, &source_payload_lookup, &host_ports)
+            .into_iter()
+            .map(|entry| (entry.source_path, entry.payload_type))
+            .collect(),
+    )
+}
+
 fn check_program_profiled_syntax(
     program: &TypecheckSyntaxProgram,
 ) -> (CheckOutput, TypeCheckProfile) {

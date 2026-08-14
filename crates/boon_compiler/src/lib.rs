@@ -20,6 +20,8 @@ use web_time::Instant;
 
 mod distributed_compiler;
 mod document_plan_backend;
+#[cfg(any(test, feature = "test-kernel-oracle"))]
+mod kernel_oracle;
 mod machine_plan_backend;
 mod session;
 
@@ -27,6 +29,12 @@ pub use distributed_compiler::{
     CompiledDistributedMachinePlans, DistributedClientProjectionSource, DistributedCompilerProgram,
     compile_distributed_runtime_source_programs,
     compile_distributed_runtime_source_programs_with_client_projection,
+};
+#[cfg(feature = "test-kernel-oracle")]
+#[doc(hidden)]
+pub use kernel_oracle::{
+    KernelOwnerOracleEntry, KernelOwnerOracleReport, KernelOwnerOracleTimings, kernel_owner_oracle,
+    kernel_owner_oracle_with_source_payloads, profile_kernel_owner_oracle_with_source_payloads,
 };
 pub use session::{
     CancellationToken, CompileIntent, CompilerProject, CompilerSession, CompilerSessionResult,

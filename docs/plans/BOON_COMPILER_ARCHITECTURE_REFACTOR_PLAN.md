@@ -2030,6 +2030,641 @@ versus linker, and runnable model versus builder/executor. Each split still
 requires a measured Rust rebuild-cone reduction and cannot stand in for Boon
 latency evidence.
 
+### Eleventh High-Level Audit: Greenfield Dense Compiler Kernel
+
+The 2026-08-13 implementation checkpoint starts the replacement engine in this
+repository as `boon_compiler_kernel`. A separate repository is rejected: the
+new engine needs the same parser contracts, checked type vocabulary, stable
+identities, differential fixtures, and flag-day consumers. Keeping it here also
+lets each migrated owner be compared against the current compiler before the
+old implementation is deleted. The kernel is dependency-bottom and currently
+depends only on `boon_checked`; an architecture test forbids dependencies on
+the parser, typechecker, semantic, verifier, IR, plan, or compiler crates.
+
+The first vertical slice is deliberately not a wrapper around `TypeUnifier`.
+It owns:
+
+- an immutable, hash-consed type-term DAG with dense `u32` IDs;
+- compact variables and packed operations instead of source nodes and generic
+  edge-role searches during evaluation;
+- one reverse-consumer CSR index and a mutation-driven work queue;
+- explicit single-writer directional publication (`Union`,
+  `StructuralWiden`, and exact `Replace`) plus symmetric `Unify`;
+- detached projection equations, including empty-path reads, so provider
+  epochs refresh chained consumers without treating old producer holes as
+  consumer requirements;
+- one component solve spanning cross-owner expression references without
+  reconstructing or recursively dispatching an owner evaluator.
+
+The differential harness is test-only and feature-gated as
+`test-kernel-oracle`; normal compiler binaries do not contain it and there is no
+production fallback. Its first version imported legacy owner constraint seeds.
+That bridge has now been deleted. The harness projects its supported subset
+straight from borrowed parser owner views into the compact kernel program; it
+does not construct `OwnerSyntaxInput`, a lexical plan, `OwnerConstraintSeed`, an
+interface result, or a body transfer graph. Closed `SOURCE` payloads remain
+explicit ABI inputs, but those inputs are now projected by a separate
+parser/host-contract pass without constructing a checker database or running
+either old type solver. The old compiler runs only after the candidate path as
+the differential oracle and contributes no candidate input. Unsupported owners
+are classified explicitly and recursively removed from the supported component
+rather than silently falling back.
+
+The direct parser slice also has invocation-local formals and acyclic user-call
+composition. Every call allocates a fresh formal frame and compiles the callee
+nodes into the caller's component. A recursive backedge may address only the
+callee principal frame; the evaluator never recursively dispatches an owner.
+A parser-backed differential calls one generic function with Number and Text
+and proves that the two result records remain independently specialized.
+Formal occurrences and formal requirements live in separate invocation-local
+frames: projected reads flow from the supplied actual, while constraints found
+inside the callee flow back through the requirement frame without replacing or
+sharing the actual's provider root. The compact program now also owns mode
+equations, cyclic HOLD structural widening, numeric/boolean infix residuals,
+and compiled singleton-pattern selection. These are work-queue operations, not
+recursive re-entry into an owner evaluator. Generic match-arm correlation,
+OUT formals, block-local lexical bindings, and most builtin ABIs remain explicit
+unsupported boundaries.
+
+The ignored NovyWave probe is the repeatable timing and semantic gate:
+
+```bash
+cargo test -p boon_compiler --features test-kernel-oracle \
+  kernel_oracle::tests::novywave_kernel_timing_probe -- \
+  --ignored --exact --nocapture
+cargo test --release -p boon_compiler --features test-kernel-oracle \
+  kernel_oracle::tests::novywave_kernel_timing_probe -- \
+  --ignored --exact --nocapture
+```
+
+It times source-bundle loading, unit-native parsing, the independent direct
+SOURCE-ABI projection, owner projection, dependency pruning, dense program
+compilation, solve, and artifact projection independently. The old compiler
+runs afterward only as the differential oracle and is timed outside every
+candidate total. The probe also reports owner coverage,
+operation/activation/mutation counts, and ranked unsupported classes. Timing
+values never enter the deterministic report. Rust test compilation time is
+reported by Cargo separately and is not counted as Boon compilation latency.
+
+The first 2026-08-13 release probe exposed the old bridge rather than the new
+solver: 294.365 ms of a 298.094 ms kernel request was owner projection, while
+dense compile plus solve took 1.244 ms. Splitting that projection showed, in a
+debug build, approximately 850 ms in legacy constraint-seed construction and
+360 ms in legacy owner-syntax projection. Deleting the constraint seed reduced
+the debug kernel request from approximately 1.26 s to 469 ms. Deleting the
+owner-syntax artifact and projecting directly from parser views reduced it
+again to 25--56 ms in subsequent debug samples, depending on the enabled call
+slice and differential checks.
+
+The current call-composition release slice solves 216 of 1,397 NovyWave owners
+exactly in 13.473 ms of kernel time: 9.236 ms direct projection, 0.332 ms program
+compilation, 1.211 ms solve, and 0.731 ms artifact projection. Unit-native parse
+was 78.563 ms and the independent SOURCE ABI pass was 10.439 ms, making the
+candidate compile 102.475 ms after source loading or 105.818 ms including the
+3.343 ms bundle read. The old compiler differential oracle took 272.626 ms and
+is outside the candidate total. A debug sample was 207.833 ms after source
+loading versus 1,080.897 ms for the old oracle. The same slice performs 483
+operations, 990 activations, and 507 mutations. Every supported NovyWave owner
+and expression is compared with the current checked artifact, alpha-normalized
+within its owner; an empty-LIST mismatch found by this gate repaired the kernel
+before these measurements were accepted. The optimized Rust test rebuild took
+1 minute 58 seconds and is intentionally reported separately from every Boon
+timing above.
+
+The release breakdown changes the next speed priority. Dense compilation and
+solving are only about 1.5 ms combined; cold parsing is roughly 77% of the
+candidate path. `CompilerSession` already retains unchanged immutable unit
+snapshots, so the probe must not misrepresent that 79 ms as an unavoidable warm
+cost. On the retained project snapshot, the still-full SOURCE ABI plus kernel
+passes total 23.912 ms. The next cut must install these artifacts in the typed
+session request graph and measure one changed unit/affected SCC; merely rerunning
+the cold probe would ignore existing parser reuse, while micro-optimizing the
+1.2 ms solver would optimize the wrong layer. Cold one-shot workflows can then
+attack snapshot construction separately.
+
+Counter and TodoMVC retain exact supported-subgraph parity at 10 of 24 and 13
+of 43 owners. Their direct debug kernel requests are now approximately 1--3 ms,
+down from the initial seed-bridge observations of approximately 16 ms and 57
+ms. All numbers remain directional migration-slice receipts, not a production
+compiler speed claim: most NovyWave owners are still explicitly unsupported,
+and no production request has cut over.
+
+The next measured boundary, after direct PASSED composition, cyclic HOLD,
+infix, and compiled selector residuals, solves 366 of 1,397 NovyWave owners.
+The 2026-08-13 release sample is:
+
+- 3.572 ms source-bundle loading;
+- 87.699 ms cold unit-native parsing;
+- 12.539 ms independent SOURCE-ABI projection;
+- 19.067 ms owner projection, of which 18.475 ms is direct syntax projection;
+- 3.673 ms dependency pruning;
+- 1.304 ms dense program compilation;
+- 8.349 ms work-queue solve;
+- 1.093 ms artifact projection;
+- 39.766 ms total kernel time, 52.305 ms on a retained parsed snapshot, and
+  143.576 ms cold including bundle loading;
+- 299.932 ms for the separate old-compiler differential oracle.
+
+This is approximately 2.1x faster than the old checker on that cold partial
+slice, but it is not a whole-compiler speedup: 1,031 owners are still rejected
+or dependency-pruned, and semantic construction, verification, and planning
+have not cut over. The optimized Rust rebuild for this checkpoint took about
+89 seconds and is reported separately.
+
+An intermediate debug sample after adding parser-native render-constructor residuals
+projected 854 owners but still solved 366 because every newly admitted render
+owner depended on an unsupported owner. It measured 9.158 ms bundle loading,
+98.275 ms parse, 55.052 ms SOURCE ABI, 95.491 ms owner projection, 8.945 ms
+dependency pruning, 6.326 ms dense compilation, 60.480 ms solve, 2.892 ms
+artifact projection, and 350.299 ms cold candidate total versus 1,084.254 ms
+for the old oracle. That checkpoint prevents a misleading coverage claim and
+sets the next target: shared builtin/pipe residuals and lexical/block closure,
+not additional render-constructor special cases.
+
+The next accepted boundary adds one compiled pure-builtin residual family,
+more render constructors, and identity-preserving nested projection. Repeated
+PASSES through the same nested path now retain one alpha even when unrelated
+sibling projections are interleaved; the solver no longer recursively
+materializes an unresolved scaffold before unifying it. The debug NovyWave
+sample solves 402 owners and leaves 995 unsupported, with only five direct Call
+and five direct Pipe rejections. It measured 9.342 ms bundle loading, 98.844 ms
+parse, 54.564 ms SOURCE ABI, 96.624 ms owner projection, 10.373 ms dependency
+pruning, 9.484 ms dense compilation, 57.497 ms solve, 3.090 ms artifact
+projection, and 353.458 ms cold candidate total versus 1,088.866 ms for the old
+oracle.
+
+The corresponding optimized sample solves the same 402 owners with 3.482 ms
+bundle loading, 78.139 ms parse, 9.947 ms SOURCE ABI, 17.092 ms owner
+projection, 4.273 ms dependency pruning, 1.854 ms dense compilation, 8.474 ms
+solve, and 0.931 ms artifact projection. Kernel time is 37.595 ms, the retained
+snapshot candidate is 47.542 ms, and the cold candidate including bundle
+loading is 129.163 ms. The separate old oracle is 259.449 ms, so this partial
+cold path is approximately 2.0x faster. The optimized Rust rebuild took 69
+seconds and remains outside the Boon timings. The program has 3,766 compact
+operations, 7,598 activations, 4,043 mutations, and 20,256 dynamic dependency
+edges. These counts and timings are the new baseline; they are not a production
+or whole-compiler speed claim.
+
+The next architecture checkpoint adds replayable authored-order record spreads,
+structural widening across union members, and the first call-residual sharing
+cuts. Coverage rises from 436 to 583 of 1,397 NovyWave owners. This is a useful
+warning against comparing partial slices only by wall time: the newly admitted
+call graph expanded the transitional flat component from 7,211 to 69,029
+operations. Before simplifying the representation, the accepted release probe
+measured 365.454 ms of kernel work: 35.573 ms projection, 67.408 ms program
+compilation, 246.881 ms solve, and 2.607 ms artifact projection. The matching
+debug solve used 1,827.973 ms. This regression is coverage-driven residual
+duplication, not evidence that record overlays themselves are expensive.
+
+The first systematic deletion pass now:
+
+- reuses a definition's principal result when its complete result cone is
+  formal-independent;
+- aliases invocation formals directly to caller provider roots and memoizes an
+  identical `(definition, actual roots, static selector surface)` application,
+  while preserving private occurrence and requirement roots for genuinely
+  different calls;
+- replaces per-operation recursive live-dependency discovery with a compact
+  variable-to-dependent-variable graph updated only when a binding changes;
+- keeps exact publications, records, projections, and equality constraints as
+  lazy immutable term-DAG links, resolving only the outer shape required by an
+  operation and materializing recursively at artifact output.
+
+The accepted post-cut release probe keeps all 583 results and differential
+checks green while reducing the flat program to 65,044 operations. It measures
+3.461 ms bundle loading, 80.984 ms parsing, 10.869 ms SOURCE ABI projection,
+29.400 ms owner projection, 5.102 ms dependency pruning, 70.021 ms program
+compilation, 135.186 ms solve, and 2.663 ms artifact projection. Kernel work is
+248.334 ms; the retained-snapshot candidate is 259.203 ms and the cold candidate
+including bundle loading is 343.648 ms. The independent old oracle used
+258.089 ms in the same process. The comparable debug checkpoint reports
+1,754.848 ms kernel work and a 1,216.810 ms solve. Dynamic dependency storage is
+55,814 edges rather than the pre-cut 204,627, although lazy links intentionally
+cause 139,263 cheap activations. These timings are still a partial diagnostics
+slice, not a production speed claim.
+
+The flat component remains transitional. A 65k-operation program for 583 owner
+results still embeds callee operations per distinct invocation frame, and its
+70 ms compile plus 135 ms solve already consumes almost the whole final
+diagnostics envelope before complete coverage. The next flag-day cut is one
+compiled typed residual module per definition/SCC plus compact invocation
+frames. Acyclic calls reference modules; they do not clone operation payloads.
+Frame-local cells preserve call isolation, recursive edges address the SCC's
+principal fallback, and only demanded outputs instantiate work. The lazy term
+DAG and binding-dependency graph remain the evaluation substrate. Do not spend
+the next tranche tuning BTreeMap lookups inside the flat representation and do
+not admit another large semantic family until modular operation/frame counts
+and timing are reported.
+
+A follow-up scheduler cut removes the last allocation-heavy work-queue path.
+The old `schedule_variable` created a set and vector, traversed transitive
+binding dependencies, then sorted and deduplicated operation IDs for every
+mutation. The replacement retains generation-stamped variable visitation and
+one reusable traversal stack; the existing queued bitset directly deduplicates
+operations. Traversal remains deterministic because CSR consumers and binding
+dependents are stored in canonical order. Immutable operation payloads are also
+shared and evaluated by reference rather than cloning boxed inputs on every
+activation.
+
+The accepted release result after that cut is 197.174 ms of kernel work:
+31.358 ms owner projection, 5.134 ms pruning, 71.207 ms flat-program compile,
+80.946 ms solve, and 2.579 ms artifact projection. SOURCE ABI projection adds
+10.890 ms, making the retained-snapshot candidate 208.064 ms. Cold parsing is
+81.881 ms and bundle loading 3.400 ms, making the partial cold candidate
+293.345 ms. The old parse/typecheck oracle took 250.457 ms in the same process.
+The comparable debug solve falls from 1,216.810 ms to 442.356 ms and total
+kernel work from 1,754.848 ms to 970.296 ms. Work remains 65,044 operations,
+139,210 activations, 80,709 mutations, and 55,814 binding-dependency edges;
+the speedup therefore comes from deleting scheduler overhead, not from doing
+less semantic work or reducing coverage.
+
+This makes the next boundary unambiguous. Solve is no longer catastrophically
+more expensive than compilation; flattened residual construction and
+evaluation are now comparable 71/81 ms owners. Shared definition modules and
+compact frames must remove both together. A representation that merely makes
+the current operation loop a few percent faster is insufficient, because
+complete owner coverage and later semantic/plan consumers have not yet entered
+the timing envelope.
+
+The shared-module boundary now exists. Each definition principal and each
+distinct `(definition, static selector surface)` specialization compiles one
+immutable typed residual module. Invocation occurrences retain only compact
+variable frames and linker tables; they do not clone the module's operation
+payload. Module forward dependencies are computed once and remapped at link
+time. The mutable solver state is separated from immutable executable code, so
+hot evaluation borrows shared operations directly. Projection instructions can
+write directly into their declared occurrence, deleting the former
+projection-temporary plus equality/publication adapter pair. The final linker
+orders the initial pass from single writers and module forward dependencies;
+the ordinary mutation queue handles only subsequent propagation and the nine
+instructions outside the acyclic prefix.
+
+The physical/logical counters prove this is architectural sharing rather than
+a timing-only change. NovyWave uses 769 residual type modules and 2,283 frames.
+Their 13,796 physical operations serve 58,540 linked operations (4.24x reuse),
+and 18,381 physical module terms serve 52,087 linked terms (2.83x reuse).
+58,531 of 58,540 linked operations receive a provider-before-consumer initial
+order. Compared with the accepted flat checkpoint, linked operations fall from
+65,044 to 58,540, activations from 139,210 to 109,988, mutations from 80,709 to
+58,606, and dynamic binding-dependency edges from 55,814 to 13,303. The
+remaining activation mix is 28,358 equality, 50,438 publication, 17,585
+projection, 7,682 selection, and 5,925 record activations.
+
+A three-run debug checkpoint keeps all 583 results exact. Its median is
+809.282 ms of kernel work: 162.612 ms owner projection, 15.682 ms dependency
+pruning, 330.046 ms compile/link, 281.681 ms solve, and 8.139 ms artifact
+projection. SOURCE ABI makes the retained-snapshot median 863.889 ms; parse and
+bundle loading make the cold median 971.766 ms. The debug numbers are retained
+for edit-loop direction, not release acceptance.
+
+The accepted optimized checkpoint measures 3.443 ms bundle loading, 80.787 ms
+parsing, 11.578 ms SOURCE ABI, 29.659 ms owner projection, 5.629 ms pruning,
+83.134 ms compile/link, 56.238 ms solve, and 2.676 ms artifact projection.
+Kernel work is 183.211 ms, the retained-snapshot candidate is 194.789 ms, and
+the cold candidate is 279.019 ms. The independent old oracle took 259.238 ms in
+the same process and remains outside candidate latency. Against the best flat
+checkpoint, modular kernel and retained-snapshot time improve by about 7% and
+solve improves by about 31%, while compile/link rises from 71.207 ms to
+83.134 ms. That shift is intentional evidence for the next cut: compile one
+immutable definition/SCC result summary plus compact residual module instead
+of recompiling/relinking equivalent call surfaces inside one cold request.
+Cross-revision persistence and currentness remain deliberately later than the
+complete cold checker gate. The optimized Rust rebuild took 1 minute 28
+seconds and is outside all Boon timings.
+
+The 2026-08-14 semantic expansion reaches 718 of 1,397 NovyWave owners. It also
+exposes the next representation multiplier: 947 physical residual modules with
+17,336 operations are linked through 4,931 frames into 137,993 executable
+operations. Only 17 linked operations are outside the static acyclic prefix.
+Before the scheduler cut, a three-run debug median used 2,054 ms of kernel time,
+including 751 ms to compile/link and 1,060 ms to solve, with 263,896 operation
+activations. This is coverage-driven frame expansion; it must not be compared
+to the smaller 583-owner checkpoint as if it were the same workload.
+
+The solver now installs equality/scaffold equations once before directional
+providers, never schedules those persistent equations as reactive work, and
+does not reschedule the currently executing operation merely because it wrote
+its own acyclic output. The 17 cyclic operations retain ordinary self-replay.
+This reduces deterministic work to 145,326 activations for 137,993 operations.
+A runtime attempt to rebuild the whole DAG through canonicalized nested binding
+dependencies was measured and deleted: it increased solve time to 1,431 ms and
+dynamic edges to 64,279. The retained split is both smaller and faster.
+
+The accepted three-run debug median after this cut is 1,683 ms kernel time:
+194 ms owner projection, 29 ms dependency pruning, 760 ms compile/link, 678 ms
+solve, and 7 ms artifact projection. SOURCE ABI makes the retained-snapshot
+median 1,741 ms; parsing and bundle loading make the cold median 1,848 ms. At
+the same 718-owner coverage this improves kernel time by about 18%, solve by
+about 36%, and cold candidate time by about 17%.
+
+The corresponding optimized median is 3.447 ms bundle loading, 77.803 ms
+parsing, 10.392 ms SOURCE ABI, 33.898 ms owner projection, 9.012 ms dependency
+pruning, 181.839 ms compile/link, 166.426 ms solve, and 2.778 ms artifact
+projection. Kernel work is 399.667 ms, the retained-snapshot candidate is
+410.031 ms, and the cold candidate is 491.005 ms. The independent old oracle
+used 249.099 ms in the same process and remains outside candidate latency. This
+partial kernel is therefore not yet a whole-compiler speed win: the next large
+cut must eliminate linked frame expansion and make the 17,336 physical module
+operations immutable definition/SCC artifacts rather than optimize the
+remaining 5% replay. Warm persistence is not an acceptance shortcut for this
+cold-path cut.
+
+The first frame-expansion cut reuses every formal-independent expression from
+the definition principal, not only a wholly formal-independent result. An
+invocation allocates cells and mode variables only for the result cone that can
+actually observe one of its actuals; constant and otherwise independent
+subexpressions remain immutable shared principal authorities. NovyWave records
+43,776 such expression reuses. Residual module operations fall from 17,336 to
+15,300, linked operations from 137,993 to 93,044, activations from 145,326 to
+100,261, and linked terms from 121,618 to 79,646. A focused two-call test proves
+that Number and Text occurrence fields remain isolated while their shared
+constant field is computed once.
+
+The accepted post-sharing debug median is 1,462 ms kernel time: 192 ms owner
+projection, 29 ms pruning, 595 ms compile/link, 620 ms solve, and 7 ms artifact
+projection. The retained-snapshot candidate is 1,516 ms and the cold candidate
+is 1,624 ms. Against the first 718-owner baseline, kernel time improves by about
+29%, compile/link by about 21%, solve by about 42%, and cold time by about 27%.
+
+The corresponding optimized median is 3.372 ms bundle loading, 78.480 ms
+parsing, 10.013 ms SOURCE ABI, 33.697 ms owner projection, 8.921 ms pruning,
+137.677 ms compile/link, 146.279 ms solve, and 2.684 ms artifact projection.
+Kernel work is 333.824 ms, the retained-snapshot candidate is 343.784 ms, and
+the cold candidate is 425.766 ms. The old differential oracle used 249.771 ms.
+This remains a partial migration rather than a speed claim: 679 owners are
+still unsupported or dependency-pruned, while the new path already carries
+4,201 specialized invocation frames and 190,208 live variables. The next large
+cut is an immutable result/type summary per definition specialization, so
+callers do not instantiate mutable cells for the same result transfer
+repeatedly. Persistent revision currentness and backdating begin only after the
+complete cold checker passes its parity and performance gates.
+
+A premature cross-revision module cache was measured and deleted. Its retained
+full-owner keys improved a second identical run but added cloning/hashing to the
+authoritative cold path; the optimized cold median regressed to about 352 ms of
+kernel work and 150 ms of compile/link. Warm hits cannot justify that ordering,
+and no retained compiler cache remains in this checkpoint. The existing dense
+`SpecializationKey` map continues to share one module per definition/static
+surface within a cold request without treating structurally identical unrelated
+owners as cache entries.
+
+The first immutable definition-summary cut makes specialization reachability an
+allocation authority. Invocation frames now allocate expression and mode cells
+only for the formal-dependent nodes reachable from that specialized result;
+unreachable dependent arms reuse the immutable principal slots and receive no
+occurrence state. NovyWave prunes 116,521 such cells, reducing live variables
+from 190,208 to 73,687 while keeping the same 93,044 operations, 100,261
+activations, and exact 718-owner differential. A focused eight-arm generic call
+proves seven unselected dependent arms allocate no occurrence cells. Solved
+rows are now published as immutable `DefinitionArtifact`s inside one
+`KernelCheckedSnapshot`; global solve work is owned once by the snapshot rather
+than repeated on definition rows.
+
+The accepted three-run debug median is 1,440.068 ms kernel time: 193.246 ms
+owner projection, 29.615 ms pruning, 580.305 ms compile/link, 613.499 ms solve,
+and 7.088 ms artifact projection. SOURCE ABI makes the retained parsed-snapshot
+median 1,496.243 ms; parse and bundle loading make the cold median 1,603.788 ms.
+
+The corresponding optimized median is 3.399 ms bundle loading, 77.314 ms
+parsing, 10.298 ms SOURCE ABI, 33.756 ms owner projection, 8.724 ms pruning,
+130.864 ms compile/link, 140.179 ms solve, and 2.703 ms artifact projection.
+Kernel work is 321.768 ms, the retained parsed-snapshot candidate is 332.066 ms,
+and the cold candidate is 414.231 ms. Against the preceding accepted release
+checkpoint, kernel work improves by about 3.6%, compile/link by about 4.9%, and
+the cold candidate by about 2.7%; the larger result is deleting 61% of live
+solver variables before complete coverage.
+
+The complete-owner expansion on 2026-08-14 changes the scale again and replaces
+the preceding partial-slice timing baseline. The kernel now solves 1,388 of
+1,397 NovyWave owners; the remaining nine are explicit unsupported boundaries,
+not legacy fallbacks. Before the next normalization cut, a candidate-only
+release request used 3,722.8 ms of kernel work: 691 ms to compile/link and
+2,965 ms to solve. It contained 380,276 live variables, 488,259 linked
+instructions, 85,823 scheduled work items, 996,846 instruction activations,
+642,535 mutations, and 1,240,886 dynamic dependency edges. The comparable
+debug request used 25,176 ms. These complete-slice receipts supersede every
+smaller-coverage result for speed claims.
+
+Two residual scheduling experiments were measured and deleted rather than
+allowed to accumulate as cleverness in the hot path. Omitting frame-internal
+reverse edges and manually propagating locally reduced an optimized request to
+3,382 ms, but it detached equality/binding-dependent flows and changed
+`store.active_metadata_format` from `Text` to `Text | Var`. Restoring exact
+per-instruction reverse edges recovered parity but increased debug kernel work
+to 28,253 ms despite fewer activations. The accepted representation therefore
+keeps one coarse scheduled work item for a fully acyclic residual frame and
+instruction-grained replay only for the cyclic tail. Queue refinements are not
+the current speed owner.
+
+The first complete-slice definition normalization instead removes authored
+adapter cells before linking. Invocation-only MATCH arms that are used solely
+as WHEN arms alias their exact output; principal frames still materialize every
+authored expression for checked artifacts. LIST, SET, and MAP construction now
+uses one packed collection instruction that widens item/key/value inputs
+directly into the final collection authority. It deletes the intermediate
+structural-widen cell and final publication while retaining empty LIST's open
+object item and language-neutral Unknown SET/MAP defaults. Focused tests prove
+heterogeneous structural widening, precise producer isolation, empty
+collections, and one-instruction MAP construction.
+
+The fresh accepted release receipt after those cuts is 3,622.678 ms of kernel
+work: 705.996 ms compile/link and 2,850.805 ms solve. The graph contains
+355,947 variables, 463,930 linked instructions, 85,777 scheduled work items,
+907,302 activations, 599,982 mutations, and 1,227,049 dynamic dependency
+edges. Relative to the complete-owner baseline this deletes 24,329 variables
+and instructions, removes 89,544 activations, improves solve by about 3.9%, and
+improves kernel time by about 2.7%; compile/link is slightly worse and remains
+red. The matching debug receipt is 24,759.170 ms of kernel work, including
+3,270.068 ms compile/link and 21,156.957 ms solve. The dominant residual is
+`NovyView/tree_row`: its 65-instruction module is linked through 419 frames for
+27,235 logical instructions, down from 72/30,168 before packed collections.
+
+All 40 kernel tests pass. The full NovyWave differential still stops at the one
+known pre-existing mode mismatch: `store.focused_control_label` HOLD expression
+3 is `PresentOrAbsent` in the kernel and `Continuous` in the current checker.
+No new type, expression, collection, or checked-artifact mismatch was exposed
+by the normalization cuts. Candidate-only timing deliberately skips parity and
+must never be reported as parity-certified.
+
+The next large cut is a compiled parametric result summary per definition and
+static selector surface. Pure acyclic constructors such as `tree_row` must be
+represented once as summary bytecode over formal slots, with explicit
+projection/backflow outputs, rather than allocating and linking 65 mutable
+expression cells for each of 419 calls. Principal checked rows remain complete;
+invocations request only the public result, requirements, modes, effects, and
+state identities they actually consume. This is the intended bridge from the
+current shared residual modules to `DefinitionArtifact` plus compact invocation
+frames. Do not claim success by recursively interpreting source nodes at each
+call or by caching a fully expanded frame across revisions.
+
+A measured negative prototype locks that last rule. Extending the existing
+recursive direct-result compiler across WHEN, collections, render constructors,
+and pure builtins reduced residual frames from 26,129 to 4,203, but emitted its
+summary operations afresh at every call. Variables rose from 355,947 to
+724,442, linked instructions from 463,930 to 1,039,702, and debug kernel time
+from 24,759 ms to 40,691 ms. The prototype was deleted immediately. The shared
+summary must be an immutable compiled module with compact actual/result and
+requirement relocations; a recursive source walk is not an intermediate
+implementation of that architecture.
+
+The accepted parametric-summary cut implements that missing ownership seam.
+Each eligible definition now owns one immutable `KernelSummaryProgram`; call
+occurrences carry only actual input terms and one result publication. Its lazy,
+memoized bytecode supports constants, records and spreads, LIST/SET/MAP,
+requirements, authored sequencing, MATCH/WHEN selection, render records,
+fixed-result pure ABI operations, external authorities, and nested pure user
+calls. A singleton WHEN evaluates only its selected arm, so an unselected arm
+cannot impose its requirements. Cycles fail closed. Principal checked rows
+remain complete, and unsupported summary shapes use the ordinary compiled
+frame rather than a recursive source interpreter. The obsolete per-call
+recursive summary fallback was deleted in the same cut.
+
+On the complete 1,388/1,397-owner NovyWave surface, 4,127 call occurrences use
+shared summaries. Linked instructions fall from 463,930 to 265,751, live
+variables from 355,947 to 200,771, activations from 907,302 to 465,696, and
+mutations from 599,982 to 349,185. Debug kernel work falls from 24,759.170 ms to
+19,285.573 ms: compile/link falls from 3,202.321 ms at the immediate shared-
+summary foundation to 1,466.288 ms, and solve falls from 21,493.146 ms to
+17,507.556 ms. The optimized kernel falls from 3,622.678 ms to 2,595.897 ms:
+296.171 ms compile/link and 2,235.931 ms solve. Parse plus SOURCE ABI plus the
+kernel is 2,684.253 ms in that release sample. This is about 28% lower release
+kernel wall time and roughly half the mutable graph/work, not yet the final
+250 ms diagnostics gate.
+
+All 41 kernel tests pass, including a direct adversarial proof that an
+unselected summary arm cannot constrain its input. The complete differential
+again reaches only the known `store.focused_control_label` HOLD expression 3
+mode mismatch (`PresentOrAbsent` versus the current checker's `Continuous`),
+with no earlier type or artifact divergence. The next dominant cost is no
+longer residual module linking: solve owns 2,235.931 ms, 235,570 projection
+activations, and 1,132,755 dynamic dependency edges. Summary inputs still
+materialize standalone projection operations and requirement scaffolds before
+the bytecode runs. Move those projections into the lazy summary invocation,
+subscribe the invocation directly to provider roots, and delete the separate
+projection/unify adapters. This must preserve detached authoritative reads,
+nested requirement backflow, late provider replay, and branch laziness.
+
+That lazy-input cut is now accepted. A summary call stores one compact
+provider/path program per demanded formal read and allocates only its private
+consumer cells. It subscribes directly to the provider root and evaluates a
+path only when selected bytecode demands the input. Standalone adapter
+projections and requirement unifications disappear. On the same complete
+NovyWave surface, variables fall to 148,875, linked instructions to 98,697,
+activations to roughly 212,000, and projection activations to 75,085. The
+optimized kernel falls to 2,003.834 ms (176.971 ms compile/link and 1,766.403
+ms solve); parse plus SOURCE ABI plus kernel is 2,094.665 ms. Focused tests lock
+unselected-path laziness and nested requirement backflow.
+
+The following dependency cut replaces append-only inferred edges with an
+exact bidirectional binding dependency table. Replacing a binding first
+removes its old reverse edges, variable union transfers authority without
+copying stale dependents, and queue exhaustion remains the sole convergence
+rule. Active dynamic edges fall from 1,063,222 to 100,825 without changing the
+checked differential. Summary coverage then expands across pure infix,
+transparent THEN/Arrow, and dynamic text sequencing. That deletes the repeated
+`NovyView/file_tree_row_label` residual and leaves 127,122 variables, 66,524
+linked instructions, 14,410 scheduled work items, 153,727 activations, and
+91,072 live dynamic edges. The first release median after that expansion was
+about 2,075 ms, slightly slower than the 2,004 ms lazy-input sample despite the
+smaller graph, so it was not recorded as a speed win. Telemetry exposed the
+reason: 10,582 summary activations still recursively dispatched 1,142,399
+summary nodes, while term resolution performed 1,708,489 intern lookups and
+91.9% of structural-widen requests hit an existing result.
+
+The accepted dense-term execution cut removes hash/set allocation from this
+shared path. Term resolution, cycle checks, and exact dependency extraction
+now use reusable generation-stamped arrays. Every immutable term also carries
+one derived `has_variable` bit; a closed type bypasses recursive resolution,
+occurs traversal, dependency traversal, and reconstruction entirely. This is
+term-DAG metadata owned once by the arena, not a cross-request result cache.
+Debug kernel work falls first from 13,060.471 ms to 11,411.164 ms with dense
+scratch storage, then to 9,170.181 ms with closed-term bypass; solve falls from
+11,744.630 ms to 7,834.660 ms. Intern requests fall from 1,708,489 to 1,087,621
+with identical operations, activations, mutations, and outputs.
+
+Three fresh no-rebuild optimized samples after the full cut record kernel times
+of 1,455.195, 1,420.421, and 1,402.469 ms (median 1,420.421 ms). Their complete
+parse plus SOURCE ABI plus kernel times are 1,551.670, 1,506.496, and 1,489.286
+ms (median 1,506.496 ms). The median solve is 1,181.592 ms and compile/link is
+178.593 ms. Against the first complete optimized kernel receipt of 3,722.8 ms,
+the greenfield path is about 62% faster and is now inside the plan's 0.8--2.0 s
+first-kernel milestone. This is not checker cutover readiness: nine owners
+remain explicitly unsupported and the complete differential still stops at
+the same pre-existing `store.focused_control_label` HOLD mode mismatch, with no
+earlier type or artifact divergence. All 44 kernel tests pass.
+
+The next large speed slice is to replace recursive summary-DAG dispatch with a
+packed linear execution plan and to give high-frequency immutable term shapes
+direct typed indexes, guided by the retained counters. In parallel, the
+remaining residual-module ranking must keep shrinking; a smaller interpreter
+cannot substitute for compiling each definition once. Release improvement is
+accepted only when the complete candidate path improves, not merely when graph
+counts fall.
+
+Run the debug probe after each meaningful semantic slice. Run the release probe
+at architecture boundaries or when a debug profile changes materially; do not
+spend a full optimized rebuild on every small edit. Keep the latest accepted
+debug and release receipts in this section, including solved/unsupported counts
+and rebuild time, so a faster partial slice cannot be confused with a faster
+complete compiler.
+
+The next migration is architecture-first, but production changes only in one
+checker-wide flag day:
+
+1. Add one compact builtin/pipe ABI residual layer and use it for the ranked
+   NovyWave surface, beginning with pure Text, Number, List, and Field
+   operations. Keep host/effect calls explicit until their effect contract is
+   compiled; never rediscover ABI semantics by walking rich checker objects.
+2. Close block-local lexical bindings, transparent statement sequencing, OUT
+   formals, pattern-binding projections, and correlated generic match-arm
+   selection. Keep the ranked unsupported inventory decreasing monotonically;
+   never insert a fallback.
+3. Project complete interface SCCs directly from immutable syntax/link
+   artifacts into the dense program. Freeze each public interface separately
+   from its private residual program and fingerprint both once. SCC-by-SCC
+   execution is an internal differential strategy only; it cannot become a
+   production pilot or fallback.
+4. Run Counter, TodoMVC, and then NovyWave differentials over every SCC and
+   owner kind. Require exact public and expression flow types, diagnostics,
+   calls/effects/state/list/source facts, dependency cones, stable output,
+   deterministic work counts, and no nested owner dispatch for acyclic code.
+5. Finish the permanent `KernelProjectInput`, one-revision `KernelSession`,
+   `CheckDemand`, `DefinitionArtifact`, and `KernelCheckedSnapshot` boundary.
+   Require complete coverage, fresh-process determinism, NovyWave cold
+   diagnostics below two seconds, and zero provider-wide scans, separate body
+   solves, and source-shaped residual interpretation. Warm caches do not count
+   toward these gates.
+6. Perform one checker-wide production cutover. In the same tranche delete all
+   legacy owner interface/body unifier machinery, flow/capture replay,
+   source-shaped residual preparation and recursive evaluation, duplicate
+   checked-row reconstruction, and superseded session requests/fingerprint
+   domains. The old implementation may remain only as explicitly test-gated
+   oracle code until the final parity suite is archived; it is never a
+   production fallback.
+
+Renderer semantics are a separate ABI migration, not a language special case.
+`NoElement` is an ordinary user/library tag. The existing checker currently
+recognizes that spelling in structural widening and render validation only as
+legacy built-in UI coupling; the dense kernel deliberately does not. Likewise,
+`Type::RenderContract` is a compiler-owned wildcard used by the hard-coded
+Document/Scene constructor registry, not a source-level data type. Replace both
+mechanisms flag-day with an explicit renderer/library ABI that supplies callable
+signatures and accepted slot shapes to the typechecker/backend. Then delete
+`Type::RenderContract`, the built-in renderable tag/name tables, and all
+`NoElement` name tests from the core type algebra. Different UI libraries must
+be free to use another absence convention or no absence tag at all.
+
+Based on the measured old call amplification (1,251 requested roots becoming
+18,690 owner evaluations, 17,439 nested frames, and 235,484 residual source-node
+visits), eliminating recursive acyclic dispatch should make the owner
+interface/body portion roughly 3--8x faster. With the remaining parse,
+checked-row, and diagnostics work still present, the first whole diagnostics
+cut is estimated at 2--5x. These are planning ranges, not acceptance evidence.
+The 250 ms diagnostics and one-second verified goals still require the direct
+parser projection, real persistent request evaluator, demand-owned definition
+artifacts, thin linking, and deletion of the rich semantic/Manifest assembly
+described above.
+
 ## Architectural Decisions
 
 ### 1. Activation Is A First-Class Output, Not An Empty Mount

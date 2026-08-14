@@ -11,9 +11,13 @@ default = []
 # is absent from ordinary compiler binaries and cannot become a runtime
 # fallback.
 test-flat-oracle = ["boon_semantic/test-flat-oracle"]
+# Enables the bounded dense-kernel differential producer. It is absent from
+# ordinary compiler binaries and cannot become a runtime fallback.
+test-kernel-oracle = ["dep:boon_compiler_kernel"]
 
 [dependencies]
 boon_checked.workspace = true
+boon_compiler_kernel = { workspace = true, optional = true }
 boon_compilation_db.workspace = true
 boon_contract.workspace = true
 boon_data.workspace = true
@@ -34,6 +38,7 @@ unicode-segmentation.workspace = true
 web-time.workspace = true
 
 [dev-dependencies]
+boon_compiler_kernel.workspace = true
 boon_document.workspace = true
 boon_plan_executor.workspace = true
 

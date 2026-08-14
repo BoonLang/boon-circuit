@@ -462,6 +462,39 @@ impl<'a> UnitOwnerSyntaxView<'a> {
         unit_statement_by_local_id(self.fields, statement, 0)
     }
 
+    /// Return the canonical value produced by one finalized parser statement.
+    ///
+    /// This is the same statement-sequencing authority used while linking
+    /// multiline pipelines. The returned id follows this view's raw or packed
+    /// syntax namespace. Function declarations intentionally have no value at
+    /// their declaration site; use [`Self::statement_body_result_expression`]
+    /// when projecting a callable's body result.
+    pub fn statement_value_expression(&self, statement: UnitLocalStatementId) -> Option<usize> {
+        let statement = self.statement_for_local(statement)?;
+        statement_value_expression_with(statement, &|expression| {
+            let expression = self.local_expression_id(expression)?;
+            self.fields.ast.expressions.get(expression.as_usize())
+        })
+    }
+
+    /// Return the canonical final value of a statement's executable body.
+    ///
+    /// Unlike [`Self::statement_value_expression`], this deliberately enters a
+    /// function body while still excluding nested function declarations from
+    /// the surrounding statement sequence.
+    pub fn statement_body_result_expression(
+        &self,
+        statement: UnitLocalStatementId,
+    ) -> Option<usize> {
+        let statement = self.statement_for_local(statement)?;
+        statement_sequence_values_with(&statement.children, &|expression| {
+            let expression = self.local_expression_id(expression)?;
+            self.fields.ast.expressions.get(expression.as_usize())
+        })
+        .last()
+        .copied()
+    }
+
     /// Return the stable check owner of any unit-local statement. This is the
     /// statement counterpart of `stable_check_owner_for_syntax_expression` and
     /// is intended for exact cross-owner containment authority.
@@ -4256,6 +4289,15 @@ fn statement_pipeline_continuation_target(
     statement: &AstStatement,
     expressions: &[AstExpr],
 ) -> Option<usize> {
+    statement_pipeline_continuation_target_with(statement, &|expression| {
+        expressions.get(expression)
+    })
+}
+
+fn statement_pipeline_continuation_target_with<'a>(
+    statement: &AstStatement,
+    expression: &impl Fn(usize) -> Option<&'a AstExpr>,
+) -> Option<usize> {
     if matches!(
         statement.kind,
         AstStatementKind::Function { .. }
@@ -4266,7 +4308,7 @@ fn statement_pipeline_continuation_target(
     ) {
         return None;
     }
-    pipeline_placeholder_target(statement.expr?, expressions)
+    pipeline_placeholder_target_with(statement.expr?, expression)
 }
 
 fn normalize_unlinked_unary_negation(expressions: &mut [AstExpr], work: &ParseWorkRecorder) {
@@ -4296,12 +4338,15 @@ fn statement_is_pipeline_continuation(statement: &AstStatement, expressions: &[A
     statement_pipeline_continuation_target(statement, expressions).is_some()
 }
 
-fn pipeline_placeholder_target(expr_id: usize, expressions: &[AstExpr]) -> Option<usize> {
-    let expression = expressions.get(expr_id)?;
-    if expression.linked_input.is_some() && matches!(expression.kind, AstExprKind::Infix { .. }) {
+fn pipeline_placeholder_target_with<'a>(
+    expr_id: usize,
+    expression: &impl Fn(usize) -> Option<&'a AstExpr>,
+) -> Option<usize> {
+    let node = expression(expr_id)?;
+    if node.linked_input.is_some() && matches!(node.kind, AstExprKind::Infix { .. }) {
         return Some(expr_id);
     }
-    let input = match &expression.kind {
+    let input = match &node.kind {
         AstExprKind::Pipe { input, .. }
         | AstExprKind::Then { input, .. }
         | AstExprKind::When { input, .. }
@@ -4316,13 +4361,10 @@ fn pipeline_placeholder_target(expr_id: usize, expressions: &[AstExpr]) -> Optio
         } => return None,
         _ => return None,
     };
-    if expressions
-        .get(input)
-        .is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter))
-    {
+    if expression(input).is_some_and(|input| matches!(input.kind, AstExprKind::Delimiter)) {
         Some(expr_id)
     } else {
-        pipeline_placeholder_target(input, expressions)
+        pipeline_placeholder_target_with(input, expression)
     }
 }
 
@@ -4782,12 +4824,21 @@ fn expression_owns_statement_children(expr_id: usize, expressions: &[AstExpr]) -
 }
 
 fn statement_sequence_values(statements: &[AstStatement], expressions: &[AstExpr]) -> Vec<usize> {
+    statement_sequence_values_with(statements, &|expression| expressions.get(expression))
+}
+
+fn statement_sequence_values_with<'a>(
+    statements: &[AstStatement],
+    expression: &impl Fn(usize) -> Option<&'a AstExpr>,
+) -> Vec<usize> {
     let mut values = Vec::new();
     for statement in statements {
-        let Some(value) = statement_value_expression(statement, expressions) else {
+        let Some(value) = statement_value_expression_with(statement, expression) else {
             continue;
         };
-        if statement_is_pipeline_continuation(statement, expressions) && !values.is_empty() {
+        if statement_pipeline_continuation_target_with(statement, expression).is_some()
+            && !values.is_empty()
+        {
             *values.last_mut().expect("non-empty values") = value;
         } else {
             values.push(value);
@@ -4797,37 +4848,40 @@ fn statement_sequence_values(statements: &[AstStatement], expressions: &[AstExpr
 }
 
 fn statement_value_expression(statement: &AstStatement, expressions: &[AstExpr]) -> Option<usize> {
+    statement_value_expression_with(statement, &|expression| expressions.get(expression))
+}
+
+fn statement_value_expression_with<'a>(
+    statement: &AstStatement,
+    expression: &impl Fn(usize) -> Option<&'a AstExpr>,
+) -> Option<usize> {
     // A function declaration owns an executable body but contributes no value
     // at its declaration site. Never let its body tail leak into an enclosing
     // BLOCK/LIST or statement sequence as an implicit structural result.
     if matches!(statement.kind, AstStatementKind::Function { .. }) {
         return None;
     }
-    if statement
-        .expr
-        .and_then(|expr_id| expressions.get(expr_id))
-        .is_some_and(|expr| {
-            matches!(
-                &expr.kind,
-                AstExprKind::Block { .. }
-                    | AstExprKind::Object(_)
-                    | AstExprKind::ListLiteral { .. }
-                    | AstExprKind::BytesLiteral { .. }
-                    | AstExprKind::MapLiteral { .. }
-                    | AstExprKind::SetLiteral { .. }
-                    | AstExprKind::Flush { .. }
-                    | AstExprKind::Hold { .. }
-                    | AstExprKind::Latest { .. }
-                    | AstExprKind::When { .. }
-                    | AstExprKind::Then { .. }
-                    | AstExprKind::MatchArm { .. }
-                    | AstExprKind::Arrow { .. }
-            ) || matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "WHILE")
-        })
-    {
+    if statement.expr.and_then(expression).is_some_and(|expr| {
+        matches!(
+            &expr.kind,
+            AstExprKind::Block { .. }
+                | AstExprKind::Object(_)
+                | AstExprKind::ListLiteral { .. }
+                | AstExprKind::BytesLiteral { .. }
+                | AstExprKind::MapLiteral { .. }
+                | AstExprKind::SetLiteral { .. }
+                | AstExprKind::Flush { .. }
+                | AstExprKind::Hold { .. }
+                | AstExprKind::Latest { .. }
+                | AstExprKind::When { .. }
+                | AstExprKind::Then { .. }
+                | AstExprKind::MatchArm { .. }
+                | AstExprKind::Arrow { .. }
+        ) || matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "WHILE")
+    }) {
         return statement.expr;
     }
-    statement_sequence_values(&statement.children, expressions)
+    statement_sequence_values_with(&statement.children, expression)
         .last()
         .copied()
         .or(statement.expr)

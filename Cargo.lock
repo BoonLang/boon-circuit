@@ -714,6 +714,7 @@ version = "0.1.0"
 dependencies = [
  "boon_checked",
  "boon_compilation_db",
+ "boon_compiler_kernel",
  "boon_contract",
  "boon_data",
  "boon_document",
@@ -731,6 +732,15 @@ dependencies = [
  "toml",
  "unicode-segmentation",
  "web-time",
+]
+
+[[package]]
+name = "boon_compiler_kernel"
+version = "0.1.0"
+dependencies = [
+ "boon_checked",
+ "boon_data",
+ "boon_effect_schema",
 ]
 
 [[package]]

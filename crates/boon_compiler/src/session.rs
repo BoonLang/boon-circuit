@@ -9894,8 +9894,9 @@ mod tests {
         // All callable-scope and unchanged interface-transfer module requests
         // are reused by this literal-only warm edit; the edited owner's
         // ordinary dependency cone remains local.
-        // Every owner also publishes one current diagnostic-replay evaluation
-        // and one independently backdatable normalized semantic fact.
+        // Owner flow now publishes diagnostics and normalized semantic facts
+        // from its mutation epoch instead of demanding two additional rows per
+        // live owner.
         // One shared output-flow component is demanded after those facts; it
         // executes cold and reuses its unchanged semantic result on this edit.
         // The project diagnostic-facts request executes once per revision and
@@ -9905,7 +9906,7 @@ mod tests {
         // projection; unchanged local rows reuse their retained value.
         assert_eq!(
             (first_request_counts, request_counts(second_stats)),
-            ((114, 112, 2, 0, 112), (228, 135, 93, 11, 124))
+            ((106, 104, 2, 0, 104), (212, 126, 86, 11, 115))
         );
 
         let mut isolated = CompilerSession::new();
@@ -11828,15 +11829,16 @@ mod tests {
         // The callable-only ABI, resolution, scope topology/SCC, and provider
         // families are included here. An exported callable change reexecutes
         // its exact scope cone and backdates unchanged projections; the body-
-        // only edit reuses 163 of 205 demanded requests and changes only 25.
+        // only edit reuses 151 of 191 demanded requests and changes only 23.
         // The exact child-boundary lexical projection adds five executions to
         // the exported-interface cone. The project diagnostic-facts request
         // adds one exact execution/change to both cones. Three source-unit
         // owner presentation requests add one changed/reexecuted unit and two
         // reused units to each cone. Every source unit also publishes one
         // current project-diagnostic evaluation and one independently
-        // backdatable local row projection. Each live owner publishes one
-        // current diagnostic-replay evaluation and one normalized semantic fact.
+        // backdatable local row projection. Owner flow publishes diagnostic
+        // replay and normalized semantic facts from its mutation epoch,
+        // without two additional request rows per live owner.
         // The shared output-flow component executes once per cone and
         // backdates when the body-only edit leaves its graph unchanged.
         // The live interface-component residual transaction directly records
@@ -11845,7 +11847,7 @@ mod tests {
         // retired post-solve transaction could reuse without that edge.
         assert_eq!(
             (interface_delta, body_delta),
-            ((205, 103, 102, 47, 56), (205, 42, 163, 17, 25))
+            ((191, 99, 92, 46, 53), (191, 40, 151, 17, 23))
         );
     }
 

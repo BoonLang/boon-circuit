@@ -3,7 +3,8 @@ use crate::{
     KernelRecordEntry, KernelSelectArm, KernelSolveError, KernelSolveWork, KernelSummaryCallInput,
     KernelSummaryNode, KernelSummaryProgram, KernelSummaryProjectionStep, KernelSummaryRecordEntry,
     KernelSummarySelectArm, KernelSummaryValueId, OutputId, PublishMode, TypeTermId,
-    TypeVariableId, solve_component,
+    TypeVariableId, build_snapshot_receipts, definition_basis_fingerprint,
+    definition_basis_fingerprint_with_buffer, solve_component,
 };
 use boon_checked::{
     BytesType, CheckedListKeyPolicy, CheckedStateKind, FlowMode, FlowType, ObjectShape, Type,
@@ -13,39 +14,42 @@ use boon_data::ExactRoundingRule;
 use boon_effect_schema::{
     BarrierSpec, DeliveryCardinalitySpec, ReplaySpec, ResultPolicySpec, ValueType, host_effect_spec,
 };
+use serde::Serialize;
+use serde::ser::SerializeStruct;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct KernelExpressionId(pub u32);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct KernelStatementId(pub u32);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct KernelDeclarationId(pub u32);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct KernelSourceId(pub u32);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct KernelStateId(pub u32);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct KernelListId(pub u32);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct KernelOwnerId(pub u32);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelInheritedFormal {
     pub target_ordinal: u32,
     pub caller_ordinal: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelCollectionKind {
     List,
     Bytes,
@@ -53,7 +57,7 @@ pub enum KernelCollectionKind {
     Map,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelRenderConstructorKind {
     Fixed(Box<str>),
     StripeDirection,
@@ -64,7 +68,7 @@ pub enum KernelRenderConstructorKind {
 /// These variants describe result and requirement equations, not runtime
 /// implementations. The residual program therefore contains no function-name
 /// dispatch or generic ABI edge search.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelPureBuiltinKind {
     TextTransform,
     TextSlice,
@@ -89,7 +93,7 @@ pub enum KernelPureBuiltinKind {
     FieldColor,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelOwnerNodeKind {
     /// A closed ABI value supplied at the kernel boundary (for example a
     /// SOURCE payload contract). It is imported once into the type DAG.
@@ -176,7 +180,7 @@ pub enum KernelOwnerNodeKind {
     Unknown,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelOwnerEdgeRole {
     RecordField {
         name: Box<str>,
@@ -214,20 +218,20 @@ pub enum KernelOwnerEdgeRole {
     ArrowOutput,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelOwnerInputEdge {
     pub role: KernelOwnerEdgeRole,
     pub expression: KernelExpressionId,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelOwnerNode {
     pub kind: KernelOwnerNodeKind,
     pub inputs: Box<[KernelOwnerInputEdge]>,
     pub mode: FlowMode,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelOwnerProgramInput {
     pub nodes: Box<[KernelOwnerNode]>,
     /// Invocation-local parameter/context slots consumed by `FormalRead`.
@@ -237,20 +241,20 @@ pub struct KernelOwnerProgramInput {
     pub result: KernelExpressionId,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelParameterKind {
     Value,
     Out,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelStatementParameter {
     pub name: Box<str>,
     pub kind: KernelParameterKind,
     pub ordinal: u32,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelStatementKind {
     Function {
         name: Box<str>,
@@ -276,7 +280,7 @@ pub enum KernelStatementKind {
     Expression,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelStatementInput {
     pub id: KernelStatementId,
     pub kind: KernelStatementKind,
@@ -289,7 +293,7 @@ pub struct KernelStatementInput {
 /// The dense declaration ID is intentionally revision-local. The origin is
 /// expressed only through other definition-local IDs so a linker can relocate
 /// it without retaining parser arenas, byte offsets, or legacy checker IDs.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum KernelDeclarationOrigin {
     Statement {
         statement: KernelStatementId,
@@ -312,7 +316,7 @@ pub enum KernelDeclarationOrigin {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum KernelDeclarationKind {
     Function,
     ValueParameter,
@@ -325,7 +329,7 @@ pub enum KernelDeclarationKind {
     FreshOut,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelDeclarationInput {
     pub id: KernelDeclarationId,
     pub origin: KernelDeclarationOrigin,
@@ -334,21 +338,21 @@ pub struct KernelDeclarationInput {
     pub value: Option<KernelExpressionId>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelDeclarationReference {
     Local(KernelDeclarationId),
     /// The unique public declaration exported by another dense definition.
     OwnerPublic(KernelOwnerId),
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelStatementReference {
     Local(KernelStatementId),
     /// The public/root statement exported by another dense definition.
     OwnerPublic(KernelOwnerId),
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelLexicalBindingTargetInput {
     Declaration(KernelDeclarationReference),
     ContextFormal {
@@ -362,7 +366,7 @@ pub enum KernelLexicalBindingTargetInput {
     RuntimeContext,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelLexicalAccess {
     Read,
     Drain,
@@ -373,7 +377,7 @@ pub enum KernelLexicalAccess {
 /// The solved expression row still owns its type equation. This row owns the
 /// declaration identity and authored projection so later state/resource and
 /// diagnostics construction never has to rediscover lexical resolution.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelLexicalBindingInput {
     pub expression: KernelExpressionId,
     pub target: KernelLexicalBindingTargetInput,
@@ -381,13 +385,13 @@ pub struct KernelLexicalBindingInput {
     pub access: KernelLexicalAccess,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelSemanticPath {
     pub anchor: KernelDeclarationReference,
     pub projection: Box<[Box<str>]>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelSourceInput {
     pub id: KernelSourceId,
     pub declaration: KernelDeclarationReference,
@@ -397,7 +401,7 @@ pub struct KernelSourceInput {
     pub interval_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelStateInput {
     pub id: KernelStateId,
     pub binding_declaration: KernelDeclarationReference,
@@ -409,7 +413,7 @@ pub struct KernelStateInput {
     pub kind: CheckedStateKind,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelListInput {
     pub id: KernelListId,
     pub declaration: KernelDeclarationReference,
@@ -420,13 +424,13 @@ pub struct KernelListInput {
     pub key_policy: CheckedListKeyPolicy,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelStatementChildReference {
     Local(KernelStatementId),
     Owner(KernelOwnerId),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelDefinitionFactsInput {
     pub statements: Box<[KernelStatementInput]>,
     pub declarations: Box<[KernelDeclarationInput]>,
@@ -436,13 +440,13 @@ pub struct KernelDefinitionFactsInput {
     pub lists: Box<[KernelListInput]>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelExternalExpression {
     pub owner: KernelOwnerId,
     pub target: KernelExternalTarget,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelExternalTarget {
     Expression(KernelExpressionId),
     Result,
@@ -459,7 +463,7 @@ pub struct KernelOwnerBuildError {
 }
 
 impl KernelOwnerBuildError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -487,6 +491,7 @@ pub struct KernelOwnerProgram {
     resources: PendingKernelResources,
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
+    basis_fingerprint_v1: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -550,6 +555,7 @@ struct KernelProjectOwnerOutputs {
     resources: PendingKernelResources,
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
+    basis_fingerprint_v1: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -606,7 +612,7 @@ struct PendingKernelListArtifact {
     key_policy: CheckedListKeyPolicy,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelCallTarget {
     User {
         target: KernelOwnerId,
@@ -623,13 +629,13 @@ pub enum KernelCallTarget {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelCallInputRole {
     Formal { ordinal: u32 },
     Abi { name: Box<str> },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelCallInputArtifact {
     pub role: KernelCallInputRole,
     pub value: KernelValueReference,
@@ -639,7 +645,7 @@ pub struct KernelCallInputArtifact {
 /// explicit expression/result authority in another dense definition. Keeping
 /// the namespaces distinct prevents linked external providers from masquerading
 /// as out-of-range local expression IDs.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelValueReference {
     Local(KernelExpressionId),
     External(KernelExternalExpression),
@@ -647,7 +653,7 @@ pub enum KernelValueReference {
 
 pub type KernelCallValueReference = KernelValueReference;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelExpressionInputArtifact {
     pub role: KernelOwnerEdgeRole,
     pub value: KernelValueReference,
@@ -656,7 +662,7 @@ pub struct KernelExpressionInputArtifact {
 /// One solved expression row in a definition artifact. The compact authored
 /// kind and typed input edges survive solving, so downstream stages consume
 /// immutable definition facts instead of reconstructing source graphs.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelExpressionArtifact {
     pub id: KernelExpressionId,
     pub kind: KernelOwnerNodeKind,
@@ -664,7 +670,7 @@ pub struct KernelExpressionArtifact {
     pub flow_type: FlowType,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelStatementArtifact {
     pub id: KernelStatementId,
     pub kind: KernelStatementKind,
@@ -672,7 +678,7 @@ pub struct KernelStatementArtifact {
     pub children: Box<[KernelStatementChildReference]>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelDeclarationArtifact {
     pub id: KernelDeclarationId,
     pub origin: KernelDeclarationOrigin,
@@ -681,7 +687,7 @@ pub struct KernelDeclarationArtifact {
     pub value: Option<KernelValueReference>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelLexicalBindingTarget {
     Declaration(KernelDeclarationReference),
     ContextFormal { ordinal: u32 },
@@ -689,7 +695,7 @@ pub enum KernelLexicalBindingTarget {
     RuntimeContext,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelLexicalBindingArtifact {
     pub expression: KernelExpressionId,
     pub target: KernelLexicalBindingTarget,
@@ -700,7 +706,7 @@ pub struct KernelLexicalBindingArtifact {
 /// One source-authored call occurrence with its compact input edges and solved
 /// result. Downstream consumers no longer need to rediscover call structure by
 /// walking the owner expression graph.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelCallArtifact {
     pub expression: KernelExpressionId,
     pub target: KernelCallTarget,
@@ -722,7 +728,105 @@ pub struct KernelHostEffectArtifact {
     pub delivery: DeliveryCardinalitySpec,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Serialize)]
+enum KernelDeliveryCardinalityFingerprint<'a> {
+    Single,
+    Stream {
+        initial_credits: u32,
+        max_in_flight: u32,
+        credit_result_tags: &'a [&'static str],
+        terminal_result_tags: &'a [&'static str],
+    },
+}
+
+impl Serialize for KernelHostEffectArtifact {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let replay = match self.replay {
+            ReplaySpec::ReadOnly => "read_only",
+            ReplaySpec::ProcessScoped => "process_scoped",
+            ReplaySpec::IdempotentBytesKey => "idempotent_bytes_key",
+            ReplaySpec::NonReplayable => "non_replayable",
+        };
+        let barrier = match self.barrier {
+            BarrierSpec::None => "none",
+            BarrierSpec::Before => "before",
+            BarrierSpec::BeforeAndAfter => "before_and_after",
+        };
+        let result_policy = match self.result_policy {
+            ResultPolicySpec::ReturnValue => "return_value",
+            ResultPolicySpec::Acknowledgement => "acknowledgement",
+            ResultPolicySpec::Discarded => "discarded",
+        };
+        let delivery = match &self.delivery {
+            DeliveryCardinalitySpec::Single => KernelDeliveryCardinalityFingerprint::Single,
+            DeliveryCardinalitySpec::Stream {
+                initial_credits,
+                max_in_flight,
+                credit_result_tags,
+                terminal_result_tags,
+            } => KernelDeliveryCardinalityFingerprint::Stream {
+                initial_credits: *initial_credits,
+                max_in_flight: *max_in_flight,
+                credit_result_tags,
+                terminal_result_tags,
+            },
+        };
+        let mut state = serializer.serialize_struct("KernelHostEffectArtifact", 6)?;
+        state.serialize_field("expression", &self.expression)?;
+        state.serialize_field("operation", &self.operation)?;
+        state.serialize_field("replay", replay)?;
+        state.serialize_field("barrier", barrier)?;
+        state.serialize_field("result_policy", result_policy)?;
+        state.serialize_field("delivery", &delivery)?;
+        state.end()
+    }
+}
+
+impl Hash for KernelHostEffectArtifact {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.expression.hash(state);
+        self.operation.hash(state);
+        match self.replay {
+            ReplaySpec::ReadOnly => 0_u8,
+            ReplaySpec::ProcessScoped => 1,
+            ReplaySpec::IdempotentBytesKey => 2,
+            ReplaySpec::NonReplayable => 3,
+        }
+        .hash(state);
+        match self.barrier {
+            BarrierSpec::None => 0_u8,
+            BarrierSpec::Before => 1,
+            BarrierSpec::BeforeAndAfter => 2,
+        }
+        .hash(state);
+        match self.result_policy {
+            ResultPolicySpec::ReturnValue => 0_u8,
+            ResultPolicySpec::Acknowledgement => 1,
+            ResultPolicySpec::Discarded => 2,
+        }
+        .hash(state);
+        match &self.delivery {
+            DeliveryCardinalitySpec::Single => 0_u8.hash(state),
+            DeliveryCardinalitySpec::Stream {
+                initial_credits,
+                max_in_flight,
+                credit_result_tags,
+                terminal_result_tags,
+            } => {
+                1_u8.hash(state);
+                initial_credits.hash(state);
+                max_in_flight.hash(state);
+                credit_result_tags.hash(state);
+                terminal_result_tags.hash(state);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelSourceArtifact {
     pub id: KernelSourceId,
     pub declaration: KernelDeclarationReference,
@@ -733,7 +837,7 @@ pub struct KernelSourceArtifact {
     pub payload_type: Type,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelStateArtifact {
     pub id: KernelStateId,
     pub binding_declaration: KernelDeclarationReference,
@@ -746,7 +850,7 @@ pub struct KernelStateArtifact {
     pub flow_type: FlowType,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelListArtifact {
     pub id: KernelListId,
     pub declaration: KernelDeclarationReference,
@@ -763,7 +867,7 @@ pub struct KernelListArtifact {
 /// This is deliberately free of solver cells, operation IDs, and work
 /// counters. Later checked rows (calls, effects, state, lists, diagnostics)
 /// extend this single artifact instead of creating parallel owner products.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct DefinitionArtifact {
     pub result: FlowType,
     pub expressions: Box<[KernelExpressionArtifact]>,
@@ -780,6 +884,8 @@ pub struct DefinitionArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelDefinitionSnapshot {
     pub definition: DefinitionArtifact,
+    pub dependencies: crate::KernelDefinitionDependencyGraph,
+    pub currentness: crate::KernelDefinitionCurrentnessReceipt,
     pub work: KernelSolveWork,
 }
 
@@ -787,6 +893,8 @@ pub struct KernelDefinitionSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCheckedSnapshot {
     pub definitions: Box<[DefinitionArtifact]>,
+    pub dependencies: crate::KernelDefinitionDependencyGraph,
+    pub currentness: Box<[crate::KernelDefinitionCurrentnessReceipt]>,
     pub work: KernelSolveWork,
 }
 
@@ -800,6 +908,7 @@ pub fn is_kernel_host_effect(operation: &str) -> bool {
 
 impl KernelOwnerProgram {
     pub fn solve(self) -> Result<KernelDefinitionSnapshot, KernelSolveError> {
+        let basis_fingerprint_v1 = self.basis_fingerprint_v1;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
             .output(self.result_output)
@@ -832,19 +941,29 @@ impl KernelOwnerProgram {
             materialize_resource_artifacts(self.resources, &expression_flows, None);
         let expressions =
             materialize_expression_artifacts(self.expression_artifacts, expression_flows);
+        let mut definition = DefinitionArtifact {
+            result,
+            expressions,
+            statements: self.statements,
+            declarations: self.declarations,
+            lexical_bindings: self.lexical_bindings,
+            calls,
+            effects: self.effects,
+            sources,
+            states,
+            lists,
+        };
+        let (dependencies, currentness) = build_snapshot_receipts(
+            std::slice::from_mut(&mut definition),
+            &[basis_fingerprint_v1],
+        )?;
+        let [currentness] = currentness.as_ref() else {
+            unreachable!("one standalone kernel definition produces one receipt")
+        };
         Ok(KernelDefinitionSnapshot {
-            definition: DefinitionArtifact {
-                result,
-                expressions,
-                statements: self.statements,
-                declarations: self.declarations,
-                lexical_bindings: self.lexical_bindings,
-                calls,
-                effects: self.effects,
-                sources,
-                states,
-                lists,
-            },
+            definition,
+            dependencies,
+            currentness: *currentness,
             work: artifact.work,
         })
     }
@@ -856,6 +975,11 @@ impl KernelOwnerProgram {
 
 impl KernelProjectProgram {
     pub fn solve(self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
+        let basis_fingerprints = self
+            .owners
+            .iter()
+            .map(|owner| owner.basis_fingerprint_v1)
+            .collect::<Vec<_>>();
         let artifact = solve_component(self.component)?;
         let public_results = self
             .owners
@@ -876,7 +1000,7 @@ impl KernelProjectProgram {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let definitions = self
+        let mut definitions = self
             .owners
             .into_vec()
             .into_iter()
@@ -921,8 +1045,12 @@ impl KernelProjectProgram {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let (dependencies, currentness) =
+            build_snapshot_receipts(&mut definitions, &basis_fingerprints)?;
         Ok(KernelCheckedSnapshot {
             definitions,
+            dependencies,
+            currentness,
             work: artifact.work,
         })
     }
@@ -946,6 +1074,7 @@ pub fn compile_owner_program_with_definition_facts(
     input: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
+    let basis_fingerprint_v1 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
@@ -1089,6 +1218,7 @@ pub fn compile_owner_program_with_definition_facts(
         resources,
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
+        basis_fingerprint_v1,
     })
 }
 
@@ -2094,6 +2224,7 @@ pub fn compile_project_program_with_definition_facts(
         }
     }
     let modes = mode_builder.solve();
+    let mut basis_fingerprint_scratch = Vec::new();
     let owners = input
         .owners
         .iter()
@@ -2129,6 +2260,11 @@ pub fn compile_project_program_with_definition_facts(
                 resources,
                 calls: collect_call_artifacts(owner)?,
                 effects: collect_host_effect_artifacts(owner)?,
+                basis_fingerprint_v1: definition_basis_fingerprint_with_buffer(
+                    owner,
+                    &facts[owner_index],
+                    &mut basis_fingerprint_scratch,
+                )?,
             })
         })
         .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?;

@@ -3021,6 +3021,54 @@ dependency/currentness receipts, and the permanent session/demand API—not
 resource micro-optimization. Those tables must be differential-clean before
 the checker-wide flag-day cutover and deletion of the old owner solvers.
 
+The dependency/currentness receipt cut is now complete. The kernel owns an
+exact typed dependency row for every external expression, result, public
+declaration, public statement, call target/input, lexical read, and persistent
+resource anchor. A compact CSR index preserves all authored uses in the
+forward direction and one deduplicated reverse-consumer edge per definition;
+NovyWave contains 7,001 dependency rows and 3,053 reverse-consumer rows. Queue
+invalidation can now start from this index instead of rescanning definitions.
+
+Each solved definition publishes five distinct V1 SHA-256 receipts: the exact
+compiled basis, alpha-stable public result, alpha-stable complete artifact,
+imported dependency authorities, and exact combined currentness. Type-variable
+alpha normalization is performed once for the complete definition, preserving
+all intra-definition correlations. An implementation-only edit can therefore
+change the exact definition receipt while a dependent definition backdates
+when its imported public authority is unchanged. The structural hash stream
+has an explicit domain and fixed-width numeric encoding; a future persistent
+`KernelSession` must include compiler/kernel ABI identity rather than assuming
+that Rust's derived `Hash` contract remains stable across compiler upgrades.
+Focused tests lock the current byte contract, exact dependency cones, and the
+separation between semantic backdating and exact evaluation currentness.
+
+All 60 kernel tests, 87 non-ignored compiler unit tests, and 16 compiler
+integration tests pass. The ignored full NovyWave differential also passes
+with 1,389 executable definitions, eight inert containers, zero unsupported
+owners, and complete receipt coverage. One final optimized differential sample
+records 602.791 ms kernel time, 691.581 ms complete candidate time, 110.177 ms
+compile/link, and 395.045 ms solve/seal time.
+
+Three no-rebuild debug samples record 2,534.372, 2,451.759, and 2,458.587 ms
+kernel time (median 2,458.587 ms); complete candidate time is 2,691.284,
+2,604.326, and 2,611.554 ms (median 2,611.554 ms). Three optimized samples
+record 608.843, 595.990, and 616.712 ms kernel time (median 608.843 ms);
+complete candidate time is 699.815, 684.308, and 710.921 ms (median 699.815
+ms). Median optimized compile/link is 111.487 ms and solve/seal is 396.748 ms.
+
+This is deliberately recorded as a performance regression, not a speed win.
+Relative to the persistent-resource checkpoint, median optimized kernel time
+rose by 177.391 ms (41.1%) and complete candidate time by 179.693 ms (34.5%).
+The required ownership review found that dependency collection is small; the
+dominant cost is alpha-normalizing and sealing every complete checked artifact.
+An earlier CBOR materialization design was slower and was replaced by the
+direct structural hash stream, but local hashing changes cannot make full
+checked-image publication free. The next architecture tranche is therefore the
+permanent `CheckDemand` boundary: diagnostics-only compilation must stop before
+complete artifact normalization/currentness sealing, while checked-image and
+demanded-definition requests explicitly pay for the products they request.
+This demand split precedes further solver micro-optimization.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not

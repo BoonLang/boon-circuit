@@ -8,12 +8,14 @@
 mod artifact;
 mod owner;
 mod program;
+mod receipt;
 mod solver;
 mod term;
 
 pub use artifact::*;
 pub use owner::*;
 pub use program::*;
+pub use receipt::*;
 pub use solver::*;
 pub use term::*;
 

@@ -225,7 +225,20 @@ pub struct KernelOwnerOracleReport {
     pub container_owners: Box<[StableCheckOwnerKey]>,
     pub unsupported: Box<[(StableCheckOwnerKey, String)]>,
     pub root_blockers: Box<[KernelOwnerBlockerImpact]>,
+    pub dependency_edges: usize,
+    pub reverse_consumer_edges: usize,
+    pub currentness: Box<[KernelOwnerOracleCurrentness]>,
     pub work: KernelSolveWork,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleCurrentness {
+    pub owner: StableCheckOwnerKey,
+    pub basis_fingerprint_v1: [u8; 32],
+    pub public_result_fingerprint_v1: [u8; 32],
+    pub artifact_fingerprint_v1: [u8; 32],
+    pub dependency_fingerprint_v1: [u8; 32],
+    pub fingerprint_v1: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -738,10 +751,33 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     };
 
     let artifact_projection_started = Instant::now();
-    let (supported, work) = artifact.map_or_else(
-        || (Vec::new(), KernelSolveWork::default()),
+    let (supported, work, dependency_edges, reverse_consumer_edges, currentness) = artifact
+        .map_or_else(
+        || {
+            (
+                Vec::new(),
+                KernelSolveWork::default(),
+                0,
+                0,
+                Vec::new(),
+            )
+        },
         |artifact| {
             let work = artifact.work;
+            let dependency_edges = artifact.dependencies.dependency_count();
+            let reverse_consumer_edges = artifact.dependencies.reverse_consumer_count();
+            let currentness = active
+                .iter()
+                .zip(&artifact.currentness)
+                .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
+                    owner: prepared[*prepared_index].owner.clone(),
+                    basis_fingerprint_v1: receipt.basis_fingerprint_v1,
+                    public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
+                    artifact_fingerprint_v1: receipt.artifact_fingerprint_v1,
+                    dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
+                    fingerprint_v1: receipt.fingerprint_v1,
+                })
+                .collect::<Vec<_>>();
             let definitions = artifact.definitions;
             let result_by_owner = active
                 .iter()
@@ -1175,7 +1211,13 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                     }
                 })
                 .collect::<Vec<_>>();
-            (supported, work)
+            (
+                supported,
+                work,
+                dependency_edges,
+                reverse_consumer_edges,
+                currentness,
+            )
         },
     );
     let mut blocker_counts = BTreeMap::<StableCheckOwnerKey, usize>::new();
@@ -1212,6 +1254,9 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         container_owners: container_owners.into_boxed_slice(),
         unsupported: unsupported.into_boxed_slice(),
         root_blockers: root_blockers.into_boxed_slice(),
+        dependency_edges,
+        reverse_consumer_edges,
+        currentness: currentness.into_boxed_slice(),
         work,
     };
     let artifact_projection_us = elapsed_us(artifact_projection_started.elapsed());
@@ -10016,6 +10061,24 @@ mod tests {
                 project.stable_check_owner_keys().count(),
                 "every example owner must be classified explicitly"
             );
+            assert_eq!(
+                first.currentness.len(),
+                first.supported.len(),
+                "every solved definition must publish one exact currentness receipt"
+            );
+            assert!(
+                first
+                    .currentness
+                    .iter()
+                    .zip(&first.supported)
+                    .all(|(receipt, owner)| receipt.owner == owner.owner
+                        && receipt.fingerprint_v1 != [0; 32]),
+                "receipt order and ownership must match the dense definition table"
+            );
+            assert!(
+                first.dependency_edges >= first.reverse_consumer_edges,
+                "reverse definition consumers are a deduplicated dependency projection"
+            );
             for owner in &first.supported {
                 assert_owner_matches_current(
                     owner,
@@ -10070,7 +10133,7 @@ mod tests {
         let (report, timings) =
             profile_kernel_owner_oracle_with_source_payloads(&project, &source_payloads);
         eprintln!(
-            "kernel-novywave definition_artifacts expression_rows={} statement_rows={} declaration_rows={} lexical_binding_rows={} source_resource_rows={} hold_state_rows={} persistent_list_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={}",
+            "kernel-novywave definition_artifacts expression_rows={} statement_rows={} declaration_rows={} lexical_binding_rows={} source_resource_rows={} hold_state_rows={} persistent_list_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={} dependency_edges={} reverse_consumer_edges={}",
             report
                 .supported
                 .iter()
@@ -10126,6 +10189,8 @@ mod tests {
                 .iter()
                 .map(|owner| owner.effects.len())
                 .sum::<usize>(),
+            report.dependency_edges,
+            report.reverse_consumer_edges,
         );
 
         if std::env::var_os("BOON_KERNEL_CANDIDATE_ONLY").is_some() {

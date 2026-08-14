@@ -1,5 +1,6 @@
 use crate::{NameId, TypeTerm, TypeTermArena, TypeTermId, TypeVariableId};
 use boon_checked::FlowMode;
+use serde::Serialize;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -28,7 +29,7 @@ pub enum KernelCollectionOperationKind {
     Map,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelPattern {
     Wildcard,
     Number,

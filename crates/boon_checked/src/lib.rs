@@ -2249,7 +2249,7 @@ pub struct CheckedSource {
     pub span: CheckedSpan,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckedStateKind {
     Hold,
@@ -2275,7 +2275,7 @@ pub struct CheckedState {
     pub span: CheckedSpan,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CheckedListKeyPolicy {
     GeneratedOccurrenceU64 { has_generation: bool },

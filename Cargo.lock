@@ -741,6 +741,8 @@ dependencies = [
  "boon_checked",
  "boon_data",
  "boon_effect_schema",
+ "serde",
+ "sha2",
 ]
 
 [[package]]

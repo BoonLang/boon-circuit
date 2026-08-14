@@ -3,7 +3,7 @@ use crate::{
     KernelPattern, KernelRecordEntry, KernelSelectArm, KernelSolveError, KernelSolveWork,
     KernelSummaryCallInput, KernelSummaryNode, KernelSummaryProgram, KernelSummaryProjectionStep,
     KernelSummaryRecordEntry, KernelSummarySelectArm, KernelSummaryValueId, OutputId, PublishMode,
-    TypeTermId, TypeVariableId, alpha_normalize_definition, alpha_normalize_public_flow,
+    TypeTermId, TypeVariableId, alpha_normalize_callable_interface, alpha_normalize_definition,
     build_snapshot_receipts, definition_basis_fingerprint,
     definition_basis_fingerprint_with_buffer, solve_component,
 };
@@ -483,6 +483,8 @@ impl Error for KernelOwnerBuildError {}
 pub struct KernelOwnerProgram {
     component: ComponentProgram,
     result_output: OutputId,
+    formal_outputs: Box<[OutputId]>,
+    formal_modes: Box<[FlowMode]>,
     expression_outputs: Box<[OutputId]>,
     expression_modes: Box<[FlowMode]>,
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
@@ -512,6 +514,7 @@ pub struct KernelSolvedProject {
     artifact: ComponentArtifact,
     owners: Box<[KernelProjectOwnerOutputs]>,
     public_results: Box<[FlowType]>,
+    public_formals: Box<[Box<[FlowType]>]>,
 }
 
 pub const KERNEL_RESIDUAL_MODULE_RANKING_LEN: usize = 16;
@@ -559,6 +562,8 @@ pub struct KernelCompileWork {
 #[derive(Clone, Debug)]
 struct KernelProjectOwnerOutputs {
     result: OutputId,
+    formals: Box<[OutputId]>,
+    formal_modes: Box<[FlowMode]>,
     expressions: Box<[OutputId]>,
     expression_modes: Box<[FlowMode]>,
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
@@ -724,7 +729,24 @@ pub struct KernelCallArtifact {
     pub expression: KernelExpressionId,
     pub target: KernelCallTarget,
     pub inputs: Box<[KernelCallInputArtifact]>,
+    /// Target-definition-local substitutions, independent of the solver's
+    /// revision-local variable namespace.
+    pub type_substitutions: Box<[KernelCallTypeSubstitution]>,
     pub result: FlowType,
+}
+
+/// Stable ordinal of a schematic type variable in one callable interface.
+///
+/// Ordinals are assigned by walking formals in declaration order followed by
+/// the result. They therefore remain meaningful across fresh solver arenas and
+/// never expose global checked-program `TypeVar` numbering.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct KernelTypeParameterId(pub u32);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelCallTypeSubstitution {
+    pub variable: KernelTypeParameterId,
+    pub value: Type,
 }
 
 /// One source-authored host-effect occurrence in a definition artifact.
@@ -883,6 +905,9 @@ pub struct KernelListArtifact {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct DefinitionArtifact {
     pub result: FlowType,
+    /// Principal callable formal surfaces in dense declaration order. This is
+    /// empty for non-callable definitions.
+    pub formals: Box<[FlowType]>,
     pub expressions: Box<[KernelExpressionArtifact]>,
     pub statements: Box<[KernelStatementArtifact]>,
     pub declarations: Box<[KernelDeclarationArtifact]>,
@@ -919,6 +944,7 @@ pub struct KernelCheckedSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelInterfaceSnapshot {
     pub public_results: Box<[FlowType]>,
+    pub callable_formals: Box<[Box<[FlowType]>]>,
     pub work: KernelSolveWork,
 }
 
@@ -973,13 +999,35 @@ impl KernelOwnerProgram {
             .position(|output| *output == self.result_output)
             .expect("owner result belongs to its expression outputs");
         result.mode = self.expression_modes[result_index];
-        let calls = materialize_call_artifacts(self.calls, &expression_flows);
+        let formal_flows = self
+            .formal_outputs
+            .iter()
+            .zip(self.formal_modes.iter().copied())
+            .map(|(output, mode)| {
+                let mut flow = artifact
+                    .output(*output)
+                    .expect("owner formal output belongs to its component")
+                    .flow_type
+                    .clone();
+                flow.mode = mode;
+                flow
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let calls = materialize_call_artifacts(
+            KernelOwnerId(0),
+            self.calls,
+            &expression_flows,
+            std::slice::from_ref(&formal_flows),
+            std::slice::from_ref(&result),
+        );
         let (sources, states, lists) =
             materialize_resource_artifacts(self.resources, &expression_flows, None);
         let expressions =
             materialize_expression_artifacts(self.expression_artifacts, expression_flows);
         let mut definition = DefinitionArtifact {
             result,
+            formals: formal_flows,
             expressions,
             statements: self.statements,
             declarations: self.declarations,
@@ -1034,10 +1082,12 @@ impl KernelProjectProgram {
     ) -> Result<KernelDemandedDefinitionSnapshot, KernelSolveError> {
         let artifact = solve_component(self.component)?;
         let public_results = project_public_results(&self.owners, &artifact);
+        let public_formals = project_public_formals(&self.owners, &artifact);
         KernelSolvedProject {
             artifact,
             owners: self.owners,
             public_results,
+            public_formals,
         }
         .into_demanded_definitions(demanded)
     }
@@ -1048,10 +1098,12 @@ impl KernelProjectProgram {
     pub fn solve_graph(self) -> Result<KernelSolvedProject, KernelSolveError> {
         let artifact = solve_component(self.component)?;
         let public_results = project_public_results(&self.owners, &artifact);
+        let public_formals = project_public_formals(&self.owners, &artifact);
         Ok(KernelSolvedProject {
             artifact,
             owners: self.owners,
             public_results,
+            public_formals,
         })
     }
 
@@ -1066,14 +1118,16 @@ impl KernelProjectProgram {
 
 impl KernelSolvedProject {
     pub fn interface_snapshot(&self) -> KernelInterfaceSnapshot {
-        let public_results = self
-            .public_results
-            .iter()
-            .map(alpha_normalize_public_flow)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let mut public_results = Vec::with_capacity(self.public_results.len());
+        let mut callable_formals = Vec::with_capacity(self.public_formals.len());
+        for (formals, result) in self.public_formals.iter().zip(&self.public_results) {
+            let (formals, result) = alpha_normalize_callable_interface(formals, result);
+            callable_formals.push(formals);
+            public_results.push(result);
+        }
         KernelInterfaceSnapshot {
-            public_results,
+            public_results: public_results.into_boxed_slice(),
+            callable_formals: callable_formals.into_boxed_slice(),
             work: self.artifact.work,
         }
     }
@@ -1099,6 +1153,7 @@ impl KernelSolvedProject {
                     owner,
                     &self.artifact,
                     &self.public_results,
+                    &self.public_formals,
                 )
             })
             .collect::<Vec<_>>()
@@ -1152,6 +1207,7 @@ impl KernelSolvedProject {
                 owner,
                 &self.artifact,
                 &self.public_results,
+                &self.public_formals,
             );
             alpha_normalize_definition(&mut definition);
             definitions.push(KernelDemandedDefinitionArtifact {
@@ -1191,11 +1247,39 @@ fn project_public_results(
         .into_boxed_slice()
 }
 
+fn project_public_formals(
+    owners: &[KernelProjectOwnerOutputs],
+    artifact: &ComponentArtifact,
+) -> Box<[Box<[FlowType]>]> {
+    owners
+        .iter()
+        .map(|owner| {
+            owner
+                .formals
+                .iter()
+                .zip(owner.formal_modes.iter().copied())
+                .map(|(output, mode)| {
+                    let mut flow = artifact
+                        .output(*output)
+                        .expect("project owner formal belongs to its component")
+                        .flow_type
+                        .clone();
+                    flow.mode = mode;
+                    flow
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
 fn materialize_project_definition(
     owner_index: usize,
     owner: KernelProjectOwnerOutputs,
     artifact: &ComponentArtifact,
     public_results: &[FlowType],
+    public_formals: &[Box<[FlowType]>],
 ) -> DefinitionArtifact {
     let result = public_results[owner_index].clone();
     let expression_flows = owner
@@ -1213,13 +1297,22 @@ fn materialize_project_definition(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    let calls = materialize_call_artifacts(owner.calls, &expression_flows);
+    let calls = materialize_call_artifacts(
+        KernelOwnerId(
+            u32::try_from(owner_index).expect("kernel definition count exceeds u32 namespace"),
+        ),
+        owner.calls,
+        &expression_flows,
+        public_formals,
+        public_results,
+    );
     let (sources, states, lists) =
         materialize_resource_artifacts(owner.resources, &expression_flows, Some(public_results));
     let expressions =
         materialize_expression_artifacts(owner.expression_artifacts, expression_flows);
     DefinitionArtifact {
         result,
+        formals: public_formals[owner_index].clone(),
         expressions,
         statements: owner.statements,
         declarations: owner.declarations,
@@ -1362,9 +1455,21 @@ pub fn compile_owner_program_with_definition_facts(
         .zip(input.nodes.iter())
         .map(|(variable, node)| builder.add_output(*variable, node.mode))
         .collect::<Vec<_>>();
+    let formal_outputs = principal
+        .formal_requirements
+        .iter()
+        .map(|variable| builder.add_output(*variable, FlowMode::Continuous))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     let modes = mode_builder.solve();
     let expression_modes = principal
         .expression_modes
+        .iter()
+        .map(|mode| modes[mode.0 as usize])
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let formal_modes = principal
+        .formal_modes
         .iter()
         .map(|mode| modes[mode.0 as usize])
         .collect::<Vec<_>>()
@@ -1377,6 +1482,8 @@ pub fn compile_owner_program_with_definition_facts(
     Ok(KernelOwnerProgram {
         component: builder.finish(),
         result_output,
+        formal_outputs,
+        formal_modes,
         expression_outputs: expression_outputs.into_boxed_slice(),
         expression_modes,
         expression_artifacts: collect_expression_artifacts(input)?,
@@ -2046,20 +2153,323 @@ fn materialize_resource_artifacts(
 }
 
 fn materialize_call_artifacts(
+    owner: KernelOwnerId,
     pending: Box<[PendingKernelCallArtifact]>,
     expressions: &[FlowType],
+    public_formals: &[Box<[FlowType]>],
+    public_results: &[FlowType],
 ) -> Box<[KernelCallArtifact]> {
     pending
         .into_vec()
         .into_iter()
-        .map(|call| KernelCallArtifact {
-            expression: call.expression,
-            target: call.target,
-            inputs: call.inputs,
-            result: expressions[call.expression.0 as usize].clone(),
+        .map(|call| {
+            let type_substitutions = materialize_user_call_type_substitutions(
+                owner,
+                &call,
+                expressions,
+                public_formals,
+                public_results,
+            );
+            KernelCallArtifact {
+                expression: call.expression,
+                target: call.target,
+                inputs: call.inputs,
+                type_substitutions,
+                result: expressions[call.expression.0 as usize].clone(),
+            }
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
+}
+
+fn materialize_user_call_type_substitutions(
+    owner: KernelOwnerId,
+    call: &PendingKernelCallArtifact,
+    expressions: &[FlowType],
+    public_formals: &[Box<[FlowType]>],
+    public_results: &[FlowType],
+) -> Box<[KernelCallTypeSubstitution]> {
+    let KernelCallTarget::User {
+        target,
+        inherited_formal,
+    } = call.target
+    else {
+        return Box::new([]);
+    };
+    let Some(target_formals) = public_formals.get(target.0 as usize) else {
+        return Box::new([]);
+    };
+    let Some(target_result) = public_results.get(target.0 as usize) else {
+        return Box::new([]);
+    };
+
+    let mut actuals =
+        Vec::with_capacity(call.inputs.len() + usize::from(inherited_formal.is_some()));
+    for input in call.inputs.iter() {
+        let KernelCallInputRole::Formal { ordinal } = input.role else {
+            continue;
+        };
+        let Some(actual) = call_value_flow(input.value, expressions, public_results) else {
+            continue;
+        };
+        actuals.push((ordinal, actual.ty.clone()));
+    }
+    if let Some(inherited) = inherited_formal
+        && let Some(actual) = public_formals
+            .get(owner.0 as usize)
+            .and_then(|formals| formals.get(inherited.caller_ordinal as usize))
+    {
+        actuals.push((inherited.target_ordinal, actual.ty.clone()));
+    }
+
+    derive_kernel_call_type_substitutions(target_formals, target_result, &actuals)
+}
+
+/// Derive the canonical substitution environment for one callable
+/// occurrence. The callable and actual type-variable namespaces must be
+/// disjoint; production solver arenas guarantee that, while differential
+/// adapters alpha-isolate legacy definition-local schemes before calling.
+pub fn derive_kernel_call_type_substitutions(
+    target_formals: &[FlowType],
+    target_result: &FlowType,
+    actuals: &[(u32, Type)],
+) -> Box<[KernelCallTypeSubstitution]> {
+    let mut parameter_ids = BTreeMap::new();
+    for formal in target_formals {
+        collect_callable_type_parameters(&formal.ty, &mut parameter_ids);
+    }
+    collect_callable_type_parameters(&target_result.ty, &mut parameter_ids);
+
+    let mut substitutions = BTreeMap::new();
+    for (ordinal, actual) in actuals {
+        let Some(pattern) = target_formals.get(*ordinal as usize) else {
+            continue;
+        };
+        match_call_type_pattern(&pattern.ty, actual, &mut substitutions);
+    }
+
+    let mut substitutions = substitutions
+        .into_iter()
+        .filter_map(|(variable, value)| {
+            parameter_ids
+                .get(&variable)
+                .copied()
+                .map(|variable| KernelCallTypeSubstitution { variable, value })
+        })
+        .collect::<Vec<_>>();
+    substitutions.sort_unstable_by_key(|substitution| substitution.variable);
+    substitutions.into_boxed_slice()
+}
+
+fn call_value_flow<'a>(
+    value: KernelValueReference,
+    expressions: &'a [FlowType],
+    public_results: &'a [FlowType],
+) -> Option<&'a FlowType> {
+    match value {
+        KernelValueReference::Local(expression) => expressions.get(expression.0 as usize),
+        KernelValueReference::External(KernelExternalExpression {
+            owner,
+            target: KernelExternalTarget::Result,
+        }) => public_results.get(owner.0 as usize),
+        KernelValueReference::External(KernelExternalExpression {
+            target: KernelExternalTarget::Expression(_),
+            ..
+        }) => None,
+    }
+}
+
+fn collect_callable_type_parameters(
+    ty: &Type,
+    parameters: &mut BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>,
+) {
+    match ty {
+        Type::Var(variable) => {
+            let next = KernelTypeParameterId(
+                u32::try_from(parameters.len())
+                    .expect("kernel callable type-parameter count exceeds u32"),
+            );
+            parameters.entry(*variable).or_insert(next);
+        }
+        Type::Object(shape) => {
+            for field in shape.ordered_fields().into_iter().map(|(_, field)| field) {
+                collect_callable_type_parameters(field, parameters);
+            }
+        }
+        Type::List(item) | Type::Set(item) => {
+            collect_callable_type_parameters(item, parameters);
+        }
+        Type::Map { key, value } => {
+            collect_callable_type_parameters(key, parameters);
+            collect_callable_type_parameters(value, parameters);
+        }
+        Type::Function { args, result } => {
+            for argument in args {
+                collect_callable_type_parameters(argument, parameters);
+            }
+            collect_callable_type_parameters(&result.ty, parameters);
+        }
+        Type::VariantSet(variants) => {
+            for variant in variants {
+                if let Variant::Tagged { fields, .. } = variant {
+                    for field in fields.ordered_fields().into_iter().map(|(_, field)| field) {
+                        collect_callable_type_parameters(field, parameters);
+                    }
+                }
+            }
+        }
+        Type::Union(members) => {
+            for member in members {
+                collect_callable_type_parameters(member, parameters);
+            }
+        }
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown => {}
+    }
+}
+
+fn call_type_is_placeholder(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }
+    ) || matches!(ty, Type::Object(shape) if shape.open && shape.fields.is_empty())
+}
+
+fn match_call_type_pattern(
+    pattern: &Type,
+    actual: &Type,
+    substitutions: &mut BTreeMap<boon_checked::TypeVar, Type>,
+) {
+    match (pattern, actual) {
+        (Type::Var(_), Type::Unknown | Type::UnresolvedShape { .. } | Type::Absent) => {}
+        (Type::Var(variable), actual) => {
+            if substitutions
+                .get(variable)
+                .is_none_or(call_type_is_placeholder)
+            {
+                substitutions.insert(*variable, actual.clone());
+            }
+        }
+        (Type::List(pattern), Type::List(actual)) | (Type::Set(pattern), Type::Set(actual)) => {
+            match_call_type_pattern(pattern, actual, substitutions);
+        }
+        (
+            Type::Map {
+                key: pattern_key,
+                value: pattern_value,
+            },
+            Type::Map {
+                key: actual_key,
+                value: actual_value,
+            },
+        ) => {
+            match_call_type_pattern(pattern_key, actual_key, substitutions);
+            match_call_type_pattern(pattern_value, actual_value, substitutions);
+        }
+        (
+            Type::Function {
+                args: pattern_args,
+                result: pattern_result,
+            },
+            Type::Function {
+                args: actual_args,
+                result: actual_result,
+            },
+        ) if pattern_args.len() == actual_args.len() => {
+            for (pattern, actual) in pattern_args.iter().zip(actual_args) {
+                match_call_type_pattern(pattern, actual, substitutions);
+            }
+            match_call_type_pattern(&pattern_result.ty, &actual_result.ty, substitutions);
+        }
+        (Type::Object(pattern), Type::Object(actual)) => {
+            for (name, pattern) in &pattern.fields {
+                if let Some(actual) = actual.fields.get(name) {
+                    match_call_type_pattern(pattern, actual, substitutions);
+                }
+            }
+        }
+        (Type::VariantSet(pattern), Type::VariantSet(actual)) => {
+            for pattern in pattern {
+                let Variant::Tagged {
+                    tag: pattern_tag,
+                    fields: pattern_fields,
+                } = pattern
+                else {
+                    continue;
+                };
+                let Some(Variant::Tagged {
+                    fields: actual_fields,
+                    ..
+                }) = actual.iter().find(
+                    |variant| matches!(variant, Variant::Tagged { tag, .. } if tag == pattern_tag),
+                )
+                else {
+                    continue;
+                };
+                for (name, pattern) in &pattern_fields.fields {
+                    if let Some(actual) = actual_fields.fields.get(name) {
+                        match_call_type_pattern(pattern, actual, substitutions);
+                    }
+                }
+            }
+        }
+        (Type::Union(pattern), Type::Union(actual)) => {
+            for actual in actual {
+                if let Some(pattern) = pattern
+                    .iter()
+                    .find(|pattern| call_type_pattern_accepts(pattern, actual))
+                {
+                    match_call_type_pattern(pattern, actual, substitutions);
+                }
+            }
+        }
+        (Type::Union(pattern), actual) => {
+            if let Some(pattern) = pattern
+                .iter()
+                .find(|pattern| call_type_pattern_accepts(pattern, actual))
+            {
+                match_call_type_pattern(pattern, actual, substitutions);
+            }
+        }
+        (pattern, Type::Union(actual)) => {
+            for actual in actual
+                .iter()
+                .filter(|actual| call_type_pattern_accepts(pattern, actual))
+            {
+                match_call_type_pattern(pattern, actual, substitutions);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn call_type_pattern_accepts(pattern: &Type, actual: &Type) -> bool {
+    match (pattern, actual) {
+        (Type::Var(_), Type::Unknown | Type::UnresolvedShape { .. } | Type::Absent) => false,
+        (Type::Var(_), _) => true,
+        (Type::List(pattern), Type::List(actual)) | (Type::Set(pattern), Type::Set(actual)) => {
+            call_type_pattern_accepts(pattern, actual)
+        }
+        (Type::Object(pattern), Type::Object(actual)) => pattern.fields.iter().all(|(name, ty)| {
+            actual
+                .fields
+                .get(name)
+                .is_some_and(|actual| call_type_pattern_accepts(ty, actual))
+        }),
+        (Type::Union(pattern), actual) => pattern
+            .iter()
+            .any(|pattern| call_type_pattern_accepts(pattern, actual)),
+        (pattern, Type::Union(actual)) => actual
+            .iter()
+            .all(|actual| call_type_pattern_accepts(pattern, actual)),
+        _ => pattern == actual || boon_checked::resolved_type_is_assignable_to(actual, pattern),
+    }
 }
 
 fn collect_call_artifacts(
@@ -2414,6 +2824,18 @@ pub fn compile_project_program_with_definition_facts(
             let resources = collect_resource_artifacts(owner, &facts[owner_index])?;
             Ok(KernelProjectOwnerOutputs {
                 result: expressions[result],
+                formals: principals[owner_index]
+                    .formal_requirements
+                    .iter()
+                    .map(|variable| builder.add_output(*variable, FlowMode::Continuous))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                formal_modes: principals[owner_index]
+                    .formal_modes
+                    .iter()
+                    .map(|mode| modes[mode.0 as usize])
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
                 expressions,
                 expression_modes: principals[owner_index]
                     .expression_modes
@@ -2536,7 +2958,16 @@ type StaticVariantSet = BTreeSet<Box<str>>;
 
 #[derive(Clone, Debug)]
 struct CallActual {
+    /// Provider surface used to evaluate the callee occurrence.
     variable: TypeVariableId,
+    /// Caller-owned surface that accepts definition-local requirements.
+    ///
+    /// Explicit arguments use the expression occurrence for both roles. An
+    /// inherited formal deliberately separates them: its provider is the
+    /// caller formal, while requirements must land on the caller's private
+    /// formal-requirement surface. Keeping these channels distinct prevents
+    /// inherited PASSED calls from silently detaching transitive constraints.
+    requirement: TypeVariableId,
     mode: ModeVariableId,
     mode_source: ModeSource,
     static_variants: Option<StaticVariantSet>,
@@ -3764,7 +4195,7 @@ fn instantiate_owner(
         if builder.is_authoritative(actual.variable) {
             continue;
         }
-        let actual = builder.variable_term(actual.variable);
+        let actual = builder.variable_term(actual.requirement);
         let requirement = builder.variable_term(*requirement);
         builder.add_unify(actual, requirement);
     }
@@ -5093,6 +5524,27 @@ fn emit_compiled_direct_summary(
                         });
                     }
                 }
+                if !builder.is_authoritative(actual.variable) {
+                    // Summary inputs are detached projections so a concrete
+                    // call-site provider can never be specialized by the
+                    // callee. An open caller formal is different: the
+                    // callee's definition-local requirement must flow back to
+                    // that formal's private requirement surface. Recreate the
+                    // same root/path equation used by a full invocation frame
+                    // without allocating that frame.
+                    let consumer = steps
+                        .last()
+                        .expect("a summary projection always has one step")
+                        .consumer;
+                    let requirement_root = builder.new_contextual_hole();
+                    let requirement = requirement_projection(builder, requirement_root, fields);
+                    let consumer = builder.variable_term(consumer);
+                    let requirement = builder.variable_term(requirement);
+                    builder.add_unify(consumer, requirement);
+                    let actual = builder.variable_term(actual.requirement);
+                    let requirement_root = builder.variable_term(requirement_root);
+                    builder.add_unify(actual, requirement_root);
+                }
                 call_inputs.push(KernelSummaryCallInput::Projection {
                     provider: actual.variable,
                     steps: steps.into_boxed_slice(),
@@ -5429,8 +5881,10 @@ fn compile_node(
                         "kernel owner node {index} repeats argument {ordinal}"
                     )));
                 }
+                let variable = edge_variable(context, index, edge)?;
                 *slot = Some(CallActual {
-                    variable: edge_variable(context, index, edge)?,
+                    variable,
+                    requirement: variable,
                     mode: edge_mode_variable(context, index, edge)?,
                     mode_source: mode_source_for_edge(
                         context,
@@ -5450,6 +5904,16 @@ fn compile_node(
                     .ok_or_else(|| {
                         KernelOwnerBuildError::new(format!(
                             "kernel owner node {index} inherits missing caller formal {}",
+                            inherited.caller_ordinal
+                        ))
+                    })?;
+                let actual_requirement = context
+                    .formal_requirements
+                    .get(inherited.caller_ordinal as usize)
+                    .copied()
+                    .ok_or_else(|| {
+                        KernelOwnerBuildError::new(format!(
+                            "kernel owner node {index} inherits missing caller formal requirement {}",
                             inherited.caller_ordinal
                         ))
                     })?;
@@ -5484,6 +5948,7 @@ fn compile_node(
                 if slot
                     .replace(CallActual {
                         variable: actual,
+                        requirement: actual_requirement,
                         mode: actual_mode,
                         mode_source: actual_mode_source,
                         static_variants: context
@@ -5562,7 +6027,7 @@ fn compile_node(
                     let output_term = builder.variable_term(output);
                     let requirement = builder.variable_term(requirement);
                     builder.add_unify(output_term, requirement);
-                    let actual_term = builder.variable_term(actual.variable);
+                    let actual_term = builder.variable_term(actual.requirement);
                     let requirement_root = builder.variable_term(requirement_root);
                     builder.add_unify(actual_term, requirement_root);
                 }
@@ -8899,6 +9364,139 @@ mod tests {
     }
 
     #[test]
+    fn callable_formals_publish_definition_local_builtin_requirements() {
+        let input = KernelProjectProgramInput {
+            owners: vec![KernelOwnerProgramInput {
+                nodes: vec![
+                    KernelOwnerNode {
+                        kind: KernelOwnerNodeKind::FormalRead {
+                            formal: 0,
+                            fields: Box::new([]),
+                        },
+                        inputs: Box::new([]),
+                        mode: FlowMode::Continuous,
+                    },
+                    KernelOwnerNode {
+                        kind: KernelOwnerNodeKind::PureBuiltin {
+                            kind: KernelPureBuiltinKind::TextLength,
+                        },
+                        inputs: vec![edge(
+                            KernelOwnerEdgeRole::AbiArgument {
+                                name: "$pipe".into(),
+                            },
+                            0,
+                        )]
+                        .into_boxed_slice(),
+                        mode: FlowMode::Continuous,
+                    },
+                ]
+                .into_boxed_slice(),
+                formal_count: 1,
+                external_expressions: Box::new([]),
+                result: KernelExpressionId(1),
+            }]
+            .into_boxed_slice(),
+        };
+
+        let artifact = compile_project_program(&input).unwrap().solve().unwrap();
+        assert_eq!(
+            artifact.definitions[0].formals.as_ref(),
+            [FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Text,
+            }]
+        );
+        assert_eq!(
+            artifact.definitions[0].result,
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Number,
+            }
+        );
+    }
+
+    #[test]
+    fn direct_result_summaries_forward_callee_requirements_to_open_caller_formals() {
+        let requiring_callee = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::PureBuiltin {
+                        kind: KernelPureBuiltinKind::TextLength,
+                    },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::AbiArgument {
+                            name: "$pipe".into(),
+                        },
+                        0,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+        let wrapper = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+
+        let program = compile_project_program(&KernelProjectProgramInput {
+            owners: vec![requiring_callee, wrapper].into_boxed_slice(),
+        })
+        .unwrap();
+        assert!(program.compile_work().direct_result_summaries > 0);
+        let artifact = program.solve().unwrap();
+        let text_formal = FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::Text,
+        };
+        assert_eq!(
+            artifact.definitions[0].formals.as_ref(),
+            [text_formal.clone()]
+        );
+        assert_eq!(artifact.definitions[1].formals.as_ref(), [text_formal]);
+        assert_eq!(
+            artifact.definitions[1].result,
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Number,
+            }
+        );
+    }
+
+    #[test]
     fn acyclic_user_calls_compose_fresh_formal_frames_into_one_component() {
         let callee = KernelOwnerProgramInput {
             nodes: vec![KernelOwnerNode {
@@ -9023,6 +9621,25 @@ mod tests {
         );
         assert_eq!(number_call.result.ty, Type::Number);
         assert_eq!(text_call.result.ty, Type::Text);
+        assert_eq!(
+            number_call.type_substitutions.as_ref(),
+            [KernelCallTypeSubstitution {
+                variable: KernelTypeParameterId(0),
+                value: Type::Number,
+            }]
+        );
+        assert_eq!(
+            text_call.type_substitutions.as_ref(),
+            [KernelCallTypeSubstitution {
+                variable: KernelTypeParameterId(0),
+                value: Type::Text,
+            }]
+        );
+        assert_eq!(artifact.definitions[0].formals.len(), 1);
+        assert!(matches!(
+            artifact.definitions[0].formals[0].ty,
+            Type::Var(_)
+        ));
         let number_expression = &artifact.definitions[1].expressions[2];
         assert_eq!(number_expression.id, KernelExpressionId(2));
         assert_eq!(

@@ -433,8 +433,15 @@ impl KernelSession {
                     .map(|definition| definition.result.clone())
                     .collect::<Vec<_>>()
                     .into_boxed_slice();
+                let callable_formals = snapshot
+                    .definitions
+                    .iter()
+                    .map(|definition| definition.formals.clone())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
                 KernelCheckProduct::Diagnostics(Arc::new(KernelInterfaceSnapshot {
                     public_results,
+                    callable_formals,
                     work: snapshot.work,
                 }))
             }
@@ -598,6 +605,13 @@ mod tests {
             panic!("diagnostics demand returned another product")
         };
         assert_eq!(snapshot.public_results.len(), 3);
+        assert_eq!(snapshot.callable_formals.len(), 3);
+        assert!(
+            snapshot
+                .callable_formals
+                .iter()
+                .all(|formals| formals.is_empty())
+        );
         assert_eq!(snapshot.public_results[2].ty, Type::Number);
         assert_eq!(result.product.materialized_definition_count(), 0);
         assert_eq!(result.product.sealed_definition_count(), 0);
@@ -624,6 +638,16 @@ mod tests {
                 .collect::<Vec<_>>()
                 .as_slice(),
             "diagnostics and checked-image demands must share one public interface authority"
+        );
+        assert_eq!(
+            snapshot.callable_formals.as_ref(),
+            checked_snapshot
+                .definitions
+                .iter()
+                .map(|definition| definition.formals.clone())
+                .collect::<Vec<_>>()
+                .as_slice(),
+            "diagnostics and checked-image demands must share callable formal authorities"
         );
 
         let repeated = session

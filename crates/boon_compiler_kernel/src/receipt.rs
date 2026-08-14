@@ -14,11 +14,11 @@ use std::hash::{Hash, Hasher};
 const KERNEL_DEFINITION_BASIS_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.definition-basis.v1\0";
 const KERNEL_PUBLIC_RESULT_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.public-result.v1\0";
 const KERNEL_EXPRESSION_SURFACE_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.expression-surface.v1\0";
-const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V1: &[u8] =
-    b"boon.compiler-kernel.definition-artifact.v1\0";
+const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V2: &[u8] =
+    b"boon.compiler-kernel.definition-artifact.v2\0";
 const KERNEL_DEPENDENCY_IMPORTS_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.dependency-imports.v1\0";
-const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V1: &[u8] =
-    b"boon.compiler-kernel.definition-currentness.v1\0";
+const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V2: &[u8] =
+    b"boon.compiler-kernel.definition-currentness.v2\0";
 
 /// Exact definition-local origin of one dependency edge.
 ///
@@ -191,9 +191,9 @@ impl KernelDefinitionDependencyGraph {
 pub struct KernelDefinitionCurrentnessReceipt {
     pub basis_fingerprint_v1: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v1: [u8; 32],
+    pub artifact_fingerprint_v2: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v1: [u8; 32],
+    pub fingerprint_v2: [u8; 32],
 }
 
 pub(crate) fn definition_basis_fingerprint(
@@ -253,7 +253,7 @@ pub(crate) fn build_snapshot_receipts(
             &mut hash_scratch,
         )?);
         artifact_fingerprints.push(stable_fingerprint(
-            KERNEL_DEFINITION_ARTIFACT_DOMAIN_V1,
+            KERNEL_DEFINITION_ARTIFACT_DOMAIN_V2,
             definition,
             &mut hash_scratch,
         ));
@@ -317,12 +317,12 @@ pub(crate) fn build_snapshot_receipts(
         );
         let basis_fingerprint_v1 = basis_fingerprints[definition_index];
         let public_result_fingerprint_v1 = public_result_fingerprints[definition_index];
-        let artifact_fingerprint_v1 = artifact_fingerprints[definition_index];
-        let fingerprint_v1 = stable_fingerprint(
-            KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V1,
+        let artifact_fingerprint_v2 = artifact_fingerprints[definition_index];
+        let fingerprint_v2 = stable_fingerprint(
+            KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V2,
             &(
                 basis_fingerprint_v1,
-                artifact_fingerprint_v1,
+                artifact_fingerprint_v2,
                 dependency_fingerprint_v1,
             ),
             &mut hash_scratch,
@@ -330,9 +330,9 @@ pub(crate) fn build_snapshot_receipts(
         receipts.push(KernelDefinitionCurrentnessReceipt {
             basis_fingerprint_v1,
             public_result_fingerprint_v1,
-            artifact_fingerprint_v1,
+            artifact_fingerprint_v2,
             dependency_fingerprint_v1,
-            fingerprint_v1,
+            fingerprint_v2,
         });
     }
     Ok((dependency_graph, receipts.into_boxed_slice()))
@@ -618,6 +618,9 @@ fn validate_dependency_target(
 pub(crate) fn alpha_normalize_definition(normalized: &mut DefinitionArtifact) {
     let mut variables = BTreeMap::new();
     let mut next = 0;
+    for formal in &mut normalized.formals {
+        *formal = alpha_normalize_flow_type(formal, &mut variables, &mut next);
+    }
     normalized.result = alpha_normalize_flow_type(&normalized.result, &mut variables, &mut next);
     for expression in &mut normalized.expressions {
         expression.flow_type =
@@ -631,6 +634,10 @@ pub(crate) fn alpha_normalize_definition(normalized: &mut DefinitionArtifact) {
     }
     for call in &mut normalized.calls {
         call.result = alpha_normalize_flow_type(&call.result, &mut variables, &mut next);
+        for substitution in &mut call.type_substitutions {
+            substitution.value =
+                alpha_normalize_type(&substitution.value, &mut variables, &mut next);
+        }
     }
     for source in &mut normalized.sources {
         source.payload_type = alpha_normalize_type(&source.payload_type, &mut variables, &mut next);
@@ -645,6 +652,24 @@ pub(crate) fn alpha_normalize_definition(normalized: &mut DefinitionArtifact) {
 
 pub(crate) fn alpha_normalize_public_flow(flow_type: &FlowType) -> FlowType {
     alpha_normalize_flow_type(flow_type, &mut BTreeMap::new(), &mut 0)
+}
+
+/// Normalize one callable scheme as a single namespace. Formal order owns the
+/// stable type-parameter ordinals; the result may reuse those variables or add
+/// result-only parameters afterward.
+pub(crate) fn alpha_normalize_callable_interface(
+    formals: &[FlowType],
+    result: &FlowType,
+) -> (Box<[FlowType]>, FlowType) {
+    let mut variables = BTreeMap::new();
+    let mut next = 0;
+    let formals = formals
+        .iter()
+        .map(|formal| alpha_normalize_flow_type(formal, &mut variables, &mut next))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let result = alpha_normalize_flow_type(result, &mut variables, &mut next);
+    (formals, result)
 }
 
 fn hash_normalized_flow_type(
@@ -972,11 +997,11 @@ mod tests {
             "an unused implementation edit must preserve the public type identity"
         );
         assert_ne!(
-            first.currentness[0].artifact_fingerprint_v1,
-            second.currentness[0].artifact_fingerprint_v1
+            first.currentness[0].artifact_fingerprint_v2,
+            second.currentness[0].artifact_fingerprint_v2
         );
         assert_ne!(
-            first.currentness[0].fingerprint_v1, second.currentness[0].fingerprint_v1,
+            first.currentness[0].fingerprint_v2, second.currentness[0].fingerprint_v2,
             "the edited definition must not claim the old exact evaluation receipt"
         );
         assert_eq!(
@@ -992,6 +1017,7 @@ mod tests {
                 mode: FlowMode::Continuous,
                 ty: Type::Var(TypeVar(variable)),
             },
+            formals: Box::new([]),
             expressions: Box::new([crate::KernelExpressionArtifact {
                 id: KernelExpressionId(0),
                 kind: KernelOwnerNodeKind::FormalRead {
@@ -1025,21 +1051,21 @@ mod tests {
             second[0].public_result_fingerprint_v1
         );
         assert_eq!(
-            first[0].artifact_fingerprint_v1,
-            second[0].artifact_fingerprint_v1
+            first[0].artifact_fingerprint_v2,
+            second[0].artifact_fingerprint_v2
         );
         assert_eq!(
-            first[0].artifact_fingerprint_v1,
+            first[0].artifact_fingerprint_v2,
             [
-                169, 80, 109, 154, 104, 182, 113, 150, 35, 221, 40, 234, 146, 176, 108, 31, 252,
-                209, 197, 155, 173, 124, 115, 104, 54, 197, 104, 186, 56, 116, 49, 224,
+                64, 219, 58, 35, 240, 231, 14, 131, 91, 152, 231, 110, 33, 91, 158, 239, 15, 227,
+                196, 61, 29, 32, 197, 194, 151, 69, 180, 171, 104, 82, 75, 111,
             ],
-            "the V1 direct structural fingerprint byte contract changed"
+            "the V2 direct structural fingerprint byte contract changed"
         );
         assert_ne!(
             first[0].basis_fingerprint_v1,
             second[0].basis_fingerprint_v1
         );
-        assert_ne!(first[0].fingerprint_v1, second[0].fingerprint_v1);
+        assert_ne!(first[0].fingerprint_v2, second[0].fingerprint_v2);
     }
 }

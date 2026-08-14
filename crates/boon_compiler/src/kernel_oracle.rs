@@ -9,10 +9,10 @@ use boon_checked::{
     type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
-    KernelCallInputRole, KernelCallTarget, KernelCollectionKind, KernelCompileWork,
-    KernelDeclarationId, KernelDeclarationInput, KernelDeclarationKind, KernelDeclarationOrigin,
-    KernelDeclarationReference, KernelDefinitionFactsInput, KernelExpressionId,
-    KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
+    KernelCallInputRole, KernelCallTarget, KernelCallTypeSubstitution, KernelCollectionKind,
+    KernelCompileWork, KernelDeclarationId, KernelDeclarationInput, KernelDeclarationKind,
+    KernelDeclarationOrigin, KernelDeclarationReference, KernelDefinitionFactsInput,
+    KernelExpressionId, KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
     KernelInheritedFormal, KernelLexicalAccess, KernelLexicalBindingInput,
     KernelLexicalBindingTarget, KernelLexicalBindingTargetInput, KernelListId, KernelListInput,
     KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
@@ -20,8 +20,8 @@ use boon_compiler_kernel::{
     KernelProjectProgramInput, KernelPureBuiltinKind, KernelRenderConstructorKind, KernelSolveWork,
     KernelSourceId, KernelSourceInput, KernelStateId, KernelStateInput,
     KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
-    KernelStatementParameter, KernelStatementReference, KernelValueReference,
-    is_kernel_host_effect,
+    KernelStatementParameter, KernelStatementReference, KernelTypeParameterId,
+    KernelValueReference, derive_kernel_call_type_substitutions, is_kernel_host_effect,
 };
 use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
 use boon_syntax::{
@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 pub struct KernelOwnerOracleEntry {
     pub owner: StableCheckOwnerKey,
     pub result_expression: Option<StableExpressionKey>,
+    pub formals: Box<[FlowType]>,
     pub result: FlowType,
     pub expressions: Box<[(StableExpressionKey, FlowType)]>,
     pub statements: Box<[KernelOwnerOracleStatement]>,
@@ -157,6 +158,7 @@ pub struct KernelOwnerOracleCall {
     pub expression: StableExpressionKey,
     pub target: KernelOwnerOracleCallTarget,
     pub inputs: Box<[KernelOwnerOracleCallInput]>,
+    pub type_substitutions: Box<[KernelCallTypeSubstitution]>,
     pub result: FlowType,
 }
 
@@ -236,9 +238,9 @@ pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
     pub basis_fingerprint_v1: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v1: [u8; 32],
+    pub artifact_fingerprint_v2: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v1: [u8; 32],
+    pub fingerprint_v2: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -800,9 +802,9 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                     owner: prepared[*prepared_index].owner.clone(),
                     basis_fingerprint_v1: receipt.basis_fingerprint_v1,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v1: receipt.artifact_fingerprint_v1,
+                    artifact_fingerprint_v2: receipt.artifact_fingerprint_v2,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v1: receipt.fingerprint_v1,
+                    fingerprint_v2: receipt.fingerprint_v2,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -1169,6 +1171,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                                     })
                                     .collect::<Vec<_>>()
                                     .into_boxed_slice(),
+                                type_substitutions: call.type_substitutions,
                                 result: call.result,
                             }
                         })
@@ -1195,6 +1198,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                     KernelOwnerOracleEntry {
                         owner: owner.owner.clone(),
                         result_expression: owner.result_expression.clone(),
+                        formals: artifact.formals,
                         result: artifact.result,
                         expressions,
                         statements,
@@ -6371,6 +6375,346 @@ mod tests {
             .collect()
     }
 
+    fn checked_callable_interface(
+        checked: &CheckedProgramFields,
+        project: &ProjectSyntaxSnapshot,
+        owner: &StableCheckOwnerKey,
+    ) -> Option<(Box<[FlowType]>, FlowType)> {
+        let StableCheckOwnerKey::Item(owner) = owner else {
+            return None;
+        };
+        let entry = project
+            .item_index()
+            .owners()
+            .find(|entry| entry.owner_key == *owner && entry.kind == UnitItemKind::Function)?;
+        let statement = checked
+            .statements
+            .get(project.statement_slot(entry.statement_id)?)?;
+        let CheckedStatementKind::Function { declaration } = statement.kind else {
+            return None;
+        };
+        let signature = checked
+            .callables
+            .iter()
+            .find(|signature| signature.decl_id == declaration)?;
+        let mut parameters = signature.parameters.iter().collect::<Vec<_>>();
+        parameters.sort_unstable_by_key(|parameter| parameter.ordinal);
+        let mut formals = parameters
+            .into_iter()
+            .map(|parameter| parameter.flow_type.clone())
+            .collect::<Vec<_>>();
+        if let Some(context) = signature
+            .context_formal
+            .and_then(|formal| checked.context_formal(formal))
+        {
+            formals.push(context.scheme.flow_type.clone());
+        }
+        Some((formals.into_boxed_slice(), signature.result.clone()))
+    }
+
+    fn alpha_normalize_callable_surface(
+        formals: &[FlowType],
+        result: &FlowType,
+    ) -> (Box<[FlowType]>, FlowType) {
+        let neutral = FlowType {
+            mode: FlowMode::Absent,
+            ty: Type::Absent,
+        };
+        let (_, mut surface) = alpha_normalize_owner(
+            &neutral,
+            formals
+                .iter()
+                .cloned()
+                .chain(std::iter::once(result.clone())),
+        );
+        let result = surface
+            .pop()
+            .expect("callable surface always contains its result");
+        (surface.into_boxed_slice(), result)
+    }
+
+    fn callable_interface_mismatches(
+        report: &KernelOwnerOracleReport,
+        checked: &CheckedProgramFields,
+        project: &ProjectSyntaxSnapshot,
+    ) -> Vec<String> {
+        let mut mismatches = Vec::new();
+        for owner in &report.supported {
+            let Some((checked_formals, checked_result)) =
+                checked_callable_interface(checked, project, &owner.owner)
+            else {
+                if !owner.formals.is_empty() {
+                    mismatches.push(format!(
+                        "kernel owner {:?} publishes {} callable formals without a checked callable interface",
+                        owner.owner,
+                        owner.formals.len()
+                    ));
+                }
+                continue;
+            };
+            let (kernel_formals, _) =
+                alpha_normalize_callable_surface(&owner.formals, &owner.result);
+            let (checked_formals, _) =
+                alpha_normalize_callable_surface(&checked_formals, &checked_result);
+            if kernel_formals.len() != checked_formals.len() {
+                mismatches.push(format!(
+                    "kernel owner {:?} callable formal count differs from checked: kernel={} checked={}",
+                    owner.owner,
+                    kernel_formals.len(),
+                    checked_formals.len()
+                ));
+                continue;
+            }
+            for (ordinal, (kernel, checked)) in
+                kernel_formals.iter().zip(&checked_formals).enumerate()
+            {
+                let compatible = kernel.mode == checked.mode
+                    && (legacy_generic_selector_type_matches(&kernel.ty, &checked.ty)
+                        || legacy_generic_selector_type_matches(&checked.ty, &kernel.ty));
+                if !compatible && owner.generic_selector_dependents.is_empty() {
+                    mismatches.push(format!(
+                        "kernel owner {:?} callable formal {ordinal} is incompatible with checked: kernel={kernel:?} checked={checked:?}",
+                        owner.owner
+                    ));
+                }
+            }
+        }
+        mismatches
+    }
+
+    fn collect_callable_type_parameter_ids(
+        ty: &Type,
+        parameters: &mut BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>,
+    ) {
+        match ty {
+            Type::Var(variable) => {
+                let next = KernelTypeParameterId(
+                    u32::try_from(parameters.len())
+                        .expect("checked callable type-parameter count exceeds u32"),
+                );
+                parameters.entry(*variable).or_insert(next);
+            }
+            Type::Object(shape) => {
+                for (_, field) in shape.ordered_fields() {
+                    collect_callable_type_parameter_ids(field, parameters);
+                }
+            }
+            Type::List(item) | Type::Set(item) => {
+                collect_callable_type_parameter_ids(item, parameters);
+            }
+            Type::Map { key, value } => {
+                collect_callable_type_parameter_ids(key, parameters);
+                collect_callable_type_parameter_ids(value, parameters);
+            }
+            Type::Function { args, result } => {
+                for argument in args {
+                    collect_callable_type_parameter_ids(argument, parameters);
+                }
+                collect_callable_type_parameter_ids(&result.ty, parameters);
+            }
+            Type::VariantSet(variants) => {
+                for variant in variants {
+                    if let Variant::Tagged { fields, .. } = variant {
+                        for (_, field) in fields.ordered_fields() {
+                            collect_callable_type_parameter_ids(field, parameters);
+                        }
+                    }
+                }
+            }
+            Type::Union(members) => {
+                for member in members {
+                    collect_callable_type_parameter_ids(member, parameters);
+                }
+            }
+            Type::Text
+            | Type::Number
+            | Type::Bytes(_)
+            | Type::Bits { .. }
+            | Type::Absent
+            | Type::RenderContract
+            | Type::UnresolvedShape { .. }
+            | Type::Unknown => {}
+        }
+    }
+
+    fn checked_call_type_substitutions(
+        checked: &CheckedProgramFields,
+        call: &boon_checked::CheckedCall,
+        target_formals: &[FlowType],
+        target_result: &FlowType,
+    ) -> Option<Box<[KernelCallTypeSubstitution]>> {
+        let signature = checked
+            .callables
+            .iter()
+            .find(|signature| signature.decl_id == call.callable)?;
+        let mut parameters = signature.parameters.iter().collect::<Vec<_>>();
+        parameters.sort_unstable_by_key(|parameter| parameter.ordinal);
+        let mut target_formals = target_formals.to_vec();
+        let mut target_result = target_result.clone();
+
+        let mut actuals = Vec::new();
+        for entry in &call.entries {
+            let boon_checked::CheckedCallEntry::Input { formal, value, .. } = entry else {
+                continue;
+            };
+            let parameter = parameters
+                .iter()
+                .find(|parameter| parameter.decl_id == *formal)?;
+            let actual = checked
+                .expressions
+                .get(value.0 as usize)?
+                .flow_type
+                .ty
+                .clone();
+            actuals.push((u32::try_from(parameter.ordinal).ok()?, actual));
+        }
+        let context_ordinal = u32::try_from(parameters.len()).ok()?;
+        if let Some((value, _)) = call.context_binding.explicit() {
+            let actual = checked
+                .expressions
+                .get(value.0 as usize)?
+                .flow_type
+                .ty
+                .clone();
+            actuals.push((context_ordinal, actual));
+        } else if let Some(formal) = call.context_binding.inherited()
+            && let Some(actual) = checked.context_formal(formal)
+        {
+            actuals.push((context_ordinal, actual.scheme.flow_type.ty.clone()));
+        }
+
+        // Checked scheme ordinals are definition-local and can numerically
+        // collide across caller/callee rows. Isolate both namespaces before
+        // asking the permanent kernel for its canonical substitution product.
+        let mut target_parameters = BTreeMap::new();
+        for formal in &target_formals {
+            collect_callable_type_parameter_ids(&formal.ty, &mut target_parameters);
+        }
+        collect_callable_type_parameter_ids(&target_result.ty, &mut target_parameters);
+        let target_replacements = target_parameters
+            .iter()
+            .map(|(variable, parameter)| (*variable, Type::Var(boon_checked::TypeVar(parameter.0))))
+            .collect::<BTreeMap<_, _>>();
+        for formal in &mut target_formals {
+            formal.ty =
+                boon_checked::apply_checked_type_environment(&formal.ty, &target_replacements);
+        }
+        target_result.ty =
+            boon_checked::apply_checked_type_environment(&target_result.ty, &target_replacements);
+
+        let mut actual_parameters = BTreeMap::new();
+        for (_, actual) in &actuals {
+            collect_callable_type_parameter_ids(actual, &mut actual_parameters);
+        }
+        let actual_replacements = actual_parameters
+            .iter()
+            .map(|(variable, parameter)| {
+                (
+                    *variable,
+                    Type::Var(boon_checked::TypeVar(
+                        u32::try_from(target_parameters.len())
+                            .expect("target parameter count exceeds u32")
+                            .saturating_add(parameter.0),
+                    )),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (_, actual) in &mut actuals {
+            *actual = boon_checked::apply_checked_type_environment(actual, &actual_replacements);
+        }
+
+        let mut substitutions =
+            derive_kernel_call_type_substitutions(&target_formals, &target_result, &actuals)
+                .into_vec();
+
+        let neutral = FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::Absent,
+        };
+        let normalized = alpha_normalize_owner(
+            &neutral,
+            substitutions.iter().map(|substitution| FlowType {
+                mode: FlowMode::Continuous,
+                ty: substitution.value.clone(),
+            }),
+        )
+        .1;
+        for (substitution, flow) in substitutions.iter_mut().zip(normalized) {
+            substitution.value = flow.ty;
+        }
+        Some(substitutions.into_boxed_slice())
+    }
+
+    fn normalized_kernel_call_type_substitutions(
+        substitutions: &[KernelCallTypeSubstitution],
+    ) -> Box<[KernelCallTypeSubstitution]> {
+        let neutral = FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::Absent,
+        };
+        let mut substitutions = substitutions.to_vec();
+        substitutions.sort_unstable_by_key(|substitution| substitution.variable);
+        let normalized = alpha_normalize_owner(
+            &neutral,
+            substitutions.iter().map(|substitution| FlowType {
+                mode: FlowMode::Continuous,
+                ty: substitution.value.clone(),
+            }),
+        )
+        .1;
+        for (substitution, flow) in substitutions.iter_mut().zip(normalized) {
+            substitution.value = flow.ty;
+        }
+        substitutions.into_boxed_slice()
+    }
+
+    fn call_substitution_mismatch(
+        kernel: &[KernelCallTypeSubstitution],
+        checked: &[KernelCallTypeSubstitution],
+        legacy_selector_target: bool,
+    ) -> Option<String> {
+        let kernel = kernel
+            .iter()
+            .map(|substitution| (substitution.variable, &substitution.value))
+            .collect::<BTreeMap<_, _>>();
+        let checked = checked
+            .iter()
+            .map(|substitution| (substitution.variable, &substitution.value))
+            .collect::<BTreeMap<_, _>>();
+        for (variable, checked) in checked {
+            let Some(kernel) = kernel.get(&variable) else {
+                // The legacy owner checker can back-specialize an inherited
+                // PASSED actual from a downstream WHEN selector. The dense
+                // kernel deliberately keeps that definition-local provider
+                // generic: a partial reactive selector is not an input type
+                // restriction. Preserve strict missing-evidence checks for
+                // ordinary callables, but do not require this known legacy
+                // selector contamination to appear in the canonical call
+                // substitution environment.
+                if legacy_selector_target {
+                    continue;
+                }
+                if !matches!(
+                    checked,
+                    Type::Var(_) | Type::Unknown | Type::UnresolvedShape { .. }
+                ) {
+                    return Some(format!(
+                        "kernel omits concrete checked substitution {variable:?}={checked:?}"
+                    ));
+                }
+                continue;
+            };
+            if !legacy_generic_selector_type_matches(kernel, checked)
+                && !legacy_generic_selector_type_matches(checked, kernel)
+            {
+                return Some(format!(
+                    "substitution {variable:?} is incompatible: kernel={kernel:?} checked={checked:?}"
+                ));
+            }
+        }
+        None
+    }
+
     fn call_and_effect_inventory_mismatches(
         report: &KernelOwnerOracleReport,
         checked: &CheckedProgramFields,
@@ -6379,6 +6723,11 @@ mod tests {
         project: &ProjectSyntaxSnapshot,
     ) -> Vec<String> {
         let callable_owners = checked_callable_owners(checked, project);
+        let kernel_interfaces = report
+            .supported
+            .iter()
+            .map(|owner| (owner.owner.clone(), owner))
+            .collect::<BTreeMap<_, _>>();
         let mut mismatches = Vec::new();
         let mut kernel_calls = BTreeMap::new();
         let mut kernel_effects = BTreeMap::new();
@@ -6463,12 +6812,34 @@ mod tests {
                     target,
                     inherited_formal,
                 } => {
-                    callable_owners.get(&current.callable) == Some(target)
+                    let target_matches = callable_owners.get(&current.callable) == Some(target)
                         && inherited_formal.is_some()
                             == matches!(
                                 current.context_binding,
                                 boon_checked::CheckedContextBinding::Inherited { .. }
-                            )
+                            );
+                    if target_matches
+                        && let Some(target_interface) = kernel_interfaces.get(target)
+                        && let Some(current_substitutions) = checked_call_type_substitutions(
+                            checked,
+                            current,
+                            &target_interface.formals,
+                            &target_interface.result,
+                        )
+                    {
+                        let kernel_substitutions =
+                            normalized_kernel_call_type_substitutions(&kernel.type_substitutions);
+                        if let Some(reason) = call_substitution_mismatch(
+                            &kernel_substitutions,
+                            &current_substitutions,
+                            !target_interface.generic_selector_dependents.is_empty(),
+                        ) {
+                            mismatches.push(format!(
+                                "kernel owner {owner:?} call {stable:?} substitutions differ from checked: {reason}; kernel={kernel_substitutions:?} checked={current_substitutions:?}"
+                            ));
+                        }
+                    }
+                    target_matches
                 }
                 KernelOwnerOracleCallTarget::RenderConstructor(kind) => {
                     render_constructor_kind(&current.function).as_ref() == Some(kind)
@@ -8193,6 +8564,35 @@ mod tests {
     }
 
     #[test]
+    fn selector_contaminated_checked_calls_do_not_invent_kernel_substitutions() {
+        let checked = [KernelCallTypeSubstitution {
+            variable: KernelTypeParameterId(0),
+            value: Type::VariantSet(
+                vec![
+                    Variant::Tag("Dark".to_owned()),
+                    Variant::Tag("Light".to_owned()),
+                ]
+                .into(),
+            ),
+        }];
+
+        assert!(call_substitution_mismatch(&[], &checked, false).is_some());
+        assert_eq!(call_substitution_mismatch(&[], &checked, true), None);
+        assert!(
+            call_substitution_mismatch(
+                &[KernelCallTypeSubstitution {
+                    variable: KernelTypeParameterId(0),
+                    value: Type::Number,
+                }],
+                &checked,
+                true,
+            )
+            .is_some(),
+            "selector compatibility may omit legacy-only evidence but may not hide contradictory evidence",
+        );
+    }
+
+    #[test]
     fn legacy_generic_selector_alpha_does_not_weaken_general_flow_matching() {
         let kernel = FlowType {
             mode: FlowMode::Continuous,
@@ -8844,6 +9244,23 @@ mod tests {
                 &input.provider,
                 KernelOwnerOracleValueReference::Expression(_)
             ));
+            let [substitution] = call.type_substitutions.as_ref() else {
+                panic!("generic box call must publish one target-local substitution")
+            };
+            assert_eq!(substitution.variable, KernelTypeParameterId(0));
+            assert_eq!(
+                substitution.value,
+                if owner.result.ty
+                    == Type::object(ObjectShape::from_ordered_fields(
+                        [("value".to_owned(), Type::Number)],
+                        false,
+                    ))
+                {
+                    Type::Number
+                } else {
+                    Type::Text
+                }
+            );
         }
     }
 
@@ -10102,7 +10519,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v1 != [0; 32]),
+                        && receipt.fingerprint_v2 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(
@@ -10418,8 +10835,8 @@ mod tests {
                 .filter(|owner| format!("{:?}", owner.owner).contains(pattern.as_ref()))
             {
                 eprintln!(
-                    "kernel-owner-trace solved owner={:?} result={:?}",
-                    owner.owner, owner.result
+                    "kernel-owner-trace solved owner={:?} formals={:?} result={:?}",
+                    owner.owner, owner.formals, owner.result
                 );
                 for (index, (stable, flow)) in owner.expressions.iter().enumerate() {
                     let current = checked_by_stable_key.get(stable);
@@ -10429,6 +10846,12 @@ mod tests {
                         flow.mode,
                         flow.ty,
                         current.map(|current| &current.ty),
+                    );
+                }
+                for call in &owner.calls {
+                    eprintln!(
+                        "kernel-owner-trace call expression={:?} target={:?} substitutions={:?} result={:?}",
+                        call.expression, call.target, call.type_substitutions, call.result,
                     );
                 }
             }
@@ -10446,6 +10869,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
+        mismatches.extend(callable_interface_mismatches(&report, fields, &project));
         mismatches.extend(call_and_effect_inventory_mismatches(
             &report,
             fields,
@@ -10495,6 +10919,8 @@ mod tests {
                     "lexical-extra"
                 } else if mismatch.contains("lexical") {
                     "lexical-other"
+                } else if mismatch.contains("callable interface") {
+                    "callable-interface"
                 } else if mismatch.contains("call") {
                     "call"
                 } else if mismatch.contains("SOURCE resource") {

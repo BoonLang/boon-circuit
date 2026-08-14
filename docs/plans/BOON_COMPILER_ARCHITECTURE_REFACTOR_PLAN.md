@@ -3109,9 +3109,42 @@ stable-key demand canonicalization, sparse materialization, zero receipt work
 for diagnostics and sparse definitions, public-interface equality across
 demands, same-revision graph reuse, checked-image replacement, and revision
 invalidation. This closes the input/session/demand ownership milestone. Exact
-diagnostic rows and callable substitutions are next; they must attach to these
-products without reintroducing a second solve or making diagnostics pay for a
-checked image.
+diagnostic rows must attach to these products without reintroducing a second
+solve or making diagnostics pay for a checked image.
+
+The callable-interface slice is now complete. Every definition publishes one
+canonical formal scheme from its private requirement surfaces, and every user
+call publishes a target-definition-local substitution environment. Parameter
+IDs are assigned by the target scheme rather than leaking union-find ordinals,
+so they remain meaningful across occurrence frames and fresh processes. Call
+actuals now carry separate provider and requirement channels: explicit
+arguments can share one occurrence surface, while an inherited `PASSED` formal
+reads the caller provider and sends transitive callee requirements to the
+caller's private requirement surface. This removes the detached-context bug
+without adding another per-call projection graph or specializing concrete
+providers.
+
+The differential compares callable schemes and occurrence substitutions in
+those canonical namespaces. It keeps one narrow legacy allowance: the old
+checker can back-specialize an inherited generic context from a downstream
+partial `WHEN` selector, whereas the kernel intentionally keeps that provider
+generic. Missing legacy-only selector evidence is ignored; contradictory
+substitutions still fail. This is not a tag or UI exception, and `NoElement`
+remains an ordinary library tag.
+
+The 2026-08-14 full NovyWave differential passes over all 1,389 executable
+owners and 2,123 call sites. A fresh debug diagnostics sample records
+2,291.075 ms candidate time, 2,138.140 ms kernel time, and 956.244 ms graph
+solve. A fresh optimized sample records 550.265 ms candidate time, 461.382 ms
+kernel time, 232.922 ms graph solve, and 7.525 ms public-interface projection;
+the full optimized differential body completes in 1.61 seconds. The two-job
+release rebuild took 121.34 seconds and is excluded from Boon latency. All 67
+kernel tests, 88 non-ignored compiler unit tests, and 16 compiler integration
+tests pass. This closes the public callable interface/substitution milestone.
+The next measured architecture target is the diagnostics construction path:
+roughly 129.5 ms of program compilation and 232.9 ms of graph solve remain
+larger than interface projection, so work must reduce compiled operations and
+solver activation rather than tune the already-small projection tail.
 
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release

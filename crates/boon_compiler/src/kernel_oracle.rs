@@ -237,6 +237,17 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 node.mode, node.kind, node.inputs,
             );
         }
+        for call in &prepared[prepared_index].call_targets {
+            let target = prepared_by_owner[&call.owner];
+            eprintln!(
+                "kernel-owner-call expression={} dense_target={} stable_target={:#?}",
+                call.node,
+                dense_owner[target]
+                    .expect("active traced call target has a dense owner")
+                    .0,
+                call.owner,
+            );
+        }
     }
     let project_input = KernelProjectProgramInput {
         owners: active

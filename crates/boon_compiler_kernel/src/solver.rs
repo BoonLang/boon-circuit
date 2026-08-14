@@ -1108,6 +1108,19 @@ impl ComponentSolver {
                 }
             }
             KernelSummaryNode::Term(term) => Ok(*term),
+            KernelSummaryNode::Projection { provider, fields } => {
+                let mut provider =
+                    self.evaluate_summary_value(program, inputs, *provider, memo, active)?;
+                for field in fields {
+                    provider = self.project_field(provider, *field).unwrap_or_else(|| {
+                        let field = self.program.terms.name(*field);
+                        self.program.terms.unresolved_shape(format!(
+                            "authoritative summary value omits projection `{field}`"
+                        ))
+                    });
+                }
+                Ok(self.resolve_term_head(provider))
+            }
             KernelSummaryNode::Constrain { value, expected } => {
                 let actual = self.evaluate_summary_value(program, inputs, *value, memo, active)?;
                 self.unify_terms(actual, *expected);

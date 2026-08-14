@@ -2128,11 +2128,9 @@ fn direct_result_summary_supported(
                 .collect::<Vec<_>>();
             matches!(inputs.as_slice(), [input] if child(input, active))
         }
-        KernelOwnerNodeKind::LexicalRead { fields }
-        | KernelOwnerNodeKind::ValueRead { fields }
-        | KernelOwnerNodeKind::DerivedRead { fields }
-            if fields.is_empty() =>
-        {
+        KernelOwnerNodeKind::LexicalRead { .. }
+        | KernelOwnerNodeKind::ValueRead { .. }
+        | KernelOwnerNodeKind::DerivedRead { .. } => {
             let providers = node
                 .inputs
                 .iter()
@@ -2316,6 +2314,7 @@ enum PlannedSummaryActual {
 struct PlannedSummaryValue {
     value: KernelSummaryValueId,
     mode: DirectSummaryMode,
+    formal_projection_input: Option<u32>,
 }
 
 struct DirectSummaryPlanCompiler<'a> {
@@ -2332,6 +2331,57 @@ impl DirectSummaryPlanCompiler<'_> {
         );
         self.nodes.push(node);
         id
+    }
+
+    fn push_formal_projection(
+        &mut self,
+        formal: u32,
+        fields: Box<[crate::NameId]>,
+    ) -> PlannedSummaryValue {
+        let input =
+            u32::try_from(self.inputs.len()).expect("kernel summary input count exceeds u32");
+        self.inputs
+            .push(DirectSummaryInput::FormalProjection { formal, fields });
+        PlannedSummaryValue {
+            value: self.push_node(KernelSummaryNode::Input(input)),
+            mode: DirectSummaryMode::Input(input),
+            formal_projection_input: Some(input),
+        }
+    }
+
+    fn project_value(
+        &mut self,
+        value: PlannedSummaryValue,
+        fields: &[Box<str>],
+        mode: DirectSummaryMode,
+    ) -> Option<PlannedSummaryValue> {
+        if fields.is_empty() {
+            return Some(value);
+        }
+        let fields = fields
+            .iter()
+            .map(|field| self.builder.terms_mut().intern_name(field))
+            .collect::<Vec<_>>();
+        if let Some(input) = value.formal_projection_input {
+            let DirectSummaryInput::FormalProjection {
+                formal,
+                fields: prefix,
+            } = self.inputs.get(input as usize)?.clone()
+            else {
+                return None;
+            };
+            let mut projection = prefix.into_vec();
+            projection.extend(fields);
+            return Some(self.push_formal_projection(formal, projection.into_boxed_slice()));
+        }
+        Some(PlannedSummaryValue {
+            value: self.push_node(KernelSummaryNode::Projection {
+                provider: value.value,
+                fields: fields.into_boxed_slice(),
+            }),
+            mode,
+            formal_projection_input: None,
+        })
     }
 
     fn compile_expression(
@@ -2354,6 +2404,7 @@ impl DirectSummaryPlanCompiler<'_> {
             let term_value = |compiler: &mut Self, term| PlannedSummaryValue {
                 value: compiler.push_node(KernelSummaryNode::Term(term)),
                 mode: fixed_mode,
+                formal_projection_input: None,
             };
             match &node.kind {
                 KernelOwnerNodeKind::Known(ty) if type_is_recursively_closed(ty) => {
@@ -2394,6 +2445,7 @@ impl DirectSummaryPlanCompiler<'_> {
                             result,
                         }),
                         mode: fixed_mode,
+                        formal_projection_input: None,
                     })
                 }
                 KernelOwnerNodeKind::Number => {
@@ -2422,19 +2474,11 @@ impl DirectSummaryPlanCompiler<'_> {
                                 .map(|field| self.builder.terms_mut().intern_name(field))
                                 .collect::<Vec<_>>()
                                 .into_boxed_slice();
-                            let input = u32::try_from(self.inputs.len())
-                                .expect("kernel summary input count exceeds u32");
-                            self.inputs.push(DirectSummaryInput::FormalProjection {
-                                formal: *formal,
-                                fields,
-                            });
-                            Some(PlannedSummaryValue {
-                                value: self.push_node(KernelSummaryNode::Input(input)),
-                                mode: DirectSummaryMode::Input(input),
-                            })
+                            Some(self.push_formal_projection(*formal, fields))
                         }
-                        PlannedSummaryActual::Value(value) if fields.is_empty() => Some(*value),
-                        PlannedSummaryActual::Value(_) => None,
+                        PlannedSummaryActual::Value(value) => {
+                            self.project_value(*value, fields, fixed_mode)
+                        }
                     }
                 }
                 KernelOwnerNodeKind::Record { tag } => {
@@ -2468,6 +2512,7 @@ impl DirectSummaryPlanCompiler<'_> {
                             entries: entries.into_boxed_slice(),
                         }),
                         mode: fixed_mode,
+                        formal_projection_input: None,
                     })
                 }
                 KernelOwnerNodeKind::Collection(kind) => match kind {
@@ -2499,6 +2544,7 @@ impl DirectSummaryPlanCompiler<'_> {
                                 values: Box::new([]),
                             }),
                             mode: fixed_mode,
+                            formal_projection_input: None,
                         })
                     }
                     KernelCollectionKind::Bytes => {
@@ -2528,6 +2574,7 @@ impl DirectSummaryPlanCompiler<'_> {
                                 result,
                             }),
                             mode: fixed_mode,
+                            formal_projection_input: None,
                         })
                     }
                     KernelCollectionKind::Map => {
@@ -2562,6 +2609,7 @@ impl DirectSummaryPlanCompiler<'_> {
                                 values: values.into_boxed_slice(),
                             }),
                             mode: fixed_mode,
+                            formal_projection_input: None,
                         })
                     }
                 },
@@ -2592,6 +2640,7 @@ impl DirectSummaryPlanCompiler<'_> {
                             result,
                         }),
                         mode: fixed_mode,
+                        formal_projection_input: None,
                     })
                 }
                 KernelOwnerNodeKind::Block => {
@@ -2618,9 +2667,7 @@ impl DirectSummaryPlanCompiler<'_> {
                 }
                 KernelOwnerNodeKind::LexicalRead { fields }
                 | KernelOwnerNodeKind::ValueRead { fields }
-                | KernelOwnerNodeKind::DerivedRead { fields }
-                    if fields.is_empty() =>
-                {
+                | KernelOwnerNodeKind::DerivedRead { fields } => {
                     let providers = node
                         .inputs
                         .iter()
@@ -2630,8 +2677,8 @@ impl DirectSummaryPlanCompiler<'_> {
                         return None;
                     };
                     let reference = provider.expression.0 as usize;
-                    if reference < owner.nodes.len() {
-                        self.compile_expression(owner_id, reference, actuals, active)
+                    let provider = if reference < owner.nodes.len() {
+                        self.compile_expression(owner_id, reference, actuals, active)?
                     } else {
                         let external = owner
                             .external_expressions
@@ -2647,14 +2694,16 @@ impl DirectSummaryPlanCompiler<'_> {
                             owner: external.owner,
                             expression,
                         });
-                        Some(PlannedSummaryValue {
+                        PlannedSummaryValue {
                             value: self.push_node(KernelSummaryNode::Input(input)),
                             mode: DirectSummaryMode::Fixed {
                                 owner: external.owner,
                                 expression,
                             },
-                        })
-                    }
+                            formal_projection_input: None,
+                        }
+                    };
+                    self.project_value(provider, fields, fixed_mode)
                 }
                 KernelOwnerNodeKind::UserCall {
                     target,
@@ -2778,6 +2827,7 @@ impl DirectSummaryPlanCompiler<'_> {
                             entries: entries.into_boxed_slice(),
                         }),
                         mode: fixed_mode,
+                        formal_projection_input: None,
                     })
                 }
                 KernelOwnerNodeKind::PureBuiltin { kind }
@@ -2830,6 +2880,7 @@ impl DirectSummaryPlanCompiler<'_> {
                             result,
                         }),
                         mode: fixed_mode,
+                        formal_projection_input: None,
                     })
                 }
                 KernelOwnerNodeKind::When => {
@@ -2874,6 +2925,7 @@ impl DirectSummaryPlanCompiler<'_> {
                             arms: arms.into_boxed_slice(),
                         }),
                         mode: selector.mode,
+                        formal_projection_input: None,
                     })
                 }
                 KernelOwnerNodeKind::MatchArm { .. } => {
@@ -2927,6 +2979,7 @@ impl DirectSummaryPlanCompiler<'_> {
                                 entries: entries.into_boxed_slice(),
                             }),
                             mode: fixed_mode,
+                            formal_projection_input: None,
                         })
                     } else if outputs.is_empty() && node.inputs.is_empty() {
                         let absent = self.builder.terms().absent();
@@ -2971,6 +3024,7 @@ impl DirectSummaryPlanCompiler<'_> {
                             result: selected,
                         }),
                         mode: fixed_mode,
+                        formal_projection_input: None,
                     })
                 }
                 KernelOwnerNodeKind::Infix { operation } => {
@@ -3020,6 +3074,7 @@ impl DirectSummaryPlanCompiler<'_> {
                             result,
                         }),
                         mode: fixed_mode,
+                        formal_projection_input: None,
                     })
                 }
                 KernelOwnerNodeKind::Arrow => {
@@ -6533,6 +6588,197 @@ mod tests {
         };
         assert_eq!(number.fields["value"], Type::Number);
         assert_eq!(text.fields["value"], Type::Text);
+    }
+
+    #[test]
+    fn structural_result_summary_composes_nested_formal_projections() {
+        let projector = KernelOwnerProgramInput {
+            nodes: vec![KernelOwnerNode {
+                kind: KernelOwnerNodeKind::FormalRead {
+                    formal: 0,
+                    fields: vec!["value".into()].into_boxed_slice(),
+                },
+                inputs: Box::new([]),
+                mode: FlowMode::Continuous,
+            }]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(0),
+        };
+        let wrapper = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+        let caller = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record { tag: None },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::RecordField {
+                            name: "value".into(),
+                            spread: false,
+                        },
+                        0,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(1),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 1)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(2),
+        };
+
+        let program = compile_project_program(&KernelProjectProgramInput {
+            owners: vec![projector, wrapper, caller].into_boxed_slice(),
+        })
+        .unwrap();
+        assert_eq!(
+            program.compile_work().invocation_frames,
+            0,
+            "a nested projection of a forwarded formal must stay in summary bytecode",
+        );
+        let summary_inputs = program
+            .component()
+            .operations
+            .iter()
+            .find_map(|operation| match operation.as_ref() {
+                crate::KernelOperation::SummaryCall { inputs, .. }
+                    if inputs.iter().any(|input| {
+                        matches!(
+                            input,
+                            KernelSummaryCallInput::Projection { steps, .. }
+                                if steps.iter().any(|step| step.field.is_some())
+                        )
+                    }) =>
+                {
+                    Some(inputs)
+                }
+                _ => None,
+            })
+            .expect("the wrapper call must use a composed formal projection input");
+        assert!(summary_inputs.len() >= 2);
+        assert_eq!(
+            program.solve().unwrap().definitions[2].result.ty,
+            Type::Number
+        );
+    }
+
+    #[test]
+    fn structural_result_summary_projects_a_computed_value() {
+        let callee = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record { tag: None },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::RecordField {
+                            name: "value".into(),
+                            spread: false,
+                        },
+                        0,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::DerivedRead {
+                        fields: vec!["value".into()].into_boxed_slice(),
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::ReadProvider, 1)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(2),
+        };
+        let caller = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+
+        let program = compile_project_program(&KernelProjectProgramInput {
+            owners: vec![callee, caller].into_boxed_slice(),
+        })
+        .unwrap();
+        assert_eq!(program.compile_work().invocation_frames, 0);
+        assert!(program.component().operations.iter().any(|operation| {
+            matches!(
+                operation.as_ref(),
+                crate::KernelOperation::SummaryCall { program, .. }
+                    if program.nodes.iter().any(|node| {
+                        matches!(node, KernelSummaryNode::Projection { .. })
+                    })
+            )
+        }));
+        assert_eq!(
+            program.solve().unwrap().definitions[1].result.ty,
+            Type::Number
+        );
     }
 
     #[test]

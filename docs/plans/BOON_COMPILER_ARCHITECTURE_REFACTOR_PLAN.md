@@ -2620,12 +2620,61 @@ This is another 7.6% below the 1,420.421 ms kernel checkpoint and about 65% belo
 the original 3,722.8 ms complete-kernel receipt. Work counts and the full
 differential are unchanged, including the one known HOLD mode mismatch.
 
-The next large speed slice must either encode guarded selectors in one packed
-summary program or remove the dominant repeated residual definition, guided by
-fresh counters. The remaining residual-module ranking must keep shrinking; a
-smaller interpreter cannot substitute for compiling each definition once.
-Release improvement is accepted only when the complete candidate path improves,
-not merely when graph counts fall.
+The next definition-summary cut removes a false boundary between nested calls.
+A forwarded formal now retains the identity of its occurrence-local projection
+input, so a callee read such as `row.expanded_label` composes its field path
+against the original actual instead of allocating a complete residual frame.
+Computed summary values have one immutable directional `Projection` bytecode
+node for cases such as a parsed tagged result followed by a payload read. The
+former preserves private requirement backflow; the latter projects an
+authoritative derived value without inventing a mutable provider cell. Gated
+owner tracing also reports remapped dense and stable call targets rather than
+the pre-projection placeholder IDs.
+
+On NovyWave this makes `file_tree_simple_scope_expand_button` and
+`waveform_segment_for_signal` shared summaries. Invocation frames fall from
+2,115 to 512, residual frames from 3,503 to 1,900, linked instructions from
+66,524 to 32,823, activations from 153,727 to 69,754, and live variables from
+127,122 to 99,442. Three fresh optimized samples record kernel times of
+1,208.321, 1,121.139, and 1,146.833 ms (median 1,146.833 ms). Their complete
+parse plus SOURCE ABI plus kernel times are 1,313.259, 1,217.505, and
+1,242.646 ms (median 1,242.646 ms); median compile/link is 173.795 ms and
+median solve is 907.353 ms. The fresh two-job release rebuild took 1m57s. This
+is 12.7% below the preceding 1,312.981 ms
+kernel checkpoint and about 69% below the original 3,722.8 ms receipt. Debug
+samples remain noisier at roughly 7.30--8.00 seconds of kernel work, while the
+same deterministic workload records 69,754 activations, 158,504 mutations,
+316,694 intern requests, and 56,114 live dependency edges.
+
+A collection-summary prototype is explicitly rejected and deleted. Adding
+directional item extraction plus `List/map` result bytecode reduced invocation
+frames again from 512 to 156 and linked instructions from 32,823 to 25,714,
+but recursively embedded and reinterpreted the mapped definition graph at each
+occurrence. Two debug observations regressed solve from roughly 6.1--6.6
+seconds to 9.493/10.431 seconds and kernel work to 11.208/12.326 seconds.
+Smaller mutable graph counts therefore do not justify recursively interpreting
+large summary trees. A future collection cut must compile the map body once as
+compact guarded/loop bytecode or direct typed operations; it cannot inline the
+source-shaped callee tree into every summary activation.
+
+All 46 kernel tests and 77 non-ignored compiler tests pass. The complete
+NovyWave differential again reaches only the known
+`store.focused_control_label` HOLD expression 3 mode mismatch
+(`PresentOrAbsent` versus the current checker's `Continuous`), with no earlier
+type or artifact divergence. The next dominant repeated residual is
+`NovyView/selected_wave_area` through `waveform_segment_lane` (29 operations
+through 27 frames). It is collection/map-shaped and must wait for the compiled
+collection-summary design above. In parallel, 961,506 summary-node evaluations
+remain the largest direct-dispatch counter, so guarded packed summary
+instructions are now more important than removing another small residual
+module.
+
+The next large speed slice must encode guarded selectors and straight-line
+summary regions in one packed program, then add a compiled collection body
+without recursive source interpretation. The remaining residual-module ranking
+must keep shrinking, but a smaller interpreter cannot substitute for compiling
+each definition once. Release improvement is accepted only when the complete
+candidate path improves, not merely when graph counts fall.
 
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not

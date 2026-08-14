@@ -88,6 +88,14 @@ pub struct KernelSummaryProgram {
 pub enum KernelSummaryNode {
     Input(u32),
     Term(TypeTermId),
+    /// Directional projection of a value constructed inside the immutable
+    /// summary. Formal-root projections stay occurrence-local call inputs so
+    /// they can retain requirement backflow; computed values need no mutable
+    /// provider cell and are projected directly during summary evaluation.
+    Projection {
+        provider: KernelSummaryValueId,
+        fields: Box<[NameId]>,
+    },
     Constrain {
         value: KernelSummaryValueId,
         expected: TypeTermId,

@@ -6,7 +6,8 @@ use crate::{
     TypeVariableId, solve_component,
 };
 use boon_checked::{
-    BytesType, FlowMode, FlowType, ObjectShape, Type, Variant, type_is_recursively_closed,
+    BytesType, CheckedListKeyPolicy, CheckedStateKind, FlowMode, FlowType, ObjectShape, Type,
+    Variant, type_is_recursively_closed,
 };
 use boon_data::ExactRoundingRule;
 use boon_effect_schema::{
@@ -25,6 +26,15 @@ pub struct KernelStatementId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct KernelDeclarationId(pub u32);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct KernelSourceId(pub u32);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct KernelStateId(pub u32);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct KernelListId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct KernelOwnerId(pub u32);
@@ -331,6 +341,13 @@ pub enum KernelDeclarationReference {
     OwnerPublic(KernelOwnerId),
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelStatementReference {
+    Local(KernelStatementId),
+    /// The public/root statement exported by another dense definition.
+    OwnerPublic(KernelOwnerId),
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum KernelLexicalBindingTargetInput {
     Declaration(KernelDeclarationReference),
@@ -364,6 +381,45 @@ pub struct KernelLexicalBindingInput {
     pub access: KernelLexicalAccess,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct KernelSemanticPath {
+    pub anchor: KernelDeclarationReference,
+    pub projection: Box<[Box<str>]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelSourceInput {
+    pub id: KernelSourceId,
+    pub declaration: KernelDeclarationReference,
+    pub statement: KernelStatementReference,
+    pub expression: KernelExpressionId,
+    pub projection: Box<[Box<str>]>,
+    pub interval_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelStateInput {
+    pub id: KernelStateId,
+    pub binding_declaration: KernelDeclarationReference,
+    pub declaration: KernelDeclarationReference,
+    pub statement: KernelStatementReference,
+    pub expression: KernelExpressionId,
+    pub initial: KernelExpressionId,
+    pub projection: Box<[Box<str>]>,
+    pub kind: CheckedStateKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelListInput {
+    pub id: KernelListId,
+    pub declaration: KernelDeclarationReference,
+    pub statement: KernelStatementReference,
+    pub producer: KernelExpressionId,
+    pub projection: Box<[Box<str>]>,
+    pub capacity: Option<usize>,
+    pub key_policy: CheckedListKeyPolicy,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum KernelStatementChildReference {
     Local(KernelStatementId),
@@ -375,6 +431,9 @@ pub struct KernelDefinitionFactsInput {
     pub statements: Box<[KernelStatementInput]>,
     pub declarations: Box<[KernelDeclarationInput]>,
     pub lexical_bindings: Box<[KernelLexicalBindingInput]>,
+    pub sources: Box<[KernelSourceInput]>,
+    pub states: Box<[KernelStateInput]>,
+    pub lists: Box<[KernelListInput]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -425,6 +484,7 @@ pub struct KernelOwnerProgram {
     statements: Box<[KernelStatementArtifact]>,
     declarations: Box<[KernelDeclarationArtifact]>,
     lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
+    resources: PendingKernelResources,
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
 }
@@ -487,6 +547,7 @@ struct KernelProjectOwnerOutputs {
     statements: Box<[KernelStatementArtifact]>,
     declarations: Box<[KernelDeclarationArtifact]>,
     lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
+    resources: PendingKernelResources,
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
 }
@@ -503,6 +564,46 @@ struct PendingKernelCallArtifact {
     expression: KernelExpressionId,
     target: KernelCallTarget,
     inputs: Box<[KernelCallInputArtifact]>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PendingKernelResources {
+    sources: Box<[PendingKernelSourceArtifact]>,
+    states: Box<[PendingKernelStateArtifact]>,
+    lists: Box<[PendingKernelListArtifact]>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingKernelSourceArtifact {
+    id: KernelSourceId,
+    declaration: KernelDeclarationReference,
+    statement: KernelStatementReference,
+    expression: KernelExpressionId,
+    path: KernelSemanticPath,
+    interval_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingKernelStateArtifact {
+    id: KernelStateId,
+    binding_declaration: KernelDeclarationReference,
+    declaration: KernelDeclarationReference,
+    statement: KernelStatementReference,
+    expression: KernelExpressionId,
+    initial: KernelValueReference,
+    path: KernelSemanticPath,
+    kind: CheckedStateKind,
+}
+
+#[derive(Clone, Debug)]
+struct PendingKernelListArtifact {
+    id: KernelListId,
+    declaration: KernelDeclarationReference,
+    statement: KernelStatementReference,
+    producer: KernelExpressionId,
+    path: KernelSemanticPath,
+    capacity: Option<usize>,
+    key_policy: CheckedListKeyPolicy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -621,6 +722,42 @@ pub struct KernelHostEffectArtifact {
     pub delivery: DeliveryCardinalitySpec,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelSourceArtifact {
+    pub id: KernelSourceId,
+    pub declaration: KernelDeclarationReference,
+    pub statement: KernelStatementReference,
+    pub expression: KernelExpressionId,
+    pub path: KernelSemanticPath,
+    pub interval_ms: Option<u64>,
+    pub payload_type: Type,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelStateArtifact {
+    pub id: KernelStateId,
+    pub binding_declaration: KernelDeclarationReference,
+    pub declaration: KernelDeclarationReference,
+    pub statement: KernelStatementReference,
+    pub expression: KernelExpressionId,
+    pub initial: KernelValueReference,
+    pub path: KernelSemanticPath,
+    pub kind: CheckedStateKind,
+    pub flow_type: FlowType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelListArtifact {
+    pub id: KernelListId,
+    pub declaration: KernelDeclarationReference,
+    pub statement: KernelStatementReference,
+    pub producer: KernelExpressionId,
+    pub path: KernelSemanticPath,
+    pub item_type: Type,
+    pub capacity: Option<usize>,
+    pub key_policy: CheckedListKeyPolicy,
+}
+
 /// Immutable checked result surface for one definition.
 ///
 /// This is deliberately free of solver cells, operation IDs, and work
@@ -635,6 +772,9 @@ pub struct DefinitionArtifact {
     pub lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
     pub calls: Box<[KernelCallArtifact]>,
     pub effects: Box<[KernelHostEffectArtifact]>,
+    pub sources: Box<[KernelSourceArtifact]>,
+    pub states: Box<[KernelStateArtifact]>,
+    pub lists: Box<[KernelListArtifact]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -688,6 +828,8 @@ impl KernelOwnerProgram {
             .expect("owner result belongs to its expression outputs");
         result.mode = self.expression_modes[result_index];
         let calls = materialize_call_artifacts(self.calls, &expression_flows);
+        let (sources, states, lists) =
+            materialize_resource_artifacts(self.resources, &expression_flows, None);
         let expressions =
             materialize_expression_artifacts(self.expression_artifacts, expression_flows);
         Ok(KernelDefinitionSnapshot {
@@ -699,6 +841,9 @@ impl KernelOwnerProgram {
                 lexical_bindings: self.lexical_bindings,
                 calls,
                 effects: self.effects,
+                sources,
+                states,
+                lists,
             },
             work: artifact.work,
         })
@@ -712,16 +857,32 @@ impl KernelOwnerProgram {
 impl KernelProjectProgram {
     pub fn solve(self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
         let artifact = solve_component(self.component)?;
-        let definitions = self
+        let public_results = self
             .owners
-            .into_vec()
-            .into_iter()
+            .iter()
             .map(|owner| {
                 let mut result = artifact
                     .output(owner.result)
                     .expect("project owner result belongs to its component")
                     .flow_type
                     .clone();
+                let result_index = owner
+                    .expressions
+                    .iter()
+                    .position(|output| *output == owner.result)
+                    .expect("owner result belongs to its expression outputs");
+                result.mode = owner.expression_modes[result_index];
+                result
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let definitions = self
+            .owners
+            .into_vec()
+            .into_iter()
+            .enumerate()
+            .map(|(owner_index, owner)| {
+                let result = public_results[owner_index].clone();
                 let expression_flows = owner
                     .expressions
                     .iter()
@@ -737,13 +898,12 @@ impl KernelProjectProgram {
                     })
                     .collect::<Vec<_>>()
                     .into_boxed_slice();
-                let result_index = owner
-                    .expressions
-                    .iter()
-                    .position(|output| *output == owner.result)
-                    .expect("project owner result belongs to its expression outputs");
-                result.mode = owner.expression_modes[result_index];
                 let calls = materialize_call_artifacts(owner.calls, &expression_flows);
+                let (sources, states, lists) = materialize_resource_artifacts(
+                    owner.resources,
+                    &expression_flows,
+                    Some(&public_results),
+                );
                 let expressions =
                     materialize_expression_artifacts(owner.expression_artifacts, expression_flows);
                 DefinitionArtifact {
@@ -754,6 +914,9 @@ impl KernelProjectProgram {
                     lexical_bindings: owner.lexical_bindings,
                     calls,
                     effects: owner.effects,
+                    sources,
+                    states,
+                    lists,
                 }
             })
             .collect::<Vec<_>>()
@@ -808,6 +971,27 @@ pub fn compile_owner_program_with_definition_facts(
     }) {
         return Err(KernelOwnerBuildError::new(
             "standalone owner lexical bindings cannot reference another owner",
+        ));
+    }
+    if facts.sources.iter().any(|source| {
+        matches!(
+            source.declaration,
+            KernelDeclarationReference::OwnerPublic(_)
+        ) || matches!(source.statement, KernelStatementReference::OwnerPublic(_))
+    }) || facts.states.iter().any(|state| {
+        matches!(
+            state.declaration,
+            KernelDeclarationReference::OwnerPublic(_)
+        ) || matches!(
+            state.binding_declaration,
+            KernelDeclarationReference::OwnerPublic(_)
+        ) || matches!(state.statement, KernelStatementReference::OwnerPublic(_))
+    }) || facts.lists.iter().any(|list| {
+        matches!(list.declaration, KernelDeclarationReference::OwnerPublic(_))
+            || matches!(list.statement, KernelStatementReference::OwnerPublic(_))
+    }) {
+        return Err(KernelOwnerBuildError::new(
+            "standalone owner resources cannot reference another owner",
         ));
     }
     let result = checked_expression_index(input.result, input.nodes.len(), "owner result")?;
@@ -892,6 +1076,7 @@ pub fn compile_owner_program_with_definition_facts(
     let statements = collect_statement_artifacts(input, facts)?;
     let declarations = collect_declaration_artifacts(input, facts)?;
     let lexical_bindings = collect_lexical_binding_artifacts(input, facts)?;
+    let resources = collect_resource_artifacts(input, facts)?;
     Ok(KernelOwnerProgram {
         component: builder.finish(),
         result_output,
@@ -901,6 +1086,7 @@ pub fn compile_owner_program_with_definition_facts(
         statements,
         declarations,
         lexical_bindings,
+        resources,
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
     })
@@ -1122,6 +1308,17 @@ fn validate_declaration_origin(
                     },
                     KernelDeclarationKind::List,
                 ) => name == &declaration.name,
+                // An authored fieldless HOLD alias can be the private state
+                // declaration for its lexical region. The syntax projection
+                // decides whether this statement owns that authority; the
+                // kernel validates the exact alias/statement identity here.
+                (
+                    KernelStatementKind::Hold {
+                        field: None,
+                        name: Some(name),
+                    },
+                    KernelDeclarationKind::Hold,
+                ) => name == &declaration.name,
                 _ => false,
             };
             if !matches {
@@ -1281,6 +1478,273 @@ fn collect_lexical_binding_artifacts(
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Vec::into_boxed_slice)
+}
+
+fn validate_resource_declaration(
+    facts: &KernelDefinitionFactsInput,
+    declaration: KernelDeclarationReference,
+    context: &str,
+) -> Result<(), KernelOwnerBuildError> {
+    if let KernelDeclarationReference::Local(declaration) = declaration
+        && declaration.0 as usize >= facts.declarations.len()
+    {
+        return Err(KernelOwnerBuildError::new(format!(
+            "{context} references missing declaration {}",
+            declaration.0
+        )));
+    }
+    Ok(())
+}
+
+fn validate_resource_statement(
+    facts: &KernelDefinitionFactsInput,
+    statement: KernelStatementReference,
+    context: &str,
+) -> Result<(), KernelOwnerBuildError> {
+    let KernelStatementReference::Local(statement) = statement else {
+        return Ok(());
+    };
+    if statement.0 as usize >= facts.statements.len() {
+        return Err(KernelOwnerBuildError::new(format!(
+            "{context} references missing statement {}",
+            statement.0
+        )));
+    }
+    Ok(())
+}
+
+fn collect_resource_artifacts(
+    owner: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<PendingKernelResources, KernelOwnerBuildError> {
+    let mut resource_expressions = BTreeSet::new();
+    let sources = facts
+        .sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            if source.id.0 as usize != index {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel SOURCE rows must use dense IDs: row {index} has ID {}",
+                    source.id.0
+                )));
+            }
+            validate_resource_declaration(facts, source.declaration, "kernel SOURCE row")?;
+            validate_resource_statement(facts, source.statement, "kernel SOURCE row")?;
+            let expression = checked_expression_index(
+                source.expression,
+                owner.nodes.len(),
+                "kernel SOURCE expression",
+            )?;
+            if !matches!(owner.nodes[expression].kind, KernelOwnerNodeKind::Source(_)) {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel SOURCE row {index} expression {expression} is not a literal SOURCE"
+                )));
+            }
+            if !resource_expressions.insert((0u8, source.expression)) {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel SOURCE expression {expression} is published more than once"
+                )));
+            }
+            Ok(PendingKernelSourceArtifact {
+                id: source.id,
+                declaration: source.declaration,
+                statement: source.statement,
+                expression: source.expression,
+                path: KernelSemanticPath {
+                    anchor: source.declaration,
+                    projection: source.projection.clone(),
+                },
+                interval_ms: source.interval_ms,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_boxed_slice();
+
+    let states = facts
+        .states
+        .iter()
+        .enumerate()
+        .map(|(index, state)| {
+            if state.id.0 as usize != index {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel state rows must use dense IDs: row {index} has ID {}",
+                    state.id.0
+                )));
+            }
+            validate_resource_declaration(
+                facts,
+                state.binding_declaration,
+                "kernel state binding",
+            )?;
+            validate_resource_declaration(facts, state.declaration, "kernel state row")?;
+            validate_resource_statement(facts, state.statement, "kernel state row")?;
+            let expression = checked_expression_index(
+                state.expression,
+                owner.nodes.len(),
+                "kernel state expression",
+            )?;
+            if !matches!(
+                (&owner.nodes[expression].kind, state.kind),
+                (KernelOwnerNodeKind::Hold, CheckedStateKind::Hold)
+            ) {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel state row {index} kind {:?} is incompatible with expression {expression} kind {:?}",
+                    state.kind, owner.nodes[expression].kind
+                )));
+            }
+            if !resource_expressions.insert((1u8, state.expression)) {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel state expression {expression} is published more than once"
+                )));
+            }
+            let initial = kernel_value_reference(owner, state.initial, expression)?;
+            Ok(PendingKernelStateArtifact {
+                id: state.id,
+                binding_declaration: state.binding_declaration,
+                declaration: state.declaration,
+                statement: state.statement,
+                expression: state.expression,
+                initial,
+                path: KernelSemanticPath {
+                    anchor: state.declaration,
+                    projection: state.projection.clone(),
+                },
+                kind: state.kind,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_boxed_slice();
+
+    let lists = facts
+        .lists
+        .iter()
+        .enumerate()
+        .map(|(index, list)| {
+            if list.id.0 as usize != index {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel LIST rows must use dense IDs: row {index} has ID {}",
+                    list.id.0
+                )));
+            }
+            validate_resource_declaration(facts, list.declaration, "kernel LIST row")?;
+            validate_resource_statement(facts, list.statement, "kernel LIST row")?;
+            let producer =
+                checked_expression_index(list.producer, owner.nodes.len(), "kernel LIST producer")?;
+            let KernelOwnerNodeKind::Collection {
+                kind: KernelCollectionKind::List,
+                capacity,
+            } = &owner.nodes[producer].kind
+            else {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel LIST row {index} producer {producer} is not a list literal"
+                )));
+            };
+            if capacity != &list.capacity {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel LIST row {index} capacity {:?} differs from producer capacity {:?}",
+                    list.capacity, capacity
+                )));
+            }
+            if !resource_expressions.insert((2u8, list.producer)) {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel LIST producer {producer} is published more than once"
+                )));
+            }
+            Ok(PendingKernelListArtifact {
+                id: list.id,
+                declaration: list.declaration,
+                statement: list.statement,
+                producer: list.producer,
+                path: KernelSemanticPath {
+                    anchor: list.declaration,
+                    projection: list.projection.clone(),
+                },
+                capacity: list.capacity,
+                key_policy: list.key_policy,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_boxed_slice();
+
+    Ok(PendingKernelResources {
+        sources,
+        states,
+        lists,
+    })
+}
+
+fn materialize_resource_artifacts(
+    pending: PendingKernelResources,
+    expressions: &[FlowType],
+    public_results: Option<&[FlowType]>,
+) -> (
+    Box<[KernelSourceArtifact]>,
+    Box<[KernelStateArtifact]>,
+    Box<[KernelListArtifact]>,
+) {
+    let sources = pending
+        .sources
+        .into_vec()
+        .into_iter()
+        .map(|source| KernelSourceArtifact {
+            id: source.id,
+            declaration: source.declaration,
+            statement: source.statement,
+            expression: source.expression,
+            path: source.path,
+            interval_ms: source.interval_ms,
+            payload_type: expressions[source.expression.0 as usize].ty.clone(),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let states = pending
+        .states
+        .into_vec()
+        .into_iter()
+        .map(|state| KernelStateArtifact {
+            id: state.id,
+            binding_declaration: state.binding_declaration,
+            declaration: state.declaration,
+            statement: state.statement,
+            expression: state.expression,
+            initial: state.initial,
+            path: state.path,
+            kind: state.kind,
+            flow_type: expressions[state.expression.0 as usize].clone(),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let lists = pending
+        .lists
+        .into_vec()
+        .into_iter()
+        .map(|list| {
+            let producer = &expressions[list.producer.0 as usize];
+            let authority = match list.declaration {
+                KernelDeclarationReference::OwnerPublic(owner) => public_results
+                    .and_then(|results| results.get(owner.0 as usize))
+                    .filter(|result| matches!(result.ty, Type::List(_)))
+                    .unwrap_or(producer),
+                KernelDeclarationReference::Local(_) => producer,
+            };
+            let Type::List(item_type) = &authority.ty else {
+                unreachable!("a solved LIST literal must retain a List type")
+            };
+            KernelListArtifact {
+                id: list.id,
+                declaration: list.declaration,
+                statement: list.statement,
+                producer: list.producer,
+                path: list.path,
+                item_type: item_type.as_ref().clone(),
+                capacity: list.capacity,
+                key_policy: list.key_policy,
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    (sources, states, lists)
 }
 
 fn materialize_call_artifacts(
@@ -1452,6 +1916,42 @@ pub fn compile_project_program_with_definition_facts(
                 )));
             }
         }
+        let validate_resource_owner = |reference: KernelDeclarationReference, context: &str| {
+            if let KernelDeclarationReference::OwnerPublic(owner) = reference
+                && owner.0 as usize >= input.owners.len()
+            {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel definition {definition} {context} references missing owner {}",
+                    owner.0
+                )));
+            }
+            Ok(())
+        };
+        let validate_resource_statement_owner =
+            |reference: KernelStatementReference, context: &str| {
+                if let KernelStatementReference::OwnerPublic(owner) = reference
+                    && owner.0 as usize >= input.owners.len()
+                {
+                    return Err(KernelOwnerBuildError::new(format!(
+                        "kernel definition {definition} {context} references missing owner {}",
+                        owner.0
+                    )));
+                }
+                Ok(())
+            };
+        for source in &facts.sources {
+            validate_resource_owner(source.declaration, "SOURCE row")?;
+            validate_resource_statement_owner(source.statement, "SOURCE statement")?;
+        }
+        for state in &facts.states {
+            validate_resource_owner(state.declaration, "state row")?;
+            validate_resource_owner(state.binding_declaration, "state binding")?;
+            validate_resource_statement_owner(state.statement, "state statement")?;
+        }
+        for list in &facts.lists {
+            validate_resource_owner(list.declaration, "LIST row")?;
+            validate_resource_statement_owner(list.statement, "LIST statement")?;
+        }
     }
     let mut builder = ComponentProgramBuilder::new();
     let mut mode_builder = ModeProgramBuilder::default();
@@ -1611,6 +2111,8 @@ pub fn compile_project_program_with_definition_facts(
                 .map(|(variable, node)| builder.add_output(*variable, node.mode))
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
+            let statements = collect_statement_artifacts(owner, &facts[owner_index])?;
+            let resources = collect_resource_artifacts(owner, &facts[owner_index])?;
             Ok(KernelProjectOwnerOutputs {
                 result: expressions[result],
                 expressions,
@@ -1621,9 +2123,10 @@ pub fn compile_project_program_with_definition_facts(
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
                 expression_artifacts: collect_expression_artifacts(owner)?,
-                statements: collect_statement_artifacts(owner, &facts[owner_index])?,
+                statements,
                 declarations: collect_declaration_artifacts(owner, &facts[owner_index])?,
                 lexical_bindings: collect_lexical_binding_artifacts(owner, &facts[owner_index])?,
+                resources,
                 calls: collect_call_artifacts(owner)?,
                 effects: collect_host_effect_artifacts(owner)?,
             })
@@ -7066,6 +7569,9 @@ mod tests {
                 access: KernelLexicalAccess::Drain,
             }]
             .into_boxed_slice(),
+            sources: Box::new([]),
+            states: Box::new([]),
+            lists: Box::new([]),
         };
 
         let artifact = compile_owner_program_with_definition_facts(&input, &facts)
@@ -7105,6 +7611,224 @@ mod tests {
             .err()
             .expect("a lexical row must not target a missing declaration");
         assert!(error.to_string().contains("missing declaration 7"));
+    }
+
+    #[test]
+    fn definition_resources_materialize_from_one_solved_expression_table() {
+        let input = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Source(Type::Number),
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Tag("Off".into()),
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Tag("On".into()),
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Hold,
+                    inputs: vec![
+                        edge(KernelOwnerEdgeRole::HoldInitial, 1),
+                        edge(KernelOwnerEdgeRole::HoldUpdate, 2),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Collection {
+                        kind: KernelCollectionKind::List,
+                        capacity: Some(4),
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CollectionItem, 4)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record { tag: None },
+                    inputs: vec![
+                        edge(
+                            KernelOwnerEdgeRole::RecordField {
+                                name: "pulse".into(),
+                                spread: false,
+                            },
+                            0,
+                        ),
+                        edge(
+                            KernelOwnerEdgeRole::RecordField {
+                                name: "state".into(),
+                                spread: false,
+                            },
+                            3,
+                        ),
+                        edge(
+                            KernelOwnerEdgeRole::RecordField {
+                                name: "rows".into(),
+                                spread: false,
+                            },
+                            5,
+                        ),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(6),
+        };
+        let statements = vec![
+            KernelStatementInput {
+                id: KernelStatementId(0),
+                kind: KernelStatementKind::Field {
+                    name: "root".into(),
+                },
+                value: Some(KernelExpressionId(6)),
+                children: vec![
+                    KernelStatementChildReference::Local(KernelStatementId(1)),
+                    KernelStatementChildReference::Local(KernelStatementId(2)),
+                    KernelStatementChildReference::Local(KernelStatementId(3)),
+                ]
+                .into_boxed_slice(),
+            },
+            KernelStatementInput {
+                id: KernelStatementId(1),
+                kind: KernelStatementKind::Source {
+                    field: Some("pulse".into()),
+                    event: None,
+                },
+                value: Some(KernelExpressionId(0)),
+                children: Box::new([]),
+            },
+            KernelStatementInput {
+                id: KernelStatementId(2),
+                kind: KernelStatementKind::Hold {
+                    field: Some("state".into()),
+                    name: Some("state".into()),
+                },
+                value: Some(KernelExpressionId(3)),
+                children: Box::new([]),
+            },
+            KernelStatementInput {
+                id: KernelStatementId(3),
+                kind: KernelStatementKind::List {
+                    field: Some("rows".into()),
+                    capacity: Some(4),
+                },
+                value: Some(KernelExpressionId(5)),
+                children: Box::new([]),
+            },
+        ]
+        .into_boxed_slice();
+        let declarations = [
+            ("root", KernelDeclarationKind::Field, 6u32),
+            ("pulse", KernelDeclarationKind::Source, 0),
+            ("state", KernelDeclarationKind::Hold, 3),
+            ("rows", KernelDeclarationKind::List, 5),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, kind, value))| KernelDeclarationInput {
+            id: KernelDeclarationId(u32::try_from(index).unwrap()),
+            origin: KernelDeclarationOrigin::Statement {
+                statement: KernelStatementId(u32::try_from(index).unwrap()),
+            },
+            name: name.into(),
+            kind,
+            value: Some(KernelExpressionId(value)),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+        let facts = KernelDefinitionFactsInput {
+            statements,
+            declarations,
+            lexical_bindings: Box::new([]),
+            sources: vec![KernelSourceInput {
+                id: KernelSourceId(0),
+                declaration: KernelDeclarationReference::Local(KernelDeclarationId(1)),
+                statement: KernelStatementReference::Local(KernelStatementId(1)),
+                expression: KernelExpressionId(0),
+                projection: Box::new([]),
+                interval_ms: None,
+            }]
+            .into_boxed_slice(),
+            states: vec![KernelStateInput {
+                id: KernelStateId(0),
+                binding_declaration: KernelDeclarationReference::Local(KernelDeclarationId(2)),
+                declaration: KernelDeclarationReference::Local(KernelDeclarationId(2)),
+                statement: KernelStatementReference::Local(KernelStatementId(2)),
+                expression: KernelExpressionId(3),
+                initial: KernelExpressionId(1),
+                projection: Box::new([]),
+                kind: CheckedStateKind::Hold,
+            }]
+            .into_boxed_slice(),
+            lists: vec![KernelListInput {
+                id: KernelListId(0),
+                declaration: KernelDeclarationReference::Local(KernelDeclarationId(3)),
+                statement: KernelStatementReference::Local(KernelStatementId(3)),
+                producer: KernelExpressionId(5),
+                projection: Box::new([]),
+                capacity: Some(4),
+                key_policy: CheckedListKeyPolicy::GeneratedOccurrenceU64 {
+                    has_generation: true,
+                },
+            }]
+            .into_boxed_slice(),
+        };
+
+        let artifact = compile_owner_program_with_definition_facts(&input, &facts)
+            .unwrap()
+            .solve()
+            .unwrap()
+            .definition;
+
+        let [source] = artifact.sources.as_ref() else {
+            panic!("one SOURCE artifact must be materialized")
+        };
+        assert_eq!(source.payload_type, Type::Number);
+        assert_eq!(source.expression, KernelExpressionId(0));
+        let [state] = artifact.states.as_ref() else {
+            panic!("one HOLD state artifact must be materialized")
+        };
+        assert_eq!(
+            state.initial,
+            KernelValueReference::Local(KernelExpressionId(1))
+        );
+        assert_eq!(
+            state.flow_type.ty,
+            Type::VariantSet(
+                vec![
+                    Variant::Tag("Off".to_owned()),
+                    Variant::Tag("On".to_owned())
+                ]
+                .into()
+            )
+        );
+        let [list] = artifact.lists.as_ref() else {
+            panic!("one persistent LIST artifact must be materialized")
+        };
+        assert_eq!(list.item_type, Type::Number);
+        assert_eq!(list.capacity, Some(4));
+        assert_eq!(list.path.anchor, list.declaration);
+
+        let mut invalid = facts;
+        invalid.sources[0].expression = KernelExpressionId(4);
+        let error = compile_owner_program_with_definition_facts(&input, &invalid)
+            .err()
+            .expect("a SOURCE artifact must name a SOURCE node");
+        assert!(error.to_string().contains("is not a literal SOURCE"));
     }
 
     #[test]

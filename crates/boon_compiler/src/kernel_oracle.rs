@@ -4,19 +4,23 @@
 //! lexical, constraint-seed, interface, and body artifacts; production cutover
 //! will reuse the compact projection only after complete SCC parity.
 
-use boon_checked::{FlowMode, FlowType, ObjectShape, Type, Variant, type_is_recursively_closed};
+use boon_checked::{
+    CheckedListKeyPolicy, CheckedStateKind, FlowMode, FlowType, ObjectShape, Type, Variant,
+    type_is_recursively_closed,
+};
 use boon_compiler_kernel::{
     KernelCallInputRole, KernelCallTarget, KernelCollectionKind, KernelCompileWork,
     KernelDeclarationId, KernelDeclarationInput, KernelDeclarationKind, KernelDeclarationOrigin,
     KernelDeclarationReference, KernelDefinitionFactsInput, KernelExpressionId,
     KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
     KernelInheritedFormal, KernelLexicalAccess, KernelLexicalBindingInput,
-    KernelLexicalBindingTarget, KernelLexicalBindingTargetInput, KernelOwnerEdgeRole,
-    KernelOwnerId, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
+    KernelLexicalBindingTarget, KernelLexicalBindingTargetInput, KernelListId, KernelListInput,
+    KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
     KernelOwnerProgramInput, KernelParameterKind, KernelPattern, KernelProjectProgramInput,
-    KernelPureBuiltinKind, KernelRenderConstructorKind, KernelSolveWork,
-    KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
-    KernelStatementParameter, KernelValueReference, compile_project_program_with_definition_facts,
+    KernelPureBuiltinKind, KernelRenderConstructorKind, KernelSolveWork, KernelSourceId,
+    KernelSourceInput, KernelStateId, KernelStateInput, KernelStatementChildReference,
+    KernelStatementId, KernelStatementInput, KernelStatementKind, KernelStatementParameter,
+    KernelStatementReference, KernelValueReference, compile_project_program_with_definition_facts,
     is_kernel_host_effect,
 };
 use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
@@ -40,6 +44,9 @@ pub struct KernelOwnerOracleEntry {
     pub lexical_bindings: Box<[KernelOwnerOracleLexicalBinding]>,
     pub collections: Box<[KernelOwnerOracleCollection]>,
     pub sources: Box<[KernelOwnerOracleSource]>,
+    pub source_resources: Box<[KernelOwnerOracleSourceResource]>,
+    pub states: Box<[KernelOwnerOracleState]>,
+    pub lists: Box<[KernelOwnerOracleList]>,
     pub calls: Box<[KernelOwnerOracleCall]>,
     pub effects: Box<[(StableExpressionKey, KernelHostEffectArtifact)]>,
     pub public_child_owner_fields: Box<[(String, StableCheckOwnerKey)]>,
@@ -103,6 +110,46 @@ pub struct KernelOwnerOracleLexicalBinding {
     pub target: KernelOwnerOracleLexicalTarget,
     pub projection: Box<[Box<str>]>,
     pub access: KernelLexicalAccess,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleSemanticPath {
+    pub anchor_owner: StableCheckOwnerKey,
+    pub anchor: Option<KernelOwnerOracleDeclarationOrigin>,
+    pub projection: Box<[Box<str>]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleSourceResource {
+    pub declaration: KernelOwnerOracleLexicalTarget,
+    pub statement: StableStatementKey,
+    pub expression: StableExpressionKey,
+    pub path: KernelOwnerOracleSemanticPath,
+    pub interval_ms: Option<u64>,
+    pub payload_type: Type,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleState {
+    pub binding_declaration: KernelOwnerOracleLexicalTarget,
+    pub declaration: KernelOwnerOracleLexicalTarget,
+    pub statement: StableStatementKey,
+    pub expression: StableExpressionKey,
+    pub initial: KernelOwnerOracleValueReference,
+    pub path: KernelOwnerOracleSemanticPath,
+    pub kind: CheckedStateKind,
+    pub flow_type: FlowType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleList {
+    pub declaration: KernelOwnerOracleLexicalTarget,
+    pub statement: StableStatementKey,
+    pub producer: StableExpressionKey,
+    pub path: KernelOwnerOracleSemanticPath,
+    pub item_type: Type,
+    pub capacity: Option<usize>,
+    pub key_policy: CheckedListKeyPolicy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -266,6 +313,38 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
             }
         }
     }
+    let mut resource_ordinals =
+        BTreeMap::<(StableCheckOwnerKey, PreparedResourceSyntheticKind), usize>::new();
+    for owner in &mut prepared {
+        for synthetic in &owner.resource_synthetic_paths {
+            let ordinal = resource_ordinals
+                .entry((synthetic.anchor.clone(), synthetic.kind))
+                .or_default();
+            let projection = match synthetic.kind {
+                PreparedResourceSyntheticKind::State => owner
+                    .definition_facts
+                    .states
+                    .get_mut(synthetic.row)
+                    .map(|state| &mut state.projection),
+                PreparedResourceSyntheticKind::List => owner
+                    .definition_facts
+                    .lists
+                    .get_mut(synthetic.row)
+                    .map(|list| &mut list.projection),
+            }
+            .expect("prepared synthetic resource row is in range");
+            assert!(
+                projection.is_empty(),
+                "a synthetic resource path must begin without a structural projection"
+            );
+            let prefix = match synthetic.kind {
+                PreparedResourceSyntheticKind::State => "state",
+                PreparedResourceSyntheticKind::List => "list",
+            };
+            *projection = vec![format!("{prefix}_{ordinal}").into_boxed_str()].into_boxed_slice();
+            *ordinal = ordinal.saturating_add(1);
+        }
+    }
     let mut root_blocker_by_owner = unsupported
         .keys()
         .cloned()
@@ -377,10 +456,36 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         )
                     })
                 });
+                let resource_owner_reason =
+                    owner.resource_owner_targets.iter().find_map(|target| {
+                        let Some(prepared_target) = prepared_by_owner.get(&target.owner).copied()
+                        else {
+                            return Some((
+                                format!(
+                                    "resource depends on unsupported owner {:#?}",
+                                    target.owner
+                                ),
+                                target.owner.clone(),
+                            ));
+                        };
+                        (!active.contains(&prepared_target)).then(|| {
+                            (
+                                format!(
+                                    "resource depends on unsupported owner {:#?}",
+                                    target.owner
+                                ),
+                                root_blocker_by_owner
+                                    .get(&target.owner)
+                                    .cloned()
+                                    .unwrap_or_else(|| target.owner.clone()),
+                            )
+                        })
+                    });
                 external_reason
                     .or(call_reason)
                     .or(statement_child_reason)
                     .or(lexical_owner_reason)
+                    .or(resource_owner_reason)
                     .map(|(reason, root)| (*index, reason, root))
             })
             .collect::<Vec<_>>();
@@ -489,6 +594,8 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         .iter()
         .map(|prepared_index| {
             let owner = &prepared[*prepared_index];
+            let dense_current =
+                dense_owner[*prepared_index].expect("active resource owner has a dense owner ID");
             let mut facts = owner.definition_facts.clone();
             for target in &owner.statement_child_targets {
                 let prepared_target = prepared_by_owner[&target.owner];
@@ -516,6 +623,76 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 };
                 *owner =
                     dense_owner[prepared_target].expect("active lexical target has a dense owner");
+            }
+            for target in &owner.resource_owner_targets {
+                let prepared_target = prepared_by_owner[&target.owner];
+                let dense_target =
+                    dense_owner[prepared_target].expect("active resource target has a dense owner");
+                match target.field {
+                    PreparedResourceOwnerField::SourceDeclaration(row) => {
+                        let KernelDeclarationReference::OwnerPublic(owner) =
+                            &mut facts.sources[row].declaration
+                        else {
+                            panic!("prepared SOURCE declaration target became local")
+                        };
+                        *owner = dense_target;
+                    }
+                    PreparedResourceOwnerField::SourceStatement(row) => {
+                        let KernelStatementReference::OwnerPublic(owner) =
+                            &mut facts.sources[row].statement
+                        else {
+                            panic!("prepared SOURCE statement target became local")
+                        };
+                        *owner = dense_target;
+                    }
+                    PreparedResourceOwnerField::StateBindingDeclaration(row) => {
+                        let KernelDeclarationReference::OwnerPublic(owner) =
+                            &mut facts.states[row].binding_declaration
+                        else {
+                            panic!("prepared state binding target became local")
+                        };
+                        *owner = dense_target;
+                    }
+                    PreparedResourceOwnerField::StateDeclaration(row) => {
+                        let KernelDeclarationReference::OwnerPublic(owner) =
+                            &mut facts.states[row].declaration
+                        else {
+                            panic!("prepared state declaration target became local")
+                        };
+                        *owner = dense_target;
+                    }
+                    PreparedResourceOwnerField::StateStatement(row) => {
+                        let KernelStatementReference::OwnerPublic(owner) =
+                            &mut facts.states[row].statement
+                        else {
+                            panic!("prepared state statement target became local")
+                        };
+                        *owner = dense_target;
+                    }
+                    PreparedResourceOwnerField::ListDeclaration(row) => {
+                        let KernelDeclarationReference::OwnerPublic(owner) =
+                            &mut facts.lists[row].declaration
+                        else {
+                            panic!("prepared LIST declaration target became local")
+                        };
+                        *owner = dense_target;
+                    }
+                    PreparedResourceOwnerField::ListStatement(row) => {
+                        let parent_authority =
+                            project_inline_list_authority_owner(&project_input, dense_target)
+                                == Some(dense_current);
+                        if parent_authority {
+                            facts.lists[row].statement =
+                                KernelStatementReference::OwnerPublic(dense_target);
+                        } else if let KernelStatementReference::OwnerPublic(owner) =
+                            &mut facts.lists[row].statement
+                        {
+                            // This is the no-local-statement fallback. It is
+                            // still an owner reference and must be relocated.
+                            *owner = dense_target;
+                        }
+                    }
+                }
             }
             facts
         })
@@ -768,6 +945,118 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
+                    let stable_declaration = |reference: KernelDeclarationReference| match reference {
+                        KernelDeclarationReference::Local(declaration) => {
+                            KernelOwnerOracleLexicalTarget::Declaration {
+                                owner: owner.owner.clone(),
+                                origin: declaration_origins[declaration.0 as usize].clone(),
+                            }
+                        }
+                        KernelDeclarationReference::OwnerPublic(target) => {
+                            let target = active
+                                .get(target.0 as usize)
+                                .and_then(|target| prepared.get(*target))
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "kernel resource targets missing dense owner {}",
+                                        target.0
+                                    )
+                                });
+                            KernelOwnerOracleLexicalTarget::OwnerPublic(target.owner.clone())
+                        }
+                    };
+                    let stable_path = |path: &boon_compiler_kernel::KernelSemanticPath| {
+                        match path.anchor {
+                            KernelDeclarationReference::Local(declaration) => {
+                                KernelOwnerOracleSemanticPath {
+                                    anchor_owner: owner.owner.clone(),
+                                    anchor: Some(
+                                        declaration_origins[declaration.0 as usize].clone(),
+                                    ),
+                                    projection: path.projection.clone(),
+                                }
+                            }
+                            KernelDeclarationReference::OwnerPublic(target) => {
+                                let target = active
+                                    .get(target.0 as usize)
+                                    .and_then(|target| prepared.get(*target))
+                                    .unwrap_or_else(|| {
+                                        panic!(
+                                            "kernel resource path targets missing dense owner {}",
+                                            target.0
+                                        )
+                                    });
+                                KernelOwnerOracleSemanticPath {
+                                    anchor_owner: target.owner.clone(),
+                                    anchor: None,
+                                    projection: path.projection.clone(),
+                                }
+                            }
+                        }
+                    };
+                    let stable_statement = |reference: KernelStatementReference| match reference {
+                        KernelStatementReference::Local(statement) => {
+                            owner.statements[statement.0 as usize].clone()
+                        }
+                        KernelStatementReference::OwnerPublic(target) => {
+                            let target = active
+                                .get(target.0 as usize)
+                                .and_then(|target| prepared.get(*target))
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "kernel resource statement targets missing dense owner {}",
+                                        target.0
+                                    )
+                                });
+                            target
+                                .statements
+                                .first()
+                                .cloned()
+                                .expect("a public resource owner has a root statement")
+                        }
+                    };
+                    let source_resources = artifact
+                        .sources
+                        .iter()
+                        .map(|source| KernelOwnerOracleSourceResource {
+                            declaration: stable_declaration(source.declaration),
+                            statement: stable_statement(source.statement),
+                            expression: owner.expressions[source.expression.0 as usize].clone(),
+                            path: stable_path(&source.path),
+                            interval_ms: source.interval_ms,
+                            payload_type: source.payload_type.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    let states = artifact
+                        .states
+                        .iter()
+                        .map(|state| KernelOwnerOracleState {
+                            binding_declaration: stable_declaration(state.binding_declaration),
+                            declaration: stable_declaration(state.declaration),
+                            statement: stable_statement(state.statement),
+                            expression: owner.expressions[state.expression.0 as usize].clone(),
+                            initial: stable_provider(state.initial),
+                            path: stable_path(&state.path),
+                            kind: state.kind,
+                            flow_type: state.flow_type.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    let lists = artifact
+                        .lists
+                        .iter()
+                        .map(|list| KernelOwnerOracleList {
+                            declaration: stable_declaration(list.declaration),
+                            statement: stable_statement(list.statement),
+                            producer: owner.expressions[list.producer.0 as usize].clone(),
+                            path: stable_path(&list.path),
+                            item_type: list.item_type.clone(),
+                            capacity: list.capacity,
+                            key_policy: list.key_policy,
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
                     let calls = artifact
                         .calls
                         .into_iter()
@@ -850,6 +1139,9 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         lexical_bindings,
                         collections,
                         sources,
+                        source_resources,
+                        states,
+                        lists,
                         calls,
                         effects,
                         public_child_owner_fields: owner.public_child_owner_fields.clone(),
@@ -989,6 +1281,8 @@ struct PreparedOwner {
     definition_facts: KernelDefinitionFactsInput,
     statement_child_targets: Box<[PreparedStatementChildTarget]>,
     lexical_owner_targets: Box<[PreparedLexicalOwnerTarget]>,
+    resource_owner_targets: Box<[PreparedResourceOwnerTarget]>,
+    resource_synthetic_paths: Box<[PreparedResourceSyntheticPath]>,
     external_expressions: Box<[PreparedExternalExpression]>,
     call_targets: Box<[PreparedCallTarget]>,
     compact: KernelOwnerProgramInput,
@@ -1008,6 +1302,40 @@ struct PreparedLexicalBinding {
     target: PreparedLexicalTarget,
     prefix: Box<[String]>,
     directional: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedResourceOwnerField {
+    SourceDeclaration(usize),
+    SourceStatement(usize),
+    StateBindingDeclaration(usize),
+    StateDeclaration(usize),
+    StateStatement(usize),
+    ListDeclaration(usize),
+    /// A child LIST can be the storage authority of its enclosing public
+    /// declaration even when the parent result passes through list-preserving
+    /// ABI operations. The project linker resolves this candidate after owner
+    /// IDs and external result edges are dense.
+    ListStatement(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedResourceOwnerTarget {
+    field: PreparedResourceOwnerField,
+    owner: StableCheckOwnerKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum PreparedResourceSyntheticKind {
+    State,
+    List,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedResourceSyntheticPath {
+    kind: PreparedResourceSyntheticKind,
+    row: usize,
+    anchor: StableCheckOwnerKey,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2460,6 +2788,16 @@ fn compact_owner_view(
         )?;
     definition_facts.declarations = declarations;
     definition_facts.lexical_bindings = lexical_bindings;
+    let (resource_owner_targets, resource_synthetic_paths) = compact_resource_facts(
+        view,
+        &owner,
+        root_statement_id,
+        &raw_expressions,
+        &local_by_syntax,
+        &nodes,
+        checked_kernel_expression(result_index)?,
+        &mut definition_facts,
+    )?;
     Ok(PreparedOwner {
         owner,
         expressions: expressions.into_boxed_slice(),
@@ -2467,6 +2805,8 @@ fn compact_owner_view(
         definition_facts,
         statement_child_targets,
         lexical_owner_targets,
+        resource_owner_targets,
+        resource_synthetic_paths,
         external_expressions: external_expressions.into_boxed_slice(),
         call_targets: call_targets.into_boxed_slice(),
         compact: KernelOwnerProgramInput {
@@ -3486,6 +3826,683 @@ fn compact_statement_facts(
     ))
 }
 
+fn kernel_resource_projection(
+    nodes: &[KernelOwnerNode],
+    root: KernelExpressionId,
+    target: KernelExpressionId,
+) -> Option<Vec<Box<str>>> {
+    fn visit(
+        nodes: &[KernelOwnerNode],
+        current: KernelExpressionId,
+        target: KernelExpressionId,
+        active: &mut BTreeSet<KernelExpressionId>,
+    ) -> Option<Vec<Box<str>>> {
+        if current == target {
+            return Some(Vec::new());
+        }
+        if !active.insert(current) {
+            return None;
+        }
+        let node = nodes.get(current.0 as usize)?;
+        let result = node.inputs.iter().find_map(|input| {
+            let child = input.expression;
+            if child.0 as usize >= nodes.len() {
+                return None;
+            }
+            let mut projection = visit(nodes, child, target, active)?;
+            if let KernelOwnerEdgeRole::RecordField {
+                name,
+                spread: false,
+            } = &input.role
+            {
+                projection.insert(0, name.clone());
+            }
+            Some(projection)
+        });
+        active.remove(&current);
+        result
+    }
+
+    visit(nodes, root, target, &mut BTreeSet::new())
+}
+
+fn kernel_inline_list_authority_root(
+    nodes: &[KernelOwnerNode],
+    root: KernelExpressionId,
+) -> Option<KernelExpressionId> {
+    let mut current = root;
+    let mut visited = BTreeSet::new();
+    while visited.insert(current) {
+        let node = nodes.get(current.0 as usize)?;
+        match &node.kind {
+            KernelOwnerNodeKind::Collection {
+                kind: KernelCollectionKind::List,
+                ..
+            } => return Some(current),
+            KernelOwnerNodeKind::Draining => {
+                current = node
+                    .inputs
+                    .iter()
+                    .find(|input| input.role == KernelOwnerEdgeRole::DrainingInput)?
+                    .expression;
+            }
+            KernelOwnerNodeKind::Block => {
+                current = node
+                    .inputs
+                    .iter()
+                    .find(|input| input.role == KernelOwnerEdgeRole::BlockResult)?
+                    .expression;
+            }
+            KernelOwnerNodeKind::Then => {
+                current = node
+                    .inputs
+                    .iter()
+                    .find(|input| input.role == KernelOwnerEdgeRole::ThenOutput)?
+                    .expression;
+            }
+            KernelOwnerNodeKind::MatchArm { .. } => {
+                current = node
+                    .inputs
+                    .iter()
+                    .find(|input| input.role == KernelOwnerEdgeRole::MatchOutput)?
+                    .expression;
+            }
+            KernelOwnerNodeKind::PureBuiltin {
+                kind:
+                    KernelPureBuiltinKind::ListFilter
+                    | KernelPureBuiltinKind::ListMap
+                    | KernelPureBuiltinKind::ListAppend
+                    | KernelPureBuiltinKind::ListSort,
+            } => {
+                current = node
+                    .inputs
+                    .iter()
+                    .find(|input| {
+                        matches!(
+                            &input.role,
+                            KernelOwnerEdgeRole::AbiArgument { name }
+                                if name.as_ref() == "$pipe" || name.as_ref() == "list"
+                        )
+                    })?
+                    .expression;
+            }
+            _ => return None,
+        }
+        if current.0 as usize >= nodes.len() {
+            return None;
+        }
+    }
+    None
+}
+
+/// Return the definition whose public result supplies the persistent LIST
+/// authority for `owner` after following only operations that preserve the
+/// input list's occurrence identity.
+///
+/// This is intentionally a project-graph query. A child LIST owner can feed a
+/// parent field through `List/map`, `List/filter`, `List/append`, or another
+/// transparent carrier. Parser nesting alone cannot prove that relationship;
+/// the dense external-result edge can.
+fn project_inline_list_authority_owner(
+    project: &KernelProjectProgramInput,
+    owner: KernelOwnerId,
+) -> Option<KernelOwnerId> {
+    let input = project.owners.get(owner.0 as usize)?;
+    let mut current = input.result;
+    let mut visited = BTreeSet::new();
+    while visited.insert(current) {
+        let index = current.0 as usize;
+        if index >= input.nodes.len() {
+            let external = input.external_expressions.get(index - input.nodes.len())?;
+            return match external.target {
+                KernelExternalTarget::Result => Some(external.owner),
+                KernelExternalTarget::Expression(expression) => {
+                    let target = project.owners.get(external.owner.0 as usize)?;
+                    kernel_inline_list_authority_root(&target.nodes, expression)
+                        .map(|_| external.owner)
+                }
+            };
+        }
+        let node = &input.nodes[index];
+        current = match &node.kind {
+            KernelOwnerNodeKind::Collection {
+                kind: KernelCollectionKind::List,
+                ..
+            } => return Some(owner),
+            KernelOwnerNodeKind::Draining => {
+                node.inputs
+                    .iter()
+                    .find(|input| input.role == KernelOwnerEdgeRole::DrainingInput)?
+                    .expression
+            }
+            KernelOwnerNodeKind::Block => {
+                node.inputs
+                    .iter()
+                    .find(|input| input.role == KernelOwnerEdgeRole::BlockResult)?
+                    .expression
+            }
+            KernelOwnerNodeKind::Then => {
+                node.inputs
+                    .iter()
+                    .find(|input| input.role == KernelOwnerEdgeRole::ThenOutput)?
+                    .expression
+            }
+            KernelOwnerNodeKind::MatchArm { .. } => {
+                node.inputs
+                    .iter()
+                    .find(|input| input.role == KernelOwnerEdgeRole::MatchOutput)?
+                    .expression
+            }
+            KernelOwnerNodeKind::PureBuiltin {
+                kind:
+                    KernelPureBuiltinKind::ListFilter
+                    | KernelPureBuiltinKind::ListMap
+                    | KernelPureBuiltinKind::ListAppend
+                    | KernelPureBuiltinKind::ListSort,
+            } => {
+                node.inputs
+                    .iter()
+                    .find(|input| {
+                        matches!(
+                            &input.role,
+                            KernelOwnerEdgeRole::AbiArgument { name }
+                                if name.as_ref() == "$pipe" || name.as_ref() == "list"
+                        )
+                    })?
+                    .expression
+            }
+            _ => return None,
+        };
+    }
+    None
+}
+
+fn compact_resource_facts(
+    view: UnitOwnerSyntaxView<'_>,
+    owner: &StableCheckOwnerKey,
+    root_statement: UnitLocalStatementId,
+    raw_expressions: &[&boon_syntax::AstExpr],
+    local_by_syntax: &BTreeMap<usize, usize>,
+    nodes: &[KernelOwnerNode],
+    result: KernelExpressionId,
+    facts: &mut KernelDefinitionFactsInput,
+) -> Result<
+    (
+        Box<[PreparedResourceOwnerTarget]>,
+        Box<[PreparedResourceSyntheticPath]>,
+    ),
+    String,
+> {
+    fn push_owner_target(
+        targets: &mut Vec<PreparedResourceOwnerTarget>,
+        field: PreparedResourceOwnerField,
+        target: &PreparedLexicalTarget,
+    ) {
+        if let PreparedLexicalTarget::OwnerPublic(owner) = target {
+            targets.push(PreparedResourceOwnerTarget {
+                field,
+                owner: owner.clone(),
+            });
+        }
+    }
+
+    let dense_statement_by_syntax = view
+        .statement_ids()
+        .iter()
+        .copied()
+        .zip(view.statements())
+        .enumerate()
+        .map(|(dense, (local, statement))| {
+            (
+                (local, statement.id),
+                KernelStatementId(
+                    u32::try_from(dense).expect("definition statement count fits u32"),
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let dense_statement_by_local = dense_statement_by_syntax
+        .iter()
+        .map(|((local, _), dense)| (*local, *dense))
+        .collect::<BTreeMap<_, _>>();
+    let dense_statement_by_id = dense_statement_by_syntax
+        .iter()
+        .map(|((_, syntax), dense)| (*syntax, *dense))
+        .collect::<BTreeMap<_, _>>();
+    let root_statement_dense = *dense_statement_by_local
+        .get(&root_statement)
+        .ok_or_else(|| "kernel resource root statement is not definition-local".to_owned())?;
+    let declaration_by_origin = facts
+        .declarations
+        .iter()
+        .map(|declaration| (declaration.origin.clone(), declaration.id))
+        .collect::<BTreeMap<_, _>>();
+    let public_declaration = declaration_by_origin
+        .get(&KernelDeclarationOrigin::Statement {
+            statement: root_statement_dense,
+        })
+        .copied();
+    let declarations_by_value = facts.declarations.iter().fold(
+        BTreeMap::<KernelExpressionId, Vec<&KernelDeclarationInput>>::new(),
+        |mut by_value, declaration| {
+            if let Some(value) = declaration.value {
+                by_value.entry(value).or_default().push(declaration);
+            }
+            by_value
+        },
+    );
+    let containing_statements = resource_containing_statements(
+        view,
+        raw_expressions,
+        local_by_syntax,
+        nodes,
+        &facts.statements,
+    );
+    let enclosing_declaration_target = {
+        let mut parent = view
+            .statement_locator(root_statement)
+            .and_then(|locator| locator.parent());
+        let mut target = None;
+        while let Some(statement) = parent {
+            let Some(statement_input) = view.statement_for_local(statement) else {
+                break;
+            };
+            let declares = matches!(
+                statement_input.kind,
+                AstStatementKind::Function { .. } | AstStatementKind::Field { .. }
+            ) || matches!(
+                statement_input.kind,
+                AstStatementKind::Source { field: Some(_), .. }
+                    | AstStatementKind::Hold { field: Some(_), .. }
+                    | AstStatementKind::List { field: Some(_), .. }
+            );
+            if declares {
+                target = prepared_statement_lexical_target(
+                    view,
+                    owner,
+                    statement,
+                    &dense_statement_by_id,
+                );
+                break;
+            }
+            parent = view
+                .statement_locator(statement)
+                .and_then(|locator| locator.parent());
+        }
+        target
+    };
+    let root_hold_target =
+        prepared_hold_alias_lexical_target(view, owner, root_statement, &dense_statement_by_id)?;
+
+    let mut owner_targets = Vec::new();
+    let mut synthetic_paths = Vec::new();
+    let mut sources = Vec::new();
+    let mut states = Vec::new();
+    let mut lists = Vec::new();
+    let mut state_count = 0usize;
+    let mut list_count = 0usize;
+
+    let canonical_target = |expression: KernelExpressionId,
+                            exact_statement: bool,
+                            exact_record_field: bool|
+     -> Option<PreparedLexicalTarget> {
+        let exact = declarations_by_value
+            .get(&expression)
+            .and_then(|declarations| {
+                declarations
+                    .iter()
+                    .find(|declaration| {
+                        exact_statement
+                            && matches!(
+                                declaration.origin,
+                                KernelDeclarationOrigin::Statement { .. }
+                            )
+                    })
+                    .or_else(|| {
+                        declarations.iter().find(|declaration| {
+                            exact_record_field
+                                && matches!(
+                                    declaration.origin,
+                                    KernelDeclarationOrigin::RecordField { .. }
+                                )
+                        })
+                    })
+                    .copied()
+            });
+        exact
+            .map(|declaration| PreparedLexicalTarget::Declaration(declaration.origin.clone()))
+            .or_else(|| {
+                public_declaration.map(|declaration| {
+                    PreparedLexicalTarget::Declaration(
+                        facts.declarations[declaration.0 as usize].origin.clone(),
+                    )
+                })
+            })
+            .or_else(|| root_hold_target.clone())
+            .or_else(|| enclosing_declaration_target.clone())
+    };
+    let local_reference = |target: &PreparedLexicalTarget| -> Option<KernelDeclarationReference> {
+        match target {
+            PreparedLexicalTarget::Declaration(origin) => declaration_by_origin
+                .get(origin)
+                .copied()
+                .map(KernelDeclarationReference::Local),
+            PreparedLexicalTarget::OwnerPublic(_) => {
+                Some(KernelDeclarationReference::OwnerPublic(KernelOwnerId(0)))
+            }
+            PreparedLexicalTarget::Value(_) | PreparedLexicalTarget::RuntimeContext => None,
+        }
+    };
+    let target_owner = |target: &PreparedLexicalTarget| match target {
+        PreparedLexicalTarget::OwnerPublic(owner) => owner.clone(),
+        PreparedLexicalTarget::Declaration(_) => owner.clone(),
+        PreparedLexicalTarget::Value(_) | PreparedLexicalTarget::RuntimeContext => owner.clone(),
+    };
+    let canonical_projection = |target: &PreparedLexicalTarget,
+                                expression: KernelExpressionId|
+     -> (Vec<Box<str>>, bool) {
+        let PreparedLexicalTarget::Declaration(origin) = target else {
+            return (
+                Vec::new(),
+                kernel_resource_projection(nodes, result, expression).is_some(),
+            );
+        };
+        let Some(declaration) = declaration_by_origin
+            .get(origin)
+            .and_then(|declaration| facts.declarations.get(declaration.0 as usize))
+        else {
+            return (Vec::new(), false);
+        };
+        let root = declaration.value;
+        let projection = root.and_then(|root| kernel_resource_projection(nodes, root, expression));
+        (projection.clone().unwrap_or_default(), projection.is_some())
+    };
+    let resource_statement =
+        |target: &PreparedLexicalTarget,
+         syntax_expression: usize|
+         -> Option<(KernelStatementReference, Option<StableCheckOwnerKey>)> {
+            if let PreparedLexicalTarget::OwnerPublic(owner) = target {
+                return Some((
+                    KernelStatementReference::OwnerPublic(KernelOwnerId(0)),
+                    Some(owner.clone()),
+                ));
+            }
+            let declaration_statement = match target {
+                PreparedLexicalTarget::Declaration(origin) => declaration_by_origin
+                    .get(origin)
+                    .and_then(|declaration| facts.declarations.get(declaration.0 as usize))
+                    .and_then(|declaration| match declaration.origin {
+                        KernelDeclarationOrigin::Statement { statement } => Some(statement),
+                        _ => None,
+                    }),
+                _ => None,
+            };
+            declaration_statement
+                .or_else(|| containing_statements.get(&syntax_expression).copied())
+                .map(|statement| (KernelStatementReference::Local(statement), None))
+        };
+    for expression in raw_expressions {
+        let Some(dense) = local_by_syntax.get(&expression.id).copied() else {
+            continue;
+        };
+        let dense = KernelExpressionId(checked_u32(dense, "resource expression")?);
+        match &nodes[dense.0 as usize].kind {
+            KernelOwnerNodeKind::Source(_) => {
+                let Some(target) = canonical_target(dense, true, true) else {
+                    continue;
+                };
+                let Some(declaration) = local_reference(&target) else {
+                    continue;
+                };
+                let Some((statement, statement_owner)) = resource_statement(&target, expression.id)
+                else {
+                    continue;
+                };
+                let (projection, _) = canonical_projection(&target, dense);
+                let row = sources.len();
+                sources.push(KernelSourceInput {
+                    id: KernelSourceId(checked_u32(row, "SOURCE resource row")?),
+                    declaration,
+                    statement,
+                    expression: dense,
+                    projection: projection.into_boxed_slice(),
+                    interval_ms: None,
+                });
+                push_owner_target(
+                    &mut owner_targets,
+                    PreparedResourceOwnerField::SourceDeclaration(row),
+                    &target,
+                );
+                if let Some(owner) = statement_owner {
+                    owner_targets.push(PreparedResourceOwnerTarget {
+                        field: PreparedResourceOwnerField::SourceStatement(row),
+                        owner,
+                    });
+                }
+            }
+            KernelOwnerNodeKind::Hold => {
+                let Some(target) = canonical_target(dense, true, false) else {
+                    continue;
+                };
+                let Some(declaration) = local_reference(&target) else {
+                    continue;
+                };
+                let Some((statement, statement_owner)) = resource_statement(&target, expression.id)
+                else {
+                    continue;
+                };
+                let binding_target = containing_statements
+                    .get(&expression.id)
+                    .and_then(|statement| view.statement_ids().get(statement.0 as usize).copied())
+                    .and_then(|statement| {
+                        view.statement_for_local(statement)
+                            .and_then(|statement_input| {
+                                (statement_input.expr == Some(expression.id)
+                                    && matches!(
+                                        statement_input.kind,
+                                        AstStatementKind::Hold { .. }
+                                    ))
+                                .then_some(statement)
+                            })
+                    })
+                    .map(|statement| {
+                        prepared_hold_alias_lexical_target(
+                            view,
+                            owner,
+                            statement,
+                            &dense_statement_by_id,
+                        )
+                    })
+                    .transpose()?
+                    .flatten()
+                    .or_else(|| {
+                        declarations_by_value.get(&dense).and_then(|declarations| {
+                            declarations
+                                .iter()
+                                .find(|declaration| {
+                                    matches!(
+                                        declaration.origin,
+                                        KernelDeclarationOrigin::RecordField { .. }
+                                    )
+                                })
+                                .map(|declaration| {
+                                    PreparedLexicalTarget::Declaration(declaration.origin.clone())
+                                })
+                        })
+                    })
+                    .unwrap_or_else(|| target.clone());
+                let Some(binding_declaration) = local_reference(&binding_target) else {
+                    continue;
+                };
+                let Some(initial) = nodes[dense.0 as usize]
+                    .inputs
+                    .iter()
+                    .find(|input| input.role == KernelOwnerEdgeRole::HoldInitial)
+                    .map(|input| input.expression)
+                else {
+                    return Err(format!(
+                        "HOLD resource expression {} has no initial",
+                        expression.id
+                    ));
+                };
+                let (projection, declaration_result) = canonical_projection(&target, dense);
+                let row = states.len();
+                states.push(KernelStateInput {
+                    id: KernelStateId(checked_u32(row, "state resource row")?),
+                    binding_declaration,
+                    declaration,
+                    statement,
+                    expression: dense,
+                    initial,
+                    projection: projection.into_boxed_slice(),
+                    kind: CheckedStateKind::Hold,
+                });
+                push_owner_target(
+                    &mut owner_targets,
+                    PreparedResourceOwnerField::StateBindingDeclaration(row),
+                    &binding_target,
+                );
+                push_owner_target(
+                    &mut owner_targets,
+                    PreparedResourceOwnerField::StateDeclaration(row),
+                    &target,
+                );
+                if let Some(owner) = statement_owner {
+                    owner_targets.push(PreparedResourceOwnerTarget {
+                        field: PreparedResourceOwnerField::StateStatement(row),
+                        owner,
+                    });
+                }
+                let function_declaration = matches!(
+                    target,
+                    PreparedLexicalTarget::Declaration(ref origin)
+                        if declaration_by_origin
+                            .get(origin)
+                            .and_then(|declaration| facts.declarations.get(declaration.0 as usize))
+                            .is_some_and(|declaration| declaration.kind == KernelDeclarationKind::Function)
+                );
+                if states[row].projection.is_empty()
+                    && (!declaration_result || function_declaration)
+                {
+                    synthetic_paths.push(PreparedResourceSyntheticPath {
+                        kind: PreparedResourceSyntheticKind::State,
+                        row,
+                        anchor: target_owner(&target),
+                    });
+                }
+                state_count = state_count.saturating_add(1);
+            }
+            KernelOwnerNodeKind::Collection {
+                kind: KernelCollectionKind::List,
+                capacity,
+            } => {
+                let Some(target) = canonical_target(dense, true, true) else {
+                    continue;
+                };
+                let Some(declaration) = local_reference(&target) else {
+                    continue;
+                };
+                let declaration_authority = match &target {
+                    PreparedLexicalTarget::Declaration(origin) => declaration_by_origin
+                        .get(origin)
+                        .and_then(|declaration| facts.declarations.get(declaration.0 as usize))
+                        .and_then(|declaration| declaration.value)
+                        .or_else(|| {
+                            matches!(
+                                target,
+                                PreparedLexicalTarget::Declaration(ref origin)
+                                    if declaration_by_origin
+                                        .get(origin)
+                                        .and_then(|declaration| facts.declarations.get(declaration.0 as usize))
+                                        .is_some_and(|declaration| declaration.kind == KernelDeclarationKind::Function)
+                            )
+                            .then_some(result)
+                        })
+                        .and_then(|root| kernel_inline_list_authority_root(nodes, root))
+                        == Some(dense),
+                    // Cross-owner authority is resolved from the dense project
+                    // graph after external owner IDs have been linked. Keep
+                    // the local LIST statement here as the fail-closed default.
+                    PreparedLexicalTarget::OwnerPublic(_) => false,
+                    _ => false,
+                };
+                let statement = (!declaration_authority)
+                    .then(|| containing_statements.get(&expression.id).copied())
+                    .flatten()
+                    .map(|statement| (KernelStatementReference::Local(statement), None))
+                    .or_else(|| resource_statement(&target, expression.id));
+                let Some((statement, statement_owner)) = statement else {
+                    continue;
+                };
+                let (projection, _) = canonical_projection(&target, dense);
+                let row = lists.len();
+                lists.push(KernelListInput {
+                    id: KernelListId(checked_u32(row, "LIST resource row")?),
+                    declaration,
+                    statement,
+                    producer: dense,
+                    projection: projection.into_boxed_slice(),
+                    capacity: *capacity,
+                    key_policy: CheckedListKeyPolicy::GeneratedOccurrenceU64 {
+                        has_generation: true,
+                    },
+                });
+                push_owner_target(
+                    &mut owner_targets,
+                    PreparedResourceOwnerField::ListDeclaration(row),
+                    &target,
+                );
+                if let PreparedLexicalTarget::OwnerPublic(authority) = &target {
+                    owner_targets.push(PreparedResourceOwnerTarget {
+                        field: PreparedResourceOwnerField::ListStatement(row),
+                        owner: authority.clone(),
+                    });
+                } else if let Some(owner) = statement_owner {
+                    owner_targets.push(PreparedResourceOwnerTarget {
+                        field: PreparedResourceOwnerField::ListStatement(row),
+                        owner,
+                    });
+                }
+                let function_declaration = matches!(
+                    target,
+                    PreparedLexicalTarget::Declaration(ref origin)
+                        if declaration_by_origin
+                            .get(origin)
+                            .and_then(|declaration| facts.declarations.get(declaration.0 as usize))
+                            .is_some_and(|declaration| declaration.kind == KernelDeclarationKind::Function)
+                );
+                if lists[row].projection.is_empty() && function_declaration {
+                    synthetic_paths.push(PreparedResourceSyntheticPath {
+                        kind: PreparedResourceSyntheticKind::List,
+                        row,
+                        anchor: target_owner(&target),
+                    });
+                }
+                list_count = list_count.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+
+    debug_assert_eq!(state_count, states.len());
+    debug_assert_eq!(list_count, lists.len());
+    facts.sources = sources.into_boxed_slice();
+    facts.states = states.into_boxed_slice();
+    facts.lists = lists.into_boxed_slice();
+    if std::env::var_os("BOON_KERNEL_ORACLE_TRACE_OWNER")
+        .is_some_and(|pattern| format!("{owner:?}").contains(pattern.to_string_lossy().as_ref()))
+    {
+        eprintln!(
+            "kernel-owner-trace resources sources={:#?} states={:#?} lists={:#?}",
+            facts.sources, facts.states, facts.lists
+        );
+    }
+    Ok((
+        owner_targets.into_boxed_slice(),
+        synthetic_paths.into_boxed_slice(),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compact_declaration_and_lexical_facts(
     view: UnitOwnerSyntaxView<'_>,
@@ -3516,19 +4533,21 @@ fn compact_declaration_and_lexical_facts(
         .copied()
         .zip(view.statements())
         .enumerate()
-        .map(|(dense, (_, statement))| (statement.id, dense))
-        .collect::<BTreeMap<_, _>>();
-    let root_statement = KernelStatementId(checked_u32(
-        *dense_statement_by_syntax
-            .get(
-                &view
-                    .statement_for_local(root_statement)
-                    .ok_or_else(|| "kernel root declaration statement is missing".to_owned())?
-                    .id,
-            )
-            .ok_or_else(|| "kernel root declaration is not definition-local".to_owned())?,
-        "root declaration statement",
-    )?);
+        .map(|(dense, (_, statement))| {
+            Ok((
+                statement.id,
+                KernelStatementId(checked_u32(dense, "declaration statement")?),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let root_statement = *dense_statement_by_syntax
+        .get(
+            &view
+                .statement_for_local(root_statement)
+                .ok_or_else(|| "kernel root declaration statement is missing".to_owned())?
+                .id,
+        )
+        .ok_or_else(|| "kernel root declaration is not definition-local".to_owned())?;
 
     let mut pending = Vec::<(
         KernelDeclarationOrigin,
@@ -3550,11 +4569,40 @@ fn compact_declaration_and_lexical_facts(
             KernelStatementKind::Hold {
                 field: Some(name), ..
             } => (name.clone(), KernelDeclarationKind::Hold, statement.value),
+            KernelStatementKind::Hold {
+                field: None,
+                name: Some(name),
+            } => {
+                let local_statement = *view
+                    .statement_ids()
+                    .get(statement.id.0 as usize)
+                    .ok_or_else(|| {
+                        "kernel fieldless HOLD declaration has no local statement".to_owned()
+                    })?;
+                let owns_declaration = matches!(
+                    prepared_hold_alias_lexical_target(
+                        view,
+                        owner,
+                        local_statement,
+                        &dense_statement_by_syntax,
+                    )?,
+                    Some(PreparedLexicalTarget::Declaration(
+                        KernelDeclarationOrigin::Statement { statement: target },
+                    )) if target == statement.id
+                );
+                if !owns_declaration {
+                    continue;
+                }
+                (name.clone(), KernelDeclarationKind::Hold, statement.value)
+            }
             KernelStatementKind::List {
                 field: Some(name), ..
             } => (name.clone(), KernelDeclarationKind::List, statement.value),
             KernelStatementKind::Source { field: None, .. }
-            | KernelStatementKind::Hold { field: None, .. }
+            | KernelStatementKind::Hold {
+                field: None,
+                name: None,
+            }
             | KernelStatementKind::List { field: None, .. }
             | KernelStatementKind::Block
             | KernelStatementKind::Spread
@@ -3957,6 +5005,117 @@ fn direct_containing_statements(
         }
     }
     owners
+}
+
+/// Reproduce the checked resource-statement ownership walk directly over the
+/// compact expression graph. This deliberately follows only value-producing
+/// carriers: collection items, LATEST branches, HOLD updates, and BLOCK
+/// bindings belong to their own statement regions and must not be pulled into
+/// an enclosing declaration merely because they are dependency children.
+fn resource_containing_statements(
+    view: UnitOwnerSyntaxView<'_>,
+    raw_expressions: &[&boon_syntax::AstExpr],
+    local_by_syntax: &BTreeMap<usize, usize>,
+    nodes: &[KernelOwnerNode],
+    statements: &[KernelStatementInput],
+) -> BTreeMap<usize, KernelStatementId> {
+    fn owned_inputs(node: &KernelOwnerNode) -> impl Iterator<Item = KernelExpressionId> + '_ {
+        node.inputs.iter().filter_map(move |input| {
+            let owned = match &node.kind {
+                KernelOwnerNodeKind::UserCall { .. }
+                | KernelOwnerNodeKind::RenderConstructor { .. }
+                | KernelOwnerNodeKind::PureBuiltin { .. }
+                | KernelOwnerNodeKind::HostEffect { .. } => matches!(
+                    input.role,
+                    KernelOwnerEdgeRole::CallArgument { .. }
+                        | KernelOwnerEdgeRole::AbiArgument { .. }
+                ),
+                KernelOwnerNodeKind::Record { .. } => {
+                    matches!(input.role, KernelOwnerEdgeRole::RecordField { .. })
+                }
+                KernelOwnerNodeKind::Draining => input.role == KernelOwnerEdgeRole::DrainingInput,
+                KernelOwnerNodeKind::Hold => input.role == KernelOwnerEdgeRole::HoldInitial,
+                KernelOwnerNodeKind::When => input.role == KernelOwnerEdgeRole::WhenInput,
+                KernelOwnerNodeKind::Then => matches!(
+                    input.role,
+                    KernelOwnerEdgeRole::ThenInput | KernelOwnerEdgeRole::ThenOutput
+                ),
+                KernelOwnerNodeKind::Infix { .. } => matches!(
+                    input.role,
+                    KernelOwnerEdgeRole::InfixLeft | KernelOwnerEdgeRole::InfixRight
+                ),
+                KernelOwnerNodeKind::MatchArm { .. } => {
+                    input.role == KernelOwnerEdgeRole::MatchOutput
+                }
+                KernelOwnerNodeKind::Known(_)
+                | KernelOwnerNodeKind::Source(_)
+                | KernelOwnerNodeKind::Absent
+                | KernelOwnerNodeKind::Text
+                | KernelOwnerNodeKind::TextTemplate
+                | KernelOwnerNodeKind::Number
+                | KernelOwnerNodeKind::Byte
+                | KernelOwnerNodeKind::Bits(_)
+                | KernelOwnerNodeKind::Tag(_)
+                | KernelOwnerNodeKind::Block
+                | KernelOwnerNodeKind::Collection { .. }
+                | KernelOwnerNodeKind::MapEntry
+                | KernelOwnerNodeKind::FormalRead { .. }
+                | KernelOwnerNodeKind::LexicalRead { .. }
+                | KernelOwnerNodeKind::ValueRead { .. }
+                | KernelOwnerNodeKind::DerivedRead { .. }
+                | KernelOwnerNodeKind::CollectionItemRead
+                | KernelOwnerNodeKind::Latest
+                | KernelOwnerNodeKind::Arrow
+                | KernelOwnerNodeKind::Delimiter
+                | KernelOwnerNodeKind::Unknown => false,
+            };
+            owned.then_some(input.expression)
+        })
+    }
+
+    let local_statement_ids = view.statement_ids();
+    let mut owners = vec![None; nodes.len()];
+    for statement in statements.iter().rev() {
+        let Some(local_statement) = local_statement_ids.get(statement.id.0 as usize).copied()
+        else {
+            continue;
+        };
+        let mut pending = Vec::with_capacity(2);
+        if let Some(value) = statement.value
+            && (value.0 as usize) < nodes.len()
+        {
+            pending.push(value);
+        }
+        if let Some(expression) = view
+            .statement_for_local(local_statement)
+            .and_then(|statement| statement.expr)
+            .and_then(|expression| local_by_syntax.get(&expression).copied())
+            .and_then(|expression| u32::try_from(expression).ok())
+            .map(KernelExpressionId)
+            && !pending.contains(&expression)
+        {
+            pending.push(expression);
+        }
+        let mut visited = BTreeSet::new();
+        while let Some(expression) = pending.pop() {
+            if !visited.insert(expression) {
+                continue;
+            }
+            let Some(node) = nodes.get(expression.0 as usize) else {
+                continue;
+            };
+            owners[expression.0 as usize].get_or_insert(statement.id);
+            pending.extend(owned_inputs(node).filter(|input| (input.0 as usize) < nodes.len()));
+        }
+    }
+
+    raw_expressions
+        .iter()
+        .filter_map(|expression| {
+            let dense = *local_by_syntax.get(&expression.id)?;
+            Some((expression.id, owners.get(dense).copied().flatten()?))
+        })
+        .collect()
 }
 
 struct PreparedCallContextSurface {
@@ -5469,6 +6628,529 @@ mod tests {
         mismatches
     }
 
+    fn resource_inventory_mismatches(
+        report: &KernelOwnerOracleReport,
+        checked: &CheckedProgramFields,
+        checked_expression_by_stable: &BTreeMap<StableExpressionKey, boon_checked::CheckedExprId>,
+        stable_by_checked_expression: &BTreeMap<boon_checked::CheckedExprId, StableExpressionKey>,
+        project: &ProjectSyntaxSnapshot,
+    ) -> Vec<String> {
+        fn declaration_from_statement(
+            statement: &boon_checked::CheckedStatement,
+        ) -> Option<DeclId> {
+            match statement.kind {
+                CheckedStatementKind::Function { declaration }
+                | CheckedStatementKind::Field { declaration } => Some(declaration),
+                CheckedStatementKind::Source { declaration, .. }
+                | CheckedStatementKind::Hold { declaration, .. }
+                | CheckedStatementKind::List { declaration, .. } => declaration,
+                CheckedStatementKind::Block
+                | CheckedStatementKind::Spread
+                | CheckedStatementKind::Expression => None,
+            }
+        }
+
+        fn types_alpha_equal(left: &Type, right: &Type) -> bool {
+            let neutral = FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Absent,
+            };
+            let left = alpha_normalize_owner(
+                &neutral,
+                [FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: left.clone(),
+                }],
+            )
+            .1;
+            let right = alpha_normalize_owner(
+                &neutral,
+                [FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: right.clone(),
+                }],
+            )
+            .1;
+            left == right
+        }
+
+        fn resource_types_compatible(left: &Type, right: &Type) -> bool {
+            if types_alpha_equal(left, right) {
+                return true;
+            }
+            let left = FlowType {
+                mode: FlowMode::Continuous,
+                ty: left.clone(),
+            };
+            let right = FlowType {
+                mode: FlowMode::Continuous,
+                ty: right.clone(),
+            };
+            flow_matches_current_or_legacy_render_projection(&left, &right)
+        }
+
+        fn type_contains_tag(ty: &Type, expected: &str) -> bool {
+            match ty {
+                Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+                    Variant::Tag(tag) => tag == expected,
+                    Variant::Tagged { tag, fields } => {
+                        tag == expected
+                            || fields
+                                .fields
+                                .values()
+                                .any(|field| type_contains_tag(field, expected))
+                    }
+                }),
+                Type::Object(shape) => shape
+                    .fields
+                    .values()
+                    .any(|field| type_contains_tag(field, expected)),
+                Type::List(item) | Type::Set(item) => type_contains_tag(item, expected),
+                Type::Function { args, result } => {
+                    args.iter().any(|arg| type_contains_tag(arg, expected))
+                        || type_contains_tag(&result.ty, expected)
+                }
+                Type::Union(members) => members
+                    .iter()
+                    .any(|member| type_contains_tag(member, expected)),
+                Type::Map { key, value } => {
+                    type_contains_tag(key, expected) || type_contains_tag(value, expected)
+                }
+                Type::Text
+                | Type::Number
+                | Type::Bytes(_)
+                | Type::Absent
+                | Type::RenderContract
+                | Type::UnresolvedShape { .. }
+                | Type::Var(_)
+                | Type::Unknown
+                | Type::Bits { .. } => false,
+            }
+        }
+
+        fn is_public_origin(
+            project: &ProjectSyntaxSnapshot,
+            owner: &StableCheckOwnerKey,
+            origin: &KernelOwnerOracleDeclarationOrigin,
+        ) -> bool {
+            let KernelOwnerOracleDeclarationOrigin::Statement(statement) = origin else {
+                return false;
+            };
+            project
+                .owner_view(owner)
+                .and_then(|view| {
+                    view.statement_ids()
+                        .first()
+                        .and_then(|root| view.stable_statement_key_local(*root))
+                })
+                .as_ref()
+                == Some(statement)
+        }
+
+        fn declaration_targets_equal(
+            project: &ProjectSyntaxSnapshot,
+            left: &KernelOwnerOracleLexicalTarget,
+            right: &KernelOwnerOracleLexicalTarget,
+        ) -> bool {
+            if left == right {
+                return true;
+            }
+            match (left, right) {
+                (
+                    KernelOwnerOracleLexicalTarget::OwnerPublic(owner),
+                    KernelOwnerOracleLexicalTarget::Declaration {
+                        owner: candidate,
+                        origin,
+                    },
+                )
+                | (
+                    KernelOwnerOracleLexicalTarget::Declaration {
+                        owner: candidate,
+                        origin,
+                    },
+                    KernelOwnerOracleLexicalTarget::OwnerPublic(owner),
+                ) => owner == candidate && is_public_origin(project, owner, origin),
+                _ => false,
+            }
+        }
+
+        fn resource_paths_equal(
+            project: &ProjectSyntaxSnapshot,
+            left: &KernelOwnerOracleSemanticPath,
+            right: &KernelOwnerOracleSemanticPath,
+        ) -> bool {
+            if left.anchor_owner != right.anchor_owner || left.projection != right.projection {
+                return false;
+            }
+            match (&left.anchor, &right.anchor) {
+                (left, right) if left == right => true,
+                (None, Some(origin)) | (Some(origin), None) => {
+                    is_public_origin(project, &left.anchor_owner, origin)
+                }
+                _ => false,
+            }
+        }
+
+        let mut stable_statement_by_checked = BTreeMap::new();
+        let mut checked_statement_by_stable = BTreeMap::new();
+        for owner in project.stable_check_owner_keys() {
+            let Some(view) = project.owner_view(&owner) else {
+                continue;
+            };
+            for statement in view.statement_ids() {
+                let Some(stable) = view.stable_statement_key_local(*statement) else {
+                    continue;
+                };
+                let Some(syntax) = view.statement_for_local(*statement) else {
+                    continue;
+                };
+                let Some(checked_statement) = project
+                    .statement_slot(syntax.id)
+                    .and_then(|slot| checked.statements.get(slot))
+                else {
+                    continue;
+                };
+                stable_statement_by_checked
+                    .entry(checked_statement.id)
+                    .or_insert_with(|| stable.clone());
+                checked_statement_by_stable
+                    .entry(stable)
+                    .or_insert(checked_statement);
+            }
+        }
+
+        let mut stable_declaration_by_checked = BTreeMap::new();
+        for owner in &report.supported {
+            for declaration in &owner.declarations {
+                let checked_declaration = match &declaration.origin {
+                    KernelOwnerOracleDeclarationOrigin::Statement(statement) => {
+                        checked_statement_by_stable
+                            .get(statement)
+                            .and_then(|statement| declaration_from_statement(statement))
+                    }
+                    KernelOwnerOracleDeclarationOrigin::RecordField { object, ordinal } => {
+                        checked_expression_by_stable
+                            .get(object)
+                            .and_then(|expression| {
+                                let expression = checked.expressions.get(expression.0 as usize)?;
+                                let fields = match &expression.kind {
+                                    CheckedExpressionKind::Object { fields }
+                                    | CheckedExpressionKind::TaggedObject { fields, .. } => fields,
+                                    _ => return None,
+                                };
+                                fields.get(*ordinal as usize)?.declaration
+                            })
+                    }
+                    KernelOwnerOracleDeclarationOrigin::Parameter { statement, ordinal } => {
+                        checked_statement_by_stable
+                            .get(statement)
+                            .and_then(|statement| declaration_from_statement(statement))
+                            .and_then(|callable| {
+                                checked
+                                    .callables
+                                    .iter()
+                                    .find(|entry| entry.decl_id == callable)
+                            })
+                            .and_then(|callable| {
+                                callable
+                                    .parameters
+                                    .iter()
+                                    .find(|parameter| parameter.ordinal == *ordinal as usize)
+                            })
+                            .map(|parameter| parameter.decl_id)
+                    }
+                    KernelOwnerOracleDeclarationOrigin::PatternBinding { .. }
+                    | KernelOwnerOracleDeclarationOrigin::CallbackBinding { .. } => None,
+                };
+                if let Some(checked_declaration) = checked_declaration {
+                    stable_declaration_by_checked
+                        .entry(checked_declaration)
+                        .or_insert(KernelOwnerOracleLexicalTarget::Declaration {
+                            owner: owner.owner.clone(),
+                            origin: declaration.origin.clone(),
+                        });
+                }
+            }
+        }
+
+        let stable_path = |anchor: DeclId, projection: &[String]| {
+            let target = stable_declaration_by_checked.get(&anchor)?;
+            match target {
+                KernelOwnerOracleLexicalTarget::Declaration { owner, origin } => {
+                    Some(KernelOwnerOracleSemanticPath {
+                        anchor_owner: owner.clone(),
+                        anchor: Some(origin.clone()),
+                        projection: projection
+                            .iter()
+                            .cloned()
+                            .map(String::into_boxed_str)
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
+                    })
+                }
+                KernelOwnerOracleLexicalTarget::OwnerPublic(owner) => {
+                    Some(KernelOwnerOracleSemanticPath {
+                        anchor_owner: owner.clone(),
+                        anchor: None,
+                        projection: projection
+                            .iter()
+                            .cloned()
+                            .map(String::into_boxed_str)
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
+                    })
+                }
+                KernelOwnerOracleLexicalTarget::ContextFormal { .. }
+                | KernelOwnerOracleLexicalTarget::Value(_)
+                | KernelOwnerOracleLexicalTarget::RuntimeContext => None,
+            }
+        };
+        let resource_statement_matches =
+            |checked_statement: boon_checked::CheckedStatementId,
+             kernel_statement: &StableStatementKey| {
+                checked_statement_by_stable
+                    .get(kernel_statement)
+                    .is_some_and(|statement| statement.id == checked_statement)
+            };
+
+        let result_expression_by_owner = report
+            .supported
+            .iter()
+            .filter_map(|owner| Some((owner.owner.clone(), owner.result_expression.clone()?)))
+            .collect::<BTreeMap<_, _>>();
+        let legacy_no_element_expressions = report
+            .supported
+            .iter()
+            .flat_map(|owner| owner.legacy_no_element_dependents.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let stable_value_expression = |value: &KernelOwnerOracleValueReference| match value {
+            KernelOwnerOracleValueReference::Expression(expression) => Some(expression.clone()),
+            KernelOwnerOracleValueReference::OwnerResult(owner) => {
+                result_expression_by_owner.get(owner).cloned()
+            }
+        };
+
+        let mut mismatches = Vec::new();
+        let mut kernel_sources = BTreeMap::new();
+        let mut kernel_states = BTreeMap::new();
+        let mut kernel_lists = BTreeMap::new();
+        for owner in &report.supported {
+            for source in &owner.source_resources {
+                if kernel_sources
+                    .insert(source.expression.clone(), source)
+                    .is_some()
+                {
+                    mismatches.push(format!(
+                        "kernel repeats SOURCE resource {:?}",
+                        source.expression
+                    ));
+                }
+            }
+            for state in &owner.states {
+                if kernel_states
+                    .insert(state.expression.clone(), state)
+                    .is_some()
+                {
+                    mismatches.push(format!("kernel repeats HOLD state {:?}", state.expression));
+                }
+            }
+            for list in &owner.lists {
+                if kernel_lists.insert(list.producer.clone(), list).is_some() {
+                    mismatches.push(format!("kernel repeats LIST resource {:?}", list.producer));
+                }
+            }
+        }
+
+        let mut current_sources = BTreeMap::new();
+        for source in &checked.sources {
+            let Some(stable) = stable_by_checked_expression
+                .get(&source.expression)
+                .cloned()
+            else {
+                continue;
+            };
+            if !matches!(
+                checked
+                    .expressions
+                    .get(source.expression.0 as usize)
+                    .map(|row| &row.kind),
+                Some(CheckedExpressionKind::Source)
+            ) {
+                continue;
+            }
+            current_sources.insert(stable, source);
+        }
+        let mut current_states = BTreeMap::new();
+        for state in &checked.states {
+            if state.kind != CheckedStateKind::Hold {
+                continue;
+            }
+            let Some(stable) = stable_by_checked_expression.get(&state.expression).cloned() else {
+                continue;
+            };
+            current_states.insert(stable, state);
+        }
+        let mut current_lists = BTreeMap::new();
+        for list in &checked.lists {
+            let Some(stable) = stable_by_checked_expression.get(&list.producer).cloned() else {
+                continue;
+            };
+            current_lists.insert(stable, list);
+        }
+
+        for (stable, kernel) in &kernel_sources {
+            let Some(current) = current_sources.get(stable) else {
+                mismatches.push(format!(
+                    "kernel SOURCE resource {stable:?} has no checked resource row"
+                ));
+                continue;
+            };
+            let current_declaration = stable_declaration_by_checked.get(&current.declaration);
+            let current_statement = stable_statement_by_checked.get(&current.statement);
+            let current_path = stable_path(current.path.anchor, &current.path.projection);
+            if !current_declaration.is_some_and(|current| {
+                declaration_targets_equal(project, current, &kernel.declaration)
+            }) || !resource_statement_matches(current.statement, &kernel.statement)
+                || !current_path
+                    .as_ref()
+                    .is_some_and(|current| resource_paths_equal(project, current, &kernel.path))
+                || current.interval_ms != kernel.interval_ms
+                || !types_alpha_equal(&current.payload_type, &kernel.payload_type)
+            {
+                mismatches.push(format!(
+                    "kernel SOURCE resource {stable:?} differs from checked row: kernel={kernel:?} checked={current:?} checked_declaration={current_declaration:?} checked_statement={current_statement:?} checked_path={current_path:?}"
+                ));
+            }
+        }
+        for stable in current_sources.keys() {
+            if !kernel_sources.contains_key(stable) {
+                mismatches.push(format!(
+                    "checked literal SOURCE resource {stable:?} has no kernel resource row"
+                ));
+            }
+        }
+
+        for (stable, kernel) in &kernel_states {
+            let Some(current) = current_states.get(stable) else {
+                mismatches.push(format!(
+                    "kernel HOLD state {stable:?} has no checked state row"
+                ));
+                continue;
+            };
+            let current_declaration = stable_declaration_by_checked.get(&current.declaration);
+            let current_binding = stable_declaration_by_checked.get(&current.binding_declaration);
+            let current_statement = stable_statement_by_checked.get(&current.statement);
+            let current_initial = stable_by_checked_expression.get(&current.initial);
+            let current_path = stable_path(current.path.anchor, &current.path.projection);
+            if !current_declaration.is_some_and(|current| {
+                declaration_targets_equal(project, current, &kernel.declaration)
+            }) || !current_binding.is_some_and(|current| {
+                declaration_targets_equal(project, current, &kernel.binding_declaration)
+            }) || !resource_statement_matches(current.statement, &kernel.statement)
+                || current_initial != stable_value_expression(&kernel.initial).as_ref()
+                || !current_path
+                    .as_ref()
+                    .is_some_and(|current| resource_paths_equal(project, current, &kernel.path))
+                || current.kind != kernel.kind
+            {
+                mismatches.push(format!(
+                    "kernel HOLD state {stable:?} differs from checked row: kernel={kernel:?} checked={current:?} checked_declaration={current_declaration:?} checked_binding={current_binding:?} checked_statement={current_statement:?} checked_initial={current_initial:?} checked_path={current_path:?}"
+                ));
+            }
+        }
+        for stable in current_states.keys() {
+            if !kernel_states.contains_key(stable) {
+                mismatches.push(format!(
+                    "checked HOLD state {stable:?} has no kernel state row"
+                ));
+            }
+        }
+
+        for (stable, kernel) in &kernel_lists {
+            let Some(current) = current_lists.get(stable) else {
+                mismatches.push(format!(
+                    "kernel LIST resource {stable:?} has no checked list row"
+                ));
+                continue;
+            };
+            let current_declaration = stable_declaration_by_checked.get(&current.declaration);
+            let current_statement = stable_statement_by_checked.get(&current.statement);
+            let current_path = stable_path(current.path.anchor, &current.path.projection);
+            let declaration_matches = current_declaration.is_some_and(|current| {
+                declaration_targets_equal(project, current, &kernel.declaration)
+            });
+            let statement_matches =
+                resource_statement_matches(current.statement, &kernel.statement);
+            let path_matches = current_path
+                .as_ref()
+                .is_some_and(|current| resource_paths_equal(project, current, &kernel.path));
+            let capacity_matches = current.capacity == kernel.capacity;
+            let key_policy_matches = current.key_policy == kernel.key_policy;
+            let kernel_item_flow = FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::List(Type::shared(kernel.item_type.clone())),
+            };
+            let current_item_flow = FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::List(Type::shared(current.item_type.clone())),
+            };
+            let item_type_matches =
+                resource_types_compatible(&kernel.item_type, &current.item_type)
+                    || ((legacy_no_element_expressions.contains(stable)
+                        || type_contains_tag(&kernel.item_type, "NoElement"))
+                        && (legacy_no_element_widening_matches(
+                            &kernel_item_flow,
+                            &current_item_flow,
+                        ) || boon_checked::resolved_type_is_assignable_to(
+                            &kernel_item_flow.ty,
+                            &current_item_flow.ty,
+                        )));
+            if !(declaration_matches
+                && statement_matches
+                && path_matches
+                && capacity_matches
+                && key_policy_matches
+                && item_type_matches)
+            {
+                mismatches.push(format!(
+                    "kernel LIST resource {stable:?} differs from checked row: declaration_matches={declaration_matches} statement_matches={statement_matches} path_matches={path_matches} capacity_matches={capacity_matches} key_policy_matches={key_policy_matches} item_type_matches={item_type_matches} kernel_statement={:?} checked_statement={current_statement:?} kernel_path={:?} checked_path={current_path:?} checked_id={:?} checked_span={:?}",
+                    kernel.statement,
+                    kernel.path,
+                    current.id,
+                    current.span,
+                ));
+            }
+        }
+        for stable in current_lists.keys() {
+            if !kernel_lists.contains_key(stable) {
+                let current = current_lists[stable];
+                let kernel_owner = report.supported.iter().find(|owner| {
+                    owner
+                        .expressions
+                        .iter()
+                        .any(|(expression, _)| expression == stable)
+                });
+                let kernel_collection = kernel_owner.and_then(|owner| {
+                    owner
+                        .collections
+                        .iter()
+                        .find(|collection| &collection.expression == stable)
+                });
+                mismatches.push(format!(
+                    "checked LIST resource {stable:?} has no kernel list row: kernel_owner={:?} kernel_collection={} checked_id={:?} declaration={:?} statement={:?} path={:?} span={:?}",
+                    kernel_owner.map(|owner| &owner.owner),
+                    kernel_collection.is_some(),
+                    current.id,
+                    current.declaration,
+                    current.statement,
+                    current.path,
+                    current.span,
+                ));
+            }
+        }
+        mismatches
+    }
+
     fn statement_inventory_mismatches(
         report: &KernelOwnerOracleReport,
         checked: &CheckedProgramFields,
@@ -5882,25 +7564,58 @@ mod tests {
                 }
             };
 
+            let dense_statement_by_syntax = view
+                .statement_ids()
+                .iter()
+                .enumerate()
+                .filter_map(|(dense, statement_id)| {
+                    let statement = view.statement_for_local(*statement_id)?;
+                    Some((statement.id, KernelStatementId(u32::try_from(dense).ok()?)))
+                })
+                .collect::<BTreeMap<_, _>>();
             let mut expected_origins = BTreeSet::new();
             for statement in &owner.statements {
-                let Some(syntax) = view.statement_ids().iter().find_map(|statement_id| {
-                    let stable = view.stable_statement_key_local(*statement_id)?;
-                    (stable == statement.statement)
-                        .then(|| view.statement_for_local(*statement_id))
-                        .flatten()
-                }) else {
+                let Some((local_statement, syntax)) =
+                    view.statement_ids().iter().find_map(|statement_id| {
+                        let stable = view.stable_statement_key_local(*statement_id)?;
+                        (stable == statement.statement)
+                            .then(|| {
+                                view.statement_for_local(*statement_id)
+                                    .map(|statement| (*statement_id, statement))
+                            })
+                            .flatten()
+                    })
+                else {
                     continue;
                 };
-                let declares = matches!(
-                    syntax.kind,
-                    AstStatementKind::Function { .. } | AstStatementKind::Field { .. }
-                ) || matches!(
-                    syntax.kind,
-                    AstStatementKind::Source { field: Some(_), .. }
-                        | AstStatementKind::Hold { field: Some(_), .. }
-                        | AstStatementKind::List { field: Some(_), .. }
+                let owns_fieldless_hold = matches!(
+                    &syntax.kind,
+                    AstStatementKind::Hold {
+                        field: None,
+                        name: Some(_),
+                    }
+                ) && matches!(
+                    prepared_hold_alias_lexical_target(
+                        view,
+                        &owner.owner,
+                        local_statement,
+                        &dense_statement_by_syntax,
+                    ),
+                    Ok(Some(PreparedLexicalTarget::Declaration(
+                        KernelDeclarationOrigin::Statement { statement: target },
+                    ))) if Some(&target) == dense_statement_by_syntax.get(&syntax.id)
                 );
+                let declares = owns_fieldless_hold
+                    || matches!(
+                        syntax.kind,
+                        AstStatementKind::Function { .. } | AstStatementKind::Field { .. }
+                    )
+                    || matches!(
+                        syntax.kind,
+                        AstStatementKind::Source { field: Some(_), .. }
+                            | AstStatementKind::Hold { field: Some(_), .. }
+                            | AstStatementKind::List { field: Some(_), .. }
+                    );
                 if declares {
                     expected_origins.insert(KernelOwnerOracleDeclarationOrigin::Statement(
                         statement.statement.clone(),
@@ -7911,6 +9626,16 @@ mod tests {
                 )
             });
         assert_eq!(function.result.ty, Type::Number);
+        let [state] = function.states.as_ref() else {
+            panic!(
+                "fieldless function HOLD must own exactly one persistent state row: {:#?}",
+                function.states
+            )
+        };
+        assert_eq!(state.kind, CheckedStateKind::Hold);
+        assert_eq!(state.flow_type.ty, Type::Number);
+        assert_eq!(state.binding_declaration, state.declaration);
+        assert!(state.path.projection.is_empty());
         assert!(
             oracle
                 .unsupported
@@ -7919,6 +9644,123 @@ mod tests {
             "only the declaration-less unit root may be non-executable: {:#?}",
             oracle.unsupported
         );
+    }
+
+    #[test]
+    fn source_hold_and_mapped_list_resources_match_checked_authorities() {
+        let source = concat!(
+            "store: [\n",
+            "    pulse: SOURCE\n",
+            "    state:\n",
+            "        0 |> HOLD state {\n",
+            "            pulse |> THEN { 1 }\n",
+            "        }\n",
+            "    rows:\n",
+            "        LIST {\n",
+            "            1\n",
+            "            2\n",
+            "        }\n",
+            "        |> List/map(item, new: item)\n",
+            "]\n",
+        );
+        let parsed = parse_source("app/RUN.bn", source).expect("parse resource fixture");
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            !checked.report.has_errors(),
+            "current checker diagnostics: {:#?}",
+            checked.report.diagnostics
+        );
+        let (checked, _) = checked
+            .program
+            .expect("resource fixture checks")
+            .into_parts();
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse project resource fixture");
+        let [checked_source] = checked.sources.as_slice() else {
+            panic!("resource fixture must expose one checked SOURCE")
+        };
+        let report = kernel_owner_oracle_with_source_payloads(
+            &project,
+            &BTreeMap::from([(
+                "store.pulse".to_owned(),
+                checked_source.payload_type.clone(),
+            )]),
+        );
+        assert!(
+            report
+                .unsupported
+                .iter()
+                .all(|(owner, _)| matches!(owner, StableCheckOwnerKey::UnitRoot(_))),
+            "every declared resource owner must compile: {:#?}",
+            report.unsupported
+        );
+
+        let mut checked_expression_by_stable = BTreeMap::new();
+        let mut stable_by_checked_expression = BTreeMap::new();
+        for owner in project.stable_check_owner_keys() {
+            let view = project
+                .owner_view(&owner)
+                .expect("resource owner has a view");
+            for (expression, stable) in view.expressions().zip(view.stable_expression_keys()) {
+                let Some(checked_expression) = project
+                    .expression_slot(expression.id)
+                    .and_then(|slot| checked.expressions.get(slot))
+                else {
+                    continue;
+                };
+                checked_expression_by_stable.insert(stable.clone(), checked_expression.id);
+                stable_by_checked_expression.insert(checked_expression.id, stable);
+            }
+        }
+        let mismatches = resource_inventory_mismatches(
+            &report,
+            &checked,
+            &checked_expression_by_stable,
+            &stable_by_checked_expression,
+            &project,
+        );
+        assert!(mismatches.is_empty(), "resource parity: {mismatches:#?}");
+        assert_eq!(
+            report
+                .supported
+                .iter()
+                .map(|owner| owner.source_resources.len())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            report
+                .supported
+                .iter()
+                .map(|owner| owner.states.len())
+                .sum::<usize>(),
+            1
+        );
+        assert_eq!(
+            report
+                .supported
+                .iter()
+                .map(|owner| owner.lists.len())
+                .sum::<usize>(),
+            1
+        );
+        let lists = report
+            .supported
+            .iter()
+            .flat_map(|owner| owner.lists.iter())
+            .collect::<Vec<_>>();
+        let [list] = lists.as_slice() else {
+            panic!("resource fixture must expose one persistent LIST")
+        };
+        assert!(
+            matches!(
+                list.declaration,
+                KernelOwnerOracleLexicalTarget::OwnerPublic(_)
+            ),
+            "the child LIST must retain its parent field declaration authority"
+        );
+        assert_eq!(list.item_type, Type::Number);
     }
 
     #[test]
@@ -8228,7 +10070,7 @@ mod tests {
         let (report, timings) =
             profile_kernel_owner_oracle_with_source_payloads(&project, &source_payloads);
         eprintln!(
-            "kernel-novywave definition_artifacts expression_rows={} statement_rows={} declaration_rows={} lexical_binding_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={}",
+            "kernel-novywave definition_artifacts expression_rows={} statement_rows={} declaration_rows={} lexical_binding_rows={} source_resource_rows={} hold_state_rows={} persistent_list_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={}",
             report
                 .supported
                 .iter()
@@ -8248,6 +10090,21 @@ mod tests {
                 .supported
                 .iter()
                 .map(|owner| owner.lexical_bindings.len())
+                .sum::<usize>(),
+            report
+                .supported
+                .iter()
+                .map(|owner| owner.source_resources.len())
+                .sum::<usize>(),
+            report
+                .supported
+                .iter()
+                .map(|owner| owner.states.len())
+                .sum::<usize>(),
+            report
+                .supported
+                .iter()
+                .map(|owner| owner.lists.len())
                 .sum::<usize>(),
             report
                 .supported
@@ -8479,6 +10336,13 @@ mod tests {
             &checked_expression_by_stable,
             &stable_by_checked_expression,
         ));
+        mismatches.extend(resource_inventory_mismatches(
+            &report,
+            fields,
+            &checked_expression_by_stable,
+            &stable_by_checked_expression,
+            &project,
+        ));
         mismatches.extend(statement_inventory_mismatches(
             &report,
             fields,
@@ -8510,6 +10374,12 @@ mod tests {
                     "lexical-other"
                 } else if mismatch.contains("call") {
                     "call"
+                } else if mismatch.contains("SOURCE resource") {
+                    "resource-source"
+                } else if mismatch.contains("HOLD state") {
+                    "resource-state"
+                } else if mismatch.contains("LIST resource") {
+                    "resource-list"
                 } else if mismatch.contains("statement") {
                     "statement"
                 } else if mismatch.contains("collection") || mismatch.contains("source") {

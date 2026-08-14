@@ -2949,7 +2949,7 @@ parser-owned containing statement chain to the enclosing state declaration;
 they do not alias the initializer/provider expression. DRAIN is compiled as an
 ordinary lexical occurrence and has no separate type-flow implementation.
 
-The independent lexical-plan differential covers 4,488 declaration rows and
+The independent lexical-plan differential covers 4,489 declaration rows and
 3,963 lexical-binding rows across all 1,389 executable NovyWave owners, with
 eight inert unit containers, zero unsupported owners, and zero declaration,
 target, projection, access, or coverage mismatches. Focused parser-backed tests
@@ -2973,6 +2973,53 @@ the statement-only checkpoint is recorded as artifact-publication cost and
 measurement noise, not a speed win. All 56 kernel tests, 86 non-ignored compiler
 unit tests, and 16 compiler integration tests pass, and the full ignored
 NovyWave differential passes explicitly.
+
+The persistent-resource artifact cut is now complete. `DefinitionArtifact`
+owns SOURCE, HOLD-state, and persistent-LIST rows directly beside its dense
+expressions, statements, declarations, and lexical occurrences. Each resource
+uses typed local-or-public declaration and statement references plus one
+declaration-anchored semantic path; there is no source-shaped resource draft
+and no second body solve. SOURCE payload types, HOLD state/initial flow, and
+LIST item authorities are materialized from the already solved expression and
+public-result tables. A child LIST that supplies a public field through
+list-preserving operations is linked to that parent statement by following the
+packed project graph and its external-result edge, rather than inferring
+authority from parser nesting.
+
+The complete NovyWave differential now covers 117 SOURCE resource rows, 76
+HOLD state rows, and 133 persistent LIST rows, in addition to 15,575
+expressions, 5,541 statements, 4,489 declarations, 3,963 lexical bindings, 133
+collection expressions, 1,821 calls, and 11 host effects. Every declared owner
+is supported: 1,389 executable definitions plus eight inert unit containers,
+with zero unsupported owners. The resource comparison checks exact
+declaration, statement, path, initial/provider, payload/state/item type,
+capacity, and key-policy authority. `NoElement` remains an ordinary UI-library
+tag in the kernel. One explicitly scoped test-oracle allowance recognizes the
+legacy checker's spelling-based structural-widening loss; it changes no kernel
+type rule.
+
+Three no-rebuild debug samples record 2,027.397, 2,040.099, and 2,042.011 ms
+kernel time (median 2,040.099 ms); complete candidate time is 2,178.085,
+2,190.699, and 2,192.895 ms (median 2,190.699 ms). Three optimized samples
+record 431.452, 417.595, and 433.662 ms kernel time (median 431.452 ms);
+complete candidate time is 520.122, 504.705, and 520.720 ms (median 520.122
+ms). Median optimized compile/link is 103.605 ms and solve is 230.725 ms. The
+fresh two-job optimized rebuild took 1m48s and is excluded from every Boon
+latency. A separate optimized full differential run passes and records 525.603
+ms candidate time versus 272.405 ms for the legacy parse/check oracle; the new
+candidate is not yet production and the old oracle time is not included in its
+total. Resource publication raises optimized candidate latency by roughly 4--5%
+from the declaration/lexical checkpoint while adding all 326 persistent
+resource rows; this is recorded as artifact cost, not a speed improvement.
+
+All 57 kernel tests, 87 non-ignored compiler unit tests, and 16 compiler
+integration tests pass. Focused tests validate dense resource IDs and node
+kinds, solved SOURCE/HOLD/LIST surfaces, malformed-resource rejection, a
+fieldless function HOLD, and parent LIST authority through `List/map`. The
+next checker tranche is therefore diagnostics, callable substitutions, exact
+dependency/currentness receipts, and the permanent session/demand API—not
+resource micro-optimization. Those tables must be differential-clean before
+the checker-wide flag-day cutover and deletion of the old owner solvers.
 
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release

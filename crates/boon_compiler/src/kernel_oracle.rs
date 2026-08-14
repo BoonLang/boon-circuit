@@ -7,19 +7,24 @@
 use boon_checked::{FlowMode, FlowType, ObjectShape, Type, Variant, type_is_recursively_closed};
 use boon_compiler_kernel::{
     KernelCallInputRole, KernelCallTarget, KernelCollectionKind, KernelCompileWork,
-    KernelDefinitionFactsInput, KernelExpressionId, KernelExternalExpression, KernelExternalTarget,
-    KernelHostEffectArtifact, KernelInheritedFormal, KernelOwnerEdgeRole, KernelOwnerId,
-    KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput,
-    KernelParameterKind, KernelPattern, KernelProjectProgramInput, KernelPureBuiltinKind,
-    KernelRenderConstructorKind, KernelSolveWork, KernelStatementChildReference, KernelStatementId,
-    KernelStatementInput, KernelStatementKind, KernelStatementParameter, KernelValueReference,
-    compile_project_program_with_definition_facts, is_kernel_host_effect,
+    KernelDeclarationId, KernelDeclarationInput, KernelDeclarationKind, KernelDeclarationOrigin,
+    KernelDeclarationReference, KernelDefinitionFactsInput, KernelExpressionId,
+    KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
+    KernelInheritedFormal, KernelLexicalAccess, KernelLexicalBindingInput,
+    KernelLexicalBindingTarget, KernelLexicalBindingTargetInput, KernelOwnerEdgeRole,
+    KernelOwnerId, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
+    KernelOwnerProgramInput, KernelParameterKind, KernelPattern, KernelProjectProgramInput,
+    KernelPureBuiltinKind, KernelRenderConstructorKind, KernelSolveWork,
+    KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
+    KernelStatementParameter, KernelValueReference, compile_project_program_with_definition_facts,
+    is_kernel_host_effect,
 };
 use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
 use boon_syntax::{
-    AstCallArgKind, AstExprKind, AstMatchPattern, AstParameterKind, AstStatementKind,
-    AstTextSegment, StableCheckOwnerKey, StableExpressionKey, StableItemRouteSegment,
-    StableStatementKey, StableStatementKind, UnitItemKind, UnitLocalStatementId,
+    AstBlockBindingDeclaration, AstCallArgKind, AstExprKind, AstMatchPattern, AstParameterKind,
+    AstStatementKind, AstTextSegment, StableCheckOwnerKey, StableExpressionKey,
+    StableItemRouteSegment, StableStatementKey, StableStatementKind, UnitItemKind,
+    UnitLocalStatementId,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -31,6 +36,8 @@ pub struct KernelOwnerOracleEntry {
     pub result: FlowType,
     pub expressions: Box<[(StableExpressionKey, FlowType)]>,
     pub statements: Box<[KernelOwnerOracleStatement]>,
+    pub declarations: Box<[KernelOwnerOracleDeclaration]>,
+    pub lexical_bindings: Box<[KernelOwnerOracleLexicalBinding]>,
     pub collections: Box<[KernelOwnerOracleCollection]>,
     pub sources: Box<[KernelOwnerOracleSource]>,
     pub calls: Box<[KernelOwnerOracleCall]>,
@@ -44,6 +51,58 @@ pub struct KernelOwnerOracleEntry {
     pub generic_selector_dependents: Box<[StableExpressionKey]>,
     pub detached_generic_reads: Box<[StableExpressionKey]>,
     pub legacy_no_element_dependents: Box<[StableExpressionKey]>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum KernelOwnerOracleDeclarationOrigin {
+    Statement(StableStatementKey),
+    Parameter {
+        statement: StableStatementKey,
+        ordinal: u32,
+    },
+    RecordField {
+        object: StableExpressionKey,
+        ordinal: u32,
+    },
+    PatternBinding {
+        arm: StableExpressionKey,
+        ordinal: u32,
+    },
+    CallbackBinding {
+        call: StableExpressionKey,
+        ordinal: u32,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleDeclaration {
+    pub origin: KernelOwnerOracleDeclarationOrigin,
+    pub name: Box<str>,
+    pub kind: KernelDeclarationKind,
+    pub value: Option<KernelOwnerOracleValueReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KernelOwnerOracleLexicalTarget {
+    Declaration {
+        owner: StableCheckOwnerKey,
+        origin: KernelOwnerOracleDeclarationOrigin,
+    },
+    OwnerPublic(StableCheckOwnerKey),
+    ContextFormal {
+        owner: StableCheckOwnerKey,
+        ordinal: u32,
+    },
+    Value(KernelOwnerOracleValueReference),
+    RuntimeContext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleLexicalBinding {
+    pub expression: StableExpressionKey,
+    pub target: KernelOwnerOracleLexicalTarget,
+    pub projection: Box<[Box<str>]>,
+    pub access: KernelLexicalAccess,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -294,9 +353,34 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                             )
                         })
                     });
+                let lexical_owner_reason = owner.lexical_owner_targets.iter().find_map(|target| {
+                    let Some(prepared_target) = prepared_by_owner.get(&target.owner).copied()
+                    else {
+                        return Some((
+                            format!(
+                                "lexical binding depends on unsupported owner {:#?}",
+                                target.owner
+                            ),
+                            target.owner.clone(),
+                        ));
+                    };
+                    (!active.contains(&prepared_target)).then(|| {
+                        (
+                            format!(
+                                "lexical binding depends on unsupported owner {:#?}",
+                                target.owner
+                            ),
+                            root_blocker_by_owner
+                                .get(&target.owner)
+                                .cloned()
+                                .unwrap_or_else(|| target.owner.clone()),
+                        )
+                    })
+                });
                 external_reason
                     .or(call_reason)
                     .or(statement_child_reason)
+                    .or(lexical_owner_reason)
                     .map(|(reason, root)| (*index, reason, root))
             })
             .collect::<Vec<_>>();
@@ -417,6 +501,21 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 };
                 *owner = dense_owner[prepared_target]
                     .expect("active statement child target has a dense owner");
+            }
+            for target in &owner.lexical_owner_targets {
+                let prepared_target = prepared_by_owner[&target.owner];
+                let binding = facts
+                    .lexical_bindings
+                    .get_mut(target.binding)
+                    .expect("prepared lexical owner target is in range");
+                let KernelLexicalBindingTargetInput::Declaration(
+                    KernelDeclarationReference::OwnerPublic(owner),
+                ) = &mut binding.target
+                else {
+                    panic!("prepared lexical owner target became local")
+                };
+                *owner =
+                    dense_owner[prepared_target].expect("active lexical target has a dense owner");
             }
             facts
         })
@@ -602,6 +701,73 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
+                    let declaration_origins = artifact
+                        .declarations
+                        .iter()
+                        .map(|declaration| {
+                            stable_kernel_declaration_origin(owner, &declaration.origin)
+                        })
+                        .collect::<Vec<_>>();
+                    let declarations = artifact
+                        .declarations
+                        .iter()
+                        .map(|declaration| KernelOwnerOracleDeclaration {
+                            origin: declaration_origins[declaration.id.0 as usize].clone(),
+                            name: declaration.name.clone(),
+                            kind: declaration.kind,
+                            value: declaration.value.map(&stable_provider),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    let lexical_bindings = artifact
+                        .lexical_bindings
+                        .iter()
+                        .map(|binding| {
+                            let target = match &binding.target {
+                                KernelLexicalBindingTarget::Declaration(
+                                    KernelDeclarationReference::Local(declaration),
+                                ) => KernelOwnerOracleLexicalTarget::Declaration {
+                                    owner: owner.owner.clone(),
+                                    origin: declaration_origins[declaration.0 as usize].clone(),
+                                },
+                                KernelLexicalBindingTarget::Declaration(
+                                    KernelDeclarationReference::OwnerPublic(target),
+                                ) => {
+                                    let target = active
+                                        .get(target.0 as usize)
+                                        .and_then(|target| prepared.get(*target))
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "kernel lexical binding targets missing dense owner {}",
+                                                target.0
+                                            )
+                                        });
+                                    KernelOwnerOracleLexicalTarget::OwnerPublic(
+                                        target.owner.clone(),
+                                    )
+                                }
+                                KernelLexicalBindingTarget::ContextFormal { ordinal } => {
+                                    KernelOwnerOracleLexicalTarget::ContextFormal {
+                                        owner: owner.owner.clone(),
+                                        ordinal: *ordinal,
+                                    }
+                                }
+                                KernelLexicalBindingTarget::Value { provider } => {
+                                    KernelOwnerOracleLexicalTarget::Value(stable_provider(*provider))
+                                }
+                                KernelLexicalBindingTarget::RuntimeContext => {
+                                    KernelOwnerOracleLexicalTarget::RuntimeContext
+                                }
+                            };
+                            KernelOwnerOracleLexicalBinding {
+                                expression: owner.expressions[binding.expression.0 as usize].clone(),
+                                target,
+                                projection: binding.projection.clone(),
+                                access: binding.access,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
                     let calls = artifact
                         .calls
                         .into_iter()
@@ -680,6 +846,8 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         result: artifact.result,
                         expressions,
                         statements,
+                        declarations,
+                        lexical_bindings,
                         collections,
                         sources,
                         calls,
@@ -777,12 +945,50 @@ fn elapsed_us(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
+fn stable_kernel_declaration_origin(
+    owner: &PreparedOwner,
+    origin: &KernelDeclarationOrigin,
+) -> KernelOwnerOracleDeclarationOrigin {
+    match origin {
+        KernelDeclarationOrigin::Statement { statement } => {
+            KernelOwnerOracleDeclarationOrigin::Statement(
+                owner.statements[statement.0 as usize].clone(),
+            )
+        }
+        KernelDeclarationOrigin::Parameter { statement, ordinal } => {
+            KernelOwnerOracleDeclarationOrigin::Parameter {
+                statement: owner.statements[statement.0 as usize].clone(),
+                ordinal: *ordinal,
+            }
+        }
+        KernelDeclarationOrigin::RecordField { object, ordinal } => {
+            KernelOwnerOracleDeclarationOrigin::RecordField {
+                object: owner.expressions[object.0 as usize].clone(),
+                ordinal: *ordinal,
+            }
+        }
+        KernelDeclarationOrigin::PatternBinding { arm, ordinal } => {
+            KernelOwnerOracleDeclarationOrigin::PatternBinding {
+                arm: owner.expressions[arm.0 as usize].clone(),
+                ordinal: *ordinal,
+            }
+        }
+        KernelDeclarationOrigin::CallbackBinding { call, ordinal } => {
+            KernelOwnerOracleDeclarationOrigin::CallbackBinding {
+                call: owner.expressions[call.0 as usize].clone(),
+                ordinal: *ordinal,
+            }
+        }
+    }
+}
+
 struct PreparedOwner {
     owner: StableCheckOwnerKey,
     expressions: Box<[StableExpressionKey]>,
     statements: Box<[StableStatementKey]>,
     definition_facts: KernelDefinitionFactsInput,
     statement_child_targets: Box<[PreparedStatementChildTarget]>,
+    lexical_owner_targets: Box<[PreparedLexicalOwnerTarget]>,
     external_expressions: Box<[PreparedExternalExpression]>,
     call_targets: Box<[PreparedCallTarget]>,
     compact: KernelOwnerProgramInput,
@@ -799,8 +1005,17 @@ struct PreparedOwner {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PreparedLexicalBinding {
     provider: PreparedLexicalProvider,
+    target: PreparedLexicalTarget,
     prefix: Box<[String]>,
     directional: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PreparedLexicalTarget {
+    Declaration(KernelDeclarationOrigin),
+    OwnerPublic(StableCheckOwnerKey),
+    Value(PreparedInputReference),
+    RuntimeContext,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -854,6 +1069,12 @@ struct PreparedCallTarget {
 struct PreparedStatementChildTarget {
     statement: usize,
     child: usize,
+    owner: StableCheckOwnerKey,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedLexicalOwnerTarget {
+    binding: usize,
     owner: StableCheckOwnerKey,
 }
 
@@ -1071,6 +1292,45 @@ fn exact_value_surface<'a>(
             candidates.len()
         )),
     }
+}
+
+/// Resolve the deepest declaration prefix of a qualified value path.
+///
+/// The type equation may still project from an ancestor provider, but lexical
+/// identity belongs to the nested authored declaration. Keeping those two
+/// facts separate avoids turning `store.elements.click` into a read of
+/// `store` plus an invented semantic projection.
+fn exact_value_path_surface<'a>(
+    parts: &[String],
+    surfaces: &'a BTreeMap<String, Vec<ValueSurface>>,
+    current_owner: &StableCheckOwnerKey,
+) -> Result<(&'a ValueSurface, usize), String> {
+    for consumed in (2..=parts.len()).rev() {
+        let name = &parts[consumed - 1];
+        let mut matches = surfaces.get(name).into_iter().flatten().filter(|surface| {
+            let scope = surface
+                .lexical_scope
+                .iter()
+                .filter_map(|segment| segment.names.first())
+                .map(String::as_str)
+                .chain(std::iter::once(name.as_str()))
+                .collect::<Vec<_>>();
+            scope
+                == parts[..consumed]
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+        });
+        if let Some(surface) = matches.next()
+            && matches.next().is_none()
+        {
+            return Ok((surface, consumed));
+        }
+    }
+    let Some(root) = parts.first() else {
+        return Err("value path has no root".to_owned());
+    };
+    exact_value_surface(root, surfaces, current_owner).map(|surface| (surface, 1))
 }
 
 fn local_value_surface_provider(
@@ -1402,6 +1662,8 @@ fn compact_owner_view(
     let mut public_field_names = BTreeSet::new();
     public_child_owner_fields.retain(|(name, _)| public_field_names.insert(name.clone()));
     let public_child_owner_fields = public_child_owner_fields.into_boxed_slice();
+    let statement_record_field_targets =
+        direct_statement_record_field_targets(view, &owner, &raw_expressions);
     let lexical_binding_reads = direct_lexical_binding_reads(
         view,
         &owner,
@@ -1410,7 +1672,8 @@ fn compact_owner_view(
         &local_by_syntax,
         &collection_bindings_by_scope,
         &structured_records,
-    );
+        &statement_record_field_targets,
+    )?;
     let structured_delimiter_nodes = structured_records
         .keys()
         .filter_map(|syntax| {
@@ -1528,8 +1791,25 @@ fn compact_owner_view(
                         }
                     }
                 }
-                AstExprKind::Path(path) => {
-                    let (root, fields) = path
+                AstExprKind::Path(_) | AstExprKind::Drain { .. } => {
+                    let parts = match &expression.kind {
+                        AstExprKind::Path(path) => path.clone(),
+                        AstExprKind::Drain { path } => match path {
+                            boon_syntax::AstDrainPath::Binding { name } => vec![name.clone()],
+                            boon_syntax::AstDrainPath::Field { binding, fields } => {
+                                std::iter::once(binding.clone())
+                                    .chain(fields.iter().cloned())
+                                    .collect()
+                            }
+                            boon_syntax::AstDrainPath::Passed { fields } => {
+                                std::iter::once("PASSED".to_owned())
+                                    .chain(fields.iter().cloned())
+                                    .collect()
+                            }
+                        },
+                        _ => unreachable!("path/read arm only accepts lexical path syntax"),
+                    };
+                    let (root, fields) = parts
                         .split_first()
                         .ok_or_else(|| "value path has no root".to_owned())?;
                     let path_fields = fields
@@ -2153,7 +2433,7 @@ fn compact_owner_view(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    let (statements, definition_facts, statement_child_targets) = compact_statement_facts(
+    let (statements, mut definition_facts, statement_child_targets) = compact_statement_facts(
         view,
         &owner,
         &local_by_syntax,
@@ -2161,12 +2441,32 @@ fn compact_owner_view(
         &mut external_by_key,
         &mut external_expressions,
     )?;
+    let (declarations, lexical_bindings, lexical_owner_targets) =
+        compact_declaration_and_lexical_facts(
+            view,
+            &owner,
+            root_statement_id,
+            &raw_expressions,
+            &local_by_syntax,
+            &formal_by_name,
+            owner_context_ordinal,
+            &lexical_binding_reads,
+            &statement_record_field_targets,
+            value_surfaces,
+            node_count,
+            &definition_facts.statements,
+            &mut external_by_key,
+            &mut external_expressions,
+        )?;
+    definition_facts.declarations = declarations;
+    definition_facts.lexical_bindings = lexical_bindings;
     Ok(PreparedOwner {
         owner,
         expressions: expressions.into_boxed_slice(),
         statements,
         definition_facts,
         statement_child_targets,
+        lexical_owner_targets,
         external_expressions: external_expressions.into_boxed_slice(),
         call_targets: call_targets.into_boxed_slice(),
         compact: KernelOwnerProgramInput {
@@ -2396,6 +2696,220 @@ fn prepared_input_reference_index(
         .ok_or_else(|| "owner expression namespace overflowed".to_owned())
 }
 
+fn prepared_statement_lexical_target(
+    view: UnitOwnerSyntaxView<'_>,
+    owner: &StableCheckOwnerKey,
+    statement: UnitLocalStatementId,
+    dense_statement_by_syntax: &BTreeMap<usize, KernelStatementId>,
+) -> Option<PreparedLexicalTarget> {
+    let target_owner = view.stable_check_owner_for_local_statement(statement)?;
+    if target_owner != *owner {
+        return Some(PreparedLexicalTarget::OwnerPublic(target_owner));
+    }
+    let syntax = view.statement_for_local(statement)?;
+    dense_statement_by_syntax
+        .get(&syntax.id)
+        .copied()
+        .map(|statement| {
+            PreparedLexicalTarget::Declaration(KernelDeclarationOrigin::Statement { statement })
+        })
+}
+
+/// Resolve the declaration named by a HOLD update alias directly from the
+/// parser-owned statement ancestry.
+///
+/// A field-bearing HOLD owns its statement declaration. A fieldless HOLD
+/// shares the nearest enclosing Field/HOLD declaration; before another named
+/// declaration boundary, the outermost fieldless HOLD owns the declaration.
+/// Unlike the old owner DTO this bridge can inspect the complete finalized
+/// syntax view, so the authority does not need to be copied into an
+/// intermediate `containing_hold_authority` field.
+fn prepared_hold_alias_lexical_target(
+    view: UnitOwnerSyntaxView<'_>,
+    owner: &StableCheckOwnerKey,
+    statement: UnitLocalStatementId,
+    dense_statement_by_syntax: &BTreeMap<usize, KernelStatementId>,
+) -> Result<Option<PreparedLexicalTarget>, String> {
+    let statement_input = view
+        .statement_for_local(statement)
+        .ok_or_else(|| "HOLD alias references a missing parser statement".to_owned())?;
+    let AstStatementKind::Hold { field, name } = &statement_input.kind else {
+        return Ok(None);
+    };
+    if name.is_none() {
+        return Ok(None);
+    }
+    if field.is_some() {
+        return Ok(prepared_statement_lexical_target(
+            view,
+            owner,
+            statement,
+            dense_statement_by_syntax,
+        ));
+    }
+
+    let mut fieldless_hold = statement;
+    let mut parent = view
+        .statement_locator(statement)
+        .and_then(|locator| locator.parent());
+    let mut visited = BTreeSet::new();
+    while let Some(parent_id) = parent {
+        if !visited.insert(parent_id) {
+            return Err("HOLD alias statement ancestry contains a cycle".to_owned());
+        }
+        let parent_input = view.statement_for_local(parent_id).ok_or_else(|| {
+            "HOLD alias ancestry references a missing parser statement".to_owned()
+        })?;
+        match &parent_input.kind {
+            AstStatementKind::Field { .. } | AstStatementKind::Hold { field: Some(_), .. } => {
+                return Ok(prepared_statement_lexical_target(
+                    view,
+                    owner,
+                    parent_id,
+                    dense_statement_by_syntax,
+                ));
+            }
+            AstStatementKind::Hold {
+                field: None,
+                name: Some(_),
+            } => fieldless_hold = parent_id,
+            AstStatementKind::Function { .. }
+            | AstStatementKind::Source { field: Some(_), .. }
+            | AstStatementKind::List { field: Some(_), .. } => {
+                return Ok(prepared_statement_lexical_target(
+                    view,
+                    owner,
+                    fieldless_hold,
+                    dense_statement_by_syntax,
+                ));
+            }
+            AstStatementKind::Source { field: None, .. }
+            | AstStatementKind::Hold {
+                field: None,
+                name: None,
+            }
+            | AstStatementKind::List { field: None, .. }
+            | AstStatementKind::Block
+            | AstStatementKind::Spread
+            | AstStatementKind::Expression => {}
+        }
+        parent = view
+            .statement_locator(parent_id)
+            .and_then(|locator| locator.parent());
+    }
+
+    Ok(prepared_statement_lexical_target(
+        view,
+        owner,
+        fieldless_hold,
+        dense_statement_by_syntax,
+    ))
+}
+
+fn direct_statement_record_field_targets(
+    view: UnitOwnerSyntaxView<'_>,
+    owner: &StableCheckOwnerKey,
+    raw_expressions: &[&boon_syntax::AstExpr],
+) -> BTreeMap<(usize, String), PreparedLexicalTarget> {
+    let expressions = raw_expressions
+        .iter()
+        .map(|expression| (expression.id, *expression))
+        .collect::<BTreeMap<_, _>>();
+    let dense_statement_by_syntax = view
+        .statement_ids()
+        .iter()
+        .copied()
+        .zip(view.statements())
+        .enumerate()
+        .map(|(dense, (_, statement))| {
+            (
+                statement.id,
+                KernelStatementId(
+                    u32::try_from(dense).expect("definition statement count fits u32"),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let statement_by_placement = view
+        .statement_ids()
+        .iter()
+        .copied()
+        .filter_map(|statement| {
+            let locator = view.statement_locator(statement)?;
+            Some(((locator.parent(), locator.child_index()), statement))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut targets = BTreeMap::new();
+    for (statement_id, statement) in view.statement_ids().iter().copied().zip(view.statements()) {
+        if statement.children.is_empty()
+            && !matches!(statement.kind, AstStatementKind::Function { .. })
+        {
+            continue;
+        }
+        let Some(direct) = statement.expr else {
+            continue;
+        };
+        let Some(direct_expression) = expressions.get(&direct).copied() else {
+            continue;
+        };
+        let container = match &direct_expression.kind {
+            AstExprKind::Object(_) => Some(direct),
+            AstExprKind::MatchArm {
+                output: Some(output),
+                ..
+            }
+            | AstExprKind::Then {
+                output: Some(output),
+                ..
+            } if expressions
+                .get(output)
+                .is_some_and(|output| matches!(output.kind, AstExprKind::Object(_))) =>
+            {
+                Some(*output)
+            }
+            _ => None,
+        };
+        let Some(container) = container else {
+            continue;
+        };
+        let Some(AstExprKind::Object(fields)) = expressions
+            .get(&container)
+            .map(|expression| &expression.kind)
+        else {
+            continue;
+        };
+        for field in fields.iter().filter(|field| !field.spread) {
+            let statement_target = statement
+                .children
+                .iter()
+                .enumerate()
+                .find(|(_, child)| statement_binding_name(&child.kind) == Some(&field.name))
+                .and_then(|(child_index, _)| {
+                    statement_by_placement
+                        .get(&(Some(statement_id), child_index))
+                        .copied()
+                })
+                .and_then(|child| {
+                    prepared_statement_lexical_target(
+                        view,
+                        owner,
+                        child,
+                        &dense_statement_by_syntax,
+                    )
+                });
+            let target = statement_target.or_else(|| {
+                view.stable_check_owner_for_syntax_expression(field.value)
+                    .filter(|field_owner| field_owner != owner)
+                    .map(PreparedLexicalTarget::OwnerPublic)
+            });
+            if let Some(target) = target {
+                targets.insert((container, field.name.clone()), target);
+            }
+        }
+    }
+    targets
+}
+
 fn direct_lexical_binding_reads(
     view: UnitOwnerSyntaxView<'_>,
     owner: &StableCheckOwnerKey,
@@ -2404,7 +2918,30 @@ fn direct_lexical_binding_reads(
     local_by_syntax: &BTreeMap<usize, usize>,
     collection_bindings_by_scope: &BTreeMap<usize, Box<[(String, usize)]>>,
     structured_records: &BTreeMap<usize, Vec<PreparedRecordEntry>>,
-) -> BTreeMap<usize, PreparedLexicalBinding> {
+    statement_record_field_targets: &BTreeMap<(usize, String), PreparedLexicalTarget>,
+) -> Result<BTreeMap<usize, PreparedLexicalBinding>, String> {
+    let dense_statement_by_syntax = view
+        .statement_ids()
+        .iter()
+        .copied()
+        .zip(view.statements())
+        .enumerate()
+        .map(|(dense, (_, statement))| {
+            (
+                statement.id,
+                KernelStatementId(
+                    u32::try_from(dense).expect("definition statement count fits u32"),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let local_statement_by_syntax = view
+        .statement_ids()
+        .iter()
+        .copied()
+        .zip(view.statements())
+        .map(|(local, statement)| (statement.id, local))
+        .collect::<BTreeMap<_, _>>();
     let syntax_by_stable = stable_expressions
         .iter()
         .cloned()
@@ -2440,6 +2977,11 @@ fn direct_lexical_binding_reads(
                 Some(root) => root,
                 None => continue,
             },
+            AstExprKind::Drain { path } => match path {
+                boon_syntax::AstDrainPath::Binding { name }
+                | boon_syntax::AstDrainPath::Field { binding: name, .. } => name,
+                boon_syntax::AstDrainPath::Passed { .. } => "PASSED",
+            },
             _ => continue,
         };
         let mut cursor = expression.id;
@@ -2467,10 +3009,15 @@ fn direct_lexical_binding_reads(
                     PreparedRecordEntry::Field { .. } | PreparedRecordEntry::Spread { .. } => None,
                 })
             {
+                let target = statement_record_field_targets
+                    .get(&(parent_expression.id, root.to_owned()))
+                    .cloned()
+                    .unwrap_or_else(|| PreparedLexicalTarget::Value(provider.clone()));
                 reads.insert(
                     expression.id,
                     PreparedLexicalBinding {
-                        provider: PreparedLexicalProvider::Input(provider),
+                        provider: PreparedLexicalProvider::Input(provider.clone()),
+                        target,
                         prefix: Box::new([]),
                         directional: false,
                     },
@@ -2484,12 +3031,38 @@ fn direct_lexical_binding_reads(
                     .find(|field| !field.spread && field.name == root && field.value != cursor)
                     .map(|field| field.value)
             {
+                let target = statement_record_field_targets
+                    .get(&(parent_expression.id, root.to_owned()))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        PreparedLexicalTarget::Declaration(KernelDeclarationOrigin::RecordField {
+                            object: checked_kernel_expression(
+                                *local_by_syntax
+                                    .get(&parent_expression.id)
+                                    .expect("local parent expression has a dense row"),
+                            )
+                            .expect("local parent expression index fits u32"),
+                            ordinal: checked_u32(
+                                fields
+                                    .iter()
+                                    .position(|field| {
+                                        !field.spread
+                                            && field.name == root
+                                            && field.value == provider
+                                    })
+                                    .expect("matching record field has an ordinal"),
+                                "record field ordinal",
+                            )
+                            .expect("record field ordinal fits u32"),
+                        })
+                    });
                 reads.insert(
                     expression.id,
                     PreparedLexicalBinding {
                         provider: PreparedLexicalProvider::Input(PreparedInputReference::Syntax(
                             provider,
                         )),
+                        target,
                         prefix: Box::new([]),
                         directional: false,
                     },
@@ -2514,6 +3087,7 @@ fn direct_lexical_binding_reads(
                     expression.id,
                     PreparedLexicalBinding {
                         provider: PreparedLexicalProvider::Known(context.flow_type),
+                        target: PreparedLexicalTarget::RuntimeContext,
                         prefix: Box::new([]),
                         directional: false,
                     },
@@ -2523,12 +3097,36 @@ fn direct_lexical_binding_reads(
             if let AstExprKind::Block { bindings, .. } = &parent_expression.kind
                 && let Some(binding) = bindings.iter().find(|binding| binding.name == root)
             {
+                let target = match binding.declaration {
+                    AstBlockBindingDeclaration::Local { statement } => local_statement_by_syntax
+                        .get(&statement)
+                        .copied()
+                        .and_then(|statement| {
+                            prepared_statement_lexical_target(
+                                view,
+                                owner,
+                                statement,
+                                &dense_statement_by_syntax,
+                            )
+                        }),
+                    AstBlockBindingDeclaration::Child { child } => view
+                        .child_owners()
+                        .get(child)
+                        .and_then(|child| {
+                            view.stable_check_owner_for_local_statement(child.statement())
+                        })
+                        .map(PreparedLexicalTarget::OwnerPublic),
+                }
+                .unwrap_or_else(|| {
+                    PreparedLexicalTarget::Value(PreparedInputReference::Syntax(binding.value))
+                });
                 reads.insert(
                     expression.id,
                     PreparedLexicalBinding {
                         provider: PreparedLexicalProvider::Input(PreparedInputReference::Syntax(
                             binding.value,
                         )),
+                        target,
                         prefix: Box::new([]),
                         directional: false,
                     },
@@ -2546,17 +3144,36 @@ fn direct_lexical_binding_reads(
                         provider: PreparedLexicalProvider::Input(PreparedInputReference::Syntax(
                             provider,
                         )),
+                        target: PreparedLexicalTarget::Declaration(
+                            KernelDeclarationOrigin::PatternBinding {
+                                arm: checked_kernel_expression(
+                                    *local_by_syntax
+                                        .get(&parent_expression.id)
+                                        .expect("local match arm has a dense row"),
+                                )
+                                .expect("local match arm index fits u32"),
+                                ordinal: checked_u32(
+                                    pattern_variable_names(pattern)
+                                        .iter()
+                                        .position(|name| name == root)
+                                        .expect("matching pattern binding has an ordinal"),
+                                    "pattern binding ordinal",
+                                )
+                                .expect("pattern binding ordinal fits u32"),
+                            },
+                        ),
                         prefix: prefix.into_boxed_slice(),
                         directional: true,
                     },
                 );
                 break;
             }
-            if let Some((_, provider)) = collection_bindings_by_scope
+            if let Some((ordinal, (_, provider))) = collection_bindings_by_scope
                 .get(&parent_expression.id)
                 .into_iter()
                 .flatten()
-                .find(|(name, provider)| name == root && *provider != expression.id)
+                .enumerate()
+                .find(|(_, (name, provider))| name == root && *provider != expression.id)
             {
                 reads.insert(
                     expression.id,
@@ -2564,6 +3181,18 @@ fn direct_lexical_binding_reads(
                         provider: PreparedLexicalProvider::Input(PreparedInputReference::Syntax(
                             *provider,
                         )),
+                        target: PreparedLexicalTarget::Declaration(
+                            KernelDeclarationOrigin::CallbackBinding {
+                                call: checked_kernel_expression(
+                                    *local_by_syntax
+                                        .get(&parent_expression.id)
+                                        .expect("local callback expression has a dense row"),
+                                )
+                                .expect("local callback expression index fits u32"),
+                                ordinal: checked_u32(ordinal, "callback binding ordinal")
+                                    .expect("callback binding ordinal fits u32"),
+                            },
+                        ),
                         prefix: Box::new([]),
                         directional: true,
                     },
@@ -2596,19 +3225,29 @@ fn direct_lexical_binding_reads(
                 && matches!(&parent_statement.kind, AstStatementKind::Hold { name: Some(name), .. } if name == root)
                 && let Some(provider) = parent_statement.expr
             {
+                let target = prepared_hold_alias_lexical_target(
+                    view,
+                    owner,
+                    parent,
+                    &dense_statement_by_syntax,
+                )?
+                .unwrap_or_else(|| {
+                    PreparedLexicalTarget::Value(PreparedInputReference::Syntax(provider))
+                });
                 reads.insert(
                     expression.id,
                     PreparedLexicalBinding {
                         provider: PreparedLexicalProvider::Input(PreparedInputReference::Syntax(
                             provider,
                         )),
+                        target,
                         prefix: Box::new([]),
                         directional: true,
                     },
                 );
                 break;
             }
-            let provider = view
+            let binding = view
                 .statement_for_local(parent)
                 .and_then(|parent_statement| {
                     parent_statement.children[..locator.child_index()]
@@ -2616,21 +3255,32 @@ fn direct_lexical_binding_reads(
                         .enumerate()
                         .rev()
                         .find_map(|(child_index, child)| {
-                            (statement_binding_name(&child.kind) == Some(root)).then(|| {
-                                statement_by_placement
-                                    .get(&(Some(parent), child_index))
-                                    .and_then(|child| view.statement_value_expression(*child))
-                                    .or(child.expr)
-                            })
+                            if statement_binding_name(&child.kind) != Some(root) {
+                                return None;
+                            }
+                            let statement = statement_by_placement
+                                .get(&(Some(parent), child_index))
+                                .copied()?;
+                            let provider = view
+                                .statement_value_expression(statement)
+                                .or(child.expr)
+                                .map(PreparedInputReference::Syntax)?;
+                            let target = prepared_statement_lexical_target(
+                                view,
+                                owner,
+                                statement,
+                                &dense_statement_by_syntax,
+                            )
+                            .unwrap_or_else(|| PreparedLexicalTarget::Value(provider.clone()));
+                            Some((provider, target))
                         })
-                        .flatten()
-                        .map(PreparedInputReference::Syntax)
                 });
-            if let Some(provider) = provider {
+            if let Some((provider, target)) = binding {
                 reads.insert(
                     expression.id,
                     PreparedLexicalBinding {
-                        provider: PreparedLexicalProvider::Input(provider),
+                        provider: PreparedLexicalProvider::Input(provider.clone()),
+                        target,
                         prefix: Box::new([]),
                         directional: false,
                     },
@@ -2663,12 +3313,12 @@ fn direct_lexical_binding_reads(
             );
         }
     }
-    reads
+    Ok(reads)
 }
 
 fn statement_binding_name(kind: &AstStatementKind) -> Option<&str> {
     match kind {
-        AstStatementKind::Field { name } => Some(name),
+        AstStatementKind::Field { name } | AstStatementKind::Function { name, .. } => Some(name),
         AstStatementKind::Source {
             field: Some(name), ..
         }
@@ -2678,8 +3328,7 @@ fn statement_binding_name(kind: &AstStatementKind) -> Option<&str> {
         | AstStatementKind::List {
             field: Some(name), ..
         } => Some(name),
-        AstStatementKind::Function { .. }
-        | AstStatementKind::Source { field: None, .. }
+        AstStatementKind::Source { field: None, .. }
         | AstStatementKind::Hold { field: None, .. }
         | AstStatementKind::List { field: None, .. }
         | AstStatementKind::Block
@@ -2829,9 +3478,433 @@ fn compact_statement_facts(
         .into_boxed_slice();
     Ok((
         stable,
-        KernelDefinitionFactsInput { statements },
+        KernelDefinitionFactsInput {
+            statements,
+            ..KernelDefinitionFactsInput::default()
+        },
         child_targets.into_boxed_slice(),
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compact_declaration_and_lexical_facts(
+    view: UnitOwnerSyntaxView<'_>,
+    owner: &StableCheckOwnerKey,
+    root_statement: UnitLocalStatementId,
+    raw_expressions: &[&boon_syntax::AstExpr],
+    local_by_syntax: &BTreeMap<usize, usize>,
+    formal_by_name: &BTreeMap<String, usize>,
+    owner_context_ordinal: Option<usize>,
+    lexical_binding_reads: &BTreeMap<usize, PreparedLexicalBinding>,
+    statement_record_field_targets: &BTreeMap<(usize, String), PreparedLexicalTarget>,
+    value_surfaces: &BTreeMap<String, Vec<ValueSurface>>,
+    node_count: usize,
+    statements: &[KernelStatementInput],
+    external_by_key: &mut BTreeMap<PreparedExternalExpression, usize>,
+    external_expressions: &mut Vec<PreparedExternalExpression>,
+) -> Result<
+    (
+        Box<[KernelDeclarationInput]>,
+        Box<[KernelLexicalBindingInput]>,
+        Box<[PreparedLexicalOwnerTarget]>,
+    ),
+    String,
+> {
+    let dense_statement_by_syntax = view
+        .statement_ids()
+        .iter()
+        .copied()
+        .zip(view.statements())
+        .enumerate()
+        .map(|(dense, (_, statement))| (statement.id, dense))
+        .collect::<BTreeMap<_, _>>();
+    let root_statement = KernelStatementId(checked_u32(
+        *dense_statement_by_syntax
+            .get(
+                &view
+                    .statement_for_local(root_statement)
+                    .ok_or_else(|| "kernel root declaration statement is missing".to_owned())?
+                    .id,
+            )
+            .ok_or_else(|| "kernel root declaration is not definition-local".to_owned())?,
+        "root declaration statement",
+    )?);
+
+    let mut pending = Vec::<(
+        KernelDeclarationOrigin,
+        Box<str>,
+        KernelDeclarationKind,
+        Option<KernelExpressionId>,
+    )>::new();
+    for statement in statements {
+        let (name, kind, value) = match &statement.kind {
+            KernelStatementKind::Function { name, .. } => {
+                (name.clone(), KernelDeclarationKind::Function, None)
+            }
+            KernelStatementKind::Field { name } => {
+                (name.clone(), KernelDeclarationKind::Field, statement.value)
+            }
+            KernelStatementKind::Source {
+                field: Some(name), ..
+            } => (name.clone(), KernelDeclarationKind::Source, statement.value),
+            KernelStatementKind::Hold {
+                field: Some(name), ..
+            } => (name.clone(), KernelDeclarationKind::Hold, statement.value),
+            KernelStatementKind::List {
+                field: Some(name), ..
+            } => (name.clone(), KernelDeclarationKind::List, statement.value),
+            KernelStatementKind::Source { field: None, .. }
+            | KernelStatementKind::Hold { field: None, .. }
+            | KernelStatementKind::List { field: None, .. }
+            | KernelStatementKind::Block
+            | KernelStatementKind::Spread
+            | KernelStatementKind::Expression => continue,
+        };
+        pending.push((
+            KernelDeclarationOrigin::Statement {
+                statement: statement.id,
+            },
+            name,
+            kind,
+            value,
+        ));
+        if let KernelStatementKind::Function { parameters, .. } = &statement.kind {
+            pending.extend(parameters.iter().map(|parameter| {
+                (
+                    KernelDeclarationOrigin::Parameter {
+                        statement: statement.id,
+                        ordinal: parameter.ordinal,
+                    },
+                    parameter.name.clone(),
+                    match parameter.kind {
+                        KernelParameterKind::Value => KernelDeclarationKind::ValueParameter,
+                        KernelParameterKind::Out => KernelDeclarationKind::OutParameter,
+                    },
+                    None,
+                )
+            }));
+        }
+    }
+
+    let mut callback_origin_by_binding = BTreeMap::<usize, KernelDeclarationOrigin>::new();
+    for expression in raw_expressions {
+        let object = KernelExpressionId(checked_u32(
+            *local_by_syntax
+                .get(&expression.id)
+                .ok_or_else(|| "kernel declaration expression is not local".to_owned())?,
+            "declaration expression",
+        )?);
+        match &expression.kind {
+            AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
+                for (ordinal, field) in fields.iter().enumerate() {
+                    if field.spread
+                        || statement_record_field_targets
+                            .contains_key(&(expression.id, field.name.clone()))
+                        || view
+                            .stable_check_owner_for_syntax_expression(field.value)
+                            .is_some_and(|field_owner| field_owner != *owner)
+                    {
+                        continue;
+                    }
+                    pending.push((
+                        KernelDeclarationOrigin::RecordField {
+                            object,
+                            ordinal: checked_u32(ordinal, "record field ordinal")?,
+                        },
+                        field.name.clone().into_boxed_str(),
+                        KernelDeclarationKind::Field,
+                        Some(checked_kernel_expression(prepared_input_reference_index(
+                            PreparedInputReference::Syntax(field.value),
+                            view,
+                            owner,
+                            Some(expression.id),
+                            local_by_syntax,
+                            node_count,
+                            external_by_key,
+                            external_expressions,
+                        )?)?),
+                    ));
+                }
+            }
+            AstExprKind::MatchArm { pattern, .. } => {
+                for (ordinal, name) in pattern_variable_names(pattern).into_iter().enumerate() {
+                    pending.push((
+                        KernelDeclarationOrigin::PatternBinding {
+                            arm: object,
+                            ordinal: checked_u32(ordinal, "pattern binding ordinal")?,
+                        },
+                        name.into_boxed_str(),
+                        KernelDeclarationKind::PatternBinding,
+                        None,
+                    ));
+                }
+            }
+            AstExprKind::Call { function, args, .. }
+            | AstExprKind::Pipe {
+                op: function, args, ..
+            } if collection_callback_builtin(function) => {
+                for (ordinal, argument) in args
+                    .iter()
+                    .filter(|argument| argument.kind == AstCallArgKind::BareBinding)
+                    .enumerate()
+                {
+                    let name = raw_expressions
+                        .iter()
+                        .find(|candidate| candidate.id == argument.value)
+                        .and_then(|candidate| match &candidate.kind {
+                            AstExprKind::Identifier(name) => Some(name.clone()),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            format!("collection callback `{function}` binding is not an identifier")
+                        })?;
+                    let origin = KernelDeclarationOrigin::CallbackBinding {
+                        call: object,
+                        ordinal: checked_u32(ordinal, "callback binding ordinal")?,
+                    };
+                    if callback_origin_by_binding
+                        .insert(argument.value, origin.clone())
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "collection callback `{function}` repeats one binding occurrence"
+                        ));
+                    }
+                    pending.push((
+                        origin,
+                        name.into_boxed_str(),
+                        KernelDeclarationKind::FreshOut,
+                        None,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    pending.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut declaration_by_origin = BTreeMap::new();
+    let declarations = pending
+        .into_iter()
+        .enumerate()
+        .map(|(index, (origin, name, kind, value))| {
+            let id = KernelDeclarationId(checked_u32(index, "declaration index")?);
+            if declaration_by_origin.insert(origin.clone(), id).is_some() {
+                return Err(format!(
+                    "kernel declaration origin {origin:?} was projected twice"
+                ));
+            }
+            Ok(KernelDeclarationInput {
+                id,
+                origin,
+                name,
+                kind,
+                value,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let public_declaration = declaration_by_origin
+        .get(&KernelDeclarationOrigin::Statement {
+            statement: root_statement,
+        })
+        .copied();
+    let mut owner_targets = Vec::new();
+    let mut bindings = Vec::new();
+    for expression in raw_expressions {
+        let (parts, access) = match &expression.kind {
+            AstExprKind::Identifier(root) => (vec![root.clone()], KernelLexicalAccess::Read),
+            AstExprKind::Path(path) => (path.clone(), KernelLexicalAccess::Read),
+            AstExprKind::Drain { path } => (
+                match path {
+                    boon_syntax::AstDrainPath::Binding { name } => vec![name.clone()],
+                    boon_syntax::AstDrainPath::Field { binding, fields } => {
+                        std::iter::once(binding.clone())
+                            .chain(fields.iter().cloned())
+                            .collect()
+                    }
+                    boon_syntax::AstDrainPath::Passed { fields } => {
+                        std::iter::once("PASSED".to_owned())
+                            .chain(fields.iter().cloned())
+                            .collect()
+                    }
+                },
+                KernelLexicalAccess::Drain,
+            ),
+            _ => continue,
+        };
+        let Some((root, suffix)) = parts.split_first() else {
+            continue;
+        };
+        let expression_id = KernelExpressionId(checked_u32(
+            *local_by_syntax
+                .get(&expression.id)
+                .ok_or_else(|| "lexical expression is not definition-local".to_owned())?,
+            "lexical expression",
+        )?);
+        let mut residual_suffix = suffix.to_vec();
+        let (target, prefix): (KernelLexicalBindingTargetInput, &[String]) = if let Some(origin) =
+            callback_origin_by_binding.get(&expression.id)
+        {
+            (
+                KernelLexicalBindingTargetInput::Declaration(KernelDeclarationReference::Local(
+                    declaration_by_origin[origin],
+                )),
+                &[],
+            )
+        } else if let Some(binding) = lexical_binding_reads.get(&expression.id) {
+            let target = match &binding.target {
+                PreparedLexicalTarget::Declaration(origin) => declaration_by_origin
+                    .get(origin)
+                    .copied()
+                    .map(KernelDeclarationReference::Local)
+                    .map(KernelLexicalBindingTargetInput::Declaration)
+                    .unwrap_or_else(|| {
+                        prepared_binding_value_target(
+                            &binding.provider,
+                            view,
+                            owner,
+                            expression.id,
+                            local_by_syntax,
+                            node_count,
+                            external_by_key,
+                            external_expressions,
+                        )
+                        .expect("prepared lexical provider was validated")
+                    }),
+                PreparedLexicalTarget::OwnerPublic(target_owner) => {
+                    let binding = bindings.len();
+                    owner_targets.push(PreparedLexicalOwnerTarget {
+                        binding,
+                        owner: target_owner.clone(),
+                    });
+                    KernelLexicalBindingTargetInput::Declaration(
+                        KernelDeclarationReference::OwnerPublic(KernelOwnerId(0)),
+                    )
+                }
+                PreparedLexicalTarget::Value(provider) => KernelLexicalBindingTargetInput::Value {
+                    provider: checked_kernel_expression(prepared_input_reference_index(
+                        provider.clone(),
+                        view,
+                        owner,
+                        Some(expression.id),
+                        local_by_syntax,
+                        node_count,
+                        external_by_key,
+                        external_expressions,
+                    )?)?,
+                },
+                PreparedLexicalTarget::RuntimeContext => {
+                    KernelLexicalBindingTargetInput::RuntimeContext
+                }
+            };
+            let target_prefix = if matches!(
+                binding.target,
+                PreparedLexicalTarget::Declaration(KernelDeclarationOrigin::PatternBinding { .. })
+            ) {
+                &[]
+            } else {
+                binding.prefix.as_ref()
+            };
+            (target, target_prefix)
+        } else if let Some(formal) = formal_by_name.get(root).copied() {
+            let ordinal = checked_u32(formal, "lexical formal ordinal")?;
+            if owner_context_ordinal == Some(formal) {
+                (
+                    KernelLexicalBindingTargetInput::ContextFormal { ordinal },
+                    &[],
+                )
+            } else {
+                let origin = KernelDeclarationOrigin::Parameter {
+                    statement: root_statement,
+                    ordinal,
+                };
+                let declaration = declaration_by_origin.get(&origin).copied().ok_or_else(|| {
+                    format!("formal `{root}` has no declaration origin {origin:?}")
+                })?;
+                (
+                    KernelLexicalBindingTargetInput::Declaration(
+                        KernelDeclarationReference::Local(declaration),
+                    ),
+                    &[],
+                )
+            }
+        } else {
+            let mut parts = Vec::with_capacity(suffix.len() + 1);
+            parts.push(root.to_owned());
+            parts.extend(suffix.iter().cloned());
+            let (surface, consumed) = exact_value_path_surface(&parts, value_surfaces, owner)?;
+            residual_suffix = parts[consumed..].to_vec();
+            if &surface.owner == owner {
+                let declaration = public_declaration.ok_or_else(|| {
+                    format!("owner-local read `{root}` has no public declaration")
+                })?;
+                (
+                    KernelLexicalBindingTargetInput::Declaration(
+                        KernelDeclarationReference::Local(declaration),
+                    ),
+                    &[],
+                )
+            } else {
+                let binding = bindings.len();
+                owner_targets.push(PreparedLexicalOwnerTarget {
+                    binding,
+                    owner: surface.owner.clone(),
+                });
+                (
+                    KernelLexicalBindingTargetInput::Declaration(
+                        KernelDeclarationReference::OwnerPublic(KernelOwnerId(0)),
+                    ),
+                    &[],
+                )
+            }
+        };
+        let projection = prefix
+            .iter()
+            .chain(residual_suffix.iter())
+            .cloned()
+            .map(String::into_boxed_str)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        bindings.push(KernelLexicalBindingInput {
+            expression: expression_id,
+            target,
+            projection,
+            access,
+        });
+    }
+    Ok((
+        declarations.into_boxed_slice(),
+        bindings.into_boxed_slice(),
+        owner_targets.into_boxed_slice(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepared_binding_value_target(
+    provider: &PreparedLexicalProvider,
+    view: UnitOwnerSyntaxView<'_>,
+    owner: &StableCheckOwnerKey,
+    consumer: usize,
+    local_by_syntax: &BTreeMap<usize, usize>,
+    node_count: usize,
+    external_by_key: &mut BTreeMap<PreparedExternalExpression, usize>,
+    external_expressions: &mut Vec<PreparedExternalExpression>,
+) -> Result<KernelLexicalBindingTargetInput, String> {
+    match provider {
+        PreparedLexicalProvider::Input(provider) => Ok(KernelLexicalBindingTargetInput::Value {
+            provider: checked_kernel_expression(prepared_input_reference_index(
+                provider.clone(),
+                view,
+                owner,
+                Some(consumer),
+                local_by_syntax,
+                node_count,
+                external_by_key,
+                external_expressions,
+            )?)?,
+        }),
+        PreparedLexicalProvider::Known(_) => Ok(KernelLexicalBindingTargetInput::RuntimeContext),
+    }
 }
 
 fn direct_containing_statements(
@@ -3074,6 +4147,18 @@ fn match_pattern_binding_prefix(pattern: &AstMatchPattern, root: &str) -> Option
         | AstMatchPattern::Binding { .. }
         | AstMatchPattern::Invalid { .. }
         | AstMatchPattern::Bits { .. } => None,
+    }
+}
+
+fn pattern_variable_names(pattern: &AstMatchPattern) -> Vec<String> {
+    match pattern {
+        AstMatchPattern::Binding { name } => vec![name.clone()],
+        AstMatchPattern::Tag { fields, .. } => fields.clone(),
+        AstMatchPattern::Wildcard
+        | AstMatchPattern::Number { .. }
+        | AstMatchPattern::Text { .. }
+        | AstMatchPattern::Invalid { .. }
+        | AstMatchPattern::Bits { .. } => Vec::new(),
     }
 }
 
@@ -3357,7 +4442,9 @@ fn source_ast_edges(
     expression: &boon_syntax::AstExpr,
 ) -> Result<Vec<(KernelOwnerEdgeRole, usize)>, String> {
     match &expression.kind {
-        AstExprKind::Identifier(_) | AstExprKind::Path(_) => Ok(Vec::new()),
+        AstExprKind::Identifier(_) | AstExprKind::Path(_) | AstExprKind::Drain { .. } => {
+            Ok(Vec::new())
+        }
         AstExprKind::Call { args, pass, .. } => Ok(args
             .iter()
             .map(|argument| (KernelOwnerEdgeRole::CollectionItem, argument.value))
@@ -4608,6 +5695,363 @@ mod tests {
             if !kernel_statements.contains_key(stable) {
                 mismatches.push(format!(
                     "checked statement {stable:?} has no kernel statement artifact"
+                ));
+            }
+        }
+        mismatches
+    }
+
+    fn lexical_plan_inventory_mismatches(
+        report: &KernelOwnerOracleReport,
+        project: &ProjectSyntaxSnapshot,
+    ) -> Vec<String> {
+        #[derive(Clone, Debug, Eq, PartialEq)]
+        enum StableLexicalTarget {
+            Declaration {
+                owner: StableCheckOwnerKey,
+                declaration: boon_checked::OwnerDeclarationStableKey,
+            },
+            ContextFormal {
+                owner: StableCheckOwnerKey,
+            },
+            Value(KernelOwnerOracleValueReference),
+            RuntimeContext,
+            Ambiguous,
+        }
+
+        fn record_field_name(
+            project: &ProjectSyntaxSnapshot,
+            owner: &StableCheckOwnerKey,
+            object: &StableExpressionKey,
+            ordinal: u32,
+        ) -> Option<String> {
+            let view = project.owner_view(owner)?;
+            let expression = view
+                .expressions()
+                .zip(view.stable_expression_keys())
+                .find_map(|(expression, stable)| (stable == *object).then_some(expression))?;
+            let fields = match &expression.kind {
+                AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => fields,
+                _ => return None,
+            };
+            fields.get(ordinal as usize).map(|field| field.name.clone())
+        }
+
+        fn pattern_binding_name(
+            project: &ProjectSyntaxSnapshot,
+            owner: &StableCheckOwnerKey,
+            arm: &StableExpressionKey,
+            ordinal: u32,
+        ) -> Option<String> {
+            let view = project.owner_view(owner)?;
+            let expression = view
+                .expressions()
+                .zip(view.stable_expression_keys())
+                .find_map(|(expression, stable)| (stable == *arm).then_some(expression))?;
+            let AstExprKind::MatchArm { pattern, .. } = &expression.kind else {
+                return None;
+            };
+            pattern_variable_names(pattern)
+                .get(ordinal as usize)
+                .cloned()
+        }
+
+        fn root_statement(
+            project: &ProjectSyntaxSnapshot,
+            owner: &StableCheckOwnerKey,
+        ) -> Option<StableStatementKey> {
+            let view = project.owner_view(owner)?;
+            view.statement_ids()
+                .first()
+                .and_then(|statement| view.stable_statement_key_local(*statement))
+        }
+
+        fn kernel_target(
+            project: &ProjectSyntaxSnapshot,
+            target: &KernelOwnerOracleLexicalTarget,
+        ) -> Option<StableLexicalTarget> {
+            match target {
+                KernelOwnerOracleLexicalTarget::Declaration { owner, origin } => {
+                    let declaration = match origin {
+                        KernelOwnerOracleDeclarationOrigin::Statement(statement) => {
+                            if root_statement(project, owner).as_ref() == Some(statement) {
+                                boon_checked::OwnerDeclarationStableKey::Public
+                            } else {
+                                boon_checked::OwnerDeclarationStableKey::Statement {
+                                    statement: statement.clone(),
+                                }
+                            }
+                        }
+                        KernelOwnerOracleDeclarationOrigin::Parameter { ordinal, .. } => {
+                            boon_checked::OwnerDeclarationStableKey::Parameter { ordinal: *ordinal }
+                        }
+                        KernelOwnerOracleDeclarationOrigin::RecordField { object, ordinal } => {
+                            boon_checked::OwnerDeclarationStableKey::RecordField {
+                                object: object.clone(),
+                                ordinal: *ordinal,
+                                name: record_field_name(project, owner, object, *ordinal)?,
+                            }
+                        }
+                        KernelOwnerOracleDeclarationOrigin::PatternBinding { arm, ordinal } => {
+                            boon_checked::OwnerDeclarationStableKey::PatternBinding {
+                                selector: arm.clone(),
+                                ordinal: *ordinal,
+                                name: pattern_binding_name(project, owner, arm, *ordinal)?,
+                            }
+                        }
+                        KernelOwnerOracleDeclarationOrigin::CallbackBinding { call, ordinal } => {
+                            boon_checked::OwnerDeclarationStableKey::FreshOut {
+                                call: call.clone(),
+                                formal_ordinal: *ordinal,
+                            }
+                        }
+                    };
+                    Some(StableLexicalTarget::Declaration {
+                        owner: owner.clone(),
+                        declaration,
+                    })
+                }
+                KernelOwnerOracleLexicalTarget::OwnerPublic(owner) => {
+                    Some(StableLexicalTarget::Declaration {
+                        owner: owner.clone(),
+                        declaration: boon_checked::OwnerDeclarationStableKey::Public,
+                    })
+                }
+                KernelOwnerOracleLexicalTarget::ContextFormal { owner, .. } => {
+                    Some(StableLexicalTarget::ContextFormal {
+                        owner: owner.clone(),
+                    })
+                }
+                KernelOwnerOracleLexicalTarget::Value(value) => {
+                    Some(StableLexicalTarget::Value(value.clone()))
+                }
+                KernelOwnerOracleLexicalTarget::RuntimeContext => {
+                    Some(StableLexicalTarget::RuntimeContext)
+                }
+            }
+        }
+
+        fn planned_target(
+            target: Option<&boon_checked::OwnerLexicalTargetRef>,
+        ) -> Option<StableLexicalTarget> {
+            match target? {
+                boon_checked::OwnerLexicalTargetRef::Declaration {
+                    owner, declaration, ..
+                } => Some(StableLexicalTarget::Declaration {
+                    owner: owner.clone(),
+                    declaration: declaration.clone(),
+                }),
+                boon_checked::OwnerLexicalTargetRef::ContextFormal { owner } => {
+                    Some(StableLexicalTarget::ContextFormal {
+                        owner: owner.clone(),
+                    })
+                }
+                boon_checked::OwnerLexicalTargetRef::Ambiguous { .. } => {
+                    Some(StableLexicalTarget::Ambiguous)
+                }
+            }
+        }
+
+        let mut mismatches = Vec::new();
+        for owner in &report.supported {
+            let Some(view) = project.owner_view(&owner.owner) else {
+                mismatches.push(format!(
+                    "kernel owner {:?} has no syntax view for lexical parity",
+                    owner.owner
+                ));
+                continue;
+            };
+            let input = match boon_typecheck::project_owner_syntax_input(view) {
+                Ok(input) => input,
+                Err(error) => {
+                    mismatches.push(format!(
+                        "kernel owner {:?} cannot project lexical oracle input: {error}",
+                        owner.owner
+                    ));
+                    continue;
+                }
+            };
+            let plan = match boon_typecheck::project_owner_lexical_plan(&input) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    mismatches.push(format!(
+                        "kernel owner {:?} cannot project lexical oracle plan: {error}",
+                        owner.owner
+                    ));
+                    continue;
+                }
+            };
+
+            let mut expected_origins = BTreeSet::new();
+            for statement in &owner.statements {
+                let Some(syntax) = view.statement_ids().iter().find_map(|statement_id| {
+                    let stable = view.stable_statement_key_local(*statement_id)?;
+                    (stable == statement.statement)
+                        .then(|| view.statement_for_local(*statement_id))
+                        .flatten()
+                }) else {
+                    continue;
+                };
+                let declares = matches!(
+                    syntax.kind,
+                    AstStatementKind::Function { .. } | AstStatementKind::Field { .. }
+                ) || matches!(
+                    syntax.kind,
+                    AstStatementKind::Source { field: Some(_), .. }
+                        | AstStatementKind::Hold { field: Some(_), .. }
+                        | AstStatementKind::List { field: Some(_), .. }
+                );
+                if declares {
+                    expected_origins.insert(KernelOwnerOracleDeclarationOrigin::Statement(
+                        statement.statement.clone(),
+                    ));
+                }
+                if let AstStatementKind::Function { parameters, .. } = &syntax.kind {
+                    expected_origins.extend(parameters.iter().filter_map(|parameter| {
+                        Some(KernelOwnerOracleDeclarationOrigin::Parameter {
+                            statement: statement.statement.clone(),
+                            ordinal: u32::try_from(parameter.ordinal).ok()?,
+                        })
+                    }));
+                }
+            }
+            expected_origins.extend(plan.record_fields().iter().filter_map(|field| {
+                Some(KernelOwnerOracleDeclarationOrigin::RecordField {
+                    object: input
+                        .expressions
+                        .get(field.object as usize)?
+                        .stable_key
+                        .clone(),
+                    ordinal: field.ordinal,
+                })
+            }));
+            for expression in &input.expressions {
+                match &expression.kind {
+                    AstExprKind::MatchArm { pattern, .. } => {
+                        expected_origins.extend(
+                            pattern_variable_names(pattern)
+                                .into_iter()
+                                .enumerate()
+                                .filter_map(|(ordinal, _)| {
+                                    Some(KernelOwnerOracleDeclarationOrigin::PatternBinding {
+                                        arm: expression.stable_key.clone(),
+                                        ordinal: u32::try_from(ordinal).ok()?,
+                                    })
+                                }),
+                        );
+                    }
+                    AstExprKind::Call { function, args, .. }
+                    | AstExprKind::Pipe {
+                        op: function, args, ..
+                    } if collection_callback_builtin(function) => {
+                        expected_origins.extend(
+                            args.iter()
+                                .filter(|argument| argument.kind == AstCallArgKind::BareBinding)
+                                .enumerate()
+                                .filter_map(|(ordinal, _)| {
+                                    Some(KernelOwnerOracleDeclarationOrigin::CallbackBinding {
+                                        call: expression.stable_key.clone(),
+                                        ordinal: u32::try_from(ordinal).ok()?,
+                                    })
+                                }),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            let actual_origins = owner
+                .declarations
+                .iter()
+                .map(|declaration| declaration.origin.clone())
+                .collect::<BTreeSet<_>>();
+            for missing in expected_origins.difference(&actual_origins).take(64) {
+                mismatches.push(format!(
+                    "lexical plan declaration origin missing from kernel {:?}: {missing:?}",
+                    owner.owner
+                ));
+            }
+            for extra in actual_origins.difference(&expected_origins).take(64) {
+                mismatches.push(format!(
+                    "kernel declaration origin absent from lexical plan {:?}: {extra:?}",
+                    owner.owner
+                ));
+            }
+
+            let actual_bindings = owner
+                .lexical_bindings
+                .iter()
+                .map(|binding| (binding.expression.clone(), binding))
+                .collect::<BTreeMap<_, _>>();
+            let mut expected_expressions = BTreeSet::new();
+            for (index, read) in plan.reads().iter().enumerate() {
+                let Some(read) = read else {
+                    continue;
+                };
+                let Some(expression) = input.expressions.get(index) else {
+                    continue;
+                };
+                expected_expressions.insert(expression.stable_key.clone());
+                let Some(actual) = actual_bindings.get(&expression.stable_key).copied() else {
+                    mismatches.push(format!(
+                        "lexical plan read {:?} in {:?} has no kernel binding",
+                        expression.stable_key, owner.owner
+                    ));
+                    continue;
+                };
+                let expected_access = match read.access {
+                    boon_typecheck::OwnerLexicalAccess::Read => KernelLexicalAccess::Read,
+                    boon_typecheck::OwnerLexicalAccess::Drain => KernelLexicalAccess::Drain,
+                };
+                if actual.access != expected_access
+                    || actual
+                        .projection
+                        .iter()
+                        .map(Box::as_ref)
+                        .ne(read.projection.iter().map(String::as_str))
+                {
+                    mismatches.push(format!(
+                        "kernel lexical binding {:?} projection/access {:?}/{:?} differs from lexical plan {:?}/{:?}",
+                        expression.stable_key,
+                        actual.projection,
+                        actual.access,
+                        read.projection,
+                        expected_access
+                    ));
+                }
+                let expected_target =
+                    planned_target(plan.signature_regions().stable_target(&read.target));
+                let actual_target = kernel_target(project, &actual.target);
+                if expected_target.is_some()
+                    && expected_target != actual_target
+                    && expected_target != Some(StableLexicalTarget::Ambiguous)
+                {
+                    mismatches.push(format!(
+                        "kernel lexical binding {:?} in {:?} target {actual_target:?} differs from lexical plan {expected_target:?}",
+                        expression.stable_key, owner.owner
+                    ));
+                }
+            }
+            for reference in plan
+                .external_candidates()
+                .iter()
+                .filter(|reference| reference.kind == boon_typecheck::OwnerReferenceKind::Value)
+            {
+                expected_expressions.insert(reference.expression.clone());
+                if !actual_bindings.contains_key(&reference.expression) {
+                    mismatches.push(format!(
+                        "lexical external read {:?} in {:?} has no kernel binding",
+                        reference.expression, owner.owner
+                    ));
+                }
+            }
+            for extra in actual_bindings
+                .keys()
+                .filter(|expression| !expected_expressions.contains(*expression))
+                .take(64)
+            {
+                mismatches.push(format!(
+                    "kernel lexical binding {extra:?} in {:?} has no lexical plan read",
+                    owner.owner
                 ));
             }
         }
@@ -6255,6 +7699,114 @@ mod tests {
     }
 
     #[test]
+    fn declaration_and_lexical_artifacts_match_the_parser_owned_plan() {
+        let fixtures = [
+            (
+                "block-pattern-callback-drain",
+                concat!(
+                    "FUNCTION project(value) {\n",
+                    "    BLOCK {\n",
+                    "        local: [entry: Found[value: value]]\n",
+                    "        selected:\n",
+                    "            local.entry |> WHEN {\n",
+                    "                Found[payload] => payload\n",
+                    "                __ => value\n",
+                    "            }\n",
+                    "        rows: LIST { [rank: selected] }\n",
+                    "        drained: rows |> List/map(item, new: DRAIN { item.rank })\n",
+                    "        [value: selected, drained: drained]\n",
+                    "    }\n",
+                    "}\n",
+                    "result: project(value: 1)\n",
+                ),
+            ),
+            (
+                "statement-record-hold-alias",
+                concat!(
+                    "store: [\n",
+                    "    state:\n",
+                    "        0 |> HOLD state {\n",
+                    "            True |> THEN { state }\n",
+                    "        }\n",
+                    "]\n",
+                ),
+            ),
+        ];
+
+        let mut declarations = Vec::new();
+        let mut has_record_field = false;
+        let mut lexical_targets = Vec::new();
+        let mut lexical_accesses = Vec::new();
+        for (name, source) in fixtures {
+            let project = parse_project_syntax(
+                format!("app/{name}.bn"),
+                [(format!("app/{name}.bn"), source.to_owned())],
+            )
+            .unwrap_or_else(|error| panic!("parse {name} lexical fixture: {error}"));
+            let oracle = kernel_owner_oracle(&project);
+            assert!(
+                !oracle.supported.is_empty(),
+                "{name} must exercise kernel definition artifacts: {:#?}",
+                oracle.unsupported
+            );
+            assert!(
+                oracle
+                    .unsupported
+                    .iter()
+                    .all(|(owner, _)| matches!(owner, StableCheckOwnerKey::UnitRoot(_))),
+                "every declared {name} owner must compile: {:#?}",
+                oracle.unsupported
+            );
+            let mismatches = lexical_plan_inventory_mismatches(&oracle, &project);
+            assert!(
+                mismatches.is_empty(),
+                "{name} declaration/lexical parity: {mismatches:#?}"
+            );
+            declarations.extend(
+                oracle
+                    .supported
+                    .iter()
+                    .flat_map(|owner| owner.declarations.iter())
+                    .map(|declaration| declaration.kind),
+            );
+            has_record_field |= oracle.supported.iter().any(|owner| {
+                owner.declarations.iter().any(|declaration| {
+                    matches!(
+                        declaration.origin,
+                        KernelOwnerOracleDeclarationOrigin::RecordField { .. }
+                    )
+                })
+            });
+            lexical_targets.extend(
+                oracle
+                    .supported
+                    .iter()
+                    .flat_map(|owner| owner.lexical_bindings.iter())
+                    .map(|binding| binding.target.clone()),
+            );
+            lexical_accesses.extend(
+                oracle
+                    .supported
+                    .iter()
+                    .flat_map(|owner| owner.lexical_bindings.iter())
+                    .map(|binding| binding.access),
+            );
+        }
+
+        assert!(declarations.contains(&KernelDeclarationKind::ValueParameter));
+        assert!(declarations.contains(&KernelDeclarationKind::Field));
+        assert!(has_record_field);
+        assert!(declarations.contains(&KernelDeclarationKind::PatternBinding));
+        assert!(declarations.contains(&KernelDeclarationKind::FreshOut));
+        assert!(
+            lexical_targets
+                .iter()
+                .any(|target| matches!(target, KernelOwnerOracleLexicalTarget::OwnerPublic(_)))
+        );
+        assert!(lexical_accesses.contains(&KernelLexicalAccess::Drain));
+    }
+
+    #[test]
     fn multiline_record_siblings_are_visible_inside_a_later_hold_field() {
         let source = concat!(
             "FUNCTION stateful(value) {\n",
@@ -6676,7 +8228,7 @@ mod tests {
         let (report, timings) =
             profile_kernel_owner_oracle_with_source_payloads(&project, &source_payloads);
         eprintln!(
-            "kernel-novywave definition_artifacts expression_rows={} statement_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={}",
+            "kernel-novywave definition_artifacts expression_rows={} statement_rows={} declaration_rows={} lexical_binding_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={}",
             report
                 .supported
                 .iter()
@@ -6686,6 +8238,16 @@ mod tests {
                 .supported
                 .iter()
                 .map(|owner| owner.statements.len())
+                .sum::<usize>(),
+            report
+                .supported
+                .iter()
+                .map(|owner| owner.declarations.len())
+                .sum::<usize>(),
+            report
+                .supported
+                .iter()
+                .map(|owner| owner.lexical_bindings.len())
                 .sum::<usize>(),
             report
                 .supported
@@ -6923,10 +8485,50 @@ mod tests {
             &stable_by_checked_expression,
             &project,
         ));
+        mismatches.extend(lexical_plan_inventory_mismatches(&report, &project));
         if !mismatches.is_empty() {
             eprintln!("kernel-novywave parity_mismatch_count={}", mismatches.len());
+            let mut mismatch_classes = BTreeMap::<&str, usize>::new();
             for mismatch in &mismatches {
+                let class = if mismatch.contains("declaration origin missing from kernel") {
+                    "declaration-missing"
+                } else if mismatch.contains("declaration origin absent from lexical plan") {
+                    "declaration-extra"
+                } else if mismatch.contains("kernel declaration") {
+                    "declaration-row"
+                } else if mismatch.contains("lexical binding")
+                    && mismatch.contains("projection/access")
+                {
+                    "lexical-projection"
+                } else if mismatch.contains("lexical binding") && mismatch.contains("target") {
+                    "lexical-target"
+                } else if mismatch.contains("has no kernel binding") {
+                    "lexical-missing"
+                } else if mismatch.contains("has no lexical plan read") {
+                    "lexical-extra"
+                } else if mismatch.contains("lexical") {
+                    "lexical-other"
+                } else if mismatch.contains("call") {
+                    "call"
+                } else if mismatch.contains("statement") {
+                    "statement"
+                } else if mismatch.contains("collection") || mismatch.contains("source") {
+                    "collection-or-source"
+                } else {
+                    "owner-flow"
+                };
+                *mismatch_classes.entry(class).or_default() += 1;
+            }
+            eprintln!("kernel-novywave parity_mismatch_classes={mismatch_classes:?}");
+            const MISMATCH_SAMPLE_LIMIT: usize = 24;
+            for mismatch in mismatches.iter().take(MISMATCH_SAMPLE_LIMIT) {
                 eprintln!("kernel-novywave parity_mismatch={mismatch}");
+            }
+            if mismatches.len() > MISMATCH_SAMPLE_LIMIT {
+                eprintln!(
+                    "kernel-novywave parity_mismatch_omitted={}",
+                    mismatches.len() - MISMATCH_SAMPLE_LIMIT
+                );
             }
             panic!(
                 "NovyWave kernel/current differential found {} owner mismatches",

@@ -24,6 +24,9 @@ pub struct KernelExpressionId(pub u32);
 pub struct KernelStatementId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct KernelDeclarationId(pub u32);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct KernelOwnerId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -271,6 +274,96 @@ pub struct KernelStatementInput {
     pub children: Box<[KernelStatementChildReference]>,
 }
 
+/// Stable-within-definition structural origin of one declaration row.
+///
+/// The dense declaration ID is intentionally revision-local. The origin is
+/// expressed only through other definition-local IDs so a linker can relocate
+/// it without retaining parser arenas, byte offsets, or legacy checker IDs.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum KernelDeclarationOrigin {
+    Statement {
+        statement: KernelStatementId,
+    },
+    Parameter {
+        statement: KernelStatementId,
+        ordinal: u32,
+    },
+    RecordField {
+        object: KernelExpressionId,
+        ordinal: u32,
+    },
+    PatternBinding {
+        arm: KernelExpressionId,
+        ordinal: u32,
+    },
+    CallbackBinding {
+        call: KernelExpressionId,
+        ordinal: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum KernelDeclarationKind {
+    Function,
+    ValueParameter,
+    OutParameter,
+    Field,
+    Source,
+    Hold,
+    List,
+    PatternBinding,
+    FreshOut,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct KernelDeclarationInput {
+    pub id: KernelDeclarationId,
+    pub origin: KernelDeclarationOrigin,
+    pub name: Box<str>,
+    pub kind: KernelDeclarationKind,
+    pub value: Option<KernelExpressionId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelDeclarationReference {
+    Local(KernelDeclarationId),
+    /// The unique public declaration exported by another dense definition.
+    OwnerPublic(KernelOwnerId),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum KernelLexicalBindingTargetInput {
+    Declaration(KernelDeclarationReference),
+    ContextFormal {
+        ordinal: u32,
+    },
+    /// A definition-local or external value authority without an authored
+    /// declaration (for example a contextual callback item).
+    Value {
+        provider: KernelExpressionId,
+    },
+    RuntimeContext,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelLexicalAccess {
+    Read,
+    Drain,
+}
+
+/// One occurrence-to-authority lexical equation.
+///
+/// The solved expression row still owns its type equation. This row owns the
+/// declaration identity and authored projection so later state/resource and
+/// diagnostics construction never has to rediscover lexical resolution.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct KernelLexicalBindingInput {
+    pub expression: KernelExpressionId,
+    pub target: KernelLexicalBindingTargetInput,
+    pub projection: Box<[Box<str>]>,
+    pub access: KernelLexicalAccess,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum KernelStatementChildReference {
     Local(KernelStatementId),
@@ -280,6 +373,8 @@ pub enum KernelStatementChildReference {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct KernelDefinitionFactsInput {
     pub statements: Box<[KernelStatementInput]>,
+    pub declarations: Box<[KernelDeclarationInput]>,
+    pub lexical_bindings: Box<[KernelLexicalBindingInput]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -328,6 +423,8 @@ pub struct KernelOwnerProgram {
     expression_modes: Box<[FlowMode]>,
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
     statements: Box<[KernelStatementArtifact]>,
+    declarations: Box<[KernelDeclarationArtifact]>,
+    lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
 }
@@ -388,6 +485,8 @@ struct KernelProjectOwnerOutputs {
     expression_modes: Box<[FlowMode]>,
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
     statements: Box<[KernelStatementArtifact]>,
+    declarations: Box<[KernelDeclarationArtifact]>,
+    lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
 }
@@ -472,6 +571,31 @@ pub struct KernelStatementArtifact {
     pub children: Box<[KernelStatementChildReference]>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelDeclarationArtifact {
+    pub id: KernelDeclarationId,
+    pub origin: KernelDeclarationOrigin,
+    pub name: Box<str>,
+    pub kind: KernelDeclarationKind,
+    pub value: Option<KernelValueReference>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KernelLexicalBindingTarget {
+    Declaration(KernelDeclarationReference),
+    ContextFormal { ordinal: u32 },
+    Value { provider: KernelValueReference },
+    RuntimeContext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelLexicalBindingArtifact {
+    pub expression: KernelExpressionId,
+    pub target: KernelLexicalBindingTarget,
+    pub projection: Box<[Box<str>]>,
+    pub access: KernelLexicalAccess,
+}
+
 /// One source-authored call occurrence with its compact input edges and solved
 /// result. Downstream consumers no longer need to rediscover call structure by
 /// walking the owner expression graph.
@@ -507,6 +631,8 @@ pub struct DefinitionArtifact {
     pub result: FlowType,
     pub expressions: Box<[KernelExpressionArtifact]>,
     pub statements: Box<[KernelStatementArtifact]>,
+    pub declarations: Box<[KernelDeclarationArtifact]>,
+    pub lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
     pub calls: Box<[KernelCallArtifact]>,
     pub effects: Box<[KernelHostEffectArtifact]>,
 }
@@ -569,6 +695,8 @@ impl KernelOwnerProgram {
                 result,
                 expressions,
                 statements: self.statements,
+                declarations: self.declarations,
+                lexical_bindings: self.lexical_bindings,
                 calls,
                 effects: self.effects,
             },
@@ -622,6 +750,8 @@ impl KernelProjectProgram {
                     result,
                     expressions,
                     statements: owner.statements,
+                    declarations: owner.declarations,
+                    lexical_bindings: owner.lexical_bindings,
                     calls,
                     effects: owner.effects,
                 }
@@ -666,6 +796,18 @@ pub fn compile_owner_program_with_definition_facts(
     }) {
         return Err(KernelOwnerBuildError::new(
             "standalone owner statements cannot reference child owners",
+        ));
+    }
+    if facts.lexical_bindings.iter().any(|binding| {
+        matches!(
+            binding.target,
+            KernelLexicalBindingTargetInput::Declaration(KernelDeclarationReference::OwnerPublic(
+                _
+            ))
+        )
+    }) {
+        return Err(KernelOwnerBuildError::new(
+            "standalone owner lexical bindings cannot reference another owner",
         ));
     }
     let result = checked_expression_index(input.result, input.nodes.len(), "owner result")?;
@@ -747,13 +889,18 @@ pub fn compile_owner_program_with_definition_facts(
         .collect::<Vec<_>>()
         .into_boxed_slice();
     let result_output = expression_outputs[result];
+    let statements = collect_statement_artifacts(input, facts)?;
+    let declarations = collect_declaration_artifacts(input, facts)?;
+    let lexical_bindings = collect_lexical_binding_artifacts(input, facts)?;
     Ok(KernelOwnerProgram {
         component: builder.finish(),
         result_output,
         expression_outputs: expression_outputs.into_boxed_slice(),
         expression_modes,
         expression_artifacts: collect_expression_artifacts(input)?,
-        statements: collect_statement_artifacts(input, facts)?,
+        statements,
+        declarations,
+        lexical_bindings,
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
     })
@@ -882,6 +1029,254 @@ fn collect_statement_artifacts(
                     .map(|value| kernel_value_reference(owner, value, statement.id.0 as usize))
                     .transpose()?,
                 children: statement.children.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
+}
+
+fn collect_declaration_artifacts(
+    owner: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<Box<[KernelDeclarationArtifact]>, KernelOwnerBuildError> {
+    let mut origins = BTreeSet::new();
+    facts
+        .declarations
+        .iter()
+        .enumerate()
+        .map(|(index, declaration)| {
+            if declaration.id.0 as usize != index {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel declaration rows must use dense IDs: row {index} has ID {}",
+                    declaration.id.0
+                )));
+            }
+            if !origins.insert(declaration.origin.clone()) {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel declaration {index} repeats structural origin {:?}",
+                    declaration.origin
+                )));
+            }
+            validate_declaration_origin(owner, facts, declaration)?;
+            Ok(KernelDeclarationArtifact {
+                id: declaration.id,
+                origin: declaration.origin.clone(),
+                name: declaration.name.clone(),
+                kind: declaration.kind,
+                value: declaration
+                    .value
+                    .map(|value| kernel_value_reference(owner, value, index))
+                    .transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
+}
+
+fn validate_declaration_origin(
+    owner: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+    declaration: &KernelDeclarationInput,
+) -> Result<(), KernelOwnerBuildError> {
+    let invalid = || {
+        KernelOwnerBuildError::new(format!(
+            "kernel declaration {} kind {:?} has incompatible origin {:?}",
+            declaration.id.0, declaration.kind, declaration.origin
+        ))
+    };
+    match (&declaration.origin, declaration.kind) {
+        (
+            KernelDeclarationOrigin::Statement { statement },
+            KernelDeclarationKind::Function
+            | KernelDeclarationKind::Field
+            | KernelDeclarationKind::Source
+            | KernelDeclarationKind::Hold
+            | KernelDeclarationKind::List,
+        ) => {
+            let statement = facts.statements.get(statement.0 as usize).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel declaration {} references missing statement {}",
+                    declaration.id.0, statement.0
+                ))
+            })?;
+            let matches = match (&statement.kind, declaration.kind) {
+                (KernelStatementKind::Function { name, .. }, KernelDeclarationKind::Function)
+                | (KernelStatementKind::Field { name }, KernelDeclarationKind::Field) => {
+                    name == &declaration.name
+                }
+                (
+                    KernelStatementKind::Source {
+                        field: Some(name), ..
+                    },
+                    KernelDeclarationKind::Source,
+                )
+                | (
+                    KernelStatementKind::Hold {
+                        field: Some(name), ..
+                    },
+                    KernelDeclarationKind::Hold,
+                )
+                | (
+                    KernelStatementKind::List {
+                        field: Some(name), ..
+                    },
+                    KernelDeclarationKind::List,
+                ) => name == &declaration.name,
+                _ => false,
+            };
+            if !matches {
+                return Err(invalid());
+            }
+        }
+        (
+            KernelDeclarationOrigin::Parameter { statement, ordinal },
+            KernelDeclarationKind::ValueParameter | KernelDeclarationKind::OutParameter,
+        ) => {
+            let Some(KernelStatementInput {
+                kind: KernelStatementKind::Function { parameters, .. },
+                ..
+            }) = facts.statements.get(statement.0 as usize)
+            else {
+                return Err(invalid());
+            };
+            let parameter = parameters
+                .iter()
+                .find(|parameter| parameter.ordinal == *ordinal)
+                .ok_or_else(invalid)?;
+            let expected_kind = match parameter.kind {
+                KernelParameterKind::Value => KernelDeclarationKind::ValueParameter,
+                KernelParameterKind::Out => KernelDeclarationKind::OutParameter,
+            };
+            if expected_kind != declaration.kind || parameter.name != declaration.name {
+                return Err(invalid());
+            }
+        }
+        (
+            KernelDeclarationOrigin::RecordField { object, ordinal },
+            KernelDeclarationKind::Field,
+        ) => {
+            let expression = owner.nodes.get(object.0 as usize).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel declaration {} references missing record expression {}",
+                    declaration.id.0, object.0
+                ))
+            })?;
+            if !matches!(expression.kind, KernelOwnerNodeKind::Record { .. }) {
+                return Err(invalid());
+            }
+            let field = expression
+                .inputs
+                .get(*ordinal as usize)
+                .ok_or_else(invalid)?;
+            if !matches!(
+                &field.role,
+                KernelOwnerEdgeRole::RecordField { name, spread: false }
+                    if name == &declaration.name
+            ) {
+                return Err(invalid());
+            }
+        }
+        (
+            KernelDeclarationOrigin::PatternBinding { arm, ordinal },
+            KernelDeclarationKind::PatternBinding,
+        ) => {
+            let expression = owner.nodes.get(arm.0 as usize).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel declaration {} references missing match arm {}",
+                    declaration.id.0, arm.0
+                ))
+            })?;
+            let KernelOwnerNodeKind::MatchArm { pattern } = &expression.kind else {
+                return Err(invalid());
+            };
+            let names = match pattern {
+                KernelPattern::Binding { name } => std::slice::from_ref(name),
+                KernelPattern::Tag { fields, .. } => fields,
+                KernelPattern::Wildcard
+                | KernelPattern::Number
+                | KernelPattern::Text
+                | KernelPattern::Bits { .. }
+                | KernelPattern::Invalid => &[],
+            };
+            if names.get(*ordinal as usize).map(Box::as_ref) != Some(declaration.name.as_ref()) {
+                return Err(invalid());
+            }
+        }
+        (
+            KernelDeclarationOrigin::CallbackBinding { call, .. },
+            KernelDeclarationKind::FreshOut,
+        ) => {
+            let expression = owner.nodes.get(call.0 as usize).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel declaration {} references missing callback call {}",
+                    declaration.id.0, call.0
+                ))
+            })?;
+            if !matches!(
+                expression.kind,
+                KernelOwnerNodeKind::PureBuiltin { .. } | KernelOwnerNodeKind::UserCall { .. }
+            ) {
+                return Err(invalid());
+            }
+        }
+        _ => return Err(invalid()),
+    }
+    Ok(())
+}
+
+fn collect_lexical_binding_artifacts(
+    owner: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<Box<[KernelLexicalBindingArtifact]>, KernelOwnerBuildError> {
+    let mut expressions = BTreeSet::new();
+    facts
+        .lexical_bindings
+        .iter()
+        .map(|binding| {
+            let expression = checked_expression_index(
+                binding.expression,
+                owner.nodes.len(),
+                "kernel lexical binding expression",
+            )?;
+            if !expressions.insert(binding.expression) {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel expression {expression} has more than one lexical binding row"
+                )));
+            }
+            let target = match binding.target {
+                KernelLexicalBindingTargetInput::Declaration(reference) => {
+                    if let KernelDeclarationReference::Local(declaration) = reference
+                        && declaration.0 as usize >= facts.declarations.len()
+                    {
+                        return Err(KernelOwnerBuildError::new(format!(
+                            "kernel expression {expression} references missing declaration {}",
+                            declaration.0
+                        )));
+                    }
+                    KernelLexicalBindingTarget::Declaration(reference)
+                }
+                KernelLexicalBindingTargetInput::ContextFormal { ordinal } => {
+                    if ordinal >= owner.formal_count {
+                        return Err(KernelOwnerBuildError::new(format!(
+                            "kernel expression {expression} references missing context formal {ordinal}"
+                        )));
+                    }
+                    KernelLexicalBindingTarget::ContextFormal { ordinal }
+                }
+                KernelLexicalBindingTargetInput::Value { provider } => {
+                    KernelLexicalBindingTarget::Value {
+                        provider: kernel_value_reference(owner, provider, expression)?,
+                    }
+                }
+                KernelLexicalBindingTargetInput::RuntimeContext => {
+                    KernelLexicalBindingTarget::RuntimeContext
+                }
+            };
+            Ok(KernelLexicalBindingArtifact {
+                expression: binding.expression,
+                target,
+                projection: binding.projection.clone(),
+                access: binding.access,
             })
         })
         .collect::<Result<Vec<_>, _>>()
@@ -1043,6 +1438,18 @@ pub fn compile_project_program_with_definition_facts(
                         statement.id.0, owner.0
                     )));
                 }
+            }
+        }
+        for binding in &facts.lexical_bindings {
+            if let KernelLexicalBindingTargetInput::Declaration(
+                KernelDeclarationReference::OwnerPublic(owner),
+            ) = binding.target
+                && owner.0 as usize >= input.owners.len()
+            {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel definition {definition} lexical binding {} references missing owner {}",
+                    binding.expression.0, owner.0
+                )));
             }
         }
     }
@@ -1215,6 +1622,8 @@ pub fn compile_project_program_with_definition_facts(
                     .into_boxed_slice(),
                 expression_artifacts: collect_expression_artifacts(owner)?,
                 statements: collect_statement_artifacts(owner, &facts[owner_index])?,
+                declarations: collect_declaration_artifacts(owner, &facts[owner_index])?,
+                lexical_bindings: collect_lexical_binding_artifacts(owner, &facts[owner_index])?,
                 calls: collect_call_artifacts(owner)?,
                 effects: collect_host_effect_artifacts(owner)?,
             })
@@ -6554,6 +6963,7 @@ mod tests {
                 },
             ]
             .into_boxed_slice(),
+            ..KernelDefinitionFactsInput::default()
         };
 
         let artifact = compile_owner_program_with_definition_facts(&input, &facts)
@@ -6579,6 +6989,122 @@ mod tests {
             .err()
             .expect("non-dense statement IDs must fail closed");
         assert!(error.to_string().contains("dense IDs"));
+    }
+
+    #[test]
+    fn definition_declarations_and_lexical_bindings_are_validated_and_relocated() {
+        let input = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Known(Type::Number),
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record { tag: None },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::RecordField {
+                            name: "value".into(),
+                            spread: false,
+                        },
+                        0,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::LexicalRead {
+                        fields: Box::new([]),
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::ReadProvider, 0)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+        let facts = KernelDefinitionFactsInput {
+            statements: vec![KernelStatementInput {
+                id: KernelStatementId(0),
+                kind: KernelStatementKind::Field {
+                    name: "root".into(),
+                },
+                value: Some(KernelExpressionId(1)),
+                children: Box::new([]),
+            }]
+            .into_boxed_slice(),
+            declarations: vec![
+                KernelDeclarationInput {
+                    id: KernelDeclarationId(0),
+                    origin: KernelDeclarationOrigin::Statement {
+                        statement: KernelStatementId(0),
+                    },
+                    name: "root".into(),
+                    kind: KernelDeclarationKind::Field,
+                    value: Some(KernelExpressionId(1)),
+                },
+                KernelDeclarationInput {
+                    id: KernelDeclarationId(1),
+                    origin: KernelDeclarationOrigin::RecordField {
+                        object: KernelExpressionId(1),
+                        ordinal: 0,
+                    },
+                    name: "value".into(),
+                    kind: KernelDeclarationKind::Field,
+                    value: Some(KernelExpressionId(0)),
+                },
+            ]
+            .into_boxed_slice(),
+            lexical_bindings: vec![KernelLexicalBindingInput {
+                expression: KernelExpressionId(2),
+                target: KernelLexicalBindingTargetInput::Declaration(
+                    KernelDeclarationReference::Local(KernelDeclarationId(1)),
+                ),
+                projection: Box::new([]),
+                access: KernelLexicalAccess::Drain,
+            }]
+            .into_boxed_slice(),
+        };
+
+        let artifact = compile_owner_program_with_definition_facts(&input, &facts)
+            .unwrap()
+            .solve()
+            .unwrap();
+
+        assert_eq!(artifact.definition.declarations.len(), 2);
+        assert_eq!(
+            artifact.definition.declarations[1].value,
+            Some(KernelValueReference::Local(KernelExpressionId(0)))
+        );
+        assert_eq!(
+            artifact.definition.lexical_bindings.as_ref(),
+            [KernelLexicalBindingArtifact {
+                expression: KernelExpressionId(2),
+                target: KernelLexicalBindingTarget::Declaration(KernelDeclarationReference::Local(
+                    KernelDeclarationId(1)
+                )),
+                projection: Box::new([]),
+                access: KernelLexicalAccess::Drain,
+            }]
+        );
+
+        let mut invalid_origin = facts.clone();
+        invalid_origin.declarations[1].name = "missing".into();
+        let error = compile_owner_program_with_definition_facts(&input, &invalid_origin)
+            .err()
+            .expect("a record declaration must name its exact structural field");
+        assert!(error.to_string().contains("incompatible origin"));
+
+        let mut missing_target = facts.clone();
+        missing_target.lexical_bindings[0].target = KernelLexicalBindingTargetInput::Declaration(
+            KernelDeclarationReference::Local(KernelDeclarationId(7)),
+        );
+        let error = compile_owner_program_with_definition_facts(&input, &missing_target)
+            .err()
+            .expect("a lexical row must not target a missing declaration");
+        assert!(error.to_string().contains("missing declaration 7"));
     }
 
     #[test]

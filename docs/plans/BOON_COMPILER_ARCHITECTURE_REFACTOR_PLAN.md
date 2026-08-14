@@ -2939,6 +2939,41 @@ publication plus measurement noise, not solver regression. All 78 parser tests,
 55 kernel tests, 85 non-ignored compiler unit tests, and 16 compiler integration
 tests pass; the full ignored NovyWave differential passes explicitly.
 
+The declaration/lexical artifact cut is now complete. Every definition carries
+one dense declaration table for authored statements, function parameters,
+inline record fields, match-pattern bindings, and collection callback outputs,
+plus one lexical occurrence table with an exact declaration/value/context
+target, authored projection, and read-versus-drain access. Local and imported
+authorities are distinct typed references. Fieldless HOLD self-reads follow the
+parser-owned containing statement chain to the enclosing state declaration;
+they do not alias the initializer/provider expression. DRAIN is compiled as an
+ordinary lexical occurrence and has no separate type-flow implementation.
+
+The independent lexical-plan differential covers 4,488 declaration rows and
+3,963 lexical-binding rows across all 1,389 executable NovyWave owners, with
+eight inert unit containers, zero unsupported owners, and zero declaration,
+target, projection, access, or coverage mismatches. Focused parser-backed tests
+exercise parameters, BLOCK declarations, statement-backed and inline record
+fields, pattern bindings, collection callback bindings, DRAIN, and cross-owner
+HOLD authority. Kernel validation rejects incompatible structural declaration
+origins and missing lexical declaration targets. The superseded flattened
+checked-row declaration/lexical comparison helper is deleted; the remaining
+old lexical projection exists only as the explicit test oracle.
+
+Three no-rebuild debug samples record 1,985.619, 2,003.021, and 2,006.467 ms
+kernel time (median 2,003.021 ms); complete candidate time is 2,141.893,
+2,154.771, and 2,158.413 ms (median 2,154.771 ms). Three fresh optimized
+samples record 410.490, 423.980, and 407.671 ms kernel time (median 410.490
+ms); complete candidate time is 497.946, 516.275, and 495.394 ms (median
+497.946 ms). Median optimized compile/link is 103.188 ms and solve is 217.007
+ms; the two-job optimized rebuild took 1m46s. Mutable work remains effectively
+unchanged at 39,798 variables, 32,826 operations, 69,688 activations, 57,341
+mutations, and 23,827 dynamic edges. The roughly 1--2% optimized increase over
+the statement-only checkpoint is recorded as artifact-publication cost and
+measurement noise, not a speed win. All 56 kernel tests, 86 non-ignored compiler
+unit tests, and 16 compiler integration tests pass, and the full ignored
+NovyWave differential passes explicitly.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not

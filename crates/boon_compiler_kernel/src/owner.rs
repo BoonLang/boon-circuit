@@ -3,8 +3,8 @@ use crate::{
     KernelPattern, KernelRecordEntry, KernelSelectArm, KernelSolveError, KernelSolveWork,
     KernelSummaryCallInput, KernelSummaryNode, KernelSummaryProgram, KernelSummaryProjectionStep,
     KernelSummaryRecordEntry, KernelSummarySelectArm, KernelSummaryValueId, OutputId, PublishMode,
-    TypeTermId, TypeVariableId, alpha_normalize_callable_interface, alpha_normalize_definition,
-    build_snapshot_receipts, definition_basis_fingerprint,
+    TypeTermId, TypeVariableId, alpha_normalize_callable_interface_and_diagnostics,
+    alpha_normalize_definition, build_snapshot_receipts, definition_basis_fingerprint,
     definition_basis_fingerprint_with_buffer, solve_component,
 };
 use boon_checked::{
@@ -515,6 +515,8 @@ pub struct KernelSolvedProject {
     owners: Box<[KernelProjectOwnerOutputs]>,
     public_results: Box<[FlowType]>,
     public_formals: Box<[Box<[FlowType]>]>,
+    call_facts: Box<[Box<[SolvedKernelCallFacts]>]>,
+    diagnostics: Box<[Box<[KernelDiagnosticArtifact]>]>,
 }
 
 pub const KERNEL_RESIDUAL_MODULE_RANKING_LEN: usize = 16;
@@ -588,6 +590,11 @@ struct PendingKernelCallArtifact {
     expression: KernelExpressionId,
     target: KernelCallTarget,
     inputs: Box<[KernelCallInputArtifact]>,
+}
+
+#[derive(Clone, Debug)]
+struct SolvedKernelCallFacts {
+    type_substitutions: Box<[KernelCallTypeSubstitution]>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -747,6 +754,56 @@ pub struct KernelTypeParameterId(pub u32);
 pub struct KernelCallTypeSubstitution {
     pub variable: KernelTypeParameterId,
     pub value: Type,
+}
+
+/// Stable severity of a kernel-owned diagnostic fact.
+///
+/// Presentation layers relocate this fact to source coordinates. Keeping the
+/// severity in the kernel makes diagnostics demand a complete compiler
+/// product without importing parser or legacy typechecker DTOs.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum KernelDiagnosticSeverity {
+    Error,
+    Warning,
+}
+
+/// Dense authored location of a diagnostic before source relocation.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum KernelDiagnosticSite {
+    CallInput {
+        call: KernelExpressionId,
+        target: KernelOwnerId,
+        formal_ordinal: u32,
+    },
+}
+
+/// Structural reason one actual type does not satisfy a callable formal.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum KernelTypeMismatch {
+    MissingField(Box<str>),
+    IncompatibleField(Box<str>),
+    Type,
+}
+
+/// Typed diagnostic payload. Human-facing codes, parameter names, spans, and
+/// wording are deliberately supplied by the compiler facade from stable
+/// owner/expression identities instead of being embedded in the hot kernel.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelDiagnosticKind {
+    CallInputType {
+        actual: Type,
+        expected: Type,
+        mismatch: KernelTypeMismatch,
+    },
+}
+
+/// One immutable diagnostic emitted from the solved type graph.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelDiagnosticArtifact {
+    pub owner: KernelOwnerId,
+    pub severity: KernelDiagnosticSeverity,
+    pub site: KernelDiagnosticSite,
+    pub kind: KernelDiagnosticKind,
 }
 
 /// One source-authored host-effect occurrence in a definition artifact.
@@ -917,6 +974,7 @@ pub struct DefinitionArtifact {
     pub sources: Box<[KernelSourceArtifact]>,
     pub states: Box<[KernelStateArtifact]>,
     pub lists: Box<[KernelListArtifact]>,
+    pub diagnostics: Box<[KernelDiagnosticArtifact]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -945,6 +1003,9 @@ pub struct KernelCheckedSnapshot {
 pub struct KernelInterfaceSnapshot {
     pub public_results: Box<[FlowType]>,
     pub callable_formals: Box<[Box<[FlowType]>]>,
+    /// Fully typed diagnostics computed directly from the quiescent graph.
+    /// No checked definition rows are materialized for this product.
+    pub diagnostics: Box<[KernelDiagnosticArtifact]>,
     pub work: KernelSolveWork,
 }
 
@@ -1037,6 +1098,7 @@ impl KernelOwnerProgram {
             sources,
             states,
             lists,
+            diagnostics: Box::new([]),
         };
         let (dependencies, currentness) = build_snapshot_receipts(
             std::slice::from_mut(&mut definition),
@@ -1083,11 +1145,19 @@ impl KernelProjectProgram {
         let artifact = solve_component(self.component)?;
         let public_results = project_public_results(&self.owners, &artifact);
         let public_formals = project_public_formals(&self.owners, &artifact);
+        let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
+            &self.owners,
+            &artifact,
+            &public_results,
+            &public_formals,
+        );
         KernelSolvedProject {
             artifact,
             owners: self.owners,
             public_results,
             public_formals,
+            call_facts,
+            diagnostics,
         }
         .into_demanded_definitions(demanded)
     }
@@ -1099,11 +1169,19 @@ impl KernelProjectProgram {
         let artifact = solve_component(self.component)?;
         let public_results = project_public_results(&self.owners, &artifact);
         let public_formals = project_public_formals(&self.owners, &artifact);
+        let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
+            &self.owners,
+            &artifact,
+            &public_results,
+            &public_formals,
+        );
         Ok(KernelSolvedProject {
             artifact,
             owners: self.owners,
             public_results,
             public_formals,
+            call_facts,
+            diagnostics,
         })
     }
 
@@ -1120,14 +1198,27 @@ impl KernelSolvedProject {
     pub fn interface_snapshot(&self) -> KernelInterfaceSnapshot {
         let mut public_results = Vec::with_capacity(self.public_results.len());
         let mut callable_formals = Vec::with_capacity(self.public_formals.len());
-        for (formals, result) in self.public_formals.iter().zip(&self.public_results) {
-            let (formals, result) = alpha_normalize_callable_interface(formals, result);
+        let mut diagnostics = Vec::new();
+        for (owner, (formals, result)) in self
+            .public_formals
+            .iter()
+            .zip(&self.public_results)
+            .enumerate()
+        {
+            let (formals, result, owner_diagnostics) =
+                alpha_normalize_callable_interface_and_diagnostics(
+                    formals,
+                    result,
+                    &self.diagnostics[owner],
+                );
             callable_formals.push(formals);
             public_results.push(result);
+            diagnostics.extend(owner_diagnostics);
         }
         KernelInterfaceSnapshot {
             public_results: public_results.into_boxed_slice(),
             callable_formals: callable_formals.into_boxed_slice(),
+            diagnostics: diagnostics.into_boxed_slice(),
             work: self.artifact.work,
         }
     }
@@ -1147,13 +1238,17 @@ impl KernelSolvedProject {
             .into_vec()
             .into_iter()
             .enumerate()
-            .map(|(owner_index, owner)| {
+            .zip(self.call_facts.into_vec())
+            .zip(self.diagnostics.into_vec())
+            .map(|(((owner_index, owner), call_facts), diagnostics)| {
                 materialize_project_definition(
                     owner_index,
                     owner,
                     &self.artifact,
                     &self.public_results,
                     &self.public_formals,
+                    call_facts,
+                    diagnostics,
                 )
             })
             .collect::<Vec<_>>()
@@ -1193,7 +1288,14 @@ impl KernelSolvedProject {
         }
         let mut demanded_iter = demanded.into_iter().peekable();
         let mut definitions = Vec::with_capacity(demanded_iter.len());
-        for (owner_index, owner) in self.owners.into_vec().into_iter().enumerate() {
+        for (((owner_index, owner), call_facts), diagnostics) in self
+            .owners
+            .into_vec()
+            .into_iter()
+            .enumerate()
+            .zip(self.call_facts.into_vec())
+            .zip(self.diagnostics.into_vec())
+        {
             let dense_owner = KernelOwnerId(
                 u32::try_from(owner_index)
                     .expect("kernel definition count exceeds the dense u32 namespace"),
@@ -1208,6 +1310,8 @@ impl KernelSolvedProject {
                 &self.artifact,
                 &self.public_results,
                 &self.public_formals,
+                call_facts,
+                diagnostics,
             );
             alpha_normalize_definition(&mut definition);
             definitions.push(KernelDemandedDefinitionArtifact {
@@ -1274,12 +1378,449 @@ fn project_public_formals(
         .into_boxed_slice()
 }
 
+/// Project reusable call facts and user-facing type failures directly from the
+/// quiescent graph.
+///
+/// Call substitutions are derived exactly once and retained for later checked
+/// artifact materialization. This deliberately consumes only solved output
+/// cells, compact call edges, and public callable interfaces. It does not
+/// construct checked expression, statement, resource, dependency, or
+/// currentness rows, which is the central cost invariant of
+/// `CheckDemand::Diagnostics`.
+fn project_call_facts_and_diagnostics(
+    owners: &[KernelProjectOwnerOutputs],
+    artifact: &ComponentArtifact,
+    public_results: &[FlowType],
+    public_formals: &[Box<[FlowType]>],
+) -> (
+    Box<[Box<[SolvedKernelCallFacts]>]>,
+    Box<[Box<[KernelDiagnosticArtifact]>]>,
+) {
+    let mut project_call_facts = Vec::with_capacity(owners.len());
+    let mut project_diagnostics = Vec::with_capacity(owners.len());
+    for (owner_index, owner) in owners.iter().enumerate() {
+        let owner_id = KernelOwnerId(
+            u32::try_from(owner_index)
+                .expect("kernel diagnostic owner count exceeds the dense u32 namespace"),
+        );
+        let mut owner_call_facts = Vec::with_capacity(owner.calls.len());
+        let mut diagnostics = Vec::new();
+        for call in owner.calls.iter() {
+            let substitutions = if let KernelCallTarget::User { target, .. } = call.target {
+                let target_formals = public_formals
+                    .get(target.0 as usize)
+                    .expect("validated kernel call target has public formals");
+                let target_result = public_results
+                    .get(target.0 as usize)
+                    .expect("validated kernel call target has a public result");
+
+                let mut actuals = call
+                    .inputs
+                    .iter()
+                    .filter_map(|input| {
+                        let KernelCallInputRole::Formal { ordinal } = input.role else {
+                            return None;
+                        };
+                        project_call_value_type(
+                            owner_index,
+                            input.value,
+                            owners,
+                            artifact,
+                            public_results,
+                        )
+                        .map(|actual| (ordinal, actual))
+                    })
+                    .collect::<Vec<_>>();
+                if let KernelCallTarget::User {
+                    inherited_formal: Some(inherited),
+                    ..
+                } = call.target
+                    && let Some(actual) = public_formals
+                        .get(owner_index)
+                        .and_then(|formals| formals.get(inherited.caller_ordinal as usize))
+                {
+                    actuals.push((inherited.target_ordinal, actual.ty.clone()));
+                }
+                let substitutions =
+                    derive_kernel_call_type_substitutions(target_formals, target_result, &actuals);
+
+                // Inherited context has no authored call-input site. Its
+                // requirements are propagated through the separate formal
+                // requirement channel and are intentionally not diagnosed as
+                // an explicit argument error here.
+                for input in call.inputs.iter() {
+                    let KernelCallInputRole::Formal { ordinal } = input.role else {
+                        continue;
+                    };
+                    let Some(actual) = project_call_value_type(
+                        owner_index,
+                        input.value,
+                        owners,
+                        artifact,
+                        public_results,
+                    ) else {
+                        continue;
+                    };
+                    let Some(expected) = target_formals.get(ordinal as usize) else {
+                        continue;
+                    };
+                    let expected = instantiate_kernel_call_type(
+                        &expected.ty,
+                        target_formals,
+                        target_result,
+                        &substitutions,
+                    );
+                    if kernel_type_is_assignable_to(&actual, &expected) {
+                        continue;
+                    }
+                    diagnostics.push(KernelDiagnosticArtifact {
+                        owner: owner_id,
+                        severity: KernelDiagnosticSeverity::Error,
+                        site: KernelDiagnosticSite::CallInput {
+                            call: call.expression,
+                            target,
+                            formal_ordinal: ordinal,
+                        },
+                        kind: KernelDiagnosticKind::CallInputType {
+                            mismatch: kernel_type_mismatch(&actual, &expected),
+                            actual,
+                            expected,
+                        },
+                    });
+                }
+                substitutions
+            } else {
+                Box::new([])
+            };
+            owner_call_facts.push(SolvedKernelCallFacts {
+                type_substitutions: substitutions,
+            });
+        }
+        diagnostics.sort_unstable_by(|left, right| left.site.cmp(&right.site));
+        project_call_facts.push(owner_call_facts.into_boxed_slice());
+        project_diagnostics.push(diagnostics.into_boxed_slice());
+    }
+    (
+        project_call_facts.into_boxed_slice(),
+        project_diagnostics.into_boxed_slice(),
+    )
+}
+
+fn project_call_value_type(
+    caller: usize,
+    value: KernelValueReference,
+    owners: &[KernelProjectOwnerOutputs],
+    artifact: &ComponentArtifact,
+    public_results: &[FlowType],
+) -> Option<Type> {
+    match value {
+        KernelValueReference::Local(expression) => owners
+            .get(caller)?
+            .expressions
+            .get(expression.0 as usize)
+            .and_then(|output| artifact.output(*output))
+            .map(|output| output.flow_type.ty.clone()),
+        KernelValueReference::External(KernelExternalExpression {
+            owner,
+            target: KernelExternalTarget::Result,
+        }) => public_results
+            .get(owner.0 as usize)
+            .map(|result| result.ty.clone()),
+        KernelValueReference::External(KernelExternalExpression {
+            owner,
+            target: KernelExternalTarget::Expression(expression),
+        }) => owners
+            .get(owner.0 as usize)?
+            .expressions
+            .get(expression.0 as usize)
+            .and_then(|output| artifact.output(*output))
+            .map(|output| output.flow_type.ty.clone()),
+    }
+}
+
+fn instantiate_kernel_call_type(
+    ty: &Type,
+    target_formals: &[FlowType],
+    target_result: &FlowType,
+    substitutions: &[KernelCallTypeSubstitution],
+) -> Type {
+    let mut parameter_ids = BTreeMap::new();
+    for formal in target_formals {
+        collect_callable_type_parameters(&formal.ty, &mut parameter_ids);
+    }
+    collect_callable_type_parameters(&target_result.ty, &mut parameter_ids);
+    let substitutions = substitutions
+        .iter()
+        .map(|substitution| (substitution.variable, &substitution.value))
+        .collect::<BTreeMap<_, _>>();
+    substitute_kernel_call_type(ty, &parameter_ids, &substitutions)
+}
+
+fn substitute_kernel_call_type(
+    ty: &Type,
+    parameter_ids: &BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>,
+    substitutions: &BTreeMap<KernelTypeParameterId, &Type>,
+) -> Type {
+    match ty {
+        Type::Var(variable) => parameter_ids
+            .get(variable)
+            .and_then(|parameter| substitutions.get(parameter).copied())
+            .cloned()
+            .unwrap_or_else(|| ty.clone()),
+        Type::Object(shape) => Type::object(ObjectShape {
+            fields: shape
+                .fields
+                .iter()
+                .map(|(name, field)| {
+                    (
+                        name.clone(),
+                        substitute_kernel_call_type(field, parameter_ids, substitutions),
+                    )
+                })
+                .collect(),
+            field_order: shape.field_order.clone(),
+            open: shape.open,
+        }),
+        Type::List(item) => Type::List(Type::shared(substitute_kernel_call_type(
+            item,
+            parameter_ids,
+            substitutions,
+        ))),
+        Type::Set(item) => Type::Set(Type::shared(substitute_kernel_call_type(
+            item,
+            parameter_ids,
+            substitutions,
+        ))),
+        Type::Map { key, value } => Type::Map {
+            key: Box::new(substitute_kernel_call_type(
+                key,
+                parameter_ids,
+                substitutions,
+            )),
+            value: Box::new(substitute_kernel_call_type(
+                value,
+                parameter_ids,
+                substitutions,
+            )),
+        },
+        Type::Function { args, result } => Type::Function {
+            args: args
+                .iter()
+                .map(|argument| substitute_kernel_call_type(argument, parameter_ids, substitutions))
+                .collect(),
+            result: Box::new(FlowType {
+                mode: result.mode,
+                ty: substitute_kernel_call_type(&result.ty, parameter_ids, substitutions),
+            }),
+        },
+        Type::VariantSet(variants) => Type::VariantSet(
+            variants
+                .iter()
+                .map(|variant| match variant {
+                    Variant::Tag(tag) => Variant::Tag(tag.clone()),
+                    Variant::Tagged { tag, fields } => Variant::tagged(
+                        tag.clone(),
+                        ObjectShape {
+                            fields: fields
+                                .fields
+                                .iter()
+                                .map(|(name, field)| {
+                                    (
+                                        name.clone(),
+                                        substitute_kernel_call_type(
+                                            field,
+                                            parameter_ids,
+                                            substitutions,
+                                        ),
+                                    )
+                                })
+                                .collect(),
+                            field_order: fields.field_order.clone(),
+                            open: fields.open,
+                        },
+                    ),
+                })
+                .collect(),
+        ),
+        Type::Union(members) => Type::Union(
+            members
+                .iter()
+                .map(|member| substitute_kernel_call_type(member, parameter_ids, substitutions))
+                .collect(),
+        ),
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown => ty.clone(),
+    }
+}
+
+fn kernel_type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
+    if actual == expected {
+        return true;
+    }
+    if call_type_is_placeholder(actual) || call_type_is_placeholder(expected) {
+        return true;
+    }
+    match (actual, expected) {
+        // RenderContract is an internal, API-provided boundary rather than a
+        // language-level tag set. Until the concrete API contract is present
+        // in the callable interface, diagnostics must not invent special tag
+        // knowledge (including `NoElement`).
+        (Type::RenderContract, _) | (_, Type::RenderContract) => true,
+        (Type::Union(actual), _) if actual.is_empty() => false,
+        (_, Type::Union(expected)) if expected.is_empty() => false,
+        (Type::Union(actual), Type::Union(expected)) => actual.iter().all(|actual| {
+            expected
+                .iter()
+                .any(|expected| kernel_type_is_assignable_to(actual, expected))
+        }),
+        (Type::Union(actual), expected) => actual
+            .iter()
+            .all(|actual| kernel_type_is_assignable_to(actual, expected)),
+        (actual, Type::Union(expected)) => expected
+            .iter()
+            .any(|expected| kernel_type_is_assignable_to(actual, expected)),
+        (Type::Text, Type::Text) | (Type::Number, Type::Number) | (Type::Absent, Type::Absent) => {
+            true
+        }
+        (Type::Bytes(actual), Type::Bytes(expected)) => match (actual, expected) {
+            (_, BytesType::Dynamic) => true,
+            (BytesType::Fixed(actual), BytesType::Fixed(expected)) => actual == expected,
+            (BytesType::Dynamic, BytesType::Fixed(_)) => false,
+        },
+        (Type::Bits { width: actual }, Type::Bits { width: expected }) => actual == expected,
+        (Type::List(actual), Type::List(expected)) | (Type::Set(actual), Type::Set(expected)) => {
+            kernel_type_is_assignable_to(actual, expected)
+        }
+        (
+            Type::Map {
+                key: actual_key,
+                value: actual_value,
+            },
+            Type::Map {
+                key: expected_key,
+                value: expected_value,
+            },
+        ) => {
+            kernel_type_is_assignable_to(actual_key, expected_key)
+                && kernel_type_is_assignable_to(actual_value, expected_value)
+        }
+        (Type::Object(actual), Type::Object(expected)) => {
+            expected.fields.iter().all(|(name, expected_field)| {
+                actual.fields.get(name).is_some_and(|actual_field| {
+                    kernel_type_is_assignable_to(actual_field, expected_field)
+                }) || actual.open
+            })
+        }
+        (Type::VariantSet(actual), Type::Object(expected)) => actual.iter().all(|variant| {
+            let fields = match variant {
+                Variant::Tag(_) => return expected.fields.is_empty(),
+                Variant::Tagged { fields, .. } => fields,
+            };
+            kernel_type_is_assignable_to(
+                &Type::Object(fields.clone()),
+                &Type::Object(expected.clone()),
+            )
+        }),
+        (Type::VariantSet(actual), Type::VariantSet(expected)) => actual.iter().all(|actual| {
+            expected
+                .iter()
+                .any(|expected| kernel_variant_is_assignable_to(actual, expected))
+        }),
+        (
+            Type::Function {
+                args: actual_args,
+                result: actual_result,
+            },
+            Type::Function {
+                args: expected_args,
+                result: expected_result,
+            },
+        ) => {
+            actual_args.len() == expected_args.len()
+                && actual_result.mode == expected_result.mode
+                && expected_args
+                    .iter()
+                    .zip(actual_args)
+                    .all(|(expected, actual)| kernel_type_is_assignable_to(expected, actual))
+                && kernel_type_is_assignable_to(&actual_result.ty, &expected_result.ty)
+        }
+        _ => false,
+    }
+}
+
+fn kernel_variant_is_assignable_to(actual: &Variant, expected: &Variant) -> bool {
+    match (actual, expected) {
+        (Variant::Tag(actual), Variant::Tag(expected)) => actual == expected,
+        (
+            Variant::Tagged {
+                tag: actual_tag,
+                fields: actual_fields,
+            },
+            Variant::Tagged {
+                tag: expected_tag,
+                fields: expected_fields,
+            },
+        ) => {
+            actual_tag == expected_tag
+                && kernel_type_is_assignable_to(
+                    &Type::Object(actual_fields.clone()),
+                    &Type::Object(expected_fields.clone()),
+                )
+        }
+        _ => false,
+    }
+}
+
+fn kernel_type_mismatch(actual: &Type, expected: &Type) -> KernelTypeMismatch {
+    if let Some(field) = kernel_missing_field_name(actual, expected) {
+        KernelTypeMismatch::MissingField(field.into_boxed_str())
+    } else if let Some(field) = kernel_incompatible_field_name(actual, expected) {
+        KernelTypeMismatch::IncompatibleField(field.into_boxed_str())
+    } else {
+        KernelTypeMismatch::Type
+    }
+}
+
+fn kernel_missing_field_name(actual: &Type, expected: &Type) -> Option<String> {
+    let (Type::Object(actual), Type::Object(expected)) = (actual, expected) else {
+        return None;
+    };
+    expected.fields.iter().find_map(|(name, expected_field)| {
+        let Some(actual_field) = actual.fields.get(name) else {
+            return (!actual.open).then(|| name.clone());
+        };
+        kernel_missing_field_name(actual_field, expected_field)
+            .map(|nested| format!("{name}.{nested}"))
+    })
+}
+
+fn kernel_incompatible_field_name(actual: &Type, expected: &Type) -> Option<String> {
+    let (Type::Object(actual), Type::Object(expected)) = (actual, expected) else {
+        return None;
+    };
+    expected.fields.iter().find_map(|(name, expected_field)| {
+        let actual_field = actual.fields.get(name)?;
+        if let Some(nested) = kernel_incompatible_field_name(actual_field, expected_field) {
+            return Some(format!("{name}.{nested}"));
+        }
+        (!kernel_type_is_assignable_to(actual_field, expected_field)).then(|| name.clone())
+    })
+}
+
 fn materialize_project_definition(
     owner_index: usize,
     owner: KernelProjectOwnerOutputs,
     artifact: &ComponentArtifact,
     public_results: &[FlowType],
     public_formals: &[Box<[FlowType]>],
+    call_facts: Box<[SolvedKernelCallFacts]>,
+    diagnostics: Box<[KernelDiagnosticArtifact]>,
 ) -> DefinitionArtifact {
     let result = public_results[owner_index].clone();
     let expression_flows = owner
@@ -1297,15 +1838,7 @@ fn materialize_project_definition(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    let calls = materialize_call_artifacts(
-        KernelOwnerId(
-            u32::try_from(owner_index).expect("kernel definition count exceeds u32 namespace"),
-        ),
-        owner.calls,
-        &expression_flows,
-        public_formals,
-        public_results,
-    );
+    let calls = materialize_project_call_artifacts(owner.calls, call_facts, &expression_flows);
     let (sources, states, lists) =
         materialize_resource_artifacts(owner.resources, &expression_flows, Some(public_results));
     let expressions =
@@ -1322,6 +1855,7 @@ fn materialize_project_definition(
         sources,
         states,
         lists,
+        diagnostics,
     }
 }
 
@@ -2177,6 +2711,31 @@ fn materialize_call_artifacts(
                 type_substitutions,
                 result: expressions[call.expression.0 as usize].clone(),
             }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn materialize_project_call_artifacts(
+    pending: Box<[PendingKernelCallArtifact]>,
+    facts: Box<[SolvedKernelCallFacts]>,
+    expressions: &[FlowType],
+) -> Box<[KernelCallArtifact]> {
+    assert_eq!(
+        pending.len(),
+        facts.len(),
+        "solved kernel call facts must align with compact call rows"
+    );
+    pending
+        .into_vec()
+        .into_iter()
+        .zip(facts)
+        .map(|(call, facts)| KernelCallArtifact {
+            expression: call.expression,
+            target: call.target,
+            inputs: call.inputs,
+            type_substitutions: facts.type_substitutions,
+            result: expressions[call.expression.0 as usize].clone(),
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -9494,6 +10053,236 @@ mod tests {
                 ty: Type::Number,
             }
         );
+    }
+
+    #[test]
+    fn diagnostics_are_projected_from_solved_call_providers_without_definition_rows() {
+        let callee = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::PureBuiltin {
+                        kind: KernelPureBuiltinKind::TextLength,
+                    },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::AbiArgument {
+                            name: "$pipe".into(),
+                        },
+                        0,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+        let caller = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+
+        let solved = compile_project_program(&KernelProjectProgramInput {
+            owners: vec![callee, caller].into_boxed_slice(),
+        })
+        .unwrap()
+        .solve_graph()
+        .unwrap();
+        let interfaces = solved.interface_snapshot();
+        let [diagnostic] = interfaces.diagnostics.as_ref() else {
+            panic!(
+                "diagnostics-only projection must emit one typed call failure: {:#?}",
+                interfaces.diagnostics
+            )
+        };
+        assert_eq!(diagnostic.owner, KernelOwnerId(1));
+        assert_eq!(diagnostic.severity, KernelDiagnosticSeverity::Error);
+        assert_eq!(
+            diagnostic.site,
+            KernelDiagnosticSite::CallInput {
+                call: KernelExpressionId(1),
+                target: KernelOwnerId(0),
+                formal_ordinal: 0,
+            }
+        );
+        assert_eq!(
+            diagnostic.kind,
+            KernelDiagnosticKind::CallInputType {
+                actual: Type::Number,
+                expected: Type::Text,
+                mismatch: KernelTypeMismatch::Type,
+            }
+        );
+
+        let checked = solved.checked_snapshot().unwrap();
+        assert!(checked.definitions[0].diagnostics.is_empty());
+        assert_eq!(
+            checked.definitions[1].diagnostics.as_ref(),
+            [diagnostic.clone()]
+        );
+    }
+
+    #[test]
+    fn generic_calls_instantiate_formals_before_diagnostic_comparison() {
+        let identity = KernelOwnerProgramInput {
+            nodes: vec![KernelOwnerNode {
+                kind: KernelOwnerNodeKind::FormalRead {
+                    formal: 0,
+                    fields: Box::new([]),
+                },
+                inputs: Box::new([]),
+                mode: FlowMode::Continuous,
+            }]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(0),
+        };
+        let caller = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Text,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+
+        let interfaces = compile_project_program(&KernelProjectProgramInput {
+            owners: vec![identity, caller].into_boxed_slice(),
+        })
+        .unwrap()
+        .solve_interfaces()
+        .unwrap();
+        assert!(
+            interfaces.diagnostics.is_empty(),
+            "a concrete generic occurrence satisfies its instantiated formal: {:#?}",
+            interfaces.diagnostics
+        );
+    }
+
+    #[test]
+    fn call_diagnostics_retain_the_exact_missing_structural_field() {
+        let callee = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: vec!["required".into()].into_boxed_slice(),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::PureBuiltin {
+                        kind: KernelPureBuiltinKind::TextLength,
+                    },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::AbiArgument {
+                            name: "$pipe".into(),
+                        },
+                        0,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+        let caller = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Text,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record { tag: None },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::RecordField {
+                            name: "other".into(),
+                            spread: false,
+                        },
+                        0,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 1)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(2),
+        };
+
+        let interfaces = compile_project_program(&KernelProjectProgramInput {
+            owners: vec![callee, caller].into_boxed_slice(),
+        })
+        .unwrap()
+        .solve_interfaces()
+        .unwrap();
+        let [diagnostic] = interfaces.diagnostics.as_ref() else {
+            panic!("missing-field call must emit one diagnostic")
+        };
+        assert!(matches!(
+            &diagnostic.kind,
+            KernelDiagnosticKind::CallInputType {
+                mismatch: KernelTypeMismatch::MissingField(field),
+                ..
+            } if field.as_ref() == "required"
+        ));
     }
 
     #[test]

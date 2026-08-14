@@ -1,9 +1,9 @@
 use crate::{
     DefinitionArtifact, KernelCallTarget, KernelDeclarationReference, KernelDefinitionFactsInput,
-    KernelExpressionId, KernelExternalExpression, KernelExternalTarget, KernelLexicalBindingTarget,
-    KernelOwnerBuildError, KernelOwnerId, KernelOwnerNodeKind, KernelOwnerProgramInput,
-    KernelSolveError, KernelStatementChildReference, KernelStatementReference,
-    KernelValueReference,
+    KernelDiagnosticArtifact, KernelDiagnosticKind, KernelExpressionId, KernelExternalExpression,
+    KernelExternalTarget, KernelLexicalBindingTarget, KernelOwnerBuildError, KernelOwnerId,
+    KernelOwnerNodeKind, KernelOwnerProgramInput, KernelSolveError, KernelStatementChildReference,
+    KernelStatementReference, KernelValueReference,
 };
 use boon_checked::{FlowType, ObjectShape, Type, TypeVar, Variant};
 use serde::Serialize;
@@ -14,11 +14,11 @@ use std::hash::{Hash, Hasher};
 const KERNEL_DEFINITION_BASIS_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.definition-basis.v1\0";
 const KERNEL_PUBLIC_RESULT_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.public-result.v1\0";
 const KERNEL_EXPRESSION_SURFACE_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.expression-surface.v1\0";
-const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V2: &[u8] =
-    b"boon.compiler-kernel.definition-artifact.v2\0";
+const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V3: &[u8] =
+    b"boon.compiler-kernel.definition-artifact.v3\0";
 const KERNEL_DEPENDENCY_IMPORTS_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.dependency-imports.v1\0";
-const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V2: &[u8] =
-    b"boon.compiler-kernel.definition-currentness.v2\0";
+const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V3: &[u8] =
+    b"boon.compiler-kernel.definition-currentness.v3\0";
 
 /// Exact definition-local origin of one dependency edge.
 ///
@@ -191,9 +191,9 @@ impl KernelDefinitionDependencyGraph {
 pub struct KernelDefinitionCurrentnessReceipt {
     pub basis_fingerprint_v1: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v2: [u8; 32],
+    pub artifact_fingerprint_v3: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v2: [u8; 32],
+    pub fingerprint_v3: [u8; 32],
 }
 
 pub(crate) fn definition_basis_fingerprint(
@@ -253,7 +253,7 @@ pub(crate) fn build_snapshot_receipts(
             &mut hash_scratch,
         )?);
         artifact_fingerprints.push(stable_fingerprint(
-            KERNEL_DEFINITION_ARTIFACT_DOMAIN_V2,
+            KERNEL_DEFINITION_ARTIFACT_DOMAIN_V3,
             definition,
             &mut hash_scratch,
         ));
@@ -317,12 +317,12 @@ pub(crate) fn build_snapshot_receipts(
         );
         let basis_fingerprint_v1 = basis_fingerprints[definition_index];
         let public_result_fingerprint_v1 = public_result_fingerprints[definition_index];
-        let artifact_fingerprint_v2 = artifact_fingerprints[definition_index];
-        let fingerprint_v2 = stable_fingerprint(
-            KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V2,
+        let artifact_fingerprint_v3 = artifact_fingerprints[definition_index];
+        let fingerprint_v3 = stable_fingerprint(
+            KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V3,
             &(
                 basis_fingerprint_v1,
-                artifact_fingerprint_v2,
+                artifact_fingerprint_v3,
                 dependency_fingerprint_v1,
             ),
             &mut hash_scratch,
@@ -330,9 +330,9 @@ pub(crate) fn build_snapshot_receipts(
         receipts.push(KernelDefinitionCurrentnessReceipt {
             basis_fingerprint_v1,
             public_result_fingerprint_v1,
-            artifact_fingerprint_v2,
+            artifact_fingerprint_v3,
             dependency_fingerprint_v1,
-            fingerprint_v2,
+            fingerprint_v3,
         });
     }
     Ok((dependency_graph, receipts.into_boxed_slice()))
@@ -345,6 +345,7 @@ fn build_dependency_graph(
     let mut dependencies = Vec::new();
     dependency_offsets.push(0);
     for (definition_index, definition) in definitions.iter().enumerate() {
+        validate_definition_diagnostics(definitions, definition_index, definition)?;
         let mut local = definition_dependencies(definition);
         local.sort_unstable();
         local.dedup();
@@ -387,6 +388,73 @@ fn build_dependency_graph(
         consumer_offsets: consumer_offsets.into_boxed_slice(),
         consumers: consumers.into_boxed_slice(),
     })
+}
+
+fn validate_definition_diagnostics(
+    definitions: &[DefinitionArtifact],
+    owner_index: usize,
+    definition: &DefinitionArtifact,
+) -> Result<(), KernelSolveError> {
+    let owner = KernelOwnerId(
+        u32::try_from(owner_index)
+            .expect("kernel definition count exceeds the dense u32 namespace"),
+    );
+    for diagnostic in &definition.diagnostics {
+        if diagnostic.owner != owner {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition {owner_index} contains diagnostic owned by definition {}",
+                diagnostic.owner.0
+            )));
+        }
+        match diagnostic.site {
+            crate::KernelDiagnosticSite::CallInput {
+                call,
+                target,
+                formal_ordinal,
+            } => {
+                let Some(target_definition) = definitions.get(target.0 as usize) else {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition {owner_index} diagnostic targets missing definition {}",
+                        target.0
+                    )));
+                };
+                if target_definition
+                    .formals
+                    .get(formal_ordinal as usize)
+                    .is_none()
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition {owner_index} diagnostic targets missing formal {formal_ordinal} in definition {}",
+                        target.0
+                    )));
+                }
+                let call_matches = definition.calls.iter().any(|candidate| {
+                    candidate.expression == call
+                        && matches!(
+                            candidate.target,
+                            KernelCallTarget::User {
+                                target: candidate_target,
+                                ..
+                            } if candidate_target == target
+                        )
+                        && candidate.inputs.iter().any(|input| {
+                            matches!(
+                                input.role,
+                                crate::KernelCallInputRole::Formal { ordinal }
+                                    if ordinal == formal_ordinal
+                            )
+                        })
+                });
+                if !call_matches {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition {owner_index} diagnostic references missing call input {} formal {formal_ordinal} targeting definition {}",
+                        call.0, target.0
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn definition_dependencies(definition: &DefinitionArtifact) -> Vec<KernelDefinitionDependency> {
@@ -648,19 +716,21 @@ pub(crate) fn alpha_normalize_definition(normalized: &mut DefinitionArtifact) {
     for list in &mut normalized.lists {
         list.item_type = alpha_normalize_type(&list.item_type, &mut variables, &mut next);
     }
+    alpha_normalize_diagnostics(&mut normalized.diagnostics, &mut variables, &mut next);
 }
 
 pub(crate) fn alpha_normalize_public_flow(flow_type: &FlowType) -> FlowType {
     alpha_normalize_flow_type(flow_type, &mut BTreeMap::new(), &mut 0)
 }
 
-/// Normalize one callable scheme as a single namespace. Formal order owns the
-/// stable type-parameter ordinals; the result may reuse those variables or add
-/// result-only parameters afterward.
-pub(crate) fn alpha_normalize_callable_interface(
+/// Normalize one public callable surface and its definition-local diagnostics
+/// in one stable variable namespace. This is the diagnostics-only counterpart
+/// of `alpha_normalize_definition`; it never materializes checked rows.
+pub(crate) fn alpha_normalize_callable_interface_and_diagnostics(
     formals: &[FlowType],
     result: &FlowType,
-) -> (Box<[FlowType]>, FlowType) {
+    diagnostics: &[KernelDiagnosticArtifact],
+) -> (Box<[FlowType]>, FlowType, Box<[KernelDiagnosticArtifact]>) {
     let mut variables = BTreeMap::new();
     let mut next = 0;
     let formals = formals
@@ -669,7 +739,26 @@ pub(crate) fn alpha_normalize_callable_interface(
         .collect::<Vec<_>>()
         .into_boxed_slice();
     let result = alpha_normalize_flow_type(result, &mut variables, &mut next);
-    (formals, result)
+    let mut diagnostics = diagnostics.to_vec();
+    alpha_normalize_diagnostics(&mut diagnostics, &mut variables, &mut next);
+    (formals, result, diagnostics.into_boxed_slice())
+}
+
+fn alpha_normalize_diagnostics(
+    diagnostics: &mut [KernelDiagnosticArtifact],
+    variables: &mut BTreeMap<TypeVar, TypeVar>,
+    next: &mut u32,
+) {
+    for diagnostic in diagnostics {
+        match &mut diagnostic.kind {
+            KernelDiagnosticKind::CallInputType {
+                actual, expected, ..
+            } => {
+                *actual = alpha_normalize_type(actual, variables, next);
+                *expected = alpha_normalize_type(expected, variables, next);
+            }
+        }
+    }
 }
 
 fn hash_normalized_flow_type(
@@ -997,11 +1086,11 @@ mod tests {
             "an unused implementation edit must preserve the public type identity"
         );
         assert_ne!(
-            first.currentness[0].artifact_fingerprint_v2,
-            second.currentness[0].artifact_fingerprint_v2
+            first.currentness[0].artifact_fingerprint_v3,
+            second.currentness[0].artifact_fingerprint_v3
         );
         assert_ne!(
-            first.currentness[0].fingerprint_v2, second.currentness[0].fingerprint_v2,
+            first.currentness[0].fingerprint_v3, second.currentness[0].fingerprint_v3,
             "the edited definition must not claim the old exact evaluation receipt"
         );
         assert_eq!(
@@ -1038,6 +1127,7 @@ mod tests {
             sources: Box::new([]),
             states: Box::new([]),
             lists: Box::new([]),
+            diagnostics: Box::new([]),
         };
         let mut first_definition = [definition(7)];
         let mut second_definition = [definition(91)];
@@ -1051,21 +1141,99 @@ mod tests {
             second[0].public_result_fingerprint_v1
         );
         assert_eq!(
-            first[0].artifact_fingerprint_v2,
-            second[0].artifact_fingerprint_v2
+            first[0].artifact_fingerprint_v3,
+            second[0].artifact_fingerprint_v3
         );
         assert_eq!(
-            first[0].artifact_fingerprint_v2,
+            first[0].artifact_fingerprint_v3,
             [
-                64, 219, 58, 35, 240, 231, 14, 131, 91, 152, 231, 110, 33, 91, 158, 239, 15, 227,
-                196, 61, 29, 32, 197, 194, 151, 69, 180, 171, 104, 82, 75, 111,
+                146, 199, 98, 169, 28, 51, 159, 62, 100, 42, 170, 138, 128, 112, 173, 200, 77, 81,
+                115, 15, 47, 7, 56, 204, 235, 164, 146, 0, 203, 187, 53, 26,
             ],
-            "the V2 direct structural fingerprint byte contract changed"
+            "the V3 direct structural fingerprint byte contract changed"
         );
         assert_ne!(
             first[0].basis_fingerprint_v1,
             second[0].basis_fingerprint_v1
         );
-        assert_ne!(first[0].fingerprint_v2, second[0].fingerprint_v2);
+        assert_ne!(first[0].fingerprint_v3, second[0].fingerprint_v3);
+    }
+
+    #[test]
+    fn diagnostic_facts_change_exact_artifact_currentness_but_not_public_interfaces() {
+        let callee = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::PureBuiltin {
+                        kind: crate::KernelPureBuiltinKind::TextLength,
+                    },
+                    inputs: Box::new([KernelOwnerInputEdge {
+                        role: KernelOwnerEdgeRole::AbiArgument {
+                            name: "$pipe".into(),
+                        },
+                        expression: KernelExpressionId(0),
+                    }]),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+        let caller = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: Box::new([KernelOwnerInputEdge {
+                        role: KernelOwnerEdgeRole::CallArgument { ordinal: 0 },
+                        expression: KernelExpressionId(0),
+                    }]),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+        let mut diagnosed = solve_project(vec![callee, caller]);
+        assert_eq!(diagnosed.definitions[1].diagnostics.len(), 1);
+        let mut clean = diagnosed.clone();
+        clean.definitions[1].diagnostics = Box::new([]);
+        let basis = [[9; 32]; 2];
+        let (_, clean_currentness) =
+            build_snapshot_receipts(&mut clean.definitions, &basis).unwrap();
+        let (_, diagnosed_currentness) =
+            build_snapshot_receipts(&mut diagnosed.definitions, &basis).unwrap();
+
+        assert_eq!(
+            clean_currentness[1].public_result_fingerprint_v1,
+            diagnosed_currentness[1].public_result_fingerprint_v1
+        );
+        assert_ne!(
+            clean_currentness[1].artifact_fingerprint_v3,
+            diagnosed_currentness[1].artifact_fingerprint_v3
+        );
+        assert_ne!(
+            clean_currentness[1].fingerprint_v3,
+            diagnosed_currentness[1].fingerprint_v3
+        );
     }
 }

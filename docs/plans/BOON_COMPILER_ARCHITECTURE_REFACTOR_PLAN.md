@@ -3146,6 +3146,52 @@ roughly 129.5 ms of program compilation and 232.9 ms of graph solve remain
 larger than interface projection, so work must reduce compiled operations and
 solver activation rather than tune the already-small projection tail.
 
+The first exact-diagnostics slice is now complete. Diagnostics are typed kernel
+facts, not formatted legacy strings: each row owns a dense owner, exact call
+input site, target definition and formal ordinal, severity, actual and expected
+types, and an exact missing/incompatible structural field when one exists.
+They are projected from the quiescent graph and public callable schemes without
+materializing checked expressions, statements, resources, dependencies, or
+currentness receipts. `CheckDemand::Diagnostics` therefore still publishes
+zero definition artifacts and zero sealed definitions. A later checked-image
+demand reuses both the solved graph and the call substitutions derived during
+diagnostic projection; it does not derive the same substitution environment a
+second time.
+
+The compiler oracle relocates dense diagnostic sites to parser-stable call and
+target identities. Parser-backed differentials cover both ordinary authored
+arguments and explicit `PASS` context records, including the exact nested field
+failure. Generic call instantiation is applied before assignability testing, so
+a definition-local alpha does not produce a false user diagnostic. Diagnostic
+rows participate in the alpha-normalized exact artifact/currentness V3 receipt
+but deliberately do not change the public-interface fingerprint. Sealing
+validates every referenced call, target, formal and input row. This slice does
+not yet claim complete source-facing diagnostics: syntax, link, arity, name
+resolution, and other non-call-input diagnostic families still need their own
+typed facts and presentation relocations before production cutover.
+
+A fresh directional debug NovyWave run remains differential-clean over all
+1,389 owners. Diagnostics-only records 2,439.434 ms candidate time,
+2,279.199 ms kernel time, 1,056.661 ms graph solve, and 17.623 ms interface plus
+diagnostic projection. The complete checked-image path records 2,851.110 ms
+candidate time, 2,690.875 ms kernel time, and 387.025 ms checked-image
+publication. Compared with the preceding one-sample debug receipt this is a
+roughly 3--7% regression/noise band, not an accepted speed win; the new
+projection tail is only 17.6 ms and graph solve remains dominant. All 72 kernel
+tests, 90 non-ignored compiler unit tests, and 16 compiler integration tests
+pass. `NoElement` remains an ordinary tag throughout this diagnostic path; no
+library spelling is recognized by the kernel type comparison.
+
+The matching optimized architecture-boundary probe passes in 1.61 seconds
+including the legacy differential oracle. Its diagnostics-only candidate is
+563.534 ms, including 471.016 ms kernel time, 242.976 ms graph solve, and
+7.737 ms interface plus diagnostic projection. The full checked-image
+candidate is 733.407 ms, including 640.889 ms kernel time and 160.153 ms
+checked-image publication. The two-job release rebuild took 1m59s and is
+excluded from every Boon latency. Relative to the preceding single optimized
+receipt this is a roughly 2--4% regression/noise band, so it does not change
+the architectural conclusion or count as a speed improvement.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not
@@ -3165,11 +3211,13 @@ checker-wide flag day:
    and lexical-binding identities first, then HOLD state, persistent LIST, and
    SOURCE resource rows. Reuse the existing dense expression and statement
    references; never create parallel source-shaped resource drafts.
-2. Add exact diagnostics, public callable substitutions, currentness receipts,
-   and dependency-cone rows to `KernelCheckedSnapshot`. Extend Counter,
-   TodoMVC, and NovyWave differential gates over each new table before moving
-   to the next one; collect whole mismatch inventories instead of repairing one
-   serialized failure per run.
+2. Complete exact diagnostics in `KernelCheckedSnapshot`. Public callable
+   substitutions, currentness receipts, dependency-cone rows, and the first
+   call-input diagnostic family are complete; add the remaining syntax, link,
+   resolution, arity, and presentation facts. Extend Counter, TodoMVC, and
+   NovyWave differential gates over each new family before moving to the next
+   one; collect whole mismatch inventories instead of repairing one serialized
+   failure per run.
 3. Freeze each public interface separately from its private compiled definition
    and fingerprint both once. Finish the permanent `KernelProjectInput`,
    one-revision `KernelSession`, and `CheckDemand` boundary without importing

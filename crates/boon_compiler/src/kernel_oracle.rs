@@ -12,7 +12,8 @@ use boon_compiler_kernel::{
     KernelCallInputRole, KernelCallTarget, KernelCallTypeSubstitution, KernelCollectionKind,
     KernelCompileWork, KernelDeclarationId, KernelDeclarationInput, KernelDeclarationKind,
     KernelDeclarationOrigin, KernelDeclarationReference, KernelDefinitionFactsInput,
-    KernelExpressionId, KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
+    KernelDiagnosticKind, KernelDiagnosticSeverity, KernelDiagnosticSite, KernelExpressionId,
+    KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
     KernelInheritedFormal, KernelLexicalAccess, KernelLexicalBindingInput,
     KernelLexicalBindingTarget, KernelLexicalBindingTargetInput, KernelListId, KernelListInput,
     KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
@@ -50,6 +51,7 @@ pub struct KernelOwnerOracleEntry {
     pub lists: Box<[KernelOwnerOracleList]>,
     pub calls: Box<[KernelOwnerOracleCall]>,
     pub effects: Box<[(StableExpressionKey, KernelHostEffectArtifact)]>,
+    pub diagnostics: Box<[KernelOwnerOracleDiagnostic]>,
     pub public_child_owner_fields: Box<[(String, StableCheckOwnerKey)]>,
     pub public_child_kernel_fields: Box<[(String, FlowType)]>,
     pub exported_as_public_child: bool,
@@ -59,6 +61,22 @@ pub struct KernelOwnerOracleEntry {
     pub generic_selector_dependents: Box<[StableExpressionKey]>,
     pub detached_generic_reads: Box<[StableExpressionKey]>,
     pub legacy_no_element_dependents: Box<[StableExpressionKey]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleDiagnostic {
+    pub severity: KernelDiagnosticSeverity,
+    pub site: KernelOwnerOracleDiagnosticSite,
+    pub kind: KernelDiagnosticKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KernelOwnerOracleDiagnosticSite {
+    CallInput {
+        call: StableExpressionKey,
+        target: StableCheckOwnerKey,
+        formal_ordinal: u32,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -238,9 +256,9 @@ pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
     pub basis_fingerprint_v1: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v2: [u8; 32],
+    pub artifact_fingerprint_v3: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v2: [u8; 32],
+    pub fingerprint_v3: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -802,9 +820,9 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                     owner: prepared[*prepared_index].owner.clone(),
                     basis_fingerprint_v1: receipt.basis_fingerprint_v1,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v2: receipt.artifact_fingerprint_v2,
+                    artifact_fingerprint_v3: receipt.artifact_fingerprint_v3,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v2: receipt.fingerprint_v2,
+                    fingerprint_v3: receipt.fingerprint_v3,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -827,7 +845,8 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
             let supported = active
                 .iter()
                 .zip(definitions)
-                .map(|(prepared_index, artifact)| {
+                .enumerate()
+                .map(|(dense_index, (prepared_index, artifact))| {
                     let owner = &prepared[*prepared_index];
                     let stable_provider = |value: KernelValueReference| match value {
                         KernelValueReference::Local(expression) => {
@@ -1122,6 +1141,48 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
+                    let diagnostics = artifact
+                        .diagnostics
+                        .iter()
+                        .map(|diagnostic| {
+                            let dense_owner = KernelOwnerId(
+                                u32::try_from(dense_index)
+                                .expect("kernel diagnostic owner count exceeds u32"),
+                            );
+                            assert_eq!(
+                                diagnostic.owner, dense_owner,
+                                "kernel diagnostic must remain in its definition"
+                            );
+                            let site = match &diagnostic.site {
+                                KernelDiagnosticSite::CallInput {
+                                    call,
+                                    target,
+                                    formal_ordinal,
+                                } => {
+                                    let target = active
+                                        .get(target.0 as usize)
+                                        .and_then(|target| prepared.get(*target))
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "kernel diagnostic targets missing dense owner {}",
+                                                target.0
+                                            )
+                                        });
+                                    KernelOwnerOracleDiagnosticSite::CallInput {
+                                        call: owner.expressions[call.0 as usize].clone(),
+                                        target: target.owner.clone(),
+                                        formal_ordinal: *formal_ordinal,
+                                    }
+                                }
+                            };
+                            KernelOwnerOracleDiagnostic {
+                                severity: diagnostic.severity,
+                                site,
+                                kind: diagnostic.kind.clone(),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
                     let calls = artifact
                         .calls
                         .into_iter()
@@ -1211,6 +1272,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         lists,
                         calls,
                         effects,
+                        diagnostics,
                         public_child_owner_fields: owner.public_child_owner_fields.clone(),
                         public_child_kernel_fields: owner
                             .public_child_owner_fields
@@ -9298,6 +9360,134 @@ mod tests {
     }
 
     #[test]
+    fn parsed_call_diagnostics_match_legacy_type_authority_before_source_presentation() {
+        let source = concat!(
+            "FUNCTION plus_one(value) {\n",
+            "    value + 1\n",
+            "}\n",
+            "result: plus_one(value: TEXT { wrong })\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse typed diagnostic fixture");
+        let oracle = kernel_owner_oracle(&project);
+        let plus_one = oracle
+            .supported
+            .iter()
+            .find(|owner| {
+                matches!(&owner.owner, StableCheckOwnerKey::Item(key) if key.item_route.segments().last().is_some_and(|segment| segment.names.as_ref() == ["plus_one"]))
+            })
+            .unwrap_or_else(|| panic!("plus_one must compile: {:#?}", oracle.unsupported));
+        let result = oracle
+            .supported
+            .iter()
+            .find(|owner| {
+                matches!(&owner.owner, StableCheckOwnerKey::Item(key) if key.item_route.segments().last().is_some_and(|segment| segment.names.as_ref() == ["result"]))
+            })
+            .unwrap_or_else(|| panic!("result must compile: {:#?}", oracle.unsupported));
+        let [call] = result.calls.as_ref() else {
+            panic!("result must publish one call occurrence")
+        };
+        let [diagnostic] = result.diagnostics.as_ref() else {
+            panic!(
+                "invalid call must publish one typed diagnostic: {:#?}",
+                result.diagnostics
+            )
+        };
+        assert_eq!(diagnostic.severity, KernelDiagnosticSeverity::Error);
+        assert_eq!(
+            diagnostic.site,
+            KernelOwnerOracleDiagnosticSite::CallInput {
+                call: call.expression.clone(),
+                target: plus_one.owner.clone(),
+                formal_ordinal: 0,
+            }
+        );
+        assert_eq!(
+            diagnostic.kind,
+            KernelDiagnosticKind::CallInputType {
+                actual: Type::Text,
+                expected: Type::Number,
+                mismatch: boon_compiler_kernel::KernelTypeMismatch::Type,
+            }
+        );
+
+        let parsed = parse_source("app/RUN.bn", source).expect("parse legacy diagnostic fixture");
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            checked.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity == boon_checked::DiagnosticSeverity::Error
+                    && diagnostic.message.contains("argument `value`")
+                    && diagnostic.message.contains("expected: NUMBER")
+                    && diagnostic.message.contains("found: TEXT")
+            }),
+            "legacy diagnostic authority must describe the same mismatch: {:#?}",
+            checked.report.diagnostics
+        );
+    }
+
+    #[test]
+    fn explicit_pass_diagnostics_keep_the_context_formal_and_field_failure() {
+        let source = concat!(
+            "FUNCTION needs_number_pass() {\n",
+            "    PASSED.value + 1\n",
+            "}\n",
+            "result: needs_number_pass(PASS: [value: TEXT { wrong }])\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse PASS diagnostic fixture");
+        let oracle = kernel_owner_oracle(&project);
+        let target = oracle
+            .supported
+            .iter()
+            .find(|owner| {
+                matches!(&owner.owner, StableCheckOwnerKey::Item(key) if key.item_route.segments().last().is_some_and(|segment| segment.names.as_ref() == ["needs_number_pass"]))
+            })
+            .unwrap_or_else(|| panic!("PASS target must compile: {:#?}", oracle.unsupported));
+        let result = oracle
+            .supported
+            .iter()
+            .find(|owner| {
+                matches!(&owner.owner, StableCheckOwnerKey::Item(key) if key.item_route.segments().last().is_some_and(|segment| segment.names.as_ref() == ["result"]))
+            })
+            .unwrap_or_else(|| panic!("PASS caller must compile: {:#?}", oracle.unsupported));
+        let [diagnostic] = result.diagnostics.as_ref() else {
+            panic!("invalid PASS must publish one typed diagnostic")
+        };
+        assert!(matches!(
+            &diagnostic.site,
+            KernelOwnerOracleDiagnosticSite::CallInput {
+                target: diagnostic_target,
+                formal_ordinal: 0,
+                ..
+            } if diagnostic_target == &target.owner
+        ));
+        assert!(matches!(
+            &diagnostic.kind,
+            KernelDiagnosticKind::CallInputType {
+                mismatch: boon_compiler_kernel::KernelTypeMismatch::IncompatibleField(field),
+                ..
+            } if field.as_ref() == "value"
+        ));
+
+        let parsed = parse_source("app/RUN.bn", source).expect("parse legacy PASS fixture");
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            checked.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains("PASS context")
+                    && diagnostic
+                        .message
+                        .contains("field `value` has an incompatible type")
+                    && diagnostic.message.contains("expected:")
+                    && diagnostic.message.contains("found:")
+            }),
+            "legacy PASS diagnostic must present the same typed fact: {:#?}",
+            checked.report.diagnostics
+        );
+    }
+
+    #[test]
     fn infix_residuals_constrain_operands_and_publish_fixed_results() {
         let source = concat!(
             "FUNCTION numerator(value) {\n",
@@ -10519,7 +10709,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v2 != [0; 32]),
+                        && receipt.fingerprint_v3 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(

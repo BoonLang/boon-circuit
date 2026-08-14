@@ -439,9 +439,16 @@ impl KernelSession {
                     .map(|definition| definition.formals.clone())
                     .collect::<Vec<_>>()
                     .into_boxed_slice();
+                let diagnostics = snapshot
+                    .definitions
+                    .iter()
+                    .flat_map(|definition| definition.diagnostics.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
                 KernelCheckProduct::Diagnostics(Arc::new(KernelInterfaceSnapshot {
                     public_results,
                     callable_formals,
+                    diagnostics,
                     work: snapshot.work,
                 }))
             }
@@ -513,8 +520,9 @@ impl KernelSession {
 mod tests {
     use super::*;
     use crate::{
-        KernelExternalExpression, KernelExternalTarget, KernelOwnerEdgeRole, KernelOwnerInputEdge,
-        KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput,
+        KernelDiagnosticKind, KernelDiagnosticSite, KernelExternalExpression, KernelExternalTarget,
+        KernelOwnerEdgeRole, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
+        KernelOwnerProgramInput, KernelPureBuiltinKind, KernelTypeMismatch,
     };
     use boon_checked::{FlowMode, Type};
 
@@ -551,6 +559,77 @@ mod tests {
             }]),
             result: crate::KernelExpressionId(0),
         }
+    }
+
+    fn diagnostic_project() -> KernelProjectInput {
+        let callee = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::PureBuiltin {
+                        kind: KernelPureBuiltinKind::TextLength,
+                    },
+                    inputs: Box::new([KernelOwnerInputEdge {
+                        role: KernelOwnerEdgeRole::AbiArgument {
+                            name: "$pipe".into(),
+                        },
+                        expression: crate::KernelExpressionId(0),
+                    }]),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: crate::KernelExpressionId(1),
+        };
+        let caller = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: Box::new([KernelOwnerInputEdge {
+                        role: KernelOwnerEdgeRole::CallArgument { ordinal: 0 },
+                        expression: crate::KernelExpressionId(0),
+                    }]),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: crate::KernelExpressionId(1),
+        };
+        KernelProjectInput::new(
+            KernelProjectProgramInput {
+                owners: vec![callee, caller].into_boxed_slice(),
+            },
+            vec![KernelDefinitionFactsInput::default(); 2].into_boxed_slice(),
+            (0..2)
+                .map(|index| {
+                    StableCheckOwnerKey::UnitRoot(
+                        SourceUnitId::from_path(&format!("diagnostic-owner-{index}.bn"))
+                            .expect("fixture source path is canonical"),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+        .expect("diagnostic fixture has aligned definition facts")
     }
 
     fn project(first: KernelOwnerNodeKind) -> KernelProjectInput {
@@ -613,6 +692,7 @@ mod tests {
                 .all(|formals| formals.is_empty())
         );
         assert_eq!(snapshot.public_results[2].ty, Type::Number);
+        assert!(snapshot.diagnostics.is_empty());
         assert_eq!(result.product.materialized_definition_count(), 0);
         assert_eq!(result.product.sealed_definition_count(), 0);
         assert!(!result.reused);
@@ -655,6 +735,51 @@ mod tests {
             .expect("same-revision diagnostics reuse");
         assert!(repeated.reused);
         assert_eq!(repeated.product, result.product);
+    }
+
+    #[test]
+    fn diagnostics_demand_publishes_typed_failures_and_reuses_them_in_checked_images() {
+        let mut session = KernelSession::new(diagnostic_project());
+        let result = session
+            .check(CheckDemand::Diagnostics)
+            .expect("typed diagnostics demand solves");
+        let KernelCheckProduct::Diagnostics(diagnostics) = &result.product else {
+            panic!("diagnostics demand returned another product")
+        };
+        let [diagnostic] = diagnostics.diagnostics.as_ref() else {
+            panic!("diagnostics demand must publish one call failure")
+        };
+        assert_eq!(
+            diagnostic.site,
+            KernelDiagnosticSite::CallInput {
+                call: crate::KernelExpressionId(1),
+                target: KernelOwnerId(0),
+                formal_ordinal: 0,
+            }
+        );
+        assert!(matches!(
+            diagnostic.kind,
+            KernelDiagnosticKind::CallInputType {
+                actual: Type::Number,
+                expected: Type::Text,
+                mismatch: KernelTypeMismatch::Type,
+            }
+        ));
+        assert_eq!(result.product.materialized_definition_count(), 0);
+        assert_eq!(result.product.sealed_definition_count(), 0);
+
+        let checked = session
+            .check(CheckDemand::CheckedImage)
+            .expect("checked image reuses diagnostic solve");
+        assert!(checked.reused);
+        let KernelCheckProduct::CheckedImage(checked) = checked.product else {
+            panic!("checked demand returned another product")
+        };
+        assert_eq!(
+            checked.definitions[1].diagnostics.as_ref(),
+            diagnostics.diagnostics.as_ref(),
+            "one graph evaluation owns both diagnostics-only and checked-image facts"
+        );
     }
 
     #[test]

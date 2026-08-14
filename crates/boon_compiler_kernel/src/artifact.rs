@@ -1,6 +1,15 @@
 use crate::OutputId;
 use boon_checked::FlowType;
 
+pub const KERNEL_SUMMARY_DEFINITION_RANKING_LEN: usize = 16;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KernelSummaryDefinitionWork {
+    pub definition: u32,
+    pub program_evaluations: u64,
+    pub node_evaluations: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KernelSolveWork {
     pub variables: u64,
@@ -16,6 +25,8 @@ pub struct KernelSolveWork {
     pub record_activations: u64,
     /// Immutable definition-summary bytecode nodes actually demanded.
     pub summary_node_evaluations: u64,
+    pub summary_definition_ranking:
+        [KernelSummaryDefinitionWork; KERNEL_SUMMARY_DEFINITION_RANKING_LEN],
     pub summary_call_activations: u64,
     pub mutations: u64,
     pub union_operations: u64,

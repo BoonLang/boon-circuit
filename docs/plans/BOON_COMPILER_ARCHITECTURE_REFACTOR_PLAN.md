@@ -2755,6 +2755,48 @@ was deleted. The accepted design must keep the enclosing collection owner
 incremental and attach one shared callback program specifically to the
 collection operation, with explicit item and capture inputs.
 
+The next accepted cut removes a more fundamental duplicate fact. Work
+attribution now records the top residual modules and the top immutable summary
+definitions by program and node evaluations. The residual ranking proved that
+linking was already small (the largest module contributes only 783 linked
+operations), while `NovyTheme/material` alone accounted for 247,124 of
+1,149,635 demanded summary nodes. A prototype that externalized every large
+nested summary as another dependency-scheduled component was therefore tested
+and deleted: it reduced summary evaluation only to 1,041,977 nodes while
+expanding variables from 99,445 to 505,413 and slowing debug solve from about
+5.93 seconds to 10.89 seconds. Nested definition boundaries are not independent
+mutable state by default.
+
+The definition trace exposed the actual ownership error. `material(mode, of)`
+compiled 49 occurrence inputs even though they represented only two facts: the
+whole `of` formal and the whole `mode` formal repeated in many lazy arms. The
+direct-summary compiler now interns every `(formal, complete projection path)`
+once. All uses share one immutable `Input` value and one occurrence-local
+projection equation; branch outputs and constraints remain independently lazy.
+This is ordinary type-flow canonicalization, not a `material`, renderer, UI,
+tag, or `NoElement` special case. An exact regression requires two repeated
+whole-formal reads to emit one summary input and still produce both record
+fields. The existing multi-arm selector tests continue to prove that an
+unselected arm cannot impose a requirement.
+
+On complete NovyWave coverage, summary definition nodes fall from 39,243 to
+34,453, variables from 99,445 to 39,798, mutations from 158,507 to 57,375,
+dynamic dependency edges from 56,114 to 23,827, and term-intern requests from
+316,696 to 265,976. Linked operations remain 32,826 and all 1,389 executable
+owners plus eight inert containers remain covered. One no-rebuild debug sample
+records 1,861.444 ms kernel time, 595.148 ms compile/link, and 945.701 ms solve,
+down from roughly 6.87/0.63/5.93 seconds before the cut.
+
+Three fresh optimized samples record kernel times of 378.794, 381.282, and
+389.723 ms (median 381.282 ms). Complete parse plus SOURCE ABI plus kernel takes
+469.072, 470.206, and 478.447 ms (median 470.206 ms); median compile/link is
+97.578 ms and median solve is 226.029 ms. This is approximately 2.62 times
+faster than the preceding 1,000.490 ms kernel median and 2.32 times faster than
+its 1,092.366 ms complete median. All 51 kernel tests and 79 non-ignored
+compiler tests pass. The complete NovyWave differential still reaches exactly
+the known `store.focused_control_label` HOLD mode mismatch and no earlier type
+or artifact divergence.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not

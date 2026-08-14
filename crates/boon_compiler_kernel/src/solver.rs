@@ -1,9 +1,10 @@
 use crate::{
-    ArtifactOutput, ComponentArtifact, ComponentProgram, KernelCollectionOperationKind,
-    KernelOperation, KernelPattern, KernelRecordEntry, KernelSelectArm, KernelSolveWork,
-    KernelSummaryCallInput, KernelSummaryNode, KernelSummaryProgram, KernelSummaryRecordEntry,
-    NameId, OperationId, ProgramConsumer, ProgramOperationRef, PublishMode, ResidualOperationFrame,
-    TypeTerm, TypeTermId, TypeVariableId, VariantTerm,
+    ArtifactOutput, ComponentArtifact, ComponentProgram, KERNEL_SUMMARY_DEFINITION_RANKING_LEN,
+    KernelCollectionOperationKind, KernelOperation, KernelPattern, KernelRecordEntry,
+    KernelSelectArm, KernelSolveWork, KernelSummaryCallInput, KernelSummaryDefinitionWork,
+    KernelSummaryNode, KernelSummaryProgram, KernelSummaryRecordEntry, NameId, OperationId,
+    ProgramConsumer, ProgramOperationRef, PublishMode, ResidualOperationFrame, TypeTerm,
+    TypeTermId, TypeVariableId, VariantTerm,
 };
 use boon_checked::FlowType;
 use std::collections::VecDeque;
@@ -145,6 +146,8 @@ struct ComponentSolver {
     schedule_generation: u32,
     schedule_stack: Vec<TypeVariableId>,
     summary_scratch_pool: Vec<SummaryScratch>,
+    summary_program_evaluations: Vec<u64>,
+    summary_node_evaluations: Vec<u64>,
     resolve_cache_seen: Vec<u32>,
     resolve_cache_values: Vec<TypeTermId>,
     resolve_active: Vec<u32>,
@@ -327,6 +330,8 @@ impl ComponentSolver {
             schedule_generation: 0,
             schedule_stack: Vec::new(),
             summary_scratch_pool: Vec::new(),
+            summary_program_evaluations: Vec::new(),
+            summary_node_evaluations: Vec::new(),
             resolve_cache_seen: Vec::new(),
             resolve_cache_values: Vec::new(),
             resolve_active: vec![0; variable_count],
@@ -378,10 +383,39 @@ impl ComponentSolver {
         self.work.term_intern_hits_by_kind = term_work.intern_hits_by_kind;
         self.work.structural_widen_requests = term_work.structural_widen_requests;
         self.work.structural_widen_hits = term_work.structural_widen_hits;
+        self.finish_summary_definition_ranking();
         Ok(ComponentArtifact::new(
             outputs.into_boxed_slice(),
             self.work,
         ))
+    }
+
+    fn finish_summary_definition_ranking(&mut self) {
+        for definition in 0..self.summary_node_evaluations.len() {
+            let node_evaluations = self.summary_node_evaluations[definition];
+            if node_evaluations == 0 {
+                continue;
+            }
+            let candidate = KernelSummaryDefinitionWork {
+                definition: u32::try_from(definition)
+                    .expect("kernel summary definition identity exceeds u32"),
+                program_evaluations: self.summary_program_evaluations[definition],
+                node_evaluations,
+            };
+            let Some(position) = self
+                .work
+                .summary_definition_ranking
+                .iter()
+                .position(|current| candidate.node_evaluations > current.node_evaluations)
+            else {
+                continue;
+            };
+            for index in (position + 1..KERNEL_SUMMARY_DEFINITION_RANKING_LEN).rev() {
+                self.work.summary_definition_ranking[index] =
+                    self.work.summary_definition_ranking[index - 1];
+            }
+            self.work.summary_definition_ranking[position] = candidate;
+        }
     }
 
     fn activate(
@@ -1084,9 +1118,24 @@ impl ComponentSolver {
     ) -> Result<TypeTermId, KernelSolveError> {
         let mut scratch = self.summary_scratch_pool.pop().unwrap_or_default();
         scratch.begin(program.nodes.len(), self.program.terms.absent());
-        let result =
-            self.evaluate_summary_value(program, resolve_input, program.result, &mut scratch);
+        let mut node_evaluations = 0_u64;
+        let result = self.evaluate_summary_value(
+            program,
+            resolve_input,
+            program.result,
+            &mut scratch,
+            &mut node_evaluations,
+        );
         self.summary_scratch_pool.push(scratch);
+        let definition = program.definition as usize;
+        if self.summary_node_evaluations.len() <= definition {
+            self.summary_node_evaluations.resize(definition + 1, 0);
+            self.summary_program_evaluations.resize(definition + 1, 0);
+        }
+        self.summary_node_evaluations[definition] =
+            self.summary_node_evaluations[definition].saturating_add(node_evaluations);
+        self.summary_program_evaluations[definition] =
+            self.summary_program_evaluations[definition].saturating_add(1);
         result
     }
 
@@ -1129,6 +1178,7 @@ impl ComponentSolver {
         ) -> Result<TypeTermId, KernelSolveError>,
         value: crate::KernelSummaryValueId,
         scratch: &mut SummaryScratch,
+        node_evaluations: &mut u64,
     ) -> Result<TypeTermId, KernelSolveError> {
         let index = value.0 as usize;
         let Some(node) = program.nodes.get(index) else {
@@ -1149,12 +1199,18 @@ impl ComponentSolver {
         }
         scratch.active[index] = generation;
         self.work.summary_node_evaluations = self.work.summary_node_evaluations.saturating_add(1);
+        *node_evaluations = node_evaluations.saturating_add(1);
         let evaluated = (|| match node {
             KernelSummaryNode::Input(input_index) => resolve_input(self, *input_index),
             KernelSummaryNode::Term(term) => Ok(*term),
             KernelSummaryNode::Projection { provider, fields } => {
-                let mut provider =
-                    self.evaluate_summary_value(program, resolve_input, *provider, scratch)?;
+                let mut provider = self.evaluate_summary_value(
+                    program,
+                    resolve_input,
+                    *provider,
+                    scratch,
+                    node_evaluations,
+                )?;
                 for field in fields {
                     provider = self.project_field(provider, *field).unwrap_or_else(|| {
                         let field = self.program.terms.name(*field);
@@ -1166,8 +1222,13 @@ impl ComponentSolver {
                 Ok(self.resolve_term_head(provider))
             }
             KernelSummaryNode::Constrain { value, expected } => {
-                let actual =
-                    self.evaluate_summary_value(program, resolve_input, *value, scratch)?;
+                let actual = self.evaluate_summary_value(
+                    program,
+                    resolve_input,
+                    *value,
+                    scratch,
+                    node_evaluations,
+                )?;
                 self.unify_terms(actual, *expected);
                 Ok(self.resolve_term_head(actual))
             }
@@ -1176,9 +1237,21 @@ impl ComponentSolver {
                 result,
             } => {
                 for dependency in dependencies {
-                    self.evaluate_summary_value(program, resolve_input, *dependency, scratch)?;
+                    self.evaluate_summary_value(
+                        program,
+                        resolve_input,
+                        *dependency,
+                        scratch,
+                        node_evaluations,
+                    )?;
                 }
-                self.evaluate_summary_value(program, resolve_input, *result, scratch)
+                self.evaluate_summary_value(
+                    program,
+                    resolve_input,
+                    *result,
+                    scratch,
+                    node_evaluations,
+                )
             }
             KernelSummaryNode::Collection {
                 kind,
@@ -1192,6 +1265,7 @@ impl ComponentSolver {
                         resolve_input,
                         *value,
                         scratch,
+                        node_evaluations,
                     )?);
                 }
                 let mut values = Vec::with_capacity(map_values.len());
@@ -1201,6 +1275,7 @@ impl ComponentSolver {
                         resolve_input,
                         *value,
                         scratch,
+                        node_evaluations,
                     )?);
                 }
                 Ok(self.collection_type(*kind, &items, &values))
@@ -1216,13 +1291,24 @@ impl ComponentSolver {
                                 input_values.len()
                             ))
                         })?;
-                    solver.evaluate_summary_value(program, resolve_input, *value, scratch)
+                    solver.evaluate_summary_value(
+                        program,
+                        resolve_input,
+                        *value,
+                        scratch,
+                        node_evaluations,
+                    )
                 };
                 self.evaluate_summary_program_with(nested, &mut resolve_nested_input)
             }
             KernelSummaryNode::Select { selector, arms } => {
-                let selector =
-                    self.evaluate_summary_value(program, resolve_input, *selector, scratch)?;
+                let selector = self.evaluate_summary_value(
+                    program,
+                    resolve_input,
+                    *selector,
+                    scratch,
+                    node_evaluations,
+                )?;
                 let selector = self.resolve_term(selector);
                 let singleton = matches!(
                     self.program.terms.term(selector),
@@ -1238,6 +1324,7 @@ impl ComponentSolver {
                             resolve_input,
                             arm.output,
                             scratch,
+                            node_evaluations,
                         )?;
                         let candidate = self.resolve_term(candidate);
                         if !matches!(self.program.terms.term(candidate), TypeTerm::Absent) {
@@ -1248,8 +1335,13 @@ impl ComponentSolver {
                 }
                 let mut candidates = Vec::new();
                 for arm in arms {
-                    let candidate =
-                        self.evaluate_summary_value(program, resolve_input, arm.output, scratch)?;
+                    let candidate = self.evaluate_summary_value(
+                        program,
+                        resolve_input,
+                        arm.output,
+                        scratch,
+                        node_evaluations,
+                    )?;
                     let candidate = self.resolve_term(candidate);
                     if matches!(self.program.terms.term(candidate), TypeTerm::Absent) {
                         continue;
@@ -1268,6 +1360,7 @@ impl ComponentSolver {
                                 resolve_input,
                                 *value,
                                 scratch,
+                                node_evaluations,
                             )?;
                             let value = self.resolve_term_head(value);
                             insert_record_field(&mut fields, *name, value);
@@ -1278,6 +1371,7 @@ impl ComponentSolver {
                                 resolve_input,
                                 *value,
                                 scratch,
+                                node_evaluations,
                             )?;
                             let value = self.resolve_term_head(value);
                             self.merge_record_spread(value, &mut fields)?;
@@ -2040,6 +2134,7 @@ mod tests {
         let text = builder.terms().text();
         let number = builder.terms().number();
         let summary = Arc::new(KernelSummaryProgram {
+            definition: 0,
             nodes: vec![
                 KernelSummaryNode::Input(0),
                 KernelSummaryNode::Input(1),
@@ -2119,6 +2214,7 @@ mod tests {
         let text = builder.terms().text();
         let number = builder.terms().number();
         let child = Arc::new(KernelSummaryProgram {
+            definition: 1,
             nodes: vec![
                 KernelSummaryNode::Input(0),
                 KernelSummaryNode::Input(1),
@@ -2154,6 +2250,7 @@ mod tests {
             result: crate::KernelSummaryValueId(6),
         });
         let parent = Arc::new(KernelSummaryProgram {
+            definition: 0,
             nodes: vec![
                 KernelSummaryNode::Input(0),
                 KernelSummaryNode::Input(1),
@@ -2211,6 +2308,7 @@ mod tests {
         let number = builder.terms().number();
         let text = builder.terms().text();
         let summary = Arc::new(KernelSummaryProgram {
+            definition: 0,
             nodes: vec![
                 KernelSummaryNode::Input(0),
                 KernelSummaryNode::Constrain {
@@ -2262,6 +2360,7 @@ mod tests {
         let field = builder.terms_mut().intern_name("value");
         let number = builder.terms().number();
         let callee = Arc::new(KernelSummaryProgram {
+            definition: 1,
             nodes: vec![
                 KernelSummaryNode::Input(0),
                 KernelSummaryNode::Constrain {
@@ -2273,6 +2372,7 @@ mod tests {
             result: crate::KernelSummaryValueId(1),
         });
         let caller = Arc::new(KernelSummaryProgram {
+            definition: 0,
             nodes: vec![
                 KernelSummaryNode::Input(0),
                 KernelSummaryNode::Invoke {
@@ -2316,6 +2416,7 @@ mod tests {
         let text_output = builder.new_authoritative_provider();
         let number_output = builder.new_authoritative_provider();
         let summary = Arc::new(KernelSummaryProgram {
+            definition: 0,
             nodes: vec![KernelSummaryNode::Input(0)].into_boxed_slice(),
             result: crate::KernelSummaryValueId(0),
         });

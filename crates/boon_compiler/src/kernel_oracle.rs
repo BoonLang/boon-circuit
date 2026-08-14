@@ -5212,6 +5212,42 @@ mod tests {
                 report.work.structural_widen_hits,
                 report.work.dynamic_dependency_edges,
             );
+            eprintln!(
+                "kernel-novywave residual_module_ranking={:?}",
+                timings
+                    .compile_work
+                    .residual_module_ranking
+                    .iter()
+                    .filter(|module| module.linked_operations > 0)
+                    .map(|module| (
+                        report
+                            .supported
+                            .get(module.owner as usize)
+                            .map(|owner| &owner.owner),
+                        module.operations,
+                        module.frames,
+                        module.linked_operations,
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            eprintln!(
+                "kernel-novywave summary_definition_ranking={:?}",
+                report
+                    .work
+                    .summary_definition_ranking
+                    .iter()
+                    .filter(|definition| definition.node_evaluations > 0)
+                    .map(|definition| (
+                        definition.definition,
+                        report
+                            .supported
+                            .get(definition.definition as usize)
+                            .map(|owner| &owner.owner),
+                        definition.program_evaluations,
+                        definition.node_evaluations,
+                    ))
+                    .collect::<Vec<_>>()
+            );
             if std::env::var_os("BOON_KERNEL_ORACLE_UNSUPPORTED_TRACE").is_some() {
                 for (owner, reason) in &report.unsupported {
                     eprintln!("kernel-novywave unsupported owner={owner:?} reason={reason}");

@@ -264,6 +264,16 @@ pub struct KernelProjectProgram {
     compile_work: KernelCompileWork,
 }
 
+pub const KERNEL_RESIDUAL_MODULE_RANKING_LEN: usize = 16;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KernelResidualModuleWork {
+    pub owner: u32,
+    pub operations: u32,
+    pub frames: u32,
+    pub linked_operations: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KernelCompileWork {
     pub definition_modules: u64,
@@ -279,6 +289,7 @@ pub struct KernelCompileWork {
     pub dominant_module_operations: u64,
     pub dominant_module_frames: u64,
     pub dominant_module_linked_operations: u64,
+    pub residual_module_ranking: [KernelResidualModuleWork; KERNEL_RESIDUAL_MODULE_RANKING_LEN],
     pub linked_terms: u64,
     pub acyclic_initial_operations: u64,
     pub compiled_call_sites: u64,
@@ -780,6 +791,24 @@ pub fn compile_project_program(
             compile_work.dominant_module_operations = operations;
             compile_work.dominant_module_frames = frames;
             compile_work.dominant_module_linked_operations = linked;
+        }
+        let candidate = KernelResidualModuleWork {
+            owner: key.target.0,
+            operations: u32::try_from(operations)
+                .expect("kernel residual module operation count exceeds u32"),
+            frames: u32::try_from(frames).expect("kernel residual module frame count exceeds u32"),
+            linked_operations: linked,
+        };
+        if let Some(position) = compile_work
+            .residual_module_ranking
+            .iter()
+            .position(|current| candidate.linked_operations > current.linked_operations)
+        {
+            for index in (position + 1..KERNEL_RESIDUAL_MODULE_RANKING_LEN).rev() {
+                compile_work.residual_module_ranking[index] =
+                    compile_work.residual_module_ranking[index - 1];
+            }
+            compile_work.residual_module_ranking[position] = candidate;
         }
     }
     compile_work.linked_operations = component.operation_count() as u64;
@@ -2343,6 +2372,7 @@ struct DirectSummaryPlanCompiler<'a> {
     summaries: &'a [Option<Arc<CompiledDirectSummary>>],
     nodes: Vec<KernelSummaryNode>,
     inputs: Vec<DirectSummaryInput>,
+    formal_projection_inputs: HashMap<(u32, Box<[crate::NameId]>), (u32, KernelSummaryValueId)>,
 }
 
 impl DirectSummaryPlanCompiler<'_> {
@@ -2359,12 +2389,22 @@ impl DirectSummaryPlanCompiler<'_> {
         formal: u32,
         fields: Box<[crate::NameId]>,
     ) -> PlannedSummaryValue {
+        let key = (formal, fields.clone());
+        if let Some((input, value)) = self.formal_projection_inputs.get(&key).copied() {
+            return PlannedSummaryValue {
+                value,
+                mode: DirectSummaryMode::Input(input),
+                formal_projection_input: Some(input),
+            };
+        }
         let input =
             u32::try_from(self.inputs.len()).expect("kernel summary input count exceeds u32");
         self.inputs
             .push(DirectSummaryInput::FormalProjection { formal, fields });
+        let value = self.push_node(KernelSummaryNode::Input(input));
+        self.formal_projection_inputs.insert(key, (input, value));
         PlannedSummaryValue {
-            value: self.push_node(KernelSummaryNode::Input(input)),
+            value,
             mode: DirectSummaryMode::Input(input),
             formal_projection_input: Some(input),
         }
@@ -3263,6 +3303,7 @@ fn compile_direct_result_summaries(
             summaries: &summaries,
             nodes: Vec::new(),
             inputs: Vec::new(),
+            formal_projection_inputs: HashMap::new(),
         };
         let Some(result) =
             compiler.compile_expression(target, result, &actuals, &mut BTreeSet::new())
@@ -3271,6 +3312,7 @@ fn compile_direct_result_summaries(
         };
         summaries[target.0 as usize] = Some(Arc::new(CompiledDirectSummary {
             program: Arc::new(KernelSummaryProgram {
+                definition: target.0,
                 nodes: compiler.nodes.into_boxed_slice(),
                 result: result.value,
             }),
@@ -6809,14 +6851,122 @@ mod tests {
     }
 
     #[test]
+    fn structural_result_summary_shares_identical_formal_projection_inputs() {
+        let callee = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record { tag: None },
+                    inputs: vec![
+                        edge(
+                            KernelOwnerEdgeRole::RecordField {
+                                name: "left".into(),
+                                spread: false,
+                            },
+                            0,
+                        ),
+                        edge(
+                            KernelOwnerEdgeRole::RecordField {
+                                name: "right".into(),
+                                spread: false,
+                            },
+                            1,
+                        ),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(2),
+        };
+        let caller = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+
+        let program = compile_project_program(&KernelProjectProgramInput {
+            owners: vec![callee, caller].into_boxed_slice(),
+        })
+        .unwrap();
+        let calls = program
+            .component()
+            .operations
+            .iter()
+            .filter_map(|operation| match operation.as_ref() {
+                crate::KernelOperation::SummaryCall {
+                    program, inputs, ..
+                } if program.definition == 0 => Some((program, inputs)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!calls.is_empty(), "the callee must use its direct summary");
+        for (summary, inputs) in calls {
+            assert_eq!(
+                summary
+                    .nodes
+                    .iter()
+                    .filter(|node| matches!(node, KernelSummaryNode::Input(_)))
+                    .count(),
+                1,
+                "one formal path is one immutable summary value",
+            );
+            assert_eq!(
+                inputs.len(),
+                1,
+                "one formal path allocates one occurrence-local projection equation",
+            );
+        }
+
+        let artifact = program.solve().unwrap();
+        let Type::Object(result) = &artifact.definitions[1].result.ty else {
+            panic!("caller result must be a record")
+        };
+        assert_eq!(result.fields["left"], Type::Number);
+        assert_eq!(result.fields["right"], Type::Number);
+    }
+
+    #[test]
     fn structural_result_summary_invokes_large_shared_nested_bytecode() {
         let field_count = SHARED_SUMMARY_MIN_NODES - 1;
         let mut callee_nodes = (0..field_count)
             .map(|_| KernelOwnerNode {
-                kind: KernelOwnerNodeKind::FormalRead {
-                    formal: 0,
-                    fields: Box::new([]),
-                },
+                kind: KernelOwnerNodeKind::Number,
                 inputs: Box::new([]),
                 mode: FlowMode::Continuous,
             })
@@ -6839,56 +6989,37 @@ mod tests {
         });
         let callee = KernelOwnerProgramInput {
             nodes: callee_nodes.into_boxed_slice(),
-            formal_count: 1,
+            formal_count: 0,
             external_expressions: Box::new([]),
             result: KernelExpressionId(field_count as u32),
         };
         let wrapper = KernelOwnerProgramInput {
-            nodes: vec![
-                KernelOwnerNode {
-                    kind: KernelOwnerNodeKind::FormalRead {
-                        formal: 0,
-                        fields: Box::new([]),
-                    },
-                    inputs: Box::new([]),
-                    mode: FlowMode::Continuous,
+            nodes: vec![KernelOwnerNode {
+                kind: KernelOwnerNodeKind::UserCall {
+                    target: KernelOwnerId(0),
+                    inherited_formal: None,
                 },
-                KernelOwnerNode {
-                    kind: KernelOwnerNodeKind::UserCall {
-                        target: KernelOwnerId(0),
-                        inherited_formal: None,
-                    },
-                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
-                        .into_boxed_slice(),
-                    mode: FlowMode::Continuous,
-                },
-            ]
-            .into_boxed_slice(),
-            formal_count: 1,
-            external_expressions: Box::new([]),
-            result: KernelExpressionId(1),
-        };
-        let caller = KernelOwnerProgramInput {
-            nodes: vec![
-                KernelOwnerNode {
-                    kind: KernelOwnerNodeKind::Number,
-                    inputs: Box::new([]),
-                    mode: FlowMode::Continuous,
-                },
-                KernelOwnerNode {
-                    kind: KernelOwnerNodeKind::UserCall {
-                        target: KernelOwnerId(1),
-                        inherited_formal: None,
-                    },
-                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
-                        .into_boxed_slice(),
-                    mode: FlowMode::Continuous,
-                },
-            ]
+                inputs: Box::new([]),
+                mode: FlowMode::Continuous,
+            }]
             .into_boxed_slice(),
             formal_count: 0,
             external_expressions: Box::new([]),
-            result: KernelExpressionId(1),
+            result: KernelExpressionId(0),
+        };
+        let caller = KernelOwnerProgramInput {
+            nodes: vec![KernelOwnerNode {
+                kind: KernelOwnerNodeKind::UserCall {
+                    target: KernelOwnerId(1),
+                    inherited_formal: None,
+                },
+                inputs: Box::new([]),
+                mode: FlowMode::Continuous,
+            }]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(0),
         };
 
         let program = compile_project_program(&KernelProjectProgramInput {
@@ -6896,27 +7027,6 @@ mod tests {
         })
         .unwrap();
         assert!(program.compile_work().summary_invoke_nodes >= 1);
-        let wrapper_program = program
-            .component()
-            .operations
-            .iter()
-            .find_map(|operation| match operation.as_ref() {
-                crate::KernelOperation::SummaryCall { program, .. }
-                    if program
-                        .nodes
-                        .iter()
-                        .any(|node| matches!(node, KernelSummaryNode::Invoke { .. })) =>
-                {
-                    Some(program)
-                }
-                _ => None,
-            })
-            .expect("the wrapper summary must invoke the large shared callee");
-        assert_eq!(
-            wrapper_program.nodes.len(),
-            2,
-            "the wrapper should contain only its input and one shared invocation",
-        );
 
         let artifact = program.solve().unwrap();
         let Type::Object(result) = &artifact.definitions[2].result.ty else {

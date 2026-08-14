@@ -80,6 +80,9 @@ pub enum KernelSummaryRecordEntry {
 /// frame or recursively interpreting source nodes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelSummaryProgram {
+    /// Dense definition identity used only for work attribution. It is not a
+    /// cross-revision or serialized semantic identity.
+    pub definition: u32,
     pub nodes: Box<[KernelSummaryNode]>,
     pub result: KernelSummaryValueId,
 }

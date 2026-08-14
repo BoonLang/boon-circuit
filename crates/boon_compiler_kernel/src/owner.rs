@@ -259,6 +259,7 @@ pub struct KernelOwnerProgram {
     result_output: OutputId,
     expression_outputs: Box<[OutputId]>,
     expression_modes: Box<[FlowMode]>,
+    calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
 }
 
@@ -316,7 +317,65 @@ struct KernelProjectOwnerOutputs {
     result: OutputId,
     expressions: Box<[OutputId]>,
     expression_modes: Box<[FlowMode]>,
+    calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingKernelCallArtifact {
+    expression: KernelExpressionId,
+    target: KernelCallTarget,
+    inputs: Box<[KernelCallInputArtifact]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KernelCallTarget {
+    User {
+        target: KernelOwnerId,
+        inherited_formal: Option<KernelInheritedFormal>,
+    },
+    RenderConstructor {
+        kind: KernelRenderConstructorKind,
+    },
+    PureBuiltin {
+        kind: KernelPureBuiltinKind,
+    },
+    HostEffect {
+        operation: Box<str>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KernelCallInputRole {
+    Formal { ordinal: u32 },
+    Abi { name: Box<str> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelCallInputArtifact {
+    pub role: KernelCallInputRole,
+    pub value: KernelCallValueReference,
+}
+
+/// A call input names either an expression in the call's definition or an
+/// explicit expression/result authority in another dense definition. Keeping
+/// the namespaces distinct prevents linked external providers from masquerading
+/// as out-of-range local expression IDs.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelCallValueReference {
+    Local(KernelExpressionId),
+    External(KernelExternalExpression),
+}
+
+/// One source-authored call occurrence with its compact input edges and solved
+/// result. Downstream consumers no longer need to rediscover call structure by
+/// walking the owner expression graph.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelCallArtifact {
+    pub expression: KernelExpressionId,
+    pub target: KernelCallTarget,
+    pub inputs: Box<[KernelCallInputArtifact]>,
+    pub result: FlowType,
 }
 
 /// One source-authored host-effect occurrence in a definition artifact.
@@ -342,6 +401,7 @@ pub struct KernelHostEffectArtifact {
 pub struct DefinitionArtifact {
     pub result: FlowType,
     pub expressions: Box<[FlowType]>,
+    pub calls: Box<[KernelCallArtifact]>,
     pub effects: Box<[KernelHostEffectArtifact]>,
 }
 
@@ -395,10 +455,12 @@ impl KernelOwnerProgram {
             .position(|output| *output == self.result_output)
             .expect("owner result belongs to its expression outputs");
         result.mode = self.expression_modes[result_index];
+        let calls = materialize_call_artifacts(&self.calls, &expressions);
         Ok(KernelDefinitionSnapshot {
             definition: DefinitionArtifact {
                 result,
                 expressions,
+                calls,
                 effects: self.effects,
             },
             work: artifact.work,
@@ -443,9 +505,11 @@ impl KernelProjectProgram {
                     .position(|output| *output == owner.result)
                     .expect("project owner result belongs to its expression outputs");
                 result.mode = owner.expression_modes[result_index];
+                let calls = materialize_call_artifacts(&owner.calls, &expressions);
                 DefinitionArtifact {
                     result,
                     expressions,
+                    calls,
                     effects: owner.effects.clone(),
                 }
             })
@@ -558,8 +622,109 @@ pub fn compile_owner_program(
         result_output,
         expression_outputs: expression_outputs.into_boxed_slice(),
         expression_modes,
+        calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
     })
+}
+
+fn materialize_call_artifacts(
+    pending: &[PendingKernelCallArtifact],
+    expressions: &[FlowType],
+) -> Box<[KernelCallArtifact]> {
+    pending
+        .iter()
+        .map(|call| KernelCallArtifact {
+            expression: call.expression,
+            target: call.target.clone(),
+            inputs: call.inputs.clone(),
+            result: expressions[call.expression.0 as usize].clone(),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn collect_call_artifacts(
+    input: &KernelOwnerProgramInput,
+) -> Result<Box<[PendingKernelCallArtifact]>, KernelOwnerBuildError> {
+    input
+        .nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(expression, node)| {
+            let (target, uses_abi_inputs) = match &node.kind {
+                KernelOwnerNodeKind::UserCall {
+                    target,
+                    inherited_formal,
+                } => (
+                    KernelCallTarget::User {
+                        target: *target,
+                        inherited_formal: *inherited_formal,
+                    },
+                    false,
+                ),
+                KernelOwnerNodeKind::RenderConstructor { kind } => (
+                    KernelCallTarget::RenderConstructor { kind: kind.clone() },
+                    true,
+                ),
+                KernelOwnerNodeKind::PureBuiltin { kind } => {
+                    (KernelCallTarget::PureBuiltin { kind: *kind }, true)
+                }
+                KernelOwnerNodeKind::HostEffect { operation } => (
+                    KernelCallTarget::HostEffect {
+                        operation: operation.clone(),
+                    },
+                    true,
+                ),
+                _ => return None,
+            };
+            Some((|| {
+                let mut inputs = Vec::with_capacity(node.inputs.len());
+                for edge in &node.inputs {
+                    let role = match &edge.role {
+                        KernelOwnerEdgeRole::CallArgument { ordinal } if !uses_abi_inputs => {
+                            KernelCallInputRole::Formal { ordinal: *ordinal }
+                        }
+                        KernelOwnerEdgeRole::AbiArgument { name } if uses_abi_inputs => {
+                            KernelCallInputRole::Abi { name: name.clone() }
+                        }
+                        role => {
+                            return Err(KernelOwnerBuildError::new(format!(
+                                "kernel call node {expression} has non-call input role {role:?}"
+                            )));
+                        }
+                    };
+                    let reference = edge.expression.0 as usize;
+                    let value = if reference < input.nodes.len() {
+                        KernelCallValueReference::Local(edge.expression)
+                    } else {
+                        let external = input
+                            .external_expressions
+                            .get(reference - input.nodes.len())
+                            .copied()
+                            .ok_or_else(|| {
+                                KernelOwnerBuildError::new(format!(
+                                    "kernel call node {expression} input references expression {reference} outside the local and external namespaces"
+                                ))
+                            })?;
+                        KernelCallValueReference::External(external)
+                    };
+                    inputs.push(KernelCallInputArtifact {
+                        role,
+                        value,
+                    });
+                }
+                Ok(PendingKernelCallArtifact {
+                    expression: KernelExpressionId(
+                        u32::try_from(expression)
+                            .expect("kernel owner expression count exceeds u32"),
+                    ),
+                    target,
+                    inputs: inputs.into_boxed_slice(),
+                })
+            })())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
 }
 
 fn collect_host_effect_artifacts(
@@ -771,6 +936,7 @@ pub fn compile_project_program(
                     .map(|mode| modes[mode.0 as usize])
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
+                calls: collect_call_artifacts(owner)?,
                 effects: collect_host_effect_artifacts(owner)?,
             })
         })
@@ -6586,6 +6752,48 @@ mod tests {
     }
 
     #[test]
+    fn host_effect_call_and_policy_are_published_once_in_the_definition_artifact() {
+        let input = KernelOwnerProgramInput {
+            nodes: vec![KernelOwnerNode {
+                kind: KernelOwnerNodeKind::HostEffect {
+                    operation: "Clock/wall".into(),
+                },
+                inputs: Box::new([]),
+                mode: FlowMode::Continuous,
+            }]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(0),
+        };
+
+        let artifact = compile_owner_program(&input).unwrap().solve().unwrap();
+        let [call] = artifact.definition.calls.as_ref() else {
+            panic!("host effect must publish one call artifact")
+        };
+        let [effect] = artifact.definition.effects.as_ref() else {
+            panic!("host effect must publish one policy artifact")
+        };
+        let spec = host_effect_spec("Clock/wall").expect("wall-clock effect ABI");
+
+        assert_eq!(call.expression, KernelExpressionId(0));
+        assert_eq!(
+            call.target,
+            KernelCallTarget::HostEffect {
+                operation: "Clock/wall".into(),
+            }
+        );
+        assert!(call.inputs.is_empty());
+        assert_eq!(call.result, artifact.definition.expressions[0]);
+        assert_eq!(effect.expression, KernelExpressionId(0));
+        assert_eq!(effect.operation.as_ref(), spec.operation);
+        assert_eq!(effect.replay, spec.replay);
+        assert_eq!(effect.barrier, spec.barrier);
+        assert_eq!(effect.result_policy, spec.result_policy);
+        assert_eq!(effect.delivery, spec.delivery);
+    }
+
+    #[test]
     fn empty_collections_use_language_neutral_item_authorities() {
         let solve = |kind| {
             compile_owner_program(&KernelOwnerProgramInput {
@@ -6873,6 +7081,28 @@ mod tests {
         );
         assert_eq!(artifact.definitions[1].expressions[2].ty, Type::Number);
         assert_eq!(artifact.definitions[1].expressions[3].ty, Type::Text);
+        let [number_call, text_call] = artifact.definitions[1].calls.as_ref() else {
+            panic!("caller definition must publish both call occurrences")
+        };
+        assert_eq!(number_call.expression, KernelExpressionId(2));
+        assert_eq!(text_call.expression, KernelExpressionId(3));
+        assert_eq!(
+            number_call.target,
+            KernelCallTarget::User {
+                target: KernelOwnerId(0),
+                inherited_formal: None,
+            }
+        );
+        assert_eq!(
+            number_call.inputs.as_ref(),
+            [KernelCallInputArtifact {
+                role: KernelCallInputRole::Formal { ordinal: 0 },
+                value: KernelCallValueReference::Local(KernelExpressionId(0)),
+            }]
+        );
+        assert_eq!(number_call.result.ty, Type::Number);
+        assert_eq!(text_call.result.ty, Type::Text);
+        assert!(artifact.definitions[0].calls.is_empty());
     }
 
     #[test]

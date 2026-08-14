@@ -6,8 +6,9 @@
 
 use boon_checked::{FlowMode, FlowType, ObjectShape, Type, Variant, type_is_recursively_closed};
 use boon_compiler_kernel::{
-    KernelCollectionKind, KernelCompileWork, KernelExpressionId, KernelExternalExpression,
-    KernelExternalTarget, KernelInheritedFormal, KernelOwnerEdgeRole, KernelOwnerId,
+    KernelCallInputRole, KernelCallTarget, KernelCallValueReference, KernelCollectionKind,
+    KernelCompileWork, KernelExpressionId, KernelExternalExpression, KernelExternalTarget,
+    KernelHostEffectArtifact, KernelInheritedFormal, KernelOwnerEdgeRole, KernelOwnerId,
     KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput,
     KernelPattern, KernelProjectProgramInput, KernelPureBuiltinKind, KernelRenderConstructorKind,
     KernelSolveWork, compile_project_program, is_kernel_host_effect,
@@ -27,6 +28,8 @@ pub struct KernelOwnerOracleEntry {
     pub result_expression: Option<StableExpressionKey>,
     pub result: FlowType,
     pub expressions: Box<[(StableExpressionKey, FlowType)]>,
+    pub calls: Box<[KernelOwnerOracleCall]>,
+    pub effects: Box<[(StableExpressionKey, KernelHostEffectArtifact)]>,
     pub public_child_owner_fields: Box<[(String, StableCheckOwnerKey)]>,
     pub public_child_kernel_fields: Box<[(String, FlowType)]>,
     pub exported_as_public_child: bool,
@@ -36,6 +39,37 @@ pub struct KernelOwnerOracleEntry {
     pub generic_selector_dependents: Box<[StableExpressionKey]>,
     pub detached_generic_reads: Box<[StableExpressionKey]>,
     pub legacy_no_element_dependents: Box<[StableExpressionKey]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleCall {
+    pub expression: StableExpressionKey,
+    pub target: KernelOwnerOracleCallTarget,
+    pub inputs: Box<[KernelOwnerOracleCallInput]>,
+    pub result: FlowType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KernelOwnerOracleCallTarget {
+    User {
+        target: StableCheckOwnerKey,
+        inherited_formal: Option<KernelInheritedFormal>,
+    },
+    RenderConstructor(KernelRenderConstructorKind),
+    PureBuiltin(KernelPureBuiltinKind),
+    HostEffect(Box<str>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleCallInput {
+    pub role: KernelCallInputRole,
+    pub provider: KernelOwnerOracleValueReference,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KernelOwnerOracleValueReference {
+    Expression(StableExpressionKey),
+    OwnerResult(StableCheckOwnerKey),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -371,6 +405,109 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 .zip(definitions)
                 .map(|(prepared_index, artifact)| {
                     let owner = &prepared[*prepared_index];
+                    let calls = artifact
+                        .calls
+                        .into_iter()
+                        .map(|call| {
+                            let target = match call.target {
+                                KernelCallTarget::User {
+                                    target,
+                                    inherited_formal,
+                                } => {
+                                    let target = active
+                                        .get(target.0 as usize)
+                                        .and_then(|target| prepared.get(*target))
+                                        .unwrap_or_else(|| {
+                                            panic!(
+                                                "kernel call targets missing dense owner {}",
+                                                target.0
+                                            )
+                                        });
+                                    KernelOwnerOracleCallTarget::User {
+                                        target: target.owner.clone(),
+                                        inherited_formal,
+                                    }
+                                }
+                                KernelCallTarget::RenderConstructor { kind } => {
+                                    KernelOwnerOracleCallTarget::RenderConstructor(kind)
+                                }
+                                KernelCallTarget::PureBuiltin { kind } => {
+                                    KernelOwnerOracleCallTarget::PureBuiltin(kind)
+                                }
+                                KernelCallTarget::HostEffect { operation } => {
+                                    KernelOwnerOracleCallTarget::HostEffect(operation)
+                                }
+                            };
+                            KernelOwnerOracleCall {
+                                expression: owner.expressions
+                                    [call.expression.0 as usize]
+                                    .clone(),
+                                target,
+                                inputs: call
+                                    .inputs
+                                    .iter()
+                                    .map(|input| {
+                                        let provider = match input.value {
+                                            KernelCallValueReference::Local(expression) => {
+                                                KernelOwnerOracleValueReference::Expression(
+                                                    owner.expressions[expression.0 as usize].clone(),
+                                                )
+                                            }
+                                            KernelCallValueReference::External(external) => {
+                                                let target = active
+                                                    .get(external.owner.0 as usize)
+                                                    .and_then(|target| prepared.get(*target))
+                                                    .unwrap_or_else(|| {
+                                                        panic!(
+                                                            "kernel call input targets missing dense owner {}",
+                                                            external.owner.0
+                                                        )
+                                                    });
+                                                match external.target {
+                                                    KernelExternalTarget::Expression(expression) => {
+                                                        KernelOwnerOracleValueReference::Expression(
+                                                            target.expressions
+                                                                [expression.0 as usize]
+                                                                .clone(),
+                                                        )
+                                                    }
+                                                    KernelExternalTarget::Result => target
+                                                        .result_expression
+                                                        .clone()
+                                                        .map(
+                                                            KernelOwnerOracleValueReference::Expression,
+                                                        )
+                                                        .unwrap_or_else(|| {
+                                                            KernelOwnerOracleValueReference::OwnerResult(
+                                                                target.owner.clone(),
+                                                            )
+                                                        }),
+                                                }
+                                            }
+                                        };
+                                        KernelOwnerOracleCallInput {
+                                            role: input.role.clone(),
+                                            provider,
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .into_boxed_slice(),
+                                result: call.result,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    let effects = artifact
+                        .effects
+                        .into_iter()
+                        .map(|effect| {
+                            (
+                                owner.expressions[effect.expression.0 as usize].clone(),
+                                effect,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
                     let expressions = owner
                         .expressions
                         .iter()
@@ -383,6 +520,8 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         result_expression: owner.result_expression.clone(),
                         result: artifact.result,
                         expressions,
+                        calls,
+                        effects,
                         public_child_owner_fields: owner.public_child_owner_fields.clone(),
                         public_child_kernel_fields: owner
                             .public_child_owner_fields
@@ -3236,8 +3375,8 @@ fn checked_u32(value: usize, context: &str) -> Result<u32, String> {
 mod tests {
     use super::*;
     use boon_checked::{
-        CheckedDeclarationKind, CheckedProgramFields, CheckedStatementKind, ObjectShape,
-        SharedVariantSet, TypeVar, Variant,
+        CheckedDeclarationKind, CheckedExpressionKind, CheckedProgramFields, CheckedStatementKind,
+        DeclId, ObjectShape, SharedVariantSet, TypeVar, Variant,
     };
     use boon_parser::{parse_project_syntax, parse_source};
     use std::collections::BTreeMap;
@@ -3552,6 +3691,188 @@ mod tests {
         {
             panic!("{mismatch}");
         }
+    }
+
+    fn checked_callable_owners(
+        checked: &CheckedProgramFields,
+        project: &ProjectSyntaxSnapshot,
+    ) -> BTreeMap<DeclId, StableCheckOwnerKey> {
+        project
+            .item_index()
+            .owners()
+            .filter(|entry| entry.kind == UnitItemKind::Function)
+            .filter_map(|entry| {
+                let statement = checked
+                    .statements
+                    .get(project.statement_slot(entry.statement_id)?)?;
+                let CheckedStatementKind::Function { declaration } = statement.kind else {
+                    return None;
+                };
+                Some((
+                    declaration,
+                    StableCheckOwnerKey::Item(entry.owner_key.clone()),
+                ))
+            })
+            .collect()
+    }
+
+    fn call_and_effect_inventory_mismatches(
+        report: &KernelOwnerOracleReport,
+        checked: &CheckedProgramFields,
+        checked_expression_by_stable: &BTreeMap<StableExpressionKey, boon_checked::CheckedExprId>,
+        stable_by_checked_expression: &BTreeMap<boon_checked::CheckedExprId, StableExpressionKey>,
+        project: &ProjectSyntaxSnapshot,
+    ) -> Vec<String> {
+        let callable_owners = checked_callable_owners(checked, project);
+        let mut mismatches = Vec::new();
+        let mut kernel_calls = BTreeMap::new();
+        let mut kernel_effects = BTreeMap::new();
+        for owner in &report.supported {
+            let expression_flows = owner
+                .expressions
+                .iter()
+                .cloned()
+                .collect::<BTreeMap<_, _>>();
+            for call in &owner.calls {
+                if kernel_calls
+                    .insert(call.expression.clone(), (&owner.owner, call))
+                    .is_some()
+                {
+                    mismatches.push(format!(
+                        "kernel repeats call occurrence {:?}",
+                        call.expression
+                    ));
+                }
+                if expression_flows.get(&call.expression) != Some(&call.result) {
+                    mismatches.push(format!(
+                        "kernel call {:?} result differs from its expression row",
+                        call.expression
+                    ));
+                }
+            }
+            for (expression, effect) in &owner.effects {
+                if kernel_effects
+                    .insert(expression.clone(), (&owner.owner, effect))
+                    .is_some()
+                {
+                    mismatches.push(format!(
+                        "kernel repeats host-effect occurrence {expression:?}"
+                    ));
+                }
+            }
+        }
+
+        let mut current_calls = BTreeMap::new();
+        for call in &checked.calls {
+            let Some(stable) = stable_by_checked_expression.get(&call.expression).cloned() else {
+                mismatches.push(format!(
+                    "checked call {:?} `{}` has no stable source expression",
+                    call.id, call.function
+                ));
+                continue;
+            };
+            if current_calls.insert(stable.clone(), call).is_some() {
+                mismatches.push(format!("checked image repeats call occurrence {stable:?}"));
+            }
+            let Some(expression) = checked.expressions.get(call.expression.0 as usize) else {
+                mismatches.push(format!(
+                    "checked call {:?} references missing expression {:?}",
+                    call.id, call.expression
+                ));
+                continue;
+            };
+            if expression.flow_type != call.result {
+                mismatches.push(format!(
+                    "checked call {:?} result differs from its expression row",
+                    call.id
+                ));
+            }
+            if !matches!(expression.kind, CheckedExpressionKind::Call { call: id } if id == call.id)
+            {
+                mismatches.push(format!(
+                    "checked call {:?} is not owned by expression {:?}",
+                    call.id, call.expression
+                ));
+            }
+        }
+
+        for (stable, (owner, kernel)) in &kernel_calls {
+            let Some(current) = current_calls.get(stable) else {
+                mismatches.push(format!(
+                    "kernel owner {owner:?} call {stable:?} has no checked call row"
+                ));
+                continue;
+            };
+            let target_matches = match &kernel.target {
+                KernelOwnerOracleCallTarget::User {
+                    target,
+                    inherited_formal,
+                } => {
+                    callable_owners.get(&current.callable) == Some(target)
+                        && inherited_formal.is_some()
+                            == matches!(
+                                current.context_binding,
+                                boon_checked::CheckedContextBinding::Inherited { .. }
+                            )
+                }
+                KernelOwnerOracleCallTarget::RenderConstructor(kind) => {
+                    render_constructor_kind(&current.function).as_ref() == Some(kind)
+                }
+                KernelOwnerOracleCallTarget::PureBuiltin(kind) => {
+                    pure_builtin_kind(&current.function).as_ref() == Some(kind)
+                }
+                KernelOwnerOracleCallTarget::HostEffect(operation) => {
+                    current.function == operation.as_ref()
+                }
+            };
+            if !target_matches {
+                mismatches.push(format!(
+                    "kernel owner {owner:?} call {stable:?} target {:?} differs from checked `{}` callable {:?}",
+                    kernel.target, current.function, current.callable
+                ));
+            }
+            if checked_expression_by_stable.get(stable) != Some(&current.expression) {
+                mismatches.push(format!(
+                    "kernel owner {owner:?} call {stable:?} maps to a different checked expression"
+                ));
+            }
+        }
+        for stable in current_calls.keys() {
+            if !kernel_calls.contains_key(stable) {
+                mismatches.push(format!(
+                    "checked call {stable:?} has no kernel call artifact"
+                ));
+            }
+        }
+
+        let current_effects = current_calls
+            .iter()
+            .filter_map(|(stable, call)| {
+                is_kernel_host_effect(&call.function).then_some((stable.clone(), *call))
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (stable, (owner, kernel)) in &kernel_effects {
+            let Some(current) = current_effects.get(stable) else {
+                mismatches.push(format!(
+                    "kernel owner {owner:?} host effect {stable:?} has no checked effect call"
+                ));
+                continue;
+            };
+            if kernel.operation.as_ref() != current.function {
+                mismatches.push(format!(
+                    "kernel owner {owner:?} host effect {stable:?} operation differs from checked `{}`",
+                    current.function
+                ));
+            }
+        }
+        for stable in current_effects.keys() {
+            if !kernel_effects.contains_key(stable) {
+                mismatches.push(format!(
+                    "checked host effect {stable:?} has no kernel effect artifact"
+                ));
+            }
+        }
+        mismatches
     }
 
     fn checked_public_child_composed_result(
@@ -4435,7 +4756,7 @@ mod tests {
             &project,
             "call-composition function",
         );
-        let results = oracle
+        let result_owners = oracle
             .supported
             .iter()
             .filter_map(|owner| {
@@ -4443,24 +4764,78 @@ mod tests {
                     return None;
                 };
                 let name = key.item_route.segments().last()?.names.first()?;
-                matches!(name.as_str(), "number_box" | "text_box")
-                    .then(|| (name.clone(), owner.result.ty.clone()))
+                matches!(name.as_str(), "number_box" | "text_box").then(|| (name.clone(), owner))
             })
             .collect::<BTreeMap<_, _>>();
         assert_eq!(
-            results["number_box"],
+            result_owners["number_box"].result.ty,
             Type::object(ObjectShape::from_ordered_fields(
                 [("value".to_owned(), Type::Number)],
                 false,
             ))
         );
         assert_eq!(
-            results["text_box"],
+            result_owners["text_box"].result.ty,
             Type::object(ObjectShape::from_ordered_fields(
                 [("value".to_owned(), Type::Text)],
                 false,
             ))
         );
+        for owner in result_owners.values() {
+            let [call] = owner.calls.as_ref() else {
+                panic!("parsed call owner must publish one compact call row")
+            };
+            assert_eq!(call.expression, owner.result_expression.clone().unwrap());
+            assert_eq!(call.result, owner.result);
+            assert_eq!(
+                call.target,
+                KernelOwnerOracleCallTarget::User {
+                    target: function_owner.owner.clone(),
+                    inherited_formal: None,
+                }
+            );
+            let [input] = call.inputs.as_ref() else {
+                panic!("box call must publish its one formal input edge")
+            };
+            assert_eq!(input.role, KernelCallInputRole::Formal { ordinal: 0 });
+            assert!(matches!(
+                &input.provider,
+                KernelOwnerOracleValueReference::Expression(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn parsed_host_effect_publishes_one_stable_call_and_policy_row() {
+        let source = "result: Clock/wall()\n";
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse host-effect artifact fixture");
+        let oracle = kernel_owner_oracle(&project);
+        let result = oracle
+            .supported
+            .iter()
+            .find(|owner| {
+                matches!(&owner.owner, StableCheckOwnerKey::Item(key) if key.item_route.segments().last().is_some_and(|segment| segment.names.as_ref() == ["result"]))
+            })
+            .unwrap_or_else(|| panic!("host-effect result must compile: {:#?}", oracle.unsupported));
+        let [call] = result.calls.as_ref() else {
+            panic!("parsed host effect must publish one compact call row")
+        };
+        let [(effect_expression, effect)] = result.effects.as_ref() else {
+            panic!("parsed host effect must publish one compact policy row")
+        };
+
+        assert_eq!(call.expression, *effect_expression);
+        assert_eq!(call.expression, result.result_expression.clone().unwrap());
+        assert_eq!(call.result, result.result);
+        assert_eq!(
+            call.target,
+            KernelOwnerOracleCallTarget::HostEffect("Clock/wall".into())
+        );
+        assert!(call.inputs.is_empty());
+        assert_eq!(effect.expression, KernelExpressionId(0));
+        assert_eq!(effect.operation.as_ref(), "Clock/wall");
     }
 
     #[test]
@@ -5492,6 +5867,19 @@ mod tests {
 
         let (report, timings) =
             profile_kernel_owner_oracle_with_source_payloads(&project, &source_payloads);
+        eprintln!(
+            "kernel-novywave definition_artifacts call_rows={} host_effect_rows={}",
+            report
+                .supported
+                .iter()
+                .map(|owner| owner.calls.len())
+                .sum::<usize>(),
+            report
+                .supported
+                .iter()
+                .map(|owner| owner.effects.len())
+                .sum::<usize>(),
+        );
 
         if std::env::var_os("BOON_KERNEL_CANDIDATE_ONLY").is_some() {
             if report.supported.is_empty() {
@@ -5635,19 +6023,23 @@ mod tests {
         assert_eq!(timings.container_owners, report.container_owners.len());
         assert_eq!(timings.unsupported_owners, report.unsupported.len());
         let mut checked_by_stable_key = BTreeMap::new();
+        let mut checked_expression_by_stable = BTreeMap::new();
+        let mut stable_by_checked_expression = BTreeMap::new();
         for owner in project.stable_check_owner_keys() {
             let view = project
                 .owner_view(&owner)
                 .expect("NovyWave owner has a view");
             for (expression, stable_key) in view.expressions().zip(view.stable_expression_keys()) {
-                let Some(flow_type) = project
+                let Some(checked_expression) = project
                     .expression_slot(expression.id)
                     .and_then(|slot| fields.expressions.get(slot))
-                    .map(|expression| expression.flow_type.clone())
                 else {
                     continue;
                 };
-                checked_by_stable_key.insert(stable_key, flow_type);
+                checked_by_stable_key
+                    .insert(stable_key.clone(), checked_expression.flow_type.clone());
+                checked_expression_by_stable.insert(stable_key.clone(), checked_expression.id);
+                stable_by_checked_expression.insert(checked_expression.id, stable_key);
             }
         }
         if let Some(pattern) = std::env::var_os("BOON_KERNEL_ORACLE_TRACE_OWNER") {
@@ -5673,7 +6065,7 @@ mod tests {
                 }
             }
         }
-        let mismatches = report
+        let mut mismatches = report
             .supported
             .iter()
             .filter_map(|owner| {
@@ -5686,6 +6078,13 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
+        mismatches.extend(call_and_effect_inventory_mismatches(
+            &report,
+            fields,
+            &checked_expression_by_stable,
+            &stable_by_checked_expression,
+            &project,
+        ));
         if !mismatches.is_empty() {
             eprintln!("kernel-novywave parity_mismatch_count={}", mismatches.len());
             for mismatch in &mismatches {

@@ -2840,6 +2840,37 @@ slower than the preceding receipt while its first sample is slightly faster;
 with identical work counts this is recorded as measurement noise rather than a
 claimed speed change. The parity cut is accepted for correctness, not speed.
 
+The first non-flow `DefinitionArtifact` cut now makes call and host-effect
+inventory kernel-owned. Every source-authored user, renderer, pure builtin, or
+host-effect call publishes one compact row containing its definition-local
+expression, typed target, ordered input roles, explicit local/external provider
+reference, and solved result. An external provider is no longer represented by
+an out-of-range local expression ID. Host-effect rows additionally copy replay,
+barrier, result, and delivery policy exactly once from the dependency-bottom ABI
+registry; downstream construction does not need to rediscover those policies by
+walking source or checked call records.
+
+The complete NovyWave differential publishes 1,821 call rows and 11 host-effect
+rows. It proves one-to-one stable call occurrence coverage, stable user-call
+targets, inherited-context presence, renderer/pure/host target classification,
+call-result agreement with the expression artifact, and exact host operation
+coverage while retaining the full owner-flow differential. Regular parser-backed
+tests prove stable user-call/provider projection and stable host-effect rows; a
+kernel test locks every copied effect policy against the ABI registry. Exact
+legacy `FreshOut`/`ForwardOut`, contextual substitution, and call-entry binding
+parity remains a later artifact sub-cut rather than being inferred from these
+rows.
+
+One no-rebuild debug receipt records 1,824.357 ms kernel time, including 582.802
+ms compile/link and 934.597 ms solve, with the same 39,798 variables, 32,826
+operations, 69,687 activations, 57,375 mutations, and 23,827 dynamic edges.
+This table-only artifact publication is not claimed as a speed improvement over
+the preceding 1,839.611 ms debug sample, and it does not spend another optimized
+rebuild; the last accepted 402.059 ms release median remains the release
+baseline. All 54 kernel unit tests, 84 non-ignored compiler unit tests, and 16
+compiler integration tests pass; the ignored complete NovyWave call/effect and
+flow differential also passes explicitly.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not

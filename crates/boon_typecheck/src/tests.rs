@@ -2337,4 +2337,36 @@ fn compact_authoritative_call_shapes_are_unique_dense_and_type_free() {
     assert_eq!(parameters("Random/bytes"), [("byte_count", false)]);
     assert!(parameters("Clock/wall").is_empty());
     assert!(parameters("SessionInfo/status").is_empty());
+
+    let list_map = shape("List/map");
+    assert_eq!(
+        list_map
+            .parameters
+            .iter()
+            .map(|parameter| (
+                parameter.name.as_str(),
+                parameter.kind,
+                parameter.evaluation_scope,
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                "list",
+                CheckedParameterKind::Value,
+                CheckedAuthoritativeEvaluationScopeV1::Parent,
+            ),
+            (
+                "item",
+                CheckedParameterKind::Out,
+                CheckedAuthoritativeEvaluationScopeV1::Parent,
+            ),
+            (
+                "new",
+                CheckedParameterKind::Value,
+                CheckedAuthoritativeEvaluationScopeV1::Output {
+                    parameter_ordinal: 1,
+                },
+            ),
+        ]
+    );
 }

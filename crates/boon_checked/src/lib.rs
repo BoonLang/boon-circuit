@@ -1214,6 +1214,22 @@ pub struct CheckedAuthoritativeParameterShapeV1 {
     pub kind: CheckedParameterKind,
     pub ordinal: u32,
     pub optional: bool,
+    pub evaluation_scope: CheckedAuthoritativeEvaluationScopeV1,
+}
+
+/// Type-free evaluation region of one authoritative callable input.
+///
+/// This is lexical call-frame data, not a typechecker implementation detail:
+/// an ordinary callback expression may be evaluated under a fresh `OUT`
+/// binding rather than in the caller's parent region.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CheckedAuthoritativeEvaluationScopeV1 {
+    #[default]
+    Parent,
+    Output {
+        parameter_ordinal: u32,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

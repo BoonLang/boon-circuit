@@ -18,12 +18,13 @@ use boon_compiler_kernel::{
     KernelExternalTarget, KernelHostEffectArtifact, KernelInheritedFormal, KernelLexicalAccess,
     KernelLexicalBindingInput, KernelLexicalBindingTarget, KernelLexicalBindingTargetInput,
     KernelListId, KernelListInput, KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge,
-    KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelParameterKind,
-    KernelPattern, KernelProjectInput, KernelProjectProgramInput, KernelPureBuiltinKind,
-    KernelRenderConstructorKind, KernelSolveWork, KernelSourceId, KernelSourceInput, KernelStateId,
-    KernelStateInput, KernelStatementChildReference, KernelStatementId, KernelStatementInput,
-    KernelStatementKind, KernelStatementParameter, KernelStatementReference, KernelValueReference,
-    is_kernel_host_effect, is_registered_kernel_host_effect, project_kernel_call_shape,
+    KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelParameterEvaluationScope,
+    KernelParameterKind, KernelPattern, KernelProjectInput, KernelProjectProgramInput,
+    KernelPureBuiltinKind, KernelRenderConstructorKind, KernelSolveWork, KernelSourceId,
+    KernelSourceInput, KernelStateId, KernelStateInput, KernelStatementChildReference,
+    KernelStatementId, KernelStatementInput, KernelStatementKind, KernelStatementParameter,
+    KernelStatementReference, KernelValueReference, is_kernel_host_effect,
+    is_registered_kernel_host_effect, project_kernel_call_shape,
     project_kernel_source_expression_diagnostics,
 };
 use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
@@ -505,9 +506,12 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     let total_started = Instant::now();
     let owner_order = project.stable_check_owner_keys().collect::<Vec<_>>();
     let input_owners = owner_order.len();
-    let callable_surfaces = project_callable_surfaces(project);
     let value_surfaces = project_value_surfaces(project);
     let authoritative_call_shapes = project_kernel_authoritative_call_shapes();
+    let callable_surfaces = authoritative_call_shapes
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|authoritative| project_callable_surfaces(project, authoritative));
     let owner_projection_started = Instant::now();
     let mut direct_projection_elapsed = Duration::ZERO;
     let mut prepared = Vec::<PreparedOwner>::new();
@@ -527,7 +531,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
             let compact = compact_owner_view(
                 view,
                 source_payloads,
-                &callable_surfaces,
+                callable_surfaces.as_ref().map_err(Clone::clone)?,
                 authoritative_call_shapes.as_ref().map_err(Clone::clone)?,
                 &value_surfaces,
             );
@@ -1654,6 +1658,16 @@ struct PreparedLexicalBinding {
     directional: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedOutputBinding {
+    formal_ordinal: u32,
+    name: String,
+    provider: usize,
+    active_inputs: Box<[usize]>,
+}
+
+type PreparedOutputBindingsByScope = BTreeMap<usize, Box<[PreparedOutputBinding]>>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreparedResourceOwnerField {
     SourceDeclaration(usize),
@@ -1790,6 +1804,14 @@ fn project_kernel_authoritative_call_shapes()
                     },
                     name: parameter.name.into_boxed_str(),
                     optional: parameter.optional,
+                    evaluation_scope: match parameter.evaluation_scope {
+                        boon_checked::CheckedAuthoritativeEvaluationScopeV1::Parent => {
+                            KernelParameterEvaluationScope::Parent
+                        }
+                        boon_checked::CheckedAuthoritativeEvaluationScopeV1::Output {
+                            parameter_ordinal,
+                        } => KernelParameterEvaluationScope::Output { parameter_ordinal },
+                    },
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
@@ -1814,6 +1836,7 @@ fn dynamic_authoritative_call_surface(
             kind: KernelParameterKind::Value,
             name: "input".into(),
             optional: false,
+            evaluation_scope: KernelParameterEvaluationScope::Parent,
         }]
         .into_boxed_slice(),
     })
@@ -1824,11 +1847,13 @@ struct CallableParameter {
     name: String,
     ordinal: usize,
     kind: KernelParameterKind,
+    evaluation_scope: KernelParameterEvaluationScope,
 }
 
 fn project_callable_surfaces(
     project: &ProjectSyntaxSnapshot,
-) -> BTreeMap<String, Box<[CallableSurface]>> {
+    authoritative: &BTreeMap<String, AuthoritativeCallSurface>,
+) -> Result<BTreeMap<String, Box<[CallableSurface]>>, String> {
     let definitions = project
         .item_index()
         .definitions()
@@ -1894,41 +1919,417 @@ fn project_callable_surfaces(
         }
     }
 
+    let mut surfaces_by_owner = BTreeMap::<StableCheckOwnerKey, CallableSurface>::new();
+    for entry in &definitions {
+        let owner = StableCheckOwnerKey::Item(entry.owner_key.clone());
+        let context_ordinal = contexts.contains(&owner).then_some(entry.parameters.len());
+        let surface = CallableSurface {
+            owner: owner.clone(),
+            parameters: entry
+                .parameters
+                .iter()
+                .map(|parameter| CallableParameter {
+                    name: parameter.name.clone(),
+                    ordinal: parameter.ordinal,
+                    kind: match parameter.kind {
+                        AstParameterKind::Value => KernelParameterKind::Value,
+                        AstParameterKind::Out => KernelParameterKind::Out,
+                    },
+                    evaluation_scope: KernelParameterEvaluationScope::Parent,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            context_ordinal,
+        };
+        if surfaces_by_owner.insert(owner, surface).is_some() {
+            return Err("project callable index repeats one function owner".to_owned());
+        }
+    }
+    infer_callable_parameter_evaluation_scopes(
+        project,
+        authoritative,
+        &callable_owner_by_name,
+        &mut surfaces_by_owner,
+    )?;
+
     let mut surfaces = BTreeMap::<String, Vec<CallableSurface>>::new();
     for entry in definitions {
         let owner = StableCheckOwnerKey::Item(entry.owner_key.clone());
-        let context_ordinal = contexts.contains(&owner).then_some(entry.parameters.len());
+        let surface = surfaces_by_owner
+            .get(&owner)
+            .ok_or_else(|| format!("callable owner {owner:?} has no compact surface"))?;
         for name in &entry.names {
             surfaces
                 .entry(name.clone())
                 .or_default()
-                .push(CallableSurface {
-                    owner: owner.clone(),
-                    parameters: entry
-                        .parameters
-                        .iter()
-                        .map(|parameter| CallableParameter {
-                            name: parameter.name.clone(),
-                            ordinal: parameter.ordinal,
-                            kind: match parameter.kind {
-                                AstParameterKind::Value => KernelParameterKind::Value,
-                                AstParameterKind::Out => KernelParameterKind::Out,
-                            },
-                        })
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
-                    context_ordinal,
-                });
+                .push(surface.clone());
         }
     }
-    surfaces
+    Ok(surfaces
         .into_iter()
         .map(|(name, mut candidates)| {
             candidates.sort_by(|left, right| left.owner.cmp(&right.owner));
             candidates.dedup_by(|left, right| left.owner == right.owner);
             (name, candidates.into_boxed_slice())
         })
-        .collect()
+        .collect())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutputBindingActual {
+    kind: AstCallArgKind,
+    expression: usize,
+}
+
+fn infer_callable_parameter_evaluation_scopes(
+    project: &ProjectSyntaxSnapshot,
+    authoritative: &BTreeMap<String, AuthoritativeCallSurface>,
+    callable_owner_by_name: &BTreeMap<String, Vec<StableCheckOwnerKey>>,
+    surfaces_by_owner: &mut BTreeMap<StableCheckOwnerKey, CallableSurface>,
+) -> Result<(), String> {
+    loop {
+        let mut updates = BTreeMap::<(StableCheckOwnerKey, usize), u32>::new();
+        for (owner, surface) in surfaces_by_owner.iter() {
+            let Some(view) = project.owner_view(owner) else {
+                continue;
+            };
+            let raw_expressions = view.expressions().collect::<Vec<_>>();
+            let stable_expressions = view.stable_expression_keys().collect::<Vec<_>>();
+            if raw_expressions.len() != stable_expressions.len() {
+                return Err(format!(
+                    "callable scope inference has an incomplete expression table for {owner:?}"
+                ));
+            }
+            let syntax_by_stable = stable_expressions
+                .into_iter()
+                .zip(raw_expressions.iter().map(|expression| expression.id))
+                .collect::<BTreeMap<_, _>>();
+            let parent_by_syntax = raw_expressions
+                .iter()
+                .filter_map(|expression| {
+                    let (parent_owner, parent, _) =
+                        view.stable_expression_parent_edge_for_syntax(expression.id)?;
+                    (parent_owner == *owner)
+                        .then(|| syntax_by_stable.get(&parent).copied())
+                        .flatten()
+                        .map(|parent| (expression.id, parent))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let expression_by_syntax = raw_expressions
+                .iter()
+                .map(|expression| (expression.id, *expression))
+                .collect::<BTreeMap<_, _>>();
+            let value_parameters = surface
+                .parameters
+                .iter()
+                .filter(|parameter| parameter.kind == KernelParameterKind::Value)
+                .map(|parameter| (parameter.name.as_str(), parameter))
+                .collect::<BTreeMap<_, _>>();
+            let out_parameters = surface
+                .parameters
+                .iter()
+                .filter(|parameter| parameter.kind == KernelParameterKind::Out)
+                .map(|parameter| (parameter.name.as_str(), parameter.ordinal))
+                .collect::<BTreeMap<_, _>>();
+            for expression in &raw_expressions {
+                let Some(root) = syntax_binding_root(expression) else {
+                    continue;
+                };
+                let Some(parameter) = value_parameters.get(root).copied() else {
+                    continue;
+                };
+                let Some(output_ordinal) = inferred_public_output_scope(
+                    expression.id,
+                    surface,
+                    &parent_by_syntax,
+                    &expression_by_syntax,
+                    &out_parameters,
+                    authoritative,
+                    callable_owner_by_name,
+                    surfaces_by_owner,
+                )?
+                else {
+                    continue;
+                };
+                match parameter.evaluation_scope {
+                    KernelParameterEvaluationScope::Parent => {
+                        match updates.entry((owner.clone(), parameter.ordinal)) {
+                            std::collections::btree_map::Entry::Vacant(entry) => {
+                                entry.insert(output_ordinal);
+                            }
+                            std::collections::btree_map::Entry::Occupied(entry)
+                                if *entry.get() == output_ordinal => {}
+                            std::collections::btree_map::Entry::Occupied(entry) => {
+                                return Err(format!(
+                                    "callable {owner:?} parameter `{}` requires incompatible OUT scopes {} and {}",
+                                    parameter.name,
+                                    entry.get(),
+                                    output_ordinal
+                                ));
+                            }
+                        }
+                    }
+                    KernelParameterEvaluationScope::Output { parameter_ordinal }
+                        if parameter_ordinal == output_ordinal => {}
+                    KernelParameterEvaluationScope::Output { parameter_ordinal } => {
+                        return Err(format!(
+                            "callable {owner:?} parameter `{}` requires incompatible OUT scopes {} and {}",
+                            parameter.name, parameter_ordinal, output_ordinal
+                        ));
+                    }
+                }
+            }
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        for ((owner, ordinal), output_ordinal) in updates {
+            let surface = surfaces_by_owner
+                .get_mut(&owner)
+                .ok_or_else(|| format!("callable scope update lost owner {owner:?}"))?;
+            let parameter = surface
+                .parameters
+                .iter_mut()
+                .find(|parameter| parameter.ordinal == ordinal)
+                .ok_or_else(|| {
+                    format!("callable scope update lost parameter {ordinal} in {owner:?}")
+                })?;
+            parameter.evaluation_scope = KernelParameterEvaluationScope::Output {
+                parameter_ordinal: output_ordinal,
+            };
+        }
+    }
+}
+
+fn inferred_public_output_scope(
+    read: usize,
+    caller: &CallableSurface,
+    parent_by_syntax: &BTreeMap<usize, usize>,
+    expression_by_syntax: &BTreeMap<usize, &boon_syntax::AstExpr>,
+    public_outputs: &BTreeMap<&str, usize>,
+    authoritative: &BTreeMap<String, AuthoritativeCallSurface>,
+    callable_owner_by_name: &BTreeMap<String, Vec<StableCheckOwnerKey>>,
+    surfaces_by_owner: &BTreeMap<StableCheckOwnerKey, CallableSurface>,
+) -> Result<Option<u32>, String> {
+    let mut cursor = read;
+    let mut visited = BTreeSet::new();
+    while visited.insert(cursor) {
+        let Some(parent) = parent_by_syntax.get(&cursor).copied() else {
+            return Ok(None);
+        };
+        let Some(expression) = expression_by_syntax.get(&parent).copied() else {
+            return Ok(None);
+        };
+        let Some((scope, output_actual)) = call_child_evaluation_scope(
+            expression,
+            cursor,
+            caller,
+            authoritative,
+            callable_owner_by_name,
+            surfaces_by_owner,
+        )?
+        else {
+            cursor = parent;
+            continue;
+        };
+        let KernelParameterEvaluationScope::Output { .. } = scope else {
+            cursor = parent;
+            continue;
+        };
+        let Some(actual) = output_actual else {
+            return Ok(None);
+        };
+        match actual.kind {
+            AstCallArgKind::BareBinding => {
+                // A fresh nested output inherits the call's parent region.
+                cursor = parent;
+            }
+            AstCallArgKind::Named => {
+                let Some(actual_expression) = expression_by_syntax.get(&actual.expression) else {
+                    return Ok(None);
+                };
+                let Some(name) = syntax_exact_binding_name(actual_expression) else {
+                    return Ok(None);
+                };
+                let Some(ordinal) = public_outputs.get(name).copied() else {
+                    return Ok(None);
+                };
+                return u32::try_from(ordinal)
+                    .map(Some)
+                    .map_err(|_| format!("callable {:?} OUT ordinal exceeds u32", caller.owner));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn call_child_evaluation_scope(
+    expression: &boon_syntax::AstExpr,
+    child: usize,
+    caller: &CallableSurface,
+    authoritative: &BTreeMap<String, AuthoritativeCallSurface>,
+    callable_owner_by_name: &BTreeMap<String, Vec<StableCheckOwnerKey>>,
+    surfaces_by_owner: &BTreeMap<StableCheckOwnerKey, CallableSurface>,
+) -> Result<Option<(KernelParameterEvaluationScope, Option<OutputBindingActual>)>, String> {
+    let function = match &expression.kind {
+        AstExprKind::Call { function, .. } => function,
+        AstExprKind::Pipe { op, .. } => op,
+        _ => return Ok(None),
+    };
+    let (kind, parameters, context_ordinal) = if let Some(surface) = authoritative.get(function) {
+        (surface.kind, surface.parameters.clone(), None)
+    } else {
+        let Some(candidates) = callable_owner_by_name.get(function) else {
+            return Ok(None);
+        };
+        let [target] = candidates.as_slice() else {
+            return Ok(None);
+        };
+        let Some(surface) = surfaces_by_owner.get(target) else {
+            return Ok(None);
+        };
+        (
+            KernelCallableKind::User,
+            compact_call_shape_parameters(surface)?,
+            surface
+                .context_ordinal
+                .map(|ordinal| checked_u32(ordinal, "call context ordinal"))
+                .transpose()?,
+        )
+    };
+    let shape = compact_call_shape_input(KernelExpressionId(0), expression)?;
+    let projection = project_kernel_call_shape(
+        &shape,
+        &KernelCallShapeResolution::Callable {
+            kind,
+            parameters: parameters.clone(),
+            context_ordinal,
+            caller_context_ordinal: caller
+                .context_ordinal
+                .map(|ordinal| checked_u32(ordinal, "caller context ordinal"))
+                .transpose()?,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    if !projection.valid {
+        return Ok(None);
+    }
+    let source = call_argument_source_for_child(expression, child)?;
+    let Some(matched) = projection
+        .matched_inputs
+        .iter()
+        .find(|matched| Some(matched.source) == source)
+    else {
+        return Ok(None);
+    };
+    let parameter = parameters
+        .iter()
+        .find(|parameter| parameter.ordinal == matched.formal_ordinal)
+        .ok_or_else(|| {
+            format!(
+                "call `{function}` matched missing formal {}",
+                matched.formal_ordinal
+            )
+        })?;
+    let output_actual = match parameter.evaluation_scope {
+        KernelParameterEvaluationScope::Parent => None,
+        KernelParameterEvaluationScope::Output { parameter_ordinal } => {
+            let matched = projection
+                .matched_inputs
+                .iter()
+                .find(|matched| matched.formal_ordinal == parameter_ordinal)
+                .ok_or_else(|| {
+                    format!(
+                        "call `{function}` output-scoped parameter references omitted OUT formal {parameter_ordinal}"
+                    )
+                })?;
+            let (kind, expression) = call_argument_value(expression, matched.source)?;
+            Some(OutputBindingActual { kind, expression })
+        }
+    };
+    Ok(Some((parameter.evaluation_scope, output_actual)))
+}
+
+fn call_argument_source_for_child(
+    expression: &boon_syntax::AstExpr,
+    child: usize,
+) -> Result<Option<KernelCallArgumentSource>, String> {
+    let (pipe_input, arguments) = match &expression.kind {
+        AstExprKind::Call { args, .. } => (None, args.as_slice()),
+        AstExprKind::Pipe { input, args, .. } => (
+            Some(expression.linked_input.unwrap_or(*input)),
+            args.as_slice(),
+        ),
+        _ => return Ok(None),
+    };
+    let pipe = pipe_input.is_some();
+    let mut matches = Vec::new();
+    if pipe_input == Some(child) {
+        matches.push(KernelCallArgumentSource::PipeInput);
+    }
+    matches.extend(
+        arguments
+            .iter()
+            .enumerate()
+            .filter_map(|(ordinal, argument)| {
+                (argument.value == child).then(|| {
+                    checked_u32(ordinal, "call argument ordinal").map(|ordinal| {
+                        if pipe {
+                            KernelCallArgumentSource::PipeArgument { ordinal }
+                        } else {
+                            KernelCallArgumentSource::CallArgument { ordinal }
+                        }
+                    })
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    match matches.as_slice() {
+        [] => Ok(None),
+        [source] => Ok(Some(*source)),
+        _ => Err("one expression is reused by multiple direct call inputs".to_owned()),
+    }
+}
+
+fn call_argument_value(
+    expression: &boon_syntax::AstExpr,
+    source: KernelCallArgumentSource,
+) -> Result<(AstCallArgKind, usize), String> {
+    let arguments = match &expression.kind {
+        AstExprKind::Call { args, .. } | AstExprKind::Pipe { args, .. } => args,
+        _ => return Err("call input lookup received a non-call expression".to_owned()),
+    };
+    match source {
+        KernelCallArgumentSource::PipeInput => {
+            Err("an OUT formal cannot be supplied by a pipe input".to_owned())
+        }
+        KernelCallArgumentSource::CallArgument { ordinal }
+        | KernelCallArgumentSource::PipeArgument { ordinal } => arguments
+            .get(ordinal as usize)
+            .map(|argument| (argument.kind, argument.value))
+            .ok_or_else(|| format!("call input lookup lost argument ordinal {ordinal}")),
+    }
+}
+
+fn syntax_binding_root(expression: &boon_syntax::AstExpr) -> Option<&str> {
+    match &expression.kind {
+        AstExprKind::Identifier(name) => Some(name),
+        AstExprKind::Path(path) => path.first().map(String::as_str),
+        AstExprKind::Drain { path } => match path {
+            boon_syntax::AstDrainPath::Binding { name }
+            | boon_syntax::AstDrainPath::Field { binding: name, .. } => Some(name),
+            boon_syntax::AstDrainPath::Passed { .. } => None,
+        },
+        _ => None,
+    }
+}
+
+fn syntax_exact_binding_name(expression: &boon_syntax::AstExpr) -> Option<&str> {
+    match &expression.kind {
+        AstExprKind::Identifier(name) => Some(name),
+        AstExprKind::Path(path) if path.len() == 1 => path.first().map(String::as_str),
+        _ => None,
+    }
 }
 
 fn owner_uses_passed_context(view: UnitOwnerSyntaxView<'_>) -> bool {
@@ -1995,6 +2396,7 @@ fn compact_call_shape_parameters(
                 kind: parameter.kind,
                 name: parameter.name.clone().into_boxed_str(),
                 optional: false,
+                evaluation_scope: parameter.evaluation_scope,
             })
         })
         .collect::<Result<Vec<_>, String>>()?
@@ -2004,6 +2406,7 @@ fn compact_call_shape_parameters(
 fn prepared_call_shape_edges(
     projection: &boon_compiler_kernel::KernelCallShapeProjection,
     syntax: &boon_syntax::AstExpr,
+    parameters: &[CallableParameter],
 ) -> Result<Vec<(KernelOwnerEdgeRole, PreparedInputReference)>, String> {
     let (pipe_input, arguments, pass) = match &syntax.kind {
         AstExprKind::Call { args, pass, .. } => (None, args, pass.as_ref()),
@@ -2032,9 +2435,23 @@ fn prepared_call_shape_edges(
                         format!("call-shape matched missing argument ordinal {ordinal}")
                     })?,
             };
+            let parameter = parameters
+                .iter()
+                .find(|parameter| parameter.ordinal == matched.formal_ordinal as usize)
+                .ok_or_else(|| {
+                    format!(
+                        "call-shape matched missing callable parameter {}",
+                        matched.formal_ordinal
+                    )
+                })?;
             Ok((
-                KernelOwnerEdgeRole::CallArgument {
-                    ordinal: matched.formal_ordinal,
+                match parameter.kind {
+                    KernelParameterKind::Value => KernelOwnerEdgeRole::CallArgument {
+                        ordinal: matched.formal_ordinal,
+                    },
+                    KernelParameterKind::Out => KernelOwnerEdgeRole::CallOutArgument {
+                        ordinal: matched.formal_ordinal,
+                    },
                 },
                 PreparedInputReference::Syntax(value),
             ))
@@ -2244,11 +2661,11 @@ fn compact_owner_view(
     let StableCheckOwnerKey::Item(owner_key) = &owner else {
         unreachable!()
     };
-    let owner_context_ordinal = callable_surfaces
+    let owner_callable_surface = callable_surfaces
         .values()
         .flatten()
-        .find(|surface| surface.owner == owner)
-        .and_then(|surface| surface.context_ordinal);
+        .find(|surface| surface.owner == owner);
+    let owner_context_ordinal = owner_callable_surface.and_then(|surface| surface.context_ordinal);
     let (root_statement_id, root_statement) = view
         .statement_ids()
         .iter()
@@ -2276,11 +2693,6 @@ fn compact_owner_view(
         AstStatementKind::Function { parameters, .. } => {
             let mut by_name = BTreeMap::new();
             for parameter in parameters {
-                if parameter.kind != AstParameterKind::Value {
-                    return Err(
-                        "OUT formals are not in the first call-composition slice".to_owned()
-                    );
-                }
                 if parameter.ordinal >= parameters.len()
                     || by_name
                         .insert(parameter.name.clone(), parameter.ordinal)
@@ -2330,8 +2742,12 @@ fn compact_owner_view(
             return Err("owner repeats a parser expression identity".to_owned());
         }
     }
-    let (collection_binding_inputs, collection_bindings_by_scope) =
-        direct_collection_callback_bindings(&raw_expressions)?;
+    let (fresh_output_inputs, output_bindings_by_scope) = direct_output_callback_bindings(
+        &raw_expressions,
+        owner_context_ordinal,
+        authoritative_call_shapes,
+        callable_surfaces,
+    )?;
     let raw_result = root_statement
         .expr
         .or_else(|| {
@@ -2537,7 +2953,7 @@ fn compact_owner_view(
         &raw_expressions,
         &expressions,
         &local_by_syntax,
-        &collection_bindings_by_scope,
+        &output_bindings_by_scope,
         &structured_records,
         &statement_record_field_targets,
     )?;
@@ -2650,18 +3066,8 @@ fn compact_owner_view(
                 {
                     (KernelOwnerNodeKind::Unknown, Vec::new(), None, None)
                 }
-                AstExprKind::Identifier(_)
-                    if let Some(provider) = collection_binding_inputs.get(&expression.id) =>
-                {
-                    (
-                        KernelOwnerNodeKind::CollectionItemRead,
-                        vec![(
-                            KernelOwnerEdgeRole::ReadProvider,
-                            PreparedInputReference::Syntax(*provider),
-                        )],
-                        None,
-                        None,
-                    )
+                AstExprKind::Identifier(_) if fresh_output_inputs.contains(&expression.id) => {
+                    (KernelOwnerNodeKind::FreshOut, Vec::new(), None, None)
                 }
                 AstExprKind::Identifier(name) => {
                     if let Some(binding) = lexical_binding_reads.get(&expression.id) {
@@ -2669,9 +3075,16 @@ fn compact_owner_view(
                         (kind, edges, None, None)
                     } else if let Some(formal) = formal_by_name.get(name).copied() {
                         (
-                            KernelOwnerNodeKind::FormalRead {
-                                formal: checked_u32(formal, "formal ordinal")?,
-                                fields: Box::new([]),
+                            if Some(formal) == owner_context_ordinal {
+                                KernelOwnerNodeKind::ContextRead {
+                                    formal: checked_u32(formal, "context formal ordinal")?,
+                                    fields: Box::new([]),
+                                }
+                            } else {
+                                KernelOwnerNodeKind::FormalRead {
+                                    formal: checked_u32(formal, "formal ordinal")?,
+                                    fields: Box::new([]),
+                                }
                             },
                             Vec::new(),
                             None,
@@ -2751,9 +3164,16 @@ fn compact_owner_view(
                         (kind, edges, None, None)
                     } else if let Some(formal) = formal_by_name.get(root).copied() {
                         (
-                            KernelOwnerNodeKind::FormalRead {
-                                formal: checked_u32(formal, "formal ordinal")?,
-                                fields: path_fields,
+                            if Some(formal) == owner_context_ordinal {
+                                KernelOwnerNodeKind::ContextRead {
+                                    formal: checked_u32(formal, "context formal ordinal")?,
+                                    fields: path_fields,
+                                }
+                            } else {
+                                KernelOwnerNodeKind::FormalRead {
+                                    formal: checked_u32(formal, "formal ordinal")?,
+                                    fields: path_fields,
+                                }
                             },
                             Vec::new(),
                             None,
@@ -3002,17 +3422,11 @@ fn compact_owner_view(
                                         .to_owned(),
                                 );
                             }
-                            if surface
-                                .parameters
-                                .iter()
-                                .any(|parameter| parameter.kind == KernelParameterKind::Out)
-                            {
-                                return Err(
-                                    "valid OUT call frames are not in the current call-composition slice"
-                                        .to_owned(),
-                                );
-                            }
-                            let raw_edges = prepared_call_shape_edges(&projection, expression)?;
+                            let raw_edges = prepared_call_shape_edges(
+                                &projection,
+                                expression,
+                                &surface.parameters,
+                            )?;
                             (
                                 KernelOwnerNodeKind::UserCall {
                                     target: KernelOwnerId(0),
@@ -3261,7 +3675,11 @@ fn compact_owner_view(
         .iter()
         .enumerate()
         .filter_map(|(index, node)| {
-            matches!(node.kind, KernelOwnerNodeKind::FormalRead { .. }).then_some(index)
+            matches!(
+                node.kind,
+                KernelOwnerNodeKind::FormalRead { .. } | KernelOwnerNodeKind::ContextRead { .. }
+            )
+            .then_some(index)
         })
         .collect::<BTreeSet<_>>();
     let formal_dependents = local_dependency_cone(&nodes, formal_nodes);
@@ -3353,7 +3771,10 @@ fn compact_owner_view(
         .filter_map(|(index, node)| {
             matches!(
                 node.kind,
-                KernelOwnerNodeKind::FormalRead { .. } | KernelOwnerNodeKind::CollectionItemRead
+                KernelOwnerNodeKind::FormalRead { .. }
+                    | KernelOwnerNodeKind::ContextRead { .. }
+                    | KernelOwnerNodeKind::CollectionItemRead
+                    | KernelOwnerNodeKind::FreshOut
             )
             .then(|| expressions[index].clone())
         })
@@ -3362,6 +3783,7 @@ fn compact_owner_view(
     let (statements, mut definition_facts, statement_child_targets) = compact_statement_facts(
         view,
         &owner,
+        owner_callable_surface,
         &local_by_syntax,
         node_count,
         &mut external_by_key,
@@ -3377,6 +3799,7 @@ fn compact_owner_view(
             &formal_by_name,
             owner_context_ordinal,
             &lexical_binding_reads,
+            &output_bindings_by_scope,
             &statement_record_field_targets,
             value_surfaces,
             node_count,
@@ -3869,7 +4292,7 @@ fn direct_lexical_binding_reads(
     raw_expressions: &[&boon_syntax::AstExpr],
     stable_expressions: &[StableExpressionKey],
     local_by_syntax: &BTreeMap<usize, usize>,
-    collection_bindings_by_scope: &BTreeMap<usize, Box<[(String, usize)]>>,
+    output_bindings_by_scope: &PreparedOutputBindingsByScope,
     structured_records: &BTreeMap<usize, Vec<PreparedRecordEntry>>,
     statement_record_field_targets: &BTreeMap<(usize, String), PreparedLexicalTarget>,
 ) -> Result<BTreeMap<usize, PreparedLexicalBinding>, String> {
@@ -4121,18 +4544,21 @@ fn direct_lexical_binding_reads(
                 );
                 break;
             }
-            if let Some((ordinal, (_, provider))) = collection_bindings_by_scope
+            if let Some(binding) = output_bindings_by_scope
                 .get(&parent_expression.id)
                 .into_iter()
                 .flatten()
-                .enumerate()
-                .find(|(_, (name, provider))| name == root && *provider != expression.id)
+                .find(|binding| {
+                    binding.name == root
+                        && binding.provider != expression.id
+                        && binding.active_inputs.contains(&cursor)
+                })
             {
                 reads.insert(
                     expression.id,
                     PreparedLexicalBinding {
                         provider: PreparedLexicalProvider::Input(PreparedInputReference::Syntax(
-                            *provider,
+                            binding.provider,
                         )),
                         target: PreparedLexicalTarget::Declaration(
                             KernelDeclarationOrigin::CallbackBinding {
@@ -4142,8 +4568,7 @@ fn direct_lexical_binding_reads(
                                         .expect("local callback expression has a dense row"),
                                 )
                                 .expect("local callback expression index fits u32"),
-                                ordinal: checked_u32(ordinal, "callback binding ordinal")
-                                    .expect("callback binding ordinal fits u32"),
+                                ordinal: binding.formal_ordinal,
                             },
                         ),
                         prefix: Box::new([]),
@@ -4293,6 +4718,7 @@ fn statement_binding_name(kind: &AstStatementKind) -> Option<&str> {
 fn compact_statement_facts(
     view: UnitOwnerSyntaxView<'_>,
     owner: &StableCheckOwnerKey,
+    callable_surface: Option<&CallableSurface>,
     local_by_syntax: &BTreeMap<usize, usize>,
     node_count: usize,
     external_by_key: &mut BTreeMap<PreparedExternalExpression, usize>,
@@ -4355,6 +4781,14 @@ fn compact_statement_facts(
                                     parameter.ordinal,
                                     "statement parameter ordinal",
                                 )?,
+                                evaluation_scope: callable_surface
+                                    .and_then(|surface| {
+                                        surface.parameters.iter().find(|candidate| {
+                                            candidate.ordinal == parameter.ordinal
+                                        })
+                                    })
+                                    .map(|parameter| parameter.evaluation_scope)
+                                    .unwrap_or(KernelParameterEvaluationScope::Parent),
                             })
                         })
                         .collect::<Result<Vec<_>, String>>()?
@@ -5126,6 +5560,7 @@ fn compact_declaration_and_lexical_facts(
     formal_by_name: &BTreeMap<String, usize>,
     owner_context_ordinal: Option<usize>,
     lexical_binding_reads: &BTreeMap<usize, PreparedLexicalBinding>,
+    output_bindings_by_scope: &PreparedOutputBindingsByScope,
     statement_record_field_targets: &BTreeMap<(usize, String), PreparedLexicalTarget>,
     value_surfaces: &BTreeMap<String, Vec<ValueSurface>>,
     node_count: usize,
@@ -5255,6 +5690,29 @@ fn compact_declaration_and_lexical_facts(
                 .ok_or_else(|| "kernel declaration expression is not local".to_owned())?,
             "declaration expression",
         )?);
+        if let Some(bindings) = output_bindings_by_scope.get(&expression.id) {
+            for binding in bindings {
+                let origin = KernelDeclarationOrigin::CallbackBinding {
+                    call: object,
+                    ordinal: binding.formal_ordinal,
+                };
+                if callback_origin_by_binding
+                    .insert(binding.provider, origin.clone())
+                    .is_some()
+                {
+                    return Err(format!(
+                        "OUT call expression {} repeats one binding occurrence",
+                        expression.id
+                    ));
+                }
+                pending.push((
+                    origin,
+                    binding.name.clone().into_boxed_str(),
+                    KernelDeclarationKind::FreshOut,
+                    None,
+                ));
+            }
+        }
         match &expression.kind {
             AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
                 for (ordinal, field) in fields.iter().enumerate() {
@@ -5296,45 +5754,6 @@ fn compact_declaration_and_lexical_facts(
                         },
                         name.into_boxed_str(),
                         KernelDeclarationKind::PatternBinding,
-                        None,
-                    ));
-                }
-            }
-            AstExprKind::Call { function, args, .. }
-            | AstExprKind::Pipe {
-                op: function, args, ..
-            } if collection_callback_builtin(function) => {
-                for (ordinal, argument) in args
-                    .iter()
-                    .filter(|argument| argument.kind == AstCallArgKind::BareBinding)
-                    .enumerate()
-                {
-                    let name = raw_expressions
-                        .iter()
-                        .find(|candidate| candidate.id == argument.value)
-                        .and_then(|candidate| match &candidate.kind {
-                            AstExprKind::Identifier(name) => Some(name.clone()),
-                            _ => None,
-                        })
-                        .ok_or_else(|| {
-                            format!("collection callback `{function}` binding is not an identifier")
-                        })?;
-                    let origin = KernelDeclarationOrigin::CallbackBinding {
-                        call: object,
-                        ordinal: checked_u32(ordinal, "callback binding ordinal")?,
-                    };
-                    if callback_origin_by_binding
-                        .insert(argument.value, origin.clone())
-                        .is_some()
-                    {
-                        return Err(format!(
-                            "collection callback `{function}` repeats one binding occurrence"
-                        ));
-                    }
-                    pending.push((
-                        origin,
-                        name.into_boxed_str(),
-                        KernelDeclarationKind::FreshOut,
                         None,
                     ));
                 }
@@ -5673,10 +6092,12 @@ fn resource_containing_statements(
                 | KernelOwnerNodeKind::Collection { .. }
                 | KernelOwnerNodeKind::MapEntry
                 | KernelOwnerNodeKind::FormalRead { .. }
+                | KernelOwnerNodeKind::ContextRead { .. }
                 | KernelOwnerNodeKind::LexicalRead { .. }
                 | KernelOwnerNodeKind::ValueRead { .. }
                 | KernelOwnerNodeKind::DerivedRead { .. }
                 | KernelOwnerNodeKind::CollectionItemRead
+                | KernelOwnerNodeKind::FreshOut
                 | KernelOwnerNodeKind::Latest
                 | KernelOwnerNodeKind::Arrow
                 | KernelOwnerNodeKind::Delimiter
@@ -5824,86 +6245,115 @@ fn project_checked_type(provider: &Type, fields: &[&str]) -> Result<Type, String
     Ok(current.clone())
 }
 
-type PreparedCollectionBindingsByScope = BTreeMap<usize, Box<[(String, usize)]>>;
-
-fn direct_collection_callback_bindings(
+fn direct_output_callback_bindings(
     raw_expressions: &[&boon_syntax::AstExpr],
-) -> Result<(BTreeMap<usize, usize>, PreparedCollectionBindingsByScope), String> {
+    caller_context_ordinal: Option<usize>,
+    authoritative: &BTreeMap<String, AuthoritativeCallSurface>,
+    callable_surfaces: &BTreeMap<String, Box<[CallableSurface]>>,
+) -> Result<(BTreeSet<usize>, PreparedOutputBindingsByScope), String> {
     let expressions = raw_expressions
         .iter()
         .map(|expression| (expression.id, *expression))
         .collect::<BTreeMap<_, _>>();
-    let mut inputs = BTreeMap::new();
+    let mut inputs = BTreeSet::new();
     let mut scopes = BTreeMap::new();
     for expression in raw_expressions {
-        let (function, provider, arguments) = match &expression.kind {
-            AstExprKind::Pipe {
-                input, op, args, ..
-            } => (
-                op.as_str(),
-                expression.linked_input.unwrap_or(*input),
-                args.as_slice(),
-            ),
-            AstExprKind::Call { function, args, .. } => {
-                let Some(provider) = args
-                    .iter()
-                    .find(|argument| argument.named_name() == Some("list"))
-                    .map(|argument| argument.value)
-                else {
-                    continue;
-                };
-                (function.as_str(), provider, args.as_slice())
-            }
+        let function = match &expression.kind {
+            AstExprKind::Pipe { op, .. } => op,
+            AstExprKind::Call { function, .. } => function,
             _ => continue,
         };
-        if !collection_callback_builtin(function) {
+        let dynamic = dynamic_authoritative_call_surface(expression);
+        let (kind, parameters, context_ordinal) =
+            if let Some(surface) = authoritative.get(function).or(dynamic.as_ref()) {
+                (surface.kind, surface.parameters.clone(), None)
+            } else if let Some(candidates) = callable_surfaces.get(function) {
+                let [surface] = candidates.as_ref() else {
+                    continue;
+                };
+                (
+                    KernelCallableKind::User,
+                    compact_call_shape_parameters(surface)?,
+                    surface
+                        .context_ordinal
+                        .map(|ordinal| checked_u32(ordinal, "call context ordinal"))
+                        .transpose()?,
+                )
+            } else {
+                continue;
+            };
+        let shape = compact_call_shape_input(KernelExpressionId(0), expression)?;
+        let projection = project_kernel_call_shape(
+            &shape,
+            &KernelCallShapeResolution::Callable {
+                kind,
+                parameters: parameters.clone(),
+                context_ordinal,
+                caller_context_ordinal: caller_context_ordinal
+                    .map(|ordinal| checked_u32(ordinal, "caller context ordinal"))
+                    .transpose()?,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        if !projection.valid {
             continue;
         }
         let mut bindings = Vec::new();
-        for argument in arguments
-            .iter()
-            .filter(|argument| argument.kind == AstCallArgKind::BareBinding)
-        {
+        for matched in projection.matched_inputs.iter().filter(|matched| {
+            parameters.iter().any(|parameter| {
+                parameter.ordinal == matched.formal_ordinal
+                    && parameter.kind == KernelParameterKind::Out
+            })
+        }) {
+            let (kind, provider) = call_argument_value(expression, matched.source)?;
+            if kind != AstCallArgKind::BareBinding {
+                continue;
+            }
             let name = expressions
-                .get(&argument.value)
+                .get(&provider)
                 .and_then(|expression| match &expression.kind {
                     AstExprKind::Identifier(name) => Some(name.clone()),
                     _ => None,
                 })
                 .ok_or_else(|| {
-                    format!(
-                        "collection callback `{function}` has a non-identifier binding argument"
-                    )
+                    format!("OUT call `{function}` has a non-identifier bare binding")
                 })?;
-            if inputs.insert(argument.value, provider).is_some()
-                || bindings.iter().any(|(existing, _)| existing == &name)
+            if !inputs.insert(provider)
+                || bindings
+                    .iter()
+                    .any(|existing: &PreparedOutputBinding| existing.name == name)
             {
-                return Err(format!(
-                    "collection callback `{function}` repeats binding `{name}`"
-                ));
+                return Err(format!("OUT call `{function}` repeats binding `{name}`"));
             }
-            bindings.push((name, argument.value));
+            let active_inputs = projection
+                .matched_inputs
+                .iter()
+                .filter(|candidate| {
+                    parameters.iter().any(|parameter| {
+                        parameter.ordinal == candidate.formal_ordinal
+                            && parameter.evaluation_scope
+                                == KernelParameterEvaluationScope::Output {
+                                    parameter_ordinal: matched.formal_ordinal,
+                                }
+                    })
+                })
+                .map(|candidate| {
+                    call_argument_value(expression, candidate.source).map(|(_, value)| value)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            bindings.push(PreparedOutputBinding {
+                formal_ordinal: matched.formal_ordinal,
+                name,
+                provider,
+                active_inputs: active_inputs.into_boxed_slice(),
+            });
         }
         if !bindings.is_empty() {
+            bindings.sort_by_key(|binding| binding.formal_ordinal);
             scopes.insert(expression.id, bindings.into_boxed_slice());
         }
     }
     Ok((inputs, scopes))
-}
-
-fn collection_callback_builtin(function: &str) -> bool {
-    matches!(
-        function,
-        "List/filter"
-            | "List/retain"
-            | "List/remove"
-            | "List/map"
-            | "List/find"
-            | "List/sort_by"
-            | "List/then_by"
-            | "List/any"
-            | "List/every"
-    )
 }
 
 fn match_pattern_binding_prefix(pattern: &AstMatchPattern, root: &str) -> Option<Vec<String>> {
@@ -6608,7 +7058,18 @@ mod tests {
                     .iter()
                     .map(|(name, ty)| (name.clone(), normalize_type(ty, variables)))
                     .collect(),
-                field_order: shape.field_order.clone(),
+                // Open objects are structural requirement rows. Their field
+                // insertion order can reflect solver activation epochs (for
+                // example, whether a collection provider arrives before a
+                // nested callback requirement) and is not authored record
+                // order. Canonicalize only those open rows for differential
+                // comparison; closed object and tagged-record order remains
+                // an exact language/output contract.
+                field_order: if shape.open {
+                    shape.fields.keys().cloned().collect()
+                } else {
+                    shape.field_order.clone()
+                },
                 open: shape.open,
             }
         }
@@ -6669,6 +7130,29 @@ mod tests {
             .map(|flow| normalize_flow(&flow, &mut variables))
             .collect();
         (result, expressions)
+    }
+
+    #[test]
+    fn differential_canonicalizes_only_open_object_field_order() {
+        let object = |order: [&str; 2], open| FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::object(ObjectShape::from_ordered_fields(
+                order.into_iter().map(|name| (name.to_owned(), Type::Text)),
+                open,
+            )),
+        };
+        let neutral = FlowType {
+            mode: FlowMode::Absent,
+            ty: Type::Absent,
+        };
+
+        let open_left = alpha_normalize_owner(&neutral, [object(["left", "right"], true)]).1;
+        let open_right = alpha_normalize_owner(&neutral, [object(["right", "left"], true)]).1;
+        assert_eq!(open_left, open_right);
+
+        let closed_left = alpha_normalize_owner(&neutral, [object(["left", "right"], false)]).1;
+        let closed_right = alpha_normalize_owner(&neutral, [object(["right", "left"], false)]).1;
+        assert_ne!(closed_left, closed_right);
     }
 
     fn owner_mismatch(
@@ -8378,6 +8862,8 @@ mod tests {
         report: &KernelOwnerOracleReport,
         project: &ProjectSyntaxSnapshot,
     ) -> Vec<String> {
+        let authoritative = project_kernel_authoritative_call_shapes()
+            .expect("authoritative lexical shapes project in parity audit");
         #[derive(Clone, Debug, Eq, PartialEq)]
         enum StableLexicalTarget {
             Declaration {
@@ -8649,18 +9135,23 @@ mod tests {
                     AstExprKind::Call { function, args, .. }
                     | AstExprKind::Pipe {
                         op: function, args, ..
-                    } if collection_callback_builtin(function) => {
-                        expected_origins.extend(
-                            args.iter()
-                                .filter(|argument| argument.kind == AstCallArgKind::BareBinding)
-                                .enumerate()
-                                .filter_map(|(ordinal, _)| {
-                                    Some(KernelOwnerOracleDeclarationOrigin::CallbackBinding {
-                                        call: expression.stable_key.clone(),
-                                        ordinal: u32::try_from(ordinal).ok()?,
-                                    })
-                                }),
-                        );
+                    } => {
+                        let Some(surface) = authoritative.get(function) else {
+                            continue;
+                        };
+                        expected_origins.extend(args.iter().filter_map(|argument| {
+                            if argument.kind != AstCallArgKind::BareBinding {
+                                return None;
+                            }
+                            let parameter = surface.parameters.iter().find(|parameter| {
+                                parameter.kind == KernelParameterKind::Out
+                                    && parameter.name.as_ref() == argument.name
+                            })?;
+                            Some(KernelOwnerOracleDeclarationOrigin::CallbackBinding {
+                                call: expression.stable_key.clone(),
+                                ordinal: parameter.ordinal,
+                            })
+                        }));
                     }
                     _ => {}
                 }
@@ -9807,6 +10298,146 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn wrapped_out_calls_use_one_dense_frame_and_scoped_callback_binding() {
+        let source = concat!(
+            "FUNCTION doubled(list, entry: OUT, new) {\n",
+            "    list\n",
+            "    |> List/map(\n",
+            "        item: entry\n",
+            "        new: new * 2\n",
+            "    )\n",
+            "}\n",
+            "FUNCTION wrapped(list, row: OUT, new) {\n",
+            "    list\n",
+            "    |> doubled(\n",
+            "        entry: row\n",
+            "        new: new\n",
+            "    )\n",
+            "}\n",
+            "rows: LIST {\n",
+            "    [value: 1]\n",
+            "    [value: 2]\n",
+            "}\n",
+            "result:\n",
+            "    rows\n",
+            "    |> wrapped(\n",
+            "        row\n",
+            "        new: row.value\n",
+            "    )\n",
+        );
+        let parsed = parse_source("app/RUN.bn", source).expect("parse wrapped OUT fixture");
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            !checked.report.has_errors(),
+            "current checker diagnostics: {:#?}",
+            checked.report.diagnostics
+        );
+        let (checked, _) = checked
+            .program
+            .expect("wrapped OUT fixture checks")
+            .into_parts();
+        let checked_by_stable_key = parsed
+            .ast
+            .expressions
+            .iter()
+            .filter_map(|expression| {
+                Some((
+                    parsed.stable_expression_key(expression.id)?,
+                    checked.expressions.get(expression.id)?.flow_type.clone(),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse unit-native wrapped OUT fixture");
+        let authoritative =
+            project_kernel_authoritative_call_shapes().expect("authoritative OUT shapes project");
+        let surfaces = project_callable_surfaces(&project, &authoritative)
+            .expect("user OUT scope effects infer");
+        for function in ["doubled", "wrapped"] {
+            let [surface] = surfaces[function].as_ref() else {
+                panic!("{function} must have one callable surface")
+            };
+            assert_eq!(
+                surface.parameters[2].evaluation_scope,
+                KernelParameterEvaluationScope::Output {
+                    parameter_ordinal: 1,
+                },
+                "{function}.new must be evaluated under its public OUT"
+            );
+        }
+
+        let oracle = kernel_owner_oracle(&project);
+        assert!(
+            oracle.unsupported.is_empty(),
+            "wrapped OUT project must compile entirely in the dense kernel: {:#?}",
+            oracle.unsupported
+        );
+        let owner_named = |name: &str| {
+            oracle
+                .supported
+                .iter()
+                .find(|owner| {
+                    matches!(&owner.owner, StableCheckOwnerKey::Item(key)
+                    if key.item_route.segments().last().is_some_and(|segment| {
+                        segment.names.first().is_some_and(|candidate| candidate == name)
+                    }))
+                })
+                .unwrap_or_else(|| panic!("missing dense owner `{name}`"))
+        };
+        for function in ["doubled", "wrapped"] {
+            let owner = owner_named(function);
+            assert_owner_matches_current(
+                owner,
+                &checked_by_stable_key,
+                &checked,
+                &project,
+                function,
+            );
+            let function_statement = owner
+                .statements
+                .iter()
+                .find(|statement| matches!(statement.kind, KernelStatementKind::Function { .. }))
+                .expect("function statement artifact");
+            let KernelStatementKind::Function { parameters, .. } = &function_statement.kind else {
+                unreachable!()
+            };
+            assert_eq!(
+                parameters[2].evaluation_scope,
+                KernelParameterEvaluationScope::Output {
+                    parameter_ordinal: 1,
+                }
+            );
+        }
+        let result = owner_named("result");
+        assert_eq!(result.result.ty, Type::List(Type::shared(Type::Number)));
+        assert_owner_matches_current(
+            result,
+            &checked_by_stable_key,
+            &checked,
+            &project,
+            "wrapped OUT result",
+        );
+        let fresh = result
+            .declarations
+            .iter()
+            .find(|declaration| declaration.kind == KernelDeclarationKind::FreshOut)
+            .expect("outer wrapped call publishes one fresh OUT declaration");
+        assert!(matches!(
+            fresh.origin,
+            KernelOwnerOracleDeclarationOrigin::CallbackBinding { ordinal: 1, .. }
+        ));
+        assert!(result.lexical_bindings.iter().any(|binding| {
+            binding.target
+                == KernelOwnerOracleLexicalTarget::Declaration {
+                    owner: result.owner.clone(),
+                    origin: fresh.origin.clone(),
+                }
+                && !binding.projection.is_empty()
+        }));
     }
 
     #[test]

@@ -125,6 +125,13 @@ pub enum KernelOwnerNodeKind {
         formal: u32,
         fields: Box<[Box<str>]>,
     },
+    /// A detached read from the invocation's inherited `PASSED` provider.
+    /// Context is a capture-forward channel: unlike an ordinary value formal,
+    /// consumer requirements never reshape the captured/public provider.
+    ContextRead {
+        formal: u32,
+        fields: Box<[Box<str>]>,
+    },
     /// A same-owner lexical alias. Unlike a cross-owner read, its occurrence
     /// remains an equality participant and can carry requirements back to the
     /// BLOCK binding that declared it.
@@ -149,6 +156,9 @@ pub enum KernelOwnerNodeKind {
     /// One contextual collection callback binding, projected directionally
     /// from the input collection without coalescing producer and consumer.
     CollectionItemRead,
+    /// One private compile-time output port created by a bare `OUT` call
+    /// entry. The call frame, not this occurrence, supplies its producer.
+    FreshOut,
     /// A user-call occurrence. Acyclic targets are composed into this
     /// component with a fresh formal frame during compilation.
     UserCall {
@@ -204,6 +214,11 @@ pub enum KernelOwnerEdgeRole {
     CallArgument {
         ordinal: u32,
     },
+    /// An `OUT` call edge aliases a producer capability rather than reading
+    /// the argument expression as an ordinary value occurrence.
+    CallOutArgument {
+        ordinal: u32,
+    },
     AbiArgument {
         name: Box<str>,
     },
@@ -250,11 +265,21 @@ pub enum KernelParameterKind {
     Out,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelParameterEvaluationScope {
+    #[default]
+    Parent,
+    Output {
+        parameter_ordinal: u32,
+    },
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelStatementParameter {
     pub name: Box<str>,
     pub kind: KernelParameterKind,
     pub ordinal: u32,
+    pub evaluation_scope: KernelParameterEvaluationScope,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -842,6 +867,7 @@ pub struct KernelCallShapeParameter {
     pub kind: KernelParameterKind,
     pub name: Box<str>,
     pub optional: bool,
+    pub evaluation_scope: KernelParameterEvaluationScope,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -1244,6 +1270,21 @@ pub fn project_kernel_call_shape(
             return Err(KernelOwnerBuildError::new(format!(
                 "kernel callable `{}` has duplicate formal identity `{}`/{}",
                 input.function, parameter.name, parameter.ordinal
+            )));
+        }
+    }
+    for parameter in &parameters {
+        let KernelParameterEvaluationScope::Output { parameter_ordinal } =
+            parameter.evaluation_scope
+        else {
+            continue;
+        };
+        if !parameters.iter().any(|candidate| {
+            candidate.ordinal == parameter_ordinal && candidate.kind == KernelParameterKind::Out
+        }) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel callable `{}` parameter `{}` references missing OUT evaluation scope {}",
+                input.function, parameter.name, parameter_ordinal
             )));
         }
     }
@@ -3662,7 +3703,10 @@ fn collect_call_artifacts(
                 let mut inputs = Vec::with_capacity(node.inputs.len());
                 for edge in &node.inputs {
                     let role = match &edge.role {
-                        KernelOwnerEdgeRole::CallArgument { ordinal } if !uses_abi_inputs => {
+                        KernelOwnerEdgeRole::CallArgument { ordinal }
+                        | KernelOwnerEdgeRole::CallOutArgument { ordinal }
+                            if !uses_abi_inputs =>
+                        {
                             KernelCallInputRole::Formal { ordinal: *ordinal }
                         }
                         KernelOwnerEdgeRole::AbiArgument { name } if uses_abi_inputs => {
@@ -4186,6 +4230,11 @@ struct CallActual {
     /// formal-requirement surface. Keeping these channels distinct prevents
     /// inherited PASSED calls from silently detaching transitive constraints.
     requirement: TypeVariableId,
+    /// Whether this occurrence reads a private output capability and therefore
+    /// has a separate caller-owned requirement channel. The provider remains
+    /// directional and unchanged; only `requirement` accepts constraints from
+    /// the callee definition.
+    requirement_backflow: bool,
     mode: ModeVariableId,
     mode_source: ModeSource,
     static_variants: Option<StaticVariantSet>,
@@ -4391,7 +4440,9 @@ fn allocate_owner_instance_with_static_variants(
             );
         } else if matches!(
             node.kind,
-            KernelOwnerNodeKind::FormalRead { .. } | KernelOwnerNodeKind::LexicalRead { .. }
+            KernelOwnerNodeKind::FormalRead { .. }
+                | KernelOwnerNodeKind::ContextRead { .. }
+                | KernelOwnerNodeKind::LexicalRead { .. }
         ) {
             expressions.push(builder.new_variable());
         } else {
@@ -4465,7 +4516,9 @@ fn allocate_invocation_owner_instance(
             );
         } else if matches!(
             node.kind,
-            KernelOwnerNodeKind::FormalRead { .. } | KernelOwnerNodeKind::LexicalRead { .. }
+            KernelOwnerNodeKind::FormalRead { .. }
+                | KernelOwnerNodeKind::ContextRead { .. }
+                | KernelOwnerNodeKind::LexicalRead { .. }
         ) {
             expressions.push(builder.new_variable());
         } else {
@@ -4595,7 +4648,10 @@ fn infer_static_variants(
                 })
                 .collect::<Option<StaticVariantSet>>(),
             KernelOwnerNodeKind::Tag(tag) => Some(BTreeSet::from([tag.clone()])),
-            KernelOwnerNodeKind::FormalRead { formal, fields } if fields.is_empty() => {
+            KernelOwnerNodeKind::FormalRead { formal, fields }
+            | KernelOwnerNodeKind::ContextRead { formal, fields }
+                if fields.is_empty() =>
+            {
                 formal_static_variants
                     .get(*formal as usize)
                     .cloned()
@@ -4934,6 +4990,8 @@ fn owner_expressions_depend_on_formals(owner: &KernelOwnerProgramInput) -> Box<[
             matches!(
                 node.kind,
                 KernelOwnerNodeKind::FormalRead { .. }
+                    | KernelOwnerNodeKind::ContextRead { .. }
+                    | KernelOwnerNodeKind::FreshOut
                     | KernelOwnerNodeKind::Hold
                     | KernelOwnerNodeKind::UserCall {
                         inherited_formal: Some(_),
@@ -5410,7 +5468,7 @@ fn instantiate_owner(
         // A closed or directionally derived actual is provider authority, not
         // a writable formal scaffold. Callee requirements remain useful for
         // open caller formals, but must never widen a concrete occurrence.
-        if builder.is_authoritative(actual.variable) {
+        if builder.is_authoritative(actual.variable) && !actual.requirement_backflow {
             continue;
         }
         let actual = builder.variable_term(actual.requirement);
@@ -5451,7 +5509,8 @@ fn direct_result_summary_supported(
         | KernelOwnerNodeKind::Byte
         | KernelOwnerNodeKind::Bits(_)
         | KernelOwnerNodeKind::Tag(_)
-        | KernelOwnerNodeKind::FormalRead { .. } => node.inputs.is_empty(),
+        | KernelOwnerNodeKind::FormalRead { .. }
+        | KernelOwnerNodeKind::ContextRead { .. } => node.inputs.is_empty(),
         KernelOwnerNodeKind::TextTemplate => node.inputs.iter().all(|edge| {
             matches!(edge.role, KernelOwnerEdgeRole::TextDynamic) && child(edge, active)
         }),
@@ -5612,7 +5671,9 @@ fn direct_result_summary_supported(
                 .collect::<Vec<_>>();
             matches!(outputs.as_slice(), [output] if node.inputs.len() == 1 && child(output, active))
         }
-        KernelOwnerNodeKind::Delimiter | KernelOwnerNodeKind::Unknown => node.inputs.is_empty(),
+        KernelOwnerNodeKind::Delimiter
+        | KernelOwnerNodeKind::Unknown
+        | KernelOwnerNodeKind::FreshOut => node.inputs.is_empty(),
         _ => false,
     };
     active.remove(&(owner_id, expression));
@@ -5943,7 +6004,8 @@ impl DirectSummaryPlanCompiler<'_> {
                     let value = self.builder.terms_mut().variant_set([tag]);
                     Some(term_value(self, value))
                 }
-                KernelOwnerNodeKind::FormalRead { formal, fields } => {
+                KernelOwnerNodeKind::FormalRead { formal, fields }
+                | KernelOwnerNodeKind::ContextRead { formal, fields } => {
                     let actual = actuals.get(*formal as usize)?;
                     match actual {
                         PlannedSummaryActual::Formal(formal) => {
@@ -7691,7 +7753,7 @@ fn emit_compiled_direct_summary(
                         });
                     }
                 }
-                if !builder.is_authoritative(actual.variable) {
+                if !builder.is_authoritative(actual.variable) || actual.requirement_backflow {
                     // Summary inputs are detached projections so a concrete
                     // call-site provider can never be specialized by the
                     // callee. An open caller formal is different: the
@@ -7944,6 +8006,45 @@ fn compile_node(
             let output_term = builder.variable_term(output);
             builder.add_unify(output_term, requirement);
         }
+        KernelOwnerNodeKind::ContextRead { formal, fields } => {
+            if !node.inputs.is_empty() {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} context read has explicit inputs"
+                )));
+            }
+            let provider = context
+                .formals
+                .get(*formal as usize)
+                .copied()
+                .ok_or_else(|| {
+                    KernelOwnerBuildError::new(format!(
+                        "kernel owner node {index} reads missing context formal {formal}"
+                    ))
+                })?;
+            let path = fields
+                .iter()
+                .map(|field| builder.terms_mut().intern_name(field))
+                .collect::<Vec<_>>();
+            builder.add_projection_into(provider, path.iter().copied(), output);
+            // PASSED is provider-only across the call boundary, but its
+            // definition still owns a private structural requirement. Keep
+            // that requirement connected to the detached occurrence so
+            // diagnostics can compare an explicit PASS value against the
+            // callable contract without ever reshaping the captured provider.
+            let requirement = context
+                .formal_requirements
+                .get(*formal as usize)
+                .copied()
+                .ok_or_else(|| {
+                    KernelOwnerBuildError::new(format!(
+                        "kernel owner node {index} reads missing context formal requirement {formal}"
+                    ))
+                })?;
+            let requirement = requirement_projection(builder, requirement, &path);
+            let requirement = builder.variable_term(requirement);
+            let output_term = builder.variable_term(output);
+            builder.add_unify(output_term, requirement);
+        }
         KernelOwnerNodeKind::LexicalRead { fields } => {
             let mut providers = node
                 .inputs
@@ -8013,6 +8114,15 @@ fn compile_node(
             let provider = edge_variable(context, index, provider)?;
             builder.add_collection_item_projection(provider, output);
         }
+        KernelOwnerNodeKind::FreshOut => {
+            if !node.inputs.is_empty() {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} fresh OUT has explicit inputs"
+                )));
+            }
+            // The matching call frame writes constraints into this private
+            // variable. Publishing Unknown here would erase that authority.
+        }
         KernelOwnerNodeKind::UserCall {
             target,
             inherited_formal,
@@ -8032,12 +8142,38 @@ fn compile_node(
             })?;
             let mut actuals = vec![None; target_owner.formal_count as usize];
             for edge in &node.inputs {
-                let KernelOwnerEdgeRole::CallArgument { ordinal } = edge.role else {
-                    return Err(KernelOwnerBuildError::new(format!(
-                        "kernel owner node {index} user call has non-argument edge {:?}",
-                        edge.role
-                    )));
+                let (ordinal, variable) = match edge.role {
+                    KernelOwnerEdgeRole::CallArgument { ordinal } => {
+                        (ordinal, edge_variable(context, index, edge)?)
+                    }
+                    KernelOwnerEdgeRole::CallOutArgument { ordinal } => {
+                        (ordinal, edge_output_variable(context, index, edge)?)
+                    }
+                    _ => {
+                        return Err(KernelOwnerBuildError::new(format!(
+                            "kernel owner node {index} user call has non-argument edge {:?}",
+                            edge.role
+                        )));
+                    }
                 };
+                let requirement_backflow =
+                    matches!(edge.role, KernelOwnerEdgeRole::CallOutArgument { .. })
+                        || edge_reads_output_capability(context, index, edge)?;
+                // A callback/output occurrence has two independent surfaces:
+                // collection data flows forward through `variable`, while the
+                // called definition's shape requirements flow backward into a
+                // private hole. Coalescing the channels would make a use such
+                // as `row.kind` rewrite the checked callback occurrence from a
+                // generic value into `{ kind: _ }` and could specialize the
+                // original collection producer.
+                let requirement = if requirement_backflow {
+                    builder.new_contextual_hole()
+                } else {
+                    variable
+                };
+                if requirement_backflow {
+                    bind_output_capability_requirement(builder, context, edge, requirement)?;
+                }
                 let slot = actuals.get_mut(ordinal as usize).ok_or_else(|| {
                     KernelOwnerBuildError::new(format!(
                         "kernel owner node {index} supplies out-of-range argument {ordinal}"
@@ -8048,10 +8184,10 @@ fn compile_node(
                         "kernel owner node {index} repeats argument {ordinal}"
                     )));
                 }
-                let variable = edge_variable(context, index, edge)?;
                 *slot = Some(CallActual {
                     variable,
-                    requirement: variable,
+                    requirement,
+                    requirement_backflow,
                     mode: edge_mode_variable(context, index, edge)?,
                     mode_source: mode_source_for_edge(
                         context,
@@ -8116,6 +8252,7 @@ fn compile_node(
                     .replace(CallActual {
                         variable: actual,
                         requirement: actual_requirement,
+                        requirement_backflow: false,
                         mode: actual_mode,
                         mode_source: actual_mode_source,
                         static_variants: context
@@ -8168,7 +8305,8 @@ fn compile_node(
                 );
                 return Ok(());
             }
-            if let KernelOwnerNodeKind::FormalRead { formal, fields } =
+            if let KernelOwnerNodeKind::FormalRead { formal, fields }
+            | KernelOwnerNodeKind::ContextRead { formal, fields } =
                 &target_owner.nodes[result].kind
             {
                 if !target_owner.nodes[result].inputs.is_empty() {
@@ -8188,7 +8326,11 @@ fn compile_node(
                     .map(|field| builder.terms_mut().intern_name(field))
                     .collect::<Vec<_>>();
                 builder.add_projection_into(actual.variable, path.iter().copied(), output);
-                if !builder.is_authoritative(actual.variable) {
+                if matches!(
+                    &target_owner.nodes[result].kind,
+                    KernelOwnerNodeKind::FormalRead { .. }
+                ) && (!builder.is_authoritative(actual.variable) || actual.requirement_backflow)
+                {
                     let requirement_root = builder.new_contextual_hole();
                     let requirement = requirement_projection(builder, requirement_root, &path);
                     let output_term = builder.variable_term(output);
@@ -8327,6 +8469,7 @@ fn compile_node(
         }
         KernelOwnerNodeKind::PureBuiltin { kind } => {
             let mut arguments = BTreeMap::new();
+            let mut argument_edges = BTreeMap::new();
             for edge in &node.inputs {
                 let KernelOwnerEdgeRole::AbiArgument { name } = &edge.role else {
                     return Err(KernelOwnerBuildError::new(format!(
@@ -8340,6 +8483,7 @@ fn compile_node(
                         "kernel owner node {index} pure builtin repeats argument `{name}`"
                     )));
                 }
+                argument_edges.insert(name.as_ref(), edge);
                 let value = builder.variable_term(value);
                 constrain_pure_builtin_argument(builder, *kind, name, value);
             }
@@ -8363,6 +8507,22 @@ fn compile_node(
                         ))
                     })
             };
+            if matches!(
+                kind,
+                KernelPureBuiltinKind::ListPredicate
+                    | KernelPureBuiltinKind::ListFilter
+                    | KernelPureBuiltinKind::ListMap
+                    | KernelPureBuiltinKind::ListFind
+                    | KernelPureBuiltinKind::ListSort
+            ) && let Some(item_edge) = argument_edges.get("item").copied()
+            {
+                // Contextual collection calls drive the OUT port regardless
+                // of whether the caller created it fresh or forwarded an
+                // enclosing OUT. This single equation replaces the old
+                // special-case projection attached only to a bare identifier.
+                let item = edge_output_variable(context, index, item_edge)?;
+                builder.add_collection_item_projection(list_argument()?, item);
+            }
             let result = match kind {
                 KernelPureBuiltinKind::TextTransform
                 | KernelPureBuiltinKind::TextSlice
@@ -8744,7 +8904,8 @@ fn node_mode_equation(
         edge_mode_variable(context, node_index, input).map(ModeEquation::Copy)
     };
     match &node.kind {
-        KernelOwnerNodeKind::FormalRead { formal, fields } => {
+        KernelOwnerNodeKind::FormalRead { formal, fields }
+        | KernelOwnerNodeKind::ContextRead { formal, fields } => {
             let source = context
                 .formal_mode_sources
                 .get(*formal as usize)
@@ -8836,6 +8997,19 @@ fn node_mode_equation(
         }
         KernelOwnerNodeKind::CollectionItemRead => {
             copy(|role| matches!(role, KernelOwnerEdgeRole::ReadProvider))
+        }
+        KernelOwnerNodeKind::FreshOut => {
+            let mut active = BTreeSet::new();
+            match output_binding_collection_item_mode_variable(
+                mode_builder,
+                context,
+                node_index,
+                &[],
+                &mut active,
+            )? {
+                Some(provider) => Ok(ModeEquation::Copy(provider)),
+                None => Ok(ModeEquation::Fixed(node.mode)),
+            }
         }
         KernelOwnerNodeKind::Block => copy(|role| matches!(role, KernelOwnerEdgeRole::BlockResult)),
         KernelOwnerNodeKind::Latest => node
@@ -9557,6 +9731,10 @@ fn projected_mode_variable(
         KernelOwnerNodeKind::FormalRead {
             formal,
             fields: provider_fields,
+        }
+        | KernelOwnerNodeKind::ContextRead {
+            formal,
+            fields: provider_fields,
         } => {
             let mut combined = provider_fields.to_vec();
             combined.extend_from_slice(fields);
@@ -9574,6 +9752,14 @@ fn projected_mode_variable(
                 active,
             )?
         }
+        KernelOwnerNodeKind::FreshOut => output_binding_collection_item_mode_variable(
+            mode_builder,
+            context,
+            *expression,
+            fields,
+            active,
+        )?
+        .unwrap_or(mode),
         KernelOwnerNodeKind::LexicalRead {
             fields: provider_fields,
         }
@@ -10134,6 +10320,259 @@ fn projected_collection_item_mode_variable(
     Ok(result)
 }
 
+fn output_binding_collection_item_mode_variable(
+    mode_builder: &mut ModeProgramBuilder,
+    context: &OwnerCompileContext<'_>,
+    source_node: usize,
+    fields: &[Box<str>],
+    active: &mut ActiveModeProjection,
+) -> Result<Option<ModeVariableId>, KernelOwnerBuildError> {
+    let Some((consumer_index, list)) = output_binding_collection_driver(context, source_node)?
+    else {
+        return Ok(None);
+    };
+    let provider = mode_source_for_edge(
+        context,
+        context.owner,
+        context.expression_modes,
+        context.formal_mode_sources,
+        list,
+    )?;
+    projected_collection_item_mode_variable(
+        mode_builder,
+        context,
+        consumer_index,
+        &provider,
+        fields,
+        active,
+    )
+    .map(Some)
+}
+
+fn output_binding_collection_driver<'a>(
+    context: &'a OwnerCompileContext<'_>,
+    source_node: usize,
+) -> Result<Option<(usize, &'a KernelOwnerInputEdge)>, KernelOwnerBuildError> {
+    let mut consumers = context
+        .input
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            matches!(
+                node.kind,
+                KernelOwnerNodeKind::PureBuiltin {
+                    kind: KernelPureBuiltinKind::ListPredicate
+                        | KernelPureBuiltinKind::ListFilter
+                        | KernelPureBuiltinKind::ListMap
+                        | KernelPureBuiltinKind::ListFind
+                        | KernelPureBuiltinKind::ListSort
+                }
+            ) && node.inputs.iter().any(|edge| {
+                matches!(&edge.role, KernelOwnerEdgeRole::AbiArgument { name } if name.as_ref() == "item")
+                    && edge.expression.0 as usize == source_node
+            })
+        });
+    let Some((consumer_index, consumer)) = consumers.next() else {
+        return Ok(None);
+    };
+    if consumers.next().is_some() {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel owner node {source_node} is driven by multiple contextual collection calls"
+        )));
+    }
+    let list = selected_mode_edge(consumer, |role| {
+        matches!(role, KernelOwnerEdgeRole::AbiArgument { name } if matches!(name.as_ref(), "$pipe" | "list"))
+    })
+    .ok_or_else(|| {
+        KernelOwnerBuildError::new(format!(
+            "kernel owner node {consumer_index} drives OUT {source_node} without a list input"
+        ))
+    })?;
+    Ok(Some((consumer_index, list)))
+}
+
+/// Route a callback consumer requirement back through its collection input.
+///
+/// The requirement channel stops at owner/public providers. A definition-local
+/// formal is different: its principal shape is inferred from every use, so a
+/// callback requirement on `item.field` must constrain the corresponding
+/// `list[].field` formal surface. Filter/sort preserve that item identity and
+/// are traversed transparently. The callback occurrence itself remains a
+/// detached directional read and is never unified with this surface.
+fn bind_output_capability_requirement(
+    builder: &mut ComponentProgramBuilder,
+    context: &OwnerCompileContext<'_>,
+    edge: &KernelOwnerInputEdge,
+    requirement: TypeVariableId,
+) -> Result<(), KernelOwnerBuildError> {
+    let Some((output, fields)) =
+        output_capability_read_path(context, edge.expression.0 as usize, &mut BTreeSet::new())?
+    else {
+        return Ok(());
+    };
+    let Some((_, list)) = output_binding_collection_driver(context, output)? else {
+        return Ok(());
+    };
+    let item_requirement = if fields.is_empty() {
+        requirement
+    } else {
+        let root = builder.new_contextual_hole();
+        let fields = fields
+            .iter()
+            .map(|field| builder.terms_mut().intern_name(field))
+            .collect::<Vec<_>>();
+        let projected = requirement_projection(builder, root, &fields);
+        let projected = builder.variable_term(projected);
+        let requirement = builder.variable_term(requirement);
+        builder.add_unify(projected, requirement);
+        root
+    };
+    let Some(list_requirement) = expression_requirement_variable(
+        builder,
+        context,
+        list.expression.0 as usize,
+        &mut BTreeSet::new(),
+    )?
+    else {
+        return Ok(());
+    };
+    let item_requirement = builder.variable_term(item_requirement);
+    let list_shape = builder.terms_mut().list(item_requirement);
+    let list_requirement = builder.variable_term(list_requirement);
+    builder.add_unify(list_requirement, list_shape);
+    Ok(())
+}
+
+fn output_capability_read_path(
+    context: &OwnerCompileContext<'_>,
+    expression: usize,
+    active: &mut BTreeSet<usize>,
+) -> Result<Option<(usize, Vec<Box<str>>)>, KernelOwnerBuildError> {
+    if expression >= context.input.nodes.len() || !active.insert(expression) {
+        return Ok(None);
+    }
+    let node = &context.input.nodes[expression];
+    let result = match &node.kind {
+        KernelOwnerNodeKind::FreshOut => Some((expression, Vec::new())),
+        KernelOwnerNodeKind::LexicalRead { fields }
+        | KernelOwnerNodeKind::ValueRead { fields, .. }
+        | KernelOwnerNodeKind::DerivedRead { fields } => {
+            let providers = node
+                .inputs
+                .iter()
+                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider))
+                .collect::<Vec<_>>();
+            let [provider] = providers.as_slice() else {
+                active.remove(&expression);
+                return Ok(None);
+            };
+            output_capability_read_path(context, provider.expression.0 as usize, active)?.map(
+                |(output, mut path)| {
+                    path.extend(fields.iter().cloned());
+                    (output, path)
+                },
+            )
+        }
+        _ => None,
+    };
+    active.remove(&expression);
+    Ok(result)
+}
+
+fn expression_requirement_variable(
+    builder: &mut ComponentProgramBuilder,
+    context: &OwnerCompileContext<'_>,
+    expression: usize,
+    active: &mut BTreeSet<usize>,
+) -> Result<Option<TypeVariableId>, KernelOwnerBuildError> {
+    if expression >= context.input.nodes.len() || !active.insert(expression) {
+        return Ok(None);
+    }
+    let node = &context.input.nodes[expression];
+    let result = match &node.kind {
+        KernelOwnerNodeKind::FormalRead { formal, fields } => {
+            let root = context
+                .formal_requirements
+                .get(*formal as usize)
+                .copied()
+                .ok_or_else(|| {
+                    KernelOwnerBuildError::new(format!(
+                        "kernel owner node {expression} reads missing formal requirement {formal}"
+                    ))
+                })?;
+            let fields = fields
+                .iter()
+                .map(|field| builder.terms_mut().intern_name(field))
+                .collect::<Vec<_>>();
+            Some(requirement_projection(builder, root, &fields))
+        }
+        KernelOwnerNodeKind::LexicalRead { fields }
+        | KernelOwnerNodeKind::DerivedRead { fields } => {
+            let providers = node
+                .inputs
+                .iter()
+                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider))
+                .collect::<Vec<_>>();
+            let [provider] = providers.as_slice() else {
+                active.remove(&expression);
+                return Ok(None);
+            };
+            let Some(root) = expression_requirement_variable(
+                builder,
+                context,
+                provider.expression.0 as usize,
+                active,
+            )?
+            else {
+                active.remove(&expression);
+                return Ok(None);
+            };
+            let fields = fields
+                .iter()
+                .map(|field| builder.terms_mut().intern_name(field))
+                .collect::<Vec<_>>();
+            Some(requirement_projection(builder, root, &fields))
+        }
+        KernelOwnerNodeKind::Block => {
+            let provider = node
+                .inputs
+                .iter()
+                .find(|edge| matches!(edge.role, KernelOwnerEdgeRole::BlockResult));
+            match provider {
+                Some(provider) => expression_requirement_variable(
+                    builder,
+                    context,
+                    provider.expression.0 as usize,
+                    active,
+                )?,
+                None => None,
+            }
+        }
+        KernelOwnerNodeKind::PureBuiltin {
+            kind: KernelPureBuiltinKind::ListFilter | KernelPureBuiltinKind::ListSort,
+        } => {
+            let provider = node.inputs.iter().find(|edge| {
+                matches!(&edge.role, KernelOwnerEdgeRole::AbiArgument { name } if matches!(name.as_ref(), "$pipe" | "list"))
+            });
+            match provider {
+                Some(provider) => expression_requirement_variable(
+                    builder,
+                    context,
+                    provider.expression.0 as usize,
+                    active,
+                )?,
+                None => None,
+            }
+        }
+        // Cross-owner/public values are provider-only boundaries. Requirements
+        // must not specialize their producer or leak into another owner.
+        _ => None,
+    };
+    active.remove(&expression);
+    Ok(result)
+}
+
 fn edge_variable(
     context: &OwnerCompileContext<'_>,
     node_index: usize,
@@ -10211,6 +10650,92 @@ fn edge_variable(
             Ok(target_owner.expressions[result])
         }
     }
+}
+
+/// Resolve the producer capability named by an `OUT` actual.
+///
+/// Ordinary reads are detached occurrences and therefore cannot be used as
+/// the destination of a call-frame equation. A bare `OUT` creates a private
+/// variable, while forwarding an enclosing `OUT` aliases that formal's frame
+/// variable directly. Keeping this distinction explicit prevents the call and
+/// the formal-read projection from becoming competing directional writers.
+fn edge_output_variable(
+    context: &OwnerCompileContext<'_>,
+    node_index: usize,
+    edge: &KernelOwnerInputEdge,
+) -> Result<TypeVariableId, KernelOwnerBuildError> {
+    let reference = edge.expression.0 as usize;
+    let node = context.input.nodes.get(reference).ok_or_else(|| {
+        KernelOwnerBuildError::new(format!(
+            "OUT input of owner {} node {node_index} must reference a local output binding",
+            context.owner.0
+        ))
+    })?;
+    match &node.kind {
+        KernelOwnerNodeKind::FreshOut => context
+            .expressions
+            .get(reference)
+            .copied()
+            .ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "OUT input of owner {} node {node_index} references missing fresh output {reference}",
+                    context.owner.0
+                ))
+            }),
+        KernelOwnerNodeKind::FormalRead { formal, fields } if fields.is_empty() => context
+            .formals
+            .get(*formal as usize)
+            .copied()
+            .ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "OUT input of owner {} node {node_index} forwards missing formal {formal}",
+                    context.owner.0
+                ))
+            }),
+        _ => Err(KernelOwnerBuildError::new(format!(
+            "OUT input of owner {} node {node_index} must be a bare fresh output or enclosing OUT formal",
+            context.owner.0
+        ))),
+    }
+}
+
+fn edge_reads_output_capability(
+    context: &OwnerCompileContext<'_>,
+    _node_index: usize,
+    edge: &KernelOwnerInputEdge,
+) -> Result<bool, KernelOwnerBuildError> {
+    fn visit(
+        context: &OwnerCompileContext<'_>,
+        expression: usize,
+        active: &mut BTreeSet<usize>,
+    ) -> Result<bool, KernelOwnerBuildError> {
+        if expression >= context.input.nodes.len() || !active.insert(expression) {
+            return Ok(false);
+        }
+        let node = &context.input.nodes[expression];
+        let result = match &node.kind {
+            KernelOwnerNodeKind::FreshOut | KernelOwnerNodeKind::CollectionItemRead => true,
+            KernelOwnerNodeKind::LexicalRead { .. }
+            | KernelOwnerNodeKind::ValueRead { .. }
+            | KernelOwnerNodeKind::DerivedRead { .. } => {
+                let providers = node
+                    .inputs
+                    .iter()
+                    .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider))
+                    .collect::<Vec<_>>();
+                let [provider] = providers.as_slice() else {
+                    active.remove(&expression);
+                    return Ok(false);
+                };
+                visit(context, provider.expression.0 as usize, active)?
+            }
+            _ => false,
+        };
+        active.remove(&expression);
+        Ok(result)
+    }
+
+    visit(context, edge.expression.0 as usize, &mut BTreeSet::new())
 }
 
 fn referenced_node<'a>(
@@ -10365,6 +10890,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn callback_requirements_shape_a_local_formal_item_without_coalescing_channels() {
+        let mut builder = ComponentProgramBuilder::new();
+        let formal = builder.new_contextual_hole();
+        let formal_requirement = builder.new_contextual_hole();
+        let segments = builder.terms_mut().intern_name("segments");
+        let state = builder.terms_mut().intern_name("state");
+        let click_time = builder.terms_mut().intern_name("click_time");
+
+        let list = builder.new_variable();
+        builder.add_projection_into(formal, [segments], list);
+        let list_requirement =
+            requirement_projection(&mut builder, formal_requirement, &[segments]);
+        let list_term = builder.variable_term(list);
+        let list_requirement_term = builder.variable_term(list_requirement);
+        builder.add_unify(list_term, list_requirement_term);
+
+        let item = builder.new_authoritative_provider();
+        builder.add_collection_item_projection(list, item);
+        let callback_requirement = builder.new_contextual_hole();
+        let callback_requirement_term = builder.variable_term(callback_requirement);
+        let callback_list_requirement = builder.terms_mut().list(callback_requirement_term);
+        builder.add_unify(list_requirement_term, callback_list_requirement);
+
+        for field in [state, click_time] {
+            let requirement = builder.new_contextual_hole();
+            let _ = requirement_projection(&mut builder, requirement, &[field]);
+            let callback_requirement_term = builder.variable_term(callback_requirement);
+            let requirement_term = builder.variable_term(requirement);
+            builder.add_unify(callback_requirement_term, requirement_term);
+        }
+        let requirement_output = builder.add_output(callback_requirement, FlowMode::Continuous);
+        let output = builder.add_output(item, FlowMode::Continuous);
+
+        let artifact = solve_component(builder.finish()).unwrap();
+        let Type::Object(requirement_shape) =
+            &artifact.output(requirement_output).unwrap().flow_type.ty
+        else {
+            panic!("callback requirement must produce an open object")
+        };
+        assert_eq!(
+            requirement_shape
+                .fields
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["click_time".to_owned(), "state".to_owned()])
+        );
+        let Type::Object(shape) = &artifact.output(output).unwrap().flow_type.ty else {
+            panic!("callback item requirement must produce an open object")
+        };
+        assert!(shape.open);
+        assert_eq!(
+            shape.fields.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["click_time".to_owned(), "state".to_owned()])
+        );
+    }
+
     fn syntax_expression(id: usize, kind: AstExprKind) -> AstExpr {
         AstExpr {
             id,
@@ -10496,12 +11079,14 @@ mod tests {
                 kind: KernelParameterKind::Value,
                 name: "first".into(),
                 optional: false,
+                evaluation_scope: KernelParameterEvaluationScope::Parent,
             },
             KernelCallShapeParameter {
                 ordinal: 1,
                 kind: KernelParameterKind::Value,
                 name: "second".into(),
                 optional: false,
+                evaluation_scope: KernelParameterEvaluationScope::Parent,
             },
         ]
         .into_boxed_slice();
@@ -10605,6 +11190,7 @@ mod tests {
                     kind: KernelParameterKind::Out,
                     name: "output".into(),
                     optional: false,
+                    evaluation_scope: KernelParameterEvaluationScope::Parent,
                 }]
                 .into_boxed_slice(),
                 context_ordinal: None,

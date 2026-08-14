@@ -2219,8 +2219,36 @@ fn checked_authoritative_callable_shape_v1(
     name: impl Into<String>,
     kind: CheckedCallableKind,
     parameters: &[AuthoritativeParameter],
+    contextual_builtin: Option<ContextualBuiltinKind>,
 ) -> Result<CheckedAuthoritativeCallableShapeV1, String> {
     let name = name.into();
+    let output_ordinal = contextual_builtin.and_then(|_| {
+        let ordinals = parameters
+            .iter()
+            .enumerate()
+            .filter(|(_, parameter)| parameter.kind == CheckedParameterKind::Out)
+            .map(|(ordinal, _)| ordinal)
+            .collect::<Vec<_>>();
+        match ordinals.as_slice() {
+            [ordinal] => Some(*ordinal),
+            _ => None,
+        }
+    });
+    if contextual_builtin.is_some() && output_ordinal.is_none() {
+        return Err(format!(
+            "contextual authoritative callable `{name}` must have exactly one OUT parameter"
+        ));
+    }
+    let output_scoped_name = contextual_builtin.map(|operation| match operation {
+        ContextualBuiltinKind::Map => "new",
+        ContextualBuiltinKind::Filter
+        | ContextualBuiltinKind::Retain
+        | ContextualBuiltinKind::Every
+        | ContextualBuiltinKind::Any
+        | ContextualBuiltinKind::Find => "if",
+        ContextualBuiltinKind::Remove => "when",
+        ContextualBuiltinKind::SortBy | ContextualBuiltinKind::ThenBy => "key",
+    });
     let parameters = parameters
         .iter()
         .enumerate()
@@ -2232,6 +2260,20 @@ fn checked_authoritative_callable_shape_v1(
                     format!("authoritative callable `{name}` exceeds the u32 parameter namespace")
                 })?,
                 optional: parameter.requirement.is_optional(),
+                evaluation_scope: if output_scoped_name == Some(parameter.name.as_str()) {
+                    CheckedAuthoritativeEvaluationScopeV1::Output {
+                        parameter_ordinal: u32::try_from(
+                            output_ordinal.expect("contextual output ordinal was validated"),
+                        )
+                        .map_err(|_| {
+                            format!(
+                                "authoritative callable `{name}` exceeds the u32 parameter namespace"
+                            )
+                        })?,
+                    }
+                } else {
+                    CheckedAuthoritativeEvaluationScopeV1::Parent
+                },
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -30429,6 +30471,7 @@ pub fn project_authoritative_callable_shapes_v1()
                 *name,
                 CheckedCallableKind::Builtin,
                 &signature.parameters,
+                signature.contextual_builtin,
             )?,
         )?;
     }
@@ -30441,6 +30484,7 @@ pub fn project_authoritative_callable_shapes_v1()
                 name,
                 CheckedCallableKind::Builtin,
                 &signature.parameters,
+                None,
             )?,
         )?;
     }
@@ -30469,6 +30513,7 @@ pub fn project_authoritative_callable_shapes_v1()
                 *operation,
                 CheckedCallableKind::Builtin,
                 &parameters,
+                None,
             )?,
         )?;
     }

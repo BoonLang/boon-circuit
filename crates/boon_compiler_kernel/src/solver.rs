@@ -919,11 +919,20 @@ impl ComponentSolver {
             None => Some(resolved),
             Some(field) => self.project_field(resolved, field),
         };
+        let open_projection =
+            field.is_some_and(|field| self.open_shape_may_contain_field(resolved, field));
         match projected {
             Some(projected) if authoritative => {
                 self.replace_binding(consumer, projected, true);
             }
             Some(projected) => self.bind_equal(consumer, projected),
+            None if authoritative && open_projection => {
+                // An open provider has not proved the field absent. Keep the
+                // detached occurrence/requirement surface generic until a
+                // later provider epoch either supplies the field or closes
+                // the shape. Treating this as an invalid projection loses the
+                // generic fields inferred through callback requirements.
+            }
             None if authoritative => {
                 let path = field
                     .map(|field| self.program.terms.name(field).to_owned())
@@ -1456,6 +1465,19 @@ impl ComponentSolver {
         }
     }
 
+    fn open_shape_may_contain_field(&mut self, provider: TypeTermId, field: NameId) -> bool {
+        let provider = self.resolve_term_head(provider);
+        match self.program.terms.term(provider).clone() {
+            TypeTerm::Object { fields, open } => {
+                open && fields.iter().all(|candidate| candidate.name != field)
+            }
+            TypeTerm::Union(members) => members
+                .iter()
+                .any(|member| self.open_shape_may_contain_field(*member, field)),
+            _ => false,
+        }
+    }
+
     fn resolve_term_head(&mut self, mut term: TypeTermId) -> TypeTermId {
         loop {
             let TypeTerm::Variable(variable) = self.program.terms.term(term) else {
@@ -1470,6 +1492,18 @@ impl ComponentSolver {
     }
 
     fn unify_terms(&mut self, left: TypeTermId, right: TypeTermId) {
+        // Preserve variable identity while installing equality. Resolving a
+        // bound variable first would reduce two open object requirements to
+        // their current structural heads and only unify overlapping fields,
+        // silently dropping fields learned by a later equality.
+        if let TypeTerm::Variable(variable) = self.program.terms.term(left) {
+            self.bind_equal(*variable, right);
+            return;
+        }
+        if let TypeTerm::Variable(variable) = self.program.terms.term(right) {
+            self.bind_equal(*variable, left);
+            return;
+        }
         let left = self.resolve_term_head(left);
         let right = self.resolve_term_head(right);
         if left == right {
@@ -2119,7 +2153,7 @@ mod tests {
     use super::*;
     use crate::{ComponentProgramBuilder, KernelSummarySelectArm, PublishMode};
     use boon_checked::{FlowMode, ObjectShape, Type, Variant};
-    use std::sync::Arc;
+    use std::{collections::BTreeSet, sync::Arc};
 
     #[test]
     fn shared_summary_select_does_not_evaluate_unselected_requirements() {
@@ -2862,6 +2896,25 @@ mod tests {
     }
 
     #[test]
+    fn missing_open_authoritative_projection_keeps_the_occurrence_generic() {
+        let mut builder = ComponentProgramBuilder::new();
+        let provider = builder.new_authoritative_provider();
+        let present = builder.terms_mut().intern_name("present");
+        let missing = builder.terms_mut().intern_name("missing");
+        let number = builder.terms().number();
+        let open = builder.terms_mut().object([(present, number)], true);
+        builder.add_publish(provider, [open], PublishMode::Replace);
+        let projected = builder.add_projection(provider, [missing]);
+        let output = builder.add_output(projected, FlowMode::Continuous);
+
+        let artifact = solve_component(builder.finish()).unwrap();
+        assert!(matches!(
+            &artifact.output(output).unwrap().flow_type.ty,
+            Type::Var(_)
+        ));
+    }
+
+    #[test]
     fn object_projection_can_shape_an_unresolved_formal() {
         let mut builder = ComponentProgramBuilder::new();
         let formal = builder.new_variable();
@@ -2879,6 +2932,37 @@ mod tests {
                 [("name".to_owned(), Type::Text)],
                 true,
             ))
+        );
+    }
+
+    #[test]
+    fn repeated_equalities_merge_disjoint_open_object_requirements() {
+        let mut builder = ComponentProgramBuilder::new();
+        let requirement = builder.new_contextual_hole();
+        let state = builder.terms_mut().intern_name("state");
+        let click_time = builder.terms_mut().intern_name("click_time");
+        let state_leaf = builder.new_variable();
+        let click_time_leaf = builder.new_variable();
+        let state_leaf = builder.variable_term(state_leaf);
+        let click_time_leaf = builder.variable_term(click_time_leaf);
+        let state_shape = builder.terms_mut().object([(state, state_leaf)], true);
+        let click_time_shape = builder
+            .terms_mut()
+            .object([(click_time, click_time_leaf)], true);
+        let requirement_term = builder.variable_term(requirement);
+        builder.add_unify(requirement_term, state_shape);
+        let requirement_term = builder.variable_term(requirement);
+        builder.add_unify(requirement_term, click_time_shape);
+        let output = builder.add_output(requirement, FlowMode::Continuous);
+
+        let artifact = solve_component(builder.finish()).unwrap();
+        let Type::Object(shape) = &artifact.output(output).unwrap().flow_type.ty else {
+            panic!("merged requirement must remain an open object")
+        };
+        assert!(shape.open);
+        assert_eq!(
+            shape.fields.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["click_time".to_owned(), "state".to_owned()])
         );
     }
 

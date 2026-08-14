@@ -3226,6 +3226,44 @@ at 71,949, so the next large cut should remove repeated occurrence evaluation
 or specialize definition decisions in packed form rather than micro-optimize
 the public projection tail.
 
+The follow-up definition-DAG cut is also complete. After partial evaluation,
+each summary now hash-conses identical pure inputs, terms, projections,
+collections, selections, and records. Constraint publications, ordered
+sequences, and nested invocations are deliberately excluded, and a pure parent
+is eligible only when its complete local dependency graph is pure. Hash buckets
+are lookup accelerators only: every hit is checked by exact node equality and
+canonical order remains traversal-defined. This makes repeated type algebra one
+definition-owned fact without caching a prior compilation or copying code into
+callers.
+
+The full NovyWave graph deduplicates another 24,848 nodes and retains 12,856;
+only 915 nodes remain for final dead-code pruning. Summary evaluation falls
+from 732,728 to 448,132 (38.8%), structural-widen requests from 132,286 to
+96,553 (27.0%), `tree_row_text` from 88,032 to 40,143 evaluations, and
+`material` from 71,949 to 57,317. From the typed-diagnostics checkpoint, the
+combined normalization cuts remove 62.7% of stored summary nodes and 54.5% of
+summary evaluation. Exact differential parity still passes for all 1,389
+owners; all 75 kernel tests, 90 non-ignored compiler unit tests, and 16 compiler
+integration tests pass.
+
+Three source-current optimized samples record diagnostics candidates of
+543.546, 535.264, and 538.935 ms (median 538.935 ms), with median kernel time
+450.294 ms and graph solve 221.751 ms. Complete checked-image candidates record
+716.208, 707.437, and 707.060 ms (median 707.437 ms), with median kernel time
+619.730 ms, compilation 131.994 ms, and checked-image publication 162.351 ms.
+Against the preceding receipt, complete diagnostics and checked-image latency
+improve by 2.8% and 2.5%; this remains incremental progress, not the final
+Jai-like result. The two-job optimized rebuild took 2m03s and is excluded.
+
+A controlled alternative was rejected: allowing a callee that was large before
+normalization to inline merely because its normalized bytecode became small cut
+only 5% of evaluation, grew stored summary code from 25,162 to 41,564 nodes,
+raised debug compilation from about 729 to 890 ms, and slowed the candidate by
+about 8%. Shared ownership must therefore remain definition-based. The next cut
+must reduce repeated shared-program evaluations or replace more of the 48,281
+general graph operations with definition-owned packed transfer facts; caller
+expansion is not an acceptable shortcut.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not

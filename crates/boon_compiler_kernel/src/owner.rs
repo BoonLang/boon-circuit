@@ -555,6 +555,7 @@ pub struct KernelCompileWork {
     pub summary_definition_nodes: u64,
     pub summary_constant_folded_nodes: u64,
     pub summary_selector_fused_records: u64,
+    pub summary_deduplicated_nodes: u64,
     pub summary_pruned_nodes: u64,
     pub summary_pruned_inputs: u64,
     pub summary_invoke_nodes: u64,
@@ -3282,6 +3283,9 @@ pub fn compile_project_program_with_definition_facts(
         compile_work.summary_selector_fused_records = compile_work
             .summary_selector_fused_records
             .saturating_add(summary.selector_fused_records);
+        compile_work.summary_deduplicated_nodes = compile_work
+            .summary_deduplicated_nodes
+            .saturating_add(summary.deduplicated_nodes);
         compile_work.summary_pruned_nodes = compile_work
             .summary_pruned_nodes
             .saturating_add(summary.pruned_nodes);
@@ -5029,6 +5033,7 @@ struct CompiledDirectSummary {
     formal_count: usize,
     constant_folded_nodes: u64,
     selector_fused_records: u64,
+    deduplicated_nodes: u64,
     pruned_nodes: u64,
     pruned_inputs: u64,
     shared_bytecode: bool,
@@ -5063,6 +5068,10 @@ impl DirectSummaryPlanCompiler<'_> {
 
     fn compact_result(&mut self, result: &mut PlannedSummaryValue) -> (u64, u64) {
         compact_summary_result(&mut self.nodes, &mut self.inputs, result)
+    }
+
+    fn deduplicate_nodes(&mut self, result: &mut PlannedSummaryValue) -> u64 {
+        deduplicate_summary_nodes(&mut self.nodes, result)
     }
 
     fn push_node(&mut self, node: KernelSummaryNode) -> KernelSummaryValueId {
@@ -6108,6 +6117,321 @@ fn fuse_constant_summary_record_selectors(
     Some((selector, variants))
 }
 
+/// Hash-cons pure nodes inside one immutable definition summary.
+///
+/// This pass canonicalizes the summary DAG after constant folding, but it does
+/// not merge nodes that own requirement or evaluation-order effects. In
+/// particular, CONSTRAIN, SEQUENCE, and INVOKE remain distinct even when their
+/// printed operands match. Pure parents are eligible only when their complete
+/// local dependency graph is also pure. The result is one definition-owned
+/// computation for repeated type algebra without copying bytecode into callers.
+fn deduplicate_summary_nodes(
+    nodes: &mut Vec<KernelSummaryNode>,
+    result: &mut PlannedSummaryValue,
+) -> u64 {
+    let old_nodes = std::mem::take(nodes);
+    let old_node_count = old_nodes.len();
+    let mut relocations = vec![None; old_node_count];
+    let mut pure = vec![false; old_node_count];
+    let mut active = vec![false; old_node_count];
+    let mut interner = HashMap::<u64, Vec<KernelSummaryValueId>>::new();
+    let mut canonical = Vec::with_capacity(old_node_count);
+    for index in 0..old_node_count {
+        canonicalize_summary_node(
+            index,
+            &old_nodes,
+            &mut relocations,
+            &mut pure,
+            &mut active,
+            &mut interner,
+            &mut canonical,
+        );
+    }
+    result.value = relocations[result.value.0 as usize]
+        .expect("kernel summary result receives a canonical value");
+    *nodes = canonical;
+    u64::try_from(old_node_count - nodes.len()).expect("summary CSE delta exceeds u64")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonicalize_summary_node(
+    index: usize,
+    old_nodes: &[KernelSummaryNode],
+    relocations: &mut [Option<KernelSummaryValueId>],
+    purities: &mut [bool],
+    active: &mut [bool],
+    interner: &mut HashMap<u64, Vec<KernelSummaryValueId>>,
+    canonical: &mut Vec<KernelSummaryNode>,
+) -> (KernelSummaryValueId, bool) {
+    if let Some(value) = relocations
+        .get(index)
+        .copied()
+        .expect("kernel summary CSE references an existing node")
+    {
+        return (value, purities[index]);
+    }
+    if std::mem::replace(&mut active[index], true) {
+        panic!("kernel summary CSE found a value cycle through {index}");
+    }
+    let mut node = old_nodes[index].clone();
+    let is_pure = match &mut node {
+        KernelSummaryNode::Input(_) | KernelSummaryNode::Term(_) => true,
+        KernelSummaryNode::Projection { provider, .. } => {
+            let (value, pure) = canonicalize_summary_value(
+                *provider,
+                old_nodes,
+                relocations,
+                purities,
+                active,
+                interner,
+                canonical,
+            );
+            *provider = value;
+            pure
+        }
+        KernelSummaryNode::Constrain { value, .. } => {
+            *value = canonicalize_summary_value(
+                *value,
+                old_nodes,
+                relocations,
+                purities,
+                active,
+                interner,
+                canonical,
+            )
+            .0;
+            false
+        }
+        KernelSummaryNode::Sequence {
+            inputs: dependencies,
+            result,
+        } => {
+            for dependency in dependencies {
+                *dependency = canonicalize_summary_value(
+                    *dependency,
+                    old_nodes,
+                    relocations,
+                    purities,
+                    active,
+                    interner,
+                    canonical,
+                )
+                .0;
+            }
+            *result = canonicalize_summary_value(
+                *result,
+                old_nodes,
+                relocations,
+                purities,
+                active,
+                interner,
+                canonical,
+            )
+            .0;
+            false
+        }
+        KernelSummaryNode::Collection { inputs, values, .. } => {
+            let mut pure = true;
+            for value in inputs.iter_mut().chain(values.iter_mut()) {
+                let (canonical_value, value_is_pure) = canonicalize_summary_value(
+                    *value,
+                    old_nodes,
+                    relocations,
+                    purities,
+                    active,
+                    interner,
+                    canonical,
+                );
+                *value = canonical_value;
+                pure &= value_is_pure;
+            }
+            pure
+        }
+        KernelSummaryNode::Invoke {
+            inputs: arguments, ..
+        } => {
+            for argument in arguments {
+                *argument = canonicalize_summary_value(
+                    *argument,
+                    old_nodes,
+                    relocations,
+                    purities,
+                    active,
+                    interner,
+                    canonical,
+                )
+                .0;
+            }
+            false
+        }
+        KernelSummaryNode::Select { selector, arms } => {
+            let (canonical_selector, mut pure) = canonicalize_summary_value(
+                *selector,
+                old_nodes,
+                relocations,
+                purities,
+                active,
+                interner,
+                canonical,
+            );
+            *selector = canonical_selector;
+            for arm in arms {
+                let (output, output_is_pure) = canonicalize_summary_value(
+                    arm.output,
+                    old_nodes,
+                    relocations,
+                    purities,
+                    active,
+                    interner,
+                    canonical,
+                );
+                arm.output = output;
+                pure &= output_is_pure;
+            }
+            pure
+        }
+        KernelSummaryNode::Record { entries, .. } => {
+            let mut pure = true;
+            for entry in entries {
+                let value = match entry {
+                    KernelSummaryRecordEntry::Field { value, .. }
+                    | KernelSummaryRecordEntry::Spread { value } => value,
+                };
+                let (canonical_value, value_is_pure) = canonicalize_summary_value(
+                    *value,
+                    old_nodes,
+                    relocations,
+                    purities,
+                    active,
+                    interner,
+                    canonical,
+                );
+                *value = canonical_value;
+                pure &= value_is_pure;
+            }
+            pure
+        }
+    };
+    let hash = is_pure.then(|| pure_summary_node_hash(&node));
+    let value = match hash {
+        Some(hash) => {
+            let existing = interner.get(&hash).and_then(|bucket| {
+                bucket
+                    .iter()
+                    .copied()
+                    .find(|candidate| canonical[candidate.0 as usize] == node)
+            });
+            if let Some(existing) = existing {
+                existing
+            } else {
+                let value = KernelSummaryValueId(
+                    u32::try_from(canonical.len()).expect("kernel summary value count exceeds u32"),
+                );
+                canonical.push(node);
+                interner.entry(hash).or_default().push(value);
+                value
+            }
+        }
+        None => {
+            let value = KernelSummaryValueId(
+                u32::try_from(canonical.len()).expect("kernel summary value count exceeds u32"),
+            );
+            canonical.push(node);
+            value
+        }
+    };
+    active[index] = false;
+    relocations[index] = Some(value);
+    purities[index] = is_pure;
+    (value, is_pure)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonicalize_summary_value(
+    value: KernelSummaryValueId,
+    old_nodes: &[KernelSummaryNode],
+    relocations: &mut [Option<KernelSummaryValueId>],
+    purities: &mut [bool],
+    active: &mut [bool],
+    interner: &mut HashMap<u64, Vec<KernelSummaryValueId>>,
+    canonical: &mut Vec<KernelSummaryNode>,
+) -> (KernelSummaryValueId, bool) {
+    canonicalize_summary_node(
+        value.0 as usize,
+        old_nodes,
+        relocations,
+        purities,
+        active,
+        interner,
+        canonical,
+    )
+}
+
+fn pure_summary_node_hash(node: &KernelSummaryNode) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match node {
+        KernelSummaryNode::Input(input) => {
+            0_u8.hash(&mut hasher);
+            input.hash(&mut hasher);
+        }
+        KernelSummaryNode::Term(term) => {
+            1_u8.hash(&mut hasher);
+            term.hash(&mut hasher);
+        }
+        KernelSummaryNode::Projection { provider, fields } => {
+            2_u8.hash(&mut hasher);
+            provider.hash(&mut hasher);
+            fields.hash(&mut hasher);
+        }
+        KernelSummaryNode::Collection {
+            kind,
+            inputs,
+            values,
+        } => {
+            3_u8.hash(&mut hasher);
+            let kind = match kind {
+                KernelCollectionOperationKind::List => 0,
+                KernelCollectionOperationKind::Set => 1,
+                KernelCollectionOperationKind::Map => 2,
+            };
+            kind.hash(&mut hasher);
+            inputs.hash(&mut hasher);
+            values.hash(&mut hasher);
+        }
+        KernelSummaryNode::Select { selector, arms } => {
+            4_u8.hash(&mut hasher);
+            selector.hash(&mut hasher);
+            for arm in arms {
+                arm.pattern.hash(&mut hasher);
+                arm.output.hash(&mut hasher);
+            }
+        }
+        KernelSummaryNode::Record { tag, entries } => {
+            5_u8.hash(&mut hasher);
+            tag.hash(&mut hasher);
+            for entry in entries {
+                match entry {
+                    KernelSummaryRecordEntry::Field { name, value } => {
+                        0_u8.hash(&mut hasher);
+                        name.hash(&mut hasher);
+                        value.hash(&mut hasher);
+                    }
+                    KernelSummaryRecordEntry::Spread { value } => {
+                        1_u8.hash(&mut hasher);
+                        value.hash(&mut hasher);
+                    }
+                }
+            }
+        }
+        KernelSummaryNode::Constrain { .. }
+        | KernelSummaryNode::Sequence { .. }
+        | KernelSummaryNode::Invoke { .. } => {
+            unreachable!("effect-owning summary nodes are never hash-consed")
+        }
+    }
+    hasher.finish()
+}
+
 /// Retain only bytecode and occurrence inputs reachable from one summary
 /// result. Normalization deliberately leaves node IDs stable while it runs;
 /// this final compaction performs one dense relocation after every rewrite is
@@ -6609,6 +6933,7 @@ fn compile_direct_result_summaries(
         };
         let shared_bytecode = compiler.nodes.len() >= SHARED_SUMMARY_MIN_NODES;
         let (constant_folded_nodes, selector_fused_records) = compiler.fold_constant_nodes();
+        let deduplicated_nodes = compiler.deduplicate_nodes(&mut result);
         let (pruned_nodes, pruned_inputs) = compiler.compact_result(&mut result);
         summaries[target.0 as usize] = Some(Arc::new(CompiledDirectSummary {
             program: Arc::new(KernelSummaryProgram {
@@ -6621,6 +6946,7 @@ fn compile_direct_result_summaries(
             formal_count: owner.formal_count as usize,
             constant_folded_nodes,
             selector_fused_records,
+            deduplicated_nodes,
             pruned_nodes,
             pruned_inputs,
             shared_bytecode,
@@ -11476,6 +11802,75 @@ mod tests {
                 false,
             ))
         );
+    }
+
+    #[test]
+    fn definition_summary_cse_shares_pure_algebra_but_not_requirements() {
+        let mut builder = ComponentProgramBuilder::new();
+        let number = builder.terms().number();
+        let value_name = builder.terms_mut().intern_name("value");
+        let mut nodes = vec![
+            KernelSummaryNode::Input(0),
+            KernelSummaryNode::Input(0),
+            KernelSummaryNode::Term(number),
+            KernelSummaryNode::Term(number),
+            KernelSummaryNode::Record {
+                tag: None,
+                entries: vec![KernelSummaryRecordEntry::Field {
+                    name: value_name,
+                    value: KernelSummaryValueId(2),
+                }]
+                .into_boxed_slice(),
+            },
+            KernelSummaryNode::Record {
+                tag: None,
+                entries: vec![KernelSummaryRecordEntry::Field {
+                    name: value_name,
+                    value: KernelSummaryValueId(3),
+                }]
+                .into_boxed_slice(),
+            },
+            KernelSummaryNode::Constrain {
+                value: KernelSummaryValueId(4),
+                expected: number,
+            },
+            KernelSummaryNode::Constrain {
+                value: KernelSummaryValueId(5),
+                expected: number,
+            },
+            KernelSummaryNode::Sequence {
+                inputs: vec![KernelSummaryValueId(6), KernelSummaryValueId(7)].into_boxed_slice(),
+                result: KernelSummaryValueId(5),
+            },
+        ];
+        let mut result = PlannedSummaryValue {
+            value: KernelSummaryValueId(8),
+            mode: DirectSummaryMode::Fixed {
+                owner: KernelOwnerId(0),
+                expression: 0,
+            },
+            formal_projection_input: None,
+        };
+
+        assert_eq!(deduplicate_summary_nodes(&mut nodes, &mut result), 3);
+        assert_eq!(result.value, KernelSummaryValueId(5));
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| matches!(node, KernelSummaryNode::Constrain { .. }))
+                .count(),
+            2,
+            "requirement publications must retain distinct authored nodes"
+        );
+        let KernelSummaryNode::Sequence {
+            inputs,
+            result: sequence_result,
+        } = &nodes[result.value.0 as usize]
+        else {
+            panic!("summary result must remain the ordered requirement sequence")
+        };
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(*sequence_result, KernelSummaryValueId(2));
     }
 
     #[test]

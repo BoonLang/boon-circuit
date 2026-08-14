@@ -3,8 +3,9 @@ use crate::{
     KernelPattern, KernelRecordEntry, KernelSelectArm, KernelSolveError, KernelSolveWork,
     KernelSummaryCallInput, KernelSummaryNode, KernelSummaryProgram, KernelSummaryProjectionStep,
     KernelSummaryRecordEntry, KernelSummarySelectArm, KernelSummaryValueId, OutputId, PublishMode,
-    TypeTermId, TypeVariableId, alpha_normalize_callable_interface_and_diagnostics,
-    alpha_normalize_definition, build_snapshot_receipts, definition_basis_fingerprint,
+    TypeTerm, TypeTermId, TypeVariableId, VariantTerm,
+    alpha_normalize_callable_interface_and_diagnostics, alpha_normalize_definition,
+    build_snapshot_receipts, definition_basis_fingerprint,
     definition_basis_fingerprint_with_buffer, solve_component,
 };
 use boon_checked::{
@@ -552,6 +553,10 @@ pub struct KernelCompileWork {
     pub reused_invocation_frames: u64,
     pub direct_result_summaries: u64,
     pub summary_definition_nodes: u64,
+    pub summary_constant_folded_nodes: u64,
+    pub summary_selector_fused_records: u64,
+    pub summary_pruned_nodes: u64,
+    pub summary_pruned_inputs: u64,
     pub summary_invoke_nodes: u64,
     pub principal_result_reuses: u64,
     pub principal_expression_reuses: u64,
@@ -3271,6 +3276,18 @@ pub fn compile_project_program_with_definition_facts(
         compile_work.summary_definition_nodes = compile_work
             .summary_definition_nodes
             .saturating_add(summary.program.nodes.len() as u64);
+        compile_work.summary_constant_folded_nodes = compile_work
+            .summary_constant_folded_nodes
+            .saturating_add(summary.constant_folded_nodes);
+        compile_work.summary_selector_fused_records = compile_work
+            .summary_selector_fused_records
+            .saturating_add(summary.selector_fused_records);
+        compile_work.summary_pruned_nodes = compile_work
+            .summary_pruned_nodes
+            .saturating_add(summary.pruned_nodes);
+        compile_work.summary_pruned_inputs = compile_work
+            .summary_pruned_inputs
+            .saturating_add(summary.pruned_inputs);
         compile_work.summary_invoke_nodes = compile_work.summary_invoke_nodes.saturating_add(
             summary
                 .program
@@ -5010,6 +5027,11 @@ struct CompiledDirectSummary {
     inputs: Box<[DirectSummaryInput]>,
     result_mode: DirectSummaryMode,
     formal_count: usize,
+    constant_folded_nodes: u64,
+    selector_fused_records: u64,
+    pruned_nodes: u64,
+    pruned_inputs: u64,
+    shared_bytecode: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -5035,6 +5057,14 @@ struct DirectSummaryPlanCompiler<'a> {
 }
 
 impl DirectSummaryPlanCompiler<'_> {
+    fn fold_constant_nodes(&mut self) -> (u64, u64) {
+        fold_constant_summary_nodes(self.builder, &mut self.nodes)
+    }
+
+    fn compact_result(&mut self, result: &mut PlannedSummaryValue) -> (u64, u64) {
+        compact_summary_result(&mut self.nodes, &mut self.inputs, result)
+    }
+
     fn push_node(&mut self, node: KernelSummaryNode) -> KernelSummaryValueId {
         let id = KernelSummaryValueId(
             u32::try_from(self.nodes.len()).expect("kernel summary value count exceeds u32"),
@@ -5539,7 +5569,7 @@ impl DirectSummaryPlanCompiler<'_> {
                         .summaries
                         .get(target.0 as usize)
                         .and_then(Clone::clone)
-                        .filter(|summary| summary.program.nodes.len() >= SHARED_SUMMARY_MIN_NODES);
+                        .filter(|summary| summary.shared_bytecode);
                     if let Some(shared) = shared
                         && let Some(result) =
                             self.compile_shared_invoke(shared.as_ref(), &target_actuals)
@@ -5917,6 +5947,612 @@ impl DirectSummaryPlanCompiler<'_> {
     }
 }
 
+/// Replace definition-constant summary subgraphs with one interned type term.
+///
+/// The summary evaluator is deliberately lazy across SELECT arms, so this pass
+/// never evaluates an input, a requirement, or a nested invocation. It folds
+/// only closed term algebra whose value cannot vary by call occurrence. Large
+/// library constructors consequently own their constant record/collection
+/// shapes once instead of rebuilding and re-interning them on every call.
+fn fold_constant_summary_nodes(
+    builder: &mut ComponentProgramBuilder,
+    nodes: &mut Vec<KernelSummaryNode>,
+) -> (u64, u64) {
+    let mut constants = vec![None; nodes.len()];
+    let mut folded = 0_u64;
+    let mut fused_records = 0_u64;
+    let mut index = 0;
+    while index < nodes.len() {
+        let node = nodes[index].clone();
+        let constant = match &node {
+            KernelSummaryNode::Input(_)
+            | KernelSummaryNode::Constrain { .. }
+            | KernelSummaryNode::Invoke { .. } => None,
+            KernelSummaryNode::Term(term) => {
+                (!builder.terms().has_variable(*term)).then_some(*term)
+            }
+            KernelSummaryNode::Projection { provider, fields } => {
+                constant_summary_projection(builder, *provider, fields, &constants)
+            }
+            KernelSummaryNode::Sequence {
+                inputs: dependencies,
+                result,
+            } => dependencies
+                .iter()
+                .all(|dependency| summary_constant(&constants, *dependency).is_some())
+                .then(|| summary_constant(&constants, *result))
+                .flatten(),
+            KernelSummaryNode::Collection {
+                kind,
+                inputs,
+                values,
+            } => constant_summary_collection(builder, *kind, inputs, values, &constants),
+            KernelSummaryNode::Select { selector, arms } => {
+                constant_summary_select(builder, *selector, arms, &constants)
+            }
+            KernelSummaryNode::Record { tag, entries } => {
+                constant_summary_record(builder, *tag, entries, &constants)
+            }
+        };
+        constants[index] = constant;
+        if let Some(constant) = constant {
+            if !matches!(node, KernelSummaryNode::Term(term) if term == constant) {
+                nodes[index] = KernelSummaryNode::Term(constant);
+                folded = folded.saturating_add(1);
+            }
+        } else if let KernelSummaryNode::Record { tag, entries } = &node
+            && let Some((selector, variants)) =
+                fuse_constant_summary_record_selectors(builder, *tag, entries, nodes, &constants)
+        {
+            let arms = variants
+                .into_iter()
+                .map(|(pattern, term)| {
+                    let output = KernelSummaryValueId(
+                        u32::try_from(nodes.len()).expect("kernel summary value count exceeds u32"),
+                    );
+                    nodes.push(KernelSummaryNode::Term(term));
+                    constants.push(Some(term));
+                    KernelSummarySelectArm { pattern, output }
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            nodes[index] = KernelSummaryNode::Select { selector, arms };
+            fused_records = fused_records.saturating_add(1);
+        }
+        index += 1;
+    }
+    (folded, fused_records)
+}
+
+/// Fuse a record whose dynamic fields all branch on the same selector into
+/// one selector over complete closed record terms. Structural widening of the
+/// resulting records is equivalent to the original field-wise joins, while a
+/// singleton selector now performs one decision instead of one per field.
+fn fuse_constant_summary_record_selectors(
+    builder: &mut ComponentProgramBuilder,
+    tag: Option<crate::NameId>,
+    entries: &[KernelSummaryRecordEntry],
+    nodes: &[KernelSummaryNode],
+    constants: &[Option<TypeTermId>],
+) -> Option<(KernelSummaryValueId, Vec<(KernelPattern, TypeTermId)>)> {
+    let mut selector = None;
+    let mut patterns = None::<Vec<KernelPattern>>;
+    let mut has_dynamic_field = false;
+    for entry in entries {
+        let KernelSummaryRecordEntry::Field { value, .. } = entry else {
+            return None;
+        };
+        if summary_constant(constants, *value).is_some() {
+            continue;
+        }
+        let KernelSummaryNode::Select {
+            selector: field_selector,
+            arms,
+        } = nodes.get(value.0 as usize)?
+        else {
+            return None;
+        };
+        if arms.is_empty()
+            || arms.iter().any(|arm| {
+                summary_constant(constants, arm.output)
+                    .is_none_or(|term| matches!(builder.terms().term(term), TypeTerm::Absent))
+            })
+        {
+            return None;
+        }
+        if selector
+            .replace(*field_selector)
+            .is_some_and(|previous| previous != *field_selector)
+        {
+            return None;
+        }
+        let field_patterns = arms
+            .iter()
+            .map(|arm| arm.pattern.clone())
+            .collect::<Vec<_>>();
+        if patterns
+            .as_ref()
+            .is_some_and(|patterns| *patterns != field_patterns)
+        {
+            return None;
+        }
+        patterns.get_or_insert(field_patterns);
+        has_dynamic_field = true;
+    }
+    if !has_dynamic_field {
+        return None;
+    }
+    let selector = selector?;
+    let patterns = patterns?;
+    let mut variants = Vec::with_capacity(patterns.len());
+    for (ordinal, pattern) in patterns.into_iter().enumerate() {
+        let mut fields = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let KernelSummaryRecordEntry::Field { name, value } = entry else {
+                unreachable!("record-selector fusion rejected spreads above")
+            };
+            let value = if let Some(value) = summary_constant(constants, *value) {
+                value
+            } else {
+                let KernelSummaryNode::Select { arms, .. } = &nodes[value.0 as usize] else {
+                    unreachable!("record-selector fusion validated every dynamic field")
+                };
+                summary_constant(constants, arms[ordinal].output)
+                    .expect("record-selector fusion validated closed arm outputs")
+            };
+            insert_constant_summary_field(&mut fields, *name, value);
+        }
+        let record = intern_constant_summary_record(builder, tag, fields);
+        variants.push((pattern, record));
+    }
+    Some((selector, variants))
+}
+
+/// Retain only bytecode and occurrence inputs reachable from one summary
+/// result. Normalization deliberately leaves node IDs stable while it runs;
+/// this final compaction performs one dense relocation after every rewrite is
+/// complete. The caller's pre-normalization sharing decision is kept
+/// separately, so a large definition cannot become per-call inline code merely
+/// because its normalized program is compact.
+fn compact_summary_result(
+    nodes: &mut Vec<KernelSummaryNode>,
+    inputs: &mut Vec<DirectSummaryInput>,
+    result: &mut PlannedSummaryValue,
+) -> (u64, u64) {
+    let old_node_count = nodes.len();
+    let old_input_count = inputs.len();
+    let mut reachable = vec![false; old_node_count];
+    let mut used_inputs = vec![false; old_input_count];
+    let mut pending = vec![result.value];
+    while let Some(value) = pending.pop() {
+        let index = value.0 as usize;
+        let Some(seen) = reachable.get_mut(index) else {
+            panic!(
+                "kernel summary compaction references missing value {}",
+                value.0
+            )
+        };
+        if *seen {
+            continue;
+        }
+        *seen = true;
+        match &nodes[index] {
+            KernelSummaryNode::Input(input) => {
+                *used_inputs
+                    .get_mut(*input as usize)
+                    .expect("kernel summary input belongs to its compact program") = true;
+            }
+            KernelSummaryNode::Term(_) => {}
+            KernelSummaryNode::Projection { provider, .. } => pending.push(*provider),
+            KernelSummaryNode::Constrain { value, .. } => pending.push(*value),
+            KernelSummaryNode::Sequence {
+                inputs: dependencies,
+                result,
+            } => {
+                pending.extend(dependencies.iter().copied());
+                pending.push(*result);
+            }
+            KernelSummaryNode::Collection {
+                inputs: items,
+                values,
+                ..
+            } => pending.extend(items.iter().chain(values.iter()).copied()),
+            KernelSummaryNode::Invoke {
+                inputs: arguments, ..
+            } => pending.extend(arguments.iter().copied()),
+            KernelSummaryNode::Select { selector, arms } => {
+                pending.push(*selector);
+                pending.extend(arms.iter().map(|arm| arm.output));
+            }
+            KernelSummaryNode::Record { entries, .. } => {
+                pending.extend(entries.iter().map(|entry| match entry {
+                    KernelSummaryRecordEntry::Field { value, .. }
+                    | KernelSummaryRecordEntry::Spread { value } => *value,
+                }));
+            }
+        }
+    }
+    for input in [
+        match result.mode {
+            DirectSummaryMode::Input(input) => Some(input),
+            DirectSummaryMode::Fixed { .. } => None,
+        },
+        result.formal_projection_input,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        *used_inputs
+            .get_mut(input as usize)
+            .expect("kernel summary result mode references a compact input") = true;
+    }
+
+    let mut value_relocations = vec![None; old_node_count];
+    let mut next_value = 0_u32;
+    for (index, reachable) in reachable.iter().copied().enumerate() {
+        if reachable {
+            value_relocations[index] = Some(KernelSummaryValueId(next_value));
+            next_value = next_value
+                .checked_add(1)
+                .expect("kernel summary value count exceeds u32");
+        }
+    }
+    let mut input_relocations = vec![None; old_input_count];
+    let mut next_input = 0_u32;
+    for (index, used) in used_inputs.iter().copied().enumerate() {
+        if used {
+            input_relocations[index] = Some(next_input);
+            next_input = next_input
+                .checked_add(1)
+                .expect("kernel summary input count exceeds u32");
+        }
+    }
+
+    let old_nodes = std::mem::take(nodes);
+    nodes.extend(
+        old_nodes
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, mut node)| {
+                reachable[index].then(|| {
+                    relocate_summary_node(&mut node, &value_relocations, &input_relocations);
+                    node
+                })
+            }),
+    );
+    let old_inputs = std::mem::take(inputs);
+    inputs.extend(
+        old_inputs
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, input)| used_inputs[index].then_some(input)),
+    );
+    result.value = relocated_summary_value(result.value, &value_relocations);
+    result.mode = match result.mode {
+        DirectSummaryMode::Fixed { owner, expression } => {
+            DirectSummaryMode::Fixed { owner, expression }
+        }
+        DirectSummaryMode::Input(input) => DirectSummaryMode::Input(
+            input_relocations[input as usize]
+                .expect("kernel summary result mode input remains reachable"),
+        ),
+    };
+    result.formal_projection_input = result.formal_projection_input.map(|input| {
+        input_relocations[input as usize]
+            .expect("kernel summary result projection input remains reachable")
+    });
+    (
+        u64::try_from(old_node_count - nodes.len()).expect("summary node delta exceeds u64"),
+        u64::try_from(old_input_count - inputs.len()).expect("summary input delta exceeds u64"),
+    )
+}
+
+fn relocate_summary_node(
+    node: &mut KernelSummaryNode,
+    values: &[Option<KernelSummaryValueId>],
+    inputs: &[Option<u32>],
+) {
+    match node {
+        KernelSummaryNode::Input(input) => {
+            *input = inputs[*input as usize].expect("reachable summary input has a relocation");
+        }
+        KernelSummaryNode::Term(_) => {}
+        KernelSummaryNode::Projection { provider, .. } => {
+            *provider = relocated_summary_value(*provider, values);
+        }
+        KernelSummaryNode::Constrain { value, .. } => {
+            *value = relocated_summary_value(*value, values);
+        }
+        KernelSummaryNode::Sequence {
+            inputs: dependencies,
+            result,
+        } => {
+            for dependency in dependencies {
+                *dependency = relocated_summary_value(*dependency, values);
+            }
+            *result = relocated_summary_value(*result, values);
+        }
+        KernelSummaryNode::Collection {
+            inputs: items,
+            values: map_values,
+            ..
+        } => {
+            for value in items.iter_mut().chain(map_values.iter_mut()) {
+                *value = relocated_summary_value(*value, values);
+            }
+        }
+        KernelSummaryNode::Invoke {
+            inputs: arguments, ..
+        } => {
+            for argument in arguments {
+                *argument = relocated_summary_value(*argument, values);
+            }
+        }
+        KernelSummaryNode::Select { selector, arms } => {
+            *selector = relocated_summary_value(*selector, values);
+            for arm in arms {
+                arm.output = relocated_summary_value(arm.output, values);
+            }
+        }
+        KernelSummaryNode::Record { entries, .. } => {
+            for entry in entries {
+                let value = match entry {
+                    KernelSummaryRecordEntry::Field { value, .. }
+                    | KernelSummaryRecordEntry::Spread { value } => value,
+                };
+                *value = relocated_summary_value(*value, values);
+            }
+        }
+    }
+}
+
+fn relocated_summary_value(
+    value: KernelSummaryValueId,
+    relocations: &[Option<KernelSummaryValueId>],
+) -> KernelSummaryValueId {
+    relocations[value.0 as usize].expect("reachable summary value has a relocation")
+}
+
+fn summary_constant(
+    constants: &[Option<TypeTermId>],
+    value: KernelSummaryValueId,
+) -> Option<TypeTermId> {
+    constants.get(value.0 as usize).copied().flatten()
+}
+
+fn constant_summary_projection(
+    builder: &mut ComponentProgramBuilder,
+    provider: KernelSummaryValueId,
+    fields: &[crate::NameId],
+    constants: &[Option<TypeTermId>],
+) -> Option<TypeTermId> {
+    let mut provider = summary_constant(constants, provider)?;
+    for field in fields {
+        provider = constant_summary_project_field(builder, provider, *field).unwrap_or_else(|| {
+            let field = builder.terms().name(*field).to_owned();
+            builder.terms_mut().unresolved_shape(format!(
+                "authoritative summary value omits projection `{field}`"
+            ))
+        });
+    }
+    Some(provider)
+}
+
+fn constant_summary_project_field(
+    builder: &mut ComponentProgramBuilder,
+    provider: TypeTermId,
+    field: crate::NameId,
+) -> Option<TypeTermId> {
+    match builder.terms().term(provider).clone() {
+        TypeTerm::Object { fields, .. } => fields
+            .iter()
+            .find(|candidate| candidate.name == field)
+            .map(|candidate| candidate.ty),
+        TypeTerm::Union(members) => {
+            let projected = members
+                .iter()
+                .filter_map(|member| constant_summary_project_field(builder, *member, field))
+                .collect::<Vec<_>>();
+            (!projected.is_empty()).then(|| builder.terms_mut().union(projected))
+        }
+        TypeTerm::VariantSet(variants) => {
+            let projected = variants
+                .iter()
+                .filter_map(|variant| match variant {
+                    VariantTerm::Tagged { fields, .. } => {
+                        constant_summary_project_field(builder, *fields, field)
+                    }
+                    VariantTerm::Tag(_) => None,
+                })
+                .collect::<Vec<_>>();
+            (!projected.is_empty()).then(|| builder.terms_mut().union(projected))
+        }
+        _ => None,
+    }
+}
+
+fn constant_summary_collection(
+    builder: &mut ComponentProgramBuilder,
+    kind: KernelCollectionOperationKind,
+    inputs: &[KernelSummaryValueId],
+    values: &[KernelSummaryValueId],
+    constants: &[Option<TypeTermId>],
+) -> Option<TypeTermId> {
+    let inputs = inputs
+        .iter()
+        .map(|value| summary_constant(constants, *value))
+        .collect::<Option<Vec<_>>>()?;
+    let values = values
+        .iter()
+        .map(|value| summary_constant(constants, *value))
+        .collect::<Option<Vec<_>>>()?;
+    let item = if inputs.is_empty() {
+        match kind {
+            KernelCollectionOperationKind::List => builder.terms().open_object(),
+            KernelCollectionOperationKind::Set | KernelCollectionOperationKind::Map => {
+                builder.terms().unknown()
+            }
+        }
+    } else {
+        constant_summary_structural_widen(builder, &inputs)
+    };
+    Some(match kind {
+        KernelCollectionOperationKind::List => builder.terms_mut().list(item),
+        KernelCollectionOperationKind::Set => builder.terms_mut().set(item),
+        KernelCollectionOperationKind::Map => {
+            let value = if values.is_empty() {
+                builder.terms().unknown()
+            } else {
+                constant_summary_structural_widen(builder, &values)
+            };
+            builder.terms_mut().map(item, value)
+        }
+    })
+}
+
+fn constant_summary_structural_widen(
+    builder: &mut ComponentProgramBuilder,
+    values: &[TypeTermId],
+) -> TypeTermId {
+    values
+        .iter()
+        .copied()
+        .fold(None, |current, value| {
+            Some(match current {
+                None => value,
+                Some(current) => builder.terms_mut().structural_widen(current, value),
+            })
+        })
+        .unwrap_or_else(|| builder.terms().absent())
+}
+
+fn constant_summary_select(
+    builder: &mut ComponentProgramBuilder,
+    selector: KernelSummaryValueId,
+    arms: &[KernelSummarySelectArm],
+    constants: &[Option<TypeTermId>],
+) -> Option<TypeTermId> {
+    let selector = summary_constant(constants, selector)?;
+    let singleton = matches!(
+        builder.terms().term(selector),
+        TypeTerm::VariantSet(variants) if variants.len() == 1
+    );
+    let mut candidates = Vec::new();
+    for arm in arms {
+        if singleton && !constant_summary_pattern_accepts(builder, selector, &arm.pattern) {
+            continue;
+        }
+        let candidate = summary_constant(constants, arm.output)?;
+        if !matches!(builder.terms().term(candidate), TypeTerm::Absent) {
+            candidates.push(candidate);
+            if singleton {
+                break;
+            }
+        }
+    }
+    Some(constant_summary_structural_widen(builder, &candidates))
+}
+
+fn constant_summary_pattern_accepts(
+    builder: &ComponentProgramBuilder,
+    selector: TypeTermId,
+    pattern: &KernelPattern,
+) -> bool {
+    match pattern {
+        KernelPattern::Wildcard | KernelPattern::Binding { .. } => true,
+        KernelPattern::Number => matches!(builder.terms().term(selector), TypeTerm::Number),
+        KernelPattern::Text => matches!(builder.terms().term(selector), TypeTerm::Text),
+        KernelPattern::Bits { width } => {
+            matches!(builder.terms().term(selector), TypeTerm::Bits(actual) if actual == width)
+        }
+        KernelPattern::Tag { name, .. } => {
+            matches!(builder.terms().term(selector), TypeTerm::VariantSet(variants) if variants.iter().any(|variant| builder.terms().name(variant.tag()) == name.as_ref()))
+        }
+        KernelPattern::Invalid => false,
+    }
+}
+
+fn constant_summary_record(
+    builder: &mut ComponentProgramBuilder,
+    tag: Option<crate::NameId>,
+    entries: &[KernelSummaryRecordEntry],
+    constants: &[Option<TypeTermId>],
+) -> Option<TypeTermId> {
+    let mut fields = Vec::<(crate::NameId, TypeTermId)>::new();
+    for entry in entries {
+        match entry {
+            KernelSummaryRecordEntry::Field { name, value } => {
+                let value = summary_constant(constants, *value)?;
+                insert_constant_summary_field(&mut fields, *name, value);
+            }
+            KernelSummaryRecordEntry::Spread { value } => {
+                let value = summary_constant(constants, *value)?;
+                if !merge_constant_summary_spread(builder, value, &mut fields) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(intern_constant_summary_record(builder, tag, fields))
+}
+
+fn intern_constant_summary_record(
+    builder: &mut ComponentProgramBuilder,
+    tag: Option<crate::NameId>,
+    fields: Vec<(crate::NameId, TypeTermId)>,
+) -> TypeTermId {
+    let object = builder.terms_mut().object(fields, false);
+    if let Some(tag) = tag {
+        let tag = builder.terms().name(tag).to_owned();
+        let variant = builder.terms_mut().tagged_variant(tag, object);
+        builder.terms_mut().variant_set([variant])
+    } else {
+        object
+    }
+}
+
+fn merge_constant_summary_spread(
+    builder: &mut ComponentProgramBuilder,
+    spread: TypeTermId,
+    fields: &mut Vec<(crate::NameId, TypeTermId)>,
+) -> bool {
+    match builder.terms().term(spread).clone() {
+        TypeTerm::Object {
+            fields: spread_fields,
+            ..
+        } => {
+            for field in spread_fields {
+                insert_constant_summary_field(fields, field.name, field.ty);
+            }
+            true
+        }
+        TypeTerm::Union(members) => members
+            .iter()
+            .all(|member| merge_constant_summary_spread(builder, *member, fields)),
+        TypeTerm::VariantSet(variants)
+            if variants
+                .iter()
+                .any(|variant| builder.terms().name(variant.tag()) == "UNPLUGGED") =>
+        {
+            true
+        }
+        TypeTerm::Unknown | TypeTerm::UnresolvedShape(_) => true,
+        _ => false,
+    }
+}
+
+fn insert_constant_summary_field(
+    fields: &mut Vec<(crate::NameId, TypeTermId)>,
+    name: crate::NameId,
+    value: TypeTermId,
+) {
+    if let Some((_, current)) = fields.iter_mut().find(|(candidate, _)| *candidate == name) {
+        *current = value;
+    } else {
+        fields.push((name, value));
+    }
+}
+
 fn compile_direct_result_summaries(
     builder: &mut ComponentProgramBuilder,
     project: &KernelProjectProgramInput,
@@ -5966,11 +6602,14 @@ fn compile_direct_result_summaries(
             inputs: Vec::new(),
             formal_projection_inputs: HashMap::new(),
         };
-        let Some(result) =
+        let Some(mut result) =
             compiler.compile_expression(target, result, &actuals, &mut BTreeSet::new())
         else {
             continue;
         };
+        let shared_bytecode = compiler.nodes.len() >= SHARED_SUMMARY_MIN_NODES;
+        let (constant_folded_nodes, selector_fused_records) = compiler.fold_constant_nodes();
+        let (pruned_nodes, pruned_inputs) = compiler.compact_result(&mut result);
         summaries[target.0 as usize] = Some(Arc::new(CompiledDirectSummary {
             program: Arc::new(KernelSummaryProgram {
                 definition: target.0,
@@ -5980,6 +6619,11 @@ fn compile_direct_result_summaries(
             inputs: compiler.inputs.into_boxed_slice(),
             result_mode: result.mode,
             formal_count: owner.formal_count as usize,
+            constant_folded_nodes,
+            selector_fused_records,
+            pruned_nodes,
+            pruned_inputs,
+            shared_bytecode,
         }));
     }
     summaries
@@ -10784,6 +11428,14 @@ mod tests {
         })
         .unwrap();
         assert!(program.compile_work().summary_invoke_nodes >= 1);
+        assert!(
+            program.compile_work().summary_constant_folded_nodes >= 1,
+            "the definition-owned constant record must fold before any call occurrence"
+        );
+        assert!(
+            program.compile_work().summary_pruned_nodes >= 1,
+            "folded summary children must not survive as dead bytecode"
+        );
 
         let artifact = program.solve().unwrap();
         let Type::Object(result) = &artifact.definitions[2].result.ty else {
@@ -10791,6 +11443,129 @@ mod tests {
         };
         assert_eq!(result.fields.len(), field_count);
         assert!(result.fields.values().all(|field| *field == Type::Number));
+    }
+
+    #[test]
+    fn definition_constant_summary_records_fold_to_one_type_term() {
+        let mut builder = ComponentProgramBuilder::new();
+        let number = builder.terms().number();
+        let value = builder.terms_mut().intern_name("value");
+        let mut nodes = vec![
+            KernelSummaryNode::Term(number),
+            KernelSummaryNode::Record {
+                tag: None,
+                entries: vec![KernelSummaryRecordEntry::Field {
+                    name: value,
+                    value: KernelSummaryValueId(0),
+                }]
+                .into_boxed_slice(),
+            },
+        ];
+
+        assert_eq!(
+            fold_constant_summary_nodes(&mut builder, &mut nodes),
+            (1, 0)
+        );
+        let KernelSummaryNode::Term(record) = nodes[1] else {
+            panic!("closed summary record was not partial-evaluated")
+        };
+        assert_eq!(
+            builder.terms().export_checked_type(record),
+            Type::object(ObjectShape::from_ordered_fields(
+                [("value".to_owned(), Type::Number)],
+                false,
+            ))
+        );
+    }
+
+    #[test]
+    fn sibling_record_field_selectors_fuse_into_one_definition_decision() {
+        let mut builder = ComponentProgramBuilder::new();
+        let selector = builder.new_authoritative_provider();
+        let output = builder.new_authoritative_provider();
+        let number = builder.terms().number();
+        let text = builder.terms().text();
+        let value_name = builder.terms_mut().intern_name("value");
+        let fixed_name = builder.terms_mut().intern_name("fixed");
+        let mut nodes = vec![
+            KernelSummaryNode::Input(0),
+            KernelSummaryNode::Term(number),
+            KernelSummaryNode::Term(text),
+            KernelSummaryNode::Select {
+                selector: KernelSummaryValueId(0),
+                arms: vec![
+                    KernelSummarySelectArm {
+                        pattern: KernelPattern::Tag {
+                            name: "Dark".into(),
+                            fields: Box::new([]),
+                        },
+                        output: KernelSummaryValueId(1),
+                    },
+                    KernelSummarySelectArm {
+                        pattern: KernelPattern::Tag {
+                            name: "Light".into(),
+                            fields: Box::new([]),
+                        },
+                        output: KernelSummaryValueId(2),
+                    },
+                ]
+                .into_boxed_slice(),
+            },
+            KernelSummaryNode::Record {
+                tag: None,
+                entries: vec![
+                    KernelSummaryRecordEntry::Field {
+                        name: value_name,
+                        value: KernelSummaryValueId(3),
+                    },
+                    KernelSummaryRecordEntry::Field {
+                        name: fixed_name,
+                        value: KernelSummaryValueId(1),
+                    },
+                ]
+                .into_boxed_slice(),
+            },
+        ];
+
+        assert_eq!(
+            fold_constant_summary_nodes(&mut builder, &mut nodes),
+            (0, 1)
+        );
+        assert!(matches!(
+            &nodes[4],
+            KernelSummaryNode::Select { arms, .. }
+                if arms.len() == 2
+                    && arms.iter().all(|arm| matches!(
+                        &nodes[arm.output.0 as usize],
+                        KernelSummaryNode::Term(_)
+                    ))
+        ));
+
+        let dark = builder.terms_mut().variant_tag("Dark");
+        let dark = builder.terms_mut().variant_set([dark]);
+        builder.add_publish(selector, [dark], PublishMode::Replace);
+        let selector_term = builder.variable_term(selector);
+        builder.add_summary_call(
+            output,
+            Arc::new(KernelSummaryProgram {
+                definition: 0,
+                nodes: nodes.into_boxed_slice(),
+                result: KernelSummaryValueId(4),
+            }),
+            [selector_term],
+        );
+        let result = builder.add_output(output, FlowMode::Continuous);
+        let artifact = solve_component(builder.finish()).expect("fused summary solves");
+        assert_eq!(
+            artifact.output(result).unwrap().flow_type.ty,
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("value".to_owned(), Type::Number),
+                    ("fixed".to_owned(), Type::Number),
+                ],
+                false,
+            ))
+        );
     }
 
     #[test]
@@ -10897,7 +11672,15 @@ mod tests {
                 _ => None,
             })
             .expect("the wrapper call must use a composed formal projection input");
-        assert!(summary_inputs.len() >= 2);
+        assert_eq!(
+            summary_inputs.len(),
+            1,
+            "the composed projection must replace the now-dead whole-formal input"
+        );
+        assert!(
+            program.compile_work().summary_pruned_inputs >= 1,
+            "summary compaction must report removing the redundant formal input"
+        );
         assert_eq!(
             program.solve().unwrap().definitions[2].result.ty,
             Type::Number

@@ -3192,6 +3192,40 @@ excluded from every Boon latency. Relative to the preceding single optimized
 receipt this is a roughly 2--4% regression/noise band, so it does not change
 the architectural conclusion or count as a speed improvement.
 
+The first definition-summary normalization cut is now complete. The kernel
+partially evaluates definition-constant projection, sequence, collection,
+selection, and record algebra once while compiling the definition. It never
+evaluates call inputs, requirements, or nested invocations during this pass, so
+unselected arms retain their lazy requirement behavior. Records whose dynamic
+fields all use the same selector and identical closed arm domains are fused into
+one selector over complete record terms. A final dense relocation removes dead
+summary nodes and unused formal inputs. Whether a definition owns shared
+summary bytecode is decided from its pre-normalization size, so making a large
+definition compact cannot accidentally turn it back into per-call inlining.
+These are language-generic term and decision rewrites; no UI constructor or
+tag spelling, including `NoElement`, participates in them.
+
+On the full NovyWave graph this cut folds 870 constant nodes, fuses 2,083
+same-selector records, removes 13,457 dead nodes and 41 dead inputs, and leaves
+25,162 summary nodes. Relative to the typed-diagnostics checkpoint, stored
+summary nodes fall from 34,453 to 25,162 (27.0%), summary-node evaluations from
+984,821 to 732,728 (25.6%), and term-intern requests from 259,795 to 202,391
+(22.1%). The complete differential remains exact across all 1,389 owners.
+All 74 kernel tests, 90 non-ignored compiler unit tests, and 16 compiler
+integration tests pass.
+
+The matching optimized candidate-only probe records 554.727 ms diagnostics,
+including 464.461 ms kernel time and 231.867 ms graph solve, versus 563.534,
+471.016, and 242.976 ms at the preceding checkpoint. The complete checked
+candidate records 725.659 ms, including 635.393 ms kernel time and 160.537 ms
+checked-image publication, versus 733.407, 640.889, and 160.153 ms. This is a
+small 1--5% cold-path improvement, not the final architecture-scale speedup;
+the two-job release rebuild again took 1m59s and is excluded. The remaining
+summary ranking is led by `tree_row_text` at 88,032 evaluations and `material`
+at 71,949, so the next large cut should remove repeated occurrence evaluation
+or specialize definition decisions in packed form rather than micro-optimize
+the public projection tail.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not

@@ -2797,6 +2797,49 @@ compiler tests pass. The complete NovyWave differential still reaches exactly
 the known `store.focused_control_label` HOLD mode mismatch and no earlier type
 or artifact divergence.
 
+The full owner-flow differential is now closed. Instead of stopping at the
+first error, the ignored NovyWave oracle collects every owner mismatch in one
+run; that exposed nine remaining differences and prevented another serial
+one-failure-per-run repair loop. The accepted fixes separate kernel semantics
+from old-checker compatibility:
+
+- tagged `WHEN` arms now carry an explicit mode-narrowing equation from the
+  matched selector to nested reads of that same provider, so historical
+  eventful `LATEST` branches cannot leak their mode into a proven selected arm;
+- an empty `LATEST {}` publishes `Unknown` shape evidence rather than claiming
+  the explicit `Absent` value type, while structural HOLD widening still keeps
+  a concrete initializer;
+- the differential alone recognizes the old assembled checker's exact erased
+  missing-projection tuple and its call-site-specialized generic-selector
+  principals. These allowances are restricted to already-proven legacy cones,
+  normalize strict and lossy alpha partitions separately, and do not weaken
+  ordinary kernel equality; and
+- compatible open generic rows can differ by call-site-added fields in the
+  legacy image, while disjoint rows, closed rows, concrete occurrences, modes,
+  and all non-generic owners remain strict.
+
+The complete NovyWave run now compares all 1,389 executable owner results and
+their stable expression rows with zero mismatches, alongside eight explicit
+inert unit containers and zero unsupported owners. This is full parity for the
+currently emitted flow surface, not checker cutover readiness: diagnostics,
+calls, effects, states, collections, sources, lexical bindings, currentness,
+and dependency cones must still become kernel-owned artifacts and pass their
+own differential gates before production changes. `NoElement` remains an
+ordinary user/library tag; none of these changes gives it language semantics.
+
+The post-parity debug sample records 1,839.611 ms kernel time and 1,999.152 ms
+for parse plus SOURCE ABI plus kernel, with 266.089 ms owner projection,
+584.405 ms compile/link, and 942.890 ms solve. Three fresh optimized samples
+record kernel times of 377.818, 402.059, and 406.314 ms (median 402.059 ms).
+Complete parse plus SOURCE ABI plus kernel takes 464.434, 495.098, and
+500.039 ms (median 495.098 ms); median compile/link is 98.198 ms and median
+solve is 242.824 ms. The optimized rebuild took 1m46s. Mutable work remains
+exactly 39,798 variables, 32,826 operations, 69,687 activations, 57,375
+mutations, and 23,827 dynamic edges. The current desktop median is about 5%
+slower than the preceding receipt while its first sample is slightly faster;
+with identical work counts this is recorded as measurement noise rather than a
+claimed speed change. The parity cut is accepted for correctness, not speed.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not

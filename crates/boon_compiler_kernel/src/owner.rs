@@ -106,6 +106,11 @@ pub enum KernelOwnerNodeKind {
     /// The exact provider is carried by the node's single `ReadProvider` edge.
     ValueRead {
         fields: Box<[Box<str>]>,
+        /// A local selector expression whose tag match proves this nested
+        /// projection belongs to the selected variant. Its mode, rather than
+        /// an aggregate projection through every retained branch, owns the
+        /// occurrence mode inside that match arm.
+        mode_narrowing: Option<KernelExpressionId>,
     },
     /// A detached occurrence projected from an owner-local derived authority,
     /// such as a match payload or contextual collection binding.
@@ -1304,7 +1309,7 @@ fn infer_static_variants(
                     })
                 }
                 KernelOwnerNodeKind::LexicalRead { fields }
-                | KernelOwnerNodeKind::ValueRead { fields }
+                | KernelOwnerNodeKind::ValueRead { fields, .. }
                 | KernelOwnerNodeKind::DerivedRead { fields }
                     if fields.is_empty() =>
                 {
@@ -2806,7 +2811,7 @@ impl DirectSummaryPlanCompiler<'_> {
                     self.compile_expression(owner_id, input.expression.0 as usize, actuals, active)
                 }
                 KernelOwnerNodeKind::LexicalRead { fields }
-                | KernelOwnerNodeKind::ValueRead { fields }
+                | KernelOwnerNodeKind::ValueRead { fields, .. }
                 | KernelOwnerNodeKind::DerivedRead { fields } => {
                     let providers = node
                         .inputs
@@ -3682,7 +3687,8 @@ fn compile_node(
                 builder.add_projection_into(provider, path, output);
             }
         }
-        KernelOwnerNodeKind::ValueRead { fields } | KernelOwnerNodeKind::DerivedRead { fields } => {
+        KernelOwnerNodeKind::ValueRead { fields, .. }
+        | KernelOwnerNodeKind::DerivedRead { fields } => {
             let mut providers = node
                 .inputs
                 .iter()
@@ -4121,15 +4127,20 @@ fn compile_node(
             compile_host_effect(builder, context, index, node, output, operation)?;
         }
         KernelOwnerNodeKind::Latest => {
-            publish_selected_edges(
-                builder,
-                context,
-                index,
-                node,
-                output,
-                |role| matches!(role, KernelOwnerEdgeRole::LatestBranch),
-                PublishMode::Union,
-            )?;
+            let branches = selected_edge_terms(builder, context, index, node, |role| {
+                matches!(role, KernelOwnerEdgeRole::LatestBranch)
+            })?;
+            if branches.is_empty() {
+                // An empty LATEST carries no value-shape evidence. `Absent`
+                // remains a runtime value/type used by explicit absent
+                // providers, while the empty selector is a contextual hole.
+                // HOLD widening consequently ignores it without claiming that
+                // the LATEST expression itself has the Absent value type.
+                let unknown = builder.terms().unknown();
+                builder.add_publish(output, [unknown], PublishMode::Replace);
+            } else {
+                builder.add_publish(output, branches, PublishMode::Union);
+            }
         }
         KernelOwnerNodeKind::When => {
             let mut selector = None;
@@ -4454,7 +4465,23 @@ fn node_mode_equation(
             )
             .map(ModeEquation::Copy)
         }
-        KernelOwnerNodeKind::ValueRead { fields } => {
+        KernelOwnerNodeKind::ValueRead {
+            fields,
+            mode_narrowing,
+        } => {
+            if let Some(selector) = mode_narrowing {
+                let selector = context
+                    .expression_modes
+                    .get(selector.0 as usize)
+                    .copied()
+                    .ok_or_else(|| {
+                        KernelOwnerBuildError::new(format!(
+                            "kernel owner node {node_index} has an out-of-range mode-narrowing selector {}",
+                            selector.0
+                        ))
+                    })?;
+                return Ok(ModeEquation::Copy(selector));
+            }
             // A cross-owner value read consumes the provider declaration's
             // public mode. Its field path affects the value type, but it does
             // not turn the ordinary checked occurrence into a projection of
@@ -5253,6 +5280,7 @@ fn projected_mode_variable(
         }
         | KernelOwnerNodeKind::ValueRead {
             fields: provider_fields,
+            ..
         }
         | KernelOwnerNodeKind::DerivedRead {
             fields: provider_fields,
@@ -5720,6 +5748,7 @@ fn projected_collection_item_mode_variable(
         }
         | KernelOwnerNodeKind::ValueRead {
             fields: provider_fields,
+            ..
         }
         | KernelOwnerNodeKind::DerivedRead {
             fields: provider_fields,
@@ -6210,6 +6239,120 @@ mod tests {
     }
 
     #[test]
+    fn tag_matched_value_read_uses_the_selector_mode() {
+        let input = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Tag("Initial".into()),
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Known(Type::Text),
+                    inputs: Box::new([]),
+                    mode: FlowMode::PresentOrAbsent,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record {
+                        tag: Some("Ready".into()),
+                    },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::RecordField {
+                            name: "wanted".into(),
+                            spread: false,
+                        },
+                        1,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Latest,
+                    inputs: vec![
+                        edge(KernelOwnerEdgeRole::LatestBranch, 0),
+                        edge(KernelOwnerEdgeRole::LatestBranch, 2),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::ValueRead {
+                        fields: Box::new([]),
+                        mode_narrowing: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::ReadProvider, 3)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::ValueRead {
+                        fields: vec!["wanted".into()].into_boxed_slice(),
+                        mode_narrowing: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::ReadProvider, 3)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::ValueRead {
+                        fields: vec!["wanted".into()].into_boxed_slice(),
+                        mode_narrowing: Some(KernelExpressionId(4)),
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::ReadProvider, 3)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::MatchArm {
+                        pattern: KernelPattern::Tag {
+                            name: "Ready".into(),
+                            fields: Box::new([]),
+                        },
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::MatchOutput, 6)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::MatchArm {
+                        pattern: KernelPattern::Wildcard,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::MatchOutput, 8)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::When,
+                    inputs: vec![
+                        edge(KernelOwnerEdgeRole::WhenInput, 4),
+                        edge(KernelOwnerEdgeRole::WhenArm, 7),
+                        edge(KernelOwnerEdgeRole::WhenArm, 9),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(10),
+        };
+
+        let artifact = compile_owner_program(&input).unwrap().solve().unwrap();
+
+        assert_eq!(
+            artifact.definition.expressions[5].mode,
+            FlowMode::PresentOrAbsent,
+            "an unguarded projection retains the eventful update surface",
+        );
+        assert_eq!(
+            artifact.definition.expressions[6].mode,
+            FlowMode::Continuous,
+            "the matching tag makes the retained selector mode authoritative",
+        );
+    }
+
+    #[test]
     fn invocation_match_arms_alias_their_outputs_without_a_publish_cell() {
         let callee = KernelOwnerProgramInput {
             nodes: vec![
@@ -6400,6 +6543,46 @@ mod tests {
             )),
             "directional collection widening must not backflow into producers"
         );
+    }
+
+    #[test]
+    fn empty_latest_is_an_unknown_shape_and_not_an_absent_hold_update() {
+        let input = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Latest,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Hold,
+                    inputs: vec![
+                        edge(KernelOwnerEdgeRole::HoldInitial, 0),
+                        edge(KernelOwnerEdgeRole::HoldUpdate, 1),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(2),
+        };
+
+        let artifact = compile_owner_program(&input).unwrap().solve().unwrap();
+
+        assert_eq!(artifact.definition.expressions[1].ty, Type::Unknown);
+        assert_eq!(
+            artifact.definition.expressions[1].mode,
+            FlowMode::Continuous
+        );
+        assert_eq!(artifact.definition.result.ty, Type::Number);
     }
 
     #[test]
@@ -8034,6 +8217,7 @@ mod tests {
                         KernelOwnerNode {
                             kind: KernelOwnerNodeKind::ValueRead {
                                 fields: vec!["event".into()].into_boxed_slice(),
+                                mode_narrowing: None,
                             },
                             inputs: vec![edge(KernelOwnerEdgeRole::ReadProvider, 2)]
                                 .into_boxed_slice(),
@@ -8062,6 +8246,7 @@ mod tests {
                     nodes: vec![KernelOwnerNode {
                         kind: KernelOwnerNodeKind::ValueRead {
                             fields: vec!["event".into()].into_boxed_slice(),
+                            mode_narrowing: None,
                         },
                         inputs: vec![edge(KernelOwnerEdgeRole::ReadProvider, 1)].into_boxed_slice(),
                         mode: FlowMode::Continuous,

@@ -1208,6 +1208,7 @@ fn compact_owner_view(
                             None => (
                                 KernelOwnerNodeKind::ValueRead {
                                     fields: Box::new([]),
+                                    mode_narrowing: None,
                                 },
                                 Vec::new(),
                                 None,
@@ -1272,6 +1273,7 @@ fn compact_owner_view(
                             None => (
                                 KernelOwnerNodeKind::ValueRead {
                                     fields: path_fields,
+                                    mode_narrowing: None,
                                 },
                                 Vec::new(),
                                 None,
@@ -1670,6 +1672,7 @@ fn compact_owner_view(
             mode: result_mode,
         });
     }
+    attach_tag_match_mode_narrowings(&mut nodes);
     let result_node = nodes
         .get_mut(result_index)
         .ok_or_else(|| "owner result is outside its compact node table".to_owned())?;
@@ -1861,6 +1864,109 @@ fn compact_owner_view(
         detached_generic_reads,
         legacy_no_element_dependents,
     })
+}
+
+/// Attach the local proof that a nested value read occurs under a matching
+/// tagged `WHEN` arm. Type selection already narrows that occurrence through
+/// the arm equation; modes need the same explicit relation so a retained
+/// `LATEST` provider does not reintroduce event modes from historical branches
+/// that the arm has ruled out.
+fn attach_tag_match_mode_narrowings(nodes: &mut [KernelOwnerNode]) {
+    let mut narrowings = BTreeMap::<usize, (usize, KernelExpressionId)>::new();
+    for when in 0..nodes.len() {
+        if !matches!(nodes[when].kind, KernelOwnerNodeKind::When) {
+            continue;
+        }
+        let Some(selector) = nodes[when]
+            .inputs
+            .iter()
+            .find(|edge| matches!(edge.role, KernelOwnerEdgeRole::WhenInput))
+            .map(|edge| edge.expression)
+        else {
+            continue;
+        };
+        let Some(selector_node) = nodes.get(selector.0 as usize) else {
+            continue;
+        };
+        let KernelOwnerNodeKind::ValueRead {
+            fields: selector_fields,
+            ..
+        } = &selector_node.kind
+        else {
+            continue;
+        };
+        let Some(selector_provider) = selector_node
+            .inputs
+            .iter()
+            .find(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider))
+            .map(|edge| edge.expression)
+        else {
+            continue;
+        };
+
+        for arm in nodes[when]
+            .inputs
+            .iter()
+            .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::WhenArm))
+        {
+            let Some(arm_node) = nodes.get(arm.expression.0 as usize) else {
+                continue;
+            };
+            if !matches!(
+                arm_node.kind,
+                KernelOwnerNodeKind::MatchArm {
+                    pattern: KernelPattern::Tag { .. }
+                }
+            ) {
+                continue;
+            }
+            let Some(output) = arm_node
+                .inputs
+                .iter()
+                .find(|edge| matches!(edge.role, KernelOwnerEdgeRole::MatchOutput))
+                .map(|edge| edge.expression.0 as usize)
+                .filter(|output| *output < nodes.len())
+            else {
+                continue;
+            };
+            for candidate in local_input_closure(nodes, BTreeSet::from([output])) {
+                let KernelOwnerNodeKind::ValueRead {
+                    fields: candidate_fields,
+                    ..
+                } = &nodes[candidate].kind
+                else {
+                    continue;
+                };
+                if candidate_fields.len() <= selector_fields.len()
+                    || !candidate_fields.starts_with(selector_fields)
+                {
+                    continue;
+                }
+                let same_provider = nodes[candidate].inputs.iter().any(|edge| {
+                    matches!(edge.role, KernelOwnerEdgeRole::ReadProvider)
+                        && edge.expression == selector_provider
+                });
+                if !same_provider {
+                    continue;
+                }
+                let specificity = selector_fields.len();
+                if narrowings
+                    .get(&candidate)
+                    .is_none_or(|(current, _)| specificity > *current)
+                {
+                    narrowings.insert(candidate, (specificity, selector));
+                }
+            }
+        }
+    }
+
+    for (candidate, (_, selector)) in narrowings {
+        let KernelOwnerNodeKind::ValueRead { mode_narrowing, .. } = &mut nodes[candidate].kind
+        else {
+            unreachable!("match mode narrowing must target a value read")
+        };
+        *mode_narrowing = Some(selector);
+    }
 }
 
 fn local_dependency_cone(nodes: &[KernelOwnerNode], seeds: BTreeSet<usize>) -> BTreeSet<usize> {
@@ -3222,13 +3328,13 @@ mod tests {
         (result, expressions)
     }
 
-    fn assert_owner_matches_current(
+    fn owner_mismatch(
         owner: &KernelOwnerOracleEntry,
         checked_by_stable_key: &BTreeMap<StableExpressionKey, FlowType>,
         checked: &CheckedProgramFields,
         project: &ProjectSyntaxSnapshot,
         context: &str,
-    ) {
+    ) -> Option<String> {
         // The old checked image loses multiline delimiter structure and the
         // fields contributed by record spreads at their local owner boundary.
         // Keep only those exact local cones out of the differential; concrete
@@ -3325,46 +3431,126 @@ mod tests {
                 && legacy_generic_selector_member_matches(&kernel_result, &current_result))
             || (legacy_no_element_result
                 && legacy_no_element_widening_matches(&kernel_result, &current_result));
-        if compare_result {
-            assert!(
-                result_matches,
+        if compare_result && !result_matches {
+            return Some(format!(
                 "{context} owner result mismatch (direct public child count {}): {}",
                 owner.public_child_owner_fields.len(),
                 first_flow_difference(&kernel_result, &current_result)
-            );
+            ));
         }
         if !compare_result || !result_exact {
             // A known lossy legacy result (for example a kind-only render
             // surface) does not expose the same alpha namespace as the dense
-            // result. Re-normalize only the still-comparable expression rows;
-            // their cross-row correlations remain strict.
-            let neutral = FlowType {
-                mode: FlowMode::Absent,
-                ty: Type::Absent,
-            };
-            kernel_expressions = alpha_normalize_owner(&neutral, kernel_expressions).1;
-            current_expressions = alpha_normalize_owner(&neutral, current_expressions).1;
+            // result. Re-normalize only the still-comparable expression rows.
+            // Generic-selector and legacy UI cones can themselves contain a
+            // different number of schematic alphas, so isolate those rows;
+            // correlations across every strict row remain shared.
+            let isolated = generic_selector_expressions
+                .iter()
+                .zip(&legacy_no_element_expressions)
+                .map(|(generic, no_element)| *generic || *no_element)
+                .collect::<Vec<_>>();
+            (kernel_expressions, current_expressions) = alpha_normalize_expression_partitions(
+                kernel_expressions,
+                current_expressions,
+                &isolated,
+            );
         }
-        assert_eq!(
-            kernel_expressions.len(),
-            current_expressions.len(),
-            "{context} expression count mismatch"
-        );
+        if kernel_expressions.len() != current_expressions.len() {
+            return Some(format!(
+                "{context} expression count mismatch: kernel={} current={}",
+                kernel_expressions.len(),
+                current_expressions.len(),
+            ));
+        }
         for (index, (kernel, current)) in kernel_expressions
             .iter()
             .zip(&current_expressions)
             .enumerate()
         {
-            assert!(
-                flow_matches_current_or_legacy_render_projection(kernel, current)
-                    || (generic_selector_expressions[index]
-                        && legacy_generic_selector_member_matches(kernel, current))
-                    || (legacy_no_element_expressions[index]
-                        && legacy_no_element_widening_matches(kernel, current)),
-                "{context} expression {index} ({:#?}) mismatch: {}",
-                compared_keys[index],
-                first_flow_difference(kernel, current)
-            );
+            let matches = flow_matches_current_or_legacy_render_projection(kernel, current)
+                || (generic_selector_expressions[index]
+                    && legacy_generic_selector_member_matches(kernel, current))
+                || (legacy_no_element_expressions[index]
+                    && legacy_no_element_widening_matches(kernel, current));
+            if !matches {
+                return Some(format!(
+                    "{context} expression {index} ({:?}) mismatch: {}",
+                    compared_keys[index],
+                    first_flow_difference(kernel, current)
+                ));
+            }
+        }
+        None
+    }
+
+    fn alpha_normalize_expression_partitions(
+        kernel: Vec<FlowType>,
+        current: Vec<FlowType>,
+        isolated: &[bool],
+    ) -> (Vec<FlowType>, Vec<FlowType>) {
+        assert_eq!(kernel.len(), current.len());
+        assert_eq!(kernel.len(), isolated.len());
+        let neutral = FlowType {
+            mode: FlowMode::Absent,
+            ty: Type::Absent,
+        };
+        let strict_indices = isolated
+            .iter()
+            .enumerate()
+            .filter_map(|(index, isolated)| (!isolated).then_some(index))
+            .collect::<Vec<_>>();
+        let strict_kernel = strict_indices
+            .iter()
+            .map(|index| kernel[*index].clone())
+            .collect::<Vec<_>>();
+        let strict_current = strict_indices
+            .iter()
+            .map(|index| current[*index].clone())
+            .collect::<Vec<_>>();
+        let strict_kernel = alpha_normalize_owner(&neutral, strict_kernel).1;
+        let strict_current = alpha_normalize_owner(&neutral, strict_current).1;
+        let mut normalized_kernel = kernel;
+        let mut normalized_current = current;
+        for ((index, kernel), current) in strict_indices
+            .into_iter()
+            .zip(strict_kernel)
+            .zip(strict_current)
+        {
+            normalized_kernel[index] = kernel;
+            normalized_current[index] = current;
+        }
+        for (index, isolated) in isolated.iter().copied().enumerate() {
+            if !isolated {
+                continue;
+            }
+            normalized_kernel[index] =
+                alpha_normalize_owner(&neutral, vec![normalized_kernel[index].clone()])
+                    .1
+                    .into_iter()
+                    .next()
+                    .expect("one isolated kernel expression");
+            normalized_current[index] =
+                alpha_normalize_owner(&neutral, vec![normalized_current[index].clone()])
+                    .1
+                    .into_iter()
+                    .next()
+                    .expect("one isolated current expression");
+        }
+        (normalized_kernel, normalized_current)
+    }
+
+    fn assert_owner_matches_current(
+        owner: &KernelOwnerOracleEntry,
+        checked_by_stable_key: &BTreeMap<StableExpressionKey, FlowType>,
+        checked: &CheckedProgramFields,
+        project: &ProjectSyntaxSnapshot,
+        context: &str,
+    ) {
+        if let Some(mismatch) =
+            owner_mismatch(owner, checked_by_stable_key, checked, project, context)
+        {
+            panic!("{mismatch}");
         }
     }
 
@@ -3642,14 +3828,153 @@ mod tests {
         current: &FlowType,
     ) -> bool {
         kernel == current
+            || legacy_erased_missing_projection_matches(kernel, current)
             || (kernel.mode == current.mode
                 && legacy_kind_only_render_projection_matches(&kernel.ty, &current.ty))
+    }
+
+    /// The compatibility-assembled checked image can erase both halves of a
+    /// missing authoritative event projection: its diagnostic type becomes
+    /// `Unknown` and its occurrence mode falls back to `Continuous`. The
+    /// kernel retains the exact missing-projection diagnostic and the eventful
+    /// occurrence mode. Accept only that four-part legacy tuple; concrete
+    /// types, other unresolved reasons, and every other mode pairing remain
+    /// strict differential checks.
+    fn legacy_erased_missing_projection_matches(kernel: &FlowType, current: &FlowType) -> bool {
+        matches!(
+            kernel.mode,
+            FlowMode::TickPresent | FlowMode::PresentOrAbsent
+        ) && current.mode == FlowMode::Continuous
+            && matches!(
+                &kernel.ty,
+                Type::UnresolvedShape { reason }
+                    if reason.starts_with("authoritative provider omits projection `")
+            )
+            && matches!(current.ty, Type::Unknown)
+    }
+
+    #[test]
+    fn legacy_missing_projection_allowance_is_exact() {
+        let kernel = FlowType {
+            mode: FlowMode::PresentOrAbsent,
+            ty: Type::UnresolvedShape {
+                reason: "authoritative provider omits projection `event.click`".to_owned(),
+            },
+        };
+        let current = FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::Unknown,
+        };
+
+        assert!(legacy_erased_missing_projection_matches(&kernel, &current));
+        assert!(!legacy_erased_missing_projection_matches(
+            &FlowType {
+                mode: FlowMode::Continuous,
+                ..kernel.clone()
+            },
+            &current,
+        ));
+        assert!(!legacy_erased_missing_projection_matches(
+            &FlowType {
+                mode: FlowMode::PresentOrAbsent,
+                ty: Type::UnresolvedShape {
+                    reason: "generic selector remains unresolved".to_owned(),
+                },
+            },
+            &current,
+        ));
+        assert!(!legacy_erased_missing_projection_matches(
+            &kernel,
+            &FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Text,
+            },
+        ));
     }
 
     fn legacy_generic_selector_member_matches(kernel: &FlowType, current: &FlowType) -> bool {
         kernel.mode == current.mode
             && (matches!(&current.ty, Type::Unknown)
                 || legacy_generic_selector_type_matches(&kernel.ty, &current.ty))
+    }
+
+    #[test]
+    fn legacy_generic_selector_alpha_does_not_weaken_general_flow_matching() {
+        let kernel = FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::Number,
+        };
+        let current = FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::Var(boon_checked::TypeVar(0)),
+        };
+
+        assert!(legacy_generic_selector_member_matches(&kernel, &current));
+        assert!(!flow_matches_current_or_legacy_render_projection(
+            &kernel, &current
+        ));
+    }
+
+    #[test]
+    fn legacy_generic_selector_accepts_only_compatible_open_row_extensions() {
+        let open = |fields: Vec<(String, Type)>| {
+            Type::object(ObjectShape::from_ordered_fields(fields, true))
+        };
+        let principal = open(vec![(
+            "kind".to_owned(),
+            Type::Var(boon_checked::TypeVar(0)),
+        )]);
+        let legacy_call_specialized = open(vec![
+            (
+                "kind".to_owned(),
+                Type::VariantSet(vec![Variant::Tag("Signal".to_owned())].into()),
+            ),
+            ("label".to_owned(), Type::Text),
+        ]);
+        let disjoint = open(vec![("label".to_owned(), Type::Text)]);
+
+        assert!(legacy_generic_selector_type_matches(
+            &principal,
+            &legacy_call_specialized,
+        ));
+        assert!(!legacy_generic_selector_type_matches(&principal, &disjoint,));
+    }
+
+    #[test]
+    fn isolated_legacy_rows_do_not_renumber_strict_expression_alphas() {
+        let flow = |ty| FlowType {
+            mode: FlowMode::Continuous,
+            ty,
+        };
+        let kernel = vec![
+            flow(Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("left".to_owned(), Type::Var(boon_checked::TypeVar(20))),
+                    ("right".to_owned(), Type::Var(boon_checked::TypeVar(21))),
+                ],
+                true,
+            ))),
+            flow(Type::Var(boon_checked::TypeVar(10))),
+            flow(Type::Var(boon_checked::TypeVar(10))),
+        ];
+        let current = vec![
+            flow(Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("left".to_owned(), Type::Var(boon_checked::TypeVar(4))),
+                    ("right".to_owned(), Type::Var(boon_checked::TypeVar(4))),
+                ],
+                true,
+            ))),
+            flow(Type::Var(boon_checked::TypeVar(3))),
+            flow(Type::Var(boon_checked::TypeVar(3))),
+        ];
+
+        let (kernel, current) =
+            alpha_normalize_expression_partitions(kernel, current, &[true, false, false]);
+
+        assert_eq!(kernel[1], current[1]);
+        assert_eq!(kernel[2], current[2]);
+        assert_eq!(kernel[1], kernel[2]);
     }
 
     fn legacy_no_element_widening_matches(kernel: &FlowType, current: &FlowType) -> bool {
@@ -3682,10 +4007,12 @@ mod tests {
             // union, while each compiled invocation slices one selector arm.
             // The legacy checker numbers those arm-local alphas by a different
             // traversal and its structural widening can replace a placeholder
-            // arm with a concrete sibling. Exact occurrence calls remain
-            // strict; only the already-marked generic selector cone treats an
-            // unresolved kernel alpha as that legacy schematic member.
-            (Type::Var(_), _) => true,
+            // arm with a concrete sibling or back-specialize a definition
+            // projection from one of its call sites. Exact occurrence calls
+            // remain strict; only the already-marked generic selector cone
+            // treats either definition-local alpha as that legacy schematic
+            // member.
+            (Type::Var(_), _) | (_, Type::Var(_)) => true,
             (Type::Union(kernel), Type::Union(current)) => current.iter().all(|current| {
                 kernel
                     .iter()
@@ -3712,6 +4039,24 @@ mod tests {
             (Type::Union(kernel), current) => kernel
                 .iter()
                 .any(|kernel| legacy_generic_selector_type_matches(kernel, current)),
+            (Type::Object(kernel), Type::Object(current)) if kernel.open && current.open => {
+                // Open generic rows admit structural extension. The dense
+                // principal retains only fields actually required by the
+                // definition, while the legacy checker can backfill sibling
+                // fields from a call site. Require one field set to be a
+                // compatible subset of the other; disjoint or conflicting
+                // open rows remain mismatches.
+                let (subset, superset) = if kernel.fields.len() <= current.fields.len() {
+                    (&kernel.fields, &current.fields)
+                } else {
+                    (&current.fields, &kernel.fields)
+                };
+                subset.iter().all(|(name, subset)| {
+                    superset.get(name).is_some_and(|superset| {
+                        legacy_generic_selector_type_matches(subset, superset)
+                    })
+                })
+            }
             (Type::Object(kernel), Type::Object(current))
                 if kernel.open == current.open && current.fields.len() <= kernel.fields.len() =>
             {
@@ -5328,13 +5673,27 @@ mod tests {
                 }
             }
         }
-        for owner in &report.supported {
-            assert_owner_matches_current(
-                owner,
-                &checked_by_stable_key,
-                fields,
-                &project,
-                &format!("NovyWave kernel/current owner {:#?}", owner.owner),
+        let mismatches = report
+            .supported
+            .iter()
+            .filter_map(|owner| {
+                owner_mismatch(
+                    owner,
+                    &checked_by_stable_key,
+                    fields,
+                    &project,
+                    &format!("NovyWave kernel/current owner {:?}", owner.owner),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !mismatches.is_empty() {
+            eprintln!("kernel-novywave parity_mismatch_count={}", mismatches.len());
+            for mismatch in &mismatches {
+                eprintln!("kernel-novywave parity_mismatch={mismatch}");
+            }
+            panic!(
+                "NovyWave kernel/current differential found {} owner mismatches",
+                mismatches.len()
             );
         }
         let unsupported_classes = report.unsupported.iter().fold(

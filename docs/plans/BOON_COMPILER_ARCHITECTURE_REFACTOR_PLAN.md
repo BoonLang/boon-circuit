@@ -2731,6 +2731,30 @@ source trees into caller summaries. A future packed interpreter should operate
 on these unique definition programs and their explicit frame stack; it must not
 recreate the rejected global guarded tape.
 
+The executable-owner coverage boundary is now closed. Compact edge projection
+uses the parser's canonical `linked_input` for every multiline-capable input
+role (`DRAINING`, `HOLD`, `WHEN`/`WHILE`, `THEN`, and infix-left), rather than
+only for `WHEN` and builtin pipes. This brought the isolated `hold_proof`
+definition into the same owner-local expression tree as its authored pipeline
+input. The NovyWave receipt now classifies 1,389 executable owners as solved,
+eight declaration-less unit roots as explicit container owners, and zero
+owners as unsupported. Empty containers are not assigned a fake result, while
+a nonempty unit root still fails closed. The added definition costs only three
+variables and three operations and leaves the existing performance profile
+otherwise unchanged.
+
+A whole-definition `List/map` summary prototype is rejected. It promoted every
+definition containing a map into one coarse summary invocation. Although
+invocation frames fell from 512 to 156 and linked operations from 32,823 to
+25,714, the enclosing definition was reevaluated on every callback-provider
+epoch: variables rose above 120,000, summary evaluation rose to 1.531 million
+nodes, mutations rose to 216,460, and debug solve time regressed from about
+6.0 seconds to more than 11 seconds. Replacing the callback item alone removed
+only about 1,400 variables and did not fix the ownership error. The prototype
+was deleted. The accepted design must keep the enclosing collection owner
+incremental and attach one shared callback program specifically to the
+collection operation, with explicit item and capture inputs.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not

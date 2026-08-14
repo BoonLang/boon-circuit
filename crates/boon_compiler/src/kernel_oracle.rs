@@ -41,6 +41,7 @@ pub struct KernelOwnerOracleEntry {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct KernelOwnerOracleReport {
     pub supported: Box<[KernelOwnerOracleEntry]>,
+    pub container_owners: Box<[StableCheckOwnerKey]>,
     pub unsupported: Box<[(StableCheckOwnerKey, String)]>,
     pub root_blockers: Box<[KernelOwnerBlockerImpact]>,
     pub work: KernelSolveWork,
@@ -70,6 +71,7 @@ pub struct KernelOwnerOracleTimings {
     pub input_owners: usize,
     pub projected_owners: usize,
     pub solved_owners: usize,
+    pub container_owners: usize,
     pub unsupported_owners: usize,
     pub compile_work: KernelCompileWork,
 }
@@ -105,18 +107,21 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     let owner_projection_started = Instant::now();
     let mut direct_projection_elapsed = Duration::ZERO;
     let mut prepared = Vec::<PreparedOwner>::new();
+    let mut container_owners = Vec::<StableCheckOwnerKey>::new();
     let mut unsupported = BTreeMap::<StableCheckOwnerKey, String>::new();
     for owner in &owner_order {
+        let Some(view) = project.owner_view(owner) else {
+            unsupported.insert(owner.clone(), "owner has no syntax view".to_owned());
+            continue;
+        };
+        if matches!(owner, StableCheckOwnerKey::UnitRoot(_)) && view.statement_ids().is_empty() {
+            container_owners.push(owner.clone());
+            continue;
+        }
         let outcome = (|| {
             let direct_projection_started = Instant::now();
-            let compact = compact_owner_view(
-                project
-                    .owner_view(owner)
-                    .ok_or_else(|| "owner has no syntax view".to_owned())?,
-                source_payloads,
-                &callable_surfaces,
-                &value_surfaces,
-            );
+            let compact =
+                compact_owner_view(view, source_payloads, &callable_surfaces, &value_surfaces);
             direct_projection_elapsed += direct_projection_started.elapsed();
             compact
         })();
@@ -443,6 +448,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         .collect::<Vec<_>>();
     let report = KernelOwnerOracleReport {
         supported: supported.into_boxed_slice(),
+        container_owners: container_owners.into_boxed_slice(),
         unsupported: unsupported.into_boxed_slice(),
         root_blockers: root_blockers.into_boxed_slice(),
         work,
@@ -459,6 +465,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         input_owners,
         projected_owners: prepared.len(),
         solved_owners: report.supported.len(),
+        container_owners: report.container_owners.len(),
         unsupported_owners: report.unsupported.len(),
         compile_work,
     };
@@ -1530,16 +1537,9 @@ fn compact_owner_view(
                         &source_paths,
                         source_payloads,
                     )?,
-                    compact_ast_edges(&expression.kind)?
+                    compact_ast_edges(&expression.kind, expression.linked_input)?
                         .into_iter()
-                        .map(|(role, reference)| {
-                            let reference = if matches!(role, KernelOwnerEdgeRole::WhenInput) {
-                                expression.linked_input.unwrap_or(reference)
-                            } else {
-                                reference
-                            };
-                            (role, PreparedInputReference::Syntax(reference))
-                        })
+                        .map(|(role, reference)| (role, PreparedInputReference::Syntax(reference)))
                         .collect(),
                     None,
                     None,
@@ -2304,7 +2304,7 @@ fn direct_containing_statements(
             };
             owners.entry(syntax).or_insert(statement_id);
             pending.extend(
-                source_ast_edges(&expression.kind)
+                source_ast_edges(expression)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|(_, input)| input),
@@ -2592,7 +2592,7 @@ fn direct_structured_statement_records(
         }
         if let Some(expression) = expressions.get(&direct) {
             delimiters.extend(
-                compact_ast_edges(&expression.kind)
+                compact_ast_edges(&expression.kind, expression.linked_input)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|(_, input)| input)
@@ -2733,7 +2733,7 @@ fn direct_view_source_payload_paths(
                 }
             }
         }
-        for (role, input) in source_ast_edges(&expression.kind)? {
+        for (role, input) in source_ast_edges(expression)? {
             let projection_len = projection.len();
             if let KernelOwnerEdgeRole::RecordField {
                 name,
@@ -2781,8 +2781,10 @@ fn direct_view_source_payload_paths(
         .collect()
 }
 
-fn source_ast_edges(kind: &AstExprKind) -> Result<Vec<(KernelOwnerEdgeRole, usize)>, String> {
-    match kind {
+fn source_ast_edges(
+    expression: &boon_syntax::AstExpr,
+) -> Result<Vec<(KernelOwnerEdgeRole, usize)>, String> {
+    match &expression.kind {
         AstExprKind::Identifier(_) | AstExprKind::Path(_) => Ok(Vec::new()),
         AstExprKind::Call { args, pass, .. } => Ok(args
             .iter()
@@ -2798,22 +2800,23 @@ fn source_ast_edges(kind: &AstExprKind) -> Result<Vec<(KernelOwnerEdgeRole, usiz
             pass,
             arms,
             ..
-        } => Ok(
-            std::iter::once((KernelOwnerEdgeRole::CollectionItem, *input))
-                .chain(
-                    args.iter()
-                        .map(|argument| (KernelOwnerEdgeRole::CollectionItem, argument.value)),
-                )
-                .chain(
-                    pass.iter()
-                        .map(|pass| (KernelOwnerEdgeRole::CollectionItem, pass.value)),
-                )
-                .chain(
-                    arms.iter()
-                        .map(|arm| (KernelOwnerEdgeRole::CollectionItem, *arm)),
-                )
-                .collect(),
-        ),
+        } => Ok(std::iter::once((
+            KernelOwnerEdgeRole::CollectionItem,
+            expression.linked_input.unwrap_or(*input),
+        ))
+        .chain(
+            args.iter()
+                .map(|argument| (KernelOwnerEdgeRole::CollectionItem, argument.value)),
+        )
+        .chain(
+            pass.iter()
+                .map(|pass| (KernelOwnerEdgeRole::CollectionItem, pass.value)),
+        )
+        .chain(
+            arms.iter()
+                .map(|arm| (KernelOwnerEdgeRole::CollectionItem, *arm)),
+        )
+        .collect()),
         AstExprKind::Block { bindings, result } => Ok(bindings
             .iter()
             .map(|binding| (KernelOwnerEdgeRole::CollectionItem, binding.value))
@@ -2823,7 +2826,7 @@ fn source_ast_edges(kind: &AstExprKind) -> Result<Vec<(KernelOwnerEdgeRole, usiz
                     .map(|result| (KernelOwnerEdgeRole::BlockResult, *result)),
             )
             .collect()),
-        _ => compact_ast_edges(kind),
+        kind => compact_ast_edges(kind, expression.linked_input),
     }
 }
 
@@ -2965,7 +2968,10 @@ fn compact_pattern(pattern: &AstMatchPattern) -> KernelPattern {
     }
 }
 
-fn compact_ast_edges(kind: &AstExprKind) -> Result<Vec<(KernelOwnerEdgeRole, usize)>, String> {
+fn compact_ast_edges(
+    kind: &AstExprKind,
+    linked_input: Option<usize>,
+) -> Result<Vec<(KernelOwnerEdgeRole, usize)>, String> {
     let edges = match kind {
         AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
@@ -3020,11 +3026,15 @@ fn compact_ast_edges(kind: &AstExprKind) -> Result<Vec<(KernelOwnerEdgeRole, usi
             .iter()
             .map(|entry| (KernelOwnerEdgeRole::MapEntry, *entry))
             .collect(),
-        AstExprKind::Draining { input } => {
-            vec![(KernelOwnerEdgeRole::DrainingInput, *input)]
-        }
+        AstExprKind::Draining { input } => vec![(
+            KernelOwnerEdgeRole::DrainingInput,
+            linked_input.unwrap_or(*input),
+        )],
         AstExprKind::Hold { initial, .. } => {
-            vec![(KernelOwnerEdgeRole::HoldInitial, *initial)]
+            vec![(
+                KernelOwnerEdgeRole::HoldInitial,
+                linked_input.unwrap_or(*initial),
+            )]
         }
         AstExprKind::Latest { branches } => branches
             .iter()
@@ -3033,20 +3043,27 @@ fn compact_ast_edges(kind: &AstExprKind) -> Result<Vec<(KernelOwnerEdgeRole, usi
         AstExprKind::When { input, arms }
         | AstExprKind::Pipe {
             input, op: _, arms, ..
-        } => std::iter::once((KernelOwnerEdgeRole::WhenInput, *input))
-            .chain(arms.iter().map(|arm| (KernelOwnerEdgeRole::WhenArm, *arm)))
-            .collect(),
-        AstExprKind::Then { input, output } => {
-            std::iter::once((KernelOwnerEdgeRole::ThenInput, *input))
-                .chain(
-                    output
-                        .iter()
-                        .map(|output| (KernelOwnerEdgeRole::ThenOutput, *output)),
-                )
-                .collect()
-        }
+        } => std::iter::once((
+            KernelOwnerEdgeRole::WhenInput,
+            linked_input.unwrap_or(*input),
+        ))
+        .chain(arms.iter().map(|arm| (KernelOwnerEdgeRole::WhenArm, *arm)))
+        .collect(),
+        AstExprKind::Then { input, output } => std::iter::once((
+            KernelOwnerEdgeRole::ThenInput,
+            linked_input.unwrap_or(*input),
+        ))
+        .chain(
+            output
+                .iter()
+                .map(|output| (KernelOwnerEdgeRole::ThenOutput, *output)),
+        )
+        .collect(),
         AstExprKind::Infix { left, right, .. } => vec![
-            (KernelOwnerEdgeRole::InfixLeft, *left),
+            (
+                KernelOwnerEdgeRole::InfixLeft,
+                linked_input.unwrap_or(*left),
+            ),
             (KernelOwnerEdgeRole::InfixRight, *right),
         ],
         AstExprKind::MatchArm { output, .. } => output
@@ -3856,17 +3873,14 @@ mod tests {
                 oracle.unsupported
             )
         };
-        let [(unsupported_owner, reason)] = oracle.unsupported.as_ref() else {
+        let [container_owner] = oracle.container_owners.as_ref() else {
             panic!(
-                "fixture must leave only its declaration-less unit root unsupported: {:#?}",
-                oracle.unsupported
+                "fixture must classify one declaration-less unit container: {:#?}",
+                oracle.container_owners
             )
         };
-        assert!(matches!(
-            unsupported_owner,
-            StableCheckOwnerKey::UnitRoot(_)
-        ));
-        assert_eq!(reason, "owner has no public declaration");
+        assert!(matches!(container_owner, StableCheckOwnerKey::UnitRoot(_)));
+        assert!(oracle.unsupported.is_empty());
 
         let parsed = parse_source("app/RUN.bn", source).expect("parsed current fixture");
         let checked = boon_typecheck::check_program(&parsed);
@@ -4628,6 +4642,24 @@ mod tests {
     }
 
     #[test]
+    fn nonempty_unit_roots_are_not_classified_as_inert_containers() {
+        let source = "1\n";
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse nonempty unit-root fixture");
+        let oracle = kernel_owner_oracle(&project);
+        assert!(oracle.container_owners.is_empty());
+        let [(owner, reason)] = oracle.unsupported.as_ref() else {
+            panic!(
+                "a nonempty unit root must remain an explicit unsupported surface: {:#?}",
+                oracle.unsupported
+            )
+        };
+        assert!(matches!(owner, StableCheckOwnerKey::UnitRoot(_)));
+        assert_eq!(reason, "owner has no public declaration");
+    }
+
+    #[test]
     fn block_bindings_compile_as_lexical_alias_edges() {
         let source = concat!(
             "FUNCTION duplicate(value) {\n",
@@ -4772,6 +4804,41 @@ mod tests {
             .into(),
         );
         assert_eq!(function.result.ty, expected);
+    }
+
+    #[test]
+    fn linked_hold_initial_uses_the_parser_owned_pipeline_input() {
+        let source = concat!(
+            "FUNCTION hold_proof() {\n",
+            "    0\n",
+            "    |> HOLD count {\n",
+            "        LATEST {}\n",
+            "    }\n",
+            "}\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse linked HOLD input fixture");
+        let oracle = kernel_owner_oracle(&project);
+        let function = oracle
+            .supported
+            .iter()
+            .find(|owner| matches!(&owner.owner, StableCheckOwnerKey::Item(key) if key.item_route.segments().last().is_some_and(|segment| segment.names == ["hold_proof"])))
+            .unwrap_or_else(|| {
+                panic!(
+                    "linked HOLD input must remain in its parser-owned expression tree: {:#?}",
+                    oracle.unsupported
+                )
+            });
+        assert_eq!(function.result.ty, Type::Number);
+        assert!(
+            oracle
+                .unsupported
+                .iter()
+                .all(|(owner, _)| matches!(owner, StableCheckOwnerKey::UnitRoot(_))),
+            "only the declaration-less unit root may be non-executable: {:#?}",
+            oracle.unsupported
+        );
     }
 
     #[test]
@@ -5023,7 +5090,7 @@ mod tests {
                 first.unsupported
             );
             assert_eq!(
-                first.supported.len() + first.unsupported.len(),
+                first.supported.len() + first.container_owners.len() + first.unsupported.len(),
                 project.stable_check_owner_keys().count(),
                 "every example owner must be classified explicitly"
             );
@@ -5042,7 +5109,7 @@ mod tests {
                 eprintln!(
                     "kernel-oracle {project_path}: supported={}/{} operations={} activations={} mutations={} dynamic_edges={} elapsed_us={}",
                     first.supported.len(),
-                    first.supported.len() + first.unsupported.len(),
+                    first.supported.len() + first.container_owners.len() + first.unsupported.len(),
                     first.work.operations,
                     first.work.activations,
                     first.work.mutations,
@@ -5095,7 +5162,7 @@ mod tests {
             let retained_snapshot_total_us = source_abi_us.saturating_add(timings.total_us);
             let candidate_total_us = parse_us.saturating_add(retained_snapshot_total_us);
             eprintln!(
-                "kernel-novywave candidate_only=true parity=not_run profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} kernel_total_us={} compile_us={} solve_us={} solved_owners={} unsupported_owners={} residual_modules={} residual_frames={} acyclic_residual_frames={} invocation_frames={} direct_result_summaries={} summary_definition_nodes={} summary_invoke_nodes={} linked_operations={} scheduled_work_items={} acyclic_initial_work_items={} dominant_module_owner={} dominant_module_operations={} dominant_module_frames={} dominant_module_linked_operations={} variables={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} summary_call_activations={} summary_node_evaluations={} mutations={} term_materializations={} term_intern_requests={} term_intern_hits={} term_intern_requests_by_kind={:?} term_intern_hits_by_kind={:?} structural_widen_requests={} structural_widen_hits={} dynamic_edges={}",
+                "kernel-novywave candidate_only=true parity=not_run profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} kernel_total_us={} compile_us={} solve_us={} solved_owners={} container_owners={} unsupported_owners={} residual_modules={} residual_frames={} acyclic_residual_frames={} invocation_frames={} direct_result_summaries={} summary_definition_nodes={} summary_invoke_nodes={} linked_operations={} scheduled_work_items={} acyclic_initial_work_items={} dominant_module_owner={} dominant_module_operations={} dominant_module_frames={} dominant_module_linked_operations={} variables={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} summary_call_activations={} summary_node_evaluations={} mutations={} term_materializations={} term_intern_requests={} term_intern_hits={} term_intern_requests_by_kind={:?} term_intern_hits_by_kind={:?} structural_widen_requests={} structural_widen_hits={} dynamic_edges={}",
                 if cfg!(debug_assertions) {
                     "debug"
                 } else {
@@ -5110,6 +5177,7 @@ mod tests {
                 timings.program_compile_us,
                 timings.solve_us,
                 timings.solved_owners,
+                timings.container_owners,
                 timings.unsupported_owners,
                 timings.compile_work.residual_type_modules,
                 timings.compile_work.residual_frames,
@@ -5144,6 +5212,11 @@ mod tests {
                 report.work.structural_widen_hits,
                 report.work.dynamic_dependency_edges,
             );
+            if std::env::var_os("BOON_KERNEL_ORACLE_UNSUPPORTED_TRACE").is_some() {
+                for (owner, reason) in &report.unsupported {
+                    eprintln!("kernel-novywave unsupported owner={owner:?} reason={reason}");
+                }
+            }
             return;
         }
 
@@ -5168,7 +5241,7 @@ mod tests {
             .checked_program_fields()
             .expect("NovyWave diagnostics own checked fields");
         assert_eq!(
-            report.supported.len() + report.unsupported.len(),
+            report.supported.len() + report.container_owners.len() + report.unsupported.len(),
             project.stable_check_owner_keys().count(),
             "every NovyWave owner must be classified"
         );
@@ -5178,6 +5251,7 @@ mod tests {
             report.unsupported
         );
         assert_eq!(timings.solved_owners, report.supported.len());
+        assert_eq!(timings.container_owners, report.container_owners.len());
         assert_eq!(timings.unsupported_owners, report.unsupported.len());
         let mut checked_by_stable_key = BTreeMap::new();
         for owner in project.stable_check_owner_keys() {
@@ -5241,7 +5315,7 @@ mod tests {
         let retained_snapshot_total_us = source_abi_us.saturating_add(timings.total_us);
         let candidate_with_bundle_us = bundle_us.saturating_add(candidate_total_us);
         eprintln!(
-            "kernel-novywave profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} candidate_with_bundle_us={} oracle_check_us={} legacy_parse_ms={:.3} legacy_typecheck_ms={:.3} kernel_total_us={} owner_projection_us={} direct_projection_us={} dependency_pruning_us={} program_compile_us={} solve_us={} artifact_projection_us={} projected_owners={} solved_owners={} unsupported_owners={} definition_modules={} principal_expressions={} residual_type_modules={} residual_module_operations={} residual_module_terms={} residual_frames={} linked_operations={} scheduled_work_items={} linked_terms={} acyclic_initial_operations={} compiled_call_sites={} invocation_frames={} reused_invocation_frames={} principal_result_reuses={} principal_expression_reuses={} pruned_invocation_expressions={} specialization_plans={} reused_specialization_plans={} max_call_depth={} variables={} operations={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} mutations={} dynamic_edges={}",
+            "kernel-novywave profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} candidate_with_bundle_us={} oracle_check_us={} legacy_parse_ms={:.3} legacy_typecheck_ms={:.3} kernel_total_us={} owner_projection_us={} direct_projection_us={} dependency_pruning_us={} program_compile_us={} solve_us={} artifact_projection_us={} projected_owners={} solved_owners={} container_owners={} unsupported_owners={} definition_modules={} principal_expressions={} residual_type_modules={} residual_module_operations={} residual_module_terms={} residual_frames={} linked_operations={} scheduled_work_items={} linked_terms={} acyclic_initial_operations={} compiled_call_sites={} invocation_frames={} reused_invocation_frames={} principal_result_reuses={} principal_expression_reuses={} pruned_invocation_expressions={} specialization_plans={} reused_specialization_plans={} max_call_depth={} variables={} operations={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} mutations={} dynamic_edges={}",
             if cfg!(debug_assertions) {
                 "debug"
             } else {
@@ -5265,6 +5339,7 @@ mod tests {
             timings.artifact_projection_us,
             timings.projected_owners,
             timings.solved_owners,
+            timings.container_owners,
             timings.unsupported_owners,
             timings.compile_work.definition_modules,
             timings.compile_work.principal_expressions,

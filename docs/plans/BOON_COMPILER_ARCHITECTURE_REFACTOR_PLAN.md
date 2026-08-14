@@ -2904,6 +2904,41 @@ algorithmic speedup. All 54 kernel unit tests, 85 non-ignored compiler unit
 tests, and 16 compiler integration tests pass; the full ignored NovyWave
 expression/collection/source/call/effect/flow differential passes explicitly.
 
+The next dependency-bottom cut adds one dense authored statement table to every
+`DefinitionArtifact`. Each row owns its definition-local statement ID, exact
+function/field/SOURCE/HOLD/LIST/block/spread/expression kind, parameter and
+capacity metadata, one typed local-or-external value reference, and ordered
+local-statement or child-owner edges. The table is carried through the same
+project compile and solve as expression rows; it is not reconstructed from
+checked statements afterward. Project assembly validates dense statement IDs,
+local child bounds, external owner bounds, and value references before solving.
+
+Multiline `WHEN` arms exposed a previously duplicated sequencing fact: the
+parser's structural statement surface retains the arm expression while the
+checked statement row points at the final pipeline value. The stable parser
+owner view now publishes `checked_statement_value_expression` as that exact
+syntax authority. The kernel bridge consumes it directly instead of importing
+the old owner syntax graph, and a parser regression locks the structural-arm
+versus checked-tail distinction. The complete NovyWave artifact contains 5,541
+statement rows with zero kind, value, child-topology, or coverage mismatches,
+while retaining the 15,575 expression, 133 collection, 117 literal SOURCE,
+1,821 call, and 11 host-effect rows from the preceding cut.
+
+Three no-rebuild debug samples record 1,897.640, 1,927.924, and 1,889.030 ms
+kernel time (median 1,897.640 ms); complete candidate time is 2,047.757,
+2,087.334, and 2,039.583 ms (median 2,047.757 ms). Three optimized samples
+record 401.878, 406.279, and 403.857 ms kernel time (median 403.857 ms);
+complete candidate time is 490.793, 494.548, and 491.071 ms (median 491.071
+ms). Median optimized compile/link is 102.952 ms and solve is 228.180 ms. The
+final two-job optimized library-test rebuild took 3m21s; an earlier broad Cargo
+test command also spent 4m36s rebuilding unused integration-test targets and is
+not a timing sample. Mutable solver work is unchanged at 39,798 variables,
+32,826 operations, 69,687 activations, 57,375 mutations, and 23,827 dynamic
+edges, so the small timing increase is recorded as statement-artifact
+publication plus measurement noise, not solver regression. All 78 parser tests,
+55 kernel tests, 85 non-ignored compiler unit tests, and 16 compiler integration
+tests pass; the full ignored NovyWave differential passes explicitly.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not
@@ -2919,36 +2954,34 @@ complete compiler.
 The next migration is architecture-first, but production changes only in one
 checker-wide flag day:
 
-1. Add one compact builtin/pipe ABI residual layer and use it for the ranked
-   NovyWave surface, beginning with pure Text, Number, List, and Field
-   operations. Keep host/effect calls explicit until their effect contract is
-   compiled; never rediscover ABI semantics by walking rich checker objects.
-2. Close block-local lexical bindings, transparent statement sequencing, OUT
-   formals, pattern-binding projections, and correlated generic match-arm
-   selection. Keep the ranked unsupported inventory decreasing monotonically;
-   never insert a fallback.
-3. Project complete interface SCCs directly from immutable syntax/link
-   artifacts into the dense program. Freeze each public interface separately
-   from its private residual program and fingerprint both once. SCC-by-SCC
-   execution is an internal differential strategy only; it cannot become a
-   production pilot or fallback.
-4. Run Counter, TodoMVC, and then NovyWave differentials over every SCC and
-   owner kind. Require exact public and expression flow types, diagnostics,
-   calls/effects/state/list/source facts, dependency cones, stable output,
-   deterministic work counts, and no nested owner dispatch for acyclic code.
-5. Finish the permanent `KernelProjectInput`, one-revision `KernelSession`,
-   `CheckDemand`, `DefinitionArtifact`, and `KernelCheckedSnapshot` boundary.
-   Require complete coverage, fresh-process determinism, NovyWave cold
-   diagnostics below two seconds, and zero provider-wide scans, separate body
-   solves, and source-shaped residual interpretation. Warm caches do not count
-   toward these gates.
-6. Perform one checker-wide production cutover. In the same tranche delete all
+1. Finish `DefinitionArtifact` from the dependency bottom upward: declaration
+   and lexical-binding identities first, then HOLD state, persistent LIST, and
+   SOURCE resource rows. Reuse the existing dense expression and statement
+   references; never create parallel source-shaped resource drafts.
+2. Add exact diagnostics, public callable substitutions, currentness receipts,
+   and dependency-cone rows to `KernelCheckedSnapshot`. Extend Counter,
+   TodoMVC, and NovyWave differential gates over each new table before moving
+   to the next one; collect whole mismatch inventories instead of repairing one
+   serialized failure per run.
+3. Freeze each public interface separately from its private compiled definition
+   and fingerprint both once. Finish the permanent `KernelProjectInput`,
+   one-revision `KernelSession`, and `CheckDemand` boundary without importing
+   old owner DTOs or adding a selectable legacy path.
+4. Require fresh-process determinism, complete owner and artifact coverage,
+   NovyWave cold diagnostics below two seconds, and zero provider-wide scans,
+   separate body solves, and source-shaped residual interpretation. Warm caches,
+   extra threads, or partial candidate paths do not count toward these gates.
+5. Perform one checker-wide production cutover. In the same tranche delete all
    legacy owner interface/body unifier machinery, flow/capture replay,
    source-shaped residual preparation and recursive evaluation, duplicate
    checked-row reconstruction, and superseded session requests/fingerprint
    domains. The old implementation may remain only as explicitly test-gated
    oracle code until the final parity suite is archived; it is never a
    production fallback.
+6. Continue the clean-slate path downstream: normalized semantic facts per
+   definition, compact invocation frames, one shared plan-code module per
+   definition, and a consuming linker/seal. Do not split more crates until a
+   measured one-way dependency seam justifies it.
 
 Renderer semantics are a separate ABI migration, not a language special case.
 `NoElement` is an ordinary user/library tag. The existing checker currently

@@ -495,6 +495,25 @@ impl<'a> UnitOwnerSyntaxView<'a> {
         .copied()
     }
 
+    /// Return the expression identity stored by the checked statement table.
+    ///
+    /// This differs from [`Self::statement_value_expression`] for structural
+    /// statements whose authored body continues a multiline pipeline. The
+    /// parser surface retains the structural expression, while the checked
+    /// statement row points at the final pipeline value. Keeping this
+    /// sequencing rule beside the finalized syntax lets independent checkers
+    /// project statement facts without importing an older checker DTO.
+    pub fn checked_statement_value_expression(
+        &self,
+        statement: UnitLocalStatementId,
+    ) -> Option<usize> {
+        let statement = self.statement_for_local(statement)?;
+        checked_statement_value_expression_with(statement, &|expression| {
+            let expression = self.local_expression_id(expression)?;
+            self.fields.ast.expressions.get(expression.as_usize())
+        })
+    }
+
     /// Return the stable check owner of any unit-local statement. This is the
     /// statement counterpart of `stable_check_owner_for_syntax_expression` and
     /// is intended for exact cross-owner containment authority.
@@ -4885,6 +4904,49 @@ fn statement_value_expression_with<'a>(
         .last()
         .copied()
         .or(statement.expr)
+}
+
+fn checked_statement_value_expression_with<'a>(
+    statement: &AstStatement,
+    expression: &impl Fn(usize) -> Option<&'a AstExpr>,
+) -> Option<usize> {
+    if matches!(statement.kind, AstStatementKind::Function { .. }) {
+        return statement_sequence_values_with(&statement.children, expression)
+            .last()
+            .copied();
+    }
+    if statement.expr.is_some_and(|expression_id| {
+        expression(expression_id)
+            .is_some_and(|expression| matches!(expression.kind, AstExprKind::Then { .. }))
+    }) {
+        return statement.expr;
+    }
+
+    let structural_value = statement_value_expression_with(statement, expression);
+    if statement_pipeline_continuation_target_with(statement, expression).is_some() {
+        return structural_value;
+    }
+    let mut pipeline_tail = None;
+    collect_checked_statement_pipeline_tail_with(statement, expression, &mut pipeline_tail);
+    pipeline_tail.or(structural_value)
+}
+
+fn collect_checked_statement_pipeline_tail_with<'a>(
+    statement: &AstStatement,
+    expression: &impl Fn(usize) -> Option<&'a AstExpr>,
+    pipeline_tail: &mut Option<usize>,
+) {
+    for child in &statement.children {
+        if !matches!(child.kind, AstStatementKind::Expression)
+            || statement_pipeline_continuation_target_with(child, expression).is_none()
+        {
+            continue;
+        }
+        if let Some(value) = child.expr {
+            *pipeline_tail = Some(value);
+        }
+        collect_checked_statement_pipeline_tail_with(child, expression, pipeline_tail);
+    }
 }
 
 fn statement_binding_name(statement: &AstStatement) -> Option<&str> {
@@ -10613,6 +10675,66 @@ document:
         );
         assert_eq!(edited, baseline);
         assert_eq!(baseline.len(), 3);
+    }
+
+    #[test]
+    fn checked_statement_value_uses_the_multiline_when_arm_pipeline_tail() {
+        let parsed = parse_project_source_unit(
+            "app/RUN.bn",
+            "FUNCTION label(result) {\n    result |> WHEN {\n        Ready =>\n            result.name\n            |> Text/trim()\n            |> Text/to_uppercase()\n        __ => TEXT { pending }\n    }\n}\n",
+        )
+        .unwrap();
+        let function = parsed
+            .owner_index()
+            .entries()
+            .iter()
+            .find(|entry| {
+                matches!(
+                    &entry.route,
+                    UnitOwnerRoute::Item(route)
+                        if route.segments().last().is_some_and(|segment| segment.names == ["label"])
+                )
+            })
+            .expect("label function owner");
+        let view = parsed.owner_view(&function.route).unwrap();
+        let ready = view
+            .statement_ids()
+            .iter()
+            .copied()
+            .find(|statement| {
+                let Some(expression) = view
+                    .statement_for_local(*statement)
+                    .and_then(|row| row.expr)
+                else {
+                    return false;
+                };
+                view.expressions().any(|candidate| {
+                    candidate.id == expression
+                        && matches!(
+                            &candidate.kind,
+                            AstExprKind::MatchArm {
+                                pattern: AstMatchPattern::Tag { name, .. },
+                                ..
+                            } if name == "Ready"
+                        )
+                })
+            })
+            .expect("Ready arm statement");
+        let structural = view
+            .statement_value_expression(ready)
+            .expect("parser structural value");
+        let checked = view
+            .checked_statement_value_expression(ready)
+            .expect("checked statement value");
+
+        assert_ne!(checked, structural);
+        assert!(view.expressions().any(|expression| {
+            expression.id == structural && matches!(expression.kind, AstExprKind::MatchArm { .. })
+        }));
+        assert!(view.expressions().any(|expression| {
+            expression.id == checked
+                && matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "Text/to_uppercase")
+        }));
     }
 
     #[test]

@@ -7,17 +7,19 @@
 use boon_checked::{FlowMode, FlowType, ObjectShape, Type, Variant, type_is_recursively_closed};
 use boon_compiler_kernel::{
     KernelCallInputRole, KernelCallTarget, KernelCollectionKind, KernelCompileWork,
-    KernelExpressionId, KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
-    KernelInheritedFormal, KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge,
-    KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelPattern,
-    KernelProjectProgramInput, KernelPureBuiltinKind, KernelRenderConstructorKind, KernelSolveWork,
-    KernelValueReference, compile_project_program, is_kernel_host_effect,
+    KernelDefinitionFactsInput, KernelExpressionId, KernelExternalExpression, KernelExternalTarget,
+    KernelHostEffectArtifact, KernelInheritedFormal, KernelOwnerEdgeRole, KernelOwnerId,
+    KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput,
+    KernelParameterKind, KernelPattern, KernelProjectProgramInput, KernelPureBuiltinKind,
+    KernelRenderConstructorKind, KernelSolveWork, KernelStatementChildReference, KernelStatementId,
+    KernelStatementInput, KernelStatementKind, KernelStatementParameter, KernelValueReference,
+    compile_project_program_with_definition_facts, is_kernel_host_effect,
 };
 use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
 use boon_syntax::{
     AstCallArgKind, AstExprKind, AstMatchPattern, AstParameterKind, AstStatementKind,
     AstTextSegment, StableCheckOwnerKey, StableExpressionKey, StableItemRouteSegment,
-    StableStatementKind, UnitItemKind, UnitLocalStatementId,
+    StableStatementKey, StableStatementKind, UnitItemKind, UnitLocalStatementId,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -28,6 +30,7 @@ pub struct KernelOwnerOracleEntry {
     pub result_expression: Option<StableExpressionKey>,
     pub result: FlowType,
     pub expressions: Box<[(StableExpressionKey, FlowType)]>,
+    pub statements: Box<[KernelOwnerOracleStatement]>,
     pub collections: Box<[KernelOwnerOracleCollection]>,
     pub sources: Box<[KernelOwnerOracleSource]>,
     pub calls: Box<[KernelOwnerOracleCall]>,
@@ -94,6 +97,20 @@ pub struct KernelOwnerOracleSource {
     pub expression: StableExpressionKey,
     pub payload_type: Type,
     pub flow_type: FlowType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleStatement {
+    pub statement: StableStatementKey,
+    pub kind: KernelStatementKind,
+    pub value: Option<KernelOwnerOracleValueReference>,
+    pub children: Box<[KernelOwnerOracleStatementChild]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KernelOwnerOracleStatementChild {
+    Local(StableStatementKey),
+    Owner(StableCheckOwnerKey),
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -259,8 +276,27 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         )
                     })
                 });
+                let statement_child_reason =
+                    owner.statement_child_targets.iter().find_map(|child| {
+                        let Some(target) = prepared_by_owner.get(&child.owner).copied() else {
+                            return Some((
+                                format!("depends on unsupported owner {:#?}", child.owner),
+                                child.owner.clone(),
+                            ));
+                        };
+                        (!active.contains(&target)).then(|| {
+                            (
+                                format!("depends on unsupported owner {:#?}", child.owner),
+                                root_blocker_by_owner
+                                    .get(&child.owner)
+                                    .cloned()
+                                    .unwrap_or_else(|| child.owner.clone()),
+                            )
+                        })
+                    });
                 external_reason
                     .or(call_reason)
+                    .or(statement_child_reason)
                     .map(|(reason, root)| (*index, reason, root))
             })
             .collect::<Vec<_>>();
@@ -365,6 +401,27 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
             .collect::<Vec<_>>()
             .into_boxed_slice(),
     };
+    let definition_facts = active
+        .iter()
+        .map(|prepared_index| {
+            let owner = &prepared[*prepared_index];
+            let mut facts = owner.definition_facts.clone();
+            for target in &owner.statement_child_targets {
+                let prepared_target = prepared_by_owner[&target.owner];
+                let child = facts.statements[target.statement]
+                    .children
+                    .get_mut(target.child)
+                    .expect("prepared statement child target is in range");
+                let KernelStatementChildReference::Owner(owner) = child else {
+                    panic!("prepared external statement child became local")
+                };
+                *owner = dense_owner[prepared_target]
+                    .expect("active statement child target has a dense owner");
+            }
+            facts
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
 
     let mut program_compile_us = 0;
     let mut solve_us = 0;
@@ -373,7 +430,9 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         None
     } else {
         let compile_started = Instant::now();
-        let compiled = compile_project_program(&project_input).map_err(|error| error.to_string());
+        let compiled =
+            compile_project_program_with_definition_facts(&project_input, &definition_facts)
+                .map_err(|error| error.to_string());
         if let Ok(program) = &compiled {
             compile_work = program.compile_work();
         }
@@ -504,6 +563,45 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
+                    assert_eq!(
+                        artifact.statements.len(),
+                        owner.statements.len(),
+                        "kernel statement artifacts retain one stable row each"
+                    );
+                    let statements = artifact
+                        .statements
+                        .iter()
+                        .map(|statement| KernelOwnerOracleStatement {
+                            statement: owner.statements[statement.id.0 as usize].clone(),
+                            kind: statement.kind.clone(),
+                            value: statement.value.map(&stable_provider),
+                            children: statement
+                                .children
+                                .iter()
+                                .map(|child| match child {
+                                    KernelStatementChildReference::Local(child) => {
+                                        KernelOwnerOracleStatementChild::Local(
+                                            owner.statements[child.0 as usize].clone(),
+                                        )
+                                    }
+                                    KernelStatementChildReference::Owner(child) => {
+                                        let child = active
+                                            .get(child.0 as usize)
+                                            .and_then(|child| prepared.get(*child))
+                                            .unwrap_or_else(|| {
+                                                panic!(
+                                                    "kernel statement child targets missing dense owner {}",
+                                                    child.0
+                                                )
+                                            });
+                                        KernelOwnerOracleStatementChild::Owner(child.owner.clone())
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice(),
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
                     let calls = artifact
                         .calls
                         .into_iter()
@@ -581,6 +679,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         result_expression: owner.result_expression.clone(),
                         result: artifact.result,
                         expressions,
+                        statements,
                         collections,
                         sources,
                         calls,
@@ -681,6 +780,9 @@ fn elapsed_us(elapsed: Duration) -> u64 {
 struct PreparedOwner {
     owner: StableCheckOwnerKey,
     expressions: Box<[StableExpressionKey]>,
+    statements: Box<[StableStatementKey]>,
+    definition_facts: KernelDefinitionFactsInput,
+    statement_child_targets: Box<[PreparedStatementChildTarget]>,
     external_expressions: Box<[PreparedExternalExpression]>,
     call_targets: Box<[PreparedCallTarget]>,
     compact: KernelOwnerProgramInput,
@@ -745,6 +847,13 @@ enum PreparedRecordEntry {
 #[derive(Clone, Debug)]
 struct PreparedCallTarget {
     node: usize,
+    owner: StableCheckOwnerKey,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedStatementChildTarget {
+    statement: usize,
+    child: usize,
     owner: StableCheckOwnerKey,
 }
 
@@ -2044,9 +2153,20 @@ fn compact_owner_view(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
+    let (statements, definition_facts, statement_child_targets) = compact_statement_facts(
+        view,
+        &owner,
+        &local_by_syntax,
+        node_count,
+        &mut external_by_key,
+        &mut external_expressions,
+    )?;
     Ok(PreparedOwner {
         owner,
         expressions: expressions.into_boxed_slice(),
+        statements,
+        definition_facts,
+        statement_child_targets,
         external_expressions: external_expressions.into_boxed_slice(),
         call_targets: call_targets.into_boxed_slice(),
         compact: KernelOwnerProgramInput {
@@ -2566,6 +2686,152 @@ fn statement_binding_name(kind: &AstStatementKind) -> Option<&str> {
         | AstStatementKind::Spread
         | AstStatementKind::Expression => None,
     }
+}
+
+fn compact_statement_facts(
+    view: UnitOwnerSyntaxView<'_>,
+    owner: &StableCheckOwnerKey,
+    local_by_syntax: &BTreeMap<usize, usize>,
+    node_count: usize,
+    external_by_key: &mut BTreeMap<PreparedExternalExpression, usize>,
+    external_expressions: &mut Vec<PreparedExternalExpression>,
+) -> Result<
+    (
+        Box<[StableStatementKey]>,
+        KernelDefinitionFactsInput,
+        Box<[PreparedStatementChildTarget]>,
+    ),
+    String,
+> {
+    let statements = view
+        .statement_ids()
+        .iter()
+        .copied()
+        .zip(view.statements())
+        .collect::<Vec<_>>();
+    let dense_by_syntax = statements
+        .iter()
+        .enumerate()
+        .map(|(index, (_, statement))| (statement.id, index))
+        .collect::<BTreeMap<_, _>>();
+    let child_owner_by_syntax = view
+        .child_owners()
+        .iter()
+        .filter_map(|boundary| {
+            Some((
+                view.statement_for_local(boundary.statement())?.id,
+                view.stable_check_owner_for_local_statement(boundary.statement())?,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let stable = statements
+        .iter()
+        .map(|(statement, _)| {
+            view.stable_statement_key_local(*statement)
+                .ok_or_else(|| format!("owner statement {:?} has no stable key", statement))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_boxed_slice();
+    let mut child_targets = Vec::new();
+    let statements = statements
+        .into_iter()
+        .enumerate()
+        .map(|(index, (statement_id, statement))| {
+            let kind = match &statement.kind {
+                AstStatementKind::Function { name, parameters } => KernelStatementKind::Function {
+                    name: name.clone().into_boxed_str(),
+                    parameters: parameters
+                        .iter()
+                        .map(|parameter| {
+                            Ok(KernelStatementParameter {
+                                name: parameter.name.clone().into_boxed_str(),
+                                kind: match parameter.kind {
+                                    AstParameterKind::Value => KernelParameterKind::Value,
+                                    AstParameterKind::Out => KernelParameterKind::Out,
+                                },
+                                ordinal: checked_u32(
+                                    parameter.ordinal,
+                                    "statement parameter ordinal",
+                                )?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, String>>()?
+                        .into_boxed_slice(),
+                },
+                AstStatementKind::Field { name } => KernelStatementKind::Field {
+                    name: name.clone().into_boxed_str(),
+                },
+                AstStatementKind::Source { field, event } => KernelStatementKind::Source {
+                    field: field.clone().map(String::into_boxed_str),
+                    event: event.clone().map(String::into_boxed_str),
+                },
+                AstStatementKind::Hold { field, name } => KernelStatementKind::Hold {
+                    field: field.clone().map(String::into_boxed_str),
+                    name: name.clone().map(String::into_boxed_str),
+                },
+                AstStatementKind::List { field, capacity } => KernelStatementKind::List {
+                    field: field.clone().map(String::into_boxed_str),
+                    capacity: *capacity,
+                },
+                AstStatementKind::Block => KernelStatementKind::Block,
+                AstStatementKind::Spread => KernelStatementKind::Spread,
+                AstStatementKind::Expression => KernelStatementKind::Expression,
+            };
+            let value = view
+                .checked_statement_value_expression(statement_id)
+                .map(|value| {
+                    prepared_input_reference_index(
+                        PreparedInputReference::Syntax(value),
+                        view,
+                        owner,
+                        None,
+                        local_by_syntax,
+                        node_count,
+                        external_by_key,
+                        external_expressions,
+                    )
+                    .and_then(checked_kernel_expression)
+                })
+                .transpose()?;
+            let children = statement
+                .children
+                .iter()
+                .enumerate()
+                .map(|(child_index, child)| {
+                    if let Some(child) = dense_by_syntax.get(&child.id).copied() {
+                        return checked_u32(child, "statement child index")
+                            .map(KernelStatementId)
+                            .map(KernelStatementChildReference::Local);
+                    }
+                    let child_owner = child_owner_by_syntax.get(&child.id).cloned().ok_or_else(|| {
+                        format!(
+                            "owner statement {} child {} is neither local nor an owner boundary",
+                            statement.id, child.id
+                        )
+                    })?;
+                    child_targets.push(PreparedStatementChildTarget {
+                        statement: index,
+                        child: child_index,
+                        owner: child_owner,
+                    });
+                    Ok(KernelStatementChildReference::Owner(KernelOwnerId(0)))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_boxed_slice();
+            Ok(KernelStatementInput {
+                id: KernelStatementId(checked_u32(index, "statement index")?),
+                kind,
+                value,
+                children,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_boxed_slice();
+    Ok((
+        stable,
+        KernelDefinitionFactsInput { statements },
+        child_targets.into_boxed_slice(),
+    ))
 }
 
 fn direct_containing_statements(
@@ -4116,6 +4382,238 @@ mod tests {
         mismatches
     }
 
+    fn statement_inventory_mismatches(
+        report: &KernelOwnerOracleReport,
+        checked: &CheckedProgramFields,
+        stable_by_checked_expression: &BTreeMap<boon_checked::CheckedExprId, StableExpressionKey>,
+        project: &ProjectSyntaxSnapshot,
+    ) -> Vec<String> {
+        let mut mismatches = Vec::new();
+        let mut kernel_statements = BTreeMap::new();
+        let mut kernel_owner_by_statement = BTreeMap::new();
+        let result_expression_by_owner = report
+            .supported
+            .iter()
+            .filter_map(|owner| Some((owner.owner.clone(), owner.result_expression.clone()?)))
+            .collect::<BTreeMap<_, _>>();
+        for owner in &report.supported {
+            for statement in &owner.statements {
+                if kernel_statements
+                    .insert(statement.statement.clone(), statement)
+                    .is_some()
+                {
+                    mismatches.push(format!(
+                        "kernel repeats statement artifact {:?}",
+                        statement.statement
+                    ));
+                }
+                if kernel_owner_by_statement
+                    .insert(statement.statement.clone(), owner.owner.clone())
+                    .is_some()
+                {
+                    mismatches.push(format!(
+                        "kernel assigns statement {:?} to multiple definitions",
+                        statement.statement
+                    ));
+                }
+            }
+        }
+
+        let mut checked_by_stable = BTreeMap::new();
+        let mut stable_by_checked = BTreeMap::new();
+        let mut syntax_by_stable = BTreeMap::new();
+        for owner in project.stable_check_owner_keys() {
+            let Some(view) = project.owner_view(&owner) else {
+                continue;
+            };
+            for statement in view.statement_ids() {
+                let Some(stable) = view.stable_statement_key_local(*statement) else {
+                    continue;
+                };
+                let Some(syntax_statement) = view.statement_for_local(*statement) else {
+                    continue;
+                };
+                let Some(slot) = project.statement_slot(syntax_statement.id) else {
+                    continue;
+                };
+                let Some(checked_statement) = checked.statements.get(slot) else {
+                    continue;
+                };
+                syntax_by_stable
+                    .entry(stable.clone())
+                    .or_insert(syntax_statement);
+                checked_by_stable
+                    .entry(stable.clone())
+                    .or_insert(checked_statement);
+                stable_by_checked
+                    .entry(checked_statement.id)
+                    .or_insert(stable);
+            }
+        }
+
+        let value_expression = |value: &KernelOwnerOracleValueReference| match value {
+            KernelOwnerOracleValueReference::Expression(expression) => Some(expression.clone()),
+            KernelOwnerOracleValueReference::OwnerResult(owner) => {
+                result_expression_by_owner.get(owner).cloned()
+            }
+        };
+        for (stable, kernel) in &kernel_statements {
+            let Some(current) = checked_by_stable.get(stable).copied() else {
+                mismatches.push(format!(
+                    "kernel statement {stable:?} has no checked statement row"
+                ));
+                continue;
+            };
+            let Some(syntax) = syntax_by_stable.get(stable).copied() else {
+                mismatches.push(format!(
+                    "kernel statement {stable:?} has no parser statement row"
+                ));
+                continue;
+            };
+            let syntax_matches = match (&kernel.kind, &syntax.kind) {
+                (
+                    KernelStatementKind::Function { name, parameters },
+                    AstStatementKind::Function {
+                        name: syntax_name,
+                        parameters: syntax_parameters,
+                    },
+                ) => {
+                    name.as_ref() == syntax_name
+                        && parameters.len() == syntax_parameters.len()
+                        && parameters.iter().zip(syntax_parameters).all(
+                            |(parameter, syntax_parameter)| {
+                                parameter.name.as_ref() == syntax_parameter.name
+                                    && Some(parameter.ordinal)
+                                        == u32::try_from(syntax_parameter.ordinal).ok()
+                                    && matches!(
+                                        (parameter.kind, syntax_parameter.kind),
+                                        (KernelParameterKind::Value, AstParameterKind::Value)
+                                            | (KernelParameterKind::Out, AstParameterKind::Out)
+                                    )
+                            },
+                        )
+                }
+                (
+                    KernelStatementKind::Field { name },
+                    AstStatementKind::Field { name: syntax_name },
+                ) => name.as_ref() == syntax_name,
+                (
+                    KernelStatementKind::Source { field, event },
+                    AstStatementKind::Source {
+                        field: syntax_field,
+                        event: syntax_event,
+                    },
+                ) => {
+                    field.as_deref() == syntax_field.as_deref()
+                        && event.as_deref() == syntax_event.as_deref()
+                }
+                (
+                    KernelStatementKind::Hold { field, name },
+                    AstStatementKind::Hold {
+                        field: syntax_field,
+                        name: syntax_name,
+                    },
+                ) => {
+                    field.as_deref() == syntax_field.as_deref()
+                        && name.as_deref() == syntax_name.as_deref()
+                }
+                (
+                    KernelStatementKind::List { field, capacity },
+                    AstStatementKind::List {
+                        field: syntax_field,
+                        capacity: syntax_capacity,
+                    },
+                ) => field.as_deref() == syntax_field.as_deref() && capacity == syntax_capacity,
+                (KernelStatementKind::Block, AstStatementKind::Block)
+                | (KernelStatementKind::Spread, AstStatementKind::Spread)
+                | (KernelStatementKind::Expression, AstStatementKind::Expression) => true,
+                _ => false,
+            };
+            if !syntax_matches {
+                mismatches.push(format!(
+                    "kernel statement {stable:?} kind {:?} differs from parser {:?}",
+                    kernel.kind, syntax.kind
+                ));
+            }
+            let kind_matches = match (&kernel.kind, &current.kind) {
+                (KernelStatementKind::Function { .. }, CheckedStatementKind::Function { .. })
+                | (KernelStatementKind::Field { .. }, CheckedStatementKind::Field { .. })
+                | (KernelStatementKind::Block, CheckedStatementKind::Block)
+                | (KernelStatementKind::Spread, CheckedStatementKind::Spread)
+                | (KernelStatementKind::Expression, CheckedStatementKind::Expression) => true,
+                (
+                    KernelStatementKind::Source { event, .. },
+                    CheckedStatementKind::Source {
+                        event: checked_event,
+                        ..
+                    },
+                ) => event.as_deref() == checked_event.as_deref(),
+                (
+                    KernelStatementKind::Hold { name, .. },
+                    CheckedStatementKind::Hold {
+                        name: checked_name, ..
+                    },
+                ) => name.as_deref() == checked_name.as_deref(),
+                (
+                    KernelStatementKind::List { capacity, .. },
+                    CheckedStatementKind::List {
+                        capacity: checked_capacity,
+                        ..
+                    },
+                ) => capacity == checked_capacity,
+                _ => false,
+            };
+            if !kind_matches {
+                mismatches.push(format!(
+                    "kernel statement {stable:?} kind {:?} differs from checked {:?}",
+                    kernel.kind, current.kind
+                ));
+            }
+            let kernel_value = kernel.value.as_ref().and_then(value_expression);
+            let checked_value = current
+                .value
+                .and_then(|value| stable_by_checked_expression.get(&value).cloned());
+            if kernel_value != checked_value {
+                mismatches.push(format!(
+                    "kernel statement {stable:?} value {kernel_value:?} differs from checked {checked_value:?}"
+                ));
+            }
+            let mut checked_children = Vec::new();
+            for child in &current.children {
+                let Some(child) = stable_by_checked.get(child).cloned() else {
+                    mismatches.push(format!(
+                        "checked statement {stable:?} references a child with no stable identity"
+                    ));
+                    continue;
+                };
+                if kernel_owner_by_statement.get(&child) == kernel_owner_by_statement.get(stable) {
+                    checked_children.push(KernelOwnerOracleStatementChild::Local(child));
+                } else if let Some(owner) = kernel_owner_by_statement.get(&child) {
+                    checked_children.push(KernelOwnerOracleStatementChild::Owner(owner.clone()));
+                } else {
+                    mismatches.push(format!(
+                        "checked statement {stable:?} references child {child:?} with no kernel owner"
+                    ));
+                }
+            }
+            let checked_children = checked_children.into_boxed_slice();
+            if kernel.children != checked_children {
+                mismatches.push(format!(
+                    "kernel statement {stable:?} children {:?} differ from checked {:?}",
+                    kernel.children, checked_children
+                ));
+            }
+        }
+        for stable in checked_by_stable.keys() {
+            if !kernel_statements.contains_key(stable) {
+                mismatches.push(format!(
+                    "checked statement {stable:?} has no kernel statement artifact"
+                ));
+            }
+        }
+        mismatches
+    }
+
     fn checked_public_child_composed_result(
         owner: &KernelOwnerOracleEntry,
         mut result: FlowType,
@@ -4819,6 +5317,33 @@ mod tests {
                     KernelOwnerOracleValueReference::Expression(_)
                 )
         }));
+        let list_statement = owner
+            .statements
+            .iter()
+            .find(|statement| {
+                matches!(
+                    &statement.kind,
+                    KernelStatementKind::List {
+                        field: Some(field),
+                        capacity: None,
+                    } if field.as_ref() == "rows"
+                )
+            })
+            .expect("LIST owner publishes its authored statement row");
+        assert_eq!(
+            list_statement.value,
+            owner
+                .result_expression
+                .clone()
+                .map(KernelOwnerOracleValueReference::Expression)
+        );
+        assert_eq!(list_statement.children.len(), 2);
+        assert!(
+            list_statement
+                .children
+                .iter()
+                .all(|child| matches!(child, KernelOwnerOracleStatementChild::Local(_)))
+        );
 
         let checked_by_stable_key = parsed
             .ast
@@ -6151,11 +6676,16 @@ mod tests {
         let (report, timings) =
             profile_kernel_owner_oracle_with_source_payloads(&project, &source_payloads);
         eprintln!(
-            "kernel-novywave definition_artifacts expression_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={}",
+            "kernel-novywave definition_artifacts expression_rows={} statement_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={}",
             report
                 .supported
                 .iter()
                 .map(|owner| owner.expressions.len())
+                .sum::<usize>(),
+            report
+                .supported
+                .iter()
+                .map(|owner| owner.statements.len())
                 .sum::<usize>(),
             report
                 .supported
@@ -6180,15 +6710,13 @@ mod tests {
         );
 
         if std::env::var_os("BOON_KERNEL_CANDIDATE_ONLY").is_some() {
-            if report.supported.is_empty() {
-                if let Some((owner, reason)) = report
-                    .unsupported
-                    .iter()
-                    .find(|(_, reason)| reason.starts_with("kernel project solve failed:"))
-                    .or_else(|| report.unsupported.first())
-                {
-                    eprintln!("kernel-novywave first_unsupported_owner={owner:?} reason={reason}");
-                }
+            if let Some((owner, reason)) = report
+                .unsupported
+                .iter()
+                .find(|(_, reason)| reason.starts_with("kernel project solve failed:"))
+                .or_else(|| report.unsupported.first())
+            {
+                eprintln!("kernel-novywave first_unsupported_owner={owner:?} reason={reason}");
             }
             let retained_snapshot_total_us = source_abi_us.saturating_add(timings.total_us);
             let candidate_total_us = parse_us.saturating_add(retained_snapshot_total_us);
@@ -6388,6 +6916,12 @@ mod tests {
             fields,
             &checked_expression_by_stable,
             &stable_by_checked_expression,
+        ));
+        mismatches.extend(statement_inventory_mismatches(
+            &report,
+            fields,
+            &stable_by_checked_expression,
+            &project,
         ));
         if !mismatches.is_empty() {
             eprintln!("kernel-novywave parity_mismatch_count={}", mismatches.len());

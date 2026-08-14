@@ -21,6 +21,9 @@ use std::sync::Arc;
 pub struct KernelExpressionId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct KernelStatementId(pub u32);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct KernelOwnerId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -222,6 +225,64 @@ pub struct KernelOwnerProgramInput {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelParameterKind {
+    Value,
+    Out,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct KernelStatementParameter {
+    pub name: Box<str>,
+    pub kind: KernelParameterKind,
+    pub ordinal: u32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum KernelStatementKind {
+    Function {
+        name: Box<str>,
+        parameters: Box<[KernelStatementParameter]>,
+    },
+    Field {
+        name: Box<str>,
+    },
+    Source {
+        field: Option<Box<str>>,
+        event: Option<Box<str>>,
+    },
+    Hold {
+        field: Option<Box<str>>,
+        name: Option<Box<str>>,
+    },
+    List {
+        field: Option<Box<str>>,
+        capacity: Option<usize>,
+    },
+    Block,
+    Spread,
+    Expression,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct KernelStatementInput {
+    pub id: KernelStatementId,
+    pub kind: KernelStatementKind,
+    pub value: Option<KernelExpressionId>,
+    pub children: Box<[KernelStatementChildReference]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelStatementChildReference {
+    Local(KernelStatementId),
+    Owner(KernelOwnerId),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct KernelDefinitionFactsInput {
+    pub statements: Box<[KernelStatementInput]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct KernelExternalExpression {
     pub owner: KernelOwnerId,
     pub target: KernelExternalTarget,
@@ -266,6 +327,7 @@ pub struct KernelOwnerProgram {
     expression_outputs: Box<[OutputId]>,
     expression_modes: Box<[FlowMode]>,
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
+    statements: Box<[KernelStatementArtifact]>,
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
 }
@@ -325,6 +387,7 @@ struct KernelProjectOwnerOutputs {
     expressions: Box<[OutputId]>,
     expression_modes: Box<[FlowMode]>,
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
+    statements: Box<[KernelStatementArtifact]>,
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
 }
@@ -401,6 +464,14 @@ pub struct KernelExpressionArtifact {
     pub flow_type: FlowType,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelStatementArtifact {
+    pub id: KernelStatementId,
+    pub kind: KernelStatementKind,
+    pub value: Option<KernelValueReference>,
+    pub children: Box<[KernelStatementChildReference]>,
+}
+
 /// One source-authored call occurrence with its compact input edges and solved
 /// result. Downstream consumers no longer need to rediscover call structure by
 /// walking the owner expression graph.
@@ -435,6 +506,7 @@ pub struct KernelHostEffectArtifact {
 pub struct DefinitionArtifact {
     pub result: FlowType,
     pub expressions: Box<[KernelExpressionArtifact]>,
+    pub statements: Box<[KernelStatementArtifact]>,
     pub calls: Box<[KernelCallArtifact]>,
     pub effects: Box<[KernelHostEffectArtifact]>,
 }
@@ -496,6 +568,7 @@ impl KernelOwnerProgram {
             definition: DefinitionArtifact {
                 result,
                 expressions,
+                statements: self.statements,
                 calls,
                 effects: self.effects,
             },
@@ -548,6 +621,7 @@ impl KernelProjectProgram {
                 DefinitionArtifact {
                     result,
                     expressions,
+                    statements: owner.statements,
                     calls,
                     effects: owner.effects,
                 }
@@ -572,9 +646,26 @@ impl KernelProjectProgram {
 pub fn compile_owner_program(
     input: &KernelOwnerProgramInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
+    compile_owner_program_with_definition_facts(input, &KernelDefinitionFactsInput::default())
+}
+
+pub fn compile_owner_program_with_definition_facts(
+    input: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
+        ));
+    }
+    if facts.statements.iter().any(|statement| {
+        statement
+            .children
+            .iter()
+            .any(|child| matches!(child, KernelStatementChildReference::Owner(_)))
+    }) {
+        return Err(KernelOwnerBuildError::new(
+            "standalone owner statements cannot reference child owners",
         ));
     }
     let result = checked_expression_index(input.result, input.nodes.len(), "owner result")?;
@@ -662,6 +753,7 @@ pub fn compile_owner_program(
         expression_outputs: expression_outputs.into_boxed_slice(),
         expression_modes,
         expression_artifacts: collect_expression_artifacts(input)?,
+        statements: collect_statement_artifacts(input, facts)?,
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
     })
@@ -739,6 +831,61 @@ fn kernel_value_reference(
                 "kernel expression {consumer} input references expression {reference} outside the local and external namespaces"
             ))
         })
+}
+
+fn collect_statement_artifacts(
+    owner: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<Box<[KernelStatementArtifact]>, KernelOwnerBuildError> {
+    let statement_count = facts.statements.len();
+    let mut claimed_local_children = BTreeSet::new();
+    for (index, statement) in facts.statements.iter().enumerate() {
+        if statement.id.0 as usize != index {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel statement rows must use dense IDs: row {index} has ID {}",
+                statement.id.0
+            )));
+        }
+        for child in &statement.children {
+            let KernelStatementChildReference::Local(child) = child else {
+                continue;
+            };
+            if child.0 as usize >= statement_count {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel statement {index} references missing child statement {}",
+                    child.0
+                )));
+            }
+            if child.0 as usize <= index {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel statement {index} has non-forward child statement {}",
+                    child.0
+                )));
+            }
+            if !claimed_local_children.insert(*child) {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel statement {} has more than one local parent",
+                    child.0
+                )));
+            }
+        }
+    }
+    facts
+        .statements
+        .iter()
+        .map(|statement| {
+            Ok(KernelStatementArtifact {
+                id: statement.id,
+                kind: statement.kind.clone(),
+                value: statement
+                    .value
+                    .map(|value| kernel_value_reference(owner, value, statement.id.0 as usize))
+                    .transpose()?,
+                children: statement.children.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
 }
 
 fn materialize_call_artifacts(
@@ -867,6 +1014,38 @@ fn collect_host_effect_artifacts(
 pub fn compile_project_program(
     input: &KernelProjectProgramInput,
 ) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
+    let facts = (0..input.owners.len())
+        .map(|_| KernelDefinitionFactsInput::default())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    compile_project_program_with_definition_facts(input, &facts)
+}
+
+pub fn compile_project_program_with_definition_facts(
+    input: &KernelProjectProgramInput,
+    facts: &[KernelDefinitionFactsInput],
+) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
+    if facts.len() != input.owners.len() {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel project has {} owners but {} definition-fact tables",
+            input.owners.len(),
+            facts.len()
+        )));
+    }
+    for (definition, facts) in facts.iter().enumerate() {
+        for statement in &facts.statements {
+            for child in &statement.children {
+                if let KernelStatementChildReference::Owner(owner) = child
+                    && owner.0 as usize >= input.owners.len()
+                {
+                    return Err(KernelOwnerBuildError::new(format!(
+                        "kernel definition {definition} statement {} references missing child owner {}",
+                        statement.id.0, owner.0
+                    )));
+                }
+            }
+        }
+    }
     let mut builder = ComponentProgramBuilder::new();
     let mut mode_builder = ModeProgramBuilder::default();
     let mut invocations = HashMap::new();
@@ -1035,6 +1214,7 @@ pub fn compile_project_program(
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
                 expression_artifacts: collect_expression_artifacts(owner)?,
+                statements: collect_statement_artifacts(owner, &facts[owner_index])?,
                 calls: collect_call_artifacts(owner)?,
                 effects: collect_host_effect_artifacts(owner)?,
             })
@@ -6335,6 +6515,70 @@ mod tests {
             role,
             expression: KernelExpressionId(expression),
         }
+    }
+
+    #[test]
+    fn definition_statement_rows_keep_dense_values_and_child_topology() {
+        let input = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Known(Type::Number),
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Known(Type::Text),
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+        let facts = KernelDefinitionFactsInput {
+            statements: vec![
+                KernelStatementInput {
+                    id: KernelStatementId(0),
+                    kind: KernelStatementKind::Block,
+                    value: Some(KernelExpressionId(1)),
+                    children: vec![KernelStatementChildReference::Local(KernelStatementId(1))]
+                        .into_boxed_slice(),
+                },
+                KernelStatementInput {
+                    id: KernelStatementId(1),
+                    kind: KernelStatementKind::Expression,
+                    value: Some(KernelExpressionId(0)),
+                    children: Box::new([]),
+                },
+            ]
+            .into_boxed_slice(),
+        };
+
+        let artifact = compile_owner_program_with_definition_facts(&input, &facts)
+            .unwrap()
+            .solve()
+            .unwrap();
+
+        assert_eq!(artifact.definition.statements.len(), 2);
+        assert_eq!(artifact.definition.statements[0].id, KernelStatementId(0));
+        assert_eq!(
+            artifact.definition.statements[0].value,
+            Some(KernelValueReference::Local(KernelExpressionId(1)))
+        );
+        assert_eq!(
+            artifact.definition.statements[0].children.as_ref(),
+            [KernelStatementChildReference::Local(KernelStatementId(1))]
+        );
+        assert_eq!(artifact.definition.statements[1].id, KernelStatementId(1));
+
+        let mut invalid = facts.clone();
+        invalid.statements[1].id = KernelStatementId(4);
+        let error = compile_owner_program_with_definition_facts(&input, &invalid)
+            .err()
+            .expect("non-dense statement IDs must fail closed");
+        assert!(error.to_string().contains("dense IDs"));
     }
 
     #[test]

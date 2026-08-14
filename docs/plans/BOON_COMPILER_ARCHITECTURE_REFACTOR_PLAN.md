@@ -3264,6 +3264,56 @@ must reduce repeated shared-program evaluations or replace more of the 48,281
 general graph operations with definition-owned packed transfer facts; caller
 expansion is not an acceptable shortcut.
 
+A second controlled alternative was also rejected. Extending the DAG pass to
+deduplicate ordered `Sequence` nodes and nested `Invoke` nodes reduced stored
+summary nodes from 12,856 to 12,508, summary evaluations from 448,132 to
+418,146, material evaluations from 10,975 to 7,265, and structural widening
+from 96,553 to 89,796. Despite those attractive counters, the optimized median
+slowed from 538.935 to 548.545 ms for diagnostics and from 707.437 to
+724.852 ms for the complete checked candidate; graph solve was effectively
+unchanged. The experiment was fully reverted. Operation-count reduction is
+therefore evidence to investigate, not a substitute for end-to-end latency.
+
+The dependency-bottom source-expression diagnostic slice is now complete.
+`KernelDefinitionFactsInput` carries typed diagnostic facts for invalid syntax
+expressions and patterns, exact `Number` parse failures, invalid `BITS`
+literals, and byte literals outside a direct `BYTES` constructor. Exact-number
+reason and position remain typed kernel data; lower-level parser details are
+retained only as display text where the stable data crate has no finer error
+enum. The kernel validates dense expression sites once, publishes these facts
+for diagnostics-only demand without constructing checked rows, and reuses the
+same facts for checked-image demand. The compiler facade relocates each dense
+site through the parser-stable expression key and immutable source-unit layout,
+then presents a `TypeDiagnostic` that is exactly equal to the existing checker
+authority, including severity and global byte/line coordinates. No legacy
+checker database or diagnostic-string parsing participates in the kernel path.
+The definition basis receipt is now V2 and artifact/currentness receipts are V4
+because diagnostic inputs and serialized diagnostic variants changed.
+
+The full NovyWave differential remains exact for all 1,389 owners with zero
+unsupported owners and unchanged graph counts: 12,856 summary nodes, 448,132
+summary evaluations, 48,281 graph operations, and 85,159 activations. A fresh
+debug sample records 2,365.726 ms diagnostics candidate time, including
+2,203.022 ms kernel time, 923.647 ms graph solve, and 17.305 ms interface and
+diagnostic projection. The complete checked candidate records 2,777.981 ms,
+including 765.765 ms compilation and 387.529 ms checked-image publication.
+All 76 kernel tests, 91 non-ignored compiler unit tests, and 16 compiler
+integration tests pass.
+
+The optimized timing is recorded as a same-machine A/B receipt because machine
+load had moved since the preceding checkpoint. Three source-current samples
+record 616.397, 580.237, and 600.195 ms diagnostics (median 600.195 ms) and
+812.959, 763.359, and 779.661 ms complete checked candidates (median
+779.661 ms). Three immediate replays of the preceding `6ee61b2` release binary
+record a 582.174 ms diagnostics median and a 767.410 ms complete median. The
+current slice is therefore 3.1% and 1.6% slower in this controlled comparison;
+it is not a speed win. The source scan finds no Novy diagnostics and accounts
+for roughly 6 ms of the owner-projection delta even after linear/hashed indexing.
+The two-job optimized rebuild took 3m50s and is excluded. This milestone is
+accepted for ownership and parity; in the permanent input model these syntax
+facts should be projected once with the immutable syntax revision rather than
+rescanned by a solver demand.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not
@@ -3285,11 +3335,14 @@ checker-wide flag day:
    references; never create parallel source-shaped resource drafts.
 2. Complete exact diagnostics in `KernelCheckedSnapshot`. Public callable
    substitutions, currentness receipts, dependency-cone rows, and the first
-   call-input diagnostic family are complete; add the remaining syntax, link,
-   resolution, arity, and presentation facts. Extend Counter, TodoMVC, and
-   NovyWave differential gates over each new family before moving to the next
-   one; collect whole mismatch inventories instead of repairing one serialized
-   failure per run.
+   call-input diagnostic family are complete. Source-expression syntax and
+   literal diagnostics plus their exact source presentation are also complete;
+   add pipeline/link, name-resolution, call-target/arity, builtin, and remaining
+   presentation facts. Owners containing an invalid call must still produce a
+   bounded artifact with an unknown result instead of becoming globally
+   unsupported. Extend Counter, TodoMVC, and NovyWave differential gates over
+   each new family before moving to the next one; collect whole mismatch
+   inventories instead of repairing one serialized failure per run.
 3. Freeze each public interface separately from its private compiled definition
    and fingerprint both once. Finish the permanent `KernelProjectInput`,
    one-revision `KernelSession`, and `CheckDemand` boundary without importing

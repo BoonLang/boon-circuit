@@ -5,8 +5,8 @@
 //! will reuse the compact projection only after complete SCC parity.
 
 use boon_checked::{
-    CheckedListKeyPolicy, CheckedStateKind, FlowMode, FlowType, ObjectShape, Type, Variant,
-    type_is_recursively_closed,
+    CheckedListKeyPolicy, CheckedStateKind, DiagnosticSeverity, FlowMode, FlowType, ObjectShape,
+    Type, TypeDiagnostic, Variant, type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
     KernelCallInputRole, KernelCallTarget, KernelCallTypeSubstitution, KernelCollectionKind,
@@ -21,8 +21,8 @@ use boon_compiler_kernel::{
     KernelProjectProgramInput, KernelPureBuiltinKind, KernelRenderConstructorKind, KernelSolveWork,
     KernelSourceId, KernelSourceInput, KernelStateId, KernelStateInput,
     KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
-    KernelStatementParameter, KernelStatementReference, KernelTypeParameterId,
-    KernelValueReference, derive_kernel_call_type_substitutions, is_kernel_host_effect,
+    KernelStatementParameter, KernelStatementReference, KernelValueReference,
+    is_kernel_host_effect, project_kernel_source_expression_diagnostics,
 };
 use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
 use boon_syntax::{
@@ -72,11 +72,89 @@ pub struct KernelOwnerOracleDiagnostic {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KernelOwnerOracleDiagnosticSite {
+    Expression(StableExpressionKey),
     CallInput {
         call: StableExpressionKey,
         target: StableCheckOwnerKey,
         formal_ordinal: u32,
     },
+}
+
+/// Relocate and present the kernel-owned source-expression diagnostic family.
+///
+/// Source positions remain unit-local in parser arenas. The compiler facade
+/// applies the immutable project layout exactly once; neither the kernel nor a
+/// legacy checked-program database needs globalized syntax rows.
+pub fn present_kernel_source_expression_diagnostic(
+    project: &ProjectSyntaxSnapshot,
+    owner: &StableCheckOwnerKey,
+    diagnostic: &KernelOwnerOracleDiagnostic,
+) -> Result<TypeDiagnostic, String> {
+    let KernelOwnerOracleDiagnosticSite::Expression(site) = &diagnostic.site else {
+        return Err("source-expression presentation received a non-expression site".to_owned());
+    };
+    let view = project
+        .owner_view(owner)
+        .ok_or_else(|| format!("kernel diagnostic owner has no syntax view: {owner:?}"))?;
+    let expression = view
+        .expressions()
+        .zip(view.stable_expression_keys())
+        .find_map(|(expression, stable)| (stable == *site).then_some(expression))
+        .ok_or_else(|| format!("kernel diagnostic site is absent from owner {owner:?}"))?;
+    let layout = project
+        .source_layouts()
+        .iter()
+        .find(|layout| layout.source_unit_id == site.source_unit_id)
+        .ok_or_else(|| {
+            format!(
+                "kernel diagnostic source unit has no project layout: {:?}",
+                site.source_unit_id
+            )
+        })?;
+    let message = match &diagnostic.kind {
+        KernelDiagnosticKind::InvalidExpression { tokens } => {
+            format!(
+                "invalid expression `{}`",
+                tokens
+                    .iter()
+                    .map(|token| token.as_ref())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        }
+        KernelDiagnosticKind::InvalidPattern => "invalid match pattern".to_owned(),
+        KernelDiagnosticKind::InvalidNumberLiteral {
+            literal, detail, ..
+        } => format!("invalid exact Number literal `{literal}`: {detail}"),
+        KernelDiagnosticKind::InvalidBitsLiteral { detail, .. } => detail.to_string(),
+        KernelDiagnosticKind::ByteLiteralOutsideBytes => {
+            "byte literals are only valid as direct BYTES constructor items".to_owned()
+        }
+        KernelDiagnosticKind::CallInputType { .. } => {
+            return Err(
+                "source-expression presentation received a call-input diagnostic".to_owned(),
+            );
+        }
+    };
+    Ok(TypeDiagnostic {
+        severity: match diagnostic.severity {
+            KernelDiagnosticSeverity::Error => DiagnosticSeverity::Error,
+            KernelDiagnosticSeverity::Warning => DiagnosticSeverity::Warning,
+        },
+        line: layout
+            .start_line
+            .checked_add(expression.line.saturating_sub(1))
+            .ok_or_else(|| "kernel diagnostic global line overflowed".to_owned())?,
+        start: layout
+            .start_byte
+            .checked_add(expression.start)
+            .ok_or_else(|| "kernel diagnostic global start overflowed".to_owned())?,
+        end: layout
+            .start_byte
+            .checked_add(expression.end)
+            .ok_or_else(|| "kernel diagnostic global end overflowed".to_owned())?,
+        message,
+    })
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -254,11 +332,11 @@ pub struct KernelOwnerOracleReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
-    pub basis_fingerprint_v1: [u8; 32],
+    pub basis_fingerprint_v2: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v3: [u8; 32],
+    pub artifact_fingerprint_v4: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v3: [u8; 32],
+    pub fingerprint_v4: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -818,11 +896,11 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 .zip(&artifact.currentness)
                 .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
                     owner: prepared[*prepared_index].owner.clone(),
-                    basis_fingerprint_v1: receipt.basis_fingerprint_v1,
+                    basis_fingerprint_v2: receipt.basis_fingerprint_v2,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v3: receipt.artifact_fingerprint_v3,
+                    artifact_fingerprint_v4: receipt.artifact_fingerprint_v4,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v3: receipt.fingerprint_v3,
+                    fingerprint_v4: receipt.fingerprint_v4,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -1154,6 +1232,11 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                                 "kernel diagnostic must remain in its definition"
                             );
                             let site = match &diagnostic.site {
+                                KernelDiagnosticSite::Expression { expression } => {
+                                    KernelOwnerOracleDiagnosticSite::Expression(
+                                        owner.expressions[expression.0 as usize].clone(),
+                                    )
+                                }
                                 KernelDiagnosticSite::CallInput {
                                     call,
                                     target,
@@ -2929,6 +3012,18 @@ fn compact_owner_view(
         )?;
     definition_facts.declarations = declarations;
     definition_facts.lexical_bindings = lexical_bindings;
+    definition_facts.diagnostics =
+        project_kernel_source_expression_diagnostics(raw_expressions.iter().enumerate().map(
+            |(index, expression)| {
+                (
+                    KernelExpressionId(
+                        u32::try_from(index).expect("kernel owner expression count exceeds u32"),
+                    ),
+                    *expression,
+                )
+            },
+        ))
+        .map_err(|error| error.to_string())?;
     let (resource_owner_targets, resource_synthetic_paths) = compact_resource_facts(
         view,
         &owner,
@@ -5856,6 +5951,8 @@ fn compact_ast_kind(
         AstExprKind::MatchArm { pattern, .. } => KernelOwnerNodeKind::MatchArm {
             pattern: compact_pattern(pattern),
         },
+        AstExprKind::Arrow { .. } => KernelOwnerNodeKind::Arrow,
+        AstExprKind::Unknown(_) => KernelOwnerNodeKind::Unknown,
         AstExprKind::Delimiter => KernelOwnerNodeKind::Delimiter,
         unsupported => return Err(format!("unsupported owner node {unsupported:?}")),
     })
@@ -5946,6 +6043,7 @@ fn compact_ast_edges(
         | AstExprKind::BitsLiteral { .. }
         | AstExprKind::Tag(_)
         | AstExprKind::Source
+        | AstExprKind::Unknown(_)
         | AstExprKind::Delimiter => Vec::new(),
         AstExprKind::TextTemplate { segments } => segments
             .iter()
@@ -6099,6 +6197,7 @@ mod tests {
         CheckedDeclarationKind, CheckedExpressionKind, CheckedProgramFields, CheckedStatementKind,
         DeclId, ObjectShape, SharedVariantSet, TypeVar, Variant,
     };
+    use boon_compiler_kernel::{KernelTypeParameterId, derive_kernel_call_type_substitutions};
     use boon_parser::{parse_project_syntax, parse_source};
     use std::collections::BTreeMap;
     use std::fs;
@@ -9427,6 +9526,138 @@ mod tests {
     }
 
     #[test]
+    fn source_expression_diagnostic_family_matches_legacy_authority() {
+        let invalid_number = "9".repeat(boon_data::MAX_NUMBER_PARSED_DIGITS + 1);
+        let source = format!(
+            "bad_number: {invalid_number}\nbad_bits: BITS[4] {{ 2u11111 }}\nbad_byte: 16uFF\n"
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.clone())])
+                .expect("parse source-expression diagnostic fixture");
+        let oracle = kernel_owner_oracle(&project);
+        let owner_named = |name: &str| {
+            oracle
+                .supported
+                .iter()
+                .find(|owner| {
+                    matches!(&owner.owner, StableCheckOwnerKey::Item(key) if key.item_route.segments().last().is_some_and(|segment| segment.names.as_ref() == [name]))
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "diagnostic owner `{name}` must compile: {:#?}",
+                        oracle.unsupported
+                    )
+                })
+        };
+
+        let number = owner_named("bad_number");
+        let [number_diagnostic] = number.diagnostics.as_ref() else {
+            panic!("invalid Number must emit one typed diagnostic")
+        };
+        assert_eq!(
+            number_diagnostic.site,
+            KernelOwnerOracleDiagnosticSite::Expression(
+                number
+                    .result_expression
+                    .clone()
+                    .expect("Number result site")
+            )
+        );
+        let KernelDiagnosticKind::InvalidNumberLiteral {
+            literal,
+            reason,
+            position,
+            detail,
+        } = &number_diagnostic.kind
+        else {
+            panic!("unexpected Number diagnostic: {number_diagnostic:#?}")
+        };
+        assert_eq!(literal.as_ref(), invalid_number);
+        assert_eq!(
+            *reason,
+            boon_compiler_kernel::KernelNumberLiteralErrorReason::ResourceLimit
+        );
+        assert_eq!(*position as usize, boon_data::MAX_NUMBER_PARSED_DIGITS + 1);
+        assert!(detail.contains("digit budget"));
+
+        let bits = owner_named("bad_bits");
+        let [bits_diagnostic] = bits.diagnostics.as_ref() else {
+            panic!("invalid BITS must emit one typed diagnostic")
+        };
+        let KernelDiagnosticKind::InvalidBitsLiteral {
+            width,
+            radix,
+            digits,
+            detail: bits_detail,
+        } = &bits_diagnostic.kind
+        else {
+            panic!("unexpected BITS diagnostic: {bits_diagnostic:#?}")
+        };
+        assert_eq!((*width, *radix, digits.as_ref()), (4, 2, "11111"));
+        assert!(bits_detail.contains("does not fit BITS[4]"));
+
+        let byte = owner_named("bad_byte");
+        assert!(matches!(
+            byte.diagnostics.as_ref(),
+            [KernelOwnerOracleDiagnostic {
+                kind: KernelDiagnosticKind::ByteLiteralOutsideBytes,
+                ..
+            }]
+        ));
+
+        let parsed = parse_source("app/RUN.bn", &source).expect("parse legacy literal fixture");
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            checked.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.message.contains("invalid exact Number literal")
+                    && diagnostic.message.contains(detail.as_ref())
+            }),
+            "legacy diagnostics must retain the same Number failure: {:#?}",
+            checked.report.diagnostics
+        );
+        assert!(
+            checked
+                .report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == bits_detail.as_ref()),
+            "legacy diagnostics must retain the same BITS failure: {:#?}",
+            checked.report.diagnostics
+        );
+        assert!(
+            checked.report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.message
+                    == "byte literals are only valid as direct BYTES constructor items"
+            }),
+            "legacy diagnostics must retain the same byte-site failure: {:#?}",
+            checked.report.diagnostics
+        );
+        for (owner, diagnostic) in [
+            (number, number_diagnostic),
+            (bits, bits_diagnostic),
+            (
+                byte,
+                byte.diagnostics
+                    .first()
+                    .expect("byte diagnostic remains available"),
+            ),
+        ] {
+            let presented =
+                present_kernel_source_expression_diagnostic(&project, &owner.owner, diagnostic)
+                    .expect("kernel source diagnostic presentation");
+            assert!(
+                checked
+                    .report
+                    .diagnostics
+                    .iter()
+                    .any(|legacy| legacy == &presented),
+                "kernel diagnostic must equal one legacy diagnostic exactly\n  kernel: {presented:#?}\n  legacy: {:#?}",
+                checked.report.diagnostics
+            );
+        }
+    }
+
+    #[test]
     fn explicit_pass_diagnostics_keep_the_context_formal_and_field_failure() {
         let source = concat!(
             "FUNCTION needs_number_pass() {\n",
@@ -10709,7 +10940,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v3 != [0; 32]),
+                        && receipt.fingerprint_v4 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(

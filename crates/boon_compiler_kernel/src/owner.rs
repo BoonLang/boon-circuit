@@ -12,13 +12,14 @@ use boon_checked::{
     BytesType, CheckedListKeyPolicy, CheckedStateKind, FlowMode, FlowType, ObjectShape, Type,
     Variant, type_is_recursively_closed,
 };
-use boon_data::ExactRoundingRule;
+use boon_data::{Bits, ExactNumber, ExactNumberParseReason, ExactRoundingRule};
 use boon_effect_schema::{
     BarrierSpec, DeliveryCardinalitySpec, ReplaySpec, ResultPolicySpec, ValueType, host_effect_spec,
 };
+use boon_syntax::{AstExpr, AstExprKind, AstMatchPattern};
 use serde::Serialize;
 use serde::ser::SerializeStruct;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -440,6 +441,10 @@ pub struct KernelDefinitionFactsInput {
     pub sources: Box<[KernelSourceInput]>,
     pub states: Box<[KernelStateInput]>,
     pub lists: Box<[KernelListInput]>,
+    /// Source-shape failures projected directly from the immutable syntax
+    /// model. These facts are definition-local and require neither type solve
+    /// replay nor checked-row materialization.
+    pub diagnostics: Box<[KernelDiagnosticInput]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -495,7 +500,8 @@ pub struct KernelOwnerProgram {
     resources: PendingKernelResources,
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
-    basis_fingerprint_v1: [u8; 32],
+    diagnostics: Box<[KernelDiagnosticArtifact]>,
+    basis_fingerprint_v2: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -581,7 +587,8 @@ struct KernelProjectOwnerOutputs {
     resources: PendingKernelResources,
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
-    basis_fingerprint_v1: [u8; 32],
+    source_diagnostics: Box<[KernelDiagnosticArtifact]>,
+    basis_fingerprint_v2: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -776,6 +783,9 @@ pub enum KernelDiagnosticSeverity {
 /// Dense authored location of a diagnostic before source relocation.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum KernelDiagnosticSite {
+    Expression {
+        expression: KernelExpressionId,
+    },
     CallInput {
         call: KernelExpressionId,
         target: KernelOwnerId,
@@ -791,16 +801,76 @@ pub enum KernelTypeMismatch {
     Type,
 }
 
+/// Stable reason for rejecting one exact Number token. The source text and
+/// one-based failure position are retained separately in the typed payload so
+/// presentation never needs to parse the literal again.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum KernelNumberLiteralErrorReason {
+    Empty,
+    Whitespace,
+    LeadingPlus,
+    InvalidDigit,
+    InvalidSyntax,
+    InvalidExponent,
+    ZeroDenominator,
+    InvalidRadix,
+    ResourceLimit,
+}
+
+impl From<ExactNumberParseReason> for KernelNumberLiteralErrorReason {
+    fn from(reason: ExactNumberParseReason) -> Self {
+        match reason {
+            ExactNumberParseReason::Empty => Self::Empty,
+            ExactNumberParseReason::Whitespace => Self::Whitespace,
+            ExactNumberParseReason::LeadingPlus => Self::LeadingPlus,
+            ExactNumberParseReason::InvalidDigit => Self::InvalidDigit,
+            ExactNumberParseReason::InvalidSyntax => Self::InvalidSyntax,
+            ExactNumberParseReason::InvalidExponent => Self::InvalidExponent,
+            ExactNumberParseReason::ZeroDenominator => Self::ZeroDenominator,
+            ExactNumberParseReason::InvalidRadix => Self::InvalidRadix,
+            ExactNumberParseReason::ResourceLimit => Self::ResourceLimit,
+        }
+    }
+}
+
 /// Typed diagnostic payload. Human-facing codes, parameter names, spans, and
 /// wording are deliberately supplied by the compiler facade from stable
 /// owner/expression identities instead of being embedded in the hot kernel.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelDiagnosticKind {
+    InvalidExpression {
+        tokens: Box<[Box<str>]>,
+    },
+    InvalidPattern,
+    InvalidNumberLiteral {
+        literal: Box<str>,
+        reason: KernelNumberLiteralErrorReason,
+        position: u32,
+        detail: Box<str>,
+    },
+    InvalidBitsLiteral {
+        width: u32,
+        radix: u32,
+        digits: Box<str>,
+        /// `boon_data::BitsError` does not yet expose a stable reason enum.
+        /// Retain its deterministic semantic detail while the surrounding
+        /// diagnostic remains structurally typed.
+        detail: Box<str>,
+    },
+    ByteLiteralOutsideBytes,
     CallInputType {
         actual: Type,
         expected: Type,
         mismatch: KernelTypeMismatch,
     },
+}
+
+/// Definition-local typed diagnostic before its dense owner is assigned.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelDiagnosticInput {
+    pub severity: KernelDiagnosticSeverity,
+    pub site: KernelDiagnosticSite,
+    pub kind: KernelDiagnosticKind,
 }
 
 /// One immutable diagnostic emitted from the solved type graph.
@@ -810,6 +880,150 @@ pub struct KernelDiagnosticArtifact {
     pub severity: KernelDiagnosticSeverity,
     pub site: KernelDiagnosticSite,
     pub kind: KernelDiagnosticKind,
+}
+
+/// Project the source-expression diagnostic family from the stable syntax
+/// model into dense definition-local facts.
+///
+/// This is intentionally owned by the kernel even while the differential
+/// bridge supplies the syntax view. It consumes only `boon_syntax` rows, not
+/// parser implementation state or legacy checker DTOs.
+pub fn project_kernel_source_expression_diagnostics<'a>(
+    expressions: impl IntoIterator<Item = (KernelExpressionId, &'a AstExpr)>,
+) -> Result<Box<[KernelDiagnosticInput]>, KernelOwnerBuildError> {
+    let expressions = expressions.into_iter().collect::<Vec<_>>();
+    let mut dense_ids = vec![false; expressions.len()];
+    let mut syntax_ids = HashSet::with_capacity(expressions.len());
+    for (dense, expression) in &expressions {
+        let Some(seen) = dense_ids.get_mut(dense.0 as usize) else {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel source diagnostic expression {} is outside dense range 0..{}",
+                dense.0,
+                expressions.len()
+            )));
+        };
+        if *seen {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel source diagnostics repeat dense expression {}",
+                dense.0
+            )));
+        }
+        *seen = true;
+        if !syntax_ids.insert(expression.id) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel source diagnostics repeat syntax expression {}",
+                expression.id
+            )));
+        }
+    }
+    let byte_items = expressions
+        .iter()
+        .filter_map(|(_, expression)| match &expression.kind {
+            AstExprKind::BytesLiteral { items, .. } => Some(items.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut diagnostics = Vec::new();
+    for (expression_id, expression) in expressions {
+        let mut push = |kind| {
+            diagnostics.push(KernelDiagnosticInput {
+                severity: KernelDiagnosticSeverity::Error,
+                site: KernelDiagnosticSite::Expression {
+                    expression: expression_id,
+                },
+                kind,
+            });
+        };
+        match &expression.kind {
+            AstExprKind::Unknown(tokens) => push(KernelDiagnosticKind::InvalidExpression {
+                tokens: tokens
+                    .iter()
+                    .cloned()
+                    .map(String::into_boxed_str)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            }),
+            AstExprKind::MatchArm {
+                pattern: AstMatchPattern::Invalid { .. },
+                ..
+            }
+            | AstExprKind::Arrow {
+                pattern: AstMatchPattern::Invalid { .. },
+                ..
+            } => push(KernelDiagnosticKind::InvalidPattern),
+            _ => {}
+        }
+
+        let number = match &expression.kind {
+            AstExprKind::Number(literal) => Some(literal.as_str()),
+            AstExprKind::MatchArm {
+                pattern: AstMatchPattern::Number { value },
+                ..
+            }
+            | AstExprKind::Arrow {
+                pattern: AstMatchPattern::Number { value },
+                ..
+            } => Some(value.as_str()),
+            _ => None,
+        };
+        if let Some(literal) = number
+            && let Err(error) = ExactNumber::parse_strict(literal, None)
+        {
+            push(KernelDiagnosticKind::InvalidNumberLiteral {
+                literal: literal.into(),
+                reason: error.reason().into(),
+                position: u32::try_from(error.position()).unwrap_or(u32::MAX),
+                detail: error.to_string().into_boxed_str(),
+            });
+        }
+
+        let bits = match &expression.kind {
+            AstExprKind::BitsLiteral {
+                width,
+                radix,
+                digits,
+            } => Some((*width, *radix, digits.as_str())),
+            AstExprKind::MatchArm {
+                pattern:
+                    AstMatchPattern::Bits {
+                        width,
+                        radix,
+                        digits,
+                    },
+                ..
+            }
+            | AstExprKind::Arrow {
+                pattern:
+                    AstMatchPattern::Bits {
+                        width,
+                        radix,
+                        digits,
+                    },
+                ..
+            } => Some((*width, *radix, digits.as_str())),
+            _ => None,
+        };
+        if let Some((width, radix, digits)) = bits
+            && let Err(error) = Bits::parse_encoded(width, radix, digits)
+        {
+            push(KernelDiagnosticKind::InvalidBitsLiteral {
+                width,
+                radix,
+                digits: digits.into(),
+                detail: error.to_string().into_boxed_str(),
+            });
+        }
+
+        if matches!(expression.kind, AstExprKind::ByteLiteral { .. })
+            && !byte_items.contains(&expression.id)
+        {
+            push(KernelDiagnosticKind::ByteLiteralOutsideBytes);
+        }
+    }
+    diagnostics.sort_unstable_by(|left, right| left.site.cmp(&right.site));
+    Ok(diagnostics.into_boxed_slice())
 }
 
 /// One source-authored host-effect occurrence in a definition artifact.
@@ -1038,7 +1252,7 @@ pub fn is_kernel_host_effect(operation: &str) -> bool {
 
 impl KernelOwnerProgram {
     pub fn solve(self) -> Result<KernelDefinitionSnapshot, KernelSolveError> {
-        let basis_fingerprint_v1 = self.basis_fingerprint_v1;
+        let basis_fingerprint_v2 = self.basis_fingerprint_v2;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
             .output(self.result_output)
@@ -1104,11 +1318,11 @@ impl KernelOwnerProgram {
             sources,
             states,
             lists,
-            diagnostics: Box::new([]),
+            diagnostics: self.diagnostics,
         };
         let (dependencies, currentness) = build_snapshot_receipts(
             std::slice::from_mut(&mut definition),
-            &[basis_fingerprint_v1],
+            &[basis_fingerprint_v2],
         )?;
         let [currentness] = currentness.as_ref() else {
             unreachable!("one standalone kernel definition produces one receipt")
@@ -1237,7 +1451,7 @@ impl KernelSolvedProject {
         let basis_fingerprints = self
             .owners
             .iter()
-            .map(|owner| owner.basis_fingerprint_v1)
+            .map(|owner| owner.basis_fingerprint_v2)
             .collect::<Vec<_>>();
         let mut definitions = self
             .owners
@@ -1410,7 +1624,7 @@ fn project_call_facts_and_diagnostics(
                 .expect("kernel diagnostic owner count exceeds the dense u32 namespace"),
         );
         let mut owner_call_facts = Vec::with_capacity(owner.calls.len());
-        let mut diagnostics = Vec::new();
+        let mut diagnostics = owner.source_diagnostics.to_vec();
         for call in owner.calls.iter() {
             let substitutions = if let KernelCallTarget::User { target, .. } = call.target {
                 let target_formals = public_formals
@@ -1875,7 +2089,7 @@ pub fn compile_owner_program_with_definition_facts(
     input: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
-    let basis_fingerprint_v1 = definition_basis_fingerprint(input, facts)?;
+    let basis_fingerprint_v2 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
@@ -2033,7 +2247,8 @@ pub fn compile_owner_program_with_definition_facts(
         resources,
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
-        basis_fingerprint_v1,
+        diagnostics: collect_source_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
+        basis_fingerprint_v2,
     })
 }
 
@@ -3104,6 +3319,40 @@ fn collect_call_artifacts(
         .map(Vec::into_boxed_slice)
 }
 
+fn collect_source_diagnostic_artifacts(
+    owner: KernelOwnerId,
+    input: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<Box<[KernelDiagnosticArtifact]>, KernelOwnerBuildError> {
+    facts
+        .diagnostics
+        .iter()
+        .map(|diagnostic| {
+            match diagnostic.site {
+                KernelDiagnosticSite::Expression { expression } => {
+                    checked_expression_index(
+                        expression,
+                        input.nodes.len(),
+                        "source diagnostic expression",
+                    )?;
+                }
+                KernelDiagnosticSite::CallInput { .. } => {
+                    return Err(KernelOwnerBuildError::new(
+                        "definition diagnostic inputs cannot precompute solved call-input failures",
+                    ));
+                }
+            }
+            Ok(KernelDiagnosticArtifact {
+                owner,
+                severity: diagnostic.severity,
+                site: diagnostic.site.clone(),
+                kind: diagnostic.kind.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
+}
+
 fn collect_host_effect_artifacts(
     input: &KernelOwnerProgramInput,
 ) -> Result<Box<[KernelHostEffectArtifact]>, KernelOwnerBuildError> {
@@ -3388,6 +3637,10 @@ pub fn compile_project_program_with_definition_facts(
         .iter()
         .enumerate()
         .map(|(owner_index, owner)| {
+            let owner_id = KernelOwnerId(
+                u32::try_from(owner_index)
+                    .expect("kernel project owner count exceeds the dense u32 namespace"),
+            );
             let result = checked_expression_index(
                 owner.result,
                 owner.nodes.len(),
@@ -3430,7 +3683,12 @@ pub fn compile_project_program_with_definition_facts(
                 resources,
                 calls: collect_call_artifacts(owner)?,
                 effects: collect_host_effect_artifacts(owner)?,
-                basis_fingerprint_v1: definition_basis_fingerprint_with_buffer(
+                source_diagnostics: collect_source_diagnostic_artifacts(
+                    owner_id,
+                    owner,
+                    &facts[owner_index],
+                )?,
+                basis_fingerprint_v2: definition_basis_fingerprint_with_buffer(
                     owner,
                     &facts[owner_index],
                     &mut basis_fingerprint_scratch,
@@ -9727,6 +9985,129 @@ mod tests {
         }
     }
 
+    fn syntax_expression(id: usize, kind: AstExprKind) -> AstExpr {
+        AstExpr {
+            id,
+            line: id + 1,
+            start: id * 10,
+            end: id * 10 + 1,
+            linked_input: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn source_expression_diagnostics_are_typed_and_published_without_checked_rows() {
+        let syntax = vec![
+            syntax_expression(10, AstExprKind::Unknown(vec!["?".to_owned()])),
+            syntax_expression(
+                11,
+                AstExprKind::MatchArm {
+                    pattern: AstMatchPattern::Invalid {
+                        message: "bad".to_owned(),
+                    },
+                    output: None,
+                },
+            ),
+            syntax_expression(12, AstExprKind::Number("1/0".to_owned())),
+            syntax_expression(
+                13,
+                AstExprKind::BitsLiteral {
+                    width: 4,
+                    radix: 2,
+                    digits: "11111".to_owned(),
+                },
+            ),
+            syntax_expression(
+                14,
+                AstExprKind::ByteLiteral {
+                    radix: 16,
+                    digits: "FF".to_owned(),
+                    value: 255,
+                },
+            ),
+            syntax_expression(
+                15,
+                AstExprKind::ByteLiteral {
+                    radix: 16,
+                    digits: "00".to_owned(),
+                    value: 0,
+                },
+            ),
+            syntax_expression(
+                16,
+                AstExprKind::BytesLiteral {
+                    size: boon_syntax::BytesSizeSyntax::Fixed(1),
+                    items: vec![15],
+                },
+            ),
+        ];
+        let diagnostics = project_kernel_source_expression_diagnostics(
+            syntax
+                .iter()
+                .enumerate()
+                .map(|(dense, expression)| (KernelExpressionId(dense as u32), expression)),
+        )
+        .expect("source diagnostic projection");
+        assert_eq!(diagnostics.len(), 5);
+        assert!(matches!(
+            diagnostics[0].kind,
+            KernelDiagnosticKind::InvalidExpression { .. }
+        ));
+        assert!(matches!(
+            diagnostics[1].kind,
+            KernelDiagnosticKind::InvalidPattern
+        ));
+        assert!(matches!(
+            diagnostics[2].kind,
+            KernelDiagnosticKind::InvalidNumberLiteral {
+                reason: KernelNumberLiteralErrorReason::ZeroDenominator,
+                ..
+            }
+        ));
+        assert!(matches!(
+            diagnostics[3].kind,
+            KernelDiagnosticKind::InvalidBitsLiteral { .. }
+        ));
+        assert!(matches!(
+            diagnostics[4].kind,
+            KernelDiagnosticKind::ByteLiteralOutsideBytes
+        ));
+
+        let program = KernelProjectProgramInput {
+            owners: vec![KernelOwnerProgramInput {
+                nodes: (0..syntax.len())
+                    .map(|_| KernelOwnerNode {
+                        kind: KernelOwnerNodeKind::Unknown,
+                        inputs: Box::new([]),
+                        mode: FlowMode::Continuous,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                formal_count: 0,
+                external_expressions: Box::new([]),
+                result: KernelExpressionId(6),
+            }]
+            .into_boxed_slice(),
+        };
+        let facts = vec![KernelDefinitionFactsInput {
+            diagnostics,
+            ..KernelDefinitionFactsInput::default()
+        }]
+        .into_boxed_slice();
+        let solved = compile_project_program_with_definition_facts(&program, &facts)
+            .expect("source diagnostic program compiles")
+            .solve_graph()
+            .expect("source diagnostic program solves");
+        let interfaces = solved.interface_snapshot();
+        assert_eq!(interfaces.diagnostics.len(), 5);
+        let checked = solved
+            .checked_snapshot()
+            .expect("source diagnostics seal into checked image");
+        assert_eq!(checked.definitions[0].diagnostics, interfaces.diagnostics);
+        assert!(checked.definitions[0].statements.is_empty());
+    }
+
     #[test]
     fn definition_statement_rows_keep_dense_values_and_child_topology() {
         let input = KernelOwnerProgramInput {
@@ -9870,6 +10251,7 @@ mod tests {
             sources: Box::new([]),
             states: Box::new([]),
             lists: Box::new([]),
+            diagnostics: Box::new([]),
         };
 
         let artifact = compile_owner_program_with_definition_facts(&input, &facts)
@@ -10084,6 +10466,7 @@ mod tests {
                 },
             }]
             .into_boxed_slice(),
+            diagnostics: Box::new([]),
         };
 
         let artifact = compile_owner_program_with_definition_facts(&input, &facts)

@@ -3361,6 +3361,49 @@ semantic subcut; the preceding source-diagnostic checkpoint remains the latest
 release receipt. All 78 kernel tests, 93 non-ignored compiler unit tests, and 16
 compiler integration tests pass.
 
+The authoritative lexical-call contract cut is now complete. `boon_checked`
+owns a versioned, type-free `CheckedAuthoritativeCallableShapeV1` row containing
+only the callable name/kind and dense ordered parameter names, VALUE/OUT kinds,
+and optionality. A narrow typechecker compatibility adapter projects those rows
+from the same builtin, render-constructor, typed-host-effect, and SessionInfo
+registries that own the current checked signatures; it does not construct the
+legacy owner ABI environment or expose recursive parameter/result types. The
+compiler facade converts the rows once into a compact name index. The permanent
+kernel remains dependency-firewalled from `boon_typecheck`, and the future
+`KernelProjectInput` can receive the same overlay directly from the eventual
+lower-level library-contract owner.
+
+Every registry-backed authoritative call now runs through the same kernel
+lexical matcher before a render, pure-builtin, or host-effect node is created.
+Invalid calls publish typed missing/extra/misordered/PASS diagnostics, an
+`Unknown` result, and no call or host-effect artifact. Shape-valid calls outside
+the migrated residual slice remain explicitly unsupported. Dynamic `Field/*`
+pipelines are the one project-derived language family: the checker creates their
+single `input` signature from syntax, so the compact bridge does the same for
+an argument-free field pipe rather than inventing a registry entry such as
+`Field/color`. The first NovyWave differential exposed this distinction across
+three Theme owners; modeling the general rule restored all owners without an
+example-specific exception.
+
+Parser-backed regressions prove exact production diagnostic and source-anchor
+equality for `Text/slice`, `Scene/new`, `Random/bytes`, `Clock/wall`, and PASS on
+`Text/empty`. A lower-layer invariant proves the projected table is uniquely
+sorted, has dense ordinals and unique parameter names, and preserves required
+versus optional surfaces for representative builtin, render, host, and
+SessionInfo entries. No receipt domain changed because this cut populates the
+existing typed call-diagnostic variants and fingerprints.
+
+The fresh full NovyWave debug differential is exact for all 1,389 owners with
+zero unsupported owners and unchanged graph counts: 12,856 summary nodes,
+448,132 summary evaluations, 48,281 operations, and 85,159 activations. It
+records 2,635.821 ms diagnostics candidate time, including 2,442.008 ms kernel
+time, 985.925 ms graph solve, and 19.284 ms interface projection. The complete
+candidate records 3,065.042 ms, including 538.478 ms owner projection,
+825.932 ms program compilation, and 405.906 ms checked-image publication. This
+single debug receipt is parity and scale evidence, not a claimed speed change;
+machine load remains above the prior sample. No optimized rebuild is spent on
+this semantic subcut.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not
@@ -3384,9 +3427,9 @@ checker-wide flag day:
    substitutions, currentness receipts, dependency-cone rows, and the first
    call-input diagnostic family are complete. Source-expression syntax and
    literal diagnostics plus their exact source presentation are also complete,
-   as are ordinary user target resolution and lexical call-shape diagnostics.
-   Next project authoritative builtin/render/host signatures into the same
-   matcher, then add valid OUT/callback lexical equations, pipeline/link and
+   as are ordinary user target resolution and lexical call-shape diagnostics,
+   plus authoritative builtin/render/host lexical signatures. Next add valid
+   OUT/callback lexical equations, pipeline/link and
    remaining name-resolution/presentation facts. Owners containing an invalid
    call must still produce a bounded artifact with an unknown result instead of
    becoming globally unsupported. Extend Counter, TodoMVC, and NovyWave

@@ -1194,6 +1194,28 @@ impl CheckedParameterRequirement {
     }
 }
 
+/// Type-free lexical surface of one authoritative callable.
+///
+/// This is the stable lower-layer contract used by compiler frontends that
+/// only need to resolve authored call entries. It intentionally excludes
+/// result types, parameter types, effects, defaults, and legacy owner ABI
+/// rows: those belong to later semantic operations, while target/arity/PASS
+/// diagnostics require only this compact shape.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedAuthoritativeCallableShapeV1 {
+    pub name: String,
+    pub kind: CheckedCallableKind,
+    pub parameters: Vec<CheckedAuthoritativeParameterShapeV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedAuthoritativeParameterShapeV1 {
+    pub name: String,
+    pub kind: CheckedParameterKind,
+    pub ordinal: u32,
+    pub optional: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckedParameter {
     pub decl_id: DeclId,

@@ -507,7 +507,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     let input_owners = owner_order.len();
     let callable_surfaces = project_callable_surfaces(project);
     let value_surfaces = project_value_surfaces(project);
-    let authoritative_builtins = boon_typecheck::BuiltinSignatureRegistry::default();
+    let authoritative_call_shapes = project_kernel_authoritative_call_shapes();
     let owner_projection_started = Instant::now();
     let mut direct_projection_elapsed = Duration::ZERO;
     let mut prepared = Vec::<PreparedOwner>::new();
@@ -528,7 +528,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 view,
                 source_payloads,
                 &callable_surfaces,
-                &authoritative_builtins,
+                authoritative_call_shapes.as_ref().map_err(Clone::clone)?,
                 &value_surfaces,
             );
             direct_projection_elapsed += direct_projection_started.elapsed();
@@ -1757,10 +1757,66 @@ struct PreparedLexicalOwnerTarget {
 }
 
 #[derive(Clone, Debug)]
+struct AuthoritativeCallSurface {
+    kind: KernelCallableKind,
+    parameters: Box<[KernelCallShapeParameter]>,
+}
+
+#[derive(Clone, Debug)]
 struct CallableSurface {
     owner: StableCheckOwnerKey,
     parameters: Box<[CallableParameter]>,
     context_ordinal: Option<usize>,
+}
+
+fn project_kernel_authoritative_call_shapes()
+-> Result<BTreeMap<String, AuthoritativeCallSurface>, String> {
+    boon_typecheck::project_authoritative_callable_shapes_v1()?
+        .into_iter()
+        .map(|shape| {
+            let kind = match shape.kind {
+                boon_checked::CheckedCallableKind::User => KernelCallableKind::User,
+                boon_checked::CheckedCallableKind::Builtin => KernelCallableKind::Builtin,
+                boon_checked::CheckedCallableKind::External => KernelCallableKind::External,
+            };
+            let parameters = shape
+                .parameters
+                .into_iter()
+                .map(|parameter| KernelCallShapeParameter {
+                    ordinal: parameter.ordinal,
+                    kind: match parameter.kind {
+                        boon_checked::CheckedParameterKind::Value => KernelParameterKind::Value,
+                        boon_checked::CheckedParameterKind::Out => KernelParameterKind::Out,
+                    },
+                    name: parameter.name.into_boxed_str(),
+                    optional: parameter.optional,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            Ok((shape.name, AuthoritativeCallSurface { kind, parameters }))
+        })
+        .collect()
+}
+
+fn dynamic_authoritative_call_surface(
+    expression: &boon_syntax::AstExpr,
+) -> Option<AuthoritativeCallSurface> {
+    let AstExprKind::Pipe { op, args, .. } = &expression.kind else {
+        return None;
+    };
+    if !op.starts_with("Field/") || !args.is_empty() {
+        return None;
+    }
+    Some(AuthoritativeCallSurface {
+        kind: KernelCallableKind::Builtin,
+        parameters: vec![KernelCallShapeParameter {
+            ordinal: 0,
+            kind: KernelParameterKind::Value,
+            name: "input".into(),
+            optional: false,
+        }]
+        .into_boxed_slice(),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -2178,7 +2234,7 @@ fn compact_owner_view(
     view: UnitOwnerSyntaxView<'_>,
     source_payloads: &BTreeMap<String, Type>,
     callable_surfaces: &BTreeMap<String, Box<[CallableSurface]>>,
-    authoritative_builtins: &boon_typecheck::BuiltinSignatureRegistry,
+    authoritative_call_shapes: &BTreeMap<String, AuthoritativeCallSurface>,
     value_surfaces: &BTreeMap<String, Vec<ValueSurface>>,
 ) -> Result<PreparedOwner, String> {
     let owner = view.stable_key();
@@ -2500,6 +2556,60 @@ fn compact_owner_view(
     let node_count = raw_expressions.len() + usize::from(synthetic_result.is_some());
     let mut nodes = Vec::with_capacity(node_count);
     for (index, expression) in raw_expressions.iter().enumerate() {
+        let dynamic_authoritative_surface = dynamic_authoritative_call_surface(expression);
+        let authoritative_projection = match &expression.kind {
+            AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. } => {
+                authoritative_call_shapes
+                    .get(function)
+                    .or(dynamic_authoritative_surface.as_ref())
+                    .map(|surface| {
+                        let shape = compact_call_shape_input(
+                            checked_kernel_expression(index)?,
+                            expression,
+                        )?;
+                        project_kernel_call_shape(
+                            &shape,
+                            &KernelCallShapeResolution::Callable {
+                                kind: surface.kind,
+                                parameters: surface.parameters.clone(),
+                                context_ordinal: None,
+                                caller_context_ordinal: None,
+                            },
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+            }
+            _ => None,
+        }
+        .transpose()?;
+        let compact_authoritative_name = match &expression.kind {
+            AstExprKind::Call { function, .. }
+                if render_constructor_kind(function).is_some()
+                    || pure_builtin_kind(function)
+                        .is_some_and(|kind| kind != KernelPureBuiltinKind::FieldColor)
+                    || is_kernel_host_effect(function) =>
+            {
+                Some(function)
+            }
+            AstExprKind::Pipe { op, .. }
+                if pure_builtin_kind(op)
+                    .is_some_and(|kind| kind != KernelPureBuiltinKind::FieldColor)
+                    || is_kernel_host_effect(op) =>
+            {
+                Some(op)
+            }
+            _ => None,
+        };
+        if let Some(function) = compact_authoritative_name
+            && authoritative_projection.is_none()
+        {
+            return Err(format!(
+                "compact authoritative callable `{function}` has no lexical shape contract"
+            ));
+        }
+        if let Some(projection) = &authoritative_projection {
+            call_shape_diagnostics.extend(projection.diagnostics.iter().cloned());
+        }
         let (kind, mut raw_edges, call_target, read_target) = if let Some(fields) =
             structured_records.get(&expression.id)
         {
@@ -2534,6 +2644,12 @@ fn compact_owner_view(
             )
         } else {
             match &expression.kind {
+                _ if authoritative_projection
+                    .as_ref()
+                    .is_some_and(|projection| !projection.valid) =>
+                {
+                    (KernelOwnerNodeKind::Unknown, Vec::new(), None, None)
+                }
                 AstExprKind::Identifier(_)
                     if let Some(provider) = collection_binding_inputs.get(&expression.id) =>
                 {
@@ -2688,42 +2804,33 @@ fn compact_owner_view(
                 AstExprKind::Call {
                     function,
                     args,
-                    pass,
-                } if render_constructor_kind(function).is_some() => {
-                    if pass.is_some() {
-                        return Err(format!(
-                            "render constructor `{function}` cannot consume PASS in the compact ABI"
-                        ));
-                    }
-                    (
-                        KernelOwnerNodeKind::RenderConstructor {
-                            kind: render_constructor_kind(function)
-                                .expect("render constructor guard resolves"),
-                        },
-                        args.iter()
-                            .map(|argument| {
-                                (
-                                    KernelOwnerEdgeRole::AbiArgument {
-                                        name: argument.name.clone().into_boxed_str(),
-                                    },
-                                    PreparedInputReference::Syntax(argument.value),
-                                )
-                            })
-                            .collect(),
-                        None,
-                        None,
-                    )
-                }
+                    pass: _,
+                } if render_constructor_kind(function).is_some() => (
+                    KernelOwnerNodeKind::RenderConstructor {
+                        kind: render_constructor_kind(function)
+                            .expect("render constructor guard resolves"),
+                    },
+                    args.iter()
+                        .map(|argument| {
+                            (
+                                KernelOwnerEdgeRole::AbiArgument {
+                                    name: argument.name.clone().into_boxed_str(),
+                                },
+                                PreparedInputReference::Syntax(argument.value),
+                            )
+                        })
+                        .collect(),
+                    None,
+                    None,
+                ),
                 AstExprKind::Call {
                     function,
                     args,
-                    pass,
-                } if pure_builtin_kind(function).is_some() => {
-                    if pass.is_some() {
-                        return Err(format!(
-                            "pure builtin `{function}` cannot consume PASS in the compact ABI"
-                        ));
-                    }
+                    pass: _,
+                } if pure_builtin_kind(function).is_some_and(|kind| {
+                    kind != KernelPureBuiltinKind::FieldColor || authoritative_projection.is_some()
+                }) =>
+                {
                     (
                         KernelOwnerNodeKind::PureBuiltin {
                             kind: pure_builtin_kind(function).expect("pure builtin guard resolves"),
@@ -2746,12 +2853,15 @@ fn compact_owner_view(
                     input,
                     op,
                     args,
-                    pass,
+                    pass: _,
                     arms,
-                } if pure_builtin_kind(op).is_some() => {
-                    if pass.is_some() || !arms.is_empty() {
+                } if pure_builtin_kind(op).is_some_and(|kind| {
+                    kind != KernelPureBuiltinKind::FieldColor || authoritative_projection.is_some()
+                }) =>
+                {
+                    if !arms.is_empty() {
                         return Err(format!(
-                            "pure builtin pipe `{op}` cannot consume PASS or arms in the compact ABI"
+                            "pure builtin pipe `{op}` cannot consume arms in the compact ABI"
                         ));
                     }
                     let mut inputs = Vec::with_capacity(args.len() + 1);
@@ -2782,41 +2892,34 @@ fn compact_owner_view(
                 AstExprKind::Call {
                     function,
                     args,
-                    pass,
-                } if is_kernel_host_effect(function) => {
-                    if pass.is_some() {
-                        return Err(format!(
-                            "host effect `{function}` cannot consume PASS in the compact ABI"
-                        ));
-                    }
-                    (
-                        KernelOwnerNodeKind::HostEffect {
-                            operation: function.clone().into_boxed_str(),
-                        },
-                        args.iter()
-                            .map(|argument| {
-                                (
-                                    KernelOwnerEdgeRole::AbiArgument {
-                                        name: argument.name.clone().into_boxed_str(),
-                                    },
-                                    PreparedInputReference::Syntax(argument.value),
-                                )
-                            })
-                            .collect(),
-                        None,
-                        None,
-                    )
-                }
+                    pass: _,
+                } if is_kernel_host_effect(function) => (
+                    KernelOwnerNodeKind::HostEffect {
+                        operation: function.clone().into_boxed_str(),
+                    },
+                    args.iter()
+                        .map(|argument| {
+                            (
+                                KernelOwnerEdgeRole::AbiArgument {
+                                    name: argument.name.clone().into_boxed_str(),
+                                },
+                                PreparedInputReference::Syntax(argument.value),
+                            )
+                        })
+                        .collect(),
+                    None,
+                    None,
+                ),
                 AstExprKind::Pipe {
                     input,
                     op,
                     args,
-                    pass,
+                    pass: _,
                     arms,
                 } if is_kernel_host_effect(op) => {
-                    if pass.is_some() || !arms.is_empty() {
+                    if !arms.is_empty() {
                         return Err(format!(
-                            "host-effect pipe `{op}` cannot consume PASS or arms in the compact ABI"
+                            "host-effect pipe `{op}` cannot consume arms in the compact ABI"
                         ));
                     }
                     let mut inputs = Vec::with_capacity(args.len() + 1);
@@ -2845,7 +2948,8 @@ fn compact_owner_view(
                     )
                 }
                 AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
-                    if is_authoritative_callable_name(authoritative_builtins, function) =>
+                    if is_authoritative_callable_name(authoritative_call_shapes, function)
+                        || dynamic_authoritative_surface.is_some() =>
                 {
                     return Err(format!(
                         "authoritative callable `{function}` is not in the current compact ABI slice"
@@ -6245,13 +6349,10 @@ fn render_constructor_kind(function: &str) -> Option<KernelRenderConstructorKind
 }
 
 fn is_authoritative_callable_name(
-    builtins: &boon_typecheck::BuiltinSignatureRegistry,
+    shapes: &BTreeMap<String, AuthoritativeCallSurface>,
     function: &str,
 ) -> bool {
-    builtins.is_authoritative_callable(function)
-        || boon_checked::is_registered_render_constructor(function)
-        || is_registered_kernel_host_effect(function)
-        || matches!(function, "SessionInfo/status" | "SessionInfo/principal")
+    shapes.contains_key(function) || is_registered_kernel_host_effect(function)
 }
 
 fn pure_builtin_kind(function: &str) -> Option<KernelPureBuiltinKind> {
@@ -9940,7 +10041,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_user_calls_remain_supported_unknown_owners_with_exact_diagnostics() {
+    fn invalid_calls_remain_supported_unknown_owners_with_exact_diagnostics() {
         let source = concat!(
             "FUNCTION needs(first, second) {\n",
             "    first\n",
@@ -9958,6 +10059,11 @@ mod tests {
             "missing_pass: contextual()\n",
             "missing_out: out_only()\n",
             "piped: 1 |> needs(second: 2)\n",
+            "builtin_missing: Text/slice(input: TEXT { value }, from: 0)\n",
+            "render_missing: Scene/new()\n",
+            "host_missing: Random/bytes()\n",
+            "host_extra: Clock/wall(extra: 1)\n",
+            "authoritative_pass: Text/empty(PASS: [])\n",
             "authoritative_unmigrated: Text/space()\n",
         );
         let project =
@@ -10022,6 +10128,11 @@ mod tests {
             "unknown",
             "missing_pass",
             "missing_out",
+            "builtin_missing",
+            "render_missing",
+            "host_missing",
+            "host_extra",
+            "authoritative_pass",
         ] {
             let owner = owner_named(name);
             assert_eq!(owner.result.ty, Type::Unknown, "{name} result");
@@ -10094,6 +10205,49 @@ mod tests {
                 kind: KernelDiagnosticKind::MissingCallEntry { function, name },
                 ..
             }] if function.as_ref() == "out_only" && name.as_ref() == "item"
+        ));
+        assert!(matches!(
+            owner_named("builtin_missing").diagnostics.as_ref(),
+            [KernelOwnerOracleDiagnostic {
+                kind: KernelDiagnosticKind::MissingCallEntry { function, name },
+                ..
+            }] if function.as_ref() == "Text/slice" && name.as_ref() == "count"
+        ));
+        assert!(matches!(
+            owner_named("render_missing").diagnostics.as_ref(),
+            [KernelOwnerOracleDiagnostic {
+                kind: KernelDiagnosticKind::MissingCallEntry { function, name },
+                ..
+            }] if function.as_ref() == "Scene/new" && name.as_ref() == "root"
+        ));
+        assert!(matches!(
+            owner_named("host_missing").diagnostics.as_ref(),
+            [KernelOwnerOracleDiagnostic {
+                kind: KernelDiagnosticKind::MissingCallEntry { function, name },
+                ..
+            }] if function.as_ref() == "Random/bytes" && name.as_ref() == "byte_count"
+        ));
+        assert!(matches!(
+            owner_named("host_extra").diagnostics.as_ref(),
+            [KernelOwnerOracleDiagnostic {
+                site: KernelOwnerOracleDiagnosticSite::CallArgument {
+                    source: KernelCallArgumentSource::CallArgument { ordinal: 0 },
+                    ..
+                },
+                kind: KernelDiagnosticKind::UnexpectedCallEntry { function, name },
+                ..
+            }] if function.as_ref() == "Clock/wall" && name.as_ref() == "extra"
+        ));
+        assert!(matches!(
+            owner_named("authoritative_pass").diagnostics.as_ref(),
+            [KernelOwnerOracleDiagnostic {
+                site: KernelOwnerOracleDiagnosticSite::CallPass { pipe: false, .. },
+                kind: KernelDiagnosticKind::PassOnAuthoritativeCallable {
+                    function,
+                    callable_kind: KernelCallableKind::Builtin,
+                },
+                ..
+            }] if function.as_ref() == "Text/empty"
         ));
         let piped = owner_named("piped");
         assert_eq!(piped.result.ty, Type::Number);

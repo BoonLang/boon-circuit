@@ -2273,3 +2273,68 @@ fn boolean_contract_defers_only_unresolved_union_branches() {
     assert!(type_accepts_true_false_or_unresolved(&unresolved_boolean));
     assert!(!type_accepts_true_false_or_unresolved(&invalid));
 }
+
+#[test]
+fn compact_authoritative_call_shapes_are_unique_dense_and_type_free() {
+    let shapes = project_authoritative_callable_shapes_v1()
+        .expect("authoritative lexical call shapes project");
+    assert!(
+        shapes.windows(2).all(|pair| pair[0].name < pair[1].name),
+        "authoritative shapes must be uniquely sorted by name"
+    );
+    for shape in &shapes {
+        assert_eq!(shape.kind, CheckedCallableKind::Builtin, "{}", shape.name);
+        assert_eq!(
+            shape
+                .parameters
+                .iter()
+                .map(|parameter| parameter.ordinal)
+                .collect::<Vec<_>>(),
+            (0..shape.parameters.len() as u32).collect::<Vec<_>>(),
+            "{} parameter ordinals",
+            shape.name
+        );
+        let names = shape
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), shape.parameters.len(), "{}", shape.name);
+    }
+
+    let shape = |name: &str| {
+        shapes
+            .iter()
+            .find(|shape| shape.name == name)
+            .unwrap_or_else(|| panic!("missing authoritative shape `{name}`"))
+    };
+    let parameters = |name: &str| {
+        shape(name)
+            .parameters
+            .iter()
+            .map(|parameter| (parameter.name.as_str(), parameter.optional))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        parameters("Text/slice"),
+        [("input", false), ("from", false), ("count", false)]
+    );
+    assert_eq!(
+        parameters("Number/to_text"),
+        [
+            ("value", false),
+            ("radix", true),
+            ("min_width", true),
+            ("signed_width", true),
+            ("group_size", true),
+            ("prefix", true),
+        ]
+    );
+    assert_eq!(
+        parameters("Scene/new"),
+        [("root", false), ("lights", true), ("geometry", true)]
+    );
+    assert_eq!(parameters("Random/bytes"), [("byte_count", false)]);
+    assert!(parameters("Clock/wall").is_empty());
+    assert!(parameters("SessionInfo/status").is_empty());
+}

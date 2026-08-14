@@ -2215,6 +2215,33 @@ struct AuthoritativeCallContext {
     flow_type: FlowType,
 }
 
+fn checked_authoritative_callable_shape_v1(
+    name: impl Into<String>,
+    kind: CheckedCallableKind,
+    parameters: &[AuthoritativeParameter],
+) -> Result<CheckedAuthoritativeCallableShapeV1, String> {
+    let name = name.into();
+    let parameters = parameters
+        .iter()
+        .enumerate()
+        .map(|(ordinal, parameter)| {
+            Ok(CheckedAuthoritativeParameterShapeV1 {
+                name: parameter.name.clone(),
+                kind: parameter.kind,
+                ordinal: u32::try_from(ordinal).map_err(|_| {
+                    format!("authoritative callable `{name}` exceeds the u32 parameter namespace")
+                })?,
+                optional: parameter.requirement.is_optional(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(CheckedAuthoritativeCallableShapeV1 {
+        name,
+        kind,
+        parameters,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct InferredStructuralValue {
     flow_type: FlowType,
@@ -29879,16 +29906,6 @@ impl Default for BuiltinSignatureRegistry {
 }
 
 impl BuiltinSignatureRegistry {
-    /// Returns whether this registry owns a callable contract for `name`.
-    ///
-    /// This intentionally exposes only name ownership, not the legacy
-    /// signature DTO. Dense compiler frontends use it to distinguish an
-    /// unresolved project call from a valid authoritative call whose compact
-    /// implementation has not migrated yet.
-    pub fn is_authoritative_callable(&self, name: &str) -> bool {
-        self.authoritative_signature(name).is_some()
-    }
-
     fn authoritative_signatures(
         &self,
     ) -> impl Iterator<Item = (&str, AuthoritativeCallableSignature)> + '_ {
@@ -30372,6 +30389,102 @@ fn render_constructor_parameters(function: &str) -> Option<Vec<AuthoritativePara
         _ => return None,
     };
     Some(parameters)
+}
+
+/// Project the lexical shapes of every stable compiler-owned callable without
+/// constructing the legacy owner ABI environment.
+///
+/// This is a compatibility adapter for dependency-bottom compiler frontends.
+/// The returned model is deliberately type-free and project-independent; a
+/// future `KernelProjectInput` can receive the same rows from the permanent
+/// language/library contract owner without depending on this crate.
+pub fn project_authoritative_callable_shapes_v1()
+-> Result<Box<[CheckedAuthoritativeCallableShapeV1]>, String> {
+    fn insert_shape(
+        shapes: &mut BTreeMap<String, CheckedAuthoritativeCallableShapeV1>,
+        shape: CheckedAuthoritativeCallableShapeV1,
+    ) -> Result<(), String> {
+        if let Some(previous) = shapes.get(&shape.name) {
+            if previous == &shape {
+                return Ok(());
+            }
+            return Err(format!(
+                "authoritative callable `{}` has conflicting lexical shapes",
+                shape.name
+            ));
+        }
+        shapes.insert(shape.name.clone(), shape);
+        Ok(())
+    }
+
+    let mut shapes = BTreeMap::new();
+    let builtins = BuiltinSignatureRegistry::default();
+    for (name, entry) in &builtins.entries {
+        let Some(signature) = &entry.callable else {
+            continue;
+        };
+        insert_shape(
+            &mut shapes,
+            checked_authoritative_callable_shape_v1(
+                *name,
+                CheckedCallableKind::Builtin,
+                &signature.parameters,
+            )?,
+        )?;
+    }
+
+    let render = RenderContractRegistry::default();
+    for (name, signature) in render.authoritative_signatures() {
+        insert_shape(
+            &mut shapes,
+            checked_authoritative_callable_shape_v1(
+                name,
+                CheckedCallableKind::Builtin,
+                &signature.parameters,
+            )?,
+        )?;
+    }
+
+    for operation in boon_effect_schema::HOST_EFFECT_OPERATIONS {
+        let Some(signature) = host_effect_signature(operation) else {
+            continue;
+        };
+        let parameters = signature
+            .intent_fields
+            .into_iter()
+            .map(|field| AuthoritativeParameter {
+                name: field.name,
+                kind: CheckedParameterKind::Value,
+                flow_type: continuous_flow_type(field.ty),
+                requirement: field
+                    .default
+                    .map_or(CheckedParameterRequirement::Required, |default| {
+                        CheckedParameterRequirement::Optional { default }
+                    }),
+            })
+            .collect::<Vec<_>>();
+        insert_shape(
+            &mut shapes,
+            checked_authoritative_callable_shape_v1(
+                *operation,
+                CheckedCallableKind::Builtin,
+                &parameters,
+            )?,
+        )?;
+    }
+
+    for name in ["SessionInfo/status", "SessionInfo/principal"] {
+        insert_shape(
+            &mut shapes,
+            CheckedAuthoritativeCallableShapeV1 {
+                name: name.to_owned(),
+                kind: CheckedCallableKind::Builtin,
+                parameters: Vec::new(),
+            },
+        )?;
+    }
+
+    Ok(shapes.into_values().collect::<Vec<_>>().into_boxed_slice())
 }
 
 impl RenderConstructorContract {

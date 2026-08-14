@@ -22,6 +22,8 @@ pub struct KernelSolveWork {
     pub term_materializations: u64,
     pub term_intern_requests: u64,
     pub term_intern_hits: u64,
+    pub term_intern_requests_by_kind: [u64; 8],
+    pub term_intern_hits_by_kind: [u64; 8],
     pub structural_widen_requests: u64,
     pub structural_widen_hits: u64,
     pub dynamic_dependency_edges: u64,

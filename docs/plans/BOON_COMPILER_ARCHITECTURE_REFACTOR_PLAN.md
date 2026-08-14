@@ -2593,13 +2593,39 @@ remain explicitly unsupported and the complete differential still stops at
 the same pre-existing `store.focused_control_label` HOLD mode mismatch, with no
 earlier type or artifact divergence. All 44 kernel tests pass.
 
-The next large speed slice is to replace recursive summary-DAG dispatch with a
-packed linear execution plan and to give high-frequency immutable term shapes
-direct typed indexes, guided by the retained counters. In parallel, the
-remaining residual-module ranking must keep shrinking; a smaller interpreter
-cannot substitute for compiling each definition once. Release improvement is
-accepted only when the complete candidate path improves, not merely when graph
-counts fall.
+A measured selector-free linear-summary prototype is rejected. Only 829 of
+10,582 summary activations contain no lazy selector, and the debug kernel moved
+from 9,170 to 9,148 ms, which is noise rather than a speed win. The partial
+second evaluator was deleted. A future packed summary plan must represent
+guarded selector jumps and preserve unselected-arm requirement laziness; a
+selector-free side engine is not enough.
+
+The accepted typed-index cut follows the larger retained counter instead.
+Intern requests break down as 732,044 variable terms, 296,335 objects, and only
+59,242 variants, unions, containers, functions, and scalars combined. The term
+arena now maps `TypeVariableId` directly to its unique `TypeTermId`, so repeated
+root resolution never hashes a variable term. Ordered object construction no
+longer allocates a temporary field-name map, object lookup compares borrowed
+ordered fields before allocating a canonical boxed slice, and the trusted
+internal lookup fingerprint uses a fast deterministic mixer. Collision buckets
+still require exact equality, so type identity and deterministic output do not
+depend on fingerprint uniqueness.
+
+Those changes reduce solve-time intern requests from 1,087,621 to 406,428 and
+debug kernel/solve medians to approximately 8,092/6,793 ms. Three optimized
+samples record kernel times of 1,300.215, 1,321.255, and 1,312.981 ms (median
+1,312.981 ms). Complete parse plus SOURCE ABI plus kernel takes 1,388.803,
+1,416.500, and 1,406.673 ms (median 1,406.673 ms); median solve is 1,067.331 ms.
+This is another 7.6% below the 1,420.421 ms kernel checkpoint and about 65% below
+the original 3,722.8 ms complete-kernel receipt. Work counts and the full
+differential are unchanged, including the one known HOLD mode mismatch.
+
+The next large speed slice must either encode guarded selectors in one packed
+summary program or remove the dominant repeated residual definition, guided by
+fresh counters. The remaining residual-module ranking must keep shrinking; a
+smaller interpreter cannot substitute for compiling each definition once.
+Release improvement is accepted only when the complete candidate path improves,
+not merely when graph counts fall.
 
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not

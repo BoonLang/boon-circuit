@@ -1,7 +1,7 @@
 use boon_checked::{BytesType, FlowMode, FlowType, ObjectShape, Type, TypeVar, Variant};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct NameId(pub u32);
@@ -96,6 +96,8 @@ pub struct TypeTermArena {
     terms: Vec<TypeTerm>,
     term_has_variable: Vec<bool>,
     term_ids: HashMap<u64, Vec<TypeTermId>>,
+    object_ids: HashMap<u64, Vec<TypeTermId>>,
+    variable_terms: Vec<Option<TypeTermId>>,
     structural_widen_cache: HashMap<(TypeTermId, TypeTermId), TypeTermId>,
     absent: TypeTermId,
     unknown: TypeTermId,
@@ -110,6 +112,9 @@ pub struct TypeTermArena {
 pub(crate) struct TypeTermArenaWork {
     pub intern_requests: u64,
     pub intern_hits: u64,
+    /// Variable, object, variant, union, list/set, map, function, scalar.
+    pub intern_requests_by_kind: [u64; 8],
+    pub intern_hits_by_kind: [u64; 8],
     pub structural_widen_requests: u64,
     pub structural_widen_hits: u64,
 }
@@ -129,6 +134,8 @@ impl TypeTermArena {
             terms: Vec::new(),
             term_has_variable: Vec::new(),
             term_ids: HashMap::new(),
+            object_ids: HashMap::new(),
+            variable_terms: Vec::new(),
             structural_widen_cache: HashMap::new(),
             absent: placeholder,
             unknown: placeholder,
@@ -223,7 +230,16 @@ impl TypeTermArena {
     }
 
     pub fn variable(&mut self, variable: TypeVariableId) -> TypeTermId {
-        self.intern_raw(TypeTerm::Variable(variable))
+        let index = variable.0 as usize;
+        if let Some(term) = self.variable_terms.get(index).copied().flatten() {
+            return term;
+        }
+        let term = self.intern_raw(TypeTerm::Variable(variable));
+        if self.variable_terms.len() <= index {
+            self.variable_terms.resize(index + 1, None);
+        }
+        self.variable_terms[index] = Some(term);
+        term
     }
 
     pub fn bytes(&mut self, bytes: BytesTerm) -> TypeTermId {
@@ -270,19 +286,14 @@ impl TypeTermArena {
         open: bool,
     ) -> TypeTermId {
         let mut ordered = Vec::<ObjectFieldTerm>::new();
-        let mut indexes = HashMap::<NameId, usize>::new();
         for (name, ty) in fields {
-            if let Some(index) = indexes.get(&name).copied() {
+            if let Some(index) = ordered.iter().position(|field| field.name == name) {
                 ordered[index].ty = ty;
             } else {
-                indexes.insert(name, ordered.len());
                 ordered.push(ObjectFieldTerm { name, ty });
             }
         }
-        self.intern_raw(TypeTerm::Object {
-            fields: ordered.into_boxed_slice(),
-            open,
-        })
+        self.intern_object(ordered, open)
     }
 
     pub fn variant_tag(&mut self, tag: impl AsRef<str>) -> VariantTerm {
@@ -780,6 +791,9 @@ impl TypeTermArena {
 
     fn intern_raw(&mut self, term: TypeTerm) -> TypeTermId {
         self.work.intern_requests = self.work.intern_requests.saturating_add(1);
+        let work_kind = term_work_kind(&term);
+        self.work.intern_requests_by_kind[work_kind] =
+            self.work.intern_requests_by_kind[work_kind].saturating_add(1);
         let hash = lookup_hash(&term);
         if let Some(id) = self.term_ids.get(&hash).and_then(|candidates| {
             candidates
@@ -787,6 +801,8 @@ impl TypeTermArena {
                 .find(|candidate| self.terms[candidate.0 as usize] == term)
         }) {
             self.work.intern_hits = self.work.intern_hits.saturating_add(1);
+            self.work.intern_hits_by_kind[work_kind] =
+                self.work.intern_hits_by_kind[work_kind].saturating_add(1);
             return *id;
         }
         let id =
@@ -820,6 +836,40 @@ impl TypeTermArena {
         self.terms.push(term);
         self.term_has_variable.push(has_variable);
         self.term_ids.entry(hash).or_default().push(id);
+        id
+    }
+
+    fn intern_object(&mut self, fields: Vec<ObjectFieldTerm>, open: bool) -> TypeTermId {
+        const OBJECT_WORK_KIND: usize = 1;
+        self.work.intern_requests = self.work.intern_requests.saturating_add(1);
+        self.work.intern_requests_by_kind[OBJECT_WORK_KIND] =
+            self.work.intern_requests_by_kind[OBJECT_WORK_KIND].saturating_add(1);
+        let hash = lookup_hash(&(open, fields.as_slice()));
+        if let Some(id) = self.object_ids.get(&hash).and_then(|candidates| {
+            candidates.iter().find(|candidate| {
+                matches!(
+                    &self.terms[candidate.0 as usize],
+                    TypeTerm::Object {
+                        fields: candidate_fields,
+                        open: candidate_open,
+                    } if *candidate_open == open && candidate_fields.as_ref() == fields.as_slice()
+                )
+            })
+        }) {
+            self.work.intern_hits = self.work.intern_hits.saturating_add(1);
+            self.work.intern_hits_by_kind[OBJECT_WORK_KIND] =
+                self.work.intern_hits_by_kind[OBJECT_WORK_KIND].saturating_add(1);
+            return *id;
+        }
+        let has_variable = fields.iter().any(|field| self.has_variable(field.ty));
+        let id =
+            TypeTermId(u32::try_from(self.terms.len()).expect("kernel term count exceeds u32"));
+        self.terms.push(TypeTerm::Object {
+            fields: fields.into_boxed_slice(),
+            open,
+        });
+        self.term_has_variable.push(has_variable);
+        self.object_ids.entry(hash).or_default().push(id);
         id
     }
 
@@ -954,6 +1004,26 @@ impl TypeTermArena {
     }
 }
 
+fn term_work_kind(term: &TypeTerm) -> usize {
+    match term {
+        TypeTerm::Variable(_) => 0,
+        TypeTerm::Object { .. } | TypeTerm::OpenObjectPlaceholder => 1,
+        TypeTerm::VariantSet(_) => 2,
+        TypeTerm::Union(_) => 3,
+        TypeTerm::List(_) | TypeTerm::Set(_) => 4,
+        TypeTerm::Map { .. } => 5,
+        TypeTerm::Function { .. } => 6,
+        TypeTerm::Text
+        | TypeTerm::Number
+        | TypeTerm::Bytes(_)
+        | TypeTerm::Absent
+        | TypeTerm::RenderContract
+        | TypeTerm::UnresolvedShape(_)
+        | TypeTerm::Unknown
+        | TypeTerm::Bits(_) => 7,
+    }
+}
+
 /// Mirrors `boon_checked::compare_variants_canonically` without allocating
 /// formatted sort keys. Keeping the term arena and public checked projection
 /// in one order makes canonical equality independent of inference history.
@@ -1015,9 +1085,99 @@ fn compare_joined_bytes(
 }
 
 fn lookup_hash(value: &(impl Hash + ?Sized)) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = KernelLookupHasher::default();
     value.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Fast deterministic lookup fingerprint for compiler-owned immutable keys.
+///
+/// Every hash hit is still checked for exact equality in the arena bucket, so
+/// this affects lookup cost only, never canonical identity or output order.
+#[derive(Default)]
+struct KernelLookupHasher {
+    hash: u64,
+}
+
+impl KernelLookupHasher {
+    const MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
+
+    fn add(&mut self, value: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ value).wrapping_mul(Self::MULTIPLIER);
+    }
+}
+
+impl Hasher for KernelLookupHasher {
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    fn write(&mut self, mut bytes: &[u8]) {
+        while let Some((chunk, remaining)) = bytes.split_first_chunk::<8>() {
+            self.add(u64::from_le_bytes(*chunk));
+            bytes = remaining;
+        }
+        if let Some((chunk, remaining)) = bytes.split_first_chunk::<4>() {
+            self.add(u32::from_le_bytes(*chunk).into());
+            bytes = remaining;
+        }
+        if let Some((chunk, remaining)) = bytes.split_first_chunk::<2>() {
+            self.add(u16::from_le_bytes(*chunk).into());
+            bytes = remaining;
+        }
+        if let Some(byte) = bytes.first() {
+            self.add((*byte).into());
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.add(value.into());
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.add(value.into());
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.add(value.into());
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+
+    fn write_u128(&mut self, value: u128) {
+        self.add(value as u64);
+        self.add((value >> 64) as u64);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+
+    fn write_i8(&mut self, value: i8) {
+        self.add(value as u64);
+    }
+
+    fn write_i16(&mut self, value: i16) {
+        self.add(value as u64);
+    }
+
+    fn write_i32(&mut self, value: i32) {
+        self.add(value as u64);
+    }
+
+    fn write_i64(&mut self, value: i64) {
+        self.add(value as u64);
+    }
+
+    fn write_i128(&mut self, value: i128) {
+        self.write_u128(value as u128);
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.add(value as u64);
+    }
 }
 
 const fn flow_mode_rank(mode: FlowMode) -> u8 {

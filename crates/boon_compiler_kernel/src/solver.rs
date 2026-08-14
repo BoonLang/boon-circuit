@@ -356,6 +356,8 @@ impl ComponentSolver {
         let term_work = self.program.terms.work();
         self.work.term_intern_requests = term_work.intern_requests;
         self.work.term_intern_hits = term_work.intern_hits;
+        self.work.term_intern_requests_by_kind = term_work.intern_requests_by_kind;
+        self.work.term_intern_hits_by_kind = term_work.intern_hits_by_kind;
         self.work.structural_widen_requests = term_work.structural_widen_requests;
         self.work.structural_widen_hits = term_work.structural_widen_hits;
         Ok(ComponentArtifact::new(

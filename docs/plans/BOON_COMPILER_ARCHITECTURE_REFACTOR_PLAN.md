@@ -3069,6 +3069,50 @@ complete artifact normalization/currentness sealing, while checked-image and
 demanded-definition requests explicitly pay for the products they request.
 This demand split precedes further solver micro-optimization.
 
+The first permanent input/session/demand cut is now complete. A
+`KernelProjectInput` owns the immutable normalized owner programs and
+definition facts, parser-stable definition identities grouped by source unit,
+and one collision-checked stable-to-dense project-link overlay. Stable keys are
+the request identity; `KernelOwnerId` remains revision-local. The kernel crate
+depends on the lower-level `boon_syntax` identity contract but still has no
+dependency on `boon_parser`, `boon_typecheck`, or any upper compiler stage.
+
+`KernelSession` owns one revision, its immutable project input, one quiescent
+solved graph, and demand-product caches. `CheckDemand::Diagnostics` publishes
+only alpha-normalized public interfaces; `CheckDemand::Definitions` resolves
+stable definition keys and materializes only the requested artifacts; and
+`CheckDemand::CheckedImage` alone builds the complete dependency/currentness
+image. Strengthening demand in one revision never recompiles or re-solves the
+type graph. Once the complete checked image is published it replaces the large
+pre-publication owner tables and answers every weaker demand, so the session
+does not retain two full representations. Replacing the project advances the
+revision and clears all products; cross-revision red/green reuse remains a
+later explicit tranche.
+
+The NovyWave probe now measures the product boundary directly. Three optimized
+no-rebuild samples record diagnostics-only candidate time of 539.276, 553.239,
+and 549.776 ms (median 549.776 ms), versus complete checked-image candidate
+time of 709.950, 727.079, and 725.537 ms (median 725.537 ms). Median kernel time
+is 455.632 ms for diagnostics and 631.393 ms for the checked image; graph solve
+is 242.705 ms, public-interface projection 7.214 ms, and complete checked-image
+publication 162.784 ms. Diagnostics therefore avoids 175.761 ms (24.2%) on the
+matched median while publishing zero definition artifacts and zero receipts.
+One final optimized differential run passes at 519.082 ms diagnostics-only and
+688.510 ms complete candidate time, with all 1,389 definitions and all artifact
+tables unchanged. A directional debug sample records 2,275.534 ms diagnostics
+and 2,668.092 ms complete candidate time. The two-job optimized rebuild took
+1m56s and is excluded from every Boon latency.
+
+All 65 kernel tests, 87 non-ignored compiler unit tests, and 16 compiler
+integration tests pass. Focused gates prove stable unit/link ownership,
+stable-key demand canonicalization, sparse materialization, zero receipt work
+for diagnostics and sparse definitions, public-interface equality across
+demands, same-revision graph reuse, checked-image replacement, and revision
+invalidation. This closes the input/session/demand ownership milestone. Exact
+diagnostic rows and callable substitutions are next; they must attach to these
+products without reintroducing a second solve or making diagnostics pay for a
+checked image.
+
 The remaining residual-module ranking must keep shrinking, but a smaller
 interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not

@@ -615,7 +615,7 @@ fn validate_dependency_target(
     Ok(())
 }
 
-fn alpha_normalize_definition(normalized: &mut DefinitionArtifact) {
+pub(crate) fn alpha_normalize_definition(normalized: &mut DefinitionArtifact) {
     let mut variables = BTreeMap::new();
     let mut next = 0;
     normalized.result = alpha_normalize_flow_type(&normalized.result, &mut variables, &mut next);
@@ -643,12 +643,16 @@ fn alpha_normalize_definition(normalized: &mut DefinitionArtifact) {
     }
 }
 
+pub(crate) fn alpha_normalize_public_flow(flow_type: &FlowType) -> FlowType {
+    alpha_normalize_flow_type(flow_type, &mut BTreeMap::new(), &mut 0)
+}
+
 fn hash_normalized_flow_type(
     domain: &[u8],
     flow_type: &FlowType,
     scratch: &mut Vec<u8>,
 ) -> Result<[u8; 32], KernelSolveError> {
-    let normalized = alpha_normalize_flow_type(flow_type, &mut BTreeMap::new(), &mut 0);
+    let normalized = alpha_normalize_public_flow(flow_type);
     Ok(stable_fingerprint(domain, &normalized, scratch))
 }
 

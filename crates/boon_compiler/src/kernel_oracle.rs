@@ -16,11 +16,11 @@ use boon_compiler_kernel::{
     KernelInheritedFormal, KernelLexicalAccess, KernelLexicalBindingInput,
     KernelLexicalBindingTarget, KernelLexicalBindingTargetInput, KernelListId, KernelListInput,
     KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
-    KernelOwnerProgramInput, KernelParameterKind, KernelPattern, KernelProjectProgramInput,
-    KernelPureBuiltinKind, KernelRenderConstructorKind, KernelSolveWork, KernelSourceId,
-    KernelSourceInput, KernelStateId, KernelStateInput, KernelStatementChildReference,
-    KernelStatementId, KernelStatementInput, KernelStatementKind, KernelStatementParameter,
-    KernelStatementReference, KernelValueReference, compile_project_program_with_definition_facts,
+    KernelOwnerProgramInput, KernelParameterKind, KernelPattern, KernelProjectInput,
+    KernelProjectProgramInput, KernelPureBuiltinKind, KernelRenderConstructorKind, KernelSolveWork,
+    KernelSourceId, KernelSourceInput, KernelStateId, KernelStateInput,
+    KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
+    KernelStatementParameter, KernelStatementReference, KernelValueReference,
     is_kernel_host_effect,
 };
 use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
@@ -260,6 +260,9 @@ pub struct KernelOwnerOracleTimings {
     pub direct_projection_us: u64,
     pub dependency_pruning_us: u64,
     pub program_compile_us: u64,
+    pub graph_solve_us: u64,
+    pub interface_projection_us: u64,
+    pub checked_image_us: u64,
     pub solve_us: u64,
     pub artifact_projection_us: u64,
     pub input_owners: usize,
@@ -712,25 +715,49 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         .collect::<Vec<_>>()
         .into_boxed_slice();
 
+    let project_is_empty = project_input.owners.is_empty();
+    let definition_keys = active
+        .iter()
+        .map(|prepared_index| prepared[*prepared_index].owner.clone())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     let mut program_compile_us = 0;
+    let mut graph_solve_us = 0;
+    let mut interface_projection_us = 0;
+    let mut checked_image_us = 0;
     let mut solve_us = 0;
     let mut compile_work = KernelCompileWork::default();
-    let artifact = if project_input.owners.is_empty() {
+    let artifact = if project_is_empty {
         None
     } else {
         let compile_started = Instant::now();
-        let compiled =
-            compile_project_program_with_definition_facts(&project_input, &definition_facts)
-                .map_err(|error| error.to_string());
+        let compiled = KernelProjectInput::new(project_input, definition_facts, definition_keys)
+            .and_then(|input| input.compile())
+            .map_err(|error| error.to_string());
         if let Ok(program) = &compiled {
             compile_work = program.compile_work();
         }
         program_compile_us = elapsed_us(compile_started.elapsed());
         let solved = compiled.and_then(|program| {
-            let solve_started = Instant::now();
-            let solved = program.solve().map_err(|error| error.to_string());
-            solve_us = elapsed_us(solve_started.elapsed());
-            solved
+            let graph_solve_started = Instant::now();
+            let solved = program.solve_graph().map_err(|error| error.to_string());
+            graph_solve_us = elapsed_us(graph_solve_started.elapsed());
+            solve_us = graph_solve_us;
+            solved.and_then(|solved| {
+                if std::env::var_os("BOON_KERNEL_MEASURE_DEMANDS").is_some() {
+                    let interface_projection_started = Instant::now();
+                    let interfaces = solved.interface_snapshot();
+                    interface_projection_us = elapsed_us(interface_projection_started.elapsed());
+                    debug_assert_eq!(interfaces.public_results.len(), active.len());
+                }
+                let checked_image_started = Instant::now();
+                let checked = solved
+                    .into_checked_snapshot()
+                    .map_err(|error| error.to_string());
+                checked_image_us = elapsed_us(checked_image_started.elapsed());
+                solve_us = graph_solve_us.saturating_add(checked_image_us);
+                checked
+            })
         });
         match solved {
             Ok(artifact) => Some(artifact),
@@ -1261,11 +1288,14 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     };
     let artifact_projection_us = elapsed_us(artifact_projection_started.elapsed());
     let timings = KernelOwnerOracleTimings {
-        total_us: elapsed_us(total_started.elapsed()),
+        total_us: elapsed_us(total_started.elapsed()).saturating_sub(interface_projection_us),
         owner_projection_us,
         direct_projection_us: elapsed_us(direct_projection_elapsed),
         dependency_pruning_us,
         program_compile_us,
+        graph_solve_us,
+        interface_projection_us,
+        checked_image_us,
         solve_us,
         artifact_projection_us,
         input_owners,
@@ -10193,6 +10223,31 @@ mod tests {
             report.reverse_consumer_edges,
         );
 
+        if timings.interface_projection_us > 0 {
+            let diagnostics_kernel_us = timings
+                .total_us
+                .saturating_sub(timings.checked_image_us)
+                .saturating_sub(timings.artifact_projection_us)
+                .saturating_add(timings.interface_projection_us);
+            let diagnostics_retained_snapshot_us =
+                source_abi_us.saturating_add(diagnostics_kernel_us);
+            let diagnostics_candidate_us =
+                parse_us.saturating_add(diagnostics_retained_snapshot_us);
+            eprintln!(
+                "kernel-novywave demand=diagnostics profile={} candidate_total_us={} retained_snapshot_total_us={} kernel_total_us={} graph_solve_us={} interface_projection_us={} materialized_definitions=0 sealed_definitions=0",
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                },
+                diagnostics_candidate_us,
+                diagnostics_retained_snapshot_us,
+                diagnostics_kernel_us,
+                timings.graph_solve_us,
+                timings.interface_projection_us,
+            );
+        }
+
         if std::env::var_os("BOON_KERNEL_CANDIDATE_ONLY").is_some() {
             if let Some((owner, reason)) = report
                 .unsupported
@@ -10205,7 +10260,7 @@ mod tests {
             let retained_snapshot_total_us = source_abi_us.saturating_add(timings.total_us);
             let candidate_total_us = parse_us.saturating_add(retained_snapshot_total_us);
             eprintln!(
-                "kernel-novywave candidate_only=true parity=not_run profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} kernel_total_us={} compile_us={} solve_us={} solved_owners={} container_owners={} unsupported_owners={} residual_modules={} residual_frames={} acyclic_residual_frames={} invocation_frames={} direct_result_summaries={} summary_definition_nodes={} summary_invoke_nodes={} linked_operations={} scheduled_work_items={} acyclic_initial_work_items={} dominant_module_owner={} dominant_module_operations={} dominant_module_frames={} dominant_module_linked_operations={} variables={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} summary_call_activations={} summary_node_evaluations={} mutations={} term_materializations={} term_intern_requests={} term_intern_hits={} term_intern_requests_by_kind={:?} term_intern_hits_by_kind={:?} structural_widen_requests={} structural_widen_hits={} dynamic_edges={}",
+                "kernel-novywave candidate_only=true parity=not_run profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} kernel_total_us={} compile_us={} solve_us={} graph_solve_us={} interface_projection_us={} checked_image_us={} solved_owners={} container_owners={} unsupported_owners={} residual_modules={} residual_frames={} acyclic_residual_frames={} invocation_frames={} direct_result_summaries={} summary_definition_nodes={} summary_invoke_nodes={} linked_operations={} scheduled_work_items={} acyclic_initial_work_items={} dominant_module_owner={} dominant_module_operations={} dominant_module_frames={} dominant_module_linked_operations={} variables={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} summary_call_activations={} summary_node_evaluations={} mutations={} term_materializations={} term_intern_requests={} term_intern_hits={} term_intern_requests_by_kind={:?} term_intern_hits_by_kind={:?} structural_widen_requests={} structural_widen_hits={} dynamic_edges={}",
                 if cfg!(debug_assertions) {
                     "debug"
                 } else {
@@ -10219,6 +10274,9 @@ mod tests {
                 timings.total_us,
                 timings.program_compile_us,
                 timings.solve_us,
+                timings.graph_solve_us,
+                timings.interface_projection_us,
+                timings.checked_image_us,
                 timings.solved_owners,
                 timings.container_owners,
                 timings.unsupported_owners,
@@ -10484,7 +10542,7 @@ mod tests {
         let retained_snapshot_total_us = source_abi_us.saturating_add(timings.total_us);
         let candidate_with_bundle_us = bundle_us.saturating_add(candidate_total_us);
         eprintln!(
-            "kernel-novywave profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} candidate_with_bundle_us={} oracle_check_us={} legacy_parse_ms={:.3} legacy_typecheck_ms={:.3} kernel_total_us={} owner_projection_us={} direct_projection_us={} dependency_pruning_us={} program_compile_us={} solve_us={} artifact_projection_us={} projected_owners={} solved_owners={} container_owners={} unsupported_owners={} definition_modules={} principal_expressions={} residual_type_modules={} residual_module_operations={} residual_module_terms={} residual_frames={} linked_operations={} scheduled_work_items={} linked_terms={} acyclic_initial_operations={} compiled_call_sites={} invocation_frames={} reused_invocation_frames={} principal_result_reuses={} principal_expression_reuses={} pruned_invocation_expressions={} specialization_plans={} reused_specialization_plans={} max_call_depth={} variables={} operations={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} mutations={} dynamic_edges={}",
+            "kernel-novywave profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} candidate_with_bundle_us={} oracle_check_us={} legacy_parse_ms={:.3} legacy_typecheck_ms={:.3} kernel_total_us={} owner_projection_us={} direct_projection_us={} dependency_pruning_us={} program_compile_us={} solve_us={} graph_solve_us={} interface_projection_us={} checked_image_us={} artifact_projection_us={} projected_owners={} solved_owners={} container_owners={} unsupported_owners={} definition_modules={} principal_expressions={} residual_type_modules={} residual_module_operations={} residual_module_terms={} residual_frames={} linked_operations={} scheduled_work_items={} linked_terms={} acyclic_initial_operations={} compiled_call_sites={} invocation_frames={} reused_invocation_frames={} principal_result_reuses={} principal_expression_reuses={} pruned_invocation_expressions={} specialization_plans={} reused_specialization_plans={} max_call_depth={} variables={} operations={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} mutations={} dynamic_edges={}",
             if cfg!(debug_assertions) {
                 "debug"
             } else {
@@ -10505,6 +10563,9 @@ mod tests {
             timings.dependency_pruning_us,
             timings.program_compile_us,
             timings.solve_us,
+            timings.graph_solve_us,
+            timings.interface_projection_us,
+            timings.checked_image_us,
             timings.artifact_projection_us,
             timings.projected_owners,
             timings.solved_owners,

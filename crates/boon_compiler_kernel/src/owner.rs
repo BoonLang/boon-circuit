@@ -1,9 +1,10 @@
 use crate::{
-    ComponentProgram, ComponentProgramBuilder, KernelCollectionOperationKind, KernelPattern,
-    KernelRecordEntry, KernelSelectArm, KernelSolveError, KernelSolveWork, KernelSummaryCallInput,
-    KernelSummaryNode, KernelSummaryProgram, KernelSummaryProjectionStep, KernelSummaryRecordEntry,
-    KernelSummarySelectArm, KernelSummaryValueId, OutputId, PublishMode, TypeTermId,
-    TypeVariableId, build_snapshot_receipts, definition_basis_fingerprint,
+    ComponentArtifact, ComponentProgram, ComponentProgramBuilder, KernelCollectionOperationKind,
+    KernelPattern, KernelRecordEntry, KernelSelectArm, KernelSolveError, KernelSolveWork,
+    KernelSummaryCallInput, KernelSummaryNode, KernelSummaryProgram, KernelSummaryProjectionStep,
+    KernelSummaryRecordEntry, KernelSummarySelectArm, KernelSummaryValueId, OutputId, PublishMode,
+    TypeTermId, TypeVariableId, alpha_normalize_definition, alpha_normalize_public_flow,
+    build_snapshot_receipts, definition_basis_fingerprint,
     definition_basis_fingerprint_with_buffer, solve_component,
 };
 use boon_checked::{
@@ -501,6 +502,18 @@ pub struct KernelProjectProgram {
     compile_work: KernelCompileWork,
 }
 
+/// Quiescent project graph before any optional checked product is published.
+///
+/// Keeping this boundary explicit lets one session solve type equations once,
+/// answer diagnostics from public interfaces, and materialize sparse or full
+/// checked artifacts only when a later demand requires them.
+#[derive(Clone, Debug)]
+pub struct KernelSolvedProject {
+    artifact: ComponentArtifact,
+    owners: Box<[KernelProjectOwnerOutputs]>,
+    public_results: Box<[FlowType]>,
+}
+
 pub const KERNEL_RESIDUAL_MODULE_RANKING_LEN: usize = 16;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -898,6 +911,30 @@ pub struct KernelCheckedSnapshot {
     pub work: KernelSolveWork,
 }
 
+/// The complete public type surface needed by diagnostics and link planning.
+///
+/// This deliberately contains no expression, statement, resource, dependency,
+/// or currentness rows. A diagnostics-only request must be able to stop here
+/// without paying to construct and fingerprint a checked image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelInterfaceSnapshot {
+    pub public_results: Box<[FlowType]>,
+    pub work: KernelSolveWork,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelDemandedDefinitionArtifact {
+    pub owner: KernelOwnerId,
+    pub definition: DefinitionArtifact,
+}
+
+/// Sparse checked artifact product for explicit definition demand.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelDemandedDefinitionSnapshot {
+    pub definitions: Box<[KernelDemandedDefinitionArtifact]>,
+    pub work: KernelSolveWork,
+}
+
 /// Returns whether the permanent kernel can resolve this operation entirely
 /// from the lower-level host-effect ABI registry.
 pub fn is_kernel_host_effect(operation: &str) -> bool {
@@ -975,83 +1012,46 @@ impl KernelOwnerProgram {
 
 impl KernelProjectProgram {
     pub fn solve(self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
-        let basis_fingerprints = self
-            .owners
-            .iter()
-            .map(|owner| owner.basis_fingerprint_v1)
-            .collect::<Vec<_>>();
+        self.solve_graph()?.into_checked_snapshot()
+    }
+
+    /// Solve the complete project type graph but publish only its public
+    /// interfaces. This is the diagnostics boundary: it performs no checked
+    /// expression/resource projection, alpha-normalization of definition
+    /// artifacts, dependency indexing, or currentness hashing.
+    pub fn solve_interfaces(self) -> Result<KernelInterfaceSnapshot, KernelSolveError> {
+        Ok(self.solve_graph()?.interface_snapshot())
+    }
+
+    /// Materialize only the explicitly demanded definition artifacts.
+    ///
+    /// Public results for every definition are still solved because call and
+    /// cross-owner equations share one component. Undemanded expression,
+    /// statement, resource, dependency, and receipt tables are never built.
+    pub fn solve_definitions(
+        self,
+        demanded: &[KernelOwnerId],
+    ) -> Result<KernelDemandedDefinitionSnapshot, KernelSolveError> {
         let artifact = solve_component(self.component)?;
-        let public_results = self
-            .owners
-            .iter()
-            .map(|owner| {
-                let mut result = artifact
-                    .output(owner.result)
-                    .expect("project owner result belongs to its component")
-                    .flow_type
-                    .clone();
-                let result_index = owner
-                    .expressions
-                    .iter()
-                    .position(|output| *output == owner.result)
-                    .expect("owner result belongs to its expression outputs");
-                result.mode = owner.expression_modes[result_index];
-                result
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let mut definitions = self
-            .owners
-            .into_vec()
-            .into_iter()
-            .enumerate()
-            .map(|(owner_index, owner)| {
-                let result = public_results[owner_index].clone();
-                let expression_flows = owner
-                    .expressions
-                    .iter()
-                    .zip(owner.expression_modes.iter().copied())
-                    .map(|(output, mode)| {
-                        let mut flow = artifact
-                            .output(*output)
-                            .expect("project owner expression belongs to its component")
-                            .flow_type
-                            .clone();
-                        flow.mode = mode;
-                        flow
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
-                let calls = materialize_call_artifacts(owner.calls, &expression_flows);
-                let (sources, states, lists) = materialize_resource_artifacts(
-                    owner.resources,
-                    &expression_flows,
-                    Some(&public_results),
-                );
-                let expressions =
-                    materialize_expression_artifacts(owner.expression_artifacts, expression_flows);
-                DefinitionArtifact {
-                    result,
-                    expressions,
-                    statements: owner.statements,
-                    declarations: owner.declarations,
-                    lexical_bindings: owner.lexical_bindings,
-                    calls,
-                    effects: owner.effects,
-                    sources,
-                    states,
-                    lists,
-                }
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let (dependencies, currentness) =
-            build_snapshot_receipts(&mut definitions, &basis_fingerprints)?;
-        Ok(KernelCheckedSnapshot {
-            definitions,
-            dependencies,
-            currentness,
-            work: artifact.work,
+        let public_results = project_public_results(&self.owners, &artifact);
+        KernelSolvedProject {
+            artifact,
+            owners: self.owners,
+            public_results,
+        }
+        .into_demanded_definitions(demanded)
+    }
+
+    /// Solve all type equations once without publishing any optional checked
+    /// product. `KernelSession` retains this quiescent graph across multiple
+    /// demands in the same revision.
+    pub fn solve_graph(self) -> Result<KernelSolvedProject, KernelSolveError> {
+        let artifact = solve_component(self.component)?;
+        let public_results = project_public_results(&self.owners, &artifact);
+        Ok(KernelSolvedProject {
+            artifact,
+            owners: self.owners,
+            public_results,
         })
     }
 
@@ -1061,6 +1061,174 @@ impl KernelProjectProgram {
 
     pub const fn compile_work(&self) -> KernelCompileWork {
         self.compile_work
+    }
+}
+
+impl KernelSolvedProject {
+    pub fn interface_snapshot(&self) -> KernelInterfaceSnapshot {
+        let public_results = self
+            .public_results
+            .iter()
+            .map(alpha_normalize_public_flow)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        KernelInterfaceSnapshot {
+            public_results,
+            work: self.artifact.work,
+        }
+    }
+
+    pub fn checked_snapshot(&self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
+        self.clone().into_checked_snapshot()
+    }
+
+    pub fn into_checked_snapshot(self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
+        let basis_fingerprints = self
+            .owners
+            .iter()
+            .map(|owner| owner.basis_fingerprint_v1)
+            .collect::<Vec<_>>();
+        let mut definitions = self
+            .owners
+            .into_vec()
+            .into_iter()
+            .enumerate()
+            .map(|(owner_index, owner)| {
+                materialize_project_definition(
+                    owner_index,
+                    owner,
+                    &self.artifact,
+                    &self.public_results,
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let (dependencies, currentness) =
+            build_snapshot_receipts(&mut definitions, &basis_fingerprints)?;
+        Ok(KernelCheckedSnapshot {
+            definitions,
+            dependencies,
+            currentness,
+            work: self.artifact.work,
+        })
+    }
+
+    pub fn demanded_definitions(
+        &self,
+        demanded: &[KernelOwnerId],
+    ) -> Result<KernelDemandedDefinitionSnapshot, KernelSolveError> {
+        self.clone().into_demanded_definitions(demanded)
+    }
+
+    pub fn into_demanded_definitions(
+        self,
+        demanded: &[KernelOwnerId],
+    ) -> Result<KernelDemandedDefinitionSnapshot, KernelSolveError> {
+        let mut demanded = demanded.to_vec();
+        demanded.sort_unstable();
+        demanded.dedup();
+        if let Some(owner) = demanded
+            .iter()
+            .find(|owner| owner.0 as usize >= self.owners.len())
+        {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition demand references missing owner {}",
+                owner.0
+            )));
+        }
+        let mut demanded_iter = demanded.into_iter().peekable();
+        let mut definitions = Vec::with_capacity(demanded_iter.len());
+        for (owner_index, owner) in self.owners.into_vec().into_iter().enumerate() {
+            let dense_owner = KernelOwnerId(
+                u32::try_from(owner_index)
+                    .expect("kernel definition count exceeds the dense u32 namespace"),
+            );
+            if demanded_iter.peek().copied() != Some(dense_owner) {
+                continue;
+            }
+            demanded_iter.next();
+            let mut definition = materialize_project_definition(
+                owner_index,
+                owner,
+                &self.artifact,
+                &self.public_results,
+            );
+            alpha_normalize_definition(&mut definition);
+            definitions.push(KernelDemandedDefinitionArtifact {
+                owner: dense_owner,
+                definition,
+            });
+        }
+        debug_assert!(demanded_iter.next().is_none());
+        Ok(KernelDemandedDefinitionSnapshot {
+            definitions: definitions.into_boxed_slice(),
+            work: self.artifact.work,
+        })
+    }
+}
+
+fn project_public_results(
+    owners: &[KernelProjectOwnerOutputs],
+    artifact: &ComponentArtifact,
+) -> Box<[FlowType]> {
+    owners
+        .iter()
+        .map(|owner| {
+            let mut result = artifact
+                .output(owner.result)
+                .expect("project owner result belongs to its component")
+                .flow_type
+                .clone();
+            let result_index = owner
+                .expressions
+                .iter()
+                .position(|output| *output == owner.result)
+                .expect("owner result belongs to its expression outputs");
+            result.mode = owner.expression_modes[result_index];
+            result
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn materialize_project_definition(
+    owner_index: usize,
+    owner: KernelProjectOwnerOutputs,
+    artifact: &ComponentArtifact,
+    public_results: &[FlowType],
+) -> DefinitionArtifact {
+    let result = public_results[owner_index].clone();
+    let expression_flows = owner
+        .expressions
+        .iter()
+        .zip(owner.expression_modes.iter().copied())
+        .map(|(output, mode)| {
+            let mut flow = artifact
+                .output(*output)
+                .expect("project owner expression belongs to its component")
+                .flow_type
+                .clone();
+            flow.mode = mode;
+            flow
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let calls = materialize_call_artifacts(owner.calls, &expression_flows);
+    let (sources, states, lists) =
+        materialize_resource_artifacts(owner.resources, &expression_flows, Some(public_results));
+    let expressions =
+        materialize_expression_artifacts(owner.expression_artifacts, expression_flows);
+    DefinitionArtifact {
+        result,
+        expressions,
+        statements: owner.statements,
+        declarations: owner.declarations,
+        lexical_bindings: owner.lexical_bindings,
+        calls,
+        effects: owner.effects,
+        sources,
+        states,
+        lists,
     }
 }
 

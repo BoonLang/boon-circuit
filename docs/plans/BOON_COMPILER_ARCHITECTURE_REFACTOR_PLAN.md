@@ -2683,12 +2683,58 @@ remain the largest direct-dispatch counter, so guarded packed summary
 instructions are now more important than removing another small residual
 module.
 
-The next large speed slice must encode guarded selectors and straight-line
-summary regions in one packed program, then add a compiled collection body
-without recursive source interpretation. The remaining residual-module ranking
-must keep shrinking, but a smaller interpreter cannot substitute for compiling
-each definition once. Release improvement is accepted only when the complete
-candidate path improves, not merely when graph counts fall.
+A guarded flat-summary prototype tested that interpreter hypothesis and is
+rejected. Flattening every lazy summary into one instruction tape produced
+290,200 semantic nodes, 311,659 instructions, and 119,163 guarded blocks. Its
+optimized median regressed to roughly 1.179 seconds of kernel work from the
+1.102-second generation-stamped checkpoint. Dense code alone did not remove
+the repeated definition graphs, and the extra guard dispatch outweighed its
+small straight-line benefit. The prototype was deleted rather than retained as
+a second evaluator.
+
+The accepted definition-bytecode cut instead removes the source-order boundary
+between nested summaries. Eligible callees are compiled in deterministic
+callee-first order. A caller either inlines a small definition or emits one
+`Invoke` node that references the callee's immutable `Arc<KernelSummaryProgram>`.
+Nested input slots resolve mapped parent values lazily through the current
+evaluation frame, so an unselected child `WHEN` arm cannot evaluate a formal
+projection or impose its requirement. Each nested definition receives a
+generation-stamped scratch frame; no source node is redispatched and no
+per-invocation argument vector is allocated.
+
+Inlining is a measured code-size/runtime decision rather than an all-or-nothing
+mode. Debug NovyWave sweeps at 32, 64, 128, and 256 summary nodes showed the
+expected frontier: larger thresholds progressively reduced dynamic node
+evaluation while increasing compile work. The 128-node boundary gave the best
+stable balance. The retained program has 39,243 definition-summary nodes and
+530 static invokes; it evaluates 1,149,635 summary nodes, down from 1,361,998
+when nearly every nested definition was shared, while avoiding the 287,965
+static nodes produced by selector-safe inlining. The surrounding mutable graph
+remains at 99,442 variables, 32,823 linked operations, 69,754 activations, and
+56,114 live dependency edges.
+
+Three fresh optimized samples record kernel times of 1,012.901, 1,000.490, and
+996.979 ms (median 1,000.490 ms). Complete parse plus SOURCE ABI plus kernel
+takes 1,109.775, 1,092.366, and 1,084.842 ms (median 1,092.366 ms); median
+compile/link is 109.190 ms and median solve is 832.288 ms. The two-job release
+rebuild took 1m49s. This is about 9.2% below the preceding 1,102.121 ms kernel
+median and about 9.1% below its 1,201.776 ms complete median. All 50 kernel
+tests and 77 non-ignored compiler tests pass. The complete NovyWave
+differential again reaches only the same pre-existing
+`store.focused_control_label` mode mismatch, with no earlier semantic or
+artifact divergence.
+
+This establishes the reusable call instruction needed by the next large cut:
+compile collection callback bodies, beginning with `List/map`, as one shared
+definition program invoked by the collection operator. Do not embed callback
+source trees into caller summaries. A future packed interpreter should operate
+on these unique definition programs and their explicit frame stack; it must not
+recreate the rejected global guarded tape.
+
+The remaining residual-module ranking must keep shrinking, but a smaller
+interpreter cannot substitute for compiling each definition once. Release
+improvement is accepted only when the complete candidate path improves, not
+merely when graph counts fall.
 
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not

@@ -285,6 +285,8 @@ pub struct KernelCompileWork {
     pub invocation_frames: u64,
     pub reused_invocation_frames: u64,
     pub direct_result_summaries: u64,
+    pub summary_definition_nodes: u64,
+    pub summary_invoke_nodes: u64,
     pub principal_result_reuses: u64,
     pub principal_expression_reuses: u64,
     pub pruned_invocation_expressions: u64,
@@ -633,6 +635,19 @@ pub fn compile_project_program(
         validate_owner_input(owner_id, owner, &principals)?;
     }
     let direct_summaries = compile_direct_result_summaries(&mut builder, input);
+    for summary in direct_summaries.iter().flatten() {
+        compile_work.summary_definition_nodes = compile_work
+            .summary_definition_nodes
+            .saturating_add(summary.program.nodes.len() as u64);
+        compile_work.summary_invoke_nodes = compile_work.summary_invoke_nodes.saturating_add(
+            summary
+                .program
+                .nodes
+                .iter()
+                .filter(|node| matches!(node, KernelSummaryNode::Invoke { .. }))
+                .count() as u64,
+        );
+    }
     for (owner_index, owner) in input.owners.iter().enumerate() {
         let owner_id = KernelOwnerId(
             u32::try_from(owner_index).expect("kernel project owner count exceeds u32"),
@@ -2275,6 +2290,11 @@ fn direct_summary_fixed_builtin_supported(kind: KernelPureBuiltinKind) -> bool {
     )
 }
 
+/// Tiny summary definitions cost less to inline than to enter through a
+/// nested scratch frame. Larger definitions remain shared so call-heavy
+/// projects do not duplicate their bytecode at every occurrence.
+const SHARED_SUMMARY_MIN_NODES: usize = 128;
+
 #[derive(Clone, Debug)]
 enum DirectSummaryInput {
     FormalProjection {
@@ -2320,6 +2340,7 @@ struct PlannedSummaryValue {
 struct DirectSummaryPlanCompiler<'a> {
     builder: &'a mut ComponentProgramBuilder,
     project: &'a KernelProjectProgramInput,
+    summaries: &'a [Option<Arc<CompiledDirectSummary>>],
     nodes: Vec<KernelSummaryNode>,
     inputs: Vec<DirectSummaryInput>,
 }
@@ -2378,6 +2399,85 @@ impl DirectSummaryPlanCompiler<'_> {
             value: self.push_node(KernelSummaryNode::Projection {
                 provider: value.value,
                 fields: fields.into_boxed_slice(),
+            }),
+            mode,
+            formal_projection_input: None,
+        })
+    }
+
+    fn project_interned_formal_value(
+        &mut self,
+        value: PlannedSummaryValue,
+        fields: &[crate::NameId],
+    ) -> Option<PlannedSummaryValue> {
+        if fields.is_empty() {
+            return Some(value);
+        }
+        let input = value.formal_projection_input?;
+        let DirectSummaryInput::FormalProjection {
+            formal,
+            fields: prefix,
+        } = self.inputs.get(input as usize)?.clone()
+        else {
+            return None;
+        };
+        let mut projection = prefix.into_vec();
+        projection.extend_from_slice(fields);
+        Some(self.push_formal_projection(formal, projection.into_boxed_slice()))
+    }
+
+    fn compile_shared_invoke(
+        &mut self,
+        summary: &CompiledDirectSummary,
+        actuals: &[PlannedSummaryActual],
+    ) -> Option<PlannedSummaryValue> {
+        if actuals.len() != summary.formal_count {
+            return None;
+        }
+        let mut values = Vec::with_capacity(summary.inputs.len());
+        let mut modes = Vec::with_capacity(summary.inputs.len());
+        for input in summary.inputs.iter() {
+            let value = match input {
+                DirectSummaryInput::FormalProjection { formal, fields } => {
+                    match actuals.get(*formal as usize)? {
+                        PlannedSummaryActual::Formal(formal) => {
+                            self.push_formal_projection(*formal, fields.clone())
+                        }
+                        PlannedSummaryActual::Value(value) => {
+                            self.project_interned_formal_value(*value, fields)?
+                        }
+                    }
+                }
+                DirectSummaryInput::External { owner, expression } => {
+                    let input = u32::try_from(self.inputs.len())
+                        .expect("kernel summary input count exceeds u32");
+                    self.inputs.push(DirectSummaryInput::External {
+                        owner: *owner,
+                        expression: *expression,
+                    });
+                    PlannedSummaryValue {
+                        value: self.push_node(KernelSummaryNode::Input(input)),
+                        mode: DirectSummaryMode::Fixed {
+                            owner: *owner,
+                            expression: *expression,
+                        },
+                        formal_projection_input: None,
+                    }
+                }
+            };
+            values.push(value.value);
+            modes.push(value.mode);
+        }
+        let mode = match summary.result_mode {
+            DirectSummaryMode::Fixed { owner, expression } => {
+                DirectSummaryMode::Fixed { owner, expression }
+            }
+            DirectSummaryMode::Input(input) => *modes.get(input as usize)?,
+        };
+        Some(PlannedSummaryValue {
+            value: self.push_node(KernelSummaryNode::Invoke {
+                program: Arc::clone(&summary.program),
+                inputs: values.into_boxed_slice(),
             }),
             mode,
             formal_projection_input: None,
@@ -2734,6 +2834,17 @@ impl DirectSummaryPlanCompiler<'_> {
                         }
                     }
                     let target_actuals = target_actuals.into_iter().collect::<Option<Vec<_>>>()?;
+                    let shared = self
+                        .summaries
+                        .get(target.0 as usize)
+                        .and_then(Clone::clone)
+                        .filter(|summary| summary.program.nodes.len() >= SHARED_SUMMARY_MIN_NODES);
+                    if let Some(shared) = shared
+                        && let Some(result) =
+                            self.compile_shared_invoke(shared.as_ref(), &target_actuals)
+                    {
+                        return Some(result);
+                    }
                     self.compile_expression(
                         *target,
                         target_owner.result.0 as usize,
@@ -3118,21 +3229,38 @@ fn compile_direct_result_summaries(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
+    let supported = targets
+        .into_iter()
+        .filter(|target| {
+            let Some(owner) = project.owners.get(target.0 as usize) else {
+                return false;
+            };
+            direct_result_summary_supported(
+                project,
+                *target,
+                owner.result.0 as usize,
+                &mut BTreeSet::new(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut order = Vec::with_capacity(supported.len());
+    let mut states = vec![0_u8; project.owners.len()];
+    for target in supported.iter().copied() {
+        append_direct_summary_order(project, target, &supported, &mut states, &mut order);
+    }
     let mut summaries = vec![None; project.owners.len()];
-    for target in targets {
+    for target in order {
         let Some(owner) = project.owners.get(target.0 as usize) else {
             continue;
         };
         let result = owner.result.0 as usize;
-        if !direct_result_summary_supported(project, target, result, &mut BTreeSet::new()) {
-            continue;
-        }
         let actuals = (0..owner.formal_count)
             .map(PlannedSummaryActual::Formal)
             .collect::<Vec<_>>();
         let mut compiler = DirectSummaryPlanCompiler {
             builder,
             project,
+            summaries: &summaries,
             nodes: Vec::new(),
             inputs: Vec::new(),
         };
@@ -3152,6 +3280,63 @@ fn compile_direct_result_summaries(
         }));
     }
     summaries
+}
+
+fn append_direct_summary_order(
+    project: &KernelProjectProgramInput,
+    target: KernelOwnerId,
+    supported: &BTreeSet<KernelOwnerId>,
+    states: &mut [u8],
+    order: &mut Vec<KernelOwnerId>,
+) {
+    let index = target.0 as usize;
+    match states.get(index).copied() {
+        Some(2) => return,
+        Some(1) | None => return,
+        Some(_) => {}
+    }
+    states[index] = 1;
+    if let Some(owner) = project.owners.get(index) {
+        let mut dependencies = BTreeSet::new();
+        collect_direct_summary_call_targets(
+            owner,
+            owner.result.0 as usize,
+            &mut BTreeSet::new(),
+            &mut dependencies,
+        );
+        for dependency in dependencies {
+            if supported.contains(&dependency) {
+                append_direct_summary_order(project, dependency, supported, states, order);
+            }
+        }
+    }
+    states[index] = 2;
+    order.push(target);
+}
+
+fn collect_direct_summary_call_targets(
+    owner: &KernelOwnerProgramInput,
+    expression: usize,
+    active: &mut BTreeSet<usize>,
+    targets: &mut BTreeSet<KernelOwnerId>,
+) {
+    if !active.insert(expression) {
+        return;
+    }
+    let Some(node) = owner.nodes.get(expression) else {
+        active.remove(&expression);
+        return;
+    };
+    if let KernelOwnerNodeKind::UserCall { target, .. } = node.kind {
+        targets.insert(target);
+    }
+    for edge in node.inputs.iter() {
+        let dependency = edge.expression.0 as usize;
+        if dependency < owner.nodes.len() {
+            collect_direct_summary_call_targets(owner, dependency, active, targets);
+        }
+    }
+    active.remove(&expression);
 }
 
 fn emit_compiled_direct_summary(
@@ -6024,10 +6209,13 @@ mod tests {
             external_expressions: Box::new([]),
             result: KernelExpressionId(3),
         };
-        let caller = KernelOwnerProgramInput {
+        let wrapper = KernelOwnerProgramInput {
             nodes: vec![
                 KernelOwnerNode {
-                    kind: KernelOwnerNodeKind::Tag("True".into()),
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
                     inputs: Box::new([]),
                     mode: FlowMode::Continuous,
                 },
@@ -6042,13 +6230,35 @@ mod tests {
                 },
             ]
             .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+        let caller = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Tag("True".into()),
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(1),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
             formal_count: 0,
             external_expressions: Box::new([]),
             result: KernelExpressionId(1),
         };
 
         let program = compile_project_program(&KernelProjectProgramInput {
-            owners: vec![callee, caller].into_boxed_slice(),
+            owners: vec![callee, wrapper, caller].into_boxed_slice(),
         })
         .unwrap();
         assert_eq!(program.compile_work().invocation_frames, 0);
@@ -6057,10 +6267,11 @@ mod tests {
                 operation.as_ref(),
                 crate::KernelOperation::SummaryCall { program, .. }
                     if program.nodes.iter().any(|node| matches!(node, KernelSummaryNode::Select { .. }))
+                        && program.nodes.iter().all(|node| !matches!(node, KernelSummaryNode::Invoke { .. }))
             )
-        }));
+        }), "the tiny selector callee should remain inline below the sharing threshold");
         assert_eq!(
-            program.solve().unwrap().definitions[1].result.ty,
+            program.solve().unwrap().definitions[2].result.ty,
             Type::Number
         );
     }
@@ -6440,7 +6651,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_result_summary_inlines_nested_pure_calls() {
+    fn structural_result_summary_inlines_trivial_nested_bytecode() {
         let identity = KernelOwnerProgramInput {
             nodes: vec![KernelOwnerNode {
                 kind: KernelOwnerNodeKind::FormalRead {
@@ -6576,6 +6787,13 @@ mod tests {
             Arc::ptr_eq(number_summary, text_summary),
             "compatible calls must share one immutable result-summary program",
         );
+        assert!(
+            number_summary
+                .nodes
+                .iter()
+                .all(|node| !matches!(node, KernelSummaryNode::Invoke { .. })),
+            "a one-node identity summary must stay inline",
+        );
         let artifact = program.solve().unwrap();
         let Type::Object(result) = &artifact.definitions[2].result.ty else {
             panic!("caller result must be a record")
@@ -6588,6 +6806,124 @@ mod tests {
         };
         assert_eq!(number.fields["value"], Type::Number);
         assert_eq!(text.fields["value"], Type::Text);
+    }
+
+    #[test]
+    fn structural_result_summary_invokes_large_shared_nested_bytecode() {
+        let field_count = SHARED_SUMMARY_MIN_NODES - 1;
+        let mut callee_nodes = (0..field_count)
+            .map(|_| KernelOwnerNode {
+                kind: KernelOwnerNodeKind::FormalRead {
+                    formal: 0,
+                    fields: Box::new([]),
+                },
+                inputs: Box::new([]),
+                mode: FlowMode::Continuous,
+            })
+            .collect::<Vec<_>>();
+        callee_nodes.push(KernelOwnerNode {
+            kind: KernelOwnerNodeKind::Record { tag: None },
+            inputs: (0..field_count)
+                .map(|index| {
+                    edge(
+                        KernelOwnerEdgeRole::RecordField {
+                            name: format!("value_{index}").into(),
+                            spread: false,
+                        },
+                        u32::try_from(index).expect("test field index exceeds u32"),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            mode: FlowMode::Continuous,
+        });
+        let callee = KernelOwnerProgramInput {
+            nodes: callee_nodes.into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(field_count as u32),
+        };
+        let wrapper = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+        let caller = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(1),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+
+        let program = compile_project_program(&KernelProjectProgramInput {
+            owners: vec![callee, wrapper, caller].into_boxed_slice(),
+        })
+        .unwrap();
+        assert!(program.compile_work().summary_invoke_nodes >= 1);
+        let wrapper_program = program
+            .component()
+            .operations
+            .iter()
+            .find_map(|operation| match operation.as_ref() {
+                crate::KernelOperation::SummaryCall { program, .. }
+                    if program
+                        .nodes
+                        .iter()
+                        .any(|node| matches!(node, KernelSummaryNode::Invoke { .. })) =>
+                {
+                    Some(program)
+                }
+                _ => None,
+            })
+            .expect("the wrapper summary must invoke the large shared callee");
+        assert_eq!(
+            wrapper_program.nodes.len(),
+            2,
+            "the wrapper should contain only its input and one shared invocation",
+        );
+
+        let artifact = program.solve().unwrap();
+        let Type::Object(result) = &artifact.definitions[2].result.ty else {
+            panic!("caller result must be the shared record")
+        };
+        assert_eq!(result.fields.len(), field_count);
+        assert!(result.fields.values().all(|field| *field == Type::Number));
     }
 
     #[test]

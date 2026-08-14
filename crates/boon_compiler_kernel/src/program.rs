@@ -109,6 +109,16 @@ pub enum KernelSummaryNode {
         inputs: Box<[KernelSummaryValueId]>,
         values: Box<[KernelSummaryValueId]>,
     },
+    /// One call into immutable bytecode owned by another definition. Callee
+    /// input slots resolve their mapped caller values lazily, while the callee
+    /// receives its own generation-stamped scratch frame. This preserves
+    /// unselected-branch laziness and keeps each definition's result program
+    /// unique instead of recursively embedding the callee graph into every
+    /// caller summary.
+    Invoke {
+        program: Arc<KernelSummaryProgram>,
+        inputs: Box<[KernelSummaryValueId]>,
+    },
     Select {
         selector: KernelSummaryValueId,
         arms: Box<[KernelSummarySelectArm]>,

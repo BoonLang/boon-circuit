@@ -144,7 +144,7 @@ struct ComponentSolver {
     schedule_seen: Vec<u32>,
     schedule_generation: u32,
     schedule_stack: Vec<TypeVariableId>,
-    summary_scratch: SummaryScratch,
+    summary_scratch_pool: Vec<SummaryScratch>,
     resolve_cache_seen: Vec<u32>,
     resolve_cache_values: Vec<TypeTermId>,
     resolve_active: Vec<u32>,
@@ -326,7 +326,7 @@ impl ComponentSolver {
             schedule_seen: vec![0; variable_count],
             schedule_generation: 0,
             schedule_stack: Vec::new(),
-            summary_scratch: SummaryScratch::default(),
+            summary_scratch_pool: Vec::new(),
             resolve_cache_seen: Vec::new(),
             resolve_cache_values: Vec::new(),
             resolve_active: vec![0; variable_count],
@@ -1058,19 +1058,75 @@ impl ComponentSolver {
         inputs: &[KernelSummaryCallInput],
     ) -> Result<(), KernelSolveError> {
         self.work.summary_call_activations = self.work.summary_call_activations.saturating_add(1);
-        let mut scratch = std::mem::take(&mut self.summary_scratch);
-        scratch.begin(program.nodes.len(), self.program.terms.absent());
-        let result = self.evaluate_summary_value(program, inputs, program.result, &mut scratch);
-        self.summary_scratch = scratch;
-        let result = result?;
+        let result = self.evaluate_summary_program(program, inputs)?;
         self.replace_binding(output, result, true);
         Ok(())
+    }
+
+    fn evaluate_summary_program(
+        &mut self,
+        program: &KernelSummaryProgram,
+        inputs: &[KernelSummaryCallInput],
+    ) -> Result<TypeTermId, KernelSolveError> {
+        let mut resolve_input = |solver: &mut ComponentSolver, input_index: u32| {
+            solver.evaluate_summary_call_input(inputs, input_index)
+        };
+        self.evaluate_summary_program_with(program, &mut resolve_input)
+    }
+
+    fn evaluate_summary_program_with(
+        &mut self,
+        program: &KernelSummaryProgram,
+        resolve_input: &mut dyn FnMut(
+            &mut ComponentSolver,
+            u32,
+        ) -> Result<TypeTermId, KernelSolveError>,
+    ) -> Result<TypeTermId, KernelSolveError> {
+        let mut scratch = self.summary_scratch_pool.pop().unwrap_or_default();
+        scratch.begin(program.nodes.len(), self.program.terms.absent());
+        let result =
+            self.evaluate_summary_value(program, resolve_input, program.result, &mut scratch);
+        self.summary_scratch_pool.push(scratch);
+        result
+    }
+
+    fn evaluate_summary_call_input(
+        &mut self,
+        inputs: &[KernelSummaryCallInput],
+        input_index: u32,
+    ) -> Result<TypeTermId, KernelSolveError> {
+        let input = inputs.get(input_index as usize).ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel summary input {input_index} is out of range for {} inputs",
+                inputs.len()
+            ))
+        })?;
+        match input {
+            KernelSummaryCallInput::Term(term) => Ok(self.resolve_term_head(*term)),
+            KernelSummaryCallInput::Projection { provider, steps } => {
+                if steps.is_empty() {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel summary input {input_index} has an empty projection program"
+                    )));
+                }
+                let mut provider = *provider;
+                for step in steps {
+                    self.project(provider, step.field, step.consumer);
+                    provider = step.consumer;
+                }
+                let provider = self.program.terms.variable(provider);
+                Ok(self.resolve_term_head(provider))
+            }
+        }
     }
 
     fn evaluate_summary_value(
         &mut self,
         program: &KernelSummaryProgram,
-        inputs: &[KernelSummaryCallInput],
+        resolve_input: &mut dyn FnMut(
+            &mut ComponentSolver,
+            u32,
+        ) -> Result<TypeTermId, KernelSolveError>,
         value: crate::KernelSummaryValueId,
         scratch: &mut SummaryScratch,
     ) -> Result<TypeTermId, KernelSolveError> {
@@ -1094,35 +1150,11 @@ impl ComponentSolver {
         scratch.active[index] = generation;
         self.work.summary_node_evaluations = self.work.summary_node_evaluations.saturating_add(1);
         let evaluated = (|| match node {
-            KernelSummaryNode::Input(input_index) => {
-                let input = inputs.get(*input_index as usize).ok_or_else(|| {
-                    KernelSolveError::new(format!(
-                        "kernel summary input {input_index} is out of range for {} inputs",
-                        inputs.len()
-                    ))
-                })?;
-                match input {
-                    KernelSummaryCallInput::Term(term) => Ok(self.resolve_term_head(*term)),
-                    KernelSummaryCallInput::Projection { provider, steps } => {
-                        if steps.is_empty() {
-                            return Err(KernelSolveError::new(format!(
-                                "kernel summary input {input_index} has an empty projection program"
-                            )));
-                        }
-                        let mut provider = *provider;
-                        for step in steps {
-                            self.project(provider, step.field, step.consumer);
-                            provider = step.consumer;
-                        }
-                        let provider = self.program.terms.variable(provider);
-                        Ok(self.resolve_term_head(provider))
-                    }
-                }
-            }
+            KernelSummaryNode::Input(input_index) => resolve_input(self, *input_index),
             KernelSummaryNode::Term(term) => Ok(*term),
             KernelSummaryNode::Projection { provider, fields } => {
                 let mut provider =
-                    self.evaluate_summary_value(program, inputs, *provider, scratch)?;
+                    self.evaluate_summary_value(program, resolve_input, *provider, scratch)?;
                 for field in fields {
                     provider = self.project_field(provider, *field).unwrap_or_else(|| {
                         let field = self.program.terms.name(*field);
@@ -1134,7 +1166,8 @@ impl ComponentSolver {
                 Ok(self.resolve_term_head(provider))
             }
             KernelSummaryNode::Constrain { value, expected } => {
-                let actual = self.evaluate_summary_value(program, inputs, *value, scratch)?;
+                let actual =
+                    self.evaluate_summary_value(program, resolve_input, *value, scratch)?;
                 self.unify_terms(actual, *expected);
                 Ok(self.resolve_term_head(actual))
             }
@@ -1143,9 +1176,9 @@ impl ComponentSolver {
                 result,
             } => {
                 for dependency in dependencies {
-                    self.evaluate_summary_value(program, inputs, *dependency, scratch)?;
+                    self.evaluate_summary_value(program, resolve_input, *dependency, scratch)?;
                 }
-                self.evaluate_summary_value(program, inputs, *result, scratch)
+                self.evaluate_summary_value(program, resolve_input, *result, scratch)
             }
             KernelSummaryNode::Collection {
                 kind,
@@ -1154,16 +1187,42 @@ impl ComponentSolver {
             } => {
                 let mut items = Vec::with_capacity(item_values.len());
                 for value in item_values {
-                    items.push(self.evaluate_summary_value(program, inputs, *value, scratch)?);
+                    items.push(self.evaluate_summary_value(
+                        program,
+                        resolve_input,
+                        *value,
+                        scratch,
+                    )?);
                 }
                 let mut values = Vec::with_capacity(map_values.len());
                 for value in map_values {
-                    values.push(self.evaluate_summary_value(program, inputs, *value, scratch)?);
+                    values.push(self.evaluate_summary_value(
+                        program,
+                        resolve_input,
+                        *value,
+                        scratch,
+                    )?);
                 }
                 Ok(self.collection_type(*kind, &items, &values))
             }
+            KernelSummaryNode::Invoke {
+                program: nested,
+                inputs: input_values,
+            } => {
+                let mut resolve_nested_input = |solver: &mut ComponentSolver, input_index: u32| {
+                    let value = input_values.get(input_index as usize).ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "nested kernel summary input {input_index} is out of range for {} inputs",
+                                input_values.len()
+                            ))
+                        })?;
+                    solver.evaluate_summary_value(program, resolve_input, *value, scratch)
+                };
+                self.evaluate_summary_program_with(nested, &mut resolve_nested_input)
+            }
             KernelSummaryNode::Select { selector, arms } => {
-                let selector = self.evaluate_summary_value(program, inputs, *selector, scratch)?;
+                let selector =
+                    self.evaluate_summary_value(program, resolve_input, *selector, scratch)?;
                 let selector = self.resolve_term(selector);
                 let singleton = matches!(
                     self.program.terms.term(selector),
@@ -1174,8 +1233,12 @@ impl ComponentSolver {
                         if !self.pattern_accepts(selector, &arm.pattern) {
                             continue;
                         }
-                        let candidate =
-                            self.evaluate_summary_value(program, inputs, arm.output, scratch)?;
+                        let candidate = self.evaluate_summary_value(
+                            program,
+                            resolve_input,
+                            arm.output,
+                            scratch,
+                        )?;
                         let candidate = self.resolve_term(candidate);
                         if !matches!(self.program.terms.term(candidate), TypeTerm::Absent) {
                             return Ok(candidate);
@@ -1186,7 +1249,7 @@ impl ComponentSolver {
                 let mut candidates = Vec::new();
                 for arm in arms {
                     let candidate =
-                        self.evaluate_summary_value(program, inputs, arm.output, scratch)?;
+                        self.evaluate_summary_value(program, resolve_input, arm.output, scratch)?;
                     let candidate = self.resolve_term(candidate);
                     if matches!(self.program.terms.term(candidate), TypeTerm::Absent) {
                         continue;
@@ -1200,14 +1263,22 @@ impl ComponentSolver {
                 for entry in entries {
                     match entry {
                         KernelSummaryRecordEntry::Field { name, value } => {
-                            let value =
-                                self.evaluate_summary_value(program, inputs, *value, scratch)?;
+                            let value = self.evaluate_summary_value(
+                                program,
+                                resolve_input,
+                                *value,
+                                scratch,
+                            )?;
                             let value = self.resolve_term_head(value);
                             insert_record_field(&mut fields, *name, value);
                         }
                         KernelSummaryRecordEntry::Spread { value } => {
-                            let value =
-                                self.evaluate_summary_value(program, inputs, *value, scratch)?;
+                            let value = self.evaluate_summary_value(
+                                program,
+                                resolve_input,
+                                *value,
+                                scratch,
+                            )?;
                             let value = self.resolve_term_head(value);
                             self.merge_record_spread(value, &mut fields)?;
                         }
@@ -2036,6 +2107,101 @@ mod tests {
     }
 
     #[test]
+    fn nested_definition_summary_preserves_unselected_input_laziness() {
+        let mut builder = ComponentProgramBuilder::new();
+        let selector = builder.new_authoritative_provider();
+        let actual = builder.new_contextual_hole();
+        let output = builder.new_authoritative_provider();
+        let true_tag = builder.terms_mut().variant_tag("True");
+        let true_type = builder.terms_mut().variant_set([true_tag]);
+        builder.add_publish(selector, [true_type], PublishMode::Replace);
+
+        let text = builder.terms().text();
+        let number = builder.terms().number();
+        let child = Arc::new(KernelSummaryProgram {
+            nodes: vec![
+                KernelSummaryNode::Input(0),
+                KernelSummaryNode::Input(1),
+                KernelSummaryNode::Term(text),
+                KernelSummaryNode::Term(number),
+                KernelSummaryNode::Constrain {
+                    value: crate::KernelSummaryValueId(1),
+                    expected: number,
+                },
+                KernelSummaryNode::Sequence {
+                    inputs: vec![crate::KernelSummaryValueId(4)].into_boxed_slice(),
+                    result: crate::KernelSummaryValueId(3),
+                },
+                KernelSummaryNode::Select {
+                    selector: crate::KernelSummaryValueId(0),
+                    arms: vec![
+                        KernelSummarySelectArm {
+                            pattern: KernelPattern::Tag {
+                                name: "True".into(),
+                                fields: Box::new([]),
+                            },
+                            output: crate::KernelSummaryValueId(2),
+                        },
+                        KernelSummarySelectArm {
+                            pattern: KernelPattern::Wildcard,
+                            output: crate::KernelSummaryValueId(5),
+                        },
+                    ]
+                    .into_boxed_slice(),
+                },
+            ]
+            .into_boxed_slice(),
+            result: crate::KernelSummaryValueId(6),
+        });
+        let parent = Arc::new(KernelSummaryProgram {
+            nodes: vec![
+                KernelSummaryNode::Input(0),
+                KernelSummaryNode::Input(1),
+                KernelSummaryNode::Invoke {
+                    program: child,
+                    inputs: vec![
+                        crate::KernelSummaryValueId(0),
+                        crate::KernelSummaryValueId(1),
+                    ]
+                    .into_boxed_slice(),
+                },
+            ]
+            .into_boxed_slice(),
+            result: crate::KernelSummaryValueId(2),
+        });
+        let selector = builder.variable_term(selector);
+        let projected = builder.new_variable();
+        let value = builder.terms_mut().intern_name("value");
+        builder.add_summary_call(
+            output,
+            parent,
+            [
+                KernelSummaryCallInput::Term(selector),
+                KernelSummaryCallInput::Projection {
+                    provider: actual,
+                    steps: vec![crate::KernelSummaryProjectionStep {
+                        field: Some(value),
+                        consumer: projected,
+                    }]
+                    .into_boxed_slice(),
+                },
+            ],
+        );
+        let actual_output = builder.add_output(actual, FlowMode::Continuous);
+        let result_output = builder.add_output(output, FlowMode::Continuous);
+
+        let artifact = solve_component(builder.finish()).unwrap();
+        assert!(matches!(
+            artifact.output(actual_output).unwrap().flow_type.ty,
+            Type::Var(_)
+        ));
+        assert_eq!(
+            artifact.output(result_output).unwrap().flow_type.ty,
+            Type::Text
+        );
+    }
+
+    #[test]
     fn demanded_summary_projection_shapes_its_private_formal_requirement() {
         let mut builder = ComponentProgramBuilder::new();
         let actual = builder.new_contextual_hole();
@@ -2084,6 +2250,63 @@ mod tests {
         assert_eq!(
             artifact.output(result_output).unwrap().flow_type.ty,
             Type::Text
+        );
+    }
+
+    #[test]
+    fn nested_definition_summary_reuses_bytecode_and_preserves_requirement_backflow() {
+        let mut builder = ComponentProgramBuilder::new();
+        let actual = builder.new_contextual_hole();
+        let output = builder.new_authoritative_provider();
+        let projected = builder.new_variable();
+        let field = builder.terms_mut().intern_name("value");
+        let number = builder.terms().number();
+        let callee = Arc::new(KernelSummaryProgram {
+            nodes: vec![
+                KernelSummaryNode::Input(0),
+                KernelSummaryNode::Constrain {
+                    value: crate::KernelSummaryValueId(0),
+                    expected: number,
+                },
+            ]
+            .into_boxed_slice(),
+            result: crate::KernelSummaryValueId(1),
+        });
+        let caller = Arc::new(KernelSummaryProgram {
+            nodes: vec![
+                KernelSummaryNode::Input(0),
+                KernelSummaryNode::Invoke {
+                    program: callee,
+                    inputs: vec![crate::KernelSummaryValueId(0)].into_boxed_slice(),
+                },
+            ]
+            .into_boxed_slice(),
+            result: crate::KernelSummaryValueId(1),
+        });
+        builder.add_summary_call(
+            output,
+            caller,
+            [KernelSummaryCallInput::Projection {
+                provider: actual,
+                steps: vec![crate::KernelSummaryProjectionStep {
+                    field: Some(field),
+                    consumer: projected,
+                }]
+                .into_boxed_slice(),
+            }],
+        );
+        let actual_output = builder.add_output(actual, FlowMode::Continuous);
+        let result_output = builder.add_output(output, FlowMode::Continuous);
+
+        let artifact = solve_component(builder.finish()).unwrap();
+        let Type::Object(actual) = &artifact.output(actual_output).unwrap().flow_type.ty else {
+            panic!("nested summary requirement must shape the caller's private projection")
+        };
+        assert!(actual.open);
+        assert_eq!(actual.fields["value"], Type::Number);
+        assert_eq!(
+            artifact.output(result_output).unwrap().flow_type.ty,
+            Type::Number
         );
     }
 

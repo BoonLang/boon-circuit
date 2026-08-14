@@ -40,6 +40,26 @@ struct VariableCell {
     authoritative_provider: bool,
 }
 
+#[derive(Default)]
+struct SummaryScratch {
+    values: Vec<TypeTermId>,
+    value_seen: Vec<u32>,
+    active: Vec<u32>,
+    generation: u32,
+}
+
+impl SummaryScratch {
+    fn begin(&mut self, value_count: usize, placeholder: TypeTermId) {
+        self.generation =
+            next_generation(&mut self.generation, &mut self.value_seen, &mut self.active);
+        if self.values.len() < value_count {
+            self.values.resize(value_count, placeholder);
+            self.value_seen.resize(value_count, 0);
+            self.active.resize(value_count, 0);
+        }
+    }
+}
+
 /// Evaluate one compact component to quiescence.
 pub fn solve_component(program: ComponentProgram) -> Result<ComponentArtifact, KernelSolveError> {
     validate_single_writers(&program)?;
@@ -124,8 +144,7 @@ struct ComponentSolver {
     schedule_seen: Vec<u32>,
     schedule_generation: u32,
     schedule_stack: Vec<TypeVariableId>,
-    summary_memo: Vec<Option<TypeTermId>>,
-    summary_active: Vec<bool>,
+    summary_scratch: SummaryScratch,
     resolve_cache_seen: Vec<u32>,
     resolve_cache_values: Vec<TypeTermId>,
     resolve_active: Vec<u32>,
@@ -307,8 +326,7 @@ impl ComponentSolver {
             schedule_seen: vec![0; variable_count],
             schedule_generation: 0,
             schedule_stack: Vec::new(),
-            summary_memo: Vec::new(),
-            summary_active: Vec::new(),
+            summary_scratch: SummaryScratch::default(),
             resolve_cache_seen: Vec::new(),
             resolve_cache_values: Vec::new(),
             resolve_active: vec![0; variable_count],
@@ -1040,16 +1058,10 @@ impl ComponentSolver {
         inputs: &[KernelSummaryCallInput],
     ) -> Result<(), KernelSolveError> {
         self.work.summary_call_activations = self.work.summary_call_activations.saturating_add(1);
-        let mut memo = std::mem::take(&mut self.summary_memo);
-        memo.clear();
-        memo.resize(program.nodes.len(), None);
-        let mut active = std::mem::take(&mut self.summary_active);
-        active.clear();
-        active.resize(program.nodes.len(), false);
-        let result =
-            self.evaluate_summary_value(program, inputs, program.result, &mut memo, &mut active);
-        self.summary_memo = memo;
-        self.summary_active = active;
+        let mut scratch = std::mem::take(&mut self.summary_scratch);
+        scratch.begin(program.nodes.len(), self.program.terms.absent());
+        let result = self.evaluate_summary_value(program, inputs, program.result, &mut scratch);
+        self.summary_scratch = scratch;
         let result = result?;
         self.replace_binding(output, result, true);
         Ok(())
@@ -1060,26 +1072,26 @@ impl ComponentSolver {
         program: &KernelSummaryProgram,
         inputs: &[KernelSummaryCallInput],
         value: crate::KernelSummaryValueId,
-        memo: &mut [Option<TypeTermId>],
-        active: &mut [bool],
+        scratch: &mut SummaryScratch,
     ) -> Result<TypeTermId, KernelSolveError> {
         let index = value.0 as usize;
-        if let Some(value) = memo.get(index).copied().flatten() {
-            return Ok(value);
-        }
         let Some(node) = program.nodes.get(index) else {
             return Err(KernelSolveError::new(format!(
                 "kernel summary references unavailable value {}",
                 value.0
             )));
         };
-        if active[index] {
+        let generation = scratch.generation;
+        if scratch.value_seen[index] == generation {
+            return Ok(scratch.values[index]);
+        }
+        if scratch.active[index] == generation {
             return Err(KernelSolveError::new(format!(
                 "kernel summary contains a value cycle through {}",
                 value.0
             )));
         }
-        active[index] = true;
+        scratch.active[index] = generation;
         self.work.summary_node_evaluations = self.work.summary_node_evaluations.saturating_add(1);
         let evaluated = (|| match node {
             KernelSummaryNode::Input(input_index) => {
@@ -1110,7 +1122,7 @@ impl ComponentSolver {
             KernelSummaryNode::Term(term) => Ok(*term),
             KernelSummaryNode::Projection { provider, fields } => {
                 let mut provider =
-                    self.evaluate_summary_value(program, inputs, *provider, memo, active)?;
+                    self.evaluate_summary_value(program, inputs, *provider, scratch)?;
                 for field in fields {
                     provider = self.project_field(provider, *field).unwrap_or_else(|| {
                         let field = self.program.terms.name(*field);
@@ -1122,7 +1134,7 @@ impl ComponentSolver {
                 Ok(self.resolve_term_head(provider))
             }
             KernelSummaryNode::Constrain { value, expected } => {
-                let actual = self.evaluate_summary_value(program, inputs, *value, memo, active)?;
+                let actual = self.evaluate_summary_value(program, inputs, *value, scratch)?;
                 self.unify_terms(actual, *expected);
                 Ok(self.resolve_term_head(actual))
             }
@@ -1131,9 +1143,9 @@ impl ComponentSolver {
                 result,
             } => {
                 for dependency in dependencies {
-                    self.evaluate_summary_value(program, inputs, *dependency, memo, active)?;
+                    self.evaluate_summary_value(program, inputs, *dependency, scratch)?;
                 }
-                self.evaluate_summary_value(program, inputs, *result, memo, active)
+                self.evaluate_summary_value(program, inputs, *result, scratch)
             }
             KernelSummaryNode::Collection {
                 kind,
@@ -1142,18 +1154,16 @@ impl ComponentSolver {
             } => {
                 let mut items = Vec::with_capacity(item_values.len());
                 for value in item_values {
-                    items.push(self.evaluate_summary_value(program, inputs, *value, memo, active)?);
+                    items.push(self.evaluate_summary_value(program, inputs, *value, scratch)?);
                 }
                 let mut values = Vec::with_capacity(map_values.len());
                 for value in map_values {
-                    values
-                        .push(self.evaluate_summary_value(program, inputs, *value, memo, active)?);
+                    values.push(self.evaluate_summary_value(program, inputs, *value, scratch)?);
                 }
                 Ok(self.collection_type(*kind, &items, &values))
             }
             KernelSummaryNode::Select { selector, arms } => {
-                let selector =
-                    self.evaluate_summary_value(program, inputs, *selector, memo, active)?;
+                let selector = self.evaluate_summary_value(program, inputs, *selector, scratch)?;
                 let selector = self.resolve_term(selector);
                 let singleton = matches!(
                     self.program.terms.term(selector),
@@ -1165,7 +1175,7 @@ impl ComponentSolver {
                             continue;
                         }
                         let candidate =
-                            self.evaluate_summary_value(program, inputs, arm.output, memo, active)?;
+                            self.evaluate_summary_value(program, inputs, arm.output, scratch)?;
                         let candidate = self.resolve_term(candidate);
                         if !matches!(self.program.terms.term(candidate), TypeTerm::Absent) {
                             return Ok(candidate);
@@ -1176,7 +1186,7 @@ impl ComponentSolver {
                 let mut candidates = Vec::new();
                 for arm in arms {
                     let candidate =
-                        self.evaluate_summary_value(program, inputs, arm.output, memo, active)?;
+                        self.evaluate_summary_value(program, inputs, arm.output, scratch)?;
                     let candidate = self.resolve_term(candidate);
                     if matches!(self.program.terms.term(candidate), TypeTerm::Absent) {
                         continue;
@@ -1191,13 +1201,13 @@ impl ComponentSolver {
                     match entry {
                         KernelSummaryRecordEntry::Field { name, value } => {
                             let value =
-                                self.evaluate_summary_value(program, inputs, *value, memo, active)?;
+                                self.evaluate_summary_value(program, inputs, *value, scratch)?;
                             let value = self.resolve_term_head(value);
                             insert_record_field(&mut fields, *name, value);
                         }
                         KernelSummaryRecordEntry::Spread { value } => {
                             let value =
-                                self.evaluate_summary_value(program, inputs, *value, memo, active)?;
+                                self.evaluate_summary_value(program, inputs, *value, scratch)?;
                             let value = self.resolve_term_head(value);
                             self.merge_record_spread(value, &mut fields)?;
                         }
@@ -1213,9 +1223,10 @@ impl ComponentSolver {
                 }
             }
         })();
-        active[index] = false;
+        scratch.active[index] = 0;
         let evaluated = evaluated?;
-        memo[index] = Some(evaluated);
+        scratch.values[index] = evaluated;
+        scratch.value_seen[index] = generation;
         Ok(evaluated)
     }
 
@@ -2073,6 +2084,41 @@ mod tests {
         assert_eq!(
             artifact.output(result_output).unwrap().flow_type.ty,
             Type::Text
+        );
+    }
+
+    #[test]
+    fn summary_scratch_generations_isolate_call_occurrences() {
+        let mut builder = ComponentProgramBuilder::new();
+        let text_output = builder.new_authoritative_provider();
+        let number_output = builder.new_authoritative_provider();
+        let summary = Arc::new(KernelSummaryProgram {
+            nodes: vec![KernelSummaryNode::Input(0)].into_boxed_slice(),
+            result: crate::KernelSummaryValueId(0),
+        });
+        let text = builder.terms().text();
+        let number = builder.terms().number();
+        builder.add_summary_call(
+            text_output,
+            Arc::clone(&summary),
+            [KernelSummaryCallInput::Term(text)],
+        );
+        builder.add_summary_call(
+            number_output,
+            summary,
+            [KernelSummaryCallInput::Term(number)],
+        );
+        let text_output = builder.add_output(text_output, FlowMode::Continuous);
+        let number_output = builder.add_output(number_output, FlowMode::Continuous);
+
+        let artifact = solve_component(builder.finish()).unwrap();
+        assert_eq!(
+            artifact.output(text_output).unwrap().flow_type.ty,
+            Type::Text
+        );
+        assert_eq!(
+            artifact.output(number_output).unwrap().flow_type.ty,
+            Type::Number
         );
     }
 

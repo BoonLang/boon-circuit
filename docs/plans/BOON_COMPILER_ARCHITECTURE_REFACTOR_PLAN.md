@@ -2657,7 +2657,21 @@ large summary trees. A future collection cut must compile the map body once as
 compact guarded/loop bytecode or direct typed operations; it cannot inline the
 source-shaped callee tree into every summary activation.
 
-All 46 kernel tests and 77 non-ignored compiler tests pass. The complete
+The summary evaluator now owns one reusable generation-stamped dense scratch
+arena. Each activation advances a stamp and writes only demanded values; it no
+longer clears and resizes result and cycle-detection buffers across every node
+in the immutable summary program. This is especially important for lazy
+selectors, where unselected arm nodes must remain untouched. Two no-rebuild
+debug observations after the cut record kernel/solve times of 7.457/6.214 and
+7.813/6.480 seconds, compared with the immediate 8.118/6.698-second baseline.
+Three optimized samples record kernel times of 1,188.470, 1,102.121, and
+1,088.352 ms (median 1,102.121 ms). Complete parse plus SOURCE ABI plus kernel
+takes 1,307.426, 1,201.776, and 1,184.231 ms (median 1,201.776 ms); median solve
+is 866.832 ms. The two-job optimized rebuild took 2m00s. Work counts remain
+identical, and a dedicated regression proves that reused scratch storage cannot
+leak one call occurrence's value into the next.
+
+All 47 kernel tests and 77 non-ignored compiler tests pass. The complete
 NovyWave differential again reaches only the known
 `store.focused_control_label` HOLD expression 3 mode mismatch
 (`PresentOrAbsent` versus the current checker's `Continuous`), with no earlier

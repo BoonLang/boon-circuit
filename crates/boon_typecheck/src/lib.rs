@@ -19535,6 +19535,23 @@ pub fn check_project_runtime_program_profiled_with_external_types(
 pub fn project_source_payload_abi_types(
     program: &ProjectSyntaxSnapshot,
 ) -> Result<BTreeMap<String, Type>, Box<[TypeDiagnostic]>> {
+    let (payloads, diagnostics) = project_source_payload_abi_types_and_diagnostics(program);
+    if diagnostics.is_empty() {
+        Ok(payloads)
+    } else {
+        Err(diagnostics)
+    }
+}
+
+/// Projects SOURCE payload ABI rows and their syntax/host-contract diagnostics
+/// without running either type solver.
+///
+/// The dense compiler consumes both channels in one diagnostics product: an
+/// invalid host-port declaration must not prevent unrelated SOURCE sites from
+/// receiving their deterministic payload shape.
+pub fn project_source_payload_abi_types_and_diagnostics(
+    program: &ProjectSyntaxSnapshot,
+) -> (BTreeMap<String, Type>, Box<[TypeDiagnostic]>) {
     let program = TypecheckSyntaxProgram::UnitNative(program.clone());
     let source_sites = syntax_source_sites(&program);
     let source_paths = source_sites
@@ -19543,15 +19560,141 @@ pub fn project_source_payload_abi_types(
         .collect::<BTreeSet<_>>();
     let source_payload_lookup = SourcePayloadPathLookup::new(&source_paths);
     let (host_ports, diagnostics) = host_port_table(&program, &source_payload_lookup);
-    if !diagnostics.is_empty() {
-        return Err(diagnostics.into_boxed_slice());
-    }
-    Ok(
+    (
         source_payload_shape_table(&program, &source_sites, &source_payload_lookup, &host_ports)
             .into_iter()
             .map(|entry| (entry.source_path, entry.payload_type))
             .collect(),
+        diagnostics.into_boxed_slice(),
     )
+}
+
+/// Validates host-port source/output identity and output payload contracts
+/// from parser syntax plus already-solved public output types.
+///
+/// This pass owns no inference state. It is the project-level ABI companion
+/// used by the dense diagnostics product.
+pub fn project_host_output_abi_diagnostics(
+    program: &ProjectSyntaxSnapshot,
+    outputs: &[(String, Type)],
+) -> Box<[TypeDiagnostic]> {
+    let program = TypecheckSyntaxProgram::UnitNative(program.clone());
+    let source_sites = syntax_source_sites(&program);
+    let source_paths = source_sites
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<BTreeSet<_>>();
+    let source_lookup = SourcePayloadPathLookup::new(&source_paths);
+    let (host_ports, _) = host_port_table(&program, &source_lookup);
+    let source_count = |path: &str| {
+        source_sites
+            .iter()
+            .filter(|source| source.path == path)
+            .count()
+    };
+    let output_count = |name: &str| outputs.iter().filter(|(output, _)| output == name).count();
+    let output_type = |name: &str| {
+        outputs
+            .iter()
+            .find_map(|(output, ty)| (output == name).then_some(ty))
+    };
+    let mut diagnostics = Vec::new();
+    let mut resolution_error = None;
+    if let Some(http) = &host_ports.http {
+        for path in
+            std::iter::once(http.request_source.as_str()).chain(http.disconnect_source.as_deref())
+        {
+            let count = source_count(path);
+            if count != 1 {
+                resolution_error = Some(format!(
+                    "host source \u{60}{path}\u{60} resolves to {count} exact checked source identities"
+                ));
+                break;
+            }
+        }
+        if resolution_error.is_none() {
+            let count = output_count(&http.response_output);
+            if count != 1 {
+                if count == 0 {
+                    diagnostics.push(diagnostic_at_line(
+                        http.line,
+                        format!(
+                            "host port \u{60}http.response\u{60} references missing output root \u{60}{}\u{60}",
+                            http.response_output
+                        ),
+                    ));
+                }
+                resolution_error = Some(format!(
+                    "host output \u{60}{}\u{60} resolves to {count} exact checked output identities",
+                    http.response_output
+                ));
+            }
+        }
+        if let Some(ty) = output_type(&http.response_output)
+            && !http_response_type_is_valid(ty)
+        {
+            diagnostics.push(diagnostic_at_line(
+                http.line,
+                format!(
+                    "host port \u{60}http.response\u{60} output \u{60}{}\u{60} must be exactly \u{60}{{ status: Number, body: Bytes }}\u{60} or \u{60}{{ status: Number, headers: List<{{ name: Text, value: Text|Bytes }}>, body: Bytes }}\u{60}; found {}",
+                    http.response_output,
+                    boon_facing_type_label(ty)
+                ),
+            ));
+        }
+    }
+    if let Some(websocket) = &host_ports.websocket {
+        if resolution_error.is_none() {
+            for path in [
+                websocket.open_source.as_str(),
+                websocket.message_source.as_str(),
+                websocket.close_source.as_str(),
+                websocket.error_source.as_str(),
+            ] {
+                let count = source_count(path);
+                if count != 1 {
+                    resolution_error = Some(format!(
+                        "host source \u{60}{path}\u{60} resolves to {count} exact checked source identities"
+                    ));
+                    break;
+                }
+            }
+        }
+        if resolution_error.is_none() {
+            let count = output_count(&websocket.actions_output);
+            if count != 1 {
+                if count == 0 {
+                    diagnostics.push(diagnostic_at_line(
+                        websocket.line,
+                        format!(
+                            "host port \u{60}websocket.actions\u{60} references missing output root \u{60}{}\u{60}",
+                            websocket.actions_output
+                        ),
+                    ));
+                }
+                resolution_error = Some(format!(
+                    "host output \u{60}{}\u{60} resolves to {count} exact checked output identities",
+                    websocket.actions_output
+                ));
+            }
+        }
+        if let Some(ty) = output_type(&websocket.actions_output)
+            && !websocket_actions_type_is_valid(ty)
+        {
+            diagnostics.push(diagnostic_at_line(
+                websocket.line,
+                format!(
+                    "host port \u{60}websocket.actions\u{60} output \u{60}{}\u{60} must be a list of closed generic WebSocket action envelopes; found {}",
+                    websocket.actions_output,
+                    boon_facing_type_label(ty)
+                ),
+            ));
+        }
+    }
+    if let Some(error) = resolution_error {
+        diagnostics.push(diagnostic_at_line(1, error));
+    }
+    diagnostics.into_boxed_slice()
 }
 
 fn check_program_profiled_syntax(
@@ -30543,6 +30686,18 @@ impl RenderConstructorContract {
 
 pub fn is_registered_element_constructor(function: &str) -> bool {
     is_registered_render_constructor(function) && !matches!(function, "Document/new" | "Scene/new")
+}
+
+/// Returns the project-level render-slot type diagnostic without constructing
+/// checked rows or running inference.
+pub fn project_render_slot_type_diagnostic(slot_name: &str, actual_type: &Type) -> Option<String> {
+    (!RenderContractRegistry::default().slot_accepts_type(slot_name, actual_type)).then(|| {
+        if type_contains_absence(actual_type) {
+            "\u{60}SKIP\u{60} cannot be used as a render value".to_owned()
+        } else {
+            render_slot_type_error(slot_name, actual_type)
+        }
+    })
 }
 
 fn type_accepts_true_false(ty: &Type) -> bool {

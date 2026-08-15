@@ -1,7 +1,7 @@
 use crate::{
     CheckedCompileRequest, CheckedSourceFromSource, CompiledSealedMachinePlanFromSource,
     CompilerDiagnostics, CompilerResult, CompilerSourceUnit, checked_source_from_owner_assembly,
-    compiler_diagnostics_from_owner_aggregate, finish_checked_machine_plan_with_cancellation,
+    finish_checked_machine_plan_with_cancellation, kernel_oracle::compiler_diagnostics_from_kernel,
 };
 use boon_compilation_db::{
     RequestAbortReason, RequestEvaluationStats, RequestEvaluatorGraph, RequestFamily,
@@ -2225,15 +2225,11 @@ impl CompilerSession {
         }
         if intent == CompileIntent::Diagnostics {
             if state.diagnostics.is_none() {
-                let (parsed, aggregate, parse_work, parse_ms, typecheck_ms) =
-                    parse_project_diagnostics_snapshot(state)?;
-                state.diagnostics = Some(compiler_diagnostics_from_owner_aggregate(
-                    parsed,
-                    &aggregate,
-                    parse_work,
-                    parse_ms,
-                    typecheck_ms,
-                )?);
+                let (parsed, parse_work, parse_ms) = parse_project_syntax_snapshot(state)?;
+                state.diagnostics = Some(
+                    compiler_diagnostics_from_kernel(parsed, parse_work, parse_ms)
+                        .map_err(session_error)?,
+                );
             }
             if cancellation.is_canceled() {
                 state.diagnostics = None;
@@ -2673,6 +2669,7 @@ fn parse_project_snapshot(
     Ok((project, assembly, work, parse_ms, typecheck_ms))
 }
 
+#[cfg(test)]
 fn parse_project_diagnostics_snapshot(
     state: &mut ProjectState,
 ) -> CompilerResult<(
@@ -9515,7 +9512,7 @@ mod tests {
         );
         {
             let state = session.projects.get(&project).unwrap();
-            assert_eq!(state.project_diagnostic_facts_requests.request_count(), 1);
+            assert_eq!(state.project_diagnostic_facts_requests.request_count(), 0);
             assert_eq!(
                 state.owner_body_inference_requests.request_count(),
                 state.owner_input_requests.request_count()
@@ -9531,9 +9528,15 @@ mod tests {
         }
         let state = session.projects.get_mut(&project).unwrap();
         let (_, aggregate, _, _, _) = parse_project_diagnostics_snapshot(state).unwrap();
-        assert_eq!(public_lean, aggregate.diagnostics());
+        assert_eq!(
+            normalized_invalid_oracle(&public_lean),
+            normalized_invalid_oracle(aggregate.diagnostics())
+        );
         let (_, assembly, _, _, _) = parse_project_snapshot(state).unwrap();
-        assert_eq!(public_lean, assembly.diagnostics());
+        assert_eq!(
+            normalized_invalid_oracle(&public_lean),
+            normalized_invalid_oracle(assembly.diagnostics())
+        );
         let legacy = crate::check_diagnostics_source(crate::CompilerCheckRequest::source_units(
             "RUN.bn",
             &units,

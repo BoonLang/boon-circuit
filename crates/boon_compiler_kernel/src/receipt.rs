@@ -755,7 +755,13 @@ pub(crate) fn alpha_normalize_callable_interface_and_diagnostics(
     formals: &[FlowType],
     result: &FlowType,
     diagnostics: &[KernelDiagnosticArtifact],
-) -> (Box<[FlowType]>, FlowType, Box<[KernelDiagnosticArtifact]>) {
+    diagnostic_values: &[Type],
+) -> (
+    Box<[FlowType]>,
+    FlowType,
+    Box<[KernelDiagnosticArtifact]>,
+    Box<[Type]>,
+) {
     let mut variables = BTreeMap::new();
     let mut next = 0;
     let formals = formals
@@ -766,7 +772,17 @@ pub(crate) fn alpha_normalize_callable_interface_and_diagnostics(
     let result = alpha_normalize_flow_type(result, &mut variables, &mut next);
     let mut diagnostics = diagnostics.to_vec();
     alpha_normalize_diagnostics(&mut diagnostics, &mut variables, &mut next);
-    (formals, result, diagnostics.into_boxed_slice())
+    let diagnostic_values = diagnostic_values
+        .iter()
+        .map(|ty| alpha_normalize_type(ty, &mut variables, &mut next))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    (
+        formals,
+        result,
+        diagnostics.into_boxed_slice(),
+        diagnostic_values,
+    )
 }
 
 fn alpha_normalize_diagnostics(
@@ -787,6 +803,11 @@ fn alpha_normalize_diagnostics(
             | KernelDiagnosticKind::InvalidNumberLiteral { .. }
             | KernelDiagnosticKind::InvalidBitsLiteral { .. }
             | KernelDiagnosticKind::ByteLiteralOutsideBytes
+            | KernelDiagnosticKind::DuplicateRecordField { .. }
+            | KernelDiagnosticKind::MissingPassedContext
+            | KernelDiagnosticKind::UnresolvedValue { .. }
+            | KernelDiagnosticKind::CallableUsedAsValue { .. }
+            | KernelDiagnosticKind::AmbiguousValue { .. }
             | KernelDiagnosticKind::UnresolvedCallable { .. }
             | KernelDiagnosticKind::AmbiguousCallable { .. }
             | KernelDiagnosticKind::PipeWithoutValueInput { .. }

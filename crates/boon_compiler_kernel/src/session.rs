@@ -449,6 +449,7 @@ impl KernelSession {
                     public_results,
                     callable_formals,
                     diagnostics,
+                    diagnostic_values: snapshot.diagnostic_values.clone(),
                     work: snapshot.work,
                 }))
             }

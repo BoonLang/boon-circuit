@@ -172,6 +172,13 @@ pub enum KernelOperation {
         left: TypeTermId,
         right: TypeTermId,
     },
+    /// One ordered whole-value lexical equation. Evaluation preserves true
+    /// equality/backflow, while the packed provider/consumer roles make its
+    /// initial dataflow direction explicit to the scheduler.
+    Alias {
+        provider: TypeVariableId,
+        consumer: TypeVariableId,
+    },
     Publish {
         output: TypeVariableId,
         inputs: Box<[TypeTermId]>,
@@ -182,6 +189,15 @@ pub enum KernelOperation {
     Projection {
         provider: TypeVariableId,
         field: Option<NameId>,
+        consumer: TypeVariableId,
+    },
+    /// Directional projection through one authored match pattern. This is a
+    /// single packed equation because ordinary field projections cannot
+    /// retain which tagged-variant arm introduced a payload binding.
+    PatternProjection {
+        provider: TypeVariableId,
+        pattern: KernelPattern,
+        fields: Box<[NameId]>,
         consumer: TypeVariableId,
     },
     /// Directional extraction of a collection's item authority. This is the
@@ -406,6 +422,10 @@ impl ComponentProgramBuilder {
         self.push_operation(KernelOperation::Unify { left, right })
     }
 
+    pub fn add_alias(&mut self, provider: TypeVariableId, consumer: TypeVariableId) -> OperationId {
+        self.push_operation(KernelOperation::Alias { provider, consumer })
+    }
+
     pub fn add_publish(
         &mut self,
         output: TypeVariableId,
@@ -470,6 +490,21 @@ impl ComponentProgramBuilder {
             });
             provider = next;
         }
+    }
+
+    pub fn add_pattern_projection_into(
+        &mut self,
+        provider: TypeVariableId,
+        pattern: KernelPattern,
+        fields: impl IntoIterator<Item = NameId>,
+        consumer: TypeVariableId,
+    ) -> OperationId {
+        self.push_operation(KernelOperation::PatternProjection {
+            provider,
+            pattern,
+            fields: fields.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            consumer,
+        })
     }
 
     pub fn add_select(
@@ -560,7 +595,7 @@ impl ComponentProgramBuilder {
         &mut self,
         module: Arc<ComponentProgram>,
         variables: Vec<TypeVariableId>,
-    ) {
+    ) -> u32 {
         assert_eq!(
             variables.len(),
             module.variables.len(),
@@ -579,6 +614,7 @@ impl ComponentProgramBuilder {
             names: Arc::from([]),
         });
         self.work_order.push(BuilderWorkItem::Residual(frame));
+        frame
     }
 
     pub fn finish(mut self) -> ComponentProgram {
@@ -808,7 +844,9 @@ pub(crate) fn operation_output(
         | KernelOperation::Record { output, .. }
         | KernelOperation::Collection { output, .. }
         | KernelOperation::SummaryCall { output, .. } => Some(*output),
-        KernelOperation::Projection { consumer, .. }
+        KernelOperation::Alias { consumer, .. }
+        | KernelOperation::Projection { consumer, .. }
+        | KernelOperation::PatternProjection { consumer, .. }
         | KernelOperation::CollectionItemProjection { consumer, .. } => Some(*consumer),
         KernelOperation::Unify { .. } => None,
     }?;
@@ -824,9 +862,9 @@ fn initial_operation_order(
     let mut writers = vec![None::<usize>; variable_count];
     for (operation, operation_outputs) in outputs.iter().enumerate() {
         for output in operation_outputs {
-            let slot = &mut writers[output.0 as usize];
-            if slot.is_none() {
-                *slot = Some(operation);
+            let writer = &mut writers[output.0 as usize];
+            if writer.is_none() {
+                *writer = Some(operation);
             }
         }
     }
@@ -897,6 +935,7 @@ fn link_residual_operation_terms(
             link_residual_term(*left, source, target, variables, term_cache, name_cache);
             link_residual_term(*right, source, target, variables, term_cache, name_cache);
         }
+        KernelOperation::Alias { .. } => {}
         KernelOperation::Publish { inputs, .. } => {
             for input in inputs {
                 link_residual_term(*input, source, target, variables, term_cache, name_cache);
@@ -905,6 +944,11 @@ fn link_residual_operation_terms(
         KernelOperation::Projection { field, .. } => {
             if let Some(name) = field {
                 link_residual_name(*name, source, target, name_cache);
+            }
+        }
+        KernelOperation::PatternProjection { fields, .. } => {
+            for field in fields {
+                link_residual_name(*field, source, target, name_cache);
             }
         }
         KernelOperation::CollectionItemProjection { .. } => {}
@@ -975,6 +1019,10 @@ fn collect_operation_variables(
             collect_term_variables(*left, terms, output);
             collect_term_variables(*right, terms, output);
         }
+        KernelOperation::Alias { provider, consumer } => {
+            output.insert(*provider);
+            output.insert(*consumer);
+        }
         KernelOperation::Publish {
             output: variable,
             inputs,
@@ -986,6 +1034,12 @@ fn collect_operation_variables(
             }
         }
         KernelOperation::Projection {
+            provider, consumer, ..
+        } => {
+            output.insert(*provider);
+            output.insert(*consumer);
+        }
+        KernelOperation::PatternProjection {
             provider, consumer, ..
         } => {
             output.insert(*provider);

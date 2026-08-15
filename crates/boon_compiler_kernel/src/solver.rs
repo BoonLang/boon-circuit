@@ -76,7 +76,9 @@ fn validate_single_writers(program: &ComponentProgram) -> Result<(), KernelSolve
      -> Result<(), KernelSolveError> {
         let output = match kind {
             KernelOperation::Publish { output, .. } => Some(*output),
-            KernelOperation::Projection { consumer, .. }
+            KernelOperation::Alias { consumer, .. }
+            | KernelOperation::Projection { consumer, .. }
+            | KernelOperation::PatternProjection { consumer, .. }
             | KernelOperation::CollectionItemProjection { consumer, .. } => Some(*consumer),
             KernelOperation::Select { output, .. }
             | KernelOperation::Record { output, .. }
@@ -493,9 +495,12 @@ impl ComponentSolver {
 
     fn count_operation_activation(&mut self, operation: &KernelOperation) {
         let counter = match operation {
-            KernelOperation::Unify { .. } => &mut self.work.unify_activations,
+            KernelOperation::Unify { .. } | KernelOperation::Alias { .. } => {
+                &mut self.work.unify_activations
+            }
             KernelOperation::Publish { .. } => &mut self.work.publish_activations,
             KernelOperation::Projection { .. }
+            | KernelOperation::PatternProjection { .. }
             | KernelOperation::CollectionItemProjection { .. } => {
                 &mut self.work.projection_activations
             }
@@ -514,6 +519,11 @@ impl ComponentSolver {
                 self.work.union_operations = self.work.union_operations.saturating_add(1);
                 self.unify_terms(*left, *right);
             }
+            KernelOperation::Alias { provider, consumer } => {
+                self.work.union_operations = self.work.union_operations.saturating_add(1);
+                let provider = self.program.terms.variable(*provider);
+                self.bind_equal(*consumer, provider);
+            }
             KernelOperation::Publish {
                 output,
                 inputs,
@@ -524,6 +534,12 @@ impl ComponentSolver {
                 field,
                 consumer,
             } => self.project(*provider, *field, *consumer),
+            KernelOperation::PatternProjection {
+                provider,
+                pattern,
+                fields,
+                consumer,
+            } => self.project_pattern(*provider, pattern, fields, *consumer),
             KernelOperation::CollectionItemProjection { provider, consumer } => {
                 self.project_collection_item(*provider, *consumer)
             }
@@ -566,6 +582,11 @@ impl ComponentSolver {
                 let right = self.import_frame_term(frame_index, frame, *right);
                 self.unify_terms(left, right);
             }
+            KernelOperation::Alias { provider, consumer } => {
+                self.work.union_operations = self.work.union_operations.saturating_add(1);
+                let provider = self.program.terms.variable(variable(*provider));
+                self.bind_equal(variable(*consumer), provider);
+            }
             KernelOperation::Publish {
                 output,
                 inputs,
@@ -578,6 +599,18 @@ impl ComponentSolver {
             } => {
                 let field = field.map(|field| self.import_frame_name(frame_index, frame, field));
                 self.project(variable(*provider), field, variable(*consumer));
+            }
+            KernelOperation::PatternProjection {
+                provider,
+                pattern,
+                fields,
+                consumer,
+            } => {
+                let fields = fields
+                    .iter()
+                    .map(|field| self.import_frame_name(frame_index, frame, *field))
+                    .collect::<Vec<_>>();
+                self.project_pattern(variable(*provider), pattern, &fields, variable(*consumer));
             }
             KernelOperation::CollectionItemProjection { provider, consumer } => {
                 self.project_collection_item(variable(*provider), variable(*consumer));
@@ -951,6 +984,134 @@ impl ComponentSolver {
                 let scaffold = self.program.terms.object([(field, consumer_term)], true);
                 self.bind_equal(provider, scaffold);
             }
+        }
+    }
+
+    fn project_pattern(
+        &mut self,
+        provider: TypeVariableId,
+        pattern: &KernelPattern,
+        fields: &[NameId],
+        consumer: TypeVariableId,
+    ) {
+        let provider = self.root(provider);
+        let authoritative = self.cells[provider.0 as usize].authoritative_provider;
+        let provider_term = self.program.terms.variable(provider);
+        let resolved = self.resolve_term_head(provider_term);
+        if authoritative && matches!(self.program.terms.term(resolved), TypeTerm::Variable(_)) {
+            return;
+        }
+        let projected = self
+            .narrow_pattern_payload(resolved, pattern)
+            .and_then(|payload| self.project_path_term(payload, fields));
+        match projected {
+            Some(projected) if authoritative => {
+                self.replace_binding(consumer, projected, true);
+            }
+            Some(projected) => self.bind_equal(consumer, projected),
+            None if authoritative => {
+                let missing = self.program.terms.unresolved_shape(format!(
+                    "authoritative provider does not satisfy pattern projection {pattern:?}"
+                ));
+                self.replace_binding(consumer, missing, true);
+            }
+            None => {
+                let consumer_term = self.program.terms.variable(consumer);
+                if let Some(scaffold) =
+                    self.pattern_projection_scaffold(pattern, fields, consumer_term)
+                {
+                    self.bind_equal(provider, scaffold);
+                }
+            }
+        }
+    }
+
+    fn narrow_pattern_payload(
+        &mut self,
+        provider: TypeTermId,
+        pattern: &KernelPattern,
+    ) -> Option<TypeTermId> {
+        let provider = self.resolve_term_head(provider);
+        match pattern {
+            KernelPattern::Tag { name, .. } => match self.program.terms.term(provider).clone() {
+                TypeTerm::VariantSet(variants) => {
+                    variants
+                        .into_vec()
+                        .into_iter()
+                        .find_map(|variant| match variant {
+                            VariantTerm::Tagged { tag, fields }
+                                if self.program.terms.name(tag) == name.as_ref() =>
+                            {
+                                Some(fields)
+                            }
+                            VariantTerm::Tag(tag)
+                                if self.program.terms.name(tag) == name.as_ref() =>
+                            {
+                                Some(self.program.terms.object([], false))
+                            }
+                            VariantTerm::Tag(_) | VariantTerm::Tagged { .. } => None,
+                        })
+                }
+                TypeTerm::Union(members) => {
+                    let matches = members
+                        .into_vec()
+                        .into_iter()
+                        .filter_map(|member| self.narrow_pattern_payload(member, pattern))
+                        .collect::<Vec<_>>();
+                    (!matches.is_empty()).then(|| self.program.terms.union(matches))
+                }
+                _ => None,
+            },
+            KernelPattern::Number
+                if matches!(self.program.terms.term(provider), TypeTerm::Number) =>
+            {
+                Some(provider)
+            }
+            KernelPattern::Text if matches!(self.program.terms.term(provider), TypeTerm::Text) => {
+                Some(provider)
+            }
+            KernelPattern::Bits { width } if matches!(self.program.terms.term(provider), TypeTerm::Bits(actual) if actual == width) => {
+                Some(provider)
+            }
+            KernelPattern::Wildcard | KernelPattern::Binding { .. } => Some(provider),
+            KernelPattern::Number
+            | KernelPattern::Text
+            | KernelPattern::Bits { .. }
+            | KernelPattern::Invalid => None,
+        }
+    }
+
+    fn project_path_term(
+        &mut self,
+        mut provider: TypeTermId,
+        fields: &[NameId],
+    ) -> Option<TypeTermId> {
+        for field in fields {
+            provider = self.project_field(provider, *field)?;
+        }
+        Some(provider)
+    }
+
+    fn pattern_projection_scaffold(
+        &mut self,
+        pattern: &KernelPattern,
+        fields: &[NameId],
+        consumer: TypeTermId,
+    ) -> Option<TypeTermId> {
+        let mut payload = consumer;
+        for field in fields.iter().rev() {
+            payload = self.program.terms.object([(*field, payload)], true);
+        }
+        match pattern {
+            KernelPattern::Tag { name, .. } => {
+                let variant = self.program.terms.tagged_variant(name, payload);
+                Some(self.program.terms.variant_set([variant]))
+            }
+            KernelPattern::Wildcard | KernelPattern::Binding { .. } => Some(payload),
+            KernelPattern::Number
+            | KernelPattern::Text
+            | KernelPattern::Bits { .. }
+            | KernelPattern::Invalid => None,
         }
     }
 
@@ -1430,7 +1591,8 @@ impl ComponentSolver {
             TypeTerm::Variable(_) | TypeTerm::Unknown | TypeTerm::UnresolvedShape(_) => {}
             invalid => {
                 return Err(KernelSolveError::new(format!(
-                    "kernel record spread expects a record value, found {invalid:?}"
+                    "kernel record spread in operation {:?} expects a record value, found {invalid:?}",
+                    self.active_operation
                 )));
             }
         }
@@ -2154,6 +2316,57 @@ mod tests {
     use crate::{ComponentProgramBuilder, KernelSummarySelectArm, PublishMode};
     use boon_checked::{FlowMode, ObjectShape, Type, Variant};
     use std::{collections::BTreeSet, sync::Arc};
+
+    #[test]
+    fn coarse_residual_orders_a_late_provider_through_an_explicit_alias() {
+        let mut module = ComponentProgramBuilder::new();
+        let initial = module.new_authoritative_provider();
+        let result = module.new_variable();
+        let alias = module.new_variable();
+        let late = module.new_authoritative_provider();
+
+        let initial_tag = module.terms_mut().variant_tag("Initial");
+        let initial_type = module.terms_mut().variant_set([initial_tag]);
+        module.add_publish(initial, [initial_type], PublishMode::Replace);
+        let initial_term = module.variable_term(initial);
+        let alias_term = module.variable_term(alias);
+        module.add_publish(
+            result,
+            [initial_term, alias_term],
+            PublishMode::StructuralWiden,
+        );
+        module.add_alias(late, alias);
+        let updated_tag = module.terms_mut().variant_tag("Updated");
+        let updated_type = module.terms_mut().variant_set([updated_tag]);
+        module.add_publish(late, [updated_type], PublishMode::Replace);
+
+        let module = Arc::new(module.finish());
+        assert_eq!(
+            module.acyclic_initial_operation_count(),
+            module.operation_count() as u64,
+            "the explicit alias remains a coarse acyclic frame"
+        );
+
+        let mut builder = ComponentProgramBuilder::new();
+        let initial = builder.new_variable();
+        let result = builder.new_variable();
+        let alias = builder.new_variable();
+        let late = builder.new_variable();
+        builder.add_residual_frame(module, vec![initial, result, alias, late]);
+        let output = builder.add_output(result, FlowMode::Continuous);
+
+        let artifact = solve_component(builder.finish()).unwrap();
+        assert_eq!(
+            artifact.output(output).unwrap().flow_type.ty,
+            Type::VariantSet(
+                vec![
+                    Variant::Tag("Initial".to_owned()),
+                    Variant::Tag("Updated".to_owned()),
+                ]
+                .into(),
+            )
+        );
+    }
 
     #[test]
     fn shared_summary_select_does_not_evaluate_unselected_requirements() {

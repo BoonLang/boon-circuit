@@ -20,7 +20,6 @@ use web_time::Instant;
 
 mod distributed_compiler;
 mod document_plan_backend;
-#[cfg(any(test, feature = "test-kernel-oracle"))]
 mod kernel_oracle;
 mod machine_plan_backend;
 mod session;
@@ -190,7 +189,12 @@ pub struct CompilerDiagnosticsProfile {
     pub call_count: usize,
     pub diagnostic_count: usize,
     pub parse_work: ParseWorkCounters,
+    /// Compatibility projection for benchmark consumers that still render
+    /// the legacy owner-work columns. Kernel diagnostics populate this from
+    /// their single dense compile/solve instead of running the owner solver.
     pub owner_work: boon_typecheck::OwnerBodyInferenceWork,
+    pub kernel_compile_work: boon_compiler_kernel::KernelCompileWork,
+    pub kernel_solve_work: boon_compiler_kernel::KernelSolveWork,
     pub parse_ms: f64,
     pub typecheck_ms: f64,
     pub total_ms: f64,
@@ -939,54 +943,6 @@ pub(crate) fn checked_source_from_owner_assembly(
             total_ms: parse_ms + typecheck_ms,
         },
     }
-}
-
-pub(crate) fn compiler_diagnostics_from_owner_aggregate(
-    syntax: ProjectSyntaxSnapshot,
-    aggregate: &boon_typecheck::OwnerDiagnosticsAggregate,
-    parse_work: ParseWorkCounters,
-    parse_ms: f64,
-    typecheck_ms: f64,
-) -> CompilerResult<CompilerDiagnostics> {
-    let source_bundle_digest_v1 = syntax.source_bundle_digest_v1();
-    if aggregate.source_bundle_digest_v1() != source_bundle_digest_v1 {
-        return Err("compiler diagnostics aggregate has a different source bundle".into());
-    }
-    let owner_count = usize::try_from(aggregate.owner_count())
-        .map_err(|_| "compiler diagnostics owner count exceeds usize")?;
-    let checked_expression_count = usize::try_from(aggregate.expression_count())
-        .map_err(|_| "compiler diagnostics expression count exceeds usize")?;
-    let call_count = usize::try_from(aggregate.call_count())
-        .map_err(|_| "compiler diagnostics call count exceeds usize")?;
-    let full_document_typecheck_coverage =
-        checked_expression_count == syntax.check_expression_count();
-    if !full_document_typecheck_coverage {
-        return Err(format!(
-            "compiler diagnostics owner coverage has {checked_expression_count} expressions for {} reachable syntax expressions",
-            syntax.check_expression_count(),
-        )
-        .into());
-    }
-    let diagnostics = aggregate.diagnostics().to_vec().into_boxed_slice();
-    Ok(CompilerDiagnostics {
-        profile: CompilerDiagnosticsProfile {
-            source_unit_count: syntax.units().len(),
-            owner_count,
-            expression_count: syntax.expression_count(),
-            checked_expression_count,
-            call_count,
-            diagnostic_count: diagnostics.len(),
-            parse_work,
-            owner_work: aggregate.work(),
-            parse_ms,
-            typecheck_ms,
-            total_ms: parse_ms + typecheck_ms,
-        },
-        syntax,
-        diagnostics,
-        full_document_typecheck_coverage,
-        fingerprint_v1: aggregate.fingerprint_v1(),
-    })
 }
 
 fn check_parsed_source_with_ownership(

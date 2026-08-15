@@ -73,6 +73,7 @@ pub enum KernelRenderConstructorKind {
 /// dispatch or generic ABI edge search.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelPureBuiltinKind {
+    TextConstant,
     TextTransform,
     TextSlice,
     TextLength,
@@ -83,6 +84,11 @@ pub enum KernelPureBuiltinKind {
     NumberMath,
     NumberRound,
     NumberProjection,
+    Boolean,
+    /// A pure record constructor whose result fields are its named inputs.
+    /// This covers ABI constructors such as the Light family without baking
+    /// library-specific record layouts into the type engine.
+    RecordConstructor,
     ListLength,
     ListPredicate,
     ListFilter,
@@ -151,6 +157,14 @@ pub enum KernelOwnerNodeKind {
     /// A detached occurrence projected from an owner-local derived authority,
     /// such as a match payload or contextual collection binding.
     DerivedRead {
+        fields: Box<[Box<str>]>,
+    },
+    /// A detached payload read owned by one authored match pattern. Unlike a
+    /// generic object projection, this preserves the enclosing tag while an
+    /// open formal is shaped and narrows a closed variant provider to the
+    /// selected arm before projecting its payload.
+    PatternRead {
+        pattern: KernelPattern,
         fields: Box<[Box<str>]>,
     },
     /// One contextual collection callback binding, projected directionally
@@ -470,6 +484,9 @@ pub struct KernelDefinitionFactsInput {
     /// call contracts. These facts are definition-local and require neither
     /// type-solve replay nor checked-row materialization.
     pub diagnostics: Box<[KernelDiagnosticInput]>,
+    /// Exact values whose solved types are needed only to evaluate compiler
+    /// diagnostics. They are projected without constructing expression rows.
+    pub diagnostic_values: Box<[KernelExpressionId]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -613,6 +630,11 @@ struct KernelProjectOwnerOutputs {
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
+    diagnostic_values: Box<[KernelValueReference]>,
+    /// Formals whose public type is an aggregate of branch-local projection
+    /// requirements. That aggregate is useful to the solver, but is not a
+    /// sound direct assignability contract for call diagnostics.
+    syntax_discriminated_formals: Box<[u32]>,
     basis_fingerprint_v3: [u8; 32],
 }
 
@@ -965,6 +987,20 @@ pub enum KernelDiagnosticKind {
         detail: Box<str>,
     },
     ByteLiteralOutsideBytes,
+    DuplicateRecordField {
+        name: Box<str>,
+    },
+    MissingPassedContext,
+    UnresolvedValue {
+        name: Box<str>,
+    },
+    CallableUsedAsValue {
+        function: Box<str>,
+    },
+    AmbiguousValue {
+        name: Box<str>,
+        candidate_count: u32,
+    },
     UnresolvedCallable {
         function: Box<str>,
     },
@@ -1067,6 +1103,10 @@ pub fn project_kernel_source_expression_diagnostics<'a>(
         .flatten()
         .copied()
         .collect::<HashSet<_>>();
+    let dense_by_syntax = expressions
+        .iter()
+        .map(|(dense, expression)| (expression.id, *dense))
+        .collect::<HashMap<_, _>>();
     let mut diagnostics = Vec::new();
     for (expression_id, expression) in expressions {
         let mut push = |kind| {
@@ -1162,6 +1202,30 @@ pub fn project_kernel_source_expression_diagnostics<'a>(
             && !byte_items.contains(&expression.id)
         {
             push(KernelDiagnosticKind::ByteLiteralOutsideBytes);
+        }
+
+        if let AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } =
+            &expression.kind
+        {
+            let mut names = HashSet::new();
+            for field in fields.iter().filter(|field| !field.spread) {
+                if names.insert(field.name.as_str()) {
+                    continue;
+                }
+                let value = dense_by_syntax.get(&field.value).copied().ok_or_else(|| {
+                    KernelOwnerBuildError::new(format!(
+                        "kernel duplicate record field `{}` references missing expression {}",
+                        field.name, field.value
+                    ))
+                })?;
+                diagnostics.push(KernelDiagnosticInput {
+                    severity: KernelDiagnosticSeverity::Error,
+                    site: KernelDiagnosticSite::Expression { expression: value },
+                    kind: KernelDiagnosticKind::DuplicateRecordField {
+                        name: field.name.clone().into_boxed_str(),
+                    },
+                });
+            }
         }
     }
     diagnostics.sort_unstable_by(|left, right| left.site.cmp(&right.site));
@@ -1616,6 +1680,7 @@ pub struct KernelDefinitionSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCheckedSnapshot {
     pub definitions: Box<[DefinitionArtifact]>,
+    pub diagnostic_values: Box<[KernelDiagnosticValueArtifact]>,
     pub dependencies: crate::KernelDefinitionDependencyGraph,
     pub currentness: Box<[crate::KernelDefinitionCurrentnessReceipt]>,
     pub work: KernelSolveWork,
@@ -1633,7 +1698,17 @@ pub struct KernelInterfaceSnapshot {
     /// Fully typed diagnostics computed directly from the quiescent graph.
     /// No checked definition rows are materialized for this product.
     pub diagnostics: Box<[KernelDiagnosticArtifact]>,
+    /// Sparse solved values explicitly demanded by diagnostic contracts.
+    pub diagnostic_values: Box<[KernelDiagnosticValueArtifact]>,
     pub work: KernelSolveWork,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelDiagnosticValueArtifact {
+    pub owner: KernelOwnerId,
+    pub ordinal: u32,
+    pub value: KernelValueReference,
+    pub ty: Type,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1832,26 +1907,61 @@ impl KernelSolvedProject {
         let mut public_results = Vec::with_capacity(self.public_results.len());
         let mut callable_formals = Vec::with_capacity(self.public_formals.len());
         let mut diagnostics = Vec::new();
+        let mut diagnostic_values = Vec::new();
         for (owner, (formals, result)) in self
             .public_formals
             .iter()
             .zip(&self.public_results)
             .enumerate()
         {
-            let (formals, result, owner_diagnostics) =
+            let owner_value_types = self.owners[owner]
+                .diagnostic_values
+                .iter()
+                .map(|value| {
+                    project_call_value_type(
+                        owner,
+                        *value,
+                        &self.owners,
+                        &self.artifact,
+                        &self.public_results,
+                    )
+                    .expect("validated diagnostic value has a solved provider")
+                })
+                .collect::<Vec<_>>();
+            let (formals, result, owner_diagnostics, owner_value_types) =
                 alpha_normalize_callable_interface_and_diagnostics(
                     formals,
                     result,
                     &self.diagnostics[owner],
+                    &owner_value_types,
                 );
             callable_formals.push(formals);
             public_results.push(result);
             diagnostics.extend(owner_diagnostics);
+            diagnostic_values.extend(
+                self.owners[owner]
+                    .diagnostic_values
+                    .iter()
+                    .copied()
+                    .zip(owner_value_types)
+                    .enumerate()
+                    .map(|(ordinal, (value, ty))| KernelDiagnosticValueArtifact {
+                        owner: KernelOwnerId(
+                            u32::try_from(owner)
+                                .expect("kernel diagnostic owner count exceeds u32"),
+                        ),
+                        ordinal: u32::try_from(ordinal)
+                            .expect("kernel diagnostic value count exceeds u32"),
+                        value,
+                        ty,
+                    }),
+            );
         }
         KernelInterfaceSnapshot {
             public_results: public_results.into_boxed_slice(),
             callable_formals: callable_formals.into_boxed_slice(),
             diagnostics: diagnostics.into_boxed_slice(),
+            diagnostic_values: diagnostic_values.into_boxed_slice(),
             work: self.artifact.work,
         }
     }
@@ -1861,6 +1971,7 @@ impl KernelSolvedProject {
     }
 
     pub fn into_checked_snapshot(self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
+        let diagnostic_values = self.interface_snapshot().diagnostic_values;
         let basis_fingerprints = self
             .owners
             .iter()
@@ -1890,6 +2001,7 @@ impl KernelSolvedProject {
             build_snapshot_receipts(&mut definitions, &basis_fingerprints)?;
         Ok(KernelCheckedSnapshot {
             definitions,
+            diagnostic_values,
             dependencies,
             currentness,
             work: self.artifact.work,
@@ -2076,7 +2188,6 @@ fn project_call_facts_and_diagnostics(
                 }
                 let substitutions =
                     derive_kernel_call_type_substitutions(target_formals, target_result, &actuals);
-
                 // Inherited context has no authored call-input site. Its
                 // requirements are propagated through the separate formal
                 // requirement channel and are intentionally not diagnosed as
@@ -2085,6 +2196,18 @@ fn project_call_facts_and_diagnostics(
                     let KernelCallInputRole::Formal { ordinal } = input.role else {
                         continue;
                     };
+                    if owners.get(target.0 as usize).is_some_and(|target| {
+                        target
+                            .syntax_discriminated_formals
+                            .binary_search(&ordinal)
+                            .is_ok()
+                    }) {
+                        // The target's aggregate formal combines projection
+                        // requirements from mutually exclusive syntax arms.
+                        // It is a solver surface, not a direct object-shape
+                        // contract for this occurrence.
+                        continue;
+                    }
                     let Some(actual) = project_call_value_type(
                         owner_index,
                         input.value,
@@ -3816,6 +3939,160 @@ fn collect_host_effect_artifacts(
         .map(Vec::into_boxed_slice)
 }
 
+fn expression_formal_dependencies(
+    owner: &KernelOwnerProgramInput,
+    root: KernelExpressionId,
+) -> BTreeSet<u32> {
+    let mut dependencies = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut pending = vec![root.0 as usize];
+    while let Some(expression) = pending.pop() {
+        if expression >= owner.nodes.len() || !visited.insert(expression) {
+            continue;
+        }
+        let node = &owner.nodes[expression];
+        match &node.kind {
+            KernelOwnerNodeKind::FormalRead { formal, .. }
+            | KernelOwnerNodeKind::ContextRead { formal, .. } => {
+                dependencies.insert(*formal);
+            }
+            _ => {}
+        }
+        pending.extend(node.inputs.iter().filter_map(|input| {
+            let input = input.expression.0 as usize;
+            (input < owner.nodes.len()).then_some(input)
+        }));
+    }
+    dependencies
+}
+
+fn expression_contains_nested_formal_read(
+    owner: &KernelOwnerProgramInput,
+    root: KernelExpressionId,
+    formal: u32,
+) -> bool {
+    let mut visited = BTreeSet::new();
+    let mut pending = vec![root.0 as usize];
+    while let Some(expression) = pending.pop() {
+        if expression >= owner.nodes.len() || !visited.insert(expression) {
+            continue;
+        }
+        let node = &owner.nodes[expression];
+        if matches!(
+            &node.kind,
+            KernelOwnerNodeKind::FormalRead {
+                formal: candidate,
+                fields,
+            } | KernelOwnerNodeKind::ContextRead {
+                formal: candidate,
+                fields,
+            } if *candidate == formal && !fields.is_empty()
+        ) {
+            return true;
+        }
+        pending.extend(node.inputs.iter().filter_map(|input| {
+            let input = input.expression.0 as usize;
+            (input < owner.nodes.len()).then_some(input)
+        }));
+    }
+    false
+}
+
+/// Find formal contracts whose field requirements are guarded by syntax
+/// selection, then propagate that fact through direct user-call arguments.
+///
+/// A `WHEN` such as `value |> WHEN { A => value.a; B => value.b }` shapes the
+/// principal formal as an object containing both `a` and `b`. Requiring every
+/// member of an actual `A[a] | B[b]` value to contain both fields would turn a
+/// valid branch-discriminated call into a false diagnostic. Wrapper functions
+/// inherit the same property when they forward one of their formals into that
+/// parameter, so this is a small fixed point over the packed call graph.
+fn project_syntax_discriminated_formals(input: &KernelProjectProgramInput) -> Vec<Box<[u32]>> {
+    let mut formals = vec![BTreeSet::<u32>::new(); input.owners.len()];
+    for (owner_index, owner) in input.owners.iter().enumerate() {
+        for node in owner
+            .nodes
+            .iter()
+            .filter(|node| matches!(node.kind, KernelOwnerNodeKind::When))
+        {
+            for selector in node
+                .inputs
+                .iter()
+                .filter(|input| matches!(input.role, KernelOwnerEdgeRole::WhenInput))
+            {
+                for formal in expression_formal_dependencies(owner, selector.expression) {
+                    let has_branch_projection = node
+                        .inputs
+                        .iter()
+                        .filter(|input| matches!(input.role, KernelOwnerEdgeRole::WhenArm))
+                        .filter_map(|arm| owner.nodes.get(arm.expression.0 as usize))
+                        .flat_map(|arm| {
+                            arm.inputs.iter().filter(|input| {
+                                matches!(input.role, KernelOwnerEdgeRole::MatchOutput)
+                            })
+                        })
+                        .any(|output| {
+                            expression_contains_nested_formal_read(owner, output.expression, formal)
+                        });
+                    if has_branch_projection {
+                        formals[owner_index].insert(formal);
+                    }
+                }
+            }
+        }
+    }
+
+    loop {
+        let mut changed = false;
+        for (owner_index, owner) in input.owners.iter().enumerate() {
+            for node in &owner.nodes {
+                let KernelOwnerNodeKind::UserCall {
+                    target,
+                    inherited_formal,
+                } = &node.kind
+                else {
+                    continue;
+                };
+                let Some(target_formals) = formals.get(target.0 as usize) else {
+                    continue;
+                };
+                let inherited_is_discriminated = inherited_formal
+                    .filter(|inherited| target_formals.contains(&inherited.target_ordinal));
+                let discriminated_inputs = node
+                    .inputs
+                    .iter()
+                    .filter_map(|input| {
+                        let KernelOwnerEdgeRole::CallArgument { ordinal } = input.role else {
+                            return None;
+                        };
+                        target_formals
+                            .contains(&ordinal)
+                            .then_some(input.expression)
+                    })
+                    .collect::<Vec<_>>();
+                let mut propagated = discriminated_inputs
+                    .into_iter()
+                    .flat_map(|expression| expression_formal_dependencies(owner, expression))
+                    .collect::<BTreeSet<_>>();
+                if let Some(inherited) = inherited_is_discriminated {
+                    propagated.insert(inherited.caller_ordinal);
+                }
+                let before = formals[owner_index].len();
+                formals[owner_index].extend(propagated);
+                changed |= formals[owner_index].len() != before;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    formals
+        .into_iter()
+        .map(|formals| formals.into_iter().collect::<Vec<_>>().into_boxed_slice())
+        .collect()
+}
+
 pub fn compile_project_program(
     input: &KernelProjectProgramInput,
 ) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
@@ -3945,6 +4222,7 @@ pub fn compile_project_program_with_definition_facts(
         );
         validate_owner_input(owner_id, owner, &principals)?;
     }
+    let syntax_discriminated_formals = project_syntax_discriminated_formals(input);
     let direct_summaries = compile_direct_result_summaries(&mut builder, input);
     for summary in direct_summaries.iter().flatten() {
         compile_work.summary_definition_nodes = compile_work
@@ -4112,6 +4390,16 @@ pub fn compile_project_program_with_definition_facts(
                     owner,
                     &facts[owner_index],
                 )?,
+                diagnostic_values: facts[owner_index]
+                    .diagnostic_values
+                    .iter()
+                    .copied()
+                    .map(|expression| {
+                        kernel_value_reference(owner, expression, expression.0 as usize)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_boxed_slice(),
+                syntax_discriminated_formals: syntax_discriminated_formals[owner_index].clone(),
                 basis_fingerprint_v3: definition_basis_fingerprint_with_buffer(
                     owner,
                     &facts[owner_index],
@@ -4443,6 +4731,7 @@ fn allocate_owner_instance_with_static_variants(
             KernelOwnerNodeKind::FormalRead { .. }
                 | KernelOwnerNodeKind::ContextRead { .. }
                 | KernelOwnerNodeKind::LexicalRead { .. }
+                | KernelOwnerNodeKind::PatternRead { .. }
         ) {
             expressions.push(builder.new_variable());
         } else {
@@ -4519,6 +4808,7 @@ fn allocate_invocation_owner_instance(
             KernelOwnerNodeKind::FormalRead { .. }
                 | KernelOwnerNodeKind::ContextRead { .. }
                 | KernelOwnerNodeKind::LexicalRead { .. }
+                | KernelOwnerNodeKind::PatternRead { .. }
         ) {
             expressions.push(builder.new_variable());
         } else {
@@ -4648,6 +4938,7 @@ fn infer_static_variants(
                 })
                 .collect::<Option<StaticVariantSet>>(),
             KernelOwnerNodeKind::Tag(tag) => Some(BTreeSet::from([tag.clone()])),
+            KernelOwnerNodeKind::Record { tag: Some(tag) } => Some(BTreeSet::from([tag.clone()])),
             KernelOwnerNodeKind::FormalRead { formal, fields }
             | KernelOwnerNodeKind::ContextRead { formal, fields }
                 if fields.is_empty() =>
@@ -4661,7 +4952,10 @@ fn infer_static_variants(
                 Some(BTreeSet::from(["False".into(), "True".into()]))
             }
             KernelOwnerNodeKind::PureBuiltin {
-                kind: KernelPureBuiltinKind::TextPredicate | KernelPureBuiltinKind::ListPredicate,
+                kind:
+                    KernelPureBuiltinKind::TextPredicate
+                    | KernelPureBuiltinKind::ListPredicate
+                    | KernelPureBuiltinKind::Boolean,
             } => Some(BTreeSet::from(["False".into(), "True".into()])),
             _ => None,
         };
@@ -5138,7 +5432,7 @@ fn append_residual_type_frame(
     module: &ResidualTypeModule,
     instance: &OwnerInstance,
     external_variables: &[TypeVariableId],
-) -> Result<(), KernelOwnerBuildError> {
+) -> Result<u32, KernelOwnerBuildError> {
     if external_variables.len() != module.external_variables.len() {
         return Err(KernelOwnerBuildError::new(format!(
             "residual frame supplies {} external variables for {} module imports",
@@ -5200,8 +5494,7 @@ fn append_residual_type_frame(
         .into_iter()
         .map(|variable| variable.expect("every residual frame variable is mapped"))
         .collect::<Vec<_>>();
-    builder.add_residual_frame(Arc::clone(&module.component), variables);
-    Ok(())
+    Ok(builder.add_residual_frame(Arc::clone(&module.component), variables))
 }
 
 fn principal_external_variables(
@@ -5569,6 +5862,9 @@ fn direct_result_summary_supported(
                 }
             })
         }
+        // A pattern projection owns tag-sensitive formal shaping and cannot
+        // be represented by the generic field-projection summary bytecode.
+        KernelOwnerNodeKind::PatternRead { .. } => false,
         KernelOwnerNodeKind::UserCall { target, .. } => {
             let Some(target_owner) = project.owners.get(target.0 as usize) else {
                 active.remove(&(owner_id, expression));
@@ -5683,7 +5979,8 @@ fn direct_result_summary_supported(
 fn direct_summary_fixed_builtin_supported(kind: KernelPureBuiltinKind) -> bool {
     matches!(
         kind,
-        KernelPureBuiltinKind::TextTransform
+        KernelPureBuiltinKind::TextConstant
+            | KernelPureBuiltinKind::TextTransform
             | KernelPureBuiltinKind::TextSlice
             | KernelPureBuiltinKind::TextLength
             | KernelPureBuiltinKind::TextConcat
@@ -5693,6 +5990,8 @@ fn direct_summary_fixed_builtin_supported(kind: KernelPureBuiltinKind) -> bool {
             | KernelPureBuiltinKind::NumberMath
             | KernelPureBuiltinKind::NumberRound
             | KernelPureBuiltinKind::NumberProjection
+            | KernelPureBuiltinKind::Boolean
+            | KernelPureBuiltinKind::RecordConstructor
             | KernelPureBuiltinKind::TextJoin
             | KernelPureBuiltinKind::FieldColor
     )
@@ -6245,6 +6544,7 @@ impl DirectSummaryPlanCompiler<'_> {
                     };
                     self.project_value(provider, fields, fixed_mode)
                 }
+                KernelOwnerNodeKind::PatternRead { .. } => None,
                 KernelOwnerNodeKind::UserCall {
                     target,
                     inherited_formal,
@@ -6385,6 +6685,7 @@ impl DirectSummaryPlanCompiler<'_> {
                     if direct_summary_fixed_builtin_supported(*kind) =>
                 {
                     let mut dependencies = Vec::with_capacity(node.inputs.len());
+                    let mut record_entries = Vec::with_capacity(node.inputs.len());
                     let mut names = BTreeSet::new();
                     for edge in &node.inputs {
                         let KernelOwnerEdgeRole::AbiArgument { name } = &edge.role else {
@@ -6407,10 +6708,17 @@ impl DirectSummaryPlanCompiler<'_> {
                                 expected,
                             });
                         }
+                        if matches!(kind, KernelPureBuiltinKind::RecordConstructor) {
+                            record_entries.push(KernelSummaryRecordEntry::Field {
+                                name: self.builder.terms_mut().intern_name(name),
+                                value: value.value,
+                            });
+                        }
                         dependencies.push(value.value);
                     }
                     let result = match kind {
-                        KernelPureBuiltinKind::TextTransform
+                        KernelPureBuiltinKind::TextConstant
+                        | KernelPureBuiltinKind::TextTransform
                         | KernelPureBuiltinKind::TextSlice
                         | KernelPureBuiltinKind::TextConcat
                         | KernelPureBuiltinKind::NumberToText
@@ -6420,8 +6728,21 @@ impl DirectSummaryPlanCompiler<'_> {
                         | KernelPureBuiltinKind::NumberRound
                         | KernelPureBuiltinKind::NumberProjection
                         | KernelPureBuiltinKind::TextLength => self.builder.terms().number(),
-                        KernelPureBuiltinKind::TextPredicate => boolean_type(self.builder),
+                        KernelPureBuiltinKind::TextPredicate | KernelPureBuiltinKind::Boolean => {
+                            boolean_type(self.builder)
+                        }
                         KernelPureBuiltinKind::TextToNumber => parsed_number_type(self.builder),
+                        KernelPureBuiltinKind::RecordConstructor => {
+                            let value = self.push_node(KernelSummaryNode::Record {
+                                tag: None,
+                                entries: record_entries.into_boxed_slice(),
+                            });
+                            return Some(PlannedSummaryValue {
+                                value,
+                                mode: fixed_mode,
+                                formal_projection_input: None,
+                            });
+                        }
                         _ => return None,
                     };
                     let result = self.push_node(KernelSummaryNode::Term(result));
@@ -8066,9 +8387,7 @@ fn compile_node(
                 .map(|field| builder.terms_mut().intern_name(field))
                 .collect::<Vec<_>>();
             if path.is_empty() {
-                let provider = builder.variable_term(provider);
-                let output_term = builder.variable_term(output);
-                builder.add_unify(output_term, provider);
+                builder.add_alias(provider, output);
             } else {
                 builder.add_projection_into(provider, path, output);
             }
@@ -8095,6 +8414,28 @@ fn compile_node(
                 .map(|field| builder.terms_mut().intern_name(field))
                 .collect::<Vec<_>>();
             builder.add_projection_into(provider, path, output);
+        }
+        KernelOwnerNodeKind::PatternRead { pattern, fields } => {
+            let mut providers = node
+                .inputs
+                .iter()
+                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider));
+            let provider = providers.next().ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} pattern read has no provider"
+                ))
+            })?;
+            if providers.next().is_some() || node.inputs.len() != 1 {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} pattern read must have exactly one provider"
+                )));
+            }
+            let provider = edge_variable(context, index, provider)?;
+            let fields = fields
+                .iter()
+                .map(|field| builder.terms_mut().intern_name(field))
+                .collect::<Vec<_>>();
+            builder.add_pattern_projection_into(provider, pattern.clone(), fields, output);
         }
         KernelOwnerNodeKind::CollectionItemRead => {
             let mut providers = node
@@ -8523,8 +8864,27 @@ fn compile_node(
                 let item = edge_output_variable(context, index, item_edge)?;
                 builder.add_collection_item_projection(list_argument()?, item);
             }
+            if matches!(kind, KernelPureBuiltinKind::ListAppend) {
+                // Append preserves the existing list item authority and
+                // widens it directionally with the new item. Publishing only
+                // `List<item>` loses every variant contributed by the input
+                // collection; equality-unifying the two would instead
+                // backflow the widened result into both producers.
+                let existing_item = builder.new_authoritative_provider();
+                builder.add_collection_item_projection(list_argument()?, existing_item);
+                let existing_item = builder.variable_term(existing_item);
+                let appended_item = builder.variable_term(argument("item")?);
+                builder.add_collection(
+                    output,
+                    KernelCollectionOperationKind::List,
+                    [existing_item, appended_item],
+                    [],
+                );
+                return Ok(());
+            }
             let result = match kind {
-                KernelPureBuiltinKind::TextTransform
+                KernelPureBuiltinKind::TextConstant
+                | KernelPureBuiltinKind::TextTransform
                 | KernelPureBuiltinKind::TextSlice
                 | KernelPureBuiltinKind::TextConcat
                 | KernelPureBuiltinKind::NumberToText
@@ -8535,10 +8895,25 @@ fn compile_node(
                 | KernelPureBuiltinKind::NumberProjection
                 | KernelPureBuiltinKind::TextLength
                 | KernelPureBuiltinKind::ListLength => builder.terms().number(),
-                KernelPureBuiltinKind::TextPredicate | KernelPureBuiltinKind::ListPredicate => {
-                    boolean_type(builder)
-                }
+                KernelPureBuiltinKind::TextPredicate
+                | KernelPureBuiltinKind::ListPredicate
+                | KernelPureBuiltinKind::Boolean => boolean_type(builder),
                 KernelPureBuiltinKind::TextToNumber => parsed_number_type(builder),
+                KernelPureBuiltinKind::RecordConstructor => {
+                    let fields = node
+                        .inputs
+                        .iter()
+                        .map(|edge| {
+                            let KernelOwnerEdgeRole::AbiArgument { name } = &edge.role else {
+                                unreachable!("pure builtin argument roles were validated above")
+                            };
+                            let value = arguments[name.as_ref()];
+                            let name = builder.terms_mut().intern_name(name);
+                            (name, builder.variable_term(value))
+                        })
+                        .collect::<Vec<_>>();
+                    builder.terms_mut().object(fields, false)
+                }
                 KernelPureBuiltinKind::ListFilter | KernelPureBuiltinKind::ListSort => {
                     builder.variable_term(list_argument()?)
                 }
@@ -8561,10 +8936,7 @@ fn compile_node(
                     builder.add_collection_item_projection(list_argument()?, item);
                     builder.variable_term(item)
                 }
-                KernelPureBuiltinKind::ListAppend => {
-                    let item = builder.variable_term(argument("item")?);
-                    builder.terms_mut().list(item)
-                }
+                KernelPureBuiltinKind::ListAppend => unreachable!("handled above"),
                 KernelPureBuiltinKind::ListChunk => {
                     let item = builder.new_authoritative_provider();
                     builder.add_collection_item_projection(list_argument()?, item);
@@ -8645,6 +9017,24 @@ fn compile_node(
                     "kernel owner node {index} WHEN has no selector"
                 ))
             })?;
+            // A closed match domain constrains a generic selector to the
+            // union of its authored patterns. A wildcard or binding arm is
+            // deliberately open: it accepts values outside the listed tags,
+            // so publishing the explicit arms as a closed VariantSet would
+            // incorrectly reject values handled by the fallback branch.
+            if !arms.iter().any(|arm| {
+                matches!(
+                    arm.pattern,
+                    KernelPattern::Wildcard | KernelPattern::Binding { .. }
+                )
+            }) {
+                let selector_requirement = builder.variable_term(selector);
+                for arm in &arms {
+                    if let Some(requirement) = pattern_requirement_term(builder, &arm.pattern) {
+                        builder.add_unify(selector_requirement, requirement);
+                    }
+                }
+            }
             builder.add_select(output, selector, arms);
         }
         KernelOwnerNodeKind::Then => {
@@ -8866,6 +9256,38 @@ fn requirement_projection(
     provider
 }
 
+fn pattern_requirement_term(
+    builder: &mut ComponentProgramBuilder,
+    pattern: &KernelPattern,
+) -> Option<TypeTermId> {
+    Some(match pattern {
+        KernelPattern::Wildcard | KernelPattern::Binding { .. } | KernelPattern::Invalid => {
+            return None;
+        }
+        KernelPattern::Number => builder.terms().number(),
+        KernelPattern::Text => builder.terms().text(),
+        KernelPattern::Bits { width } => builder.terms_mut().bits(*width),
+        KernelPattern::Tag { name, fields } => {
+            if fields.is_empty() {
+                let tag = builder.terms_mut().variant_tag(name);
+                builder.terms_mut().variant_set([tag])
+            } else {
+                let fields = fields
+                    .iter()
+                    .map(|field| {
+                        let name = builder.terms_mut().intern_name(field);
+                        let value = builder.new_contextual_hole();
+                        (name, builder.variable_term(value))
+                    })
+                    .collect::<Vec<_>>();
+                let fields = builder.terms_mut().object(fields, true);
+                let tag = builder.terms_mut().tagged_variant(name, fields);
+                builder.terms_mut().variant_set([tag])
+            }
+        }
+    })
+}
+
 fn selected_edge_terms(
     builder: &mut ComponentProgramBuilder,
     context: &OwnerCompileContext<'_>,
@@ -8941,12 +9363,12 @@ fn node_mode_equation(
                     })?;
                 return Ok(ModeEquation::Copy(selector));
             }
-            // A cross-owner value read consumes the provider declaration's
-            // public mode. Its field path affects the value type, but it does
-            // not turn the ordinary checked occurrence into a projection of
-            // the provider's private expression-mode tree. Contextual user
-            // call inference deliberately performs that deeper projection in
-            // `projected_mode_variable` below.
+            // A whole-value read consumes the provider declaration's public
+            // mode. A nested read instead projects the authored field's mode
+            // through the finalized public result expression. The latter is
+            // required for event fields inside an otherwise continuous
+            // record: publishing the record as an owner result must not erase
+            // the field's PresentOrAbsent surface.
             let mut providers = node
                 .inputs
                 .iter()
@@ -8961,17 +9383,29 @@ fn node_mode_equation(
                     "kernel owner node {node_index} value read has multiple mode providers"
                 )));
             }
-            let reference = provider.expression.0 as usize;
-            let public_result = reference
-                .checked_sub(context.input.nodes.len())
-                .and_then(|external| context.input.external_expressions.get(external))
-                .is_some_and(|external| matches!(external.target, KernelExternalTarget::Result));
-            if fields.is_empty() || public_result {
+            if fields.is_empty() {
                 edge_mode_variable(context, node_index, provider).map(ModeEquation::Copy)
             } else {
                 projected_edge_mode_variable(mode_builder, context, node_index, provider, fields)
                     .map(ModeEquation::Copy)
             }
+        }
+        KernelOwnerNodeKind::PatternRead { .. } => {
+            let providers = node
+                .inputs
+                .iter()
+                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider))
+                .count();
+            if providers != 1 {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel owner node {node_index} pattern read has {providers} mode providers instead of one"
+                )));
+            }
+            // A pattern binding is a stable value inside the selected arm.
+            // The selector's event mode activates the arm/WHEN expression;
+            // copying that mode onto the bound payload would incorrectly turn
+            // ordinary uses of `value => value` into event occurrences.
+            Ok(ModeEquation::Fixed(node.mode))
         }
         KernelOwnerNodeKind::LexicalRead { fields }
         | KernelOwnerNodeKind::DerivedRead { fields } => {
@@ -9324,6 +9758,7 @@ fn pure_builtin_argument_requirement(
     name: &str,
 ) -> Option<TypeTermId> {
     match kind {
+        KernelPureBuiltinKind::TextConstant => None,
         KernelPureBuiltinKind::TextTransform
         | KernelPureBuiltinKind::TextLength
         | KernelPureBuiltinKind::TextPredicate => Some(builder.terms().text()),
@@ -9339,6 +9774,15 @@ fn pure_builtin_argument_requirement(
         // Text/concat accepts the runtime's text-formattable scalar family.
         // That is a validation contract, not an equality constraint.
         KernelPureBuiltinKind::TextConcat | KernelPureBuiltinKind::FieldColor => None,
+        KernelPureBuiltinKind::RecordConstructor
+            if matches!(
+                name,
+                "azimuth" | "altitude" | "spread" | "intensity" | "radius" | "softness"
+            ) =>
+        {
+            Some(builder.terms().number())
+        }
+        KernelPureBuiltinKind::RecordConstructor => None,
         KernelPureBuiltinKind::TextJoin if name == "$pipe" => {
             let item = builder.terms().text();
             Some(builder.terms_mut().list(item))
@@ -9352,6 +9796,10 @@ fn pure_builtin_argument_requirement(
         KernelPureBuiltinKind::NumberRound => Some(builder.terms().number()),
         KernelPureBuiltinKind::NumberProjection if name == "zoom" => None,
         KernelPureBuiltinKind::NumberProjection => Some(builder.terms().number()),
+        KernelPureBuiltinKind::Boolean if matches!(name, "$pipe" | "value" | "left" | "right") => {
+            Some(boolean_type(builder))
+        }
+        KernelPureBuiltinKind::Boolean => None,
         KernelPureBuiltinKind::ListLength
         | KernelPureBuiltinKind::ListPredicate
         | KernelPureBuiltinKind::ListFilter
@@ -9769,6 +10217,10 @@ fn projected_mode_variable(
         }
         | KernelOwnerNodeKind::DerivedRead {
             fields: provider_fields,
+        }
+        | KernelOwnerNodeKind::PatternRead {
+            fields: provider_fields,
+            ..
         } => {
             let provider = selected_mode_edge(node, |role| {
                 matches!(role, KernelOwnerEdgeRole::ReadProvider)
@@ -10240,6 +10692,10 @@ fn projected_collection_item_mode_variable(
         }
         | KernelOwnerNodeKind::DerivedRead {
             fields: provider_fields,
+        }
+        | KernelOwnerNodeKind::PatternRead {
+            fields: provider_fields,
+            ..
         } if provider_fields.is_empty() => {
             if let Some(edge) = selected_mode_edge(node, |role| {
                 matches!(role, KernelOwnerEdgeRole::ReadProvider)
@@ -11374,6 +11830,7 @@ mod tests {
             states: Box::new([]),
             lists: Box::new([]),
             diagnostics: Box::new([]),
+            diagnostic_values: Box::new([]),
         };
 
         let artifact = compile_owner_program_with_definition_facts(&input, &facts)
@@ -11589,6 +12046,7 @@ mod tests {
             }]
             .into_boxed_slice(),
             diagnostics: Box::new([]),
+            diagnostic_values: Box::new([]),
         };
 
         let artifact = compile_owner_program_with_definition_facts(&input, &facts)
@@ -11702,6 +12160,168 @@ mod tests {
             artifact.definitions[1].result.mode,
             FlowMode::PresentOrAbsent,
             "the user-call frame follows the builtin's eventful actual"
+        );
+    }
+
+    #[test]
+    fn nested_public_result_reads_preserve_the_field_mode() {
+        let input = KernelProjectProgramInput {
+            owners: vec![
+                KernelOwnerProgramInput {
+                    nodes: vec![
+                        KernelOwnerNode {
+                            kind: KernelOwnerNodeKind::Known(Type::Text),
+                            inputs: Box::new([]),
+                            mode: FlowMode::PresentOrAbsent,
+                        },
+                        KernelOwnerNode {
+                            kind: KernelOwnerNodeKind::Number,
+                            inputs: Box::new([]),
+                            mode: FlowMode::Continuous,
+                        },
+                        KernelOwnerNode {
+                            kind: KernelOwnerNodeKind::Record { tag: None },
+                            inputs: vec![
+                                edge(
+                                    KernelOwnerEdgeRole::RecordField {
+                                        name: "event".into(),
+                                        spread: false,
+                                    },
+                                    0,
+                                ),
+                                edge(
+                                    KernelOwnerEdgeRole::RecordField {
+                                        name: "stable".into(),
+                                        spread: false,
+                                    },
+                                    1,
+                                ),
+                            ]
+                            .into_boxed_slice(),
+                            mode: FlowMode::Continuous,
+                        },
+                    ]
+                    .into_boxed_slice(),
+                    formal_count: 0,
+                    external_expressions: Box::new([]),
+                    result: KernelExpressionId(2),
+                },
+                KernelOwnerProgramInput {
+                    nodes: vec![KernelOwnerNode {
+                        kind: KernelOwnerNodeKind::ValueRead {
+                            fields: vec!["event".into()].into_boxed_slice(),
+                            mode_narrowing: None,
+                        },
+                        inputs: vec![edge(KernelOwnerEdgeRole::ReadProvider, 1)].into_boxed_slice(),
+                        mode: FlowMode::Continuous,
+                    }]
+                    .into_boxed_slice(),
+                    formal_count: 0,
+                    external_expressions: vec![KernelExternalExpression {
+                        owner: KernelOwnerId(0),
+                        target: KernelExternalTarget::Result,
+                    }]
+                    .into_boxed_slice(),
+                    result: KernelExpressionId(0),
+                },
+            ]
+            .into_boxed_slice(),
+        };
+
+        let artifact = compile_project_program(&input).unwrap().solve().unwrap();
+
+        assert_eq!(
+            artifact.definitions[0].result.mode,
+            FlowMode::Continuous,
+            "the public record remains continuous",
+        );
+        assert_eq!(
+            artifact.definitions[1].result.mode,
+            FlowMode::PresentOrAbsent,
+            "the nested read follows the event field through the public result",
+        );
+    }
+
+    #[test]
+    fn list_append_widens_existing_and_appended_items_directionally() {
+        let completed = |tag: &str| {
+            Type::object(ObjectShape::from_ordered_fields(
+                [(
+                    "completed".to_owned(),
+                    Type::VariantSet(vec![Variant::Tag(tag.to_owned())].into()),
+                )],
+                false,
+            ))
+        };
+        let input = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Known(Type::List(Type::shared(completed("True")))),
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Known(completed("False")),
+                    inputs: Box::new([]),
+                    mode: FlowMode::PresentOrAbsent,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::PureBuiltin {
+                        kind: KernelPureBuiltinKind::ListAppend,
+                    },
+                    inputs: vec![
+                        edge(
+                            KernelOwnerEdgeRole::AbiArgument {
+                                name: "$pipe".into(),
+                            },
+                            0,
+                        ),
+                        edge(
+                            KernelOwnerEdgeRole::AbiArgument {
+                                name: "item".into(),
+                            },
+                            1,
+                        ),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(2),
+        };
+
+        let artifact = compile_owner_program(&input).unwrap().solve().unwrap();
+
+        assert_eq!(
+            artifact.definition.result.ty,
+            Type::List(Type::shared(Type::object(
+                ObjectShape::from_ordered_fields(
+                    [(
+                        "completed".to_owned(),
+                        Type::VariantSet(
+                            vec![
+                                Variant::Tag("False".to_owned()),
+                                Variant::Tag("True".to_owned()),
+                            ]
+                            .into(),
+                        ),
+                    )],
+                    false,
+                ),
+            ))),
+        );
+        assert_eq!(
+            artifact.definition.expressions[0].flow_type.ty,
+            Type::List(Type::shared(completed("True"))),
+            "the widened append result must not backflow into the input list",
+        );
+        assert_eq!(
+            artifact.definition.expressions[1].flow_type.ty,
+            completed("False"),
+            "the widened append result must not backflow into the appended item",
         );
     }
 
@@ -12625,6 +13245,279 @@ mod tests {
     }
 
     #[test]
+    fn syntax_discriminated_formals_do_not_become_conjunctive_call_contracts() {
+        let callee = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: vec!["a".into()].into_boxed_slice(),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::PureBuiltin {
+                        kind: KernelPureBuiltinKind::TextLength,
+                    },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::AbiArgument {
+                            name: "$pipe".into(),
+                        },
+                        1,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::MatchArm {
+                        pattern: KernelPattern::Tag {
+                            name: "A".into(),
+                            fields: Box::new([]),
+                        },
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::MatchOutput, 2)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: vec!["b".into()].into_boxed_slice(),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::PureBuiltin {
+                        kind: KernelPureBuiltinKind::NumberToText,
+                    },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::AbiArgument {
+                            name: "$pipe".into(),
+                        },
+                        4,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::MatchArm {
+                        pattern: KernelPattern::Tag {
+                            name: "B".into(),
+                            fields: Box::new([]),
+                        },
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::MatchOutput, 5)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::When,
+                    inputs: vec![
+                        edge(KernelOwnerEdgeRole::WhenInput, 0),
+                        edge(KernelOwnerEdgeRole::WhenArm, 3),
+                        edge(KernelOwnerEdgeRole::WhenArm, 6),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(7),
+        };
+        let wrapper = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: vec!["value".into()].into_boxed_slice(),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+        let caller = |target, wrap| {
+            let mut nodes = vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Text,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record {
+                        tag: Some("A".into()),
+                    },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::RecordField {
+                            name: "a".into(),
+                            spread: false,
+                        },
+                        0,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record {
+                        tag: Some("B".into()),
+                    },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::RecordField {
+                            name: "b".into(),
+                            spread: false,
+                        },
+                        2,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Latest,
+                    inputs: vec![
+                        edge(KernelOwnerEdgeRole::LatestBranch, 1),
+                        edge(KernelOwnerEdgeRole::LatestBranch, 3),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ];
+            let argument = if wrap {
+                nodes.push(KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record { tag: None },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::RecordField {
+                            name: "value".into(),
+                            spread: false,
+                        },
+                        4,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                });
+                5
+            } else {
+                4
+            };
+            nodes.push(KernelOwnerNode {
+                kind: KernelOwnerNodeKind::UserCall {
+                    target: KernelOwnerId(target),
+                    inherited_formal: None,
+                },
+                inputs: vec![edge(
+                    KernelOwnerEdgeRole::CallArgument { ordinal: 0 },
+                    argument,
+                )]
+                .into_boxed_slice(),
+                mode: FlowMode::Continuous,
+            });
+            KernelOwnerProgramInput {
+                result: KernelExpressionId(
+                    u32::try_from(nodes.len() - 1).expect("test node count fits u32"),
+                ),
+                nodes: nodes.into_boxed_slice(),
+                formal_count: 0,
+                external_expressions: Box::new([]),
+            }
+        };
+
+        let program = KernelProjectProgramInput {
+            owners: vec![callee, wrapper, caller(0, false), caller(1, true)].into_boxed_slice(),
+        };
+        let discriminated = project_syntax_discriminated_formals(&program);
+        assert_eq!(discriminated[0].as_ref(), [0]);
+        assert_eq!(
+            discriminated[1].as_ref(),
+            [0],
+            "a wrapper formal must inherit the callee's branch-dependent contract"
+        );
+        assert!(discriminated[2].is_empty());
+        assert!(discriminated[3].is_empty());
+
+        let interfaces = compile_project_program(&program)
+            .unwrap()
+            .solve_interfaces()
+            .unwrap();
+        assert!(
+            interfaces.diagnostics.is_empty(),
+            "mutually exclusive field requirements must remain conditional through direct and wrapper calls: {:#?}",
+            interfaces.diagnostics
+        );
+    }
+
+    #[test]
+    fn diagnostics_project_only_explicit_value_demands_without_expression_rows() {
+        let owner = KernelOwnerProgramInput {
+            nodes: vec![KernelOwnerNode {
+                kind: KernelOwnerNodeKind::Number,
+                inputs: Box::new([]),
+                mode: FlowMode::Continuous,
+            }]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(0),
+        };
+        let facts = KernelDefinitionFactsInput {
+            diagnostic_values: vec![KernelExpressionId(0)].into_boxed_slice(),
+            ..KernelDefinitionFactsInput::default()
+        };
+        let solved = compile_project_program_with_definition_facts(
+            &KernelProjectProgramInput {
+                owners: vec![owner].into_boxed_slice(),
+            },
+            &[facts],
+        )
+        .unwrap()
+        .solve_graph()
+        .unwrap();
+
+        let interfaces = solved.interface_snapshot();
+        let [value] = interfaces.diagnostic_values.as_ref() else {
+            panic!("one sparse diagnostic value must be projected")
+        };
+        assert_eq!(value.owner, KernelOwnerId(0));
+        assert_eq!(value.ordinal, 0);
+        assert_eq!(
+            value.value,
+            KernelValueReference::Local(KernelExpressionId(0))
+        );
+        assert_eq!(value.ty, Type::Number);
+        assert!(interfaces.diagnostics.is_empty());
+
+        let checked = solved.checked_snapshot().unwrap();
+        assert_eq!(checked.diagnostic_values.as_ref(), [value.clone()]);
+        assert_eq!(checked.definitions.len(), 1);
+    }
+
+    #[test]
     fn generic_calls_instantiate_formals_before_diagnostic_comparison() {
         let identity = KernelOwnerProgramInput {
             nodes: vec![KernelOwnerNode {
@@ -12674,6 +13567,288 @@ mod tests {
             "a concrete generic occurrence satisfies its instantiated formal: {:#?}",
             interfaces.diagnostics
         );
+    }
+
+    #[test]
+    fn wildcard_when_keeps_the_callable_selector_open() {
+        let callee = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::MatchArm {
+                        pattern: KernelPattern::Tag {
+                            name: "Known".into(),
+                            fields: Box::new([]),
+                        },
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::MatchOutput, 1)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Text,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::MatchArm {
+                        pattern: KernelPattern::Wildcard,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::MatchOutput, 3)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::When,
+                    inputs: vec![
+                        edge(KernelOwnerEdgeRole::WhenInput, 0),
+                        edge(KernelOwnerEdgeRole::WhenArm, 2),
+                        edge(KernelOwnerEdgeRole::WhenArm, 4),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(5),
+        };
+        let caller = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Tag("Other".into()),
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+
+        let artifact = compile_project_program(&KernelProjectProgramInput {
+            owners: vec![callee, caller].into_boxed_slice(),
+        })
+        .unwrap()
+        .solve()
+        .unwrap();
+        assert!(matches!(
+            artifact.definitions[0].formals[0].ty,
+            Type::Var(_)
+        ));
+        assert_eq!(artifact.definitions[1].result.ty, Type::Text);
+        assert!(artifact.definitions[1].diagnostics.is_empty());
+    }
+
+    #[test]
+    fn closed_when_preserves_bare_tags_and_projects_tagged_payloads() {
+        let callee = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::FormalRead {
+                        formal: 0,
+                        fields: Box::new([]),
+                    },
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::PatternRead {
+                        pattern: KernelPattern::Tag {
+                            name: "Material".into(),
+                            fields: vec!["of".into()].into_boxed_slice(),
+                        },
+                        fields: vec!["of".into()].into_boxed_slice(),
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::ReadProvider, 0)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::MatchArm {
+                        pattern: KernelPattern::Tag {
+                            name: "Material".into(),
+                            fields: vec!["of".into()].into_boxed_slice(),
+                        },
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::MatchOutput, 1)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::MatchArm {
+                        pattern: KernelPattern::Tag {
+                            name: "Lights".into(),
+                            fields: Box::new([]),
+                        },
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::MatchOutput, 3)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::When,
+                    inputs: vec![
+                        edge(KernelOwnerEdgeRole::WhenInput, 0),
+                        edge(KernelOwnerEdgeRole::WhenArm, 2),
+                        edge(KernelOwnerEdgeRole::WhenArm, 4),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 1,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(5),
+        };
+        let caller = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Text,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record {
+                        tag: Some("Material".into()),
+                    },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::RecordField {
+                            name: "of".into(),
+                            spread: false,
+                        },
+                        0,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 1)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Tag("Lights".into()),
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::UserCall {
+                        target: KernelOwnerId(0),
+                        inherited_formal: None,
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 3)]
+                        .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record { tag: None },
+                    inputs: vec![
+                        edge(
+                            KernelOwnerEdgeRole::RecordField {
+                                name: "material".into(),
+                                spread: false,
+                            },
+                            2,
+                        ),
+                        edge(
+                            KernelOwnerEdgeRole::RecordField {
+                                name: "lights".into(),
+                                spread: false,
+                            },
+                            4,
+                        ),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(5),
+        };
+
+        let artifact = compile_project_program(&KernelProjectProgramInput {
+            owners: vec![callee, caller].into_boxed_slice(),
+        })
+        .unwrap()
+        .solve()
+        .unwrap();
+        let Type::VariantSet(formal) = &artifact.definitions[0].formals[0].ty else {
+            panic!("closed WHEN formal must be a variant set")
+        };
+        assert!(
+            formal
+                .iter()
+                .any(|variant| matches!(variant, Variant::Tag(tag) if tag == "Lights"))
+        );
+        assert!(formal.iter().any(|variant| matches!(variant, Variant::Tagged { tag, fields } if tag == "Material" && fields.fields.contains_key("of"))));
+        let Type::Object(result) = &artifact.definitions[1].result.ty else {
+            panic!("caller result must be an object")
+        };
+        assert_eq!(result.fields["material"], Type::Text);
+        assert_eq!(result.fields["lights"], Type::Number);
+        assert!(artifact.definitions[1].diagnostics.is_empty());
+    }
+
+    #[test]
+    fn pattern_bindings_are_continuous_values_inside_event_arms() {
+        let input = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Source(Type::Text),
+                    inputs: Box::new([]),
+                    mode: FlowMode::PresentOrAbsent,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::PatternRead {
+                        pattern: KernelPattern::Binding {
+                            name: "value".into(),
+                        },
+                        fields: Box::new([]),
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::ReadProvider, 0)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(1),
+        };
+
+        let artifact = compile_owner_program(&input).unwrap().solve().unwrap();
+        assert_eq!(artifact.definition.result.ty, Type::Text);
+        assert_eq!(artifact.definition.result.mode, FlowMode::Continuous);
     }
 
     #[test]
@@ -14436,7 +15611,7 @@ mod tests {
     }
 
     #[test]
-    fn public_reads_keep_the_declaration_mode_but_calls_project_the_actual_mode() {
+    fn public_and_exact_reads_project_the_nested_actual_mode() {
         let input = KernelProjectProgramInput {
             owners: vec![
                 KernelOwnerProgramInput {
@@ -14538,8 +15713,8 @@ mod tests {
         );
         assert_eq!(
             artifact.definitions[2].expressions[0].flow_type.mode,
-            FlowMode::Continuous,
-            "an ordinary cross-owner read retains the public declaration mode"
+            FlowMode::PresentOrAbsent,
+            "a public-result read preserves the nested event field mode"
         );
         assert_eq!(
             artifact.definitions[2].result.mode,

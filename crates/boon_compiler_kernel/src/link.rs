@@ -4,14 +4,16 @@ use crate::{
     KernelStatementChildReference, KernelStatementReference, KernelValueReference,
 };
 use boon_checked::{
-    CheckedBlockBinding, CheckedCallId, CheckedDeclaration, CheckedDeclarationKind,
-    CheckedEffectSummary, CheckedExprId, CheckedExpression, CheckedExpressionKind, CheckedList,
-    CheckedListId, CheckedMatchPattern, CheckedPassedAccess, CheckedRecordField,
+    CheckedBlockBinding, CheckedCallId, CheckedCallableKind, CheckedCallableSignature,
+    CheckedContextFormal, CheckedContextScheme, CheckedDeclaration, CheckedDeclarationKind,
+    CheckedEffectSummary, CheckedEvaluationScope, CheckedExprId, CheckedExpression,
+    CheckedExpressionKind, CheckedList, CheckedListId, CheckedMatchPattern, CheckedParameter,
+    CheckedParameterKind, CheckedParameterRequirement, CheckedPassedAccess, CheckedRecordField,
     CheckedResourceBinding, CheckedScope, CheckedScopeKind, CheckedSemanticPath, CheckedSource,
     CheckedSourceId, CheckedSourceRead, CheckedSpan, CheckedState, CheckedStateId,
     CheckedStatement, CheckedStatementId, CheckedStatementKind, CheckedTextSegment,
     CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId, ObjectShape,
-    Type, TypeVar, Variant,
+    ProgramRole, Type, TypeVar, Variant,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -69,6 +71,7 @@ pub struct KernelCheckedLinkTotals {
     pub declarations: u32,
     pub type_variables: u32,
     pub calls: u32,
+    pub callables: u32,
     pub context_formals: u32,
     pub sources: u32,
     pub states: u32,
@@ -159,6 +162,19 @@ impl KernelCheckedLinkLayout {
                     owner.0,
                 ))
             })?;
+            if matches!(
+                definition.statements.get(root_statement.0 as usize),
+                Some(crate::KernelStatementArtifact {
+                    kind: crate::KernelStatementKind::Function { .. },
+                    ..
+                })
+            ) {
+                totals.callables = totals.callables.checked_add(1).ok_or_else(|| {
+                    KernelCheckedLinkError::new(
+                        "kernel checked linker callable namespace exceeds u32",
+                    )
+                })?;
+            }
             let public_declaration = linkage.public_declaration.ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
                     "kernel definition {} omits its direct-linker public declaration",
@@ -977,6 +993,285 @@ impl KernelCheckedLinkLayout {
         Ok(expressions.into_boxed_slice())
     }
 
+    /// Emit authored user-callable signatures and their sparse inherited
+    /// PASSED schemes directly from the same definition artifacts that own
+    /// declaration and expression rows.
+    ///
+    /// Builtin/external ABI signatures are intentionally not accepted here;
+    /// the compiler facade appends those stable lower-level contracts after
+    /// this definition-owned table. Keeping the two authorities separate
+    /// prevents parser or legacy owner metadata from leaking into the kernel.
+    pub fn materialize_user_callables(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        role: ProgramRole,
+    ) -> Result<
+        (Box<[CheckedCallableSignature]>, Box<[CheckedContextFormal]>),
+        KernelCheckedLinkError,
+    > {
+        self.validate_snapshot_definition_count(snapshot, "user callable")?;
+        let mut callables = Vec::with_capacity(self.totals.callables as usize);
+        let mut context_formals = Vec::with_capacity(self.totals.context_formals as usize);
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = checked_owner_id(owner_index, "user callable")?;
+            let root_statement = definition.linkage.root_statement.ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel definition {} has no root statement while linking callables",
+                    owner.0,
+                ))
+            })?;
+            let Some(root) = definition.statements.get(root_statement.0 as usize) else {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} root statement {} is missing",
+                    owner.0, root_statement.0,
+                )));
+            };
+            let crate::KernelStatementKind::Function { name, parameters } = &root.kind else {
+                if definition.linkage.context_formal_ordinal.is_some() {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel non-callable definition {} owns a context formal",
+                        owner.0,
+                    )));
+                }
+                continue;
+            };
+            let KernelDeclarationReference::Local(public_declaration) =
+                definition.linkage.public_declaration.ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel callable definition {} has no public declaration",
+                        owner.0,
+                    ))
+                })?
+            else {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel callable definition {} delegates its public declaration",
+                    owner.0,
+                )));
+            };
+            let public_declaration_row = definition
+                .declarations
+                .get(public_declaration.0 as usize)
+                .filter(|declaration| {
+                    declaration.id == public_declaration
+                        && declaration.kind == crate::KernelDeclarationKind::Function
+                })
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel callable definition {} has no exact function declaration {}",
+                        owner.0, public_declaration.0,
+                    ))
+                })?;
+            let public_presentation = declaration_presentation(definition, public_declaration)?;
+            let body_scope = public_presentation.body_scope.ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel callable definition {} has no body scope",
+                    owner.0,
+                ))
+            })?;
+            let root_presentation = statement_presentation(definition, root_statement)?;
+            if root_presentation.body_scope != Some(body_scope) {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel callable definition {} function declaration and statement disagree on body scope",
+                    owner.0,
+                )));
+            }
+            if definition.formals.len()
+                != parameters.len()
+                    + usize::from(definition.linkage.context_formal_ordinal.is_some())
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel callable definition {} has {} parameters, {:?} context formal, and {} solved formals",
+                    owner.0,
+                    parameters.len(),
+                    definition.linkage.context_formal_ordinal,
+                    definition.formals.len(),
+                )));
+            }
+            let mut checked_parameters = Vec::with_capacity(parameters.len());
+            for parameter in parameters.iter() {
+                if parameter.ordinal as usize >= parameters.len() {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel callable definition {} parameter ordinal {} is outside 0..{}",
+                        owner.0,
+                        parameter.ordinal,
+                        parameters.len(),
+                    )));
+                }
+                let mut declarations = definition.declarations.iter().filter(|declaration| {
+                    matches!(
+                        declaration.origin,
+                        crate::KernelDeclarationOrigin::Parameter { statement, ordinal }
+                            if statement == root_statement && ordinal == parameter.ordinal
+                    )
+                });
+                let declaration = declarations.next().ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel callable definition {} parameter {} has no declaration",
+                        owner.0, parameter.ordinal,
+                    ))
+                })?;
+                if declarations.next().is_some() {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel callable definition {} parameter {} has multiple declarations",
+                        owner.0, parameter.ordinal,
+                    )));
+                }
+                let expected_kind = match parameter.kind {
+                    crate::KernelParameterKind::Value => {
+                        crate::KernelDeclarationKind::ValueParameter
+                    }
+                    crate::KernelParameterKind::Out => crate::KernelDeclarationKind::OutParameter,
+                };
+                if declaration.kind != expected_kind || declaration.name != parameter.name {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel callable definition {} parameter {} declaration disagrees with its authored header",
+                        owner.0, parameter.ordinal,
+                    )));
+                }
+                let presentation = declaration_presentation(definition, declaration.id)?;
+                let evaluation_scope = match parameter.evaluation_scope {
+                    crate::KernelParameterEvaluationScope::Parent => CheckedEvaluationScope::Parent,
+                    crate::KernelParameterEvaluationScope::Output { parameter_ordinal } => {
+                        let output = definition
+                            .declarations
+                            .iter()
+                            .find(|candidate| {
+                                matches!(
+                                    candidate.origin,
+                                    crate::KernelDeclarationOrigin::Parameter { statement, ordinal }
+                                        if statement == root_statement && ordinal == parameter_ordinal
+                                )
+                            })
+                            .ok_or_else(|| {
+                                KernelCheckedLinkError::new(format!(
+                                    "kernel callable definition {} parameter {} targets missing output parameter {}",
+                                    owner.0, parameter.ordinal, parameter_ordinal,
+                                ))
+                            })?;
+                        if output.kind != crate::KernelDeclarationKind::OutParameter {
+                            return Err(KernelCheckedLinkError::new(format!(
+                                "kernel callable definition {} parameter {} targets non-OUT parameter {}",
+                                owner.0, parameter.ordinal, parameter_ordinal,
+                            )));
+                        }
+                        CheckedEvaluationScope::Output {
+                            formal: self
+                                .declaration(owner, KernelDeclarationReference::Local(output.id))?,
+                        }
+                    }
+                };
+                checked_parameters.push(CheckedParameter {
+                    decl_id: self
+                        .declaration(owner, KernelDeclarationReference::Local(declaration.id))?,
+                    name: parameter.name.to_string(),
+                    kind: match parameter.kind {
+                        crate::KernelParameterKind::Value => CheckedParameterKind::Value,
+                        crate::KernelParameterKind::Out => CheckedParameterKind::Out,
+                    },
+                    ordinal: parameter.ordinal as usize,
+                    flow_type: self.relocate_flow_type(
+                        owner,
+                        &definition.formals[parameter.ordinal as usize],
+                    )?,
+                    requirement: CheckedParameterRequirement::Required,
+                    evaluation_scope,
+                    start: presentation.span.start,
+                    end: presentation.span.end,
+                });
+            }
+            checked_parameters.sort_unstable_by_key(|parameter| parameter.ordinal);
+
+            let context_formal = definition
+                .linkage
+                .context_formal_ordinal
+                .map(|ordinal| {
+                    let id = self.definition(owner)?.context_formal.ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel callable definition {} has no linked context formal",
+                            owner.0,
+                        ))
+                    })?;
+                    if ordinal as usize != parameters.len() {
+                        return Err(KernelCheckedLinkError::new(format!(
+                            "kernel callable definition {} context ordinal {} does not follow {} authored parameters",
+                            owner.0,
+                            ordinal,
+                            parameters.len(),
+                        )));
+                    }
+                    let flow_type = self.relocate_flow_type(
+                        owner,
+                        &definition.formals[ordinal as usize],
+                    )?;
+                    let projections = boon_checked::context_scheme_projections(&flow_type.ty);
+                    context_formals.push(CheckedContextFormal {
+                        id,
+                        callable: self.declaration(
+                            owner,
+                            KernelDeclarationReference::Local(public_declaration),
+                        )?,
+                        scheme: CheckedContextScheme {
+                            flow_type,
+                            projections,
+                        },
+                    });
+                    Ok(id)
+                })
+                .transpose()?;
+            if public_declaration_row.name != *name {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel callable definition {} declaration name {:?} differs from function header {:?}",
+                    owner.0, public_declaration_row.name, name,
+                )));
+            }
+            let mut effect = CheckedEffectSummary::default();
+            for expression in &definition.expressions {
+                effect.reads_state |= expression.effect.reads_state;
+                effect.writes_state |= expression.effect.writes_state;
+                effect.emits_source |= expression.effect.emits_source;
+                effect.invokes_host |= expression.effect.invokes_host;
+            }
+            callables.push(CheckedCallableSignature {
+                decl_id: self
+                    .declaration(owner, KernelDeclarationReference::Local(public_declaration))?,
+                scope_id: self.scope(owner, KernelScopeReference::Local(body_scope))?,
+                kind: CheckedCallableKind::User,
+                name: name.to_string(),
+                intrinsic: None,
+                external_identity: None,
+                parameters: checked_parameters,
+                contexts: Vec::new(),
+                context_formal,
+                result: self.relocate_flow_type(owner, &definition.result)?,
+                role,
+                effect,
+                body: Some(self.statement(owner, KernelStatementReference::Local(root_statement))?),
+                result_expression: Some(self.expression(
+                    owner,
+                    KernelValueReference::Local(definition.linkage.result_expression.ok_or_else(
+                        || {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel callable definition {} has no result expression",
+                                owner.0,
+                            ))
+                        },
+                    )?),
+                )?),
+                contextual_operation: None,
+            });
+        }
+        self.validate_materialized_count("user callable", callables.len(), self.totals.callables)?;
+        self.validate_materialized_count(
+            "context formal",
+            context_formals.len(),
+            self.totals.context_formals,
+        )?;
+        Ok((
+            callables.into_boxed_slice(),
+            context_formals.into_boxed_slice(),
+        ))
+    }
+
     /// Emit every SOURCE resource directly from its solved definition row.
     ///
     /// The expression presentation owns the source coordinate and lexical
@@ -1553,6 +1848,23 @@ fn statement_presentation(
             KernelCheckedLinkError::new(format!(
                 "kernel resource statement {} has no exact presentation row",
                 statement.0,
+            ))
+        })
+}
+
+fn declaration_presentation(
+    definition: &crate::DefinitionArtifact,
+    declaration: crate::KernelDeclarationId,
+) -> Result<&crate::KernelDeclarationPresentation, KernelCheckedLinkError> {
+    definition
+        .presentation
+        .declarations
+        .get(declaration.0 as usize)
+        .filter(|presentation| presentation.declaration == declaration)
+        .ok_or_else(|| {
+            KernelCheckedLinkError::new(format!(
+                "kernel declaration {} has no exact presentation row",
+                declaration.0,
             ))
         })
 }

@@ -5399,7 +5399,7 @@ impl CheckedProgramDatabase {
                 id: formal,
                 callable,
                 scheme: CheckedContextScheme {
-                    projections: context_scheme_projections(&flow_type.ty),
+                    projections: boon_checked::context_scheme_projections(&flow_type.ty),
                     flow_type,
                 },
             });
@@ -17801,27 +17801,6 @@ fn alpha_normalize_context_type(
         | Type::UnresolvedShape { .. }
         | Type::Unknown => ty.clone(),
     }
-}
-
-fn context_scheme_projections(ty: &Type) -> Vec<Vec<String>> {
-    fn visit(ty: &Type, path: &mut Vec<String>, projections: &mut Vec<Vec<String>>) {
-        match ty {
-            Type::Object(shape) if !shape.fields.is_empty() => {
-                for (field, ty) in shape.ordered_fields() {
-                    path.push(field.clone());
-                    visit(ty, path, projections);
-                    path.pop();
-                }
-            }
-            _ => projections.push(path.clone()),
-        }
-    }
-
-    let mut projections = Vec::new();
-    visit(ty, &mut Vec::new(), &mut projections);
-    projections.sort();
-    projections.dedup();
-    projections
 }
 
 fn pass_scheme_type_with_fallback(ty: &Type, fallback: &Type) -> Type {

@@ -1152,6 +1152,34 @@ pub struct CheckedContextScheme {
     pub projections: Vec<Vec<String>>,
 }
 
+/// Return the canonical sparse leaf projections carried by a PASSED context
+/// scheme. Non-empty objects contribute their recursively ordered fields;
+/// every other type is one indivisible requirement leaf.
+///
+/// This is checked-model semantics rather than a solver policy. Producers use
+/// the same derivation so a principal scheme and its projection inventory
+/// cannot drift as contextual requirements propagate through call graphs.
+pub fn context_scheme_projections(ty: &Type) -> Vec<Vec<String>> {
+    fn visit(ty: &Type, path: &mut Vec<String>, projections: &mut Vec<Vec<String>>) {
+        match ty {
+            Type::Object(shape) if !shape.fields.is_empty() => {
+                for (field, ty) in shape.ordered_fields() {
+                    path.push(field.clone());
+                    visit(ty, path, projections);
+                    path.pop();
+                }
+            }
+            _ => projections.push(path.clone()),
+        }
+    }
+
+    let mut projections = Vec::new();
+    visit(ty, &mut Vec::new(), &mut projections);
+    projections.sort();
+    projections.dedup();
+    projections
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckedContextFormal {
     pub id: ContextFormalId,

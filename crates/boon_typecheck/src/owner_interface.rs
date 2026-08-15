@@ -5172,7 +5172,7 @@ fn project_owner_interface_scc_result(
                 ty: alpha_normalize_type(&context_ty, &mut alpha_variables, &mut next_alpha),
             };
             OwnerContextInterface {
-                projections: crate::context_scheme_projections(&flow_type.ty)
+                projections: boon_checked::context_scheme_projections(&flow_type.ty)
                     .into_iter()
                     .map(Vec::into_boxed_slice)
                     .collect::<Vec<_>>()

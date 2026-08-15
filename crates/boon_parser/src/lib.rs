@@ -565,6 +565,27 @@ impl<'a> UnitOwnerSyntaxView<'a> {
         self.stable_expression_key_local(expression)
     }
 
+    /// Return the parser-issued structural occurrence identity for an
+    /// expression visible through this owner view.
+    ///
+    /// Checked-image linkers retain this identity beside authored call rows so
+    /// compact checked expression IDs never need to be reinterpreted as parser
+    /// arena slots during sealing.
+    pub fn stable_occurrence_key_for_syntax(
+        &self,
+        expression_id: usize,
+    ) -> Option<StableOccurrenceKey> {
+        let expression = self.local_expression_id(expression_id)?;
+        Some(StableOccurrenceKey {
+            source_unit_id: self.fields.source_unit_id.clone(),
+            route: self
+                .fields
+                .occurrence_routes
+                .get(expression.as_usize())?
+                .clone()?,
+        })
+    }
+
     /// Return the exact stable parent edge of any expression in this source
     /// unit. The parent can belong to this view even when `expression_id`
     /// belongs to a direct child owner; this is the structural fact required

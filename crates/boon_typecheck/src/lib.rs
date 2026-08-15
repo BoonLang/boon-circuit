@@ -15606,7 +15606,7 @@ struct CheckedStructuralCallSiteV3 {
     occurrence: StableOccurrenceKey,
 }
 
-fn checked_structural_call_site(
+fn checked_structural_call_site_from_syntax(
     parsed: &TypecheckSyntaxProgram,
     call: &CheckedCall,
 ) -> Result<CheckedStructuralCallSiteV3, String> {
@@ -15619,6 +15619,19 @@ fn checked_structural_call_site(
             )
         })?;
     Ok(CheckedStructuralCallSiteV3 { occurrence })
+}
+
+fn checked_call_occurrences_from_syntax(
+    program: &CheckedProgramFields,
+    parsed: &TypecheckSyntaxProgram,
+) -> Result<Vec<StableOccurrenceKey>, String> {
+    program
+        .calls
+        .iter()
+        .map(|call| {
+            checked_structural_call_site_from_syntax(parsed, call).map(|site| site.occurrence)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -15947,6 +15960,27 @@ fn checked_image_handoff(
     program: &CheckedProgramFields,
     parsed: &TypecheckSyntaxProgram,
 ) -> Result<CheckedImageHandoffV3, String> {
+    let call_occurrences = checked_call_occurrences_from_syntax(program, parsed)?;
+    checked_image_handoff_with_call_occurrences(program, &call_occurrences)
+}
+
+/// Build checked-image receipts from explicit parser-issued call identities.
+///
+/// The greenfield kernel uses compact checked expression IDs which are not
+/// parser arena slots. Its linker therefore carries each authored structural
+/// occurrence beside the dense call row and enters the shared seal through
+/// this relocation-aware boundary.
+fn checked_image_handoff_with_call_occurrences(
+    program: &CheckedProgramFields,
+    call_occurrences: &[StableOccurrenceKey],
+) -> Result<CheckedImageHandoffV3, String> {
+    if call_occurrences.len() != program.calls.len() {
+        return Err(format!(
+            "checked image received {} structural call occurrences for {} call rows",
+            call_occurrences.len(),
+            program.calls.len(),
+        ));
+    }
     let root_owner = CheckedShardOwnerKeyV2::ProgramTopLevel { role: program.role };
     let root_definition = checked_definition_projection(root_owner.clone());
     let root_interface = checked_interface_projection(root_owner.clone());
@@ -16134,12 +16168,15 @@ fn checked_image_handoff(
     let structural_calls = program
         .calls
         .iter()
-        .map(|call| {
+        .zip(call_occurrences)
+        .map(|(call, occurrence)| {
             let owner = call
                 .owner_callable
                 .and_then(|owner| callable_owners.get(&owner).cloned())
                 .unwrap_or_else(|| root_owner.clone());
-            let structural_site = checked_structural_call_site(parsed, call)?;
+            let structural_site = CheckedStructuralCallSiteV3 {
+                occurrence: occurrence.clone(),
+            };
             let structural_call_site_digest = boon_contract::canonical_serde_hash_v1(
                 CHECKED_STRUCTURAL_CALL_SITE_DOMAIN_V3,
                 &structural_site,
@@ -16476,6 +16513,34 @@ pub fn seal_project_checked_program_construction(
         &TypecheckSyntaxProgram::UnitNative(parsed.clone()),
         construction.__typechecker_into_fields(),
     )
+}
+
+/// Seal a project-native checked construction using the exact structural call
+/// identities retained by a compact checker.
+///
+/// Unlike [`seal_project_checked_program_construction`], this entry point does
+/// not interpret checked expression IDs as syntax projection slots. The
+/// caller must provide one parser-issued occurrence per dense checked call in
+/// row order.
+pub fn seal_project_checked_program_construction_with_call_occurrences(
+    parsed: &ProjectSyntaxSnapshot,
+    construction: CheckedProgramConstruction,
+    call_occurrences: &[StableOccurrenceKey],
+) -> Result<CheckedProgram, String> {
+    let fields = construction.__typechecker_into_fields();
+    if fields.source_bundle_digest_v1 != parsed.source_bundle_digest_v1() {
+        return Err(format!(
+            "checked construction source digest {} differs from parsed source digest {}",
+            fields.source_bundle_digest_v1,
+            parsed.source_bundle_digest_v1()
+        ));
+    }
+    let image_handoff = checked_image_handoff_with_call_occurrences(&fields, call_occurrences)?;
+    // SAFETY: the compact checker supplies fields only after successful
+    // construction and supplies parser-issued structural call identities in
+    // exact dense call order. The source digest and handoff receipts are
+    // validated above before granting runtime capability.
+    Ok(unsafe { CheckedProgram::from_typechecker_parts_unchecked(fields, image_handoff) })
 }
 
 fn seal_checked_program_fields(

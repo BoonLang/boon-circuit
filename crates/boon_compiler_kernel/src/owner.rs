@@ -16,7 +16,10 @@ use boon_data::{Bits, ExactNumber, ExactNumberParseReason, ExactRoundingRule};
 use boon_effect_schema::{
     BarrierSpec, DeliveryCardinalitySpec, ReplaySpec, ResultPolicySpec, ValueType, host_effect_spec,
 };
-use boon_syntax::{AstExpr, AstExprKind, AstMatchPattern, StableExpressionKey, StableStatementKey};
+use boon_syntax::{
+    AstExpr, AstExprKind, AstMatchPattern, StableExpressionKey, StableOccurrenceKey,
+    StableStatementKey,
+};
 use serde::Serialize;
 use serde::ser::SerializeStruct;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -722,6 +725,7 @@ pub enum KernelTextTemplateSegment {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelCallSyntaxInput {
     pub expression: KernelExpressionId,
+    pub occurrence: StableOccurrenceKey,
     pub function: Box<str>,
     pub pipe_input: Option<KernelExpressionId>,
     pub arguments: Box<[KernelCallSyntaxArgument]>,
@@ -915,7 +919,7 @@ pub struct KernelOwnerProgram {
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
-    basis_fingerprint_v12: [u8; 32],
+    basis_fingerprint_v13: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -1013,7 +1017,7 @@ struct KernelProjectOwnerOutputs {
     /// requirements. That aggregate is useful to the solver, but is not a
     /// sound direct assignability contract for call diagnostics.
     syntax_discriminated_formals: Box<[u32]>,
-    basis_fingerprint_v12: [u8; 32],
+    basis_fingerprint_v13: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -1126,6 +1130,7 @@ pub enum KernelValueReference {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelCallSyntaxArtifact {
     pub expression: KernelExpressionId,
+    pub occurrence: StableOccurrenceKey,
     pub function: Box<str>,
     pub pipe_input: Option<KernelValueReference>,
     pub arguments: Box<[KernelCallSyntaxArgumentArtifact]>,
@@ -2228,7 +2233,7 @@ pub fn is_registered_kernel_host_effect(operation: &str) -> bool {
 
 impl KernelOwnerProgram {
     pub fn solve(self) -> Result<KernelDefinitionSnapshot, KernelSolveError> {
-        let basis_fingerprint_v12 = self.basis_fingerprint_v12;
+        let basis_fingerprint_v13 = self.basis_fingerprint_v13;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
             .output(self.result_output)
@@ -2315,7 +2320,7 @@ impl KernelOwnerProgram {
         };
         let (dependencies, currentness) = build_snapshot_receipts(
             std::slice::from_mut(&mut definition),
-            &[basis_fingerprint_v12],
+            &[basis_fingerprint_v13],
         )?;
         let [currentness] = currentness.as_ref() else {
             unreachable!("one standalone kernel definition produces one receipt")
@@ -2481,7 +2486,7 @@ impl KernelSolvedProject {
         let basis_fingerprints = self
             .owners
             .iter()
-            .map(|owner| owner.basis_fingerprint_v12)
+            .map(|owner| owner.basis_fingerprint_v13)
             .collect::<Vec<_>>();
         let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(&self.owners);
         let mut definitions = self
@@ -4145,7 +4150,7 @@ pub fn compile_owner_program_with_definition_facts(
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
     validate_definition_linker_facts(input, facts, None)?;
-    let basis_fingerprint_v12 = definition_basis_fingerprint(input, facts)?;
+    let basis_fingerprint_v13 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
@@ -4315,7 +4320,7 @@ pub fn compile_owner_program_with_definition_facts(
         )?,
         effects: collect_host_effect_artifacts(input)?,
         diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
-        basis_fingerprint_v12,
+        basis_fingerprint_v13,
     })
 }
 
@@ -5476,6 +5481,7 @@ fn collect_call_syntax_artifacts(
             let call_index = call.expression.0 as usize;
             Ok(KernelCallSyntaxArtifact {
                 expression: call.expression,
+                occurrence: call.occurrence.clone(),
                 function: call.function.clone(),
                 pipe_input: call
                     .pipe_input
@@ -6273,7 +6279,7 @@ pub fn compile_project_program_with_definition_facts(
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice(),
                 syntax_discriminated_formals: syntax_discriminated_formals[owner_index].clone(),
-                basis_fingerprint_v12: definition_basis_fingerprint_with_buffer(
+                basis_fingerprint_v13: definition_basis_fingerprint_with_buffer(
                     owner,
                     &facts[owner_index],
                     &mut basis_fingerprint_scratch,
@@ -13792,16 +13798,16 @@ mod tests {
             render_slot.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            artifact.currentness.basis_fingerprint_v12,
-            render_slot.currentness.basis_fingerprint_v12,
+            artifact.currentness.basis_fingerprint_v13,
+            render_slot.currentness.basis_fingerprint_v13,
         );
         assert_ne!(
-            artifact.currentness.artifact_fingerprint_v14,
-            render_slot.currentness.artifact_fingerprint_v14,
+            artifact.currentness.artifact_fingerprint_v15,
+            render_slot.currentness.artifact_fingerprint_v15,
         );
         assert_ne!(
-            artifact.currentness.fingerprint_v14,
-            render_slot.currentness.fingerprint_v14,
+            artifact.currentness.fingerprint_v15,
+            render_slot.currentness.fingerprint_v15,
         );
 
         let mut invalid = facts.clone();
@@ -13882,16 +13888,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v12,
-            moved.currentness.basis_fingerprint_v12
+            solved.currentness.basis_fingerprint_v13,
+            moved.currentness.basis_fingerprint_v13
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v14,
-            moved.currentness.artifact_fingerprint_v14
+            solved.currentness.artifact_fingerprint_v15,
+            moved.currentness.artifact_fingerprint_v15
         );
         assert_ne!(
-            solved.currentness.fingerprint_v14,
-            moved.currentness.fingerprint_v14
+            solved.currentness.fingerprint_v15,
+            moved.currentness.fingerprint_v15
         );
 
         let mut missing = facts.clone();
@@ -13976,16 +13982,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v12,
-            moved.currentness.basis_fingerprint_v12
+            solved.currentness.basis_fingerprint_v13,
+            moved.currentness.basis_fingerprint_v13
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v14,
-            moved.currentness.artifact_fingerprint_v14
+            solved.currentness.artifact_fingerprint_v15,
+            moved.currentness.artifact_fingerprint_v15
         );
         assert_ne!(
-            solved.currentness.fingerprint_v14,
-            moved.currentness.fingerprint_v14
+            solved.currentness.fingerprint_v15,
+            moved.currentness.fingerprint_v15
         );
 
         let mut missing = facts.clone();
@@ -14083,16 +14089,16 @@ mod tests {
             edited.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v12,
-            edited.currentness.basis_fingerprint_v12,
+            solved.currentness.basis_fingerprint_v13,
+            edited.currentness.basis_fingerprint_v13,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v14,
-            edited.currentness.artifact_fingerprint_v14,
+            solved.currentness.artifact_fingerprint_v15,
+            edited.currentness.artifact_fingerprint_v15,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v14,
-            edited.currentness.fingerprint_v14,
+            solved.currentness.fingerprint_v15,
+            edited.currentness.fingerprint_v15,
         );
 
         let mut missing = facts.clone();
@@ -14175,6 +14181,14 @@ mod tests {
         };
         let syntax = KernelCallSyntaxInput {
             expression: KernelExpressionId(2),
+            occurrence: boon_syntax::StableOccurrenceKey {
+                source_unit_id: boon_syntax::SourceUnitId::from_path("call-surface.bn").unwrap(),
+                route: boon_syntax::StableOccurrenceRoute {
+                    owner: None,
+                    statement_route: Vec::new(),
+                    expression_route: Vec::new(),
+                },
+            },
             function: "Text/concat".into(),
             pipe_input: Some(KernelExpressionId(0)),
             arguments: vec![KernelCallSyntaxArgument {
@@ -14199,6 +14213,7 @@ mod tests {
             panic!("one authored call surface must be linked")
         };
         assert_eq!(linked.expression, syntax.expression);
+        assert_eq!(linked.occurrence, syntax.occurrence);
         assert_eq!(linked.function, syntax.function);
         assert_eq!(
             linked.pipe_input,
@@ -14222,16 +14237,42 @@ mod tests {
             renamed.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v12,
-            renamed.currentness.basis_fingerprint_v12,
+            solved.currentness.basis_fingerprint_v13,
+            renamed.currentness.basis_fingerprint_v13,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v14,
-            renamed.currentness.artifact_fingerprint_v14,
+            solved.currentness.artifact_fingerprint_v15,
+            renamed.currentness.artifact_fingerprint_v15,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v14,
-            renamed.currentness.fingerprint_v14,
+            solved.currentness.fingerprint_v15,
+            renamed.currentness.fingerprint_v15,
+        );
+
+        let mut moved_occurrence = facts.clone();
+        moved_occurrence.call_syntax[0].occurrence.source_unit_id =
+            boon_syntax::SourceUnitId::from_path("moved/call-surface.bn").unwrap();
+        let moved_occurrence =
+            compile_owner_program_with_definition_facts(&input, &moved_occurrence)
+                .unwrap()
+                .solve()
+                .unwrap();
+        assert_eq!(solved.definition.result, moved_occurrence.definition.result);
+        assert_eq!(
+            solved.currentness.public_result_fingerprint_v1,
+            moved_occurrence.currentness.public_result_fingerprint_v1,
+        );
+        assert_ne!(
+            solved.currentness.basis_fingerprint_v13,
+            moved_occurrence.currentness.basis_fingerprint_v13,
+        );
+        assert_ne!(
+            solved.currentness.artifact_fingerprint_v15,
+            moved_occurrence.currentness.artifact_fingerprint_v15,
+        );
+        assert_ne!(
+            solved.currentness.fingerprint_v15,
+            moved_occurrence.currentness.fingerprint_v15,
         );
 
         let mut partial = facts.clone();
@@ -14436,16 +14477,16 @@ mod tests {
             different_selector.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v12,
-            different_selector.currentness.basis_fingerprint_v12,
+            solved.currentness.basis_fingerprint_v13,
+            different_selector.currentness.basis_fingerprint_v13,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v14,
-            different_selector.currentness.artifact_fingerprint_v14,
+            solved.currentness.artifact_fingerprint_v15,
+            different_selector.currentness.artifact_fingerprint_v15,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v14,
-            different_selector.currentness.fingerprint_v14,
+            solved.currentness.fingerprint_v15,
+            different_selector.currentness.fingerprint_v15,
         );
 
         let mut partial = facts.clone();

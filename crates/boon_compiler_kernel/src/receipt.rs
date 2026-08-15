@@ -11,14 +11,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
-const KERNEL_DEFINITION_BASIS_DOMAIN_V12: &[u8] = b"boon.compiler-kernel.definition-basis.v12\0";
+const KERNEL_DEFINITION_BASIS_DOMAIN_V13: &[u8] = b"boon.compiler-kernel.definition-basis.v13\0";
 const KERNEL_PUBLIC_RESULT_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.public-result.v1\0";
 const KERNEL_EXPRESSION_SURFACE_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.expression-surface.v1\0";
-const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V14: &[u8] =
-    b"boon.compiler-kernel.definition-artifact.v14\0";
+const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V15: &[u8] =
+    b"boon.compiler-kernel.definition-artifact.v15\0";
 const KERNEL_DEPENDENCY_IMPORTS_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.dependency-imports.v1\0";
-const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V14: &[u8] =
-    b"boon.compiler-kernel.definition-currentness.v14\0";
+const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V15: &[u8] =
+    b"boon.compiler-kernel.definition-currentness.v15\0";
 
 /// Exact definition-local origin of one dependency edge.
 ///
@@ -189,11 +189,11 @@ impl KernelDefinitionDependencyGraph {
 /// exact imported authority set produced it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelDefinitionCurrentnessReceipt {
-    pub basis_fingerprint_v12: [u8; 32],
+    pub basis_fingerprint_v13: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v14: [u8; 32],
+    pub artifact_fingerprint_v15: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v14: [u8; 32],
+    pub fingerprint_v15: [u8; 32],
 }
 
 pub(crate) fn definition_basis_fingerprint(
@@ -209,7 +209,7 @@ pub(crate) fn definition_basis_fingerprint_with_buffer(
     scratch: &mut Vec<u8>,
 ) -> Result<[u8; 32], KernelOwnerBuildError> {
     Ok(stable_fingerprint(
-        KERNEL_DEFINITION_BASIS_DOMAIN_V12,
+        KERNEL_DEFINITION_BASIS_DOMAIN_V13,
         &(input, facts),
         scratch,
     ))
@@ -253,7 +253,7 @@ pub(crate) fn build_snapshot_receipts(
             &mut hash_scratch,
         )?);
         artifact_fingerprints.push(stable_fingerprint(
-            KERNEL_DEFINITION_ARTIFACT_DOMAIN_V14,
+            KERNEL_DEFINITION_ARTIFACT_DOMAIN_V15,
             definition,
             &mut hash_scratch,
         ));
@@ -315,24 +315,24 @@ pub(crate) fn build_snapshot_receipts(
             &(dependencies, imported_authorities),
             &mut hash_scratch,
         );
-        let basis_fingerprint_v12 = basis_fingerprints[definition_index];
+        let basis_fingerprint_v13 = basis_fingerprints[definition_index];
         let public_result_fingerprint_v1 = public_result_fingerprints[definition_index];
-        let artifact_fingerprint_v14 = artifact_fingerprints[definition_index];
-        let fingerprint_v14 = stable_fingerprint(
-            KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V14,
+        let artifact_fingerprint_v15 = artifact_fingerprints[definition_index];
+        let fingerprint_v15 = stable_fingerprint(
+            KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V15,
             &(
-                basis_fingerprint_v12,
-                artifact_fingerprint_v14,
+                basis_fingerprint_v13,
+                artifact_fingerprint_v15,
                 dependency_fingerprint_v1,
             ),
             &mut hash_scratch,
         );
         receipts.push(KernelDefinitionCurrentnessReceipt {
-            basis_fingerprint_v12,
+            basis_fingerprint_v13,
             public_result_fingerprint_v1,
-            artifact_fingerprint_v14,
+            artifact_fingerprint_v15,
             dependency_fingerprint_v1,
-            fingerprint_v14,
+            fingerprint_v15,
         });
     }
     Ok((dependency_graph, receipts.into_boxed_slice()))
@@ -1156,11 +1156,11 @@ mod tests {
             "an unused implementation edit must preserve the public type identity"
         );
         assert_ne!(
-            first.currentness[0].artifact_fingerprint_v14,
-            second.currentness[0].artifact_fingerprint_v14
+            first.currentness[0].artifact_fingerprint_v15,
+            second.currentness[0].artifact_fingerprint_v15
         );
         assert_ne!(
-            first.currentness[0].fingerprint_v14, second.currentness[0].fingerprint_v14,
+            first.currentness[0].fingerprint_v15, second.currentness[0].fingerprint_v15,
             "the edited definition must not claim the old exact evaluation receipt"
         );
         assert_eq!(
@@ -1219,22 +1219,22 @@ mod tests {
             second[0].public_result_fingerprint_v1
         );
         assert_eq!(
-            first[0].artifact_fingerprint_v14,
-            second[0].artifact_fingerprint_v14
+            first[0].artifact_fingerprint_v15,
+            second[0].artifact_fingerprint_v15
         );
         assert_eq!(
-            first[0].artifact_fingerprint_v14,
+            first[0].artifact_fingerprint_v15,
             [
-                45, 192, 72, 211, 195, 113, 154, 40, 193, 183, 84, 34, 220, 227, 143, 220, 224, 44,
-                144, 251, 225, 105, 22, 43, 106, 178, 195, 195, 10, 15, 136, 226,
+                47, 46, 22, 121, 19, 117, 180, 185, 172, 77, 140, 147, 2, 240, 56, 82, 196, 133,
+                214, 95, 135, 133, 34, 182, 201, 184, 155, 220, 242, 153, 248, 38,
             ],
-            "the V14 artifact fingerprint byte contract changed"
+            "the V15 artifact fingerprint byte contract changed"
         );
         assert_ne!(
-            first[0].basis_fingerprint_v12,
-            second[0].basis_fingerprint_v12
+            first[0].basis_fingerprint_v13,
+            second[0].basis_fingerprint_v13
         );
-        assert_ne!(first[0].fingerprint_v14, second[0].fingerprint_v14);
+        assert_ne!(first[0].fingerprint_v15, second[0].fingerprint_v15);
     }
 
     #[test]
@@ -1306,12 +1306,12 @@ mod tests {
             diagnosed_currentness[1].public_result_fingerprint_v1
         );
         assert_ne!(
-            clean_currentness[1].artifact_fingerprint_v14,
-            diagnosed_currentness[1].artifact_fingerprint_v14
+            clean_currentness[1].artifact_fingerprint_v15,
+            diagnosed_currentness[1].artifact_fingerprint_v15
         );
         assert_ne!(
-            clean_currentness[1].fingerprint_v14,
-            diagnosed_currentness[1].fingerprint_v14
+            clean_currentness[1].fingerprint_v15,
+            diagnosed_currentness[1].fingerprint_v15
         );
     }
 
@@ -1359,16 +1359,16 @@ mod tests {
             second.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            first.currentness.basis_fingerprint_v12,
-            second.currentness.basis_fingerprint_v12
+            first.currentness.basis_fingerprint_v13,
+            second.currentness.basis_fingerprint_v13
         );
         assert_ne!(
-            first.currentness.artifact_fingerprint_v14,
-            second.currentness.artifact_fingerprint_v14
+            first.currentness.artifact_fingerprint_v15,
+            second.currentness.artifact_fingerprint_v15
         );
         assert_ne!(
-            first.currentness.fingerprint_v14,
-            second.currentness.fingerprint_v14
+            first.currentness.fingerprint_v15,
+            second.currentness.fingerprint_v15
         );
     }
 }

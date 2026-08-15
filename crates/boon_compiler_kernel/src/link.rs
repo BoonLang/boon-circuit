@@ -20,6 +20,7 @@ use boon_checked::{
     FlowMode, FlowType, LexicalScopeId, ObjectShape, ProgramRole, SemanticOccurrence,
     SemanticOccurrenceKind, Type, TypeVar, Variant,
 };
+use boon_syntax::StableOccurrenceKey;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -115,6 +116,10 @@ pub struct KernelCheckedRows {
     pub callables: Box<[CheckedCallableSignature]>,
     pub context_formals: Box<[CheckedContextFormal]>,
     pub calls: Box<[CheckedCall]>,
+    /// Parser-issued structural identity for each call row at the same dense
+    /// ordinal. Checked-image sealing consumes this relocation directly and
+    /// never interprets compact checked expression IDs as parser slots.
+    pub call_occurrences: Box<[StableOccurrenceKey]>,
     pub call_result_paths: Box<[CheckedCallResultPath]>,
     pub pattern_bindings: Box<[CheckedPatternBinding]>,
     pub resource_projection_requirements: Box<[CheckedResourceProjectionRequirement]>,
@@ -585,7 +590,8 @@ impl KernelCheckedLinkLayout {
         let (abi_callables, abi_declarations) = self.materialize_abi_callables(project.abi())?;
         callables.extend(abi_callables);
         declarations.extend(abi_declarations);
-        let calls = self.materialize_calls(project, snapshot, &callables, &declarations)?;
+        let (calls, call_occurrences) =
+            self.materialize_calls(project, snapshot, &callables, &declarations)?;
         let call_result_paths =
             self.materialize_call_result_paths(&declarations, &callables, &expressions, &calls)?;
         let pattern_bindings = self.materialize_pattern_bindings(snapshot)?;
@@ -606,6 +612,7 @@ impl KernelCheckedLinkLayout {
             callables: callables.into_boxed_slice(),
             context_formals,
             calls,
+            call_occurrences,
             call_result_paths,
             pattern_bindings,
             resource_projection_requirements,
@@ -2223,7 +2230,7 @@ impl KernelCheckedLinkLayout {
         snapshot: &KernelCheckedSnapshot,
         callables: &[CheckedCallableSignature],
         declarations: &[CheckedDeclaration],
-    ) -> Result<Box<[CheckedCall]>, KernelCheckedLinkError> {
+    ) -> Result<(Box<[CheckedCall]>, Box<[StableOccurrenceKey]>), KernelCheckedLinkError> {
         self.validate_snapshot_definition_count(snapshot, "call")?;
         let callable_by_declaration = callables
             .iter()
@@ -2239,6 +2246,7 @@ impl KernelCheckedLinkLayout {
             .map(|declaration| (declaration.id, declaration))
             .collect::<BTreeMap<_, _>>();
         let mut calls = Vec::with_capacity(self.totals.calls as usize);
+        let mut call_occurrences = Vec::with_capacity(self.totals.calls as usize);
         for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
             let owner = checked_owner_id(owner_index, "call")?;
             let local = self.definition(owner)?;
@@ -2675,10 +2683,19 @@ impl KernelCheckedLinkLayout {
                     role: target.role,
                     span: checked_span(presentation.span),
                 });
+                call_occurrences.push(syntax.occurrence.clone());
             }
         }
         self.validate_materialized_count("call", calls.len(), self.totals.calls)?;
-        Ok(calls.into_boxed_slice())
+        self.validate_materialized_count(
+            "call occurrence",
+            call_occurrences.len(),
+            self.totals.calls,
+        )?;
+        Ok((
+            calls.into_boxed_slice(),
+            call_occurrences.into_boxed_slice(),
+        ))
     }
 
     /// Emit every SOURCE resource directly from its solved definition row.
@@ -5840,6 +5857,7 @@ mod tests {
         assert!(rows.callables.is_empty());
         assert!(rows.context_formals.is_empty());
         assert!(rows.calls.is_empty());
+        assert!(rows.call_occurrences.is_empty());
         assert!(rows.call_result_paths.is_empty());
         assert!(rows.pattern_bindings.is_empty());
         assert!(rows.resource_projection_requirements.is_empty());

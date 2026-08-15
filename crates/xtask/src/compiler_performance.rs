@@ -491,6 +491,33 @@ pub fn run(
             }
         }
     );
+    for fixture in &report.fixtures {
+        for mode in &fixture.modes {
+            let diagnostics = &mode.diagnostics;
+            let verified = &mode.verified;
+            println!(
+                "  {} {}: diagnostics_ms[p50={:.3},p95={:.3}] verified_ms[p50={:.3},p95={:.3}] phases_p50_ms[semantic={:.3},where_verify={:.3},ir_lower={:.3},ir_verify={:.3},backend={:.3},plan_verify={:.3}] phases_p95_ms[semantic={:.3},where_verify={:.3},ir_lower={:.3},ir_verify={:.3},backend={:.3},plan_verify={:.3}]",
+                fixture.id,
+                mode.mode.as_str(),
+                diagnostics.elapsed_ms.p50,
+                diagnostics.elapsed_ms.p95,
+                verified.elapsed_ms.p50,
+                verified.elapsed_ms.p95,
+                verified.phase_ms.semantic.p50,
+                verified.phase_ms.contract_verify.p50,
+                verified.phase_ms.ir_lower.p50,
+                verified.phase_ms.ir_validation.p50,
+                verified.phase_ms.backend.p50,
+                verified.phase_ms.plan_validation.p50,
+                verified.phase_ms.semantic.p95,
+                verified.phase_ms.contract_verify.p95,
+                verified.phase_ms.ir_lower.p95,
+                verified.phase_ms.ir_validation.p95,
+                verified.phase_ms.backend.p95,
+                verified.phase_ms.plan_validation.p95,
+            );
+        }
+    }
     Ok(report.status)
 }
 

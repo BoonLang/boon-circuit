@@ -2565,6 +2565,7 @@ fn link_lowered_roles(
                     cancellation_checkpoint_count: 0,
                     parse_work: Default::default(),
                     typecheck_work: Default::default(),
+                    owner_work: Default::default(),
                     parse_ms: program.parse_ms,
                     typecheck_ms: 0.0,
                     semantic_ms: 0.0,

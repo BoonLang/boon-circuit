@@ -38,8 +38,8 @@ machine_plan_sha256 = "c9a12cd0a1bcf748a20e3a072afa09d0f923c2c9dbd664f2343d34349
 [[fixtures]]
 id = "novywave"
 source = "examples/novywave/RUN.bn"
-package_source_lines = 11994
-compiler_input_source_lines = 11923
+package_source_lines = 11997
+compiler_input_source_lines = 11926
 checked_diagnostics_p95_ms = 250.0
 verified_machine_plan_p95_ms = 1000.0
 peak_rss_mib_max = 384

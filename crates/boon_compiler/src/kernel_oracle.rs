@@ -49,8 +49,8 @@ use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
 use boon_syntax::{
     AstBlockBindingDeclaration, AstCallArgKind, AstExpr, AstExprKind, AstMatchPattern,
     AstParameterKind, AstStatement, AstStatementKind, AstTextSegment, StableCheckOwnerKey,
-    StableExpressionKey, StableItemRouteSegment, StableStatementKey, StableStatementKind,
-    UnitItemKind, UnitLocalStatementId,
+    StableExpressionKey, StableItemRouteSegment, StableOccurrenceKey, StableStatementKey,
+    StableStatementKind, UnitItemKind, UnitLocalStatementId,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -500,6 +500,7 @@ pub struct KernelOwnerOracleReport {
     pub checked_callables: Box<[CheckedCallableSignature]>,
     pub checked_context_formals: Box<[CheckedContextFormal]>,
     pub checked_calls: Box<[CheckedCall]>,
+    pub checked_call_occurrences: Box<[StableOccurrenceKey]>,
     pub checked_call_result_paths: Box<[boon_checked::CheckedCallResultPath]>,
     pub checked_pattern_bindings: Box<[boon_checked::CheckedPatternBinding]>,
     pub checked_resource_projection_requirements:
@@ -520,11 +521,11 @@ pub struct KernelOwnerOracleReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
-    pub basis_fingerprint_v12: [u8; 32],
+    pub basis_fingerprint_v13: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v14: [u8; 32],
+    pub artifact_fingerprint_v15: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v14: [u8; 32],
+    pub fingerprint_v15: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1138,6 +1139,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
     let mut checked_callables: Box<[CheckedCallableSignature]> = Box::new([]);
     let mut checked_context_formals: Box<[CheckedContextFormal]> = Box::new([]);
     let mut checked_calls: Box<[CheckedCall]> = Box::new([]);
+    let mut checked_call_occurrences: Box<[StableOccurrenceKey]> = Box::new([]);
     let mut checked_call_result_paths: Box<[boon_checked::CheckedCallResultPath]> = Box::new([]);
     let mut checked_pattern_bindings: Box<[boon_checked::CheckedPatternBinding]> = Box::new([]);
     let mut checked_resource_projection_requirements: Box<
@@ -1228,6 +1230,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     let materialized_callables = rows.callables;
                     let materialized_context_formals = rows.context_formals;
                     let materialized_calls = rows.calls;
+                    let materialized_call_occurrences = rows.call_occurrences;
                     let materialized_call_result_paths = rows.call_result_paths;
                     let materialized_pattern_bindings = rows.pattern_bindings;
                     let materialized_resource_projection_requirements =
@@ -1279,6 +1282,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     checked_callables = materialized_callables;
                     checked_context_formals = materialized_context_formals;
                     checked_calls = materialized_calls;
+                    checked_call_occurrences = materialized_call_occurrences;
                     checked_call_result_paths = materialized_call_result_paths;
                     checked_pattern_bindings = materialized_pattern_bindings;
                     checked_resource_projection_requirements =
@@ -1328,11 +1332,11 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                 .zip(&artifact.currentness)
                 .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
                     owner: prepared[*prepared_index].owner.clone(),
-                    basis_fingerprint_v12: receipt.basis_fingerprint_v12,
+                    basis_fingerprint_v13: receipt.basis_fingerprint_v13,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v14: receipt.artifact_fingerprint_v14,
+                    artifact_fingerprint_v15: receipt.artifact_fingerprint_v15,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v14: receipt.fingerprint_v14,
+                    fingerprint_v15: receipt.fingerprint_v15,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -1991,6 +1995,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
         checked_callables,
         checked_context_formals,
         checked_calls,
+        checked_call_occurrences,
         checked_call_result_paths,
         checked_pattern_bindings,
         checked_resource_projection_requirements,
@@ -3626,6 +3631,14 @@ fn compact_call_syntax_input(
     };
     Ok(KernelCallSyntaxInput {
         expression: checked_kernel_expression(index)?,
+        occurrence: view
+            .stable_occurrence_key_for_syntax(syntax.id)
+            .ok_or_else(|| {
+                format!(
+                    "authored call expression {} has no parser-issued structural occurrence",
+                    syntax.id,
+                )
+            })?,
         function: function.clone().into_boxed_str(),
         pipe_input,
         arguments: arguments
@@ -18343,7 +18356,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v14 != [0; 32]),
+                        && receipt.fingerprint_v15 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(
@@ -18681,6 +18694,23 @@ mod tests {
             .output
             .checked_program_fields()
             .expect("NovyWave diagnostics own checked fields");
+        let current_call_occurrences = fields
+            .calls
+            .iter()
+            .map(|call| {
+                let syntax = project
+                    .expression_id_for_slot(call.expression.0 as usize)
+                    .expect("current checked call expression maps to syntax");
+                project
+                    .stable_occurrence_key(syntax)
+                    .expect("current checked call has a structural occurrence")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            report.checked_call_occurrences.as_ref(),
+            current_call_occurrences.as_slice(),
+            "kernel call rows must retain the exact parser-issued structural identities",
+        );
         assert_eq!(
             report.checked_call_result_paths.len(),
             fields.call_result_paths.len(),

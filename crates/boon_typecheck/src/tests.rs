@@ -72,6 +72,59 @@ fn unit_native_project_check_matches_assembled_project_exactly() {
 }
 
 #[test]
+fn explicit_call_occurrence_relocation_seals_the_same_checked_image() {
+    let project = boon_parser::parse_project_syntax(
+        "app/RUN.bn",
+        [(
+            "app/RUN.bn".to_owned(),
+            concat!(
+                "FUNCTION double(input) {\n",
+                "    input + input\n",
+                "}\n",
+                "value: double(input: 2)\n",
+            )
+            .to_owned(),
+        )],
+    )
+    .expect("explicit call occurrence fixture parses");
+    let output = check_project_diagnostics_program_profiled_with_external_types(
+        &project,
+        &ExternalTypeEnvironment::default(),
+    )
+    .0;
+    assert!(
+        !output.report.has_errors(),
+        "{:#?}",
+        output.report.diagnostics
+    );
+    let construction = output
+        .construction
+        .expect("diagnostics check retains an unsealed construction");
+    assert!(!construction.calls.is_empty(), "fixture must contain calls");
+    let syntax = TypecheckSyntaxProgram::UnitNative(project.clone());
+    let occurrences = checked_call_occurrences_from_syntax(&construction, &syntax)
+        .expect("legacy projection derives structural call identities");
+
+    let relocated = seal_project_checked_program_construction_with_call_occurrences(
+        &project,
+        construction.clone(),
+        &occurrences,
+    )
+    .expect("explicit call identities seal");
+    let projected = seal_project_checked_program_construction(&project, construction.clone())
+        .expect("legacy syntax projection seals");
+    assert_eq!(relocated, projected);
+
+    let error = seal_project_checked_program_construction_with_call_occurrences(
+        &project,
+        construction,
+        &occurrences[..occurrences.len() - 1],
+    )
+    .expect_err("missing structural call identities must fail closed");
+    assert!(error.contains("structural call occurrences"), "{error}");
+}
+
+#[test]
 fn unit_native_project_diagnostics_match_assembled_source_positions_exactly() {
     let files = vec![
         ("app/A.bn".to_owned(), "a: 1\n".to_owned()),

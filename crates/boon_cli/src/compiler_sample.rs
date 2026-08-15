@@ -363,25 +363,28 @@ macro_rules! typecheck_work_sample {
     }};
 }
 
-macro_rules! owner_work_sample {
-    ($work:expr) => {{
+macro_rules! merge_owner_work_sample {
+    ($sample:expr, $work:expr) => {{
+        let mut sample = $sample;
         let work = $work;
-        TypeCheckWorkSample {
-            owner_statements: work.statements,
-            owner_expressions: work.expressions,
-            owner_local_constraints: work.local_constraints,
-            owner_interface_imports: work.interface_imports,
-            owner_interface_plan_direct_owners: work.interface_plan_direct_owners,
-            owner_interface_plan_required_owners: work.interface_plan_required_owners,
-            owner_interface_plan_provider_sccs: work.interface_plan_provider_sccs,
-            owner_interface_plan_result_transfers: work.interface_plan_result_transfers,
-            owner_interface_plan_transfer_nodes: work.interface_plan_transfer_nodes,
-            owner_interface_plan_transfer_edges: work.interface_plan_transfer_edges,
-            owner_calls: work.calls,
-            owner_unification_steps: work.unification_steps,
-            ..TypeCheckWorkSample::default()
-        }
+        sample.owner_statements = work.statements;
+        sample.owner_expressions = work.expressions;
+        sample.owner_local_constraints = work.local_constraints;
+        sample.owner_interface_imports = work.interface_imports;
+        sample.owner_interface_plan_direct_owners = work.interface_plan_direct_owners;
+        sample.owner_interface_plan_required_owners = work.interface_plan_required_owners;
+        sample.owner_interface_plan_provider_sccs = work.interface_plan_provider_sccs;
+        sample.owner_interface_plan_result_transfers = work.interface_plan_result_transfers;
+        sample.owner_interface_plan_transfer_nodes = work.interface_plan_transfer_nodes;
+        sample.owner_interface_plan_transfer_edges = work.interface_plan_transfer_edges;
+        sample.owner_calls = work.calls;
+        sample.owner_unification_steps = work.unification_steps;
+        sample
     }};
+}
+
+macro_rules! owner_work_sample {
+    ($work:expr) => {{ merge_owner_work_sample!(TypeCheckWorkSample::default(), $work) }};
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -1091,7 +1094,10 @@ fn compiled_work_and_phase(
             semantic_graph_nodes: compiled.profile.graph_node_count,
             cancellation_checkpoints: compiled.profile.cancellation_checkpoint_count,
             parse: parser_work_sample!(compiled.profile.parse_work),
-            typecheck: typecheck_work_sample!(compiled.profile.typecheck_work),
+            typecheck: merge_owner_work_sample!(
+                typecheck_work_sample!(compiled.profile.typecheck_work),
+                compiled.profile.owner_work
+            ),
         },
         PhaseSample {
             parse_ms: compiled.profile.parse_ms,

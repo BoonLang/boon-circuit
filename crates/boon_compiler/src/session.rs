@@ -2247,7 +2247,7 @@ impl CompilerSession {
 
         if intent == CompileIntent::EditorDiagnostics {
             if state.checked.is_none() {
-                let (parsed, assembly, parse_work, parse_ms, typecheck_ms) =
+                let (parsed, assembly, parse_work, owner_work, parse_ms, typecheck_ms) =
                     parse_project_snapshot(state)?;
                 state.checked = Some(checked_source_from_owner_assembly(
                     parsed,
@@ -2255,6 +2255,7 @@ impl CompilerSession {
                     parse_work,
                     parse_ms,
                     boon_typecheck::TypeCheckWorkCounters::default(),
+                    owner_work,
                     typecheck_ms,
                 ));
             }
@@ -2273,7 +2274,7 @@ impl CompilerSession {
             .is_some_and(|(compiled_revision, _)| *compiled_revision == revision);
         if !current_artifact_available {
             if state.checked.is_none() {
-                let (parsed, assembly, parse_work, parse_ms, typecheck_ms) =
+                let (parsed, assembly, parse_work, owner_work, parse_ms, typecheck_ms) =
                     parse_project_snapshot(state)?;
                 state.checked = Some(checked_source_from_owner_assembly(
                     parsed,
@@ -2281,6 +2282,7 @@ impl CompilerSession {
                     parse_work,
                     parse_ms,
                     boon_typecheck::TypeCheckWorkCounters::default(),
+                    owner_work,
                     typecheck_ms,
                 ));
             }
@@ -2644,6 +2646,7 @@ fn parse_project_snapshot(
     ProjectSyntaxSnapshot,
     Arc<CheckedOwnerProjectAssembly>,
     ParseWorkCounters,
+    boon_typecheck::OwnerBodyInferenceWork,
     f64,
     f64,
 )> {
@@ -2659,6 +2662,11 @@ fn parse_project_snapshot(
             .current_value(&state.syntax_evaluator, &CheckedOwnerProjectAssemblyKey)?
             .ok_or_else(|| session_error("checked owner project assembly was not published"))?,
     );
+    let owner_work = state
+        .owner_diagnostics_aggregate_requests
+        .current_value(&state.syntax_evaluator, &OwnerDiagnosticsAggregateKey)?
+        .ok_or_else(|| session_error("owner diagnostics work receipt was not published"))?
+        .work();
     let typecheck_ms = typecheck_started.elapsed().as_secs_f64() * 1_000.0;
     if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() {
         eprintln!(
@@ -2671,7 +2679,7 @@ fn parse_project_snapshot(
             project.stable_check_owner_keys().count(),
         );
     }
-    Ok((project, assembly, work, parse_ms, typecheck_ms))
+    Ok((project, assembly, work, owner_work, parse_ms, typecheck_ms))
 }
 
 #[cfg(test)]
@@ -6807,7 +6815,7 @@ mod tests {
         }
 
         let state = session.projects.get_mut(&project).unwrap();
-        let (_, assembly, _, _, _) = parse_project_snapshot(state).unwrap();
+        let (_, assembly, _, _, _, _) = parse_project_snapshot(state).unwrap();
         let table = &assembly.fields().lowering_metadata.host_port_table;
         assert_eq!(table.http.as_ref().unwrap().line, http_line);
         assert_eq!(table.websocket.as_ref().unwrap().line, websocket_line);
@@ -6845,14 +6853,17 @@ mod tests {
                 0
             );
         }
-        let first_plan = session
-            .request(project, revision, CompileIntent::VerifiedPreview, &token)
-            .unwrap()
-            .compiled()
-            .unwrap()
-            .plan
-            .plan()
-            .clone();
+        let (first_plan, first_work) = {
+            let result = session
+                .request(project, revision, CompileIntent::VerifiedPreview, &token)
+                .unwrap();
+            let compiled = result.compiled().unwrap();
+            (compiled.plan.plan().clone(), compiled.profile.owner_work)
+        };
+        assert!(first_work.statements > 0);
+        assert!(first_work.expressions > 0);
+        assert!(first_work.local_constraints > 0);
+        assert!(first_work.unification_steps > 0);
         let second_plan = session
             .request(project, revision, CompileIntent::VerifiedPreview, &token)
             .unwrap()
@@ -7450,7 +7461,7 @@ mod tests {
             &lane_call.result.ty
         ));
 
-        let (_, assembly, _, _, _) =
+        let (_, assembly, _, _, _, _) =
             parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
         let fields = assembly.fields();
         let rich_declaration = fields
@@ -7877,7 +7888,7 @@ mod tests {
             boon_checked::type_is_recursively_closed(&app_background_material.result.ty),
             "AppBackground material result must be recursively closed: {app_background_material:#?}",
         );
-        let (_, assembly, _, _, _) =
+        let (_, assembly, _, _, _, _) =
             parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
         let fields = assembly.fields();
         if std::env::var_os("BOON_DEBUG_NOVY_OUT").is_some() {
@@ -9423,7 +9434,7 @@ mod tests {
                 0
             );
 
-            let (_, assembly, _, _, _) = parse_project_snapshot(state).unwrap_or_else(|error| {
+            let (_, assembly, _, _, _, _) = parse_project_snapshot(state).unwrap_or_else(|error| {
                 panic!("checked assembly failed for:\n{source}\n{error:?}")
             });
             assert_eq!(
@@ -9559,7 +9570,7 @@ mod tests {
             normalized_invalid_oracle(&public_lean),
             normalized_invalid_oracle(aggregate.diagnostics())
         );
-        let (_, assembly, _, _, _) = parse_project_snapshot(state).unwrap();
+        let (_, assembly, _, _, _, _) = parse_project_snapshot(state).unwrap();
         assert_eq!(
             normalized_invalid_oracle(&public_lean),
             normalized_invalid_oracle(assembly.diagnostics())

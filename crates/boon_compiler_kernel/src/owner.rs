@@ -743,6 +743,10 @@ pub enum KernelExecutionShapeInput {
     },
     MatchArm {
         expression: KernelExpressionId,
+        /// Exact selector authority for pattern-binding declaration types.
+        /// This is retained explicitly because optimized conditional edges do
+        /// not necessarily keep every authored arm attached to a WHEN node.
+        selector: KernelExpressionId,
         bindings: Box<[KernelDeclarationId]>,
     },
 }
@@ -851,7 +855,7 @@ pub struct KernelOwnerProgram {
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
-    basis_fingerprint_v9: [u8; 32],
+    basis_fingerprint_v10: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -949,7 +953,7 @@ struct KernelProjectOwnerOutputs {
     /// requirements. That aggregate is useful to the solver, but is not a
     /// sound direct assignability contract for call diagnostics.
     syntax_discriminated_formals: Box<[u32]>,
-    basis_fingerprint_v9: [u8; 32],
+    basis_fingerprint_v10: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -1106,6 +1110,7 @@ pub enum KernelExecutionShapeArtifact {
     },
     MatchArm {
         expression: KernelExpressionId,
+        selector: KernelValueReference,
         bindings: Box<[KernelDeclarationId]>,
     },
 }
@@ -2135,7 +2140,7 @@ pub fn is_registered_kernel_host_effect(operation: &str) -> bool {
 
 impl KernelOwnerProgram {
     pub fn solve(self) -> Result<KernelDefinitionSnapshot, KernelSolveError> {
-        let basis_fingerprint_v9 = self.basis_fingerprint_v9;
+        let basis_fingerprint_v10 = self.basis_fingerprint_v10;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
             .output(self.result_output)
@@ -2211,7 +2216,7 @@ impl KernelOwnerProgram {
         };
         let (dependencies, currentness) = build_snapshot_receipts(
             std::slice::from_mut(&mut definition),
-            &[basis_fingerprint_v9],
+            &[basis_fingerprint_v10],
         )?;
         let [currentness] = currentness.as_ref() else {
             unreachable!("one standalone kernel definition produces one receipt")
@@ -2376,7 +2381,7 @@ impl KernelSolvedProject {
         let basis_fingerprints = self
             .owners
             .iter()
-            .map(|owner| owner.basis_fingerprint_v9)
+            .map(|owner| owner.basis_fingerprint_v10)
             .collect::<Vec<_>>();
         let mut definitions = self
             .owners
@@ -3769,7 +3774,9 @@ fn validate_execution_shapes(
                     )));
                 }
             }
-            KernelExecutionShapeInput::MatchArm { bindings, .. } => {
+            KernelExecutionShapeInput::MatchArm {
+                selector, bindings, ..
+            } => {
                 let KernelOwnerNodeKind::MatchArm { pattern } = &node.kind else {
                     return Err(KernelOwnerBuildError::new(format!(
                         "kernel {label} match execution shape {index} does not name a match arm"
@@ -3789,6 +3796,12 @@ fn validate_execution_shapes(
                         "kernel {label} match execution shape {index} has {} bindings for {} pattern names",
                         bindings.len(),
                         expected_names.len(),
+                    )));
+                }
+                if selector.0 as usize >= namespace_len {
+                    return Err(KernelOwnerBuildError::new(format!(
+                        "kernel {label} match execution shape {index} references missing selector {}",
+                        selector.0,
                     )));
                 }
                 for (ordinal, (binding, name)) in
@@ -3855,7 +3868,7 @@ pub fn compile_owner_program_with_definition_facts(
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
     validate_definition_linker_facts(input, facts, None)?;
-    let basis_fingerprint_v9 = definition_basis_fingerprint(input, facts)?;
+    let basis_fingerprint_v10 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
@@ -4020,7 +4033,7 @@ pub fn compile_owner_program_with_definition_facts(
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
         diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
-        basis_fingerprint_v9,
+        basis_fingerprint_v10,
     })
 }
 
@@ -5137,12 +5150,13 @@ fn collect_execution_shape_artifacts(
                         .map(|result| kernel_value_reference(input, result, consumer))
                         .transpose()?,
                 },
-                KernelExecutionShapeInput::MatchArm { bindings, .. } => {
-                    KernelExecutionShapeArtifact::MatchArm {
-                        expression,
-                        bindings: bindings.clone(),
-                    }
-                }
+                KernelExecutionShapeInput::MatchArm {
+                    selector, bindings, ..
+                } => KernelExecutionShapeArtifact::MatchArm {
+                    expression,
+                    selector: kernel_value_reference(input, *selector, consumer)?,
+                    bindings: bindings.clone(),
+                },
             })
         })
         .collect::<Result<Vec<_>, _>>()
@@ -5800,7 +5814,7 @@ pub fn compile_project_program_with_definition_facts(
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice(),
                 syntax_discriminated_formals: syntax_discriminated_formals[owner_index].clone(),
-                basis_fingerprint_v9: definition_basis_fingerprint_with_buffer(
+                basis_fingerprint_v10: definition_basis_fingerprint_with_buffer(
                     owner,
                     &facts[owner_index],
                     &mut basis_fingerprint_scratch,
@@ -13220,16 +13234,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v9,
-            moved.currentness.basis_fingerprint_v9
+            solved.currentness.basis_fingerprint_v10,
+            moved.currentness.basis_fingerprint_v10
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v11,
-            moved.currentness.artifact_fingerprint_v11
+            solved.currentness.artifact_fingerprint_v12,
+            moved.currentness.artifact_fingerprint_v12
         );
         assert_ne!(
-            solved.currentness.fingerprint_v11,
-            moved.currentness.fingerprint_v11
+            solved.currentness.fingerprint_v12,
+            moved.currentness.fingerprint_v12
         );
 
         let mut missing = facts.clone();
@@ -13313,16 +13327,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v9,
-            moved.currentness.basis_fingerprint_v9
+            solved.currentness.basis_fingerprint_v10,
+            moved.currentness.basis_fingerprint_v10
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v11,
-            moved.currentness.artifact_fingerprint_v11
+            solved.currentness.artifact_fingerprint_v12,
+            moved.currentness.artifact_fingerprint_v12
         );
         assert_ne!(
-            solved.currentness.fingerprint_v11,
-            moved.currentness.fingerprint_v11
+            solved.currentness.fingerprint_v12,
+            moved.currentness.fingerprint_v12
         );
 
         let mut missing = facts.clone();
@@ -13420,16 +13434,16 @@ mod tests {
             edited.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v9,
-            edited.currentness.basis_fingerprint_v9,
+            solved.currentness.basis_fingerprint_v10,
+            edited.currentness.basis_fingerprint_v10,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v11,
-            edited.currentness.artifact_fingerprint_v11,
+            solved.currentness.artifact_fingerprint_v12,
+            edited.currentness.artifact_fingerprint_v12,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v11,
-            edited.currentness.fingerprint_v11,
+            solved.currentness.fingerprint_v12,
+            edited.currentness.fingerprint_v12,
         );
 
         let mut missing = facts.clone();
@@ -13558,16 +13572,16 @@ mod tests {
             renamed.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v9,
-            renamed.currentness.basis_fingerprint_v9,
+            solved.currentness.basis_fingerprint_v10,
+            renamed.currentness.basis_fingerprint_v10,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v11,
-            renamed.currentness.artifact_fingerprint_v11,
+            solved.currentness.artifact_fingerprint_v12,
+            renamed.currentness.artifact_fingerprint_v12,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v11,
-            renamed.currentness.fingerprint_v11,
+            solved.currentness.fingerprint_v12,
+            renamed.currentness.fingerprint_v12,
         );
 
         let mut partial = facts.clone();
@@ -13696,6 +13710,7 @@ mod tests {
             },
             KernelExecutionShapeInput::MatchArm {
                 expression: KernelExpressionId(4),
+                selector: KernelExpressionId(0),
                 bindings: vec![KernelDeclarationId(2)].into_boxed_slice(),
             },
             KernelExecutionShapeInput::Conditional {
@@ -13740,6 +13755,42 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            solved.definition.execution_shapes[2],
+            KernelExecutionShapeArtifact::MatchArm {
+                selector: KernelValueReference::Local(KernelExpressionId(0)),
+                ..
+            }
+        ));
+
+        let mut different_selector = facts.clone();
+        let KernelExecutionShapeInput::MatchArm { selector, .. } =
+            &mut different_selector.execution_shapes[2]
+        else {
+            unreachable!()
+        };
+        *selector = KernelExpressionId(1);
+        let different_selector =
+            compile_owner_program_with_definition_facts(&input, &different_selector)
+                .unwrap()
+                .solve()
+                .unwrap();
+        assert_eq!(
+            solved.currentness.public_result_fingerprint_v1,
+            different_selector.currentness.public_result_fingerprint_v1,
+        );
+        assert_ne!(
+            solved.currentness.basis_fingerprint_v10,
+            different_selector.currentness.basis_fingerprint_v10,
+        );
+        assert_ne!(
+            solved.currentness.artifact_fingerprint_v12,
+            different_selector.currentness.artifact_fingerprint_v12,
+        );
+        assert_ne!(
+            solved.currentness.fingerprint_v12,
+            different_selector.currentness.fingerprint_v12,
+        );
 
         let mut partial = facts.clone();
         partial.execution_shapes = partial.execution_shapes[..3].to_vec().into_boxed_slice();

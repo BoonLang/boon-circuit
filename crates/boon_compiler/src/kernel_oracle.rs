@@ -9,8 +9,8 @@
 #![cfg_attr(not(any(test, feature = "test-kernel-oracle")), allow(dead_code))]
 
 use boon_checked::{
-    CheckedListKeyPolicy, CheckedScope, CheckedStateKind, DiagnosticSeverity, FlowMode, FlowType,
-    ObjectShape, Type, TypeDiagnostic, Variant, type_is_recursively_closed,
+    CheckedDeclaration, CheckedListKeyPolicy, CheckedScope, CheckedStateKind, DiagnosticSeverity,
+    FlowMode, FlowType, ObjectShape, Type, TypeDiagnostic, Variant, type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
     CheckDemand, KernelCallArgumentKind, KernelCallArgumentSource, KernelCallInputRole,
@@ -483,6 +483,7 @@ pub enum KernelOwnerOracleStatementChild {
 pub struct KernelOwnerOracleReport {
     pub supported: Box<[KernelOwnerOracleEntry]>,
     pub checked_scopes: Box<[CheckedScope]>,
+    pub checked_declarations: Box<[CheckedDeclaration]>,
     pub container_owners: Box<[StableCheckOwnerKey]>,
     pub unsupported: Box<[(StableCheckOwnerKey, String)]>,
     pub root_blockers: Box<[KernelOwnerBlockerImpact]>,
@@ -495,11 +496,11 @@ pub struct KernelOwnerOracleReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
-    pub basis_fingerprint_v9: [u8; 32],
+    pub basis_fingerprint_v10: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v11: [u8; 32],
+    pub artifact_fingerprint_v12: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v11: [u8; 32],
+    pub fingerprint_v12: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1092,6 +1093,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     let mut checked_link_layout_us = 0;
     let mut checked_link_references = 0;
     let mut checked_scopes: Box<[CheckedScope]> = Box::new([]);
+    let mut checked_declarations: Box<[CheckedDeclaration]> = Box::new([]);
     let mut solve_us = 0;
     let mut compile_work = KernelCompileWork::default();
     let artifact = if project_is_empty {
@@ -1137,6 +1139,10 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                     checked_link_references = layout.totals().resolved_references;
                     let mut materialized_scopes = layout
                         .materialize_scopes(&checked)
+                        .map_err(|error| error.to_string())?
+                        .into_vec();
+                    let mut materialized_declarations = layout
+                        .materialize_declarations(&checked)
                         .map_err(|error| error.to_string())?
                         .into_vec();
                     for definition in layout.definitions() {
@@ -1196,8 +1202,60 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                                     format!("kernel checked scope row {row} end overflowed")
                                 })?;
                         }
+                        for row in definition.declarations.start
+                            ..definition
+                                .declarations
+                                .start
+                                .checked_add(definition.declarations.len)
+                                .ok_or_else(|| {
+                                    "kernel checked declaration range overflowed".to_owned()
+                                })?
+                        {
+                            let index = row.checked_sub(1).ok_or_else(|| {
+                                "kernel checked declaration row uses reserved identity zero"
+                                    .to_owned()
+                            })?;
+                            let declaration = materialized_declarations
+                                .get_mut(index as usize)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "kernel checked declaration linker references missing row {row}"
+                                    )
+                                })?;
+                            declaration.span.line = source
+                                .start_line
+                                .checked_add(declaration.span.line.checked_sub(1).ok_or_else(
+                                    || {
+                                        format!(
+                                            "kernel checked declaration row {row} has no source line"
+                                        )
+                                    },
+                                )?)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "kernel checked declaration row {row} line overflowed"
+                                    )
+                                })?;
+                            declaration.span.start = source
+                                .start_byte
+                                .checked_add(declaration.span.start)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "kernel checked declaration row {row} start overflowed"
+                                    )
+                                })?;
+                            declaration.span.end = source
+                                .start_byte
+                                .checked_add(declaration.span.end)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "kernel checked declaration row {row} end overflowed"
+                                    )
+                                })?;
+                        }
                     }
                     checked_scopes = materialized_scopes.into_boxed_slice();
+                    checked_declarations = materialized_declarations.into_boxed_slice();
                     Ok(checked)
                 })
             })
@@ -1241,11 +1299,11 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 .zip(&artifact.currentness)
                 .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
                     owner: prepared[*prepared_index].owner.clone(),
-                    basis_fingerprint_v9: receipt.basis_fingerprint_v9,
+                    basis_fingerprint_v10: receipt.basis_fingerprint_v10,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v11: receipt.artifact_fingerprint_v11,
+                    artifact_fingerprint_v12: receipt.artifact_fingerprint_v12,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v11: receipt.fingerprint_v11,
+                    fingerprint_v12: receipt.fingerprint_v12,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -1896,6 +1954,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     let report = KernelOwnerOracleReport {
         supported: supported.into_boxed_slice(),
         checked_scopes,
+        checked_declarations,
         container_owners: container_owners.into_boxed_slice(),
         unsupported: unsupported.into_boxed_slice(),
         root_blockers: root_blockers.into_boxed_slice(),
@@ -3555,7 +3614,7 @@ fn compact_execution_shape_inputs(
                 });
             }
             KernelOwnerNodeKind::MatchArm { .. } => {
-                let bindings = pattern_variable_names(match raw_expressions
+                let source = match raw_expressions
                     .get(index)
                     .map(|expression| &expression.kind)
                 {
@@ -3565,7 +3624,8 @@ fn compact_execution_shape_inputs(
                             "canonical match arm {index} has no exact match source: {source:?}"
                         ));
                     }
-                })
+                };
+                let bindings = pattern_variable_names(source)
                 .into_iter()
                 .enumerate()
                 .map(|(ordinal, _)| {
@@ -3581,8 +3641,30 @@ fn compact_execution_shape_inputs(
                 })
                 .collect::<Result<Vec<_>, String>>()?
                 .into_boxed_slice();
+                let selector = view
+                    .pattern_selector_for_syntax_expression(
+                        raw_expressions
+                            .get(index)
+                            .expect("canonical match arm has exact source")
+                            .id,
+                    )
+                    .ok_or_else(|| {
+                        format!("canonical match arm {index} has no exact selector authority")
+                    })?;
+                let selector = prepared_input_reference_index(
+                    PreparedInputReference::Syntax(selector),
+                    view,
+                    owner,
+                    raw_expressions.get(index).map(|expression| expression.id),
+                    local_by_syntax,
+                    node_count,
+                    external_by_key,
+                    external_expressions,
+                )
+                .and_then(checked_kernel_expression)?;
                 shapes.push(KernelExecutionShapeInput::MatchArm {
                     expression,
+                    selector,
                     bindings,
                 });
             }
@@ -12551,6 +12633,16 @@ mod tests {
             })
             .expect("checked rows declaration");
         assert_eq!(owner.result, declaration.flow_type);
+        let direct_declaration = oracle
+            .checked_declarations
+            .iter()
+            .find(|declaration| {
+                declaration.kind == CheckedDeclarationKind::List && declaration.name == "rows"
+            })
+            .expect("kernel links the LIST declaration directly");
+        assert_ne!(direct_declaration.id.0, 0);
+        assert_eq!(direct_declaration.flow_type, declaration.flow_type);
+        assert_eq!(direct_declaration.span, declaration.span);
         let [collection] = owner.collections.as_ref() else {
             panic!("LIST fixture must publish one collection artifact")
         };
@@ -12963,6 +13055,51 @@ mod tests {
             2,
             "each callable OUT parameter must retain one repeated-output scope"
         );
+        assert_eq!(
+            oracle
+                .checked_declarations
+                .iter()
+                .filter(|declaration| {
+                    declaration.kind == boon_checked::CheckedDeclarationKind::FreshOut
+                })
+                .count(),
+            1,
+            "only the authored bare OUT creates a FreshOut; nested named OUTs remain forwards"
+        );
+        assert!(
+            oracle
+                .checked_declarations
+                .iter()
+                .all(|declaration| declaration.id.0 != 0),
+            "direct checked declarations must preserve the reserved zero identity"
+        );
+        let current_fresh = checked
+            .declarations
+            .iter()
+            .filter(|declaration| declaration.kind == CheckedDeclarationKind::FreshOut)
+            .collect::<Vec<_>>();
+        for direct in oracle
+            .checked_declarations
+            .iter()
+            .filter(|declaration| declaration.kind == CheckedDeclarationKind::FreshOut)
+        {
+            let matching = current_fresh
+                .iter()
+                .copied()
+                .filter(|candidate| candidate.name == direct.name && candidate.span == direct.span)
+                .collect::<Vec<_>>();
+            let [matching] = matching.as_slice() else {
+                panic!(
+                    "direct FreshOut `{}` must match exactly one current declaration at {:?}: {matching:#?}",
+                    direct.name, direct.span,
+                )
+            };
+            assert_eq!(
+                alpha_normalize_owner(&direct.flow_type, []).0,
+                alpha_normalize_owner(&matching.flow_type, []).0,
+                "FreshOut declaration flow must come from its bare-OUT provider, not a projected consumer occurrence",
+            );
+        }
         let owner_named = |name: &str| {
             oracle
                 .supported
@@ -14385,7 +14522,7 @@ mod tests {
                     "        local: [entry: Found[value: value]]\n",
                     "        selected:\n",
                     "            local.entry |> WHEN {\n",
-                    "                Found[payload] => payload\n",
+                    "                Found[value] => value\n",
                     "                __ => value\n",
                     "            }\n",
                     "        rows: LIST { [rank: selected] }\n",
@@ -14438,6 +14575,51 @@ mod tests {
                 mismatches.is_empty(),
                 "{name} declaration/lexical parity: {mismatches:#?}"
             );
+            let direct_declarations = oracle
+                .checked_declarations
+                .iter()
+                .filter(|declaration| {
+                    matches!(
+                        declaration.kind,
+                        CheckedDeclarationKind::PatternBinding | CheckedDeclarationKind::FreshOut
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !direct_declarations.is_empty() {
+                let parsed = parse_source(format!("app/{name}.bn"), source)
+                    .unwrap_or_else(|error| panic!("parse current {name} fixture: {error}"));
+                let current = boon_typecheck::check_program(&parsed);
+                assert!(
+                    !current.report.has_errors(),
+                    "current {name} fixture diagnostics: {:#?}",
+                    current.report.diagnostics,
+                );
+                let (current, _) = current
+                    .program
+                    .expect("declaration fixture checks")
+                    .into_parts();
+                for direct in direct_declarations {
+                    let matching = current
+                        .declarations
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.kind == direct.kind
+                                && candidate.name == direct.name
+                                && candidate.span == direct.span
+                        })
+                        .collect::<Vec<_>>();
+                    let [matching] = matching.as_slice() else {
+                        panic!(
+                            "direct {:?} `{}` must match exactly one current declaration at {:?}: {matching:#?}",
+                            direct.kind, direct.name, direct.span,
+                        )
+                    };
+                    assert_eq!(
+                        alpha_normalize_owner(&direct.flow_type, []).0,
+                        alpha_normalize_owner(&matching.flow_type, []).0,
+                    );
+                }
+            }
             declarations.extend(
                 oracle
                     .supported
@@ -15076,7 +15258,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v11 != [0; 32]),
+                        && receipt.fingerprint_v12 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(

@@ -4,9 +4,12 @@ use crate::{
     KernelStatementChildReference, KernelStatementReference, KernelValueReference,
 };
 use boon_checked::{
-    CheckedCallId, CheckedExprId, CheckedListId, CheckedScope, CheckedScopeKind, CheckedSourceId,
-    CheckedSpan, CheckedStateId, CheckedStatementId, ContextFormalId, DeclId, LexicalScopeId,
+    CheckedCallId, CheckedDeclaration, CheckedDeclarationKind, CheckedExprId, CheckedListId,
+    CheckedScope, CheckedScopeKind, CheckedSourceId, CheckedSpan, CheckedStateId,
+    CheckedStatementId, ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId, ObjectShape,
+    Type, TypeVar, Variant,
 };
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 
@@ -39,6 +42,9 @@ pub struct KernelCheckedDefinitionLayout {
     pub expressions: KernelCheckedRowRange,
     pub statements: KernelCheckedRowRange,
     pub declarations: KernelCheckedRowRange,
+    /// Definition-local alpha ordinals relocated into the global checked
+    /// `TypeVar` namespace. Later expression/call rows reuse this same range.
+    pub type_variables: KernelCheckedRowRange,
     pub calls: KernelCheckedRowRange,
     pub sources: KernelCheckedRowRange,
     pub states: KernelCheckedRowRange,
@@ -57,6 +63,7 @@ pub struct KernelCheckedLinkTotals {
     pub expressions: u32,
     pub statements: u32,
     pub declarations: u32,
+    pub type_variables: u32,
     pub calls: u32,
     pub context_formals: u32,
     pub sources: u32,
@@ -91,6 +98,10 @@ impl KernelCheckedLinkLayout {
         }
         let mut totals = KernelCheckedLinkTotals::default();
         totals.scopes = 1;
+        // DeclId(0) is the language-wide absent/external-identity sentinel.
+        // Direct checked rows therefore begin at one even though every
+        // definition keeps zero-based local declaration IDs.
+        totals.declarations = 1;
         let mut definitions = Vec::with_capacity(snapshot.definitions.len());
         let mut public_declaration_authorities = Vec::with_capacity(snapshot.definitions.len());
         for (index, definition) in snapshot.definitions.iter().enumerate() {
@@ -116,6 +127,22 @@ impl KernelCheckedLinkLayout {
                 &mut totals.declarations,
                 definition.declarations.len(),
                 "declaration",
+            )?;
+            let type_variable_ordinals = definition_type_variables(definition);
+            if type_variable_ordinals
+                .iter()
+                .enumerate()
+                .any(|(expected, variable)| variable.0 as usize != expected)
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} has a non-dense local type-variable namespace {:?}",
+                    owner.0, type_variable_ordinals,
+                )));
+            }
+            let type_variables = take_range(
+                &mut totals.type_variables,
+                type_variable_ordinals.len(),
+                "type variable",
             )?;
             let calls = take_range(&mut totals.calls, definition.calls.len(), "call")?;
             let sources = take_range(&mut totals.sources, definition.sources.len(), "source")?;
@@ -165,6 +192,7 @@ impl KernelCheckedLinkLayout {
                 expressions,
                 statements,
                 declarations,
+                type_variables,
                 calls,
                 sources,
                 states,
@@ -361,6 +389,97 @@ impl KernelCheckedLinkLayout {
         Ok(scopes.into_boxed_slice())
     }
 
+    /// Emit definition-owned declaration rows in the final nonzero checked
+    /// declaration namespace. Stable ABI declarations are appended by the
+    /// compiler facade after these rows; they never participate in kernel
+    /// definition solving or local declaration relocation.
+    pub fn materialize_declarations(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<Box<[CheckedDeclaration]>, KernelCheckedLinkError> {
+        if snapshot.definitions.len() != self.definitions.len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked declaration materializer has {} definitions for a {}-definition layout",
+                snapshot.definitions.len(),
+                self.definitions.len(),
+            )));
+        }
+        let mut declarations = Vec::with_capacity(
+            self.totals
+                .declarations
+                .checked_sub(1)
+                .expect("the checked declaration namespace reserves row zero") as usize,
+        );
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+                KernelCheckedLinkError::new(
+                    "kernel checked declaration materializer definition count exceeds u32",
+                )
+            })?);
+            if definition.declarations.len() != definition.presentation.declarations.len() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} has {} declaration artifacts but {} declaration presentations",
+                    owner.0,
+                    definition.declarations.len(),
+                    definition.presentation.declarations.len(),
+                )));
+            }
+            for (declaration, presentation) in definition
+                .declarations
+                .iter()
+                .zip(definition.presentation.declarations.iter())
+            {
+                if declaration.id != presentation.declaration {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {} declaration artifact {} has presentation {}",
+                        owner.0, declaration.id.0, presentation.declaration.0,
+                    )));
+                }
+                let id =
+                    self.declaration(owner, KernelDeclarationReference::Local(declaration.id))?;
+                let expected = u32::try_from(declarations.len() + 1).map_err(|_| {
+                    KernelCheckedLinkError::new(
+                        "kernel checked declaration materializer row count exceeds u32",
+                    )
+                })?;
+                if id != DeclId(expected) {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel checked declaration materializer expected row {expected} but linked {}",
+                        id.0,
+                    )));
+                }
+                declarations.push(CheckedDeclaration {
+                    id,
+                    scope_id: self.scope(owner, presentation.scope)?,
+                    name: declaration.name.to_string(),
+                    kind: checked_declaration_kind(declaration.kind),
+                    flow_type: declaration_flow_type(self, snapshot, owner, declaration)?,
+                    value: declaration
+                        .value
+                        .map(|value| self.expression(owner, value))
+                        .transpose()?,
+                    body_scope: presentation
+                        .body_scope
+                        .map(|scope| self.scope(owner, KernelScopeReference::Local(scope)))
+                        .transpose()?,
+                    span: CheckedSpan {
+                        line: presentation.span.line,
+                        start: presentation.span.start,
+                        end: presentation.span.end,
+                    },
+                });
+            }
+        }
+        if declarations.len() + 1 != self.totals.declarations as usize {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked declaration materializer produced {} rows for a namespace ending at {}",
+                declarations.len(),
+                self.totals.declarations,
+            )));
+        }
+        Ok(declarations.into_boxed_slice())
+    }
+
     pub fn declaration(
         &self,
         owner: KernelOwnerId,
@@ -376,6 +495,21 @@ impl KernelCheckedLinkLayout {
                 Ok(self.definition(owner)?.public_declaration)
             }
         }
+    }
+
+    /// Relocate one definition-local alpha-normalized flow into the global
+    /// checked type-variable namespace. This same mapping is reused by every
+    /// direct row family, so declarations and their later expression/call
+    /// consumers cannot accidentally diverge.
+    pub fn relocate_flow_type(
+        &self,
+        owner: KernelOwnerId,
+        flow_type: &FlowType,
+    ) -> Result<FlowType, KernelCheckedLinkError> {
+        Ok(FlowType {
+            mode: flow_type.mode,
+            ty: relocate_type(self.definition(owner)?.type_variables, &flow_type.ty)?,
+        })
     }
 
     pub fn statement(
@@ -614,7 +748,11 @@ impl KernelCheckedLinkLayout {
                             resolved = resolved.saturating_add(1);
                         }
                     }
-                    crate::KernelExecutionShapeArtifact::MatchArm { bindings, .. } => {
+                    crate::KernelExecutionShapeArtifact::MatchArm {
+                        selector, bindings, ..
+                    } => {
+                        let _ = self.expression(owner, *selector)?;
+                        resolved = resolved.saturating_add(1);
                         for binding in bindings {
                             let _ = local
                                 .declarations
@@ -666,6 +804,496 @@ impl KernelCheckedLinkLayout {
         self.totals.resolved_references = resolved;
         Ok(())
     }
+}
+
+fn checked_declaration_kind(kind: crate::KernelDeclarationKind) -> CheckedDeclarationKind {
+    match kind {
+        crate::KernelDeclarationKind::Function => CheckedDeclarationKind::Function,
+        crate::KernelDeclarationKind::ValueParameter => CheckedDeclarationKind::ValueParameter,
+        crate::KernelDeclarationKind::OutParameter => CheckedDeclarationKind::OutParameter,
+        crate::KernelDeclarationKind::Field => CheckedDeclarationKind::Field,
+        crate::KernelDeclarationKind::Source => CheckedDeclarationKind::Source,
+        crate::KernelDeclarationKind::Hold => CheckedDeclarationKind::Hold,
+        crate::KernelDeclarationKind::List => CheckedDeclarationKind::List,
+        crate::KernelDeclarationKind::PatternBinding => CheckedDeclarationKind::PatternBinding,
+        crate::KernelDeclarationKind::FreshOut => CheckedDeclarationKind::FreshOut,
+    }
+}
+
+fn declaration_flow_type(
+    layout: &KernelCheckedLinkLayout,
+    snapshot: &KernelCheckedSnapshot,
+    owner: KernelOwnerId,
+    declaration: &crate::KernelDeclarationArtifact,
+) -> Result<FlowType, KernelCheckedLinkError> {
+    let definition = snapshot.definitions.get(owner.0 as usize).ok_or_else(|| {
+        KernelCheckedLinkError::new(format!(
+            "kernel checked declaration flow references missing definition {}",
+            owner.0,
+        ))
+    })?;
+    if declaration.kind == crate::KernelDeclarationKind::Function {
+        if definition.linkage.public_declaration
+            != Some(KernelDeclarationReference::Local(declaration.id))
+        {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel definition {} function declaration {} is not its public authority",
+                owner.0, declaration.id.0,
+            )));
+        }
+        let mut arguments = definition
+            .declarations
+            .iter()
+            .filter_map(|candidate| match candidate.origin {
+                crate::KernelDeclarationOrigin::Parameter { ordinal, .. }
+                    if candidate.kind == crate::KernelDeclarationKind::ValueParameter =>
+                {
+                    Some((ordinal, candidate))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        arguments.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+        let arguments = arguments
+            .into_iter()
+            .map(|(ordinal, _)| {
+                definition
+                    .formals
+                    .get(ordinal as usize)
+                    .map(|formal| formal.ty.clone())
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {} function value parameter {ordinal} has no solved formal",
+                            owner.0,
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return layout.relocate_flow_type(
+            owner,
+            &FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Function {
+                    args: arguments,
+                    result: Box::new(definition.result.clone()),
+                },
+            },
+        );
+    }
+    if definition.linkage.public_declaration
+        == Some(KernelDeclarationReference::Local(declaration.id))
+    {
+        return layout.relocate_flow_type(owner, &definition.result);
+    }
+    match declaration.origin {
+        crate::KernelDeclarationOrigin::Parameter { ordinal, .. } => definition
+            .formals
+            .get(ordinal as usize)
+            .map(|formal| layout.relocate_flow_type(owner, formal))
+            .transpose()?
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel definition {} parameter declaration {} has no solved formal {ordinal}",
+                    owner.0, declaration.id.0,
+                ))
+            }),
+        crate::KernelDeclarationOrigin::PatternBinding { arm, ordinal } => {
+            pattern_binding_flow_type(
+                layout,
+                snapshot,
+                owner,
+                arm,
+                ordinal,
+                declaration.name.as_ref(),
+            )
+        }
+        crate::KernelDeclarationOrigin::CallbackBinding { call, ordinal } => fresh_out_flow_type(
+            layout,
+            snapshot,
+            owner,
+            declaration.name.as_ref(),
+            call,
+            ordinal,
+        ),
+        crate::KernelDeclarationOrigin::Statement { .. }
+        | crate::KernelDeclarationOrigin::RecordField { .. } => {
+            let value = declaration.value.ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel definition {} declaration {} has no value authority",
+                    owner.0, declaration.id.0,
+                ))
+            })?;
+            relocated_value_flow_type(layout, snapshot, owner, value)
+        }
+    }
+}
+
+fn fresh_out_flow_type(
+    layout: &KernelCheckedLinkLayout,
+    snapshot: &KernelCheckedSnapshot,
+    owner: KernelOwnerId,
+    declaration_name: &str,
+    call: crate::KernelExpressionId,
+    ordinal: u32,
+) -> Result<FlowType, KernelCheckedLinkError> {
+    let definition = snapshot
+        .definitions
+        .get(owner.0 as usize)
+        .ok_or_else(|| KernelCheckedLinkError::new("FreshOut definition is missing"))?;
+    let mut calls = definition
+        .call_syntax
+        .iter()
+        .filter(|candidate| candidate.expression == call);
+    let call_syntax = calls.next().ok_or_else(|| {
+        KernelCheckedLinkError::new(format!(
+            "kernel definition {} FreshOut formal {ordinal} has no authored call surface",
+            owner.0
+        ))
+    })?;
+    if calls.next().is_some() {
+        return Err(KernelCheckedLinkError::new(format!(
+            "kernel definition {} FreshOut formal {ordinal} has multiple authored call surfaces",
+            owner.0
+        )));
+    }
+    let mut providers = call_syntax.arguments.iter().filter_map(|argument| {
+        (argument.kind == crate::KernelCallArgumentKind::BareBinding
+            && argument.name.as_ref() == declaration_name)
+            .then_some(argument.value)
+    });
+    let provider = providers.next().ok_or_else(|| {
+        KernelCheckedLinkError::new(format!(
+            "kernel definition {} FreshOut formal {ordinal} `{declaration_name}` has no bare-OUT provider",
+            owner.0
+        ))
+    })?;
+    if providers.next().is_some() {
+        return Err(KernelCheckedLinkError::new(format!(
+            "kernel definition {} FreshOut formal {ordinal} `{declaration_name}` has multiple bare-OUT providers",
+            owner.0
+        )));
+    }
+    let KernelValueReference::Local(provider) = provider else {
+        return Err(KernelCheckedLinkError::new(format!(
+            "kernel definition {} FreshOut formal {ordinal} `{declaration_name}` has an external bare-OUT provider",
+            owner.0,
+        )));
+    };
+    let expression = definition
+        .expressions
+        .get(provider.0 as usize)
+        .ok_or_else(|| KernelCheckedLinkError::new("FreshOut provider expression is missing"))?;
+    if !matches!(expression.kind, crate::KernelOwnerNodeKind::FreshOut) {
+        return Err(KernelCheckedLinkError::new(format!(
+            "kernel definition {} FreshOut formal {ordinal} `{declaration_name}` provider {} has kind {:?}",
+            owner.0, provider.0, expression.kind,
+        )));
+    }
+    layout.relocate_flow_type(owner, &expression.flow_type)
+}
+
+fn pattern_binding_flow_type(
+    layout: &KernelCheckedLinkLayout,
+    snapshot: &KernelCheckedSnapshot,
+    owner: KernelOwnerId,
+    arm: crate::KernelExpressionId,
+    ordinal: u32,
+    declaration_name: &str,
+) -> Result<FlowType, KernelCheckedLinkError> {
+    let definition = snapshot
+        .definitions
+        .get(owner.0 as usize)
+        .ok_or_else(|| KernelCheckedLinkError::new("pattern-binding definition is missing"))?;
+    let arm_expression = definition
+        .expressions
+        .get(arm.0 as usize)
+        .ok_or_else(|| KernelCheckedLinkError::new("pattern-binding match arm is missing"))?;
+    let crate::KernelOwnerNodeKind::MatchArm { pattern } = &arm_expression.kind else {
+        return Err(KernelCheckedLinkError::new(
+            "pattern-binding declaration does not name a match arm",
+        ));
+    };
+    let mut shapes = definition
+        .execution_shapes
+        .iter()
+        .filter_map(|shape| match shape {
+            crate::KernelExecutionShapeArtifact::MatchArm {
+                expression,
+                selector,
+                ..
+            } if *expression == arm => Some(*selector),
+            _ => None,
+        });
+    let selector = shapes.next().ok_or_else(|| {
+        KernelCheckedLinkError::new(format!(
+            "kernel definition {} match arm {} has no selector authority",
+            owner.0, arm.0,
+        ))
+    })?;
+    if shapes.next().is_some() {
+        return Err(KernelCheckedLinkError::new(format!(
+            "kernel definition {} match arm {} has multiple selector authorities",
+            owner.0, arm.0,
+        )));
+    }
+    let (selector_owner, selector) = value_flow_authority(snapshot, owner, selector)?;
+    let ty = match pattern {
+        crate::KernelPattern::Binding { name } if name.as_ref() == declaration_name => {
+            selector.ty.clone()
+        }
+        crate::KernelPattern::Tag { name, fields }
+            if fields.get(ordinal as usize).map(Box::as_ref) == Some(declaration_name) =>
+        {
+            let Type::VariantSet(variants) = &selector.ty else {
+                return Ok(FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: Type::Unknown,
+                });
+            };
+            variants
+                .iter()
+                .find_map(|variant| match variant {
+                    Variant::Tagged {
+                        tag,
+                        fields: payload,
+                    } if tag == name.as_ref() => payload.fields.get(declaration_name).cloned(),
+                    Variant::Tag(_) | Variant::Tagged { .. } => None,
+                })
+                .unwrap_or(Type::Unknown)
+        }
+        crate::KernelPattern::Wildcard
+        | crate::KernelPattern::Number
+        | crate::KernelPattern::Text
+        | crate::KernelPattern::Bits { .. }
+        | crate::KernelPattern::Tag { .. }
+        | crate::KernelPattern::Binding { .. }
+        | crate::KernelPattern::Invalid => Type::Unknown,
+    };
+    layout.relocate_flow_type(
+        selector_owner,
+        &FlowType {
+            mode: FlowMode::Continuous,
+            ty,
+        },
+    )
+}
+
+fn relocated_value_flow_type(
+    layout: &KernelCheckedLinkLayout,
+    snapshot: &KernelCheckedSnapshot,
+    owner: KernelOwnerId,
+    value: KernelValueReference,
+) -> Result<FlowType, KernelCheckedLinkError> {
+    let (authority, flow_type) = value_flow_authority(snapshot, owner, value)?;
+    layout.relocate_flow_type(authority, &flow_type)
+}
+
+fn value_flow_authority(
+    snapshot: &KernelCheckedSnapshot,
+    owner: KernelOwnerId,
+    value: KernelValueReference,
+) -> Result<(KernelOwnerId, FlowType), KernelCheckedLinkError> {
+    match value {
+        KernelValueReference::Local(expression) => snapshot
+            .definitions
+            .get(owner.0 as usize)
+            .and_then(|definition| definition.expressions.get(expression.0 as usize))
+            .map(|expression| (owner, expression.flow_type.clone()))
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel definition {} value references missing expression {}",
+                    owner.0, expression.0,
+                ))
+            }),
+        KernelValueReference::External(external) => {
+            let definition = snapshot
+                .definitions
+                .get(external.owner.0 as usize)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel value references missing external definition {}",
+                        external.owner.0,
+                    ))
+                })?;
+            match external.target {
+                KernelExternalTarget::Expression(expression) => definition
+                    .expressions
+                    .get(expression.0 as usize)
+                    .map(|expression| (external.owner, expression.flow_type.clone()))
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel external definition {} has no expression {}",
+                            external.owner.0, expression.0,
+                        ))
+                    }),
+                KernelExternalTarget::Result => Ok((external.owner, definition.result.clone())),
+            }
+        }
+    }
+}
+
+fn definition_type_variables(definition: &crate::DefinitionArtifact) -> BTreeSet<TypeVar> {
+    let mut variables = BTreeSet::new();
+    for formal in &definition.formals {
+        collect_flow_type_variables(formal, &mut variables);
+    }
+    collect_flow_type_variables(&definition.result, &mut variables);
+    for expression in &definition.expressions {
+        collect_flow_type_variables(&expression.flow_type, &mut variables);
+        match &expression.kind {
+            crate::KernelOwnerNodeKind::Known(ty) | crate::KernelOwnerNodeKind::Source(ty) => {
+                collect_type_variables(ty, &mut variables);
+            }
+            _ => {}
+        }
+    }
+    for call in &definition.calls {
+        collect_flow_type_variables(&call.result, &mut variables);
+        for substitution in &call.type_substitutions {
+            collect_type_variables(&substitution.value, &mut variables);
+        }
+    }
+    for source in &definition.sources {
+        collect_type_variables(&source.payload_type, &mut variables);
+    }
+    for state in &definition.states {
+        collect_flow_type_variables(&state.flow_type, &mut variables);
+    }
+    for list in &definition.lists {
+        collect_type_variables(&list.item_type, &mut variables);
+    }
+    for diagnostic in &definition.diagnostics {
+        if let crate::KernelDiagnosticKind::CallInputType {
+            actual, expected, ..
+        } = &diagnostic.kind
+        {
+            collect_type_variables(actual, &mut variables);
+            collect_type_variables(expected, &mut variables);
+        }
+    }
+    variables
+}
+
+fn collect_flow_type_variables(flow_type: &FlowType, variables: &mut BTreeSet<TypeVar>) {
+    collect_type_variables(&flow_type.ty, variables);
+}
+
+fn collect_type_variables(ty: &Type, variables: &mut BTreeSet<TypeVar>) {
+    match ty {
+        Type::Var(variable) => {
+            variables.insert(*variable);
+        }
+        Type::VariantSet(variants) => {
+            for variant in variants.iter() {
+                if let Variant::Tagged { fields, .. } = variant {
+                    for field in fields.fields.values() {
+                        collect_type_variables(field, variables);
+                    }
+                }
+            }
+        }
+        Type::Object(shape) => {
+            for field in shape.fields.values() {
+                collect_type_variables(field, variables);
+            }
+        }
+        Type::List(item) | Type::Set(item) => collect_type_variables(item, variables),
+        Type::Function { args, result } => {
+            for argument in args {
+                collect_type_variables(argument, variables);
+            }
+            collect_flow_type_variables(result, variables);
+        }
+        Type::Union(members) => {
+            for member in members {
+                collect_type_variables(member, variables);
+            }
+        }
+        Type::Map { key, value } => {
+            collect_type_variables(key, variables);
+            collect_type_variables(value, variables);
+        }
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Absent
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown
+        | Type::Bits { .. } => {}
+    }
+}
+
+fn relocate_type(
+    type_variables: KernelCheckedRowRange,
+    ty: &Type,
+) -> Result<Type, KernelCheckedLinkError> {
+    Ok(match ty {
+        Type::Var(variable) => Type::Var(TypeVar(
+            type_variables.resolve(variable.0, "type variable")?,
+        )),
+        Type::VariantSet(variants) => Type::VariantSet(
+            variants
+                .iter()
+                .map(|variant| {
+                    Ok(match variant {
+                        Variant::Tag(tag) => Variant::Tag(tag.clone()),
+                        Variant::Tagged { tag, fields } => Variant::Tagged {
+                            tag: tag.clone(),
+                            fields: relocate_object_shape(type_variables, fields)?.into(),
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?
+                .into(),
+        ),
+        Type::Object(shape) => Type::object(relocate_object_shape(type_variables, shape)?),
+        Type::List(item) => Type::List(Type::shared(relocate_type(type_variables, item)?)),
+        Type::Set(item) => Type::Set(Type::shared(relocate_type(type_variables, item)?)),
+        Type::Function { args, result } => Type::Function {
+            args: args
+                .iter()
+                .map(|argument| relocate_type(type_variables, argument))
+                .collect::<Result<Vec<_>, _>>()?,
+            result: Box::new(FlowType {
+                mode: result.mode,
+                ty: relocate_type(type_variables, &result.ty)?,
+            }),
+        },
+        Type::Union(members) => Type::Union(
+            members
+                .iter()
+                .map(|member| relocate_type(type_variables, member))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        Type::Map { key, value } => Type::Map {
+            key: Box::new(relocate_type(type_variables, key)?),
+            value: Box::new(relocate_type(type_variables, value)?),
+        },
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Absent
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown
+        | Type::Bits { .. } => ty.clone(),
+    })
+}
+
+fn relocate_object_shape(
+    type_variables: KernelCheckedRowRange,
+    shape: &ObjectShape,
+) -> Result<ObjectShape, KernelCheckedLinkError> {
+    Ok(ObjectShape {
+        fields: shape
+            .fields
+            .iter()
+            .map(|(name, ty)| Ok((name.clone(), relocate_type(type_variables, ty)?)))
+            .collect::<Result<_, KernelCheckedLinkError>>()?,
+        field_order: shape.field_order.clone(),
+        open: shape.open,
+    })
 }
 
 fn resolve_public_declaration(
@@ -951,12 +1579,12 @@ mod tests {
         assert_eq!(layout.totals().expressions, 2);
         assert_eq!(layout.totals().scopes, 1);
         assert_eq!(layout.totals().statements, 2);
-        assert_eq!(layout.totals().declarations, 2);
+        assert_eq!(layout.totals().declarations, 3);
         assert!(layout.totals().resolved_references >= 4);
         assert_eq!(layout.definitions()[0].result_expression, CheckedExprId(0));
         assert_eq!(layout.definitions()[1].result_expression, CheckedExprId(1));
-        assert_eq!(layout.definitions()[0].public_declaration, DeclId(0));
-        assert_eq!(layout.definitions()[1].public_declaration, DeclId(1));
+        assert_eq!(layout.definitions()[0].public_declaration, DeclId(1));
+        assert_eq!(layout.definitions()[1].public_declaration, DeclId(2));
         assert_eq!(
             layout.definitions()[0].root_statement,
             CheckedStatementId(0)
@@ -978,7 +1606,7 @@ mod tests {
                     KernelDeclarationReference::OwnerPublic(KernelOwnerId(0)),
                 )
                 .unwrap(),
-            DeclId(0),
+            DeclId(1),
         );
         assert_eq!(
             layout
@@ -1031,8 +1659,52 @@ mod tests {
         assert_eq!(materialized_scopes[0].parent, None);
         assert_eq!(materialized_scopes[1].id, LexicalScopeId(1));
         assert_eq!(materialized_scopes[1].parent, Some(LexicalScopeId(0)));
-        assert_eq!(materialized_scopes[1].owner, Some(DeclId(0)));
+        assert_eq!(materialized_scopes[1].owner, Some(DeclId(1)));
         assert_eq!(materialized_scopes[1].kind, CheckedScopeKind::Block);
+        let materialized_declarations = scoped_layout
+            .materialize_declarations(&scoped)
+            .expect("solved declarations materialize directly into checked rows");
+        assert_eq!(materialized_declarations.len(), 2);
+        assert_eq!(materialized_declarations[0].id, DeclId(1));
+        assert_eq!(materialized_declarations[0].name, "provider");
+        assert_eq!(materialized_declarations[0].scope_id, LexicalScopeId(0));
+        assert_eq!(materialized_declarations[0].body_scope, None);
+        assert_eq!(materialized_declarations[0].flow_type.ty, Type::Number);
+        assert_eq!(materialized_declarations[1].id, DeclId(2));
+        assert_eq!(materialized_declarations[1].name, "consumer");
+        assert_eq!(materialized_declarations[1].flow_type.ty, Type::Number);
+
+        let mut generic = (*snapshot).clone();
+        for definition in &mut generic.definitions {
+            definition.result.ty = Type::Var(TypeVar(0));
+            definition.expressions[0].kind = KernelOwnerNodeKind::Known(Type::Var(TypeVar(0)));
+            definition.expressions[0].flow_type.ty = Type::Var(TypeVar(0));
+        }
+        let generic_layout = KernelCheckedLinkLayout::new(&project, &generic)
+            .expect("definition-local alpha ordinals must globalize once");
+        assert_eq!(generic_layout.totals().type_variables, 2);
+        assert_eq!(
+            generic_layout.definitions()[0].type_variables,
+            KernelCheckedRowRange { start: 0, len: 1 }
+        );
+        assert_eq!(
+            generic_layout.definitions()[1].type_variables,
+            KernelCheckedRowRange { start: 1, len: 1 }
+        );
+        let generic_declarations = generic_layout
+            .materialize_declarations(&generic)
+            .expect("direct declarations must use disjoint global type variables");
+        assert_eq!(generic_declarations[0].flow_type.ty, Type::Var(TypeVar(0)));
+        assert_eq!(generic_declarations[1].flow_type.ty, Type::Var(TypeVar(1)));
+
+        let mut sparse_variables = generic.clone();
+        sparse_variables.definitions[0].result.ty = Type::Var(TypeVar(1));
+        sparse_variables.definitions[0].expressions[0].kind =
+            KernelOwnerNodeKind::Known(Type::Var(TypeVar(1)));
+        sparse_variables.definitions[0].expressions[0].flow_type.ty = Type::Var(TypeVar(1));
+        let error = KernelCheckedLinkLayout::new(&project, &sparse_variables)
+            .expect_err("a non-dense definition-local alpha namespace must fail closed");
+        assert!(error.to_string().contains("non-dense local type-variable"));
 
         let mut missing_scope = scoped.clone();
         missing_scope.definitions[1].presentation.containing_scope = KernelScopeReference::Owner {
@@ -1050,7 +1722,7 @@ mod tests {
             .expect("a nested definition may share its enclosing public declaration");
         assert_eq!(
             delegated_layout.definitions()[1].public_declaration,
-            DeclId(0)
+            DeclId(1)
         );
 
         delegated.definitions[0].linkage.public_declaration =

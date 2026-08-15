@@ -3681,11 +3681,79 @@ candidate including parse and SOURCE ABI projection. The direct link layout is
 ownership cut, not a latency claim; the accepted release baseline remains the
 preceding 850.730 ms candidate until the next architecture boundary.
 
-The next cut is direct `CheckedDeclaration` materialization. Declarations are
-the remaining anchor required before statements and expressions can be emitted
-without the legacy owner-shard builder. Dynamic FreshOut/call-context facts will
-be modeled explicitly in compact call artifacts instead of reverse-engineering
-the old assembler's scope table.
+This established the prerequisite for direct `CheckedDeclaration`
+materialization: declarations could now resolve their scopes without invoking
+the legacy owner-shard builder.
+
+### Direct checked declaration rows
+
+The second real checked-row family now materializes directly. The prefix linker
+emits 4,489 NovyWave `CheckedDeclaration` rows from the solved definition
+artifacts and compact presentation table. `DeclId(0)` remains the language-wide
+absent/external sentinel, so definition-owned declarations begin at one and the
+linker's declaration total is the exclusive end of that nonzero namespace.
+Functions, parameters, public declarations, record and statement fields,
+SOURCE, HOLD, and LIST declarations obtain their flow from one already-solved
+kernel authority; spans remain source-unit relative in the kernel and are
+globalized exactly once by `boon_compiler`.
+
+Definition artifacts intentionally use definition-local alpha ordinals. The
+prefix layout now assigns each definition a disjoint dense `TypeVar` range and
+relocates declaration types through the authority definition's range. This is
+shared infrastructure for subsequent expression, call, state, LIST, and SOURCE
+rows; concatenating local `Var(0)` values directly would silently correlate
+unrelated generic definitions in the compatibility checked model. Sparse local
+alpha namespaces and out-of-range variables fail before row allocation.
+
+Two full-project failures identified facts that the old assembler previously
+reconstructed implicitly:
+
+- A FreshOut declaration is owned by the exact bare-OUT provider expression in
+  the authored call artifact. Consumer reads may contain an object read and a
+  nested text projection of the same output, so inferring the declaration from
+  lexical occurrences is both ambiguous and directionally wrong. Named nested
+  OUT arguments remain forwards and do not create another FreshOut.
+- A pattern-binding declaration needs the exact selector authority of its match
+  arm. Optimized `WHEN`, `WHILE`, and cross-owner shapes need not leave the arm
+  attached to a canonical `When` node. `KernelExecutionShapeArtifact::MatchArm`
+  therefore retains one explicit local-or-external selector reference beside
+  its declaration IDs.
+
+Both authorities are generic compact facts rather than syntax or NovyWave
+special cases. The kernel validates unique authored bare-OUT providers, exact
+FreshOut node identity, one selector per match arm, selector bounds, declaration
+ordinals, and all relocated scope/value references. Match-selector schema
+changes advance definition basis to V10 and artifact/currentness to V12.
+Focused parity covers projected FreshOut consumers, fresh-versus-forwarded OUT
+chains, tagged pattern payloads, selector currentness, disjoint cross-definition
+type-variable relocation, and nonzero declaration IDs.
+
+The accepted full debug NovyWave differential retains all 1,389 definitions,
+15,575 expressions, 4,534 compact scopes, and 4,489 direct declarations with
+zero unsupported owners. It validates 104,470 linker references in 34.359 ms;
+the complete debug candidate is 3,344.263 ms including parse and SOURCE ABI
+projection, with 3,190.707 ms in the kernel path. The fresh optimized candidate
+is 865.855 ms including retained parsing and SOURCE ABI projection, with
+777.873 ms in the kernel path, 191.954 ms in compatibility checked-image
+publication, and 10.716 ms in direct linking. The optimized rebuild took 2
+minutes 3 seconds and is excluded from those numbers. This remains primarily an
+ownership milestone: the mandatory global alpha-namespace scan puts this
+receipt roughly 1.8% above the preceding 850.730 ms baseline. That measured
+cost is well below the plan's 25% architecture-review threshold, but it is not
+a speed claim. Direct expression construction can carry the already-known alpha
+count into the artifact and compatibility checked-image deletion remains the
+material latency cut.
+
+Stable ABI declaration rows are not yet owned by the kernel. They will be
+appended after definition rows while their recursive type contracts move out of
+`boon_typecheck` into a permitted lower contract crate. Reproducing the legacy
+numeric interleaving would preserve a construction accident rather than a
+language contract.
+
+The next dependency-bottom cut is direct `CheckedStatement` authority, followed
+by expression rows. That requires compact effect summaries and exact statement
+resource/value-use facts; those will be added once as definition artifacts
+rather than recovered from source or copied from owner shards.
 
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not

@@ -18,9 +18,10 @@ use boon_compiler_kernel::{
     KernelCallShapeResolution, KernelCallTarget, KernelCallTypeSubstitution, KernelCallableKind,
     KernelCheckProduct, KernelCollectionKind, KernelCompileWork, KernelDeclarationId,
     KernelDeclarationInput, KernelDeclarationKind, KernelDeclarationOrigin,
-    KernelDeclarationReference, KernelDefinitionFactsInput, KernelDiagnosticKind,
-    KernelDiagnosticSeverity, KernelDiagnosticSite, KernelExpressionId, KernelExternalExpression,
-    KernelExternalTarget, KernelHostEffectArtifact, KernelInheritedFormal, KernelLexicalAccess,
+    KernelDeclarationReference, KernelDefinitionFactsInput, KernelDefinitionRelocations,
+    KernelDiagnosticKind, KernelDiagnosticSeverity, KernelDiagnosticSite, KernelExpressionId,
+    KernelExpressionRelocation, KernelExternalExpression, KernelExternalTarget,
+    KernelHostEffectArtifact, KernelInheritedFormal, KernelLexicalAccess,
     KernelLexicalBindingInput, KernelLexicalBindingTarget, KernelLexicalBindingTargetInput,
     KernelListId, KernelListInput, KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge,
     KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelParameterEvaluationScope,
@@ -467,11 +468,11 @@ pub struct KernelOwnerOracleReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
-    pub basis_fingerprint_v3: [u8; 32],
+    pub basis_fingerprint_v4: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v5: [u8; 32],
+    pub artifact_fingerprint_v6: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v5: [u8; 32],
+    pub fingerprint_v6: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1095,11 +1096,11 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 .zip(&artifact.currentness)
                 .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
                     owner: prepared[*prepared_index].owner.clone(),
-                    basis_fingerprint_v3: receipt.basis_fingerprint_v3,
+                    basis_fingerprint_v4: receipt.basis_fingerprint_v4,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v5: receipt.artifact_fingerprint_v5,
+                    artifact_fingerprint_v6: receipt.artifact_fingerprint_v6,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v5: receipt.fingerprint_v5,
+                    fingerprint_v6: receipt.fingerprint_v6,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -1125,6 +1126,16 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 .enumerate()
                 .map(|(dense_index, (prepared_index, artifact))| {
                     let owner = &prepared[*prepared_index];
+                    assert_eq!(
+                        artifact.relocations.expressions,
+                        owner.definition_facts.relocations.expressions,
+                        "kernel definition artifacts retain every stable expression relocation"
+                    );
+                    assert_eq!(
+                        artifact.relocations.statements,
+                        owner.definition_facts.relocations.statements,
+                        "kernel definition artifacts retain every stable statement relocation"
+                    );
                     let stable_provider = |value: KernelValueReference| match value {
                         KernelValueReference::Local(expression) => {
                             KernelOwnerOracleValueReference::Expression(
@@ -3603,7 +3614,8 @@ fn compact_owner_view(
     let mut external_expressions = Vec::new();
     let mut call_targets = Vec::new();
     let mut call_shape_diagnostics = Vec::new();
-    let node_count = raw_expressions.len() + usize::from(synthetic_result.is_some());
+    let has_synthetic_result = synthetic_result.is_some();
+    let node_count = raw_expressions.len() + usize::from(has_synthetic_result);
     let mut nodes = Vec::with_capacity(node_count);
     for (index, expression) in raw_expressions.iter().enumerate() {
         let dynamic_authoritative_surface = dynamic_authoritative_call_surface(expression);
@@ -4527,6 +4539,19 @@ fn compact_owner_view(
         &mut external_by_key,
         &mut external_expressions,
     )?;
+    definition_facts.relocations = KernelDefinitionRelocations {
+        expressions: expressions
+            .iter()
+            .cloned()
+            .map(KernelExpressionRelocation::Authored)
+            .chain(
+                has_synthetic_result
+                    .then_some(KernelExpressionRelocation::SyntheticDefinitionResult),
+            )
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        statements: statements.clone(),
+    };
     let render_slots = view
         .statements()
         .zip(statements.iter())
@@ -13339,7 +13364,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v5 != [0; 32]),
+                        && receipt.fingerprint_v6 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(

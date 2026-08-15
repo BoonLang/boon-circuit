@@ -3409,6 +3409,41 @@ interpreter cannot substitute for compiling each definition once. Release
 improvement is accepted only when the complete candidate path improves, not
 merely when graph counts fall.
 
+### Stable semantic relocation authority
+
+The checked-image audit exposed one necessary reordering of the greenfield
+plan. Exact semantic facts cannot all wait until after checker cutover: the
+checked linker needs a definition-local source relocation for every dense
+expression and statement, or it must rediscover the same owner graph from the
+parser after solving. `KernelDefinitionFactsInput` and `DefinitionArtifact`
+therefore now carry `KernelDefinitionRelocations` as first-class immutable
+authority.
+
+Expression relocations explicitly distinguish an authored
+`StableExpressionKey` from a `SyntheticDefinitionResult`. The latter is needed
+when a structural owner publishes a record composed only from child owners and
+there is deliberately no parser expression to name that aggregate. The kernel
+validates exact dense counts, uniqueness, and source-unit ownership and refuses
+to manufacture a fake authored key. Relocations participate in the definition
+basis, artifact, and exact-currentness fingerprints; their domains advance to
+basis V4 and artifact/currentness V6. Public-result fingerprints remain
+unchanged when only source structure moves, preserving semantic backdating.
+
+The full debug NovyWave differential after this cut retains every relocation
+and remains exact for 1,389 solved owners plus eight structural containers,
+with zero unsupported owners. It records 59,302 operations, 95,483
+activations, 2,607.416 ms direct production diagnostics including parse, and a
+3,091.634 ms complete checked candidate. The latter includes 420.620 ms of
+checked-image publication. This cut adds linker authority rather than claiming
+a latency improvement, so no optimized rebuild was spent on it.
+
+This does not make the old checked assembler part of the new design. The next
+cut retains exact literal and execution facts beside these relocations, then a
+single dense linker projects `KernelCheckedSnapshot` into the existing
+`boon_checked` model. Only after that direct projection passes the full parity
+and budget gates can production checked-image requests cut over and the old
+owner row builders be deleted.
+
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not
 spend a full optimized rebuild on every small edit. Keep the latest accepted

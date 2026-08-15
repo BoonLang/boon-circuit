@@ -75,6 +75,31 @@ impl KernelProjectInput {
         let mut definition_by_key = BTreeMap::new();
         let mut units = BTreeMap::<SourceUnitId, Vec<KernelOwnerId>>::new();
         for (index, key) in definition_keys.iter().enumerate() {
+            let relocations = &definition_facts[index].relocations;
+            if let Some(expression) = relocations
+                .expressions
+                .iter()
+                .filter_map(|expression| match expression {
+                    crate::KernelExpressionRelocation::Authored(expression) => Some(expression),
+                    crate::KernelExpressionRelocation::SyntheticDefinitionResult => None,
+                })
+                .find(|expression| &expression.source_unit_id != key.source_unit_id())
+            {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel definition {key:?} contains expression relocation from source unit {}",
+                    expression.source_unit_id
+                )));
+            }
+            if let Some(statement) = relocations
+                .statements
+                .iter()
+                .find(|statement| &statement.source_unit_id != key.source_unit_id())
+            {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel definition {key:?} contains statement relocation from source unit {}",
+                    statement.source_unit_id
+                )));
+            }
             let owner = KernelOwnerId(
                 u32::try_from(index)
                     .expect("kernel project definition count exceeds the dense u32 namespace"),
@@ -673,6 +698,38 @@ mod tests {
                 &project.syntax_units()[index].source_unit_id
             );
         }
+    }
+
+    #[test]
+    fn project_input_rejects_cross_unit_definition_relocations() {
+        let definition_unit = SourceUnitId::from_path("definition.bn").unwrap();
+        let foreign_unit = SourceUnitId::from_path("foreign.bn").unwrap();
+        let error = KernelProjectInput::new(
+            KernelProjectProgramInput {
+                owners: vec![value_owner(KernelOwnerNodeKind::Number)].into_boxed_slice(),
+            },
+            vec![KernelDefinitionFactsInput {
+                relocations: crate::KernelDefinitionRelocations {
+                    expressions: vec![crate::KernelExpressionRelocation::Authored(
+                        boon_syntax::StableExpressionKey {
+                            source_unit_id: foreign_unit,
+                            route_digest_v1: [7; 32],
+                        },
+                    )]
+                    .into_boxed_slice(),
+                    statements: Box::new([]),
+                },
+                ..KernelDefinitionFactsInput::default()
+            }]
+            .into_boxed_slice(),
+            vec![StableCheckOwnerKey::UnitRoot(definition_unit)].into_boxed_slice(),
+        )
+        .expect_err("cross-unit relocation must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("expression relocation from source unit")
+        );
     }
 
     #[test]

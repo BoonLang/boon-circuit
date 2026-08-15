@@ -5,10 +5,11 @@ use crate::{
 };
 use boon_checked::{
     CheckedBlockBinding, CheckedCallId, CheckedDeclaration, CheckedDeclarationKind,
-    CheckedEffectSummary, CheckedExprId, CheckedExpression, CheckedExpressionKind, CheckedListId,
-    CheckedMatchPattern, CheckedPassedAccess, CheckedRecordField, CheckedResourceBinding,
-    CheckedScope, CheckedScopeKind, CheckedSourceId, CheckedSourceRead, CheckedSpan,
-    CheckedStateId, CheckedStatement, CheckedStatementId, CheckedStatementKind, CheckedTextSegment,
+    CheckedEffectSummary, CheckedExprId, CheckedExpression, CheckedExpressionKind, CheckedList,
+    CheckedListId, CheckedMatchPattern, CheckedPassedAccess, CheckedRecordField,
+    CheckedResourceBinding, CheckedScope, CheckedScopeKind, CheckedSemanticPath, CheckedSource,
+    CheckedSourceId, CheckedSourceRead, CheckedSpan, CheckedState, CheckedStateId,
+    CheckedStatement, CheckedStatementId, CheckedStatementKind, CheckedTextSegment,
     CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId, ObjectShape,
     Type, TypeVar, Variant,
 };
@@ -976,6 +977,218 @@ impl KernelCheckedLinkLayout {
         Ok(expressions.into_boxed_slice())
     }
 
+    /// Emit every SOURCE resource directly from its solved definition row.
+    ///
+    /// The expression presentation owns the source coordinate and lexical
+    /// scope. Resource identity, declaration authority, semantic path, and
+    /// payload contract are already explicit in the immutable artifact, so
+    /// this pass performs only dense relocation.
+    pub fn materialize_sources(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<Box<[CheckedSource]>, KernelCheckedLinkError> {
+        self.validate_snapshot_definition_count(snapshot, "SOURCE")?;
+        let mut sources = Vec::with_capacity(self.totals.sources as usize);
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = checked_owner_id(owner_index, "SOURCE")?;
+            for source in &definition.sources {
+                let id = self.source(owner, source.id.0)?;
+                if id.0 as usize != sources.len() {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel checked SOURCE materializer expected row {} but linked {}",
+                        sources.len(),
+                        id.0,
+                    )));
+                }
+                let presentation = expression_presentation(definition, source.expression)?;
+                sources.push(CheckedSource {
+                    id,
+                    declaration: self.declaration(owner, source.declaration)?,
+                    statement: self.statement(owner, source.statement)?,
+                    expression: self
+                        .expression(owner, KernelValueReference::Local(source.expression))?,
+                    owner_scope: self.scope(owner, presentation.scope)?,
+                    path: self.semantic_path(owner, &source.path)?,
+                    interval_ms: source.interval_ms,
+                    payload_type: relocate_type(
+                        self.definition(owner)?.type_variables,
+                        &source.payload_type,
+                    )?,
+                    span: checked_span(presentation.span),
+                });
+            }
+        }
+        self.validate_materialized_count("SOURCE", sources.len(), self.totals.sources)?;
+        Ok(sources.into_boxed_slice())
+    }
+
+    /// Emit every persistent state row without rediscovering HOLD/LATEST
+    /// structure from checked expressions.
+    pub fn materialize_states(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<Box<[CheckedState]>, KernelCheckedLinkError> {
+        self.validate_snapshot_definition_count(snapshot, "state")?;
+        let mut states = Vec::with_capacity(self.totals.states as usize);
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = checked_owner_id(owner_index, "state")?;
+            for state in &definition.states {
+                let id = self.state(owner, state.id.0)?;
+                if id.0 as usize != states.len() {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel checked state materializer expected row {} but linked {}",
+                        states.len(),
+                        id.0,
+                    )));
+                }
+                let (owner_scope, span) =
+                    if state.kind == boon_checked::CheckedStateKind::StatementHold {
+                        let (statement_owner, statement) =
+                            self.local_statement_reference(snapshot, owner, state.statement)?;
+                        let presentation = statement_presentation(
+                            &snapshot.definitions[statement_owner.0 as usize],
+                            statement,
+                        )?;
+                        (
+                            self.scope(statement_owner, presentation.scope)?,
+                            checked_span(presentation.span),
+                        )
+                    } else {
+                        let presentation = expression_presentation(definition, state.expression)?;
+                        (
+                            self.scope(owner, presentation.scope)?,
+                            checked_span(presentation.span),
+                        )
+                    };
+                states.push(CheckedState {
+                    id,
+                    binding_declaration: self.declaration(owner, state.binding_declaration)?,
+                    declaration: self.declaration(owner, state.declaration)?,
+                    statement: self.statement(owner, state.statement)?,
+                    expression: self
+                        .expression(owner, KernelValueReference::Local(state.expression))?,
+                    initial: self.expression(owner, state.initial)?,
+                    owner_scope,
+                    path: self.semantic_path(owner, &state.path)?,
+                    kind: state.kind,
+                    flow_type: self.relocate_flow_type(owner, &state.flow_type)?,
+                    span,
+                });
+            }
+        }
+        self.validate_materialized_count("state", states.len(), self.totals.states)?;
+        Ok(states.into_boxed_slice())
+    }
+
+    /// Emit every persistent LIST authority from the kernel's single solved
+    /// resource table.
+    pub fn materialize_lists(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<Box<[CheckedList]>, KernelCheckedLinkError> {
+        self.validate_snapshot_definition_count(snapshot, "LIST")?;
+        let mut lists = Vec::with_capacity(self.totals.lists as usize);
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = checked_owner_id(owner_index, "LIST")?;
+            for list in &definition.lists {
+                let id = self.list(owner, list.id.0)?;
+                if id.0 as usize != lists.len() {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel checked LIST materializer expected row {} but linked {}",
+                        lists.len(),
+                        id.0,
+                    )));
+                }
+                let presentation = expression_presentation(definition, list.producer)?;
+                lists.push(CheckedList {
+                    id,
+                    declaration: self.declaration(owner, list.declaration)?,
+                    statement: self.statement(owner, list.statement)?,
+                    producer: self.expression(owner, KernelValueReference::Local(list.producer))?,
+                    owner_scope: self.scope(owner, presentation.scope)?,
+                    path: self.semantic_path(owner, &list.path)?,
+                    item_type: relocate_type(
+                        self.definition(owner)?.type_variables,
+                        &list.item_type,
+                    )?,
+                    capacity: list.capacity,
+                    key_policy: list.key_policy,
+                    span: checked_span(presentation.span),
+                });
+            }
+        }
+        self.validate_materialized_count("LIST", lists.len(), self.totals.lists)?;
+        Ok(lists.into_boxed_slice())
+    }
+
+    fn validate_snapshot_definition_count(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        label: &str,
+    ) -> Result<(), KernelCheckedLinkError> {
+        if snapshot.definitions.len() != self.definitions.len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked {label} materializer has {} definitions for a {}-definition layout",
+                snapshot.definitions.len(),
+                self.definitions.len(),
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_materialized_count(
+        &self,
+        label: &str,
+        actual: usize,
+        expected: u32,
+    ) -> Result<(), KernelCheckedLinkError> {
+        if actual != expected as usize {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked {label} materializer produced {actual} rows for a {expected}-row layout",
+            )));
+        }
+        Ok(())
+    }
+
+    fn semantic_path(
+        &self,
+        owner: KernelOwnerId,
+        path: &crate::KernelSemanticPath,
+    ) -> Result<CheckedSemanticPath, KernelCheckedLinkError> {
+        Ok(CheckedSemanticPath {
+            anchor: self.declaration(owner, path.anchor)?,
+            projection: path
+                .projection
+                .iter()
+                .map(|field| field.to_string())
+                .collect(),
+        })
+    }
+
+    fn local_statement_reference(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        owner: KernelOwnerId,
+        statement: KernelStatementReference,
+    ) -> Result<(KernelOwnerId, crate::KernelStatementId), KernelCheckedLinkError> {
+        match statement {
+            KernelStatementReference::Local(statement) => Ok((owner, statement)),
+            KernelStatementReference::OwnerPublic(owner) => {
+                let statement = snapshot
+                    .definitions
+                    .get(owner.0 as usize)
+                    .and_then(|definition| definition.linkage.root_statement)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel state references definition {} without a root statement",
+                            owner.0,
+                        ))
+                    })?;
+                Ok((owner, statement))
+            }
+        }
+    }
+
     pub fn declaration(
         &self,
         owner: KernelOwnerId,
@@ -1299,6 +1512,56 @@ impl KernelCheckedLinkLayout {
         }
         self.totals.resolved_references = resolved;
         Ok(())
+    }
+}
+
+fn checked_owner_id(index: usize, label: &str) -> Result<KernelOwnerId, KernelCheckedLinkError> {
+    Ok(KernelOwnerId(u32::try_from(index).map_err(|_| {
+        KernelCheckedLinkError::new(format!(
+            "kernel checked {label} materializer definition count exceeds u32",
+        ))
+    })?))
+}
+
+fn expression_presentation(
+    definition: &crate::DefinitionArtifact,
+    expression: crate::KernelExpressionId,
+) -> Result<&crate::KernelExpressionPresentation, KernelCheckedLinkError> {
+    definition
+        .presentation
+        .expressions
+        .get(expression.0 as usize)
+        .filter(|presentation| presentation.expression == expression)
+        .ok_or_else(|| {
+            KernelCheckedLinkError::new(format!(
+                "kernel resource expression {} has no exact presentation row",
+                expression.0,
+            ))
+        })
+}
+
+fn statement_presentation(
+    definition: &crate::DefinitionArtifact,
+    statement: crate::KernelStatementId,
+) -> Result<&crate::KernelStatementPresentation, KernelCheckedLinkError> {
+    definition
+        .presentation
+        .statements
+        .get(statement.0 as usize)
+        .filter(|presentation| presentation.statement == statement)
+        .ok_or_else(|| {
+            KernelCheckedLinkError::new(format!(
+                "kernel resource statement {} has no exact presentation row",
+                statement.0,
+            ))
+        })
+}
+
+fn checked_span(span: crate::KernelSourceSpan) -> CheckedSpan {
+    CheckedSpan {
+        line: span.line,
+        start: span.start,
+        end: span.end,
     }
 }
 

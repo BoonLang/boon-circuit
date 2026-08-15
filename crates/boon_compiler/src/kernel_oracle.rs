@@ -9,9 +9,10 @@
 #![cfg_attr(not(any(test, feature = "test-kernel-oracle")), allow(dead_code))]
 
 use boon_checked::{
-    CheckedDeclaration, CheckedExpression, CheckedExpressionKind, CheckedListKeyPolicy,
-    CheckedScope, CheckedStateKind, CheckedStatement, DiagnosticSeverity, FlowMode, FlowType,
-    ObjectShape, Type, TypeDiagnostic, Variant, type_is_recursively_closed,
+    CheckedDeclaration, CheckedExpression, CheckedExpressionKind, CheckedList,
+    CheckedListKeyPolicy, CheckedScope, CheckedSource, CheckedState, CheckedStateKind,
+    CheckedStatement, DiagnosticSeverity, FlowMode, FlowType, ObjectShape, Type, TypeDiagnostic,
+    Variant, type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
     CheckDemand, KernelCallArgumentKind, KernelCallArgumentSource, KernelCallInputRole,
@@ -494,6 +495,9 @@ pub struct KernelOwnerOracleReport {
     pub checked_expression_keys: Box<[Option<StableExpressionKey>]>,
     pub checked_statements: Box<[CheckedStatement]>,
     pub checked_statement_keys: Box<[StableStatementKey]>,
+    pub checked_sources: Box<[CheckedSource]>,
+    pub checked_states: Box<[CheckedState]>,
+    pub checked_lists: Box<[CheckedList]>,
     pub container_owners: Box<[StableCheckOwnerKey]>,
     pub unsupported: Box<[(StableCheckOwnerKey, String)]>,
     pub root_blockers: Box<[KernelOwnerBlockerImpact]>,
@@ -1102,6 +1106,9 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     let mut checked_expression_keys: Box<[Option<StableExpressionKey>]> = Box::new([]);
     let mut checked_statements: Box<[CheckedStatement]> = Box::new([]);
     let mut checked_statement_keys: Box<[StableStatementKey]> = Box::new([]);
+    let mut checked_sources: Box<[CheckedSource]> = Box::new([]);
+    let mut checked_states: Box<[CheckedState]> = Box::new([]);
+    let mut checked_lists: Box<[CheckedList]> = Box::new([]);
     let mut solve_us = 0;
     let mut compile_work = KernelCompileWork::default();
     let artifact = if project_is_empty {
@@ -1158,6 +1165,18 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         .into_vec();
                     let mut materialized_statements = layout
                         .materialize_statements(&checked)
+                        .map_err(|error| error.to_string())?
+                        .into_vec();
+                    let mut materialized_sources = layout
+                        .materialize_sources(&checked)
+                        .map_err(|error| error.to_string())?
+                        .into_vec();
+                    let mut materialized_states = layout
+                        .materialize_states(&checked)
+                        .map_err(|error| error.to_string())?
+                        .into_vec();
+                    let mut materialized_lists = layout
+                        .materialize_lists(&checked)
                         .map_err(|error| error.to_string())?
                         .into_vec();
                     for definition in layout.definitions() {
@@ -1337,6 +1356,75 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                                     )
                                 })?;
                         }
+                        for row in definition.sources.start
+                            ..definition
+                                .sources
+                                .start
+                                .checked_add(definition.sources.len)
+                                .ok_or_else(|| {
+                                    "kernel checked SOURCE range overflowed".to_owned()
+                                })?
+                        {
+                            let resource = materialized_sources
+                                .get_mut(row as usize)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "kernel checked SOURCE linker references missing row {row}"
+                                    )
+                                })?;
+                            relocate_direct_checked_span(
+                                &mut resource.span,
+                                source.start_line,
+                                source.start_byte,
+                                &format!("kernel checked SOURCE row {row}"),
+                            )?;
+                        }
+                        for row in definition.states.start
+                            ..definition
+                                .states
+                                .start
+                                .checked_add(definition.states.len)
+                                .ok_or_else(|| {
+                                    "kernel checked state range overflowed".to_owned()
+                                })?
+                        {
+                            let resource = materialized_states
+                                .get_mut(row as usize)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "kernel checked state linker references missing row {row}"
+                                    )
+                                })?;
+                            relocate_direct_checked_span(
+                                &mut resource.span,
+                                source.start_line,
+                                source.start_byte,
+                                &format!("kernel checked state row {row}"),
+                            )?;
+                        }
+                        for row in definition.lists.start
+                            ..definition
+                                .lists
+                                .start
+                                .checked_add(definition.lists.len)
+                                .ok_or_else(|| {
+                                    "kernel checked LIST range overflowed".to_owned()
+                                })?
+                        {
+                            let resource = materialized_lists
+                                .get_mut(row as usize)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "kernel checked LIST linker references missing row {row}"
+                                    )
+                                })?;
+                            relocate_direct_checked_span(
+                                &mut resource.span,
+                                source.start_line,
+                                source.start_byte,
+                                &format!("kernel checked LIST row {row}"),
+                            )?;
+                        }
                     }
                     checked_scopes = materialized_scopes.into_boxed_slice();
                     checked_declarations = materialized_declarations.into_boxed_slice();
@@ -1375,6 +1463,9 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                             checked_statements.len(),
                         ));
                     }
+                    checked_sources = materialized_sources.into_boxed_slice();
+                    checked_states = materialized_states.into_boxed_slice();
+                    checked_lists = materialized_lists.into_boxed_slice();
                     checked_link_layout_us = elapsed_us(checked_link_started.elapsed());
                     Ok(checked)
                 })
@@ -2079,6 +2170,9 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         checked_expression_keys,
         checked_statements,
         checked_statement_keys,
+        checked_sources,
+        checked_states,
+        checked_lists,
         container_owners: container_owners.into_boxed_slice(),
         unsupported: unsupported.into_boxed_slice(),
         root_blockers: root_blockers.into_boxed_slice(),
@@ -16906,6 +17000,146 @@ mod tests {
             &project,
         );
         assert!(mismatches.is_empty(), "resource parity: {mismatches:#?}");
+        let direct_declaration = |id: DeclId| {
+            report
+                .checked_declarations
+                .iter()
+                .find(|declaration| declaration.id == id)
+                .map(|declaration| (declaration.kind, declaration.name.clone(), declaration.span))
+        };
+        let current_declaration = |id: DeclId| {
+            checked
+                .declarations
+                .iter()
+                .find(|declaration| declaration.id == id)
+                .map(|declaration| (declaration.kind, declaration.name.clone(), declaration.span))
+        };
+        let direct_expression_span = |id: boon_checked::CheckedExprId| {
+            report
+                .checked_expressions
+                .get(id.0 as usize)
+                .map(|expression| expression.span)
+        };
+        let current_expression_span = |id: boon_checked::CheckedExprId| {
+            checked
+                .expressions
+                .get(id.0 as usize)
+                .map(|expression| expression.span)
+        };
+        let direct_statement_span = |id: boon_checked::CheckedStatementId| {
+            report
+                .checked_statements
+                .get(id.0 as usize)
+                .map(|statement| statement.span)
+        };
+        let current_statement_span = |id: boon_checked::CheckedStatementId| {
+            checked
+                .statements
+                .get(id.0 as usize)
+                .map(|statement| statement.span)
+        };
+        let direct_scope = |id: boon_checked::LexicalScopeId| {
+            report
+                .checked_scopes
+                .get(id.0 as usize)
+                .map(|scope| (scope.kind, scope.span))
+        };
+        let current_scope = |id: boon_checked::LexicalScopeId| {
+            checked
+                .scopes
+                .get(id.0 as usize)
+                .map(|scope| (scope.kind, scope.span))
+        };
+        assert_eq!(report.checked_sources.len(), checked.sources.len());
+        for (direct, current) in report.checked_sources.iter().zip(&checked.sources) {
+            assert_eq!(
+                direct_declaration(direct.declaration),
+                current_declaration(current.declaration)
+            );
+            assert_eq!(
+                direct_statement_span(direct.statement),
+                current_statement_span(current.statement)
+            );
+            assert_eq!(
+                direct_expression_span(direct.expression),
+                current_expression_span(current.expression)
+            );
+            assert_eq!(
+                direct_scope(direct.owner_scope),
+                current_scope(current.owner_scope)
+            );
+            assert_eq!(
+                direct_declaration(direct.path.anchor),
+                current_declaration(current.path.anchor)
+            );
+            assert_eq!(direct.path.projection, current.path.projection);
+            assert_eq!(direct.interval_ms, current.interval_ms);
+            assert_eq!(direct.payload_type, current.payload_type);
+            assert_eq!(direct.span, current.span);
+        }
+        assert_eq!(report.checked_states.len(), checked.states.len());
+        for (direct, current) in report.checked_states.iter().zip(&checked.states) {
+            assert_eq!(
+                direct_declaration(direct.binding_declaration),
+                current_declaration(current.binding_declaration)
+            );
+            assert_eq!(
+                direct_declaration(direct.declaration),
+                current_declaration(current.declaration)
+            );
+            assert_eq!(
+                direct_statement_span(direct.statement),
+                current_statement_span(current.statement)
+            );
+            assert_eq!(
+                direct_expression_span(direct.expression),
+                current_expression_span(current.expression)
+            );
+            assert_eq!(
+                direct_expression_span(direct.initial),
+                current_expression_span(current.initial)
+            );
+            assert_eq!(
+                direct_scope(direct.owner_scope),
+                current_scope(current.owner_scope)
+            );
+            assert_eq!(
+                direct_declaration(direct.path.anchor),
+                current_declaration(current.path.anchor)
+            );
+            assert_eq!(direct.path.projection, current.path.projection);
+            assert_eq!(direct.kind, current.kind);
+            assert_eq!(direct.flow_type, current.flow_type);
+            assert_eq!(direct.span, current.span);
+        }
+        assert_eq!(report.checked_lists.len(), checked.lists.len());
+        for (direct, current) in report.checked_lists.iter().zip(&checked.lists) {
+            assert_eq!(
+                direct_declaration(direct.declaration),
+                current_declaration(current.declaration)
+            );
+            assert_eq!(
+                direct_statement_span(direct.statement),
+                current_statement_span(current.statement)
+            );
+            assert_eq!(
+                direct_expression_span(direct.producer),
+                current_expression_span(current.producer)
+            );
+            assert_eq!(
+                direct_scope(direct.owner_scope),
+                current_scope(current.owner_scope)
+            );
+            assert_eq!(
+                direct_declaration(direct.path.anchor),
+                current_declaration(current.path.anchor)
+            );
+            assert_eq!(direct.path.projection, current.path.projection);
+            assert_eq!(direct.item_type, current.item_type);
+            assert_eq!(direct.capacity, current.capacity);
+            assert_eq!(direct.key_policy, current.key_policy);
+            assert_eq!(direct.span, current.span);
+        }
         assert_eq!(
             report
                 .supported

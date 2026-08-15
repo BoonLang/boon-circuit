@@ -348,6 +348,123 @@ pub struct KernelDefinitionLinkage {
     pub context_formal_ordinal: Option<u32>,
 }
 
+/// Dense lexical-scope identity inside one definition artifact.
+///
+/// Scope IDs are deliberately separate from expression and statement IDs. A
+/// definition may borrow its containing scope from an enclosing definition,
+/// while every scope it creates remains a compact local row.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct KernelScopeId(pub u32);
+
+/// One lexical scope authority before the checked snapshot is globally linked.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelScopeReference {
+    #[default]
+    ProjectRoot,
+    /// The scope supplied by this definition's lexical placement. This keeps
+    /// local rows stable while an enclosing definition is dense-relocated.
+    Containing,
+    Local(KernelScopeId),
+    Owner {
+        owner: KernelOwnerId,
+        scope: KernelScopeId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelScopeKind {
+    Function,
+    Block,
+    Record,
+    RepeatedOutput,
+    CallContext,
+}
+
+/// Structural source of a scope row. This is compact linker authority, not a
+/// copy of the old owner-shard stable-key DTO.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelScopeOrigin {
+    StatementBody {
+        statement: KernelStatementId,
+    },
+    Record {
+        expression: KernelExpressionId,
+    },
+    MatchArm {
+        expression: KernelExpressionId,
+    },
+    RepeatedOutput {
+        statement: KernelStatementId,
+        parameter_ordinal: u32,
+    },
+    CallContext {
+        expression: KernelExpressionId,
+        context_ordinal: u32,
+    },
+}
+
+/// Exact source coordinates retained by the compact checked-image path.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelSourceSpan {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelScopePresentation {
+    pub id: KernelScopeId,
+    pub parent: KernelScopeReference,
+    pub owner: Option<KernelDeclarationReference>,
+    pub kind: KernelScopeKind,
+    pub origin: KernelScopeOrigin,
+    pub span: KernelSourceSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelExpressionPresentation {
+    pub expression: KernelExpressionId,
+    pub scope: KernelScopeReference,
+    pub declaration: Option<KernelDeclarationReference>,
+    pub span: KernelSourceSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelStatementPresentation {
+    pub statement: KernelStatementId,
+    pub scope: KernelScopeReference,
+    pub body_scope: Option<KernelScopeId>,
+    pub span: KernelSourceSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelDeclarationPresentation {
+    pub declaration: KernelDeclarationId,
+    pub scope: KernelScopeReference,
+    pub body_scope: Option<KernelScopeId>,
+    pub span: KernelSourceSpan,
+}
+
+/// Presentation facts needed to construct checked rows without reopening a
+/// parser arena or a legacy owner shard.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelDefinitionPresentation {
+    pub containing_scope: KernelScopeReference,
+    pub scopes: Box<[KernelScopePresentation]>,
+    pub expressions: Box<[KernelExpressionPresentation]>,
+    pub statements: Box<[KernelStatementPresentation]>,
+    pub declarations: Box<[KernelDeclarationPresentation]>,
+}
+
+impl KernelDefinitionPresentation {
+    pub fn is_empty(&self) -> bool {
+        self.scopes.is_empty()
+            && self.expressions.is_empty()
+            && self.statements.is_empty()
+            && self.declarations.is_empty()
+    }
+}
+
 /// Stable-within-definition structural origin of one declaration row.
 ///
 /// The dense declaration ID is intentionally revision-local. The origin is
@@ -655,6 +772,7 @@ impl KernelDefinitionRelocations {
 pub struct KernelDefinitionFactsInput {
     pub linkage: KernelDefinitionLinkage,
     pub relocations: KernelDefinitionRelocations,
+    pub presentation: KernelDefinitionPresentation,
     pub expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     pub call_syntax: Box<[KernelCallSyntaxInput]>,
     pub execution_shapes: Box<[KernelExecutionShapeInput]>,
@@ -722,6 +840,7 @@ pub struct KernelOwnerProgram {
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
     linkage: KernelDefinitionLinkage,
     relocations: KernelDefinitionRelocations,
+    presentation: KernelDefinitionPresentation,
     expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     call_syntax: Box<[KernelCallSyntaxArtifact]>,
     execution_shapes: Box<[KernelExecutionShapeArtifact]>,
@@ -732,7 +851,7 @@ pub struct KernelOwnerProgram {
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
-    basis_fingerprint_v8: [u8; 32],
+    basis_fingerprint_v9: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -814,6 +933,7 @@ struct KernelProjectOwnerOutputs {
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
     linkage: KernelDefinitionLinkage,
     relocations: KernelDefinitionRelocations,
+    presentation: KernelDefinitionPresentation,
     expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     call_syntax: Box<[KernelCallSyntaxArtifact]>,
     execution_shapes: Box<[KernelExecutionShapeArtifact]>,
@@ -829,7 +949,7 @@ struct KernelProjectOwnerOutputs {
     /// requirements. That aggregate is useful to the solver, but is not a
     /// sound direct assignability contract for call diagnostics.
     syntax_discriminated_formals: Box<[u32]>,
-    basis_fingerprint_v8: [u8; 32],
+    basis_fingerprint_v9: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -1925,6 +2045,9 @@ pub struct DefinitionArtifact {
     /// Exact stable source identities retained for direct checked/semantic
     /// linking. Dense IDs remain definition-local and revision-local.
     pub relocations: KernelDefinitionRelocations,
+    /// Compact lexical scopes, source spans, and row ownership required by the
+    /// direct checked-image materializer.
+    pub presentation: KernelDefinitionPresentation,
     pub expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     pub call_syntax: Box<[KernelCallSyntaxArtifact]>,
     pub execution_shapes: Box<[KernelExecutionShapeArtifact]>,
@@ -2012,7 +2135,7 @@ pub fn is_registered_kernel_host_effect(operation: &str) -> bool {
 
 impl KernelOwnerProgram {
     pub fn solve(self) -> Result<KernelDefinitionSnapshot, KernelSolveError> {
-        let basis_fingerprint_v8 = self.basis_fingerprint_v8;
+        let basis_fingerprint_v9 = self.basis_fingerprint_v9;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
             .output(self.result_output)
@@ -2071,6 +2194,7 @@ impl KernelOwnerProgram {
             formals: formal_flows,
             linkage: self.linkage,
             relocations: self.relocations,
+            presentation: self.presentation,
             expression_payloads: self.expression_payloads,
             call_syntax: self.call_syntax,
             execution_shapes: self.execution_shapes,
@@ -2087,7 +2211,7 @@ impl KernelOwnerProgram {
         };
         let (dependencies, currentness) = build_snapshot_receipts(
             std::slice::from_mut(&mut definition),
-            &[basis_fingerprint_v8],
+            &[basis_fingerprint_v9],
         )?;
         let [currentness] = currentness.as_ref() else {
             unreachable!("one standalone kernel definition produces one receipt")
@@ -2252,7 +2376,7 @@ impl KernelSolvedProject {
         let basis_fingerprints = self
             .owners
             .iter()
-            .map(|owner| owner.basis_fingerprint_v8)
+            .map(|owner| owner.basis_fingerprint_v9)
             .collect::<Vec<_>>();
         let mut definitions = self
             .owners
@@ -2881,6 +3005,7 @@ fn materialize_project_definition(
         formals: public_formals[owner_index].clone(),
         linkage: owner.linkage,
         relocations: owner.relocations,
+        presentation: owner.presentation,
         expression_payloads: owner.expression_payloads,
         call_syntax: owner.call_syntax,
         execution_shapes: owner.execution_shapes,
@@ -2943,6 +3068,7 @@ fn validate_definition_linker_facts(
     }
 
     validate_definition_linkage(input, facts, &label, relocations, definition.is_some())?;
+    validate_definition_presentation(input, facts, &label, definition.is_some())?;
 
     if !facts.expression_payloads.is_empty() {
         if facts.expression_payloads.len() != input.nodes.len() {
@@ -3122,6 +3248,226 @@ fn validate_definition_linker_facts(
         if authored_values != canonical_values {
             return Err(KernelOwnerBuildError::new(format!(
                 "kernel {label} call expression {expression} authored inputs {authored_values:?} differ from canonical inputs {canonical_values:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_presentation_scope_reference(
+    reference: KernelScopeReference,
+    scope_count: usize,
+    label: &str,
+) -> Result<(), KernelOwnerBuildError> {
+    if let KernelScopeReference::Local(scope) = reference
+        && scope.0 as usize >= scope_count
+    {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel {label} checked presentation references missing local scope {}",
+            scope.0,
+        )));
+    }
+    Ok(())
+}
+
+fn validate_presentation_declaration_reference(
+    reference: KernelDeclarationReference,
+    declaration_count: usize,
+    project_definition: bool,
+    label: &str,
+) -> Result<(), KernelOwnerBuildError> {
+    match reference {
+        KernelDeclarationReference::Local(declaration)
+            if declaration.0 as usize >= declaration_count =>
+        {
+            Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} checked presentation references missing declaration {}",
+                declaration.0,
+            )))
+        }
+        KernelDeclarationReference::OwnerPublic(_) if !project_definition => {
+            Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} checked presentation imports a declaration in a standalone definition"
+            )))
+        }
+        KernelDeclarationReference::Local(_) | KernelDeclarationReference::OwnerPublic(_) => Ok(()),
+    }
+}
+
+fn validate_definition_presentation(
+    input: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+    label: &str,
+    project_definition: bool,
+) -> Result<(), KernelOwnerBuildError> {
+    let presentation = &facts.presentation;
+    if presentation.is_empty() {
+        if project_definition && !facts.relocations.is_empty() {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} source-linked definition omits checked presentation facts"
+            )));
+        }
+        return Ok(());
+    }
+    if presentation.expressions.len() != input.nodes.len()
+        || presentation.statements.len() != facts.statements.len()
+        || presentation.declarations.len() != facts.declarations.len()
+    {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel {label} checked presentation has {} expression, {} statement, and {} declaration rows for {} expressions, {} statements, and {} declarations",
+            presentation.expressions.len(),
+            presentation.statements.len(),
+            presentation.declarations.len(),
+            input.nodes.len(),
+            facts.statements.len(),
+            facts.declarations.len(),
+        )));
+    }
+    if matches!(
+        presentation.containing_scope,
+        KernelScopeReference::Local(_) | KernelScopeReference::Containing
+    ) {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel {label} checked presentation has an unresolved containing scope"
+        )));
+    }
+    if matches!(
+        presentation.containing_scope,
+        KernelScopeReference::Owner { .. }
+    ) && !project_definition
+    {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel {label} checked presentation imports a containing scope in a standalone definition"
+        )));
+    }
+
+    let scope_count = presentation.scopes.len();
+    for (index, scope) in presentation.scopes.iter().enumerate() {
+        if scope.id.0 as usize != index {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} checked presentation scope rows do not have dense IDs"
+            )));
+        }
+        validate_presentation_scope_reference(scope.parent, scope_count, label)?;
+        if scope.parent == KernelScopeReference::Local(scope.id) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} checked presentation scope {index} is its own parent"
+            )));
+        }
+        if let KernelScopeReference::Owner { .. } = scope.parent
+            && !project_definition
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} checked presentation scope {index} imports a parent in a standalone definition"
+            )));
+        }
+        if let Some(owner) = scope.owner {
+            validate_presentation_declaration_reference(
+                owner,
+                facts.declarations.len(),
+                project_definition,
+                label,
+            )?;
+        }
+        if scope.span.start > scope.span.end {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} checked presentation scope {index} has an inverted span"
+            )));
+        }
+        match scope.origin {
+            KernelScopeOrigin::StatementBody { statement }
+            | KernelScopeOrigin::RepeatedOutput { statement, .. }
+                if statement.0 as usize >= facts.statements.len() =>
+            {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel {label} checked presentation scope {index} references missing statement {}",
+                    statement.0,
+                )));
+            }
+            KernelScopeOrigin::Record { expression }
+            | KernelScopeOrigin::MatchArm { expression }
+            | KernelScopeOrigin::CallContext { expression, .. }
+                if expression.0 as usize >= input.nodes.len() =>
+            {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel {label} checked presentation scope {index} references missing expression {}",
+                    expression.0,
+                )));
+            }
+            _ => {}
+        }
+    }
+    for start in 0..scope_count {
+        let mut active = BTreeSet::new();
+        let mut current = start;
+        while active.insert(current) {
+            match presentation.scopes[current].parent {
+                KernelScopeReference::Local(parent) => current = parent.0 as usize,
+                KernelScopeReference::ProjectRoot
+                | KernelScopeReference::Containing
+                | KernelScopeReference::Owner { .. } => break,
+            }
+        }
+        if active.contains(&current)
+            && matches!(
+                presentation.scopes[current].parent,
+                KernelScopeReference::Local(_)
+            )
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} checked presentation scopes contain a local parent cycle"
+            )));
+        }
+    }
+
+    for (index, expression) in presentation.expressions.iter().enumerate() {
+        if expression.expression.0 as usize != index || expression.span.start > expression.span.end
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} checked expression presentation row {index} is malformed"
+            )));
+        }
+        validate_presentation_scope_reference(expression.scope, scope_count, label)?;
+        if let Some(declaration) = expression.declaration {
+            validate_presentation_declaration_reference(
+                declaration,
+                facts.declarations.len(),
+                project_definition,
+                label,
+            )?;
+        }
+    }
+    for (index, statement) in presentation.statements.iter().enumerate() {
+        if statement.statement.0 as usize != index || statement.span.start > statement.span.end {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} checked statement presentation row {index} is malformed"
+            )));
+        }
+        validate_presentation_scope_reference(statement.scope, scope_count, label)?;
+        if let Some(body) = statement.body_scope
+            && body.0 as usize >= scope_count
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} checked statement presentation row {index} references missing body scope {}",
+                body.0,
+            )));
+        }
+    }
+    for (index, declaration) in presentation.declarations.iter().enumerate() {
+        if declaration.declaration.0 as usize != index
+            || declaration.span.start > declaration.span.end
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} checked declaration presentation row {index} is malformed"
+            )));
+        }
+        validate_presentation_scope_reference(declaration.scope, scope_count, label)?;
+        if let Some(body) = declaration.body_scope
+            && body.0 as usize >= scope_count
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} checked declaration presentation row {index} references missing body scope {}",
+                body.0,
             )));
         }
     }
@@ -3509,7 +3855,7 @@ pub fn compile_owner_program_with_definition_facts(
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
     validate_definition_linker_facts(input, facts, None)?;
-    let basis_fingerprint_v8 = definition_basis_fingerprint(input, facts)?;
+    let basis_fingerprint_v9 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
@@ -3663,6 +4009,7 @@ pub fn compile_owner_program_with_definition_facts(
         expression_artifacts: collect_expression_artifacts(input)?,
         linkage: facts.linkage,
         relocations: facts.relocations.clone(),
+        presentation: facts.presentation.clone(),
         expression_payloads: facts.expression_payloads.clone(),
         call_syntax: collect_call_syntax_artifacts(input, facts)?,
         execution_shapes: collect_execution_shape_artifacts(input, facts)?,
@@ -3673,7 +4020,7 @@ pub fn compile_owner_program_with_definition_facts(
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
         diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
-        basis_fingerprint_v8,
+        basis_fingerprint_v9,
     })
 }
 
@@ -5428,6 +5775,7 @@ pub fn compile_project_program_with_definition_facts(
                 expression_artifacts: collect_expression_artifacts(owner)?,
                 linkage: facts[owner_index].linkage,
                 relocations: facts[owner_index].relocations.clone(),
+                presentation: facts[owner_index].presentation.clone(),
                 expression_payloads: facts[owner_index].expression_payloads.clone(),
                 call_syntax: collect_call_syntax_artifacts(owner, &facts[owner_index])?,
                 execution_shapes: collect_execution_shape_artifacts(owner, &facts[owner_index])?,
@@ -5452,7 +5800,7 @@ pub fn compile_project_program_with_definition_facts(
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice(),
                 syntax_discriminated_formals: syntax_discriminated_formals[owner_index].clone(),
-                basis_fingerprint_v8: definition_basis_fingerprint_with_buffer(
+                basis_fingerprint_v9: definition_basis_fingerprint_with_buffer(
                     owner,
                     &facts[owner_index],
                     &mut basis_fingerprint_scratch,
@@ -12872,16 +13220,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v8,
-            moved.currentness.basis_fingerprint_v8
+            solved.currentness.basis_fingerprint_v9,
+            moved.currentness.basis_fingerprint_v9
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v10,
-            moved.currentness.artifact_fingerprint_v10
+            solved.currentness.artifact_fingerprint_v11,
+            moved.currentness.artifact_fingerprint_v11
         );
         assert_ne!(
-            solved.currentness.fingerprint_v10,
-            moved.currentness.fingerprint_v10
+            solved.currentness.fingerprint_v11,
+            moved.currentness.fingerprint_v11
         );
 
         let mut missing = facts.clone();
@@ -12902,6 +13250,106 @@ mod tests {
             .err()
             .expect("duplicate relocations must fail closed");
         assert!(error.to_string().contains("repeats a stable expression"));
+    }
+
+    #[test]
+    fn definition_presentation_is_currentness_authority_and_fails_closed() {
+        let input = KernelOwnerProgramInput {
+            nodes: vec![KernelOwnerNode {
+                kind: KernelOwnerNodeKind::Number,
+                inputs: Box::new([]),
+                mode: FlowMode::Continuous,
+            }]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(0),
+        };
+        let span = KernelSourceSpan {
+            line: 1,
+            start: 0,
+            end: 1,
+        };
+        let facts = KernelDefinitionFactsInput {
+            presentation: KernelDefinitionPresentation {
+                containing_scope: KernelScopeReference::ProjectRoot,
+                scopes: vec![KernelScopePresentation {
+                    id: KernelScopeId(0),
+                    parent: KernelScopeReference::Containing,
+                    owner: None,
+                    kind: KernelScopeKind::Record,
+                    origin: KernelScopeOrigin::Record {
+                        expression: KernelExpressionId(0),
+                    },
+                    span,
+                }]
+                .into_boxed_slice(),
+                expressions: vec![KernelExpressionPresentation {
+                    expression: KernelExpressionId(0),
+                    scope: KernelScopeReference::Local(KernelScopeId(0)),
+                    declaration: None,
+                    span,
+                }]
+                .into_boxed_slice(),
+                statements: Box::new([]),
+                declarations: Box::new([]),
+            },
+            ..KernelDefinitionFactsInput::default()
+        };
+
+        let solved = compile_owner_program_with_definition_facts(&input, &facts)
+            .unwrap()
+            .solve()
+            .unwrap();
+        let mut moved = facts.clone();
+        moved.presentation.expressions[0].span.line = 2;
+        let moved = compile_owner_program_with_definition_facts(&input, &moved)
+            .unwrap()
+            .solve()
+            .unwrap();
+        assert_eq!(solved.definition.result, moved.definition.result);
+        assert_eq!(
+            solved.currentness.public_result_fingerprint_v1,
+            moved.currentness.public_result_fingerprint_v1
+        );
+        assert_ne!(
+            solved.currentness.basis_fingerprint_v9,
+            moved.currentness.basis_fingerprint_v9
+        );
+        assert_ne!(
+            solved.currentness.artifact_fingerprint_v11,
+            moved.currentness.artifact_fingerprint_v11
+        );
+        assert_ne!(
+            solved.currentness.fingerprint_v11,
+            moved.currentness.fingerprint_v11
+        );
+
+        let mut missing = facts.clone();
+        missing.presentation.expressions[0].scope = KernelScopeReference::Local(KernelScopeId(99));
+        let error = compile_owner_program_with_definition_facts(&input, &missing)
+            .err()
+            .expect("a missing compact scope must fail closed");
+        assert!(error.to_string().contains("missing local scope 99"));
+
+        let mut cycle = facts.clone();
+        let mut scopes = cycle.presentation.scopes.into_vec();
+        scopes.push(KernelScopePresentation {
+            id: KernelScopeId(1),
+            parent: KernelScopeReference::Local(KernelScopeId(0)),
+            owner: None,
+            kind: KernelScopeKind::Block,
+            origin: KernelScopeOrigin::Record {
+                expression: KernelExpressionId(0),
+            },
+            span,
+        });
+        scopes[0].parent = KernelScopeReference::Local(KernelScopeId(1));
+        cycle.presentation.scopes = scopes.into_boxed_slice();
+        let error = compile_owner_program_with_definition_facts(&input, &cycle)
+            .err()
+            .expect("a compact scope cycle must fail closed");
+        assert!(error.to_string().contains("local parent cycle"));
     }
 
     #[test]
@@ -12972,16 +13420,16 @@ mod tests {
             edited.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v8,
-            edited.currentness.basis_fingerprint_v8,
+            solved.currentness.basis_fingerprint_v9,
+            edited.currentness.basis_fingerprint_v9,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v10,
-            edited.currentness.artifact_fingerprint_v10,
+            solved.currentness.artifact_fingerprint_v11,
+            edited.currentness.artifact_fingerprint_v11,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v10,
-            edited.currentness.fingerprint_v10,
+            solved.currentness.fingerprint_v11,
+            edited.currentness.fingerprint_v11,
         );
 
         let mut missing = facts.clone();
@@ -13110,16 +13558,16 @@ mod tests {
             renamed.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v8,
-            renamed.currentness.basis_fingerprint_v8,
+            solved.currentness.basis_fingerprint_v9,
+            renamed.currentness.basis_fingerprint_v9,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v10,
-            renamed.currentness.artifact_fingerprint_v10,
+            solved.currentness.artifact_fingerprint_v11,
+            renamed.currentness.artifact_fingerprint_v11,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v10,
-            renamed.currentness.fingerprint_v10,
+            solved.currentness.fingerprint_v11,
+            renamed.currentness.fingerprint_v11,
         );
 
         let mut partial = facts.clone();
@@ -13350,6 +13798,7 @@ mod tests {
         let facts = KernelDefinitionFactsInput {
             linkage: KernelDefinitionLinkage::default(),
             relocations: KernelDefinitionRelocations::default(),
+            presentation: KernelDefinitionPresentation::default(),
             expression_payloads: Box::new([]),
             call_syntax: Box::new([]),
             execution_shapes: Box::new([]),
@@ -13579,6 +14028,7 @@ mod tests {
         let facts = KernelDefinitionFactsInput {
             linkage: KernelDefinitionLinkage::default(),
             relocations: KernelDefinitionRelocations::default(),
+            presentation: KernelDefinitionPresentation::default(),
             expression_payloads: Box::new([]),
             call_syntax: Box::new([]),
             execution_shapes: Box::new([]),

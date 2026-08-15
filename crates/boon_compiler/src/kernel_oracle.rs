@@ -19,19 +19,22 @@ use boon_compiler_kernel::{
     KernelCallTypeSubstitution, KernelCallableKind, KernelCheckProduct, KernelCheckedLinkLayout,
     KernelCollectionKind, KernelCompileWork, KernelConditionalKind, KernelDeclarationId,
     KernelDeclarationInput, KernelDeclarationKind, KernelDeclarationOrigin,
-    KernelDeclarationReference, KernelDefinitionFactsInput, KernelDefinitionRelocations,
-    KernelDiagnosticKind, KernelDiagnosticSeverity, KernelDiagnosticSite,
-    KernelExecutionBlockBindingInput, KernelExecutionRecordFieldInput, KernelExecutionShapeInput,
-    KernelExpressionId, KernelExpressionRelocation, KernelExpressionSemanticPayload,
+    KernelDeclarationPresentation, KernelDeclarationReference, KernelDefinitionFactsInput,
+    KernelDefinitionPresentation, KernelDefinitionRelocations, KernelDiagnosticKind,
+    KernelDiagnosticSeverity, KernelDiagnosticSite, KernelExecutionBlockBindingInput,
+    KernelExecutionRecordFieldInput, KernelExecutionShapeInput, KernelExpressionId,
+    KernelExpressionPresentation, KernelExpressionRelocation, KernelExpressionSemanticPayload,
     KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
     KernelInheritedFormal, KernelLexicalAccess, KernelLexicalBindingInput,
     KernelLexicalBindingTarget, KernelLexicalBindingTargetInput, KernelListId, KernelListInput,
     KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
     KernelOwnerProgramInput, KernelParameterEvaluationScope, KernelParameterKind, KernelPattern,
     KernelProjectInput, KernelProjectProgramInput, KernelPureBuiltinKind,
-    KernelRenderConstructorKind, KernelSession, KernelSolveWork, KernelSourceId, KernelSourceInput,
-    KernelStateId, KernelStateInput, KernelStatementChildReference, KernelStatementId,
-    KernelStatementInput, KernelStatementKind, KernelStatementParameter, KernelStatementReference,
+    KernelRenderConstructorKind, KernelScopeId, KernelScopeKind, KernelScopeOrigin,
+    KernelScopePresentation, KernelScopeReference, KernelSession, KernelSolveWork, KernelSourceId,
+    KernelSourceInput, KernelSourceSpan, KernelStateId, KernelStateInput,
+    KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
+    KernelStatementParameter, KernelStatementPresentation, KernelStatementReference,
     KernelStructuralDeclarationInput, KernelTextTemplateSegment, KernelTypeMismatch,
     KernelValueReference, is_kernel_host_effect, is_registered_kernel_host_effect,
     project_kernel_call_shape, project_kernel_source_expression_diagnostics,
@@ -39,10 +42,10 @@ use boon_compiler_kernel::{
 use boon_data::{Bits, ExactNumber};
 use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
 use boon_syntax::{
-    AstBlockBindingDeclaration, AstCallArgKind, AstExprKind, AstMatchPattern, AstParameterKind,
-    AstStatementKind, AstTextSegment, StableCheckOwnerKey, StableExpressionKey,
-    StableItemRouteSegment, StableStatementKey, StableStatementKind, UnitItemKind,
-    UnitLocalStatementId,
+    AstBlockBindingDeclaration, AstCallArgKind, AstExpr, AstExprKind, AstMatchPattern,
+    AstParameterKind, AstStatement, AstStatementKind, AstTextSegment, StableCheckOwnerKey,
+    StableExpressionKey, StableItemRouteSegment, StableStatementKey, StableStatementKind,
+    UnitItemKind, UnitLocalStatementId,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -54,6 +57,7 @@ pub struct KernelOwnerOracleEntry {
     pub formals: Box<[FlowType]>,
     pub result: FlowType,
     pub expressions: Box<[(StableExpressionKey, FlowType)]>,
+    pub presentation_scope_count: usize,
     pub execution_shape_count: usize,
     pub statements: Box<[KernelOwnerOracleStatement]>,
     pub declarations: Box<[KernelOwnerOracleDeclaration]>,
@@ -490,11 +494,11 @@ pub struct KernelOwnerOracleReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
-    pub basis_fingerprint_v8: [u8; 32],
+    pub basis_fingerprint_v9: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v10: [u8; 32],
+    pub artifact_fingerprint_v11: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v10: [u8; 32],
+    pub fingerprint_v11: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -804,6 +808,33 @@ fn prepare_kernel_project_projection(
             u32::try_from(dense).expect("kernel oracle owner count exceeds u32"),
         ));
     }
+    let mut containing_placements = vec![None; prepared.len()];
+    for parent in active.iter().copied() {
+        for target in &prepared[parent].containing_scope_targets {
+            let child = prepared_by_owner[&target.owner];
+            if dense_owner[child].is_none() {
+                continue;
+            }
+            let placement = (parent, target.scope);
+            match containing_placements[child] {
+                None => containing_placements[child] = Some(placement),
+                Some(previous) if previous == placement => {}
+                Some(previous) => panic!(
+                    "kernel owner has conflicting containing-scope placements {previous:?} and {placement:?}"
+                ),
+            }
+        }
+    }
+    let mut resolved_containing_scopes = vec![None; prepared.len()];
+    for owner in active.iter().copied() {
+        resolve_prepared_containing_scope(
+            owner,
+            &containing_placements,
+            &dense_owner,
+            &mut resolved_containing_scopes,
+            &mut BTreeSet::new(),
+        );
+    }
     if let Some(dense) = std::env::var_os("BOON_KERNEL_ORACLE_TRACE_DENSE_OWNER")
         .and_then(|dense| dense.to_string_lossy().parse::<usize>().ok())
         && let Some(prepared_index) = active.get(dense).copied()
@@ -894,6 +925,8 @@ fn prepare_kernel_project_projection(
             let dense_current =
                 dense_owner[*prepared_index].expect("active resource owner has a dense owner ID");
             let mut facts = owner.definition_facts.clone();
+            facts.presentation.containing_scope = resolved_containing_scopes[*prepared_index]
+                .expect("active owner has a resolved containing scope");
             for target in &owner.statement_child_targets {
                 let prepared_target = prepared_by_owner[&target.owner];
                 let child = facts.statements[target.statement]
@@ -1145,11 +1178,11 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 .zip(&artifact.currentness)
                 .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
                     owner: prepared[*prepared_index].owner.clone(),
-                    basis_fingerprint_v8: receipt.basis_fingerprint_v8,
+                    basis_fingerprint_v9: receipt.basis_fingerprint_v9,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v10: receipt.artifact_fingerprint_v10,
+                    artifact_fingerprint_v11: receipt.artifact_fingerprint_v11,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v10: receipt.fingerprint_v10,
+                    fingerprint_v11: receipt.fingerprint_v11,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -1185,6 +1218,27 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         owner.definition_facts.relocations.statements,
                         "kernel definition artifacts retain every stable statement relocation"
                     );
+                    assert_eq!(
+                        artifact.presentation.scopes,
+                        owner.definition_facts.presentation.scopes,
+                        "kernel definition artifacts retain every compact scope row"
+                    );
+                    assert_eq!(
+                        artifact.presentation.expressions,
+                        owner.definition_facts.presentation.expressions,
+                        "kernel definition artifacts retain every checked-expression presentation row"
+                    );
+                    assert_eq!(
+                        artifact.presentation.statements,
+                        owner.definition_facts.presentation.statements,
+                        "kernel definition artifacts retain every checked-statement presentation row"
+                    );
+                    assert_eq!(
+                        artifact.presentation.declarations,
+                        owner.definition_facts.presentation.declarations,
+                        "kernel definition artifacts retain every checked-declaration presentation row"
+                    );
+                    let presentation_scope_count = artifact.presentation.scopes.len();
                     assert_eq!(
                         artifact.expression_payloads,
                         owner.definition_facts.expression_payloads,
@@ -1691,6 +1745,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         formals: artifact.formals,
                         result: artifact.result,
                         expressions,
+                        presentation_scope_count,
                         execution_shape_count,
                         statements,
                         declarations,
@@ -2393,6 +2448,7 @@ struct PreparedOwner {
     definition_facts: KernelDefinitionFactsInput,
     render_slots: Box<[Box<str>]>,
     statement_child_targets: Box<[PreparedStatementChildTarget]>,
+    containing_scope_targets: Box<[PreparedContainingScopeTarget]>,
     lexical_owner_targets: Box<[PreparedLexicalOwnerTarget]>,
     resource_owner_targets: Box<[PreparedResourceOwnerTarget]>,
     resource_synthetic_paths: Box<[PreparedResourceSyntheticPath]>,
@@ -2528,6 +2584,53 @@ struct PreparedStatementChildTarget {
     statement: usize,
     child: usize,
     owner: StableCheckOwnerKey,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedContainingScopeTarget {
+    owner: StableCheckOwnerKey,
+    scope: KernelScopeReference,
+}
+
+fn resolve_prepared_containing_scope(
+    owner: usize,
+    placements: &[Option<(usize, KernelScopeReference)>],
+    dense_owner: &[Option<KernelOwnerId>],
+    resolved: &mut [Option<KernelScopeReference>],
+    active: &mut BTreeSet<usize>,
+) -> KernelScopeReference {
+    if let Some(scope) = resolved[owner] {
+        return scope;
+    }
+    assert!(
+        active.insert(owner),
+        "kernel checked-presentation containing scopes contain a cycle"
+    );
+    let scope =
+        placements[owner].map_or(
+            KernelScopeReference::ProjectRoot,
+            |(parent, scope)| match scope {
+                KernelScopeReference::ProjectRoot => KernelScopeReference::ProjectRoot,
+                KernelScopeReference::Containing => resolve_prepared_containing_scope(
+                    parent,
+                    placements,
+                    dense_owner,
+                    resolved,
+                    active,
+                ),
+                KernelScopeReference::Local(scope) => KernelScopeReference::Owner {
+                    owner: dense_owner[parent]
+                        .expect("active containing-scope parent has a dense owner"),
+                    scope,
+                },
+                KernelScopeReference::Owner { .. } => {
+                    panic!("prepared containing scope contains a premature dense owner")
+                }
+            },
+        );
+    active.remove(&owner);
+    resolved[owner] = Some(scope);
+    scope
 }
 
 #[derive(Clone, Debug)]
@@ -5210,6 +5313,14 @@ fn compact_owner_view(
             });
         }
     }
+    let (presentation, containing_scope_targets) = compact_checked_presentation(
+        view,
+        &raw_expressions,
+        &local_by_syntax,
+        &nodes,
+        &definition_facts,
+    )?;
+    definition_facts.presentation = presentation;
     Ok(PreparedOwner {
         owner,
         expressions: expressions.into_boxed_slice(),
@@ -5221,6 +5332,7 @@ fn compact_owner_view(
             .collect::<Vec<_>>()
             .into_boxed_slice(),
         statement_child_targets,
+        containing_scope_targets,
         lexical_owner_targets,
         resource_owner_targets: resource_owner_targets.into_boxed_slice(),
         resource_synthetic_paths,
@@ -6409,6 +6521,699 @@ fn compact_statement_facts(
             ..KernelDefinitionFactsInput::default()
         },
         child_targets.into_boxed_slice(),
+    ))
+}
+
+fn kernel_expression_span(expression: &AstExpr) -> KernelSourceSpan {
+    KernelSourceSpan {
+        line: expression.line,
+        start: expression.start,
+        end: expression.end,
+    }
+}
+
+fn kernel_statement_span(statement: &AstStatement) -> KernelSourceSpan {
+    KernelSourceSpan {
+        line: statement.line,
+        start: statement.start,
+        end: statement.end,
+    }
+}
+
+fn kernel_subspan(
+    view: UnitOwnerSyntaxView<'_>,
+    fallback_line: usize,
+    start: usize,
+    end: usize,
+) -> KernelSourceSpan {
+    KernelSourceSpan {
+        line: view.physical_line_for_byte(start).unwrap_or(fallback_line),
+        start,
+        end,
+    }
+}
+
+fn kernel_syntax_expression_children(expression: &AstExpr) -> Vec<usize> {
+    let mut children = Vec::new();
+    if let Some(linked) = expression.linked_input {
+        children.push(linked);
+    }
+    match &expression.kind {
+        AstExprKind::TextTemplate { segments } => {
+            children.extend(segments.iter().filter_map(|segment| match segment {
+                AstTextSegment::Static { .. } => None,
+                AstTextSegment::Dynamic { value } => Some(*value),
+            }))
+        }
+        AstExprKind::TaggedObject { fields, .. } | AstExprKind::Object(fields) => {
+            children.extend(fields.iter().map(|field| field.value));
+        }
+        AstExprKind::Flush { payload } => children.extend(*payload),
+        AstExprKind::Call { args, pass, .. } => {
+            children.extend(args.iter().map(|argument| argument.value));
+            children.extend(pass.iter().map(|pass| pass.value));
+        }
+        AstExprKind::Pipe {
+            input,
+            args,
+            pass,
+            arms,
+            ..
+        } => {
+            children.push(*input);
+            children.extend(args.iter().map(|argument| argument.value));
+            children.extend(pass.iter().map(|pass| pass.value));
+            children.extend(arms.iter().copied());
+        }
+        AstExprKind::Draining { input } => children.push(*input),
+        AstExprKind::Hold { initial, .. } => children.push(*initial),
+        AstExprKind::Latest { branches } => children.extend(branches.iter().copied()),
+        AstExprKind::When { input, arms } => {
+            children.push(*input);
+            children.extend(arms.iter().copied());
+        }
+        AstExprKind::Then { input, output } => {
+            children.push(*input);
+            children.extend(*output);
+        }
+        AstExprKind::Infix { left, right, .. } => {
+            children.extend([*left, *right]);
+        }
+        AstExprKind::MatchArm { output, .. } => children.extend(*output),
+        AstExprKind::Block { bindings, result } => {
+            children.extend(bindings.iter().map(|binding| binding.value));
+            children.extend(*result);
+        }
+        AstExprKind::ListLiteral { items, .. }
+        | AstExprKind::BytesLiteral { items, .. }
+        | AstExprKind::SetLiteral { items } => children.extend(items.iter().copied()),
+        AstExprKind::Arrow { left, output, .. } => {
+            children.push(*left);
+            children.extend(*output);
+        }
+        AstExprKind::MapEntry { key, value } => children.extend([*key, *value]),
+        AstExprKind::MapLiteral { entries } => children.extend(entries.iter().copied()),
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::ByteLiteral { .. }
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_)
+        | AstExprKind::BitsLiteral { .. } => {}
+    }
+    children.sort_unstable();
+    children.dedup();
+    children
+}
+
+fn compact_checked_presentation(
+    view: UnitOwnerSyntaxView<'_>,
+    raw_expressions: &[&AstExpr],
+    local_by_syntax: &BTreeMap<usize, usize>,
+    nodes: &[KernelOwnerNode],
+    facts: &KernelDefinitionFactsInput,
+) -> Result<
+    (
+        KernelDefinitionPresentation,
+        Box<[PreparedContainingScopeTarget]>,
+    ),
+    String,
+> {
+    let raw_statements = view.statements().collect::<Vec<_>>();
+    if raw_statements.len() != facts.statements.len()
+        || raw_expressions.len() > nodes.len()
+        || facts
+            .declarations
+            .iter()
+            .enumerate()
+            .any(|(index, row)| row.id.0 as usize != index)
+    {
+        return Err("checked presentation input is not dense".to_owned());
+    }
+    let dense_statement_by_local = view
+        .statement_ids()
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(dense, local)| (local, dense))
+        .collect::<BTreeMap<_, _>>();
+    let statement_parents = view
+        .statement_ids()
+        .iter()
+        .map(|statement| {
+            view.statement_locator(*statement)
+                .and_then(|locator| locator.parent())
+                .and_then(|parent| dense_statement_by_local.get(&parent).copied())
+        })
+        .collect::<Vec<_>>();
+    let declaration_by_statement = facts
+        .declarations
+        .iter()
+        .filter_map(|declaration| match declaration.origin {
+            KernelDeclarationOrigin::Statement { statement } => {
+                Some((statement.0 as usize, declaration.id))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let declaration_by_record_field = facts
+        .declarations
+        .iter()
+        .filter_map(|declaration| match declaration.origin {
+            KernelDeclarationOrigin::RecordField { object, ordinal } => {
+                Some(((object.0 as usize, ordinal as usize), declaration.id))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut scopes = Vec::<KernelScopePresentation>::new();
+    let mut body_scopes = vec![None; facts.statements.len()];
+    for (index, (statement, syntax)) in facts
+        .statements
+        .iter()
+        .zip(raw_statements.iter())
+        .enumerate()
+    {
+        if !matches!(statement.kind, KernelStatementKind::Function { .. })
+            && statement.children.is_empty()
+        {
+            continue;
+        }
+        let id = KernelScopeId(checked_u32(scopes.len(), "checked presentation scope")?);
+        body_scopes[index] = Some(id);
+        let direct = syntax
+            .expr
+            .and_then(|expression| local_by_syntax.get(&expression).copied());
+        let kind = if matches!(statement.kind, KernelStatementKind::Function { .. }) {
+            KernelScopeKind::Function
+        } else if direct.is_some_and(|expression| {
+            matches!(nodes[expression].kind, KernelOwnerNodeKind::Record { .. })
+        }) {
+            KernelScopeKind::Record
+        } else {
+            KernelScopeKind::Block
+        };
+        scopes.push(KernelScopePresentation {
+            id,
+            parent: KernelScopeReference::Containing,
+            owner: declaration_by_statement
+                .get(&index)
+                .copied()
+                .map(|declaration| KernelDeclarationReference::Local(declaration)),
+            kind,
+            origin: KernelScopeOrigin::StatementBody {
+                statement: KernelStatementId(checked_u32(index, "statement scope owner")?),
+            },
+            span: kernel_statement_span(syntax),
+        });
+    }
+
+    fn statement_scope(
+        index: usize,
+        parents: &[Option<usize>],
+        bodies: &[Option<KernelScopeId>],
+        cache: &mut [Option<KernelScopeReference>],
+        active: &mut BTreeSet<usize>,
+    ) -> Result<KernelScopeReference, String> {
+        if let Some(scope) = cache[index] {
+            return Ok(scope);
+        }
+        if !active.insert(index) {
+            return Err("checked presentation statement parents contain a cycle".to_owned());
+        }
+        let scope = if let Some(parent) = parents[index] {
+            bodies[parent].map_or(
+                statement_scope(parent, parents, bodies, cache, active)?,
+                KernelScopeReference::Local,
+            )
+        } else {
+            KernelScopeReference::Containing
+        };
+        active.remove(&index);
+        cache[index] = Some(scope);
+        Ok(scope)
+    }
+
+    let mut statement_scopes = vec![None; facts.statements.len()];
+    for index in 0..facts.statements.len() {
+        let scope = statement_scope(
+            index,
+            &statement_parents,
+            &body_scopes,
+            &mut statement_scopes,
+            &mut BTreeSet::new(),
+        )?;
+        if let Some(body) = body_scopes[index] {
+            scopes[body.0 as usize].parent = scope;
+        }
+    }
+
+    let mut expression_boundaries = BTreeMap::<usize, KernelScopeId>::new();
+    for (statement, syntax) in facts.statements.iter().zip(raw_statements.iter()) {
+        let Some(body) = body_scopes[statement.id.0 as usize] else {
+            continue;
+        };
+        if let Some(expression) = syntax
+            .expr
+            .and_then(|expression| local_by_syntax.get(&expression).copied())
+            && matches!(nodes[expression].kind, KernelOwnerNodeKind::Record { .. })
+        {
+            expression_boundaries.insert(expression, body);
+        }
+    }
+    for (expression, node) in nodes.iter().enumerate().take(raw_expressions.len()) {
+        let (kind, origin) = match &node.kind {
+            KernelOwnerNodeKind::Record { .. }
+                if !expression_boundaries.contains_key(&expression) =>
+            {
+                (
+                    KernelScopeKind::Record,
+                    KernelScopeOrigin::Record {
+                        expression: KernelExpressionId(checked_u32(
+                            expression,
+                            "record scope expression",
+                        )?),
+                    },
+                )
+            }
+            KernelOwnerNodeKind::MatchArm { .. } => (
+                KernelScopeKind::Block,
+                KernelScopeOrigin::MatchArm {
+                    expression: KernelExpressionId(checked_u32(
+                        expression,
+                        "match scope expression",
+                    )?),
+                },
+            ),
+            _ => continue,
+        };
+        let id = KernelScopeId(checked_u32(scopes.len(), "expression scope")?);
+        scopes.push(KernelScopePresentation {
+            id,
+            parent: KernelScopeReference::Containing,
+            owner: None,
+            kind,
+            origin,
+            span: kernel_expression_span(raw_expressions[expression]),
+        });
+        expression_boundaries.insert(expression, id);
+    }
+
+    let root_statement = facts
+        .linkage
+        .root_statement
+        .map(|statement| statement.0 as usize);
+    if let Some(root) = root_statement
+        && let KernelStatementKind::Function { parameters, .. } = &facts.statements[root].kind
+        && let AstStatementKind::Function {
+            parameters: syntax_parameters,
+            ..
+        } = &raw_statements[root].kind
+    {
+        let function_body = body_scopes[root]
+            .ok_or_else(|| "function checked presentation has no body scope".to_owned())?;
+        if parameters.len() != syntax_parameters.len() {
+            return Err("function presentation parameter tables differ".to_owned());
+        }
+        for (parameter, syntax_parameter) in parameters.iter().zip(syntax_parameters) {
+            if parameter.kind != KernelParameterKind::Out {
+                continue;
+            }
+            let declaration = facts
+                .declarations
+                .iter()
+                .find(|declaration| {
+                    declaration.origin
+                        == (KernelDeclarationOrigin::Parameter {
+                            statement: KernelStatementId(
+                                checked_u32(root, "function root statement")
+                                    .expect("root statement already fits u32"),
+                            ),
+                            ordinal: parameter.ordinal,
+                        })
+                })
+                .map(|declaration| declaration.id)
+                .ok_or_else(|| "OUT scope has no declaration".to_owned())?;
+            let id = KernelScopeId(checked_u32(scopes.len(), "OUT scope")?);
+            scopes.push(KernelScopePresentation {
+                id,
+                parent: KernelScopeReference::Local(function_body),
+                owner: Some(KernelDeclarationReference::Local(declaration)),
+                kind: KernelScopeKind::RepeatedOutput,
+                origin: KernelScopeOrigin::RepeatedOutput {
+                    statement: KernelStatementId(checked_u32(root, "OUT statement")?),
+                    parameter_ordinal: parameter.ordinal,
+                },
+                span: kernel_subspan(
+                    view,
+                    raw_statements[root].line,
+                    syntax_parameter.start,
+                    syntax_parameter.end,
+                ),
+            });
+        }
+    }
+
+    let repeated_output_by_parameter = scopes
+        .iter()
+        .filter_map(|scope| match scope.origin {
+            KernelScopeOrigin::RepeatedOutput {
+                parameter_ordinal, ..
+            } => Some((parameter_ordinal, scope.id)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut presentations = facts
+        .relocations
+        .expressions
+        .iter()
+        .enumerate()
+        .map(|(index, relocation)| {
+            let span = match relocation {
+                KernelExpressionRelocation::Authored(_) => raw_expressions
+                    .get(index)
+                    .map(|expression| kernel_expression_span(expression))
+                    .ok_or_else(|| {
+                        "authored checked presentation expression has no syntax row".to_owned()
+                    })?,
+                KernelExpressionRelocation::SyntheticDefinitionResult => root_statement
+                    .and_then(|root| raw_statements.get(root).copied())
+                    .map(kernel_statement_span)
+                    .ok_or_else(|| {
+                        "synthetic checked presentation result has no root statement".to_owned()
+                    })?,
+            };
+            Ok(KernelExpressionPresentation {
+                expression: KernelExpressionId(checked_u32(index, "presentation expression")?),
+                scope: KernelScopeReference::Containing,
+                declaration: None,
+                span,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut assigned = vec![false; presentations.len()];
+
+    fn assign_expression_tree(
+        expression: usize,
+        inherited_scope: KernelScopeReference,
+        declaration: Option<KernelDeclarationReference>,
+        force: bool,
+        raw_expressions: &[&AstExpr],
+        local_by_syntax: &BTreeMap<usize, usize>,
+        boundaries: &BTreeMap<usize, KernelScopeId>,
+        declaration_by_record_field: &BTreeMap<(usize, usize), KernelDeclarationId>,
+        scopes: &mut [KernelScopePresentation],
+        presentations: &mut [KernelExpressionPresentation],
+        assigned: &mut [bool],
+        active: &mut BTreeSet<usize>,
+    ) -> Result<(), String> {
+        if expression >= raw_expressions.len() || expression >= presentations.len() {
+            return Ok(());
+        }
+        if assigned[expression] && !force {
+            return Ok(());
+        }
+        if !active.insert(expression) {
+            return Ok(());
+        }
+        let scope = if let Some(boundary) = boundaries.get(&expression).copied() {
+            let row = scopes
+                .get_mut(boundary.0 as usize)
+                .ok_or_else(|| "expression boundary references missing scope".to_owned())?;
+            if row.parent == KernelScopeReference::Containing || force {
+                row.parent = inherited_scope;
+            } else if row.parent != inherited_scope {
+                return Err(format!(
+                    "expression scope has conflicting lexical parents: expression={expression} boundary={boundary:?} existing={:?} inherited={inherited_scope:?}",
+                    row.parent,
+                ));
+            }
+            KernelScopeReference::Local(boundary)
+        } else {
+            inherited_scope
+        };
+        presentations[expression].scope = scope;
+        if declaration.is_some() || force {
+            presentations[expression].declaration = declaration;
+        }
+        assigned[expression] = true;
+        let syntax = raw_expressions[expression];
+        let record_fields = match &syntax.kind {
+            AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => Some(fields),
+            _ => None,
+        };
+        if let Some(fields) = record_fields {
+            for (ordinal, field) in fields.iter().enumerate() {
+                let child = local_by_syntax.get(&field.value).copied();
+                let child_declaration = if field.spread {
+                    declaration
+                } else {
+                    declaration_by_record_field
+                        .get(&(expression, ordinal))
+                        .copied()
+                        .map(KernelDeclarationReference::Local)
+                        .or(declaration)
+                };
+                if let Some(child) = child {
+                    assign_expression_tree(
+                        child,
+                        scope,
+                        child_declaration,
+                        true,
+                        raw_expressions,
+                        local_by_syntax,
+                        boundaries,
+                        declaration_by_record_field,
+                        scopes,
+                        presentations,
+                        assigned,
+                        active,
+                    )?;
+                }
+            }
+        } else {
+            for child in kernel_syntax_expression_children(syntax) {
+                if let Some(child) = local_by_syntax.get(&child).copied() {
+                    assign_expression_tree(
+                        child,
+                        scope,
+                        declaration,
+                        force,
+                        raw_expressions,
+                        local_by_syntax,
+                        boundaries,
+                        declaration_by_record_field,
+                        scopes,
+                        presentations,
+                        assigned,
+                        active,
+                    )?;
+                }
+            }
+        }
+        active.remove(&expression);
+        Ok(())
+    }
+
+    let mut inherited_declarations = vec![None; facts.statements.len()];
+    for index in 0..facts.statements.len() {
+        inherited_declarations[index] = declaration_by_statement
+            .get(&index)
+            .copied()
+            .map(KernelDeclarationReference::Local)
+            .or_else(|| statement_parents[index].and_then(|parent| inherited_declarations[parent]))
+            .or_else(|| {
+                facts
+                    .linkage
+                    .public_declaration
+                    .filter(|_| statement_parents[index].is_none())
+            });
+        if let Some(expression) = raw_statements[index]
+            .expr
+            .and_then(|expression| local_by_syntax.get(&expression).copied())
+        {
+            assign_expression_tree(
+                expression,
+                statement_scopes[index].expect("statement scope was assigned"),
+                inherited_declarations[index],
+                true,
+                raw_expressions,
+                local_by_syntax,
+                &expression_boundaries,
+                &declaration_by_record_field,
+                &mut scopes,
+                &mut presentations,
+                &mut assigned,
+                &mut BTreeSet::new(),
+            )?;
+        }
+    }
+    for expression in 0..raw_expressions.len() {
+        if !assigned[expression] {
+            assign_expression_tree(
+                expression,
+                KernelScopeReference::Containing,
+                facts.linkage.public_declaration,
+                false,
+                raw_expressions,
+                local_by_syntax,
+                &expression_boundaries,
+                &declaration_by_record_field,
+                &mut scopes,
+                &mut presentations,
+                &mut assigned,
+                &mut BTreeSet::new(),
+            )?;
+        }
+    }
+    if let Some(result) = facts.linkage.result_expression
+        && result.0 as usize >= raw_expressions.len()
+        && let Some(root) = root_statement
+    {
+        presentations[result.0 as usize].scope =
+            statement_scopes[root].expect("root statement scope was assigned");
+        presentations[result.0 as usize].declaration = inherited_declarations[root];
+    }
+
+    let statement_presentations = facts
+        .statements
+        .iter()
+        .zip(raw_statements.iter())
+        .map(|(statement, syntax)| KernelStatementPresentation {
+            statement: statement.id,
+            scope: statement_scopes[statement.id.0 as usize].expect("statement scope was assigned"),
+            body_scope: body_scopes[statement.id.0 as usize],
+            span: kernel_statement_span(syntax),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let declaration_presentations = facts
+        .declarations
+        .iter()
+        .map(|declaration| {
+            let (scope, body_scope, span) = match declaration.origin {
+                KernelDeclarationOrigin::Statement { statement } => {
+                    let index = statement.0 as usize;
+                    (
+                        statement_scopes[index].expect("statement scope was assigned"),
+                        body_scopes[index],
+                        kernel_statement_span(raw_statements[index]),
+                    )
+                }
+                KernelDeclarationOrigin::Parameter { statement, ordinal } => {
+                    let index = statement.0 as usize;
+                    let AstStatementKind::Function { parameters, .. } = &raw_statements[index].kind
+                    else {
+                        return Err("parameter presentation belongs to a non-function".to_owned());
+                    };
+                    let parameter = parameters.get(ordinal as usize).ok_or_else(|| {
+                        "parameter presentation references missing ordinal".to_owned()
+                    })?;
+                    (
+                        body_scopes[index]
+                            .map(KernelScopeReference::Local)
+                            .ok_or_else(|| {
+                                "parameter presentation has no function scope".to_owned()
+                            })?,
+                        repeated_output_by_parameter.get(&ordinal).copied(),
+                        kernel_subspan(
+                            view,
+                            raw_statements[index].line,
+                            parameter.start,
+                            parameter.end,
+                        ),
+                    )
+                }
+                KernelDeclarationOrigin::RecordField { object, ordinal } => {
+                    let object_index = object.0 as usize;
+                    let fields = match &raw_expressions[object_index].kind {
+                        AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
+                            fields
+                        }
+                        _ => {
+                            return Err(
+                                "record-field presentation belongs to a non-record".to_owned()
+                            );
+                        }
+                    };
+                    let field = fields.get(ordinal as usize).ok_or_else(|| {
+                        "record-field presentation references missing ordinal".to_owned()
+                    })?;
+                    let value = local_by_syntax.get(&field.value).copied();
+                    (
+                        presentations[object_index].scope,
+                        value
+                            .and_then(|value| expression_boundaries.get(&value).copied())
+                            .filter(|scope| {
+                                scopes[scope.0 as usize].kind == KernelScopeKind::Record
+                            }),
+                        kernel_subspan(
+                            view,
+                            raw_expressions[object_index].line,
+                            field.start,
+                            field.end,
+                        ),
+                    )
+                }
+                KernelDeclarationOrigin::PatternBinding { arm, .. } => (
+                    presentations[arm.0 as usize].scope,
+                    None,
+                    kernel_expression_span(raw_expressions[arm.0 as usize]),
+                ),
+                KernelDeclarationOrigin::CallbackBinding { call, .. } => (
+                    presentations[call.0 as usize].scope,
+                    None,
+                    kernel_expression_span(raw_expressions[call.0 as usize]),
+                ),
+            };
+            Ok(KernelDeclarationPresentation {
+                declaration: declaration.id,
+                scope,
+                body_scope,
+                span,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_boxed_slice();
+
+    let containing_scope_targets = view
+        .child_owners()
+        .iter()
+        .map(|boundary| {
+            let owner = view
+                .stable_check_owner_for_local_statement(boundary.statement())
+                .ok_or_else(|| "child scope boundary has no stable owner".to_owned())?;
+            let scope = boundary
+                .parent()
+                .and_then(|parent| dense_statement_by_local.get(&parent).copied())
+                .map(|parent| {
+                    body_scopes[parent]
+                        .map(KernelScopeReference::Local)
+                        .unwrap_or_else(|| {
+                            statement_scopes[parent].expect("parent statement scope was assigned")
+                        })
+                })
+                .unwrap_or(KernelScopeReference::Containing);
+            Ok(PreparedContainingScopeTarget { owner, scope })
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_boxed_slice();
+
+    Ok((
+        KernelDefinitionPresentation {
+            containing_scope: KernelScopeReference::ProjectRoot,
+            scopes: scopes.into_boxed_slice(),
+            expressions: presentations.into_boxed_slice(),
+            statements: statement_presentations,
+            declarations: declaration_presentations,
+        },
+        containing_scope_targets,
     ))
 }
 
@@ -13651,6 +14456,94 @@ mod tests {
     }
 
     #[test]
+    fn nested_owner_presentation_inherits_one_compact_enclosing_scope() {
+        let source = concat!(
+            "store: [\n",
+            "    state:\n",
+            "        0 |> HOLD state {\n",
+            "            True |> THEN { state }\n",
+            "        }\n",
+            "]\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse nested checked-presentation fixture");
+        let prepared = prepare_kernel_project_projection(&project, &BTreeMap::new());
+        assert!(
+            prepared
+                .unsupported
+                .keys()
+                .all(|owner| matches!(owner, StableCheckOwnerKey::UnitRoot(_))),
+            "every declared nested owner must project: {:#?}",
+            prepared.unsupported
+        );
+        let hold = prepared
+            .definition_keys
+            .iter()
+            .position(|owner| {
+                matches!(owner, StableCheckOwnerKey::Item(key) if key
+                    .item_route
+                    .segments()
+                    .last()
+                    .is_some_and(|segment| segment.kind == UnitItemKind::Hold))
+            })
+            .expect("fixture has one nested HOLD owner");
+        let KernelScopeReference::Owner {
+            owner: enclosing_owner,
+            scope: enclosing_scope,
+        } = prepared.definition_facts[hold]
+            .presentation
+            .containing_scope
+        else {
+            panic!(
+                "nested HOLD must retain an enclosing owner scope: {:?}",
+                prepared.definition_facts[hold]
+                    .presentation
+                    .containing_scope
+            )
+        };
+        let enclosing_scope_row = prepared.definition_facts[enclosing_owner.0 as usize]
+            .presentation
+            .scopes
+            .get(enclosing_scope.0 as usize)
+            .expect("nested HOLD enclosing scope exists");
+        assert!(
+            matches!(
+                enclosing_scope_row.origin,
+                KernelScopeOrigin::StatementBody { .. }
+            ) && enclosing_scope_row.owner.is_some(),
+            "nested HOLD must be anchored in its authored field-body scope: {enclosing_scope_row:?}"
+        );
+
+        let input = KernelProjectInput::new(
+            prepared.project_input,
+            prepared.definition_facts,
+            prepared.definition_keys,
+        )
+        .expect("nested checked-presentation input validates");
+        let mut session = KernelSession::new(input.clone());
+        let checked = session
+            .check(CheckDemand::CheckedImage)
+            .expect("nested checked-presentation project solves");
+        let KernelCheckProduct::CheckedImage(snapshot) = checked.product else {
+            unreachable!()
+        };
+        let layout = KernelCheckedLinkLayout::new(&input, &snapshot)
+            .expect("nested checked-presentation scopes link");
+        let expected = layout
+            .scope(
+                enclosing_owner,
+                KernelScopeReference::Local(enclosing_scope),
+            )
+            .unwrap();
+        assert_eq!(layout.definitions()[hold].containing_scope, expected);
+        assert_ne!(
+            expected.0, 0,
+            "nested owner must not collapse to project root"
+        );
+    }
+
+    #[test]
     fn hold_update_statements_read_the_private_state_capability() {
         let source = concat!(
             "FUNCTION toggle(trigger) {\n",
@@ -14110,7 +15003,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v10 != [0; 32]),
+                        && receipt.fingerprint_v11 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(
@@ -14200,11 +15093,16 @@ mod tests {
             );
         }
         eprintln!(
-            "kernel-novywave definition_artifacts expression_rows={} execution_shape_rows={} statement_rows={} declaration_rows={} lexical_binding_rows={} source_resource_rows={} hold_state_rows={} persistent_list_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={} dependency_edges={} reverse_consumer_edges={}",
+            "kernel-novywave definition_artifacts expression_rows={} scope_rows={} execution_shape_rows={} statement_rows={} declaration_rows={} lexical_binding_rows={} source_resource_rows={} hold_state_rows={} persistent_list_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={} dependency_edges={} reverse_consumer_edges={}",
             report
                 .supported
                 .iter()
                 .map(|owner| owner.expressions.len())
+                .sum::<usize>(),
+            report
+                .supported
+                .iter()
+                .map(|owner| owner.presentation_scope_count)
                 .sum::<usize>(),
             report
                 .supported

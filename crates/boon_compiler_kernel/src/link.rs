@@ -1,11 +1,11 @@
 use crate::{
     KernelCallTarget, KernelCheckedSnapshot, KernelDeclarationReference, KernelExternalTarget,
-    KernelLexicalBindingTarget, KernelOwnerId, KernelProjectInput, KernelStatementChildReference,
-    KernelStatementReference, KernelValueReference,
+    KernelLexicalBindingTarget, KernelOwnerId, KernelProjectInput, KernelScopeReference,
+    KernelStatementChildReference, KernelStatementReference, KernelValueReference,
 };
 use boon_checked::{
     CheckedCallId, CheckedExprId, CheckedListId, CheckedSourceId, CheckedStateId,
-    CheckedStatementId, ContextFormalId, DeclId,
+    CheckedStatementId, ContextFormalId, DeclId, LexicalScopeId,
 };
 use std::error::Error;
 use std::fmt;
@@ -35,6 +35,7 @@ impl KernelCheckedRowRange {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCheckedDefinitionLayout {
     pub owner: KernelOwnerId,
+    pub scopes: KernelCheckedRowRange,
     pub expressions: KernelCheckedRowRange,
     pub statements: KernelCheckedRowRange,
     pub declarations: KernelCheckedRowRange,
@@ -42,6 +43,7 @@ pub struct KernelCheckedDefinitionLayout {
     pub sources: KernelCheckedRowRange,
     pub states: KernelCheckedRowRange,
     pub lists: KernelCheckedRowRange,
+    pub containing_scope: LexicalScopeId,
     pub root_statement: CheckedStatementId,
     pub public_declaration: DeclId,
     pub result_expression: CheckedExprId,
@@ -50,6 +52,8 @@ pub struct KernelCheckedDefinitionLayout {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KernelCheckedLinkTotals {
+    /// Includes the single project-root scope at row zero.
+    pub scopes: u32,
     pub expressions: u32,
     pub statements: u32,
     pub declarations: u32,
@@ -86,12 +90,18 @@ impl KernelCheckedLinkLayout {
             )));
         }
         let mut totals = KernelCheckedLinkTotals::default();
+        totals.scopes = 1;
         let mut definitions = Vec::with_capacity(snapshot.definitions.len());
         let mut public_declaration_authorities = Vec::with_capacity(snapshot.definitions.len());
         for (index, definition) in snapshot.definitions.iter().enumerate() {
             let owner = KernelOwnerId(u32::try_from(index).map_err(|_| {
                 KernelCheckedLinkError::new("kernel checked linker definition count exceeds u32")
             })?);
+            let scopes = take_range(
+                &mut totals.scopes,
+                definition.presentation.scopes.len(),
+                "scope",
+            )?;
             let expressions = take_range(
                 &mut totals.expressions,
                 definition.expressions.len(),
@@ -151,6 +161,7 @@ impl KernelCheckedLinkLayout {
                 .transpose()?;
             definitions.push(KernelCheckedDefinitionLayout {
                 owner,
+                scopes,
                 expressions,
                 statements,
                 declarations,
@@ -158,6 +169,7 @@ impl KernelCheckedLinkLayout {
                 sources,
                 states,
                 lists,
+                containing_scope: LexicalScopeId(0),
                 root_statement: CheckedStatementId(
                     statements.resolve(root_statement.0, "root statement")?,
                 ),
@@ -170,6 +182,28 @@ impl KernelCheckedLinkLayout {
                 ),
                 context_formal,
             });
+        }
+        for (index, definition) in snapshot.definitions.iter().enumerate() {
+            definitions[index].containing_scope = match definition.presentation.containing_scope {
+                KernelScopeReference::ProjectRoot => LexicalScopeId(0),
+                KernelScopeReference::Owner { owner, scope } => LexicalScopeId(
+                    definitions
+                        .get(owner.0 as usize)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition {index} containing scope references missing owner {}",
+                                owner.0,
+                            ))
+                        })?
+                        .scopes
+                        .resolve(scope.0, "containing scope")?,
+                ),
+                KernelScopeReference::Containing | KernelScopeReference::Local(_) => {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {index} has an unresolved containing-scope authority"
+                    )));
+                }
+            };
         }
         let mut resolved_public_declarations = vec![None; definitions.len()];
         let mut resolving_public_declarations = vec![false; definitions.len()];
@@ -233,6 +267,28 @@ impl KernelCheckedLinkLayout {
                     KernelExternalTarget::Result => Ok(target.result_expression),
                 }
             }
+        }
+    }
+
+    pub fn scope(
+        &self,
+        owner: KernelOwnerId,
+        scope: KernelScopeReference,
+    ) -> Result<LexicalScopeId, KernelCheckedLinkError> {
+        match scope {
+            KernelScopeReference::ProjectRoot => Ok(LexicalScopeId(0)),
+            KernelScopeReference::Containing => Ok(self.definition(owner)?.containing_scope),
+            KernelScopeReference::Local(scope) => Ok(LexicalScopeId(
+                self.definition(owner)?.scopes.resolve(scope.0, "scope")?,
+            )),
+            KernelScopeReference::Owner {
+                owner: provider,
+                scope,
+            } => Ok(LexicalScopeId(
+                self.definition(provider)?
+                    .scopes
+                    .resolve(scope.0, "imported scope")?,
+            )),
         }
     }
 
@@ -318,6 +374,49 @@ impl KernelCheckedLinkLayout {
         for (index, definition) in snapshot.definitions.iter().enumerate() {
             let owner = KernelOwnerId(u32::try_from(index).expect("definition index fits u32"));
             let local = self.definition(owner)?.clone();
+            let _ = self.scope(owner, definition.presentation.containing_scope)?;
+            for scope in &definition.presentation.scopes {
+                let _ = local.scopes.resolve(scope.id.0, "scope presentation")?;
+                let _ = self.scope(owner, scope.parent)?;
+                if let Some(declaration) = scope.owner {
+                    let _ = self.declaration(owner, declaration)?;
+                    resolved = resolved.saturating_add(1);
+                }
+                resolved = resolved.saturating_add(1);
+            }
+            for expression in &definition.presentation.expressions {
+                let _ = local
+                    .expressions
+                    .resolve(expression.expression.0, "expression presentation")?;
+                let _ = self.scope(owner, expression.scope)?;
+                if let Some(declaration) = expression.declaration {
+                    let _ = self.declaration(owner, declaration)?;
+                    resolved = resolved.saturating_add(1);
+                }
+                resolved = resolved.saturating_add(1);
+            }
+            for statement in &definition.presentation.statements {
+                let _ = local
+                    .statements
+                    .resolve(statement.statement.0, "statement presentation")?;
+                let _ = self.scope(owner, statement.scope)?;
+                if let Some(body) = statement.body_scope {
+                    let _ = local.scopes.resolve(body.0, "statement body scope")?;
+                    resolved = resolved.saturating_add(1);
+                }
+                resolved = resolved.saturating_add(1);
+            }
+            for declaration in &definition.presentation.declarations {
+                let _ = local
+                    .declarations
+                    .resolve(declaration.declaration.0, "declaration presentation")?;
+                let _ = self.scope(owner, declaration.scope)?;
+                if let Some(body) = declaration.body_scope {
+                    let _ = local.scopes.resolve(body.0, "declaration body scope")?;
+                    resolved = resolved.saturating_add(1);
+                }
+                resolved = resolved.saturating_add(1);
+            }
             for expression in &definition.expressions {
                 let _ = local
                     .expressions
@@ -648,6 +747,43 @@ mod tests {
                 }]
                 .into_boxed_slice(),
             },
+            presentation: crate::KernelDefinitionPresentation {
+                containing_scope: KernelScopeReference::ProjectRoot,
+                scopes: Box::new([]),
+                expressions: vec![crate::KernelExpressionPresentation {
+                    expression: KernelExpressionId(0),
+                    scope: KernelScopeReference::Containing,
+                    declaration: Some(KernelDeclarationReference::Local(KernelDeclarationId(0))),
+                    span: crate::KernelSourceSpan {
+                        line: 1,
+                        start: 0,
+                        end: 1,
+                    },
+                }]
+                .into_boxed_slice(),
+                statements: vec![crate::KernelStatementPresentation {
+                    statement: KernelStatementId(0),
+                    scope: KernelScopeReference::Containing,
+                    body_scope: None,
+                    span: crate::KernelSourceSpan {
+                        line: 1,
+                        start: 0,
+                        end: 1,
+                    },
+                }]
+                .into_boxed_slice(),
+                declarations: vec![crate::KernelDeclarationPresentation {
+                    declaration: KernelDeclarationId(0),
+                    scope: KernelScopeReference::Containing,
+                    body_scope: None,
+                    span: crate::KernelSourceSpan {
+                        line: 1,
+                        start: 0,
+                        end: 1,
+                    },
+                }]
+                .into_boxed_slice(),
+            },
             expression_payloads: vec![crate::KernelExpressionSemanticPayload::None]
                 .into_boxed_slice(),
             call_syntax: Box::new([]),
@@ -744,6 +880,7 @@ mod tests {
         };
         let layout = KernelCheckedLinkLayout::new(&project, &snapshot).unwrap();
         assert_eq!(layout.totals().expressions, 2);
+        assert_eq!(layout.totals().scopes, 1);
         assert_eq!(layout.totals().statements, 2);
         assert_eq!(layout.totals().declarations, 2);
         assert!(layout.totals().resolved_references >= 4);
@@ -783,6 +920,49 @@ mod tests {
                 .unwrap(),
             CheckedStatementId(0),
         );
+
+        let mut scoped = (*snapshot).clone();
+        scoped.definitions[0].presentation.scopes = vec![crate::KernelScopePresentation {
+            id: crate::KernelScopeId(0),
+            parent: KernelScopeReference::Containing,
+            owner: Some(KernelDeclarationReference::Local(KernelDeclarationId(0))),
+            kind: crate::KernelScopeKind::Block,
+            origin: crate::KernelScopeOrigin::StatementBody {
+                statement: KernelStatementId(0),
+            },
+            span: crate::KernelSourceSpan {
+                line: 1,
+                start: 0,
+                end: 1,
+            },
+        }]
+        .into_boxed_slice();
+        scoped.definitions[1].presentation.containing_scope = KernelScopeReference::Owner {
+            owner: KernelOwnerId(0),
+            scope: crate::KernelScopeId(0),
+        };
+        let scoped_layout = KernelCheckedLinkLayout::new(&project, &scoped)
+            .expect("a nested owner must inherit its enclosing compact scope");
+        assert_eq!(scoped_layout.totals().scopes, 2);
+        assert_eq!(
+            scoped_layout.definitions()[1].containing_scope,
+            LexicalScopeId(1)
+        );
+        assert_eq!(
+            scoped_layout
+                .scope(KernelOwnerId(1), KernelScopeReference::Containing)
+                .unwrap(),
+            LexicalScopeId(1)
+        );
+
+        let mut missing_scope = scoped.clone();
+        missing_scope.definitions[1].presentation.containing_scope = KernelScopeReference::Owner {
+            owner: KernelOwnerId(0),
+            scope: crate::KernelScopeId(99),
+        };
+        let error = KernelCheckedLinkLayout::new(&project, &missing_scope)
+            .expect_err("a missing enclosing scope must fail before row materialization");
+        assert!(error.to_string().contains("containing scope"));
 
         let mut delegated = (*snapshot).clone();
         delegated.definitions[1].linkage.public_declaration =

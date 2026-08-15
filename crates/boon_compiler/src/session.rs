@@ -6417,14 +6417,16 @@ mod tests {
             .request(
                 project,
                 first_revision,
-                CompileIntent::Diagnostics,
+                CompileIntent::EditorDiagnostics,
                 &CancellationToken::new(),
             )
             .unwrap();
         let first_diagnostic = first_result
-            .diagnostics()
+            .editor_diagnostics()
             .unwrap()
-            .diagnostics()
+            .output
+            .report
+            .diagnostics
             .iter()
             .find(|diagnostic| diagnostic.message == "unknown function `mystery`")
             .cloned()
@@ -6448,14 +6450,16 @@ mod tests {
             .request(
                 project,
                 second_revision,
-                CompileIntent::Diagnostics,
+                CompileIntent::EditorDiagnostics,
                 &CancellationToken::new(),
             )
             .unwrap();
         let second_diagnostic = second_result
-            .diagnostics()
+            .editor_diagnostics()
             .unwrap()
-            .diagnostics()
+            .output
+            .report
+            .diagnostics
             .iter()
             .find(|diagnostic| diagnostic.message == "unknown function `mystery`")
             .cloned()
@@ -6485,6 +6489,24 @@ mod tests {
     fn source_unit_project_diagnostics_backdate_before_layout_relocation() {
         let first_source = "value: 1\n";
         let second_source = "document: [\n    root: 1\n]\n";
+        let editor_diagnostics = |checked: &CheckedSourceFromSource| {
+            checked
+                .output
+                .report
+                .diagnostics
+                .iter()
+                .chain(
+                    checked
+                        .output
+                        .report
+                        .render_slot_table
+                        .slots
+                        .iter()
+                        .flat_map(|slot| slot.diagnostics.iter()),
+                )
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let project_source = |first_source: &str| {
             CompilerProject::new(
                 "RUN.bn",
@@ -6511,11 +6533,11 @@ mod tests {
             .request(
                 project,
                 first_revision,
-                CompileIntent::Diagnostics,
+                CompileIntent::EditorDiagnostics,
                 &CancellationToken::new(),
             )
             .unwrap();
-        let first_diagnostics = first_result.diagnostics().unwrap().diagnostics().to_vec();
+        let first_diagnostics = editor_diagnostics(first_result.editor_diagnostics().unwrap());
         let (first_evaluation, first_projection) = {
             let state = session.projects.get(&project).unwrap();
             (
@@ -6555,11 +6577,11 @@ mod tests {
             .request(
                 project,
                 second_revision,
-                CompileIntent::Diagnostics,
+                CompileIntent::EditorDiagnostics,
                 &CancellationToken::new(),
             )
             .unwrap();
-        let second_diagnostics = second_result.diagnostics().unwrap().diagnostics().to_vec();
+        let second_diagnostics = editor_diagnostics(second_result.editor_diagnostics().unwrap());
         let second_diagnostic = second_diagnostics
             .iter()
             .find(|diagnostic| diagnostic.message == message)
@@ -6600,13 +6622,13 @@ mod tests {
             .request(
                 clean_project,
                 clean_revision,
-                CompileIntent::Diagnostics,
+                CompileIntent::EditorDiagnostics,
                 &CancellationToken::new(),
             )
             .unwrap();
         assert_eq!(
             second_diagnostics,
-            clean_result.diagnostics().unwrap().diagnostics()
+            editor_diagnostics(clean_result.editor_diagnostics().unwrap())
         );
     }
 
@@ -9890,26 +9912,15 @@ mod tests {
             second.profile.parse_work
         };
         let second_stats = session.frontend_request_stats(project).unwrap();
-        // Counts include the callable-only ABI/resolution/scope SCC split in
-        // addition to declaration-surface/lexical-plan, exact interface
-        // provider and owner-inference requests. Public diagnostics deliberately
-        // stop before construction ABI and checked-owner requests.
-        // All callable-scope and unchanged interface-transfer module requests
-        // are reused by this literal-only warm edit; the edited owner's
-        // ordinary dependency cone remains local.
-        // Owner flow now publishes diagnostics and normalized semantic facts
-        // from its mutation epoch instead of demanding two additional rows per
-        // live owner.
-        // One shared output-flow component is demanded after those facts; it
-        // executes cold and reuses its unchanged semantic result on this edit.
-        // The project diagnostic-facts request executes once per revision and
-        // changes when its exact owner-body input changes. Each source unit
-        // owns one local owner-diagnostic projection plus a current project-
-        // diagnostic evaluation and independently backdatable project row
-        // projection; unchanged local rows reuse their retained value.
+        // Public diagnostics now use the dependency-bottom kernel path and do
+        // not demand the legacy interface/body/checked-row request family. The
+        // first revision evaluates ten immutable syntax/link surfaces. This
+        // literal-only update demands the same ten surfaces, reuses seven,
+        // executes only the three affected rows, and backdates one unchanged
+        // public result.
         assert_eq!(
             (first_request_counts, request_counts(second_stats)),
-            ((106, 104, 2, 0, 104), (212, 126, 86, 11, 115))
+            ((10, 10, 0, 0, 10), (20, 13, 7, 1, 12))
         );
 
         let mut isolated = CompilerSession::new();

@@ -3597,11 +3597,54 @@ every Boon timing. This is intentionally flat against the preceding 817.964 ms
 release receipt: the cut proves that global relocation is cheap, but it has not
 yet deleted compatibility row construction.
 
+### Compact checked-presentation and lexical-scope authority
+
+The compact checked-presentation cut is complete. Each `DefinitionArtifact`
+now owns its exact source spans plus dense expression, statement, declaration,
+and lexical-scope presentation rows. Scope rows retain their structural kind,
+origin, optional owning declaration, and parent without importing the old
+owner-shard scope DTO. Definition placement is explicit: a row can refer to the
+project root, its containing scope, a local scope, or one exact scope in an
+enclosing definition. The global linker reserves row zero for the project root
+and relocates all remaining scopes through the same prefix layout as checked
+expressions and declarations.
+
+The first full NovyWave projection exposed one parser-DAG rule that a tree walk
+cannot express. A record or block reachable through an enclosing structural
+expression can later be assigned through its more precise statement-body
+container. That container pass is authoritative and must replace the earlier
+structural parent; treating the first visit as final rejected 1,019 owners.
+Applying that general override rule restored all 1,389 executable owners and
+all 15,575 expression rows at once. It is neither owner-specific nor a relaxed
+scope invariant: conflicting non-authoritative visits still fail, and the
+final compact scope graph rejects missing rows, self parents, and local cycles.
+
+NovyWave now carries 4,534 compact scope rows. The linker validates 102,596
+local and cross-definition references in one pass; parser-backed coverage proves
+that a nested HOLD definition inherits its exact enclosing field-body scope
+rather than collapsing to the project root. Focused kernel tests also prove
+cross-definition scope relocation, missing-scope rejection, local-cycle
+rejection, and that presentation-only source movement changes exact artifact
+currentness without changing the public-result fingerprint. Receipt domains
+advance to basis V9 and artifact/currentness V11.
+
+The accepted full debug differential records a 3,348.996 ms complete candidate,
+3,196.171 ms of kernel work, 450.247 ms of compatibility checked-image
+publication, and 5.236 ms of checked-link layout. The fresh optimized
+differential records an 850.730 ms complete candidate, 762.349 ms of kernel
+work, 193.310 ms of compatibility checked-image publication, and 1.721 ms of
+checked-link layout. All 1,389 owners remain differential-clean with zero
+unsupported owners. Relative to the preceding 812.641 ms release checkpoint,
+this is a roughly 4.7% metadata/publication regression, not a speed win. It is
+accepted because it removes the last parser/legacy-scope rediscovery requirement
+from the direct row builder; the next cut must reclaim that cost by deleting
+compatibility reconstruction rather than micro-optimizing the 1.7 ms linker.
+
 The next dependency-bottom slice materializes the actual `boon_checked` rows
 directly from this layout plus relocations, semantic payloads, authored call
-surfaces, and sparse structural execution rows. Once those rows are exact,
-production checked-image requests can cut over and the superseded assembly path
-can be deleted.
+surfaces, sparse structural execution rows, and the remaining checked-row
+effect/use facts. Once those rows are exact, production checked-image requests
+can cut over and the superseded assembly path can be deleted.
 
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not

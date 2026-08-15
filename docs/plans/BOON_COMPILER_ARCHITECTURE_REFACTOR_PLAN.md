@@ -3560,11 +3560,48 @@ seconds and is excluded from every Boon timing. This adjacent authority cut is
 effectively flat against the prior 797.986 ms release receipt; it was not
 expected to improve latency before the direct linker deletes reconstruction.
 
-The next dependency-bottom slice is the direct `DefinitionArtifact` to
-`boon_checked` linker. It must consume relocations, semantic payloads, authored
-call surfaces, and sparse structural execution rows without re-reading
-source-shaped owner DTOs. Once that linker is exact, production checked-image
-requests can cut over and the superseded assembly path can be deleted.
+### Direct checked-row relocation layout
+
+The first direct-linker slice is complete. Every `DefinitionArtifact` now
+publishes `KernelDefinitionLinkage`: its exact root statement, public
+declaration authority, result expression, and optional inherited-context formal
+ordinal. One prefix-sum `KernelCheckedLinkLayout` assigns the global checked
+expression, statement, declaration, call, SOURCE, state, and LIST ranges for
+the entire snapshot, then validates every local and cross-definition reference
+without re-opening parser arenas or legacy owner DTOs.
+
+The first full NovyWave run exposed an important public-authority rule. Nested
+fieldless SOURCE, HOLD, and LIST definitions do not fabricate local public
+declarations; they share the declaration exported by their enclosing owner.
+The initial local-only anchor pruned every such owner and its dependency cone.
+`KernelDefinitionLinkage` therefore stores a local-or-owner-public declaration
+reference. The linker resolves delegated chains only after every definition
+range exists and rejects cycles. A structural LIST result may pass through a
+match arm, so its declaration authority is selected by either the exact
+producer or the exact root statement, never by source spelling or a
+NovyWave-specific kind.
+
+These anchors participate in definition basis, artifact, and exact-currentness
+fingerprints, advancing those domains to basis V8 and artifact/currentness V10.
+The complete kernel suite is 95/95 green, parser-backed Counter/Todo coverage
+remains deterministic, and the full NovyWave differential again retains all
+1,389 owners, 76 HOLD states, 133 lists, 117 sources, 11 host effects, and
+52,508 validated linker references with zero unsupported owners.
+
+The fresh release candidate is 812.641 ms including retained parsing and SOURCE
+ABI projection, with 725.740 ms in the kernel path. The prefix linker itself is
+1.326 ms; 185.580 ms is still spent publishing the compatibility checked image.
+The corresponding debug candidate is 3,211.205 ms and its linker is 3.654 ms.
+The optimized Cargo rebuild took 3 minutes 21 seconds and is excluded from
+every Boon timing. This is intentionally flat against the preceding 817.964 ms
+release receipt: the cut proves that global relocation is cheap, but it has not
+yet deleted compatibility row construction.
+
+The next dependency-bottom slice materializes the actual `boon_checked` rows
+directly from this layout plus relocations, semantic payloads, authored call
+surfaces, and sparse structural execution rows. Once those rows are exact,
+production checked-image requests can cut over and the superseded assembly path
+can be deleted.
 
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not

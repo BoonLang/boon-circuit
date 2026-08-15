@@ -330,6 +330,24 @@ pub struct KernelStatementInput {
     pub children: Box<[KernelStatementChildReference]>,
 }
 
+/// Definition-local anchors needed by the direct checked-image linker.
+///
+/// These IDs deliberately remain local until every definition has been
+/// solved. One prefix-sum layout can then globalize the whole snapshot without
+/// re-opening parser arenas or rediscovering an owner's public surface.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelDefinitionLinkage {
+    pub root_statement: Option<KernelStatementId>,
+    /// The declaration exported by this definition. Nested SOURCE, HOLD, and
+    /// LIST definitions deliberately share the declaration owned by their
+    /// enclosing definition instead of fabricating a local row.
+    pub public_declaration: Option<KernelDeclarationReference>,
+    pub result_expression: Option<KernelExpressionId>,
+    /// The definition-local formal ordinal reserved for inherited `PASSED`.
+    /// Ordinary authored parameters always precede it.
+    pub context_formal_ordinal: Option<u32>,
+}
+
 /// Stable-within-definition structural origin of one declaration row.
 ///
 /// The dense declaration ID is intentionally revision-local. The origin is
@@ -635,6 +653,7 @@ impl KernelDefinitionRelocations {
 
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelDefinitionFactsInput {
+    pub linkage: KernelDefinitionLinkage,
     pub relocations: KernelDefinitionRelocations,
     pub expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     pub call_syntax: Box<[KernelCallSyntaxInput]>,
@@ -701,6 +720,7 @@ pub struct KernelOwnerProgram {
     expression_outputs: Box<[OutputId]>,
     expression_modes: Box<[FlowMode]>,
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
+    linkage: KernelDefinitionLinkage,
     relocations: KernelDefinitionRelocations,
     expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     call_syntax: Box<[KernelCallSyntaxArtifact]>,
@@ -712,7 +732,7 @@ pub struct KernelOwnerProgram {
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
-    basis_fingerprint_v7: [u8; 32],
+    basis_fingerprint_v8: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -792,6 +812,7 @@ struct KernelProjectOwnerOutputs {
     expressions: Box<[OutputId]>,
     expression_modes: Box<[FlowMode]>,
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
+    linkage: KernelDefinitionLinkage,
     relocations: KernelDefinitionRelocations,
     expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     call_syntax: Box<[KernelCallSyntaxArtifact]>,
@@ -808,7 +829,7 @@ struct KernelProjectOwnerOutputs {
     /// requirements. That aggregate is useful to the solver, but is not a
     /// sound direct assignability contract for call diagnostics.
     syntax_discriminated_formals: Box<[u32]>,
-    basis_fingerprint_v7: [u8; 32],
+    basis_fingerprint_v8: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -1900,6 +1921,7 @@ pub struct DefinitionArtifact {
     /// Principal callable formal surfaces in dense declaration order. This is
     /// empty for non-callable definitions.
     pub formals: Box<[FlowType]>,
+    pub linkage: KernelDefinitionLinkage,
     /// Exact stable source identities retained for direct checked/semantic
     /// linking. Dense IDs remain definition-local and revision-local.
     pub relocations: KernelDefinitionRelocations,
@@ -1990,7 +2012,7 @@ pub fn is_registered_kernel_host_effect(operation: &str) -> bool {
 
 impl KernelOwnerProgram {
     pub fn solve(self) -> Result<KernelDefinitionSnapshot, KernelSolveError> {
-        let basis_fingerprint_v7 = self.basis_fingerprint_v7;
+        let basis_fingerprint_v8 = self.basis_fingerprint_v8;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
             .output(self.result_output)
@@ -2047,6 +2069,7 @@ impl KernelOwnerProgram {
         let mut definition = DefinitionArtifact {
             result,
             formals: formal_flows,
+            linkage: self.linkage,
             relocations: self.relocations,
             expression_payloads: self.expression_payloads,
             call_syntax: self.call_syntax,
@@ -2064,7 +2087,7 @@ impl KernelOwnerProgram {
         };
         let (dependencies, currentness) = build_snapshot_receipts(
             std::slice::from_mut(&mut definition),
-            &[basis_fingerprint_v7],
+            &[basis_fingerprint_v8],
         )?;
         let [currentness] = currentness.as_ref() else {
             unreachable!("one standalone kernel definition produces one receipt")
@@ -2229,7 +2252,7 @@ impl KernelSolvedProject {
         let basis_fingerprints = self
             .owners
             .iter()
-            .map(|owner| owner.basis_fingerprint_v7)
+            .map(|owner| owner.basis_fingerprint_v8)
             .collect::<Vec<_>>();
         let mut definitions = self
             .owners
@@ -2856,6 +2879,7 @@ fn materialize_project_definition(
     DefinitionArtifact {
         result,
         formals: public_formals[owner_index].clone(),
+        linkage: owner.linkage,
         relocations: owner.relocations,
         expression_payloads: owner.expression_payloads,
         call_syntax: owner.call_syntax,
@@ -2917,6 +2941,8 @@ fn validate_definition_linker_facts(
             )));
         }
     }
+
+    validate_definition_linkage(input, facts, &label, relocations, definition.is_some())?;
 
     if !facts.expression_payloads.is_empty() {
         if facts.expression_payloads.len() != input.nodes.len() {
@@ -3098,6 +3124,165 @@ fn validate_definition_linker_facts(
                 "kernel {label} call expression {expression} authored inputs {authored_values:?} differ from canonical inputs {canonical_values:?}"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_definition_linkage(
+    input: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+    label: &str,
+    relocations: &KernelDefinitionRelocations,
+    project_definition: bool,
+) -> Result<(), KernelOwnerBuildError> {
+    let linkage = facts.linkage;
+    if linkage == KernelDefinitionLinkage::default() {
+        if relocations.is_empty() || !project_definition {
+            return Ok(());
+        }
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel {label} has source relocations without direct-linker definition anchors"
+        )));
+    }
+    let root_statement = linkage.root_statement.ok_or_else(|| {
+        KernelOwnerBuildError::new(format!(
+            "kernel {label} direct-linker anchors omit the root statement"
+        ))
+    })?;
+    let public_declaration = linkage.public_declaration.ok_or_else(|| {
+        KernelOwnerBuildError::new(format!(
+            "kernel {label} direct-linker anchors omit the public declaration"
+        ))
+    })?;
+    let result_expression = linkage.result_expression.ok_or_else(|| {
+        KernelOwnerBuildError::new(format!(
+            "kernel {label} direct-linker anchors omit the result expression"
+        ))
+    })?;
+    let statement = facts
+        .statements
+        .get(root_statement.0 as usize)
+        .filter(|statement| statement.id == root_statement)
+        .ok_or_else(|| {
+            KernelOwnerBuildError::new(format!(
+                "kernel {label} direct-linker root statement {} is missing",
+                root_statement.0,
+            ))
+        })?;
+    let local_public_declaration = match public_declaration {
+        KernelDeclarationReference::Local(public_declaration) => {
+            let declaration = facts
+                .declarations
+                .get(public_declaration.0 as usize)
+                .filter(|declaration| declaration.id == public_declaration)
+                .ok_or_else(|| {
+                    KernelOwnerBuildError::new(format!(
+                        "kernel {label} direct-linker public declaration {} is missing",
+                        public_declaration.0,
+                    ))
+                })?;
+            if declaration.origin
+                != (KernelDeclarationOrigin::Statement {
+                    statement: root_statement,
+                })
+            {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel {label} direct-linker public declaration does not belong to its root statement"
+                )));
+            }
+            Some(declaration)
+        }
+        KernelDeclarationReference::OwnerPublic(_) => None,
+    };
+    if result_expression != input.result || result_expression.0 as usize >= input.nodes.len() {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel {label} direct-linker result expression {} is not the canonical local result {}",
+            result_expression.0, input.result.0,
+        )));
+    }
+    if !relocations.is_empty() {
+        let stable = relocations
+            .statements
+            .get(root_statement.0 as usize)
+            .ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel {label} direct-linker root statement has no stable relocation"
+                ))
+            })?;
+        if !stable.route.statement_route.is_empty() {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} direct-linker root statement is not an item-root relocation"
+            )));
+        }
+    }
+    let (expected_local_surface, authored_formals) = match &statement.kind {
+        KernelStatementKind::Function { name, parameters } => (
+            Some((KernelDeclarationKind::Function, name.as_ref())),
+            parameters.len(),
+        ),
+        KernelStatementKind::Field { name } => {
+            (Some((KernelDeclarationKind::Field, name.as_ref())), 0)
+        }
+        KernelStatementKind::Source {
+            field: Some(name), ..
+        } => (Some((KernelDeclarationKind::Source, name.as_ref())), 0),
+        KernelStatementKind::Hold {
+            field: Some(name), ..
+        } => (Some((KernelDeclarationKind::Hold, name.as_ref())), 0),
+        KernelStatementKind::Hold {
+            field: None,
+            name: Some(name),
+        } => (Some((KernelDeclarationKind::Hold, name.as_ref())), 0),
+        KernelStatementKind::List {
+            field: Some(name), ..
+        } => (Some((KernelDeclarationKind::List, name.as_ref())), 0),
+        KernelStatementKind::Source { field: None, .. }
+        | KernelStatementKind::Hold {
+            field: None,
+            name: None,
+        }
+        | KernelStatementKind::List { field: None, .. }
+        | KernelStatementKind::Block
+        | KernelStatementKind::Spread
+        | KernelStatementKind::Expression => (None, 0),
+    };
+    match (local_public_declaration, expected_local_surface) {
+        (Some(declaration), Some((expected_kind, expected_name)))
+            if declaration.kind == expected_kind && declaration.name.as_ref() == expected_name => {}
+        (Some(_), Some(_)) => {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} direct-linker public declaration does not match its root statement"
+            )));
+        }
+        (Some(_), None) => {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} direct-linker root statement has no local public declaration surface"
+            )));
+        }
+        (None, _)
+            if matches!(
+                statement.kind,
+                KernelStatementKind::Source { field: None, .. }
+                    | KernelStatementKind::Hold { field: None, .. }
+                    | KernelStatementKind::List { field: None, .. }
+            ) => {}
+        (None, _) => {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} direct-linker root statement cannot delegate its public declaration"
+            )));
+        }
+    }
+    let expected_formals = authored_formals
+        .checked_add(usize::from(linkage.context_formal_ordinal.is_some()))
+        .ok_or_else(|| KernelOwnerBuildError::new("kernel formal count overflowed usize"))?;
+    if input.formal_count as usize != expected_formals
+        || linkage
+            .context_formal_ordinal
+            .is_some_and(|ordinal| ordinal as usize != authored_formals)
+    {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel {label} direct-linker formal/context anchors do not match the canonical formal table"
+        )));
     }
     Ok(())
 }
@@ -3324,7 +3509,7 @@ pub fn compile_owner_program_with_definition_facts(
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
     validate_definition_linker_facts(input, facts, None)?;
-    let basis_fingerprint_v7 = definition_basis_fingerprint(input, facts)?;
+    let basis_fingerprint_v8 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
@@ -3476,6 +3661,7 @@ pub fn compile_owner_program_with_definition_facts(
         expression_outputs: expression_outputs.into_boxed_slice(),
         expression_modes,
         expression_artifacts: collect_expression_artifacts(input)?,
+        linkage: facts.linkage,
         relocations: facts.relocations.clone(),
         expression_payloads: facts.expression_payloads.clone(),
         call_syntax: collect_call_syntax_artifacts(input, facts)?,
@@ -3487,7 +3673,7 @@ pub fn compile_owner_program_with_definition_facts(
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
         diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
-        basis_fingerprint_v7,
+        basis_fingerprint_v8,
     })
 }
 
@@ -4967,6 +5153,15 @@ pub fn compile_project_program_with_definition_facts(
     }
     for (definition, facts) in facts.iter().enumerate() {
         validate_definition_linker_facts(&input.owners[definition], facts, Some(definition))?;
+        if let Some(KernelDeclarationReference::OwnerPublic(owner)) =
+            facts.linkage.public_declaration
+            && owner.0 as usize >= input.owners.len()
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel definition {definition} direct-linker public declaration references missing owner {}",
+                owner.0
+            )));
+        }
         for statement in &facts.statements {
             for child in &statement.children {
                 if let KernelStatementChildReference::Owner(owner) = child
@@ -5231,6 +5426,7 @@ pub fn compile_project_program_with_definition_facts(
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
                 expression_artifacts: collect_expression_artifacts(owner)?,
+                linkage: facts[owner_index].linkage,
                 relocations: facts[owner_index].relocations.clone(),
                 expression_payloads: facts[owner_index].expression_payloads.clone(),
                 call_syntax: collect_call_syntax_artifacts(owner, &facts[owner_index])?,
@@ -5256,7 +5452,7 @@ pub fn compile_project_program_with_definition_facts(
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice(),
                 syntax_discriminated_formals: syntax_discriminated_formals[owner_index].clone(),
-                basis_fingerprint_v7: definition_basis_fingerprint_with_buffer(
+                basis_fingerprint_v8: definition_basis_fingerprint_with_buffer(
                     owner,
                     &facts[owner_index],
                     &mut basis_fingerprint_scratch,
@@ -12676,16 +12872,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v7,
-            moved.currentness.basis_fingerprint_v7
+            solved.currentness.basis_fingerprint_v8,
+            moved.currentness.basis_fingerprint_v8
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v9,
-            moved.currentness.artifact_fingerprint_v9
+            solved.currentness.artifact_fingerprint_v10,
+            moved.currentness.artifact_fingerprint_v10
         );
         assert_ne!(
-            solved.currentness.fingerprint_v9,
-            moved.currentness.fingerprint_v9
+            solved.currentness.fingerprint_v10,
+            moved.currentness.fingerprint_v10
         );
 
         let mut missing = facts.clone();
@@ -12776,16 +12972,16 @@ mod tests {
             edited.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v7,
-            edited.currentness.basis_fingerprint_v7,
+            solved.currentness.basis_fingerprint_v8,
+            edited.currentness.basis_fingerprint_v8,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v9,
-            edited.currentness.artifact_fingerprint_v9,
+            solved.currentness.artifact_fingerprint_v10,
+            edited.currentness.artifact_fingerprint_v10,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v9,
-            edited.currentness.fingerprint_v9,
+            solved.currentness.fingerprint_v10,
+            edited.currentness.fingerprint_v10,
         );
 
         let mut missing = facts.clone();
@@ -12914,16 +13110,16 @@ mod tests {
             renamed.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v7,
-            renamed.currentness.basis_fingerprint_v7,
+            solved.currentness.basis_fingerprint_v8,
+            renamed.currentness.basis_fingerprint_v8,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v9,
-            renamed.currentness.artifact_fingerprint_v9,
+            solved.currentness.artifact_fingerprint_v10,
+            renamed.currentness.artifact_fingerprint_v10,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v9,
-            renamed.currentness.fingerprint_v9,
+            solved.currentness.fingerprint_v10,
+            renamed.currentness.fingerprint_v10,
         );
 
         let mut partial = facts.clone();
@@ -13152,6 +13348,7 @@ mod tests {
             result: KernelExpressionId(1),
         };
         let facts = KernelDefinitionFactsInput {
+            linkage: KernelDefinitionLinkage::default(),
             relocations: KernelDefinitionRelocations::default(),
             expression_payloads: Box::new([]),
             call_syntax: Box::new([]),
@@ -13380,6 +13577,7 @@ mod tests {
         .collect::<Vec<_>>()
         .into_boxed_slice();
         let facts = KernelDefinitionFactsInput {
+            linkage: KernelDefinitionLinkage::default(),
             relocations: KernelDefinitionRelocations::default(),
             expression_payloads: Box::new([]),
             call_syntax: Box::new([]),

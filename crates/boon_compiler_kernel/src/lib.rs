@@ -6,6 +6,7 @@
 //! `boon_checked` is only the public projection boundary.
 
 mod artifact;
+mod link;
 mod owner;
 mod program;
 mod receipt;
@@ -14,6 +15,7 @@ mod solver;
 mod term;
 
 pub use artifact::*;
+pub use link::*;
 pub use owner::*;
 pub use program::*;
 pub use receipt::*;

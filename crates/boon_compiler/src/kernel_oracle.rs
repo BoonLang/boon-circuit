@@ -16,25 +16,25 @@ use boon_compiler_kernel::{
     CheckDemand, KernelCallArgumentKind, KernelCallArgumentSource, KernelCallInputRole,
     KernelCallPassInput, KernelCallShapeArgument, KernelCallShapeInput, KernelCallShapeParameter,
     KernelCallShapeResolution, KernelCallSyntaxArgument, KernelCallSyntaxInput, KernelCallTarget,
-    KernelCallTypeSubstitution, KernelCallableKind, KernelCheckProduct, KernelCollectionKind,
-    KernelCompileWork, KernelConditionalKind, KernelDeclarationId, KernelDeclarationInput,
-    KernelDeclarationKind, KernelDeclarationOrigin, KernelDeclarationReference,
-    KernelDefinitionFactsInput, KernelDefinitionRelocations, KernelDiagnosticKind,
-    KernelDiagnosticSeverity, KernelDiagnosticSite, KernelExecutionBlockBindingInput,
-    KernelExecutionRecordFieldInput, KernelExecutionShapeInput, KernelExpressionId,
-    KernelExpressionRelocation, KernelExpressionSemanticPayload, KernelExternalExpression,
-    KernelExternalTarget, KernelHostEffectArtifact, KernelInheritedFormal, KernelLexicalAccess,
-    KernelLexicalBindingInput, KernelLexicalBindingTarget, KernelLexicalBindingTargetInput,
-    KernelListId, KernelListInput, KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge,
-    KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelParameterEvaluationScope,
-    KernelParameterKind, KernelPattern, KernelProjectInput, KernelProjectProgramInput,
-    KernelPureBuiltinKind, KernelRenderConstructorKind, KernelSession, KernelSolveWork,
-    KernelSourceId, KernelSourceInput, KernelStateId, KernelStateInput,
-    KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
-    KernelStatementParameter, KernelStatementReference, KernelStructuralDeclarationInput,
-    KernelTextTemplateSegment, KernelTypeMismatch, KernelValueReference, is_kernel_host_effect,
-    is_registered_kernel_host_effect, project_kernel_call_shape,
-    project_kernel_source_expression_diagnostics,
+    KernelCallTypeSubstitution, KernelCallableKind, KernelCheckProduct, KernelCheckedLinkLayout,
+    KernelCollectionKind, KernelCompileWork, KernelConditionalKind, KernelDeclarationId,
+    KernelDeclarationInput, KernelDeclarationKind, KernelDeclarationOrigin,
+    KernelDeclarationReference, KernelDefinitionFactsInput, KernelDefinitionRelocations,
+    KernelDiagnosticKind, KernelDiagnosticSeverity, KernelDiagnosticSite,
+    KernelExecutionBlockBindingInput, KernelExecutionRecordFieldInput, KernelExecutionShapeInput,
+    KernelExpressionId, KernelExpressionRelocation, KernelExpressionSemanticPayload,
+    KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
+    KernelInheritedFormal, KernelLexicalAccess, KernelLexicalBindingInput,
+    KernelLexicalBindingTarget, KernelLexicalBindingTargetInput, KernelListId, KernelListInput,
+    KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
+    KernelOwnerProgramInput, KernelParameterEvaluationScope, KernelParameterKind, KernelPattern,
+    KernelProjectInput, KernelProjectProgramInput, KernelPureBuiltinKind,
+    KernelRenderConstructorKind, KernelSession, KernelSolveWork, KernelSourceId, KernelSourceInput,
+    KernelStateId, KernelStateInput, KernelStatementChildReference, KernelStatementId,
+    KernelStatementInput, KernelStatementKind, KernelStatementParameter, KernelStatementReference,
+    KernelStructuralDeclarationInput, KernelTextTemplateSegment, KernelTypeMismatch,
+    KernelValueReference, is_kernel_host_effect, is_registered_kernel_host_effect,
+    project_kernel_call_shape, project_kernel_source_expression_diagnostics,
 };
 use boon_data::{Bits, ExactNumber};
 use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
@@ -490,11 +490,11 @@ pub struct KernelOwnerOracleReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
-    pub basis_fingerprint_v7: [u8; 32],
+    pub basis_fingerprint_v8: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v9: [u8; 32],
+    pub artifact_fingerprint_v10: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v9: [u8; 32],
+    pub fingerprint_v10: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -519,6 +519,8 @@ pub struct KernelOwnerOracleTimings {
     pub graph_solve_us: u64,
     pub interface_projection_us: u64,
     pub checked_image_us: u64,
+    pub checked_link_layout_us: u64,
+    pub checked_link_references: u64,
     pub solve_us: u64,
     pub artifact_projection_us: u64,
     pub input_owners: usize,
@@ -924,6 +926,14 @@ fn prepare_kernel_project_projection(
                 let dense_target =
                     dense_owner[prepared_target].expect("active resource target has a dense owner");
                 match target.field {
+                    PreparedResourceOwnerField::LinkagePublicDeclaration => {
+                        let Some(KernelDeclarationReference::OwnerPublic(owner)) =
+                            &mut facts.linkage.public_declaration
+                        else {
+                            panic!("prepared definition public declaration target became local")
+                        };
+                        *owner = dense_target;
+                    }
                     PreparedResourceOwnerField::SourceDeclaration(row) => {
                         let KernelDeclarationReference::OwnerPublic(owner) =
                             &mut facts.sources[row].declaration
@@ -1045,15 +1055,20 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     let mut graph_solve_us = 0;
     let mut interface_projection_us = 0;
     let mut checked_image_us = 0;
+    let mut checked_link_layout_us = 0;
+    let mut checked_link_references = 0;
     let mut solve_us = 0;
     let mut compile_work = KernelCompileWork::default();
     let artifact = if project_is_empty {
         None
     } else {
         let compile_started = Instant::now();
-        let compiled = KernelProjectInput::new(project_input, definition_facts, definition_keys)
-            .and_then(|input| input.compile())
+        let input = KernelProjectInput::new(project_input, definition_facts, definition_keys)
             .map_err(|error| error.to_string());
+        let compiled = input
+            .as_ref()
+            .map_err(Clone::clone)
+            .and_then(|input| input.compile().map_err(|error| error.to_string()));
         if let Ok(program) = &compiled {
             compile_work = program.compile_work();
         }
@@ -1076,7 +1091,19 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                     .map_err(|error| error.to_string());
                 checked_image_us = elapsed_us(checked_image_started.elapsed());
                 solve_us = graph_solve_us.saturating_add(checked_image_us);
-                checked
+                checked.and_then(|checked| {
+                    let checked_link_started = Instant::now();
+                    let layout = KernelCheckedLinkLayout::new(
+                        input
+                            .as_ref()
+                            .expect("a solved kernel graph retains its immutable input"),
+                        &checked,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    checked_link_layout_us = elapsed_us(checked_link_started.elapsed());
+                    checked_link_references = layout.totals().resolved_references;
+                    Ok(checked)
+                })
             })
         });
         match solved {
@@ -1118,11 +1145,11 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 .zip(&artifact.currentness)
                 .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
                     owner: prepared[*prepared_index].owner.clone(),
-                    basis_fingerprint_v7: receipt.basis_fingerprint_v7,
+                    basis_fingerprint_v8: receipt.basis_fingerprint_v8,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v9: receipt.artifact_fingerprint_v9,
+                    artifact_fingerprint_v10: receipt.artifact_fingerprint_v10,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v9: receipt.fingerprint_v9,
+                    fingerprint_v10: receipt.fingerprint_v10,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -1768,6 +1795,8 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         graph_solve_us,
         interface_projection_us,
         checked_image_us,
+        checked_link_layout_us,
+        checked_link_references,
         solve_us,
         artifact_projection_us,
         input_owners,
@@ -2406,6 +2435,7 @@ type PreparedOutputBindingsByScope = BTreeMap<usize, Box<[PreparedOutputBinding]
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreparedResourceOwnerField {
+    LinkagePublicDeclaration,
     SourceDeclaration(usize),
     SourceStatement(usize),
     StateBindingDeclaration(usize),
@@ -3734,6 +3764,13 @@ fn compact_owner_view(
                 })
         })
         .ok_or_else(|| "owner has no public declaration".to_owned())?;
+    let root_statement_dense = KernelStatementId(checked_u32(
+        view.statement_ids()
+            .iter()
+            .position(|statement| *statement == root_statement_id)
+            .ok_or_else(|| "owner root statement is absent from its dense table".to_owned())?,
+        "definition root statement",
+    )?);
     let result_mode = match &root_statement.kind {
         AstStatementKind::Source { .. } => FlowMode::PresentOrAbsent,
         AstStatementKind::Function { .. }
@@ -5033,6 +5070,24 @@ fn compact_owner_view(
         )?;
     definition_facts.declarations = declarations;
     definition_facts.lexical_bindings = lexical_bindings;
+    let public_declaration = definition_facts
+        .declarations
+        .iter()
+        .find(|declaration| {
+            declaration.origin
+                == (KernelDeclarationOrigin::Statement {
+                    statement: root_statement_dense,
+                })
+        })
+        .map(|declaration| KernelDeclarationReference::Local(declaration.id));
+    definition_facts.linkage = boon_compiler_kernel::KernelDefinitionLinkage {
+        root_statement: Some(root_statement_dense),
+        public_declaration,
+        result_expression: Some(checked_kernel_expression(result_index)?),
+        context_formal_ordinal: owner_context_ordinal
+            .map(|ordinal| checked_u32(ordinal, "definition context formal ordinal"))
+            .transpose()?,
+    };
     definition_facts.execution_shapes = compact_execution_shape_inputs(
         view,
         &owner,
@@ -5070,6 +5125,91 @@ fn compact_owner_view(
         checked_kernel_expression(result_index)?,
         &mut definition_facts,
     )?;
+    let mut resource_owner_targets = resource_owner_targets.into_vec();
+    if definition_facts.linkage.public_declaration.is_none() {
+        let result = definition_facts
+            .linkage
+            .result_expression
+            .expect("definition result linkage was populated above");
+        let mut candidates = definition_facts
+            .sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| {
+                source.expression == result
+                    || source.statement == KernelStatementReference::Local(root_statement_dense)
+            })
+            .map(|(row, source)| {
+                (
+                    source.declaration,
+                    PreparedResourceOwnerField::SourceDeclaration(row),
+                )
+            })
+            .chain(
+                definition_facts
+                    .states
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, state)| {
+                        state.expression == result
+                            || state.statement
+                                == KernelStatementReference::Local(root_statement_dense)
+                    })
+                    .map(|(row, state)| {
+                        (
+                            state.declaration,
+                            PreparedResourceOwnerField::StateDeclaration(row),
+                        )
+                    }),
+            )
+            .chain(
+                definition_facts
+                    .lists
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, list)| {
+                        list.producer == result
+                            || list.statement
+                                == KernelStatementReference::Local(root_statement_dense)
+                    })
+                    .map(|(row, list)| {
+                        (
+                            list.declaration,
+                            PreparedResourceOwnerField::ListDeclaration(row),
+                        )
+                    }),
+            )
+            .collect::<Vec<_>>();
+        let mut unique_candidates = Vec::with_capacity(candidates.len());
+        for candidate in candidates.drain(..) {
+            if !unique_candidates.contains(&candidate) {
+                unique_candidates.push(candidate);
+            }
+        }
+        let candidates = unique_candidates;
+        let [(public_declaration, resource_field)] = candidates.as_slice() else {
+            return Err(format!(
+                "owner root statement has no unique local or exact resource declaration authority: {candidates:?}"
+            ));
+        };
+        definition_facts.linkage.public_declaration = Some(*public_declaration);
+        if matches!(
+            public_declaration,
+            KernelDeclarationReference::OwnerPublic(_)
+        ) {
+            let authority = resource_owner_targets
+                .iter()
+                .find(|target| target.field == *resource_field)
+                .map(|target| target.owner.clone())
+                .ok_or_else(|| {
+                    "owner root resource has an unresolved public declaration authority".to_owned()
+                })?;
+            resource_owner_targets.push(PreparedResourceOwnerTarget {
+                field: PreparedResourceOwnerField::LinkagePublicDeclaration,
+                owner: authority,
+            });
+        }
+    }
     Ok(PreparedOwner {
         owner,
         expressions: expressions.into_boxed_slice(),
@@ -5082,7 +5222,7 @@ fn compact_owner_view(
             .into_boxed_slice(),
         statement_child_targets,
         lexical_owner_targets,
-        resource_owner_targets,
+        resource_owner_targets: resource_owner_targets.into_boxed_slice(),
         resource_synthetic_paths,
         external_expressions: external_expressions.into_boxed_slice(),
         call_targets: call_targets.into_boxed_slice(),
@@ -13970,7 +14110,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v9 != [0; 32]),
+                        && receipt.fingerprint_v10 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(
@@ -14129,6 +14269,7 @@ mod tests {
             let diagnostics_kernel_us = timings
                 .total_us
                 .saturating_sub(timings.checked_image_us)
+                .saturating_sub(timings.checked_link_layout_us)
                 .saturating_sub(timings.artifact_projection_us)
                 .saturating_add(timings.interface_projection_us);
             let diagnostics_retained_snapshot_us =
@@ -14162,7 +14303,7 @@ mod tests {
             let retained_snapshot_total_us = source_abi_us.saturating_add(timings.total_us);
             let candidate_total_us = parse_us.saturating_add(retained_snapshot_total_us);
             eprintln!(
-                "kernel-novywave candidate_only=true parity=not_run profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} kernel_total_us={} compile_us={} solve_us={} graph_solve_us={} interface_projection_us={} checked_image_us={} solved_owners={} container_owners={} unsupported_owners={} residual_modules={} residual_frames={} acyclic_residual_frames={} invocation_frames={} direct_result_summaries={} summary_definition_nodes={} summary_constant_folded_nodes={} summary_selector_fused_records={} summary_deduplicated_nodes={} summary_pruned_nodes={} summary_pruned_inputs={} summary_invoke_nodes={} linked_operations={} scheduled_work_items={} acyclic_initial_work_items={} dominant_module_owner={} dominant_module_operations={} dominant_module_frames={} dominant_module_linked_operations={} variables={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} summary_call_activations={} summary_node_evaluations={} mutations={} term_materializations={} term_intern_requests={} term_intern_hits={} term_intern_requests_by_kind={:?} term_intern_hits_by_kind={:?} structural_widen_requests={} structural_widen_hits={} dynamic_edges={}",
+                "kernel-novywave candidate_only=true parity=not_run profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} kernel_total_us={} compile_us={} solve_us={} graph_solve_us={} interface_projection_us={} checked_image_us={} checked_link_layout_us={} checked_link_references={} solved_owners={} container_owners={} unsupported_owners={} residual_modules={} residual_frames={} acyclic_residual_frames={} invocation_frames={} direct_result_summaries={} summary_definition_nodes={} summary_constant_folded_nodes={} summary_selector_fused_records={} summary_deduplicated_nodes={} summary_pruned_nodes={} summary_pruned_inputs={} summary_invoke_nodes={} linked_operations={} scheduled_work_items={} acyclic_initial_work_items={} dominant_module_owner={} dominant_module_operations={} dominant_module_frames={} dominant_module_linked_operations={} variables={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} summary_call_activations={} summary_node_evaluations={} mutations={} term_materializations={} term_intern_requests={} term_intern_hits={} term_intern_requests_by_kind={:?} term_intern_hits_by_kind={:?} structural_widen_requests={} structural_widen_hits={} dynamic_edges={}",
                 if cfg!(debug_assertions) {
                     "debug"
                 } else {
@@ -14179,6 +14320,8 @@ mod tests {
                 timings.graph_solve_us,
                 timings.interface_projection_us,
                 timings.checked_image_us,
+                timings.checked_link_layout_us,
+                timings.checked_link_references,
                 timings.solved_owners,
                 timings.container_owners,
                 timings.unsupported_owners,
@@ -14458,7 +14601,7 @@ mod tests {
         let retained_snapshot_total_us = source_abi_us.saturating_add(timings.total_us);
         let candidate_with_bundle_us = bundle_us.saturating_add(candidate_total_us);
         eprintln!(
-            "kernel-novywave profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} candidate_with_bundle_us={} oracle_check_us={} legacy_parse_ms={:.3} legacy_typecheck_ms={:.3} kernel_total_us={} owner_projection_us={} direct_projection_us={} dependency_pruning_us={} program_compile_us={} solve_us={} graph_solve_us={} interface_projection_us={} checked_image_us={} artifact_projection_us={} projected_owners={} solved_owners={} container_owners={} unsupported_owners={} definition_modules={} principal_expressions={} residual_type_modules={} residual_module_operations={} residual_module_terms={} residual_frames={} linked_operations={} scheduled_work_items={} linked_terms={} acyclic_initial_operations={} compiled_call_sites={} invocation_frames={} reused_invocation_frames={} principal_result_reuses={} principal_expression_reuses={} pruned_invocation_expressions={} specialization_plans={} reused_specialization_plans={} max_call_depth={} variables={} operations={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} mutations={} dynamic_edges={}",
+            "kernel-novywave profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} candidate_with_bundle_us={} oracle_check_us={} legacy_parse_ms={:.3} legacy_typecheck_ms={:.3} kernel_total_us={} owner_projection_us={} direct_projection_us={} dependency_pruning_us={} program_compile_us={} solve_us={} graph_solve_us={} interface_projection_us={} checked_image_us={} checked_link_layout_us={} checked_link_references={} artifact_projection_us={} projected_owners={} solved_owners={} container_owners={} unsupported_owners={} definition_modules={} principal_expressions={} residual_type_modules={} residual_module_operations={} residual_module_terms={} residual_frames={} linked_operations={} scheduled_work_items={} linked_terms={} acyclic_initial_operations={} compiled_call_sites={} invocation_frames={} reused_invocation_frames={} principal_result_reuses={} principal_expression_reuses={} pruned_invocation_expressions={} specialization_plans={} reused_specialization_plans={} max_call_depth={} variables={} operations={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} mutations={} dynamic_edges={}",
             if cfg!(debug_assertions) {
                 "debug"
             } else {
@@ -14482,6 +14625,8 @@ mod tests {
             timings.graph_solve_us,
             timings.interface_projection_us,
             timings.checked_image_us,
+            timings.checked_link_layout_us,
+            timings.checked_link_references,
             timings.artifact_projection_us,
             timings.projected_owners,
             timings.solved_owners,

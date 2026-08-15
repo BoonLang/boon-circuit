@@ -8,6 +8,7 @@
 
 #[cfg(test)]
 use crate::ResolvedOutGraph;
+use crate::contextual_expansion::contextualize_runtime_storage_type;
 use crate::{
     SemanticBindingId, SemanticBindingTargetV1, SemanticCallId, SemanticContextualMaterialization,
     SemanticContextualOperationKind, SemanticContextualRowPredecessor,
@@ -4358,6 +4359,29 @@ fn named_value_origin_contract_flow(
     };
     let projected_checked_type =
         project_named_value_contract_type(&checked_flow.ty, &origin.checked.projection)?;
+    if matches!(target, SemanticNamedValueStorageTargetV1::List { .. }) {
+        let projected_named_type =
+            project_named_value_contract_type(&named_flow.ty, &origin.checked.projection)?;
+        let contextualized = contextualize_runtime_storage_type(
+            &projected_checked_type,
+            projected_storage_type,
+        )
+        .map_err(|error| {
+            SemanticScopeStorageError::new(format!(
+                "checked named-list contract is incompatible with its exact contextual storage occurrence: {error}"
+            ))
+        })?;
+        if contextualized != projected_named_type {
+            return Err(SemanticScopeStorageError::new(format!(
+                "semantic named-list contract {projected_named_type:?} differs from contextualized checked/storage authority {contextualized:?}"
+            )));
+        }
+        derive_storage_representation(projected_storage_type, &projected_named_type)?;
+        return Ok(FlowType {
+            mode: named_flow.mode,
+            ty: projected_named_type,
+        });
+    }
     // This call is the exact admissibility gate. The only non-identical
     // representation admitted is the explicit fixed-BYTES refinement encoded
     // into the resulting D row.

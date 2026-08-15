@@ -1080,6 +1080,79 @@ pub(crate) fn refine_runtime_occurrence_type(
     Ok(refined)
 }
 
+/// Merge a checked definition-local storage template with one exact semantic
+/// runtime occurrence. Compatible state domains widen structurally, while a
+/// checked fixed-BYTES contract remains authoritative over dynamic storage.
+pub(crate) fn contextualize_runtime_storage_type(
+    checked: &Type,
+    runtime: &Type,
+) -> Result<Type, String> {
+    refine_runtime_occurrence_type(checked, runtime)?;
+
+    fn merge(checked: &Type, runtime: &Type) -> Type {
+        if checked == runtime {
+            return checked.clone();
+        }
+        match (checked, runtime) {
+            (
+                Type::Bytes(boon_checked::BytesType::Fixed(_)),
+                Type::Bytes(boon_checked::BytesType::Dynamic),
+            ) => checked.clone(),
+            (Type::List(checked), Type::List(runtime)) => {
+                Type::List(Type::shared(merge(checked, runtime)))
+            }
+            (Type::Set(checked), Type::Set(runtime)) => {
+                Type::Set(Type::shared(merge(checked, runtime)))
+            }
+            (
+                Type::Map {
+                    key: checked_key,
+                    value: checked_value,
+                },
+                Type::Map {
+                    key: runtime_key,
+                    value: runtime_value,
+                },
+            ) => Type::Map {
+                key: Box::new(merge(checked_key, runtime_key)),
+                value: Box::new(merge(checked_value, runtime_value)),
+            },
+            (Type::Object(checked), Type::Object(runtime))
+                if checked.fields.keys().eq(runtime.fields.keys()) =>
+            {
+                let widened = boon_checked::widen_structural_type(
+                    &Type::Object(checked.clone()),
+                    &Type::Object(runtime.clone()),
+                );
+                let Type::Object(widened) = widened else {
+                    unreachable!("widening compatible records must retain a record")
+                };
+                Type::object(boon_checked::ObjectShape {
+                    fields: widened
+                        .fields
+                        .iter()
+                        .map(|(name, fallback)| {
+                            let ty = match (checked.fields.get(name), runtime.fields.get(name)) {
+                                (Some(checked), Some(runtime)) => merge(checked, runtime),
+                                _ => fallback.clone(),
+                            };
+                            (name.clone(), ty)
+                        })
+                        .collect(),
+                    field_order: widened.field_order.clone(),
+                    open: widened.open,
+                })
+            }
+            _ => boon_checked::widen_structural_type(checked, runtime),
+        }
+    }
+
+    Ok(merge(
+        &erase_runtime_type_vars(checked),
+        &erase_runtime_type_vars(runtime),
+    ))
+}
+
 fn refine_runtime_call_boundary_type(
     existing: &Type,
     formal_scheme: &Type,
@@ -1911,7 +1984,7 @@ pub(crate) fn derive_semantic_execution_graph(
         // have no runtime identity. Keep the named statement boundary in the
         // same canonical runtime namespace as its value; exact SOURCE/event
         // payloads remain owned independently by resource and view contracts.
-        let statement_flow_type = declaration
+        let mut statement_flow_type = declaration
             .and_then(|declaration| lookup.declaration(program, declaration))
             .map(|declaration| FlowType {
                 mode: declaration.flow_type.mode,
@@ -1939,6 +2012,33 @@ pub(crate) fn derive_semantic_execution_graph(
                 }
             })
             .transpose()?;
+        if matches!(
+            statement.kind,
+            boon_checked::CheckedStatementKind::Field { .. }
+        ) && let (Some(checked), Some(value)) = (statement_flow_type.as_ref(), value)
+        {
+            let runtime = builder
+                .expressions
+                .get(value.as_usize())
+                .filter(|expression| expression.id == value)
+                .map(|expression| expression.flow_type.clone())
+                .ok_or_else(|| {
+                    ExpansionError::InvalidLocalBindings(format!(
+                        "semantic field statement {semantic_statement} references missing value {value}"
+                    ))
+                })?;
+            refine_runtime_occurrence_type(&checked.ty, &runtime.ty).map_err(|error| {
+                ExpansionError::InvalidLocalBindings(format!(
+                    "semantic field statement {semantic_statement} checked type {:?} is incompatible with contextual value {value} type {:?}: {error}",
+                    checked.ty, runtime.ty,
+                ))
+            })?;
+            // A semantic statement is a runtime occurrence, not a checked
+            // definition template. Its exact expanded value owns the field
+            // flow; checked named-value metadata separately retains public
+            // refinements such as fixed-BYTES contracts.
+            statement_flow_type = Some(runtime);
+        }
         let declaration_parts = |declaration: Option<DeclId>| {
             declaration
                 .and_then(|declaration| {

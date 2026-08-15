@@ -8,6 +8,7 @@
 
 #[cfg(test)]
 use crate::ResolvedOutGraph;
+use crate::contextual_expansion::{contextualize_runtime_storage_type, erase_runtime_type_vars};
 use crate::dependency_manifest::{
     ConstructionDependencyDomainV1, ConstructionDependencyOwnerV1,
     ConstructionDependencyRowBuilderV1, ConstructionDependencyRowV1, ConstructionDependencyRowsV1,
@@ -1072,6 +1073,85 @@ fn validate_source_units(
     Ok(())
 }
 
+fn project_named_runtime_type(
+    ty: &Type,
+    projection: &[String],
+) -> Result<Type, SemanticLoweringContractError> {
+    fn project_one(ty: &Type, selector: &str) -> Option<Type> {
+        match ty {
+            Type::Object(shape) => shape.fields.get(selector).cloned(),
+            Type::List(item) => {
+                project_one(item, selector).map(|field| Type::List(Type::shared(field)))
+            }
+            _ => None,
+        }
+    }
+
+    projection.iter().try_fold(ty.clone(), |current, selector| {
+        project_one(&current, selector).ok_or_else(|| {
+            SemanticLoweringContractError::new(format!(
+                "semantic named-value projection references missing field `{selector}` in {current:?}"
+            ))
+        })
+    })
+}
+
+fn contextualize_named_value_flow(
+    checked: &FlowType,
+    origins: &[SemanticNamedValueTypeOriginV1],
+    resources: &SemanticResourceGraphV2,
+) -> Result<FlowType, SemanticLoweringContractError> {
+    let mut ty = erase_runtime_type_vars(&checked.ty);
+    for origin in origins {
+        for list in &origin.lists {
+            let list = resources
+                .lists
+                .get(list.as_usize())
+                .filter(|candidate| candidate.id == *list)
+                .ok_or_else(|| {
+                    SemanticLoweringContractError::new(format!(
+                        "semantic named value references missing list {list}"
+                    ))
+                })?;
+            let runtime = project_named_runtime_type(
+                &Type::List(Type::shared(list.item_type.clone())),
+                &origin.checked.projection,
+            )?;
+            ty = contextualize_runtime_storage_type(&ty, &runtime).map_err(|error| {
+                SemanticLoweringContractError::new(format!(
+                    "checked named-value type cannot represent contextual list {}: {error}",
+                    list.id
+                ))
+            })?;
+        }
+        for authority in &origin.value_list_authorities {
+            let authority = resources
+                .value_list_authorities
+                .get(authority.as_usize())
+                .filter(|candidate| candidate.id == *authority)
+                .ok_or_else(|| {
+                    SemanticLoweringContractError::new(format!(
+                        "semantic named value references missing value-list authority {authority}"
+                    ))
+                })?;
+            let runtime = project_named_runtime_type(
+                &Type::List(Type::shared(authority.item_type.clone())),
+                &origin.checked.projection,
+            )?;
+            ty = contextualize_runtime_storage_type(&ty, &runtime).map_err(|error| {
+                SemanticLoweringContractError::new(format!(
+                    "checked named-value type cannot represent contextual value-list authority {}: {error}",
+                    authority.id
+                ))
+            })?;
+        }
+    }
+    Ok(FlowType {
+        mode: checked.mode,
+        ty,
+    })
+}
+
 fn build_named_value_types(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
@@ -1153,12 +1233,13 @@ fn build_named_value_types(
                 .iter()
                 .map(|origin| build_named_value_origin(origin, execution, resources, reactive))
                 .collect::<Result<Vec<_>, _>>()?;
+            let flow_type = contextualize_named_value_flow(&entry.flow_type, &origins, resources)?;
             Ok(SemanticNamedValueTypeV1 {
                 id: SemanticNamedValueId(index),
                 checked_statement,
                 diagnostic_path: entry.path.clone(),
                 origins,
-                flow_type: entry.flow_type.clone(),
+                flow_type,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -3012,6 +3093,58 @@ fn lowering_contract_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contextual_named_runtime_type_widens_state_tags_but_keeps_fixed_bytes_contracts() {
+        let tags = |names: &[&str]| {
+            Type::VariantSet(
+                names
+                    .iter()
+                    .map(|name| Variant::Tag((*name).to_owned()))
+                    .collect::<Vec<_>>()
+                    .into(),
+            )
+        };
+        let row = |formatter: Type, bytes: Type| {
+            Type::object(boon_checked::ObjectShape::from_ordered_fields(
+                [
+                    ("formatter".to_owned(), formatter),
+                    ("digest".to_owned(), bytes),
+                ],
+                false,
+            ))
+        };
+        let checked = Type::List(Type::shared(row(
+            tags(&["Hexadecimal"]),
+            Type::Bytes(boon_checked::BytesType::Fixed(32)),
+        )));
+        let runtime = Type::List(Type::shared(row(
+            tags(&["Binary", "Hexadecimal"]),
+            Type::Bytes(boon_checked::BytesType::Dynamic),
+        )));
+        let contextual = contextualize_runtime_storage_type(&checked, &runtime)
+            .expect("compatible contextual state widening");
+        let Type::List(item) = contextual else {
+            panic!("contextual named type must remain a list");
+        };
+        let Type::Object(item) = item.as_ref() else {
+            panic!("contextual named list item must remain an object");
+        };
+        assert_eq!(
+            item.fields.get("formatter"),
+            Some(&tags(&["Binary", "Hexadecimal"]))
+        );
+        assert_eq!(
+            item.fields.get("digest"),
+            Some(&Type::Bytes(boon_checked::BytesType::Fixed(32))),
+            "dynamic storage must not erase a checked fixed-BYTES contract"
+        );
+
+        assert!(
+            contextualize_runtime_storage_type(&tags(&["Hexadecimal"]), &Type::Text).is_err(),
+            "unrelated runtime storage must not be accepted as contextual widening"
+        );
+    }
 
     fn checked_and_semantic(name: &str, source: &str) -> (CheckedProgram, crate::SemanticProgram) {
         let parsed = boon_parser::parse_source(name, source).expect("parse");

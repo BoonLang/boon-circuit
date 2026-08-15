@@ -19,7 +19,7 @@ use boon_effect_schema::{
 use boon_syntax::{AstExpr, AstExprKind, AstMatchPattern, StableExpressionKey, StableStatementKey};
 use serde::Serialize;
 use serde::ser::SerializeStruct;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -408,6 +408,10 @@ pub enum KernelScopeOrigin {
         statement: KernelStatementId,
         parameter_ordinal: u32,
     },
+    CallbackOutput {
+        call: KernelExpressionId,
+        formal_ordinal: u32,
+    },
     CallContext {
         expression: KernelExpressionId,
         context_ordinal: u32,
@@ -437,6 +441,10 @@ pub struct KernelExpressionPresentation {
     pub expression: KernelExpressionId,
     pub scope: KernelScopeReference,
     pub declaration: Option<KernelDeclarationReference>,
+    /// Scope from which a declaration-less authored occurrence inherits its
+    /// containing declaration. Generated scopes may relocate the occurrence
+    /// without changing this authored authority.
+    pub declaration_scope: Option<KernelScopeReference>,
     pub span: KernelSourceSpan,
 }
 
@@ -502,6 +510,14 @@ pub enum KernelDeclarationOrigin {
         call: KernelExpressionId,
         ordinal: u32,
     },
+    /// ABI-supplied declaration that exists only while evaluating one call.
+    ///
+    /// This is ordinary callable metadata, not a language-level UI concept.
+    /// Different ABIs may publish different context declarations or none.
+    CallContext {
+        call: KernelExpressionId,
+        ordinal: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -515,6 +531,7 @@ pub enum KernelDeclarationKind {
     List,
     PatternBinding,
     FreshOut,
+    ElementState,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -524,6 +541,9 @@ pub struct KernelDeclarationInput {
     pub name: Box<str>,
     pub kind: KernelDeclarationKind,
     pub value: Option<KernelExpressionId>,
+    /// Exact ABI-declared type when the declaration has no value/formal
+    /// equation from which the checked linker can derive one.
+    pub declared_flow_type: Option<FlowType>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -663,7 +683,29 @@ pub enum KernelExpressionSemanticPayload {
     Byte(u8),
     Bits(Bits),
     HoldName(Box<str>),
+    MatchPattern(KernelMatchPatternPayload),
+    /// Preserve authored delimiter presentation when structural field
+    /// equations reinterpret the same node as a record for type solving.
+    Delimiter,
+    LexicalPath(Box<[Box<str>]>),
     Invalid(Box<[Box<str>]>),
+}
+
+/// Literal-bearing source pattern retained separately from the solver's
+/// shape-only [`KernelPattern`]. Pattern values are presentation/runtime facts;
+/// they must not make the type engine distinguish `1` from `2`.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelMatchPatternPayload {
+    Wildcard,
+    Number(ExactNumber),
+    Text(Box<str>),
+    Tag {
+        name: Box<str>,
+        fields: Box<[Box<str>]>,
+    },
+    Binding(Box<str>),
+    Bits(Bits),
+    Invalid,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -729,6 +771,7 @@ pub struct KernelExecutionRecordFieldInput {
     pub name: Box<str>,
     pub value: KernelExpressionId,
     pub spread: bool,
+    pub span: KernelSourceSpan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -736,6 +779,7 @@ pub struct KernelExecutionBlockBindingInput {
     pub ordinal: u32,
     pub declaration: KernelStructuralDeclarationInput,
     pub value: KernelExpressionId,
+    pub span: KernelSourceSpan,
 }
 
 /// Sparse exact execution rows for expression shapes whose runtime/checked
@@ -869,7 +913,7 @@ pub struct KernelOwnerProgram {
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
-    basis_fingerprint_v11: [u8; 32],
+    basis_fingerprint_v12: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -967,7 +1011,7 @@ struct KernelProjectOwnerOutputs {
     /// requirements. That aggregate is useful to the solver, but is not a
     /// sound direct assignability contract for call diagnostics.
     syntax_discriminated_formals: Box<[u32]>,
-    basis_fingerprint_v11: [u8; 32],
+    basis_fingerprint_v12: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -1098,6 +1142,7 @@ pub struct KernelExecutionRecordFieldArtifact {
     pub name: Box<str>,
     pub value: KernelValueReference,
     pub spread: bool,
+    pub span: KernelSourceSpan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -1105,6 +1150,7 @@ pub struct KernelExecutionBlockBindingArtifact {
     pub ordinal: u32,
     pub declaration: KernelDeclarationReference,
     pub value: KernelValueReference,
+    pub span: KernelSourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -1157,6 +1203,16 @@ pub struct KernelExpressionArtifact {
     pub kind: KernelOwnerNodeKind,
     pub inputs: Box<[KernelExpressionInputArtifact]>,
     pub flow_type: FlowType,
+    pub flush_type: Option<Type>,
+    pub effect: KernelEffectSummary,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelEffectSummary {
+    pub reads_state: bool,
+    pub writes_state: bool,
+    pub emits_source: bool,
+    pub invokes_host: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -1175,6 +1231,7 @@ pub struct KernelDeclarationArtifact {
     pub name: Box<str>,
     pub kind: KernelDeclarationKind,
     pub value: Option<KernelValueReference>,
+    pub declared_flow_type: Option<FlowType>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -2155,7 +2212,7 @@ pub fn is_registered_kernel_host_effect(operation: &str) -> bool {
 
 impl KernelOwnerProgram {
     pub fn solve(self) -> Result<KernelDefinitionSnapshot, KernelSolveError> {
-        let basis_fingerprint_v11 = self.basis_fingerprint_v11;
+        let basis_fingerprint_v12 = self.basis_fingerprint_v12;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
             .output(self.result_output)
@@ -2219,7 +2276,7 @@ impl KernelOwnerProgram {
             &synthetic_state_ordinals,
         );
         let expressions =
-            materialize_expression_artifacts(self.expression_artifacts, expression_flows);
+            materialize_expression_artifacts(self.expression_artifacts, expression_flows, &[]);
         let mut definition = DefinitionArtifact {
             result,
             formals: formal_flows,
@@ -2242,7 +2299,7 @@ impl KernelOwnerProgram {
         };
         let (dependencies, currentness) = build_snapshot_receipts(
             std::slice::from_mut(&mut definition),
-            &[basis_fingerprint_v11],
+            &[basis_fingerprint_v12],
         )?;
         let [currentness] = currentness.as_ref() else {
             unreachable!("one standalone kernel definition produces one receipt")
@@ -2404,10 +2461,11 @@ impl KernelSolvedProject {
 
     pub fn into_checked_snapshot(self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
         let diagnostic_values = self.interface_snapshot().diagnostic_values;
+        let owner_effects = project_owner_effect_summaries(&self.owners);
         let basis_fingerprints = self
             .owners
             .iter()
-            .map(|owner| owner.basis_fingerprint_v11)
+            .map(|owner| owner.basis_fingerprint_v12)
             .collect::<Vec<_>>();
         let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(&self.owners);
         let mut definitions = self
@@ -2429,6 +2487,7 @@ impl KernelSolvedProject {
                         call_facts,
                         diagnostics,
                         &synthetic_state_ordinals,
+                        &owner_effects,
                     )
                 },
             )
@@ -2469,6 +2528,7 @@ impl KernelSolvedProject {
             )));
         }
         let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(&self.owners);
+        let owner_effects = project_owner_effect_summaries(&self.owners);
         let mut demanded_iter = demanded.into_iter().peekable();
         let mut definitions = Vec::with_capacity(demanded_iter.len());
         for ((((owner_index, owner), synthetic_state_ordinals), call_facts), diagnostics) in self
@@ -2497,6 +2557,7 @@ impl KernelSolvedProject {
                 call_facts,
                 diagnostics,
                 &synthetic_state_ordinals,
+                &owner_effects,
             );
             alpha_normalize_definition(&mut definition);
             definitions.push(KernelDemandedDefinitionArtifact {
@@ -2561,6 +2622,121 @@ fn project_public_formals(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
+}
+
+fn merge_kernel_effects(
+    left: KernelEffectSummary,
+    right: KernelEffectSummary,
+) -> KernelEffectSummary {
+    KernelEffectSummary {
+        reads_state: left.reads_state || right.reads_state,
+        writes_state: left.writes_state || right.writes_state,
+        emits_source: left.emits_source || right.emits_source,
+        invokes_host: left.invokes_host || right.invokes_host,
+    }
+}
+
+fn local_expression_effect(kind: &KernelOwnerNodeKind) -> KernelEffectSummary {
+    match kind {
+        KernelOwnerNodeKind::Source(_) => KernelEffectSummary {
+            emits_source: true,
+            ..KernelEffectSummary::default()
+        },
+        KernelOwnerNodeKind::Hold | KernelOwnerNodeKind::Latest => KernelEffectSummary {
+            reads_state: true,
+            writes_state: true,
+            ..KernelEffectSummary::default()
+        },
+        KernelOwnerNodeKind::HostEffect { .. } => KernelEffectSummary {
+            invokes_host: true,
+            ..KernelEffectSummary::default()
+        },
+        _ => KernelEffectSummary::default(),
+    }
+}
+
+/// Compute each callable's direct effect surface once over the dense owner
+/// graph. Effects form a four-bit monotone lattice, so reverse-call consumers
+/// converge by queue exhaustion even for recursive call components.
+fn project_owner_effect_summaries(
+    owners: &[KernelProjectOwnerOutputs],
+) -> Box<[KernelEffectSummary]> {
+    let mut summaries = owners
+        .iter()
+        .map(|owner| {
+            let mut summary = owner.expression_artifacts.iter().fold(
+                KernelEffectSummary::default(),
+                |summary, expression| {
+                    merge_kernel_effects(summary, local_expression_effect(&expression.kind))
+                },
+            );
+            for declaration in &owner.declarations {
+                match declaration.kind {
+                    KernelDeclarationKind::Source => summary.emits_source = true,
+                    KernelDeclarationKind::Hold => {
+                        summary.reads_state = true;
+                        summary.writes_state = true;
+                    }
+                    KernelDeclarationKind::Function
+                    | KernelDeclarationKind::ValueParameter
+                    | KernelDeclarationKind::OutParameter
+                    | KernelDeclarationKind::Field
+                    | KernelDeclarationKind::PatternBinding
+                    | KernelDeclarationKind::FreshOut
+                    | KernelDeclarationKind::ElementState
+                    | KernelDeclarationKind::List => {}
+                }
+            }
+            summary
+        })
+        .collect::<Vec<_>>();
+    let mut consumers = vec![Vec::<usize>::new(); owners.len()];
+    for (caller, owner) in owners.iter().enumerate() {
+        for target in owner.expression_artifacts.iter().filter_map(|expression| {
+            let KernelOwnerNodeKind::UserCall { target, .. } = &expression.kind else {
+                return None;
+            };
+            Some(target.0 as usize)
+        }) {
+            if let Some(target_consumers) = consumers.get_mut(target) {
+                target_consumers.push(caller);
+            }
+        }
+    }
+    for target_consumers in &mut consumers {
+        target_consumers.sort_unstable();
+        target_consumers.dedup();
+    }
+    let mut queued = vec![true; owners.len()];
+    let mut pending = (0..owners.len()).collect::<VecDeque<_>>();
+    while let Some(target) = pending.pop_front() {
+        queued[target] = false;
+        let target_summary = summaries[target];
+        for caller in consumers[target].iter().copied() {
+            let merged = merge_kernel_effects(summaries[caller], target_summary);
+            if merged != summaries[caller] {
+                summaries[caller] = merged;
+                if !queued[caller] {
+                    queued[caller] = true;
+                    pending.push_back(caller);
+                }
+            }
+        }
+    }
+    summaries.into_boxed_slice()
+}
+
+fn direct_expression_effect(
+    kind: &KernelOwnerNodeKind,
+    owner_effects: &[KernelEffectSummary],
+) -> KernelEffectSummary {
+    match kind {
+        KernelOwnerNodeKind::UserCall { target, .. } => owner_effects
+            .get(target.0 as usize)
+            .copied()
+            .unwrap_or_default(),
+        _ => local_expression_effect(kind),
+    }
 }
 
 /// Project reusable call facts and user-facing type failures directly from the
@@ -3018,6 +3194,7 @@ fn materialize_project_definition(
     call_facts: Box<[SolvedKernelCallFacts]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
     synthetic_state_ordinals: &[Option<u32>],
+    owner_effects: &[KernelEffectSummary],
 ) -> DefinitionArtifact {
     let result = public_results[owner_index].clone();
     let expression_flows = owner
@@ -3042,8 +3219,11 @@ fn materialize_project_definition(
         Some(public_results),
         synthetic_state_ordinals,
     );
-    let expressions =
-        materialize_expression_artifacts(owner.expression_artifacts, expression_flows);
+    let expressions = materialize_expression_artifacts(
+        owner.expression_artifacts,
+        expression_flows,
+        owner_effects,
+    );
     DefinitionArtifact {
         result,
         formals: public_formals[owner_index].clone(),
@@ -3170,6 +3350,26 @@ fn validate_definition_linker_facts(
                 KernelExpressionSemanticPayload::HoldName(_) => {
                     matches!(&node.kind, KernelOwnerNodeKind::Hold)
                 }
+                KernelExpressionSemanticPayload::MatchPattern(_) => {
+                    matches!(&node.kind, KernelOwnerNodeKind::MatchArm { .. })
+                }
+                KernelExpressionSemanticPayload::Delimiter => matches!(
+                    &node.kind,
+                    KernelOwnerNodeKind::Delimiter | KernelOwnerNodeKind::Record { tag: None }
+                ),
+                KernelExpressionSemanticPayload::LexicalPath(_) => matches!(
+                    &node.kind,
+                    KernelOwnerNodeKind::Known(_)
+                        | KernelOwnerNodeKind::FormalRead { .. }
+                        | KernelOwnerNodeKind::ContextRead { .. }
+                        | KernelOwnerNodeKind::LexicalRead { .. }
+                        | KernelOwnerNodeKind::ValueRead { .. }
+                        | KernelOwnerNodeKind::DerivedRead { .. }
+                        | KernelOwnerNodeKind::PatternRead { .. }
+                        | KernelOwnerNodeKind::CollectionItemRead
+                        | KernelOwnerNodeKind::FreshOut
+                        | KernelOwnerNodeKind::Unknown
+                ),
                 KernelExpressionSemanticPayload::Invalid(_) => matches!(
                     &node.kind,
                     KernelOwnerNodeKind::Unknown
@@ -3430,6 +3630,9 @@ fn validate_definition_presentation(
             }
             KernelScopeOrigin::Record { expression }
             | KernelScopeOrigin::MatchArm { expression }
+            | KernelScopeOrigin::CallbackOutput {
+                call: expression, ..
+            }
             | KernelScopeOrigin::CallContext { expression, .. }
                 if expression.0 as usize >= input.nodes.len() =>
             {
@@ -3472,6 +3675,9 @@ fn validate_definition_presentation(
             )));
         }
         validate_presentation_scope_reference(expression.scope, scope_count, label)?;
+        if let Some(declaration_scope) = expression.declaration_scope {
+            validate_presentation_scope_reference(declaration_scope, scope_count, label)?;
+        }
         if let Some(declaration) = expression.declaration {
             validate_presentation_declaration_reference(
                 declaration,
@@ -3907,7 +4113,7 @@ pub fn compile_owner_program_with_definition_facts(
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
     validate_definition_linker_facts(input, facts, None)?;
-    let basis_fingerprint_v11 = definition_basis_fingerprint(input, facts)?;
+    let basis_fingerprint_v12 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
@@ -4072,13 +4278,14 @@ pub fn compile_owner_program_with_definition_facts(
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
         diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
-        basis_fingerprint_v11,
+        basis_fingerprint_v12,
     })
 }
 
 fn materialize_expression_artifacts(
     pending: Box<[PendingKernelExpressionArtifact]>,
     flows: Box<[FlowType]>,
+    owner_effects: &[KernelEffectSummary],
 ) -> Box<[KernelExpressionArtifact]> {
     assert_eq!(
         pending.len(),
@@ -4090,10 +4297,12 @@ fn materialize_expression_artifacts(
         .into_iter()
         .zip(flows)
         .map(|(expression, flow_type)| KernelExpressionArtifact {
+            effect: direct_expression_effect(&expression.kind, owner_effects),
             id: expression.id,
             kind: expression.kind,
             inputs: expression.inputs,
             flow_type,
+            flush_type: None,
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -4238,6 +4447,7 @@ fn collect_declaration_artifacts(
                     .value
                     .map(|value| kernel_value_reference(owner, value, index))
                     .transpose()?,
+                declared_flow_type: declaration.declared_flow_type.clone(),
             })
         })
         .collect::<Result<Vec<_>, _>>()
@@ -4401,7 +4611,35 @@ fn validate_declaration_origin(
                 return Err(invalid());
             }
         }
+        (
+            KernelDeclarationOrigin::CallContext { call, .. },
+            KernelDeclarationKind::ElementState,
+        ) => {
+            let expression = owner.nodes.get(call.0 as usize).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel declaration {} references missing call-context expression {}",
+                    declaration.id.0, call.0
+                ))
+            })?;
+            if !matches!(
+                expression.kind,
+                KernelOwnerNodeKind::RenderConstructor { .. }
+                    | KernelOwnerNodeKind::PureBuiltin { .. }
+                    | KernelOwnerNodeKind::UserCall { .. }
+            ) || declaration.value.is_some()
+                || declaration.declared_flow_type.is_none()
+            {
+                return Err(invalid());
+            }
+        }
         _ => return Err(invalid()),
+    }
+    if !matches!(
+        declaration.origin,
+        KernelDeclarationOrigin::CallContext { .. }
+    ) && declaration.declared_flow_type.is_some()
+    {
+        return Err(invalid());
     }
     Ok(())
 }
@@ -5270,6 +5508,7 @@ fn collect_execution_shape_artifacts(
                                     name: field.name.clone(),
                                     value: kernel_value_reference(input, field.value, consumer)?,
                                     spread: field.spread,
+                                    span: field.span,
                                 })
                             })
                             .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?
@@ -5292,6 +5531,7 @@ fn collect_execution_shape_artifacts(
                                     consumer,
                                 )?,
                                 value: kernel_value_reference(input, binding.value, consumer)?,
+                                span: binding.span,
                             })
                         })
                         .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?
@@ -5964,7 +6204,7 @@ pub fn compile_project_program_with_definition_facts(
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice(),
                 syntax_discriminated_formals: syntax_discriminated_formals[owner_index].clone(),
-                basis_fingerprint_v11: definition_basis_fingerprint_with_buffer(
+                basis_fingerprint_v12: definition_basis_fingerprint_with_buffer(
                     owner,
                     &facts[owner_index],
                     &mut basis_fingerprint_scratch,
@@ -13324,16 +13564,16 @@ mod tests {
             render_slot.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            artifact.currentness.basis_fingerprint_v11,
-            render_slot.currentness.basis_fingerprint_v11,
+            artifact.currentness.basis_fingerprint_v12,
+            render_slot.currentness.basis_fingerprint_v12,
         );
         assert_ne!(
-            artifact.currentness.artifact_fingerprint_v13,
-            render_slot.currentness.artifact_fingerprint_v13,
+            artifact.currentness.artifact_fingerprint_v14,
+            render_slot.currentness.artifact_fingerprint_v14,
         );
         assert_ne!(
-            artifact.currentness.fingerprint_v13,
-            render_slot.currentness.fingerprint_v13,
+            artifact.currentness.fingerprint_v14,
+            render_slot.currentness.fingerprint_v14,
         );
 
         let mut invalid = facts.clone();
@@ -13414,16 +13654,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v11,
-            moved.currentness.basis_fingerprint_v11
+            solved.currentness.basis_fingerprint_v12,
+            moved.currentness.basis_fingerprint_v12
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v13,
-            moved.currentness.artifact_fingerprint_v13
+            solved.currentness.artifact_fingerprint_v14,
+            moved.currentness.artifact_fingerprint_v14
         );
         assert_ne!(
-            solved.currentness.fingerprint_v13,
-            moved.currentness.fingerprint_v13
+            solved.currentness.fingerprint_v14,
+            moved.currentness.fingerprint_v14
         );
 
         let mut missing = facts.clone();
@@ -13482,6 +13722,7 @@ mod tests {
                     expression: KernelExpressionId(0),
                     scope: KernelScopeReference::Local(KernelScopeId(0)),
                     declaration: None,
+                    declaration_scope: None,
                     span,
                 }]
                 .into_boxed_slice(),
@@ -13507,16 +13748,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v11,
-            moved.currentness.basis_fingerprint_v11
+            solved.currentness.basis_fingerprint_v12,
+            moved.currentness.basis_fingerprint_v12
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v13,
-            moved.currentness.artifact_fingerprint_v13
+            solved.currentness.artifact_fingerprint_v14,
+            moved.currentness.artifact_fingerprint_v14
         );
         assert_ne!(
-            solved.currentness.fingerprint_v13,
-            moved.currentness.fingerprint_v13
+            solved.currentness.fingerprint_v14,
+            moved.currentness.fingerprint_v14
         );
 
         let mut missing = facts.clone();
@@ -13614,16 +13855,16 @@ mod tests {
             edited.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v11,
-            edited.currentness.basis_fingerprint_v11,
+            solved.currentness.basis_fingerprint_v12,
+            edited.currentness.basis_fingerprint_v12,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v13,
-            edited.currentness.artifact_fingerprint_v13,
+            solved.currentness.artifact_fingerprint_v14,
+            edited.currentness.artifact_fingerprint_v14,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v13,
-            edited.currentness.fingerprint_v13,
+            solved.currentness.fingerprint_v14,
+            edited.currentness.fingerprint_v14,
         );
 
         let mut missing = facts.clone();
@@ -13752,16 +13993,16 @@ mod tests {
             renamed.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v11,
-            renamed.currentness.basis_fingerprint_v11,
+            solved.currentness.basis_fingerprint_v12,
+            renamed.currentness.basis_fingerprint_v12,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v13,
-            renamed.currentness.artifact_fingerprint_v13,
+            solved.currentness.artifact_fingerprint_v14,
+            renamed.currentness.artifact_fingerprint_v14,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v13,
-            renamed.currentness.fingerprint_v13,
+            solved.currentness.fingerprint_v14,
+            renamed.currentness.fingerprint_v14,
         );
 
         let mut partial = facts.clone();
@@ -13841,6 +14082,7 @@ mod tests {
                 name: "local".into(),
                 kind: KernelDeclarationKind::Field,
                 value: Some(KernelExpressionId(1)),
+                declared_flow_type: None,
             },
             KernelDeclarationInput {
                 id: KernelDeclarationId(1),
@@ -13851,6 +14093,7 @@ mod tests {
                 name: "value".into(),
                 kind: KernelDeclarationKind::Field,
                 value: Some(KernelExpressionId(0)),
+                declared_flow_type: None,
             },
             KernelDeclarationInput {
                 id: KernelDeclarationId(2),
@@ -13861,6 +14104,7 @@ mod tests {
                 name: "row".into(),
                 kind: KernelDeclarationKind::PatternBinding,
                 value: None,
+                declared_flow_type: None,
             },
         ]
         .into_boxed_slice();
@@ -13875,6 +14119,7 @@ mod tests {
                     name: "value".into(),
                     value: KernelExpressionId(0),
                     spread: false,
+                    span: KernelSourceSpan::default(),
                 }]
                 .into_boxed_slice(),
             },
@@ -13884,6 +14129,7 @@ mod tests {
                     ordinal: 0,
                     declaration: KernelStructuralDeclarationInput::Local(KernelDeclarationId(0)),
                     value: KernelExpressionId(1),
+                    span: KernelSourceSpan::default(),
                 }]
                 .into_boxed_slice(),
                 result: Some(KernelExpressionId(2)),
@@ -13961,16 +14207,16 @@ mod tests {
             different_selector.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v11,
-            different_selector.currentness.basis_fingerprint_v11,
+            solved.currentness.basis_fingerprint_v12,
+            different_selector.currentness.basis_fingerprint_v12,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v13,
-            different_selector.currentness.artifact_fingerprint_v13,
+            solved.currentness.artifact_fingerprint_v14,
+            different_selector.currentness.artifact_fingerprint_v14,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v13,
-            different_selector.currentness.fingerprint_v13,
+            solved.currentness.fingerprint_v14,
+            different_selector.currentness.fingerprint_v14,
         );
 
         let mut partial = facts.clone();
@@ -14053,6 +14299,7 @@ mod tests {
                     name: "root".into(),
                     kind: KernelDeclarationKind::Field,
                     value: Some(KernelExpressionId(1)),
+                    declared_flow_type: None,
                 },
                 KernelDeclarationInput {
                     id: KernelDeclarationId(1),
@@ -14063,6 +14310,7 @@ mod tests {
                     name: "value".into(),
                     kind: KernelDeclarationKind::Field,
                     value: Some(KernelExpressionId(0)),
+                    declared_flow_type: None,
                 },
             ]
             .into_boxed_slice(),
@@ -14259,6 +14507,7 @@ mod tests {
             name: name.into(),
             kind,
             value: Some(KernelExpressionId(value)),
+            declared_flow_type: None,
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
@@ -14405,6 +14654,7 @@ mod tests {
                 name: name.into(),
                 kind: KernelDeclarationKind::Field,
                 value: Some(KernelExpressionId(u32::try_from(index + 2).unwrap())),
+                declared_flow_type: None,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();

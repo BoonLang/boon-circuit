@@ -4,13 +4,15 @@ use crate::{
     KernelStatementChildReference, KernelStatementReference, KernelValueReference,
 };
 use boon_checked::{
-    CheckedCallId, CheckedDeclaration, CheckedDeclarationKind, CheckedExprId, CheckedListId,
-    CheckedResourceBinding, CheckedScope, CheckedScopeKind, CheckedSourceId, CheckedSpan,
-    CheckedStateId, CheckedStatement, CheckedStatementId, CheckedStatementKind, CheckedValueUse,
-    ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId, ObjectShape, Type, TypeVar,
-    Variant,
+    CheckedBlockBinding, CheckedCallId, CheckedDeclaration, CheckedDeclarationKind,
+    CheckedEffectSummary, CheckedExprId, CheckedExpression, CheckedExpressionKind, CheckedListId,
+    CheckedMatchPattern, CheckedPassedAccess, CheckedRecordField, CheckedResourceBinding,
+    CheckedScope, CheckedScopeKind, CheckedSourceId, CheckedSourceRead, CheckedSpan,
+    CheckedStateId, CheckedStatement, CheckedStatementId, CheckedStatementKind, CheckedTextSegment,
+    CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId, ObjectShape,
+    Type, TypeVar, Variant,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -318,6 +320,72 @@ impl KernelCheckedLinkLayout {
                     .scopes
                     .resolve(scope.0, "imported scope")?,
             )),
+        }
+    }
+
+    fn lexical_declaration_for_scope(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        owner: KernelOwnerId,
+        scope: KernelScopeReference,
+    ) -> Result<Option<DeclId>, KernelCheckedLinkError> {
+        let mut owner = owner;
+        let mut scope = scope;
+        let mut remaining = snapshot
+            .definitions
+            .iter()
+            .map(|definition| definition.presentation.scopes.len())
+            .sum::<usize>()
+            .saturating_add(snapshot.definitions.len())
+            .saturating_add(1);
+        loop {
+            if remaining == 0 {
+                return Err(KernelCheckedLinkError::new(
+                    "kernel checked presentation lexical scopes contain a cycle",
+                ));
+            }
+            remaining -= 1;
+            match scope {
+                KernelScopeReference::ProjectRoot => return Ok(None),
+                KernelScopeReference::Containing => {
+                    let definition = snapshot.definitions.get(owner.0 as usize).ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel lexical declaration lookup references missing definition {}",
+                            owner.0,
+                        ))
+                    })?;
+                    scope = definition.presentation.containing_scope;
+                }
+                KernelScopeReference::Owner {
+                    owner: provider,
+                    scope: provider_scope,
+                } => {
+                    owner = provider;
+                    scope = KernelScopeReference::Local(provider_scope);
+                }
+                KernelScopeReference::Local(local) => {
+                    let definition = snapshot.definitions.get(owner.0 as usize).ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel lexical declaration lookup references missing definition {}",
+                            owner.0,
+                        ))
+                    })?;
+                    let row = definition
+                        .presentation
+                        .scopes
+                        .get(local.0 as usize)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition {} lexical declaration lookup references missing scope {}",
+                                owner.0, local.0,
+                            ))
+                        })?;
+                    if let Some(declaration) = row.owner {
+                        return self.declaration(owner, declaration).map(Some);
+                    }
+                    scope = row.parent;
+                }
+            }
         }
     }
 
@@ -635,6 +703,277 @@ impl KernelCheckedLinkLayout {
             ));
         }
         Ok(statements.into_boxed_slice())
+    }
+
+    /// Emit every definition expression directly from immutable kernel facts.
+    ///
+    /// This is the central compatibility-assembler deletion seam: expression
+    /// kind, structural children, lexical authority, type, effect, scope, and
+    /// source coordinates are all consumed from compact rows produced during
+    /// graph construction/solve. No parser or legacy owner DTO is reopened.
+    pub fn materialize_expressions(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<Box<[CheckedExpression]>, KernelCheckedLinkError> {
+        if snapshot.definitions.len() != self.definitions.len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked expression materializer has {} definitions for a {}-definition layout",
+                snapshot.definitions.len(),
+                self.definitions.len(),
+            )));
+        }
+
+        let mut source_paths =
+            BTreeMap::<DeclId, Vec<(Vec<String>, CheckedSourceId, DeclId)>>::new();
+        let mut declaration_metadata =
+            BTreeMap::<DeclId, (KernelOwnerId, KernelScopeReference, Box<str>)>::new();
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+                KernelCheckedLinkError::new(
+                    "kernel checked expression materializer definition count exceeds u32",
+                )
+            })?);
+            for (declaration, presentation) in definition
+                .declarations
+                .iter()
+                .zip(definition.presentation.declarations.iter())
+            {
+                let linked =
+                    self.declaration(owner, KernelDeclarationReference::Local(declaration.id))?;
+                if declaration_metadata
+                    .insert(
+                        linked,
+                        (owner, presentation.scope, declaration.name.clone()),
+                    )
+                    .is_some()
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel checked expression materializer repeats declaration metadata for {}",
+                        linked.0,
+                    )));
+                }
+            }
+        }
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+                KernelCheckedLinkError::new(
+                    "kernel checked expression materializer definition count exceeds u32",
+                )
+            })?);
+            for source in &definition.sources {
+                let source_id = self.source(owner, source.id.0)?;
+                let source_declaration = self.declaration(owner, source.declaration)?;
+                let source_projection = source
+                    .path
+                    .projection
+                    .iter()
+                    .map(|field| field.to_string())
+                    .collect::<Vec<_>>();
+                let exact_anchor = self.declaration(owner, source.path.anchor)?;
+                source_paths.entry(exact_anchor).or_default().push((
+                    source_projection.clone(),
+                    source_id,
+                    source_declaration,
+                ));
+
+                // Checked lexical reads name a nested SOURCE by its exact
+                // declaration, even when the authored path starts at an
+                // enclosing record declaration. Derive every ancestor alias
+                // once from compact declaration/scope presentation so reads
+                // can be canonicalized without reopening parser or owner DTOs.
+                let Some((_, mut scope, source_name)) =
+                    declaration_metadata.get(&source_declaration).cloned()
+                else {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel SOURCE declaration {} has no presentation metadata",
+                        source_declaration.0,
+                    )));
+                };
+                let mut scope_owner = owner;
+                let mut alias_projection =
+                    Vec::with_capacity(source_projection.len().saturating_add(4));
+                alias_projection.push(source_name.to_string());
+                alias_projection.extend(source_projection);
+                let mut seen_anchors = BTreeSet::new();
+                while let Some(anchor) =
+                    self.lexical_declaration_for_scope(snapshot, scope_owner, scope)?
+                {
+                    if !seen_anchors.insert(anchor) || anchor == source_declaration {
+                        break;
+                    }
+                    source_paths.entry(anchor).or_default().push((
+                        alias_projection.clone(),
+                        source_id,
+                        source_declaration,
+                    ));
+                    let Some((owner, parent_scope, name)) =
+                        declaration_metadata.get(&anchor).cloned()
+                    else {
+                        break;
+                    };
+                    alias_projection.insert(0, name.to_string());
+                    scope_owner = owner;
+                    scope = parent_scope;
+                }
+            }
+        }
+        for paths in source_paths.values_mut() {
+            paths.sort_by_key(|(path, source, _)| (std::cmp::Reverse(path.len()), *source));
+        }
+
+        let mut expressions = Vec::with_capacity(self.totals.expressions as usize);
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+                KernelCheckedLinkError::new(
+                    "kernel checked expression materializer definition count exceeds u32",
+                )
+            })?);
+            let local_len = definition.expressions.len();
+            if definition.presentation.expressions.len() != local_len
+                || definition.expression_payloads.len() != local_len
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} expression artifacts, presentation, and payload tables differ: {} / {} / {}",
+                    owner.0,
+                    local_len,
+                    definition.presentation.expressions.len(),
+                    definition.expression_payloads.len(),
+                )));
+            }
+            let mut shapes = vec![None; local_len];
+            for shape in &definition.execution_shapes {
+                let slot = shapes
+                    .get_mut(shape.expression().0 as usize)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {} execution shape references missing expression {}",
+                            owner.0,
+                            shape.expression().0,
+                        ))
+                    })?;
+                if slot.replace(shape).is_some() {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {} repeats execution shape for expression {}",
+                        owner.0,
+                        shape.expression().0,
+                    )));
+                }
+            }
+            let mut lexical = vec![None; local_len];
+            for binding in &definition.lexical_bindings {
+                let slot = lexical
+                    .get_mut(binding.expression.0 as usize)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {} lexical binding references missing expression {}",
+                            owner.0, binding.expression.0,
+                        ))
+                    })?;
+                if slot.replace(binding).is_some() {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {} repeats lexical binding for expression {}",
+                        owner.0, binding.expression.0,
+                    )));
+                }
+            }
+            let mut calls = vec![None; local_len];
+            for (ordinal, call) in definition.calls.iter().enumerate() {
+                let slot = calls.get_mut(call.expression.0 as usize).ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel definition {} call references missing expression {}",
+                        owner.0, call.expression.0,
+                    ))
+                })?;
+                if slot
+                    .replace(u32::try_from(ordinal).map_err(|_| {
+                        KernelCheckedLinkError::new("kernel call ordinal exceeds u32")
+                    })?)
+                    .is_some()
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {} repeats call for expression {}",
+                        owner.0, call.expression.0,
+                    )));
+                }
+            }
+
+            for (((expression, presentation), payload), local_ordinal) in definition
+                .expressions
+                .iter()
+                .zip(definition.presentation.expressions.iter())
+                .zip(definition.expression_payloads.iter())
+                .zip(0..)
+            {
+                if expression.id != presentation.expression
+                    || expression.id.0 as usize != local_ordinal
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {} expression rows are not dense at ordinal {local_ordinal}",
+                        owner.0,
+                    )));
+                }
+                let id = self.expression(owner, KernelValueReference::Local(expression.id))?;
+                if id.0 as usize != expressions.len() {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel checked expression materializer expected row {} but linked {}",
+                        expressions.len(),
+                        id.0,
+                    )));
+                }
+                let declaration = match presentation.declaration {
+                    Some(declaration) => Some(self.declaration(owner, declaration)?),
+                    None => self.lexical_declaration_for_scope(
+                        snapshot,
+                        owner,
+                        presentation.declaration_scope.unwrap_or(presentation.scope),
+                    )?,
+                };
+                let kind = checked_expression_kind(
+                    self,
+                    owner,
+                    definition,
+                    expression,
+                    presentation.span.line,
+                    declaration,
+                    payload,
+                    shapes[local_ordinal],
+                    lexical[local_ordinal],
+                    calls[local_ordinal],
+                    &source_paths,
+                )?;
+                expressions.push(CheckedExpression {
+                    id,
+                    scope_id: self.scope(owner, presentation.scope)?,
+                    declaration,
+                    flow_type: self.relocate_flow_type(owner, &expression.flow_type)?,
+                    flush_type: expression
+                        .flush_type
+                        .as_ref()
+                        .map(|ty| relocate_type(self.definition(owner)?.type_variables, ty))
+                        .transpose()?,
+                    effect: CheckedEffectSummary {
+                        reads_state: expression.effect.reads_state,
+                        writes_state: expression.effect.writes_state,
+                        emits_source: expression.effect.emits_source,
+                        invokes_host: expression.effect.invokes_host,
+                    },
+                    kind,
+                    span: CheckedSpan {
+                        line: presentation.span.line,
+                        start: presentation.span.start,
+                        end: presentation.span.end,
+                    },
+                });
+            }
+        }
+        if expressions.len() != self.totals.expressions as usize {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked expression materializer produced {} rows for a {}-row layout",
+                expressions.len(),
+                self.totals.expressions,
+            )));
+        }
+        Ok(expressions.into_boxed_slice())
     }
 
     pub fn declaration(
@@ -974,6 +1313,7 @@ fn checked_declaration_kind(kind: crate::KernelDeclarationKind) -> CheckedDeclar
         crate::KernelDeclarationKind::List => CheckedDeclarationKind::List,
         crate::KernelDeclarationKind::PatternBinding => CheckedDeclarationKind::PatternBinding,
         crate::KernelDeclarationKind::FreshOut => CheckedDeclarationKind::FreshOut,
+        crate::KernelDeclarationKind::ElementState => CheckedDeclarationKind::ElementState,
     }
 }
 
@@ -1044,6 +1384,488 @@ fn checked_statement_kind(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn checked_expression_kind(
+    layout: &KernelCheckedLinkLayout,
+    owner: KernelOwnerId,
+    definition: &crate::DefinitionArtifact,
+    expression: &crate::KernelExpressionArtifact,
+    container_line: usize,
+    container_declaration: Option<DeclId>,
+    payload: &crate::KernelExpressionSemanticPayload,
+    shape: Option<&crate::KernelExecutionShapeArtifact>,
+    lexical: Option<&crate::KernelLexicalBindingArtifact>,
+    call: Option<u32>,
+    source_paths: &BTreeMap<DeclId, Vec<(Vec<String>, CheckedSourceId, DeclId)>>,
+) -> Result<CheckedExpressionKind, KernelCheckedLinkError> {
+    if let Some(call) = call {
+        return Ok(CheckedExpressionKind::Call {
+            call: layout.call(owner, call)?,
+        });
+    }
+    if let Some(binding) = lexical {
+        let projection = binding
+            .projection
+            .iter()
+            .map(|field| field.to_string())
+            .collect::<Vec<_>>();
+        return match &binding.target {
+            KernelLexicalBindingTarget::Declaration(target) => {
+                let target = layout.declaration(owner, *target)?;
+                Ok(match binding.access {
+                    crate::KernelLexicalAccess::Read => {
+                        let (target, projection, source) =
+                            canonical_checked_source_read(source_paths, target, projection);
+                        CheckedExpressionKind::Read {
+                            target,
+                            source,
+                            projection,
+                        }
+                    }
+                    crate::KernelLexicalAccess::Drain => {
+                        let (target, projection, _) =
+                            canonical_checked_source_read(source_paths, target, projection);
+                        CheckedExpressionKind::Drain { target, projection }
+                    }
+                })
+            }
+            KernelLexicalBindingTarget::ContextFormal { ordinal } => {
+                let owner_layout = layout.definition(owner)?;
+                if definition.linkage.context_formal_ordinal != Some(*ordinal) {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {} expression {} reads context ordinal {} but owns {:?}",
+                        owner.0,
+                        expression.id.0,
+                        ordinal,
+                        definition.linkage.context_formal_ordinal,
+                    )));
+                }
+                Ok(CheckedExpressionKind::Passed {
+                    formal: owner_layout.context_formal.ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {} has no linked context formal",
+                            owner.0,
+                        ))
+                    })?,
+                    projection,
+                    access: match binding.access {
+                        crate::KernelLexicalAccess::Read => CheckedPassedAccess::Read,
+                        crate::KernelLexicalAccess::Drain => CheckedPassedAccess::Drain,
+                    },
+                })
+            }
+            KernelLexicalBindingTarget::RuntimeContext => {
+                if binding.access == crate::KernelLexicalAccess::Drain {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {} expression {} drains an ABI runtime context",
+                        owner.0, expression.id.0,
+                    )));
+                }
+                Ok(CheckedExpressionKind::ExternalRead {
+                    canonical_path: lexical_payload_path(payload).ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {} runtime-context expression {} has no lexical path",
+                            owner.0, expression.id.0,
+                        ))
+                    })?,
+                    external_identity: None,
+                })
+            }
+            KernelLexicalBindingTarget::Value { provider } => {
+                Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} expression {} has an unanchored lexical value provider {provider:?}",
+                    owner.0, expression.id.0,
+                )))
+            }
+        };
+    }
+    if matches!(payload, crate::KernelExpressionSemanticPayload::Delimiter) {
+        return Ok(CheckedExpressionKind::Delimiter);
+    }
+
+    let inputs = |role: &crate::KernelOwnerEdgeRole| {
+        expression
+            .inputs
+            .iter()
+            .filter(|input| &input.role == role)
+            .map(|input| layout.expression(owner, input.value))
+            .collect::<Result<Vec<_>, _>>()
+    };
+    let one_input = |role: &crate::KernelOwnerEdgeRole, label: &str| {
+        let values = inputs(role)?;
+        let [value] = values.as_slice() else {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel definition {} expression {} has {} {label} inputs",
+                owner.0,
+                expression.id.0,
+                values.len(),
+            )));
+        };
+        Ok(*value)
+    };
+
+    Ok(match &expression.kind {
+        crate::KernelOwnerNodeKind::Source(_) => CheckedExpressionKind::Source,
+        crate::KernelOwnerNodeKind::Absent => CheckedExpressionKind::Absent,
+        crate::KernelOwnerNodeKind::Text => CheckedExpressionKind::Text {
+            value: match payload {
+                crate::KernelExpressionSemanticPayload::Text(value) => value.to_string(),
+                _ => {
+                    return Err(expression_payload_error(owner, expression, "text literal"));
+                }
+            },
+        },
+        crate::KernelOwnerNodeKind::TextTemplate => {
+            let dynamic = inputs(&crate::KernelOwnerEdgeRole::TextDynamic)?;
+            let crate::KernelExpressionSemanticPayload::TextTemplate(segments) = payload else {
+                return Err(expression_payload_error(owner, expression, "text template"));
+            };
+            CheckedExpressionKind::TextTemplate {
+                segments: segments
+                    .iter()
+                    .map(|segment| match segment {
+                        crate::KernelTextTemplateSegment::Static(value) => {
+                            Ok(CheckedTextSegment::Static {
+                                value: value.to_string(),
+                            })
+                        }
+                        crate::KernelTextTemplateSegment::Dynamic(ordinal) => dynamic
+                            .get(*ordinal as usize)
+                            .copied()
+                            .map(|value| CheckedTextSegment::Dynamic { value })
+                            .ok_or_else(|| {
+                                KernelCheckedLinkError::new(format!(
+                                    "kernel definition {} text template {} references missing dynamic segment {}",
+                                    owner.0, expression.id.0, ordinal,
+                                ))
+                            }),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            }
+        }
+        crate::KernelOwnerNodeKind::Number => CheckedExpressionKind::Number {
+            value: match payload {
+                crate::KernelExpressionSemanticPayload::Number(value) => value.clone(),
+                _ => {
+                    return Err(expression_payload_error(
+                        owner,
+                        expression,
+                        "number literal",
+                    ));
+                }
+            },
+        },
+        crate::KernelOwnerNodeKind::Byte => CheckedExpressionKind::BytesByte {
+            value: match payload {
+                crate::KernelExpressionSemanticPayload::Byte(value) => *value,
+                _ => return Err(expression_payload_error(owner, expression, "byte literal")),
+            },
+        },
+        crate::KernelOwnerNodeKind::Bits(_) => CheckedExpressionKind::Bits {
+            value: match payload {
+                crate::KernelExpressionSemanticPayload::Bits(value) => value.clone(),
+                _ => return Err(expression_payload_error(owner, expression, "bits literal")),
+            },
+        },
+        crate::KernelOwnerNodeKind::Tag(name) => CheckedExpressionKind::Tag {
+            name: name.to_string(),
+        },
+        crate::KernelOwnerNodeKind::Record { tag } => {
+            let Some(crate::KernelExecutionShapeArtifact::Record { fields, .. }) = shape else {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} record expression {} has no exact execution shape",
+                    owner.0, expression.id.0,
+                )));
+            };
+            let fields = checked_record_fields(
+                layout,
+                owner,
+                container_line,
+                container_declaration,
+                fields,
+            )?;
+            match tag {
+                Some(tag) => CheckedExpressionKind::TaggedObject {
+                    tag: tag.to_string(),
+                    fields,
+                },
+                None => CheckedExpressionKind::Object { fields },
+            }
+        }
+        crate::KernelOwnerNodeKind::Block => {
+            let Some(crate::KernelExecutionShapeArtifact::Block {
+                bindings, result, ..
+            }) = shape
+            else {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} BLOCK expression {} has no exact execution shape",
+                    owner.0, expression.id.0,
+                )));
+            };
+            CheckedExpressionKind::Block {
+                bindings: bindings
+                    .iter()
+                    .map(|binding| {
+                        Ok(CheckedBlockBinding {
+                            declaration: layout.declaration(owner, binding.declaration)?,
+                            value: layout.expression(owner, binding.value)?,
+                            span: checked_nested_span(container_line, binding.span),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?,
+                result: result
+                    .map(|result| layout.expression(owner, result))
+                    .transpose()?,
+            }
+        }
+        crate::KernelOwnerNodeKind::Collection { kind, capacity } => match kind {
+            crate::KernelCollectionKind::List => CheckedExpressionKind::List {
+                capacity: *capacity,
+                items: inputs(&crate::KernelOwnerEdgeRole::CollectionItem)?,
+            },
+            crate::KernelCollectionKind::Bytes => CheckedExpressionKind::Bytes {
+                fixed_size: *capacity,
+                items: inputs(&crate::KernelOwnerEdgeRole::CollectionItem)?,
+            },
+            crate::KernelCollectionKind::Set => CheckedExpressionKind::Set {
+                items: inputs(&crate::KernelOwnerEdgeRole::CollectionItem)?,
+            },
+            crate::KernelCollectionKind::Map => CheckedExpressionKind::Map {
+                entries: inputs(&crate::KernelOwnerEdgeRole::MapEntry)?,
+            },
+        },
+        crate::KernelOwnerNodeKind::MapEntry => CheckedExpressionKind::MapEntry {
+            key: one_input(&crate::KernelOwnerEdgeRole::MapKey, "map-key")?,
+            value: one_input(&crate::KernelOwnerEdgeRole::MapValue, "map-value")?,
+        },
+        crate::KernelOwnerNodeKind::Latest => CheckedExpressionKind::Latest {
+            branches: inputs(&crate::KernelOwnerEdgeRole::LatestBranch)?,
+        },
+        crate::KernelOwnerNodeKind::When => {
+            let Some(crate::KernelExecutionShapeArtifact::Conditional { kind, .. }) = shape else {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} conditional expression {} has no exact execution shape",
+                    owner.0, expression.id.0,
+                )));
+            };
+            let input = one_input(
+                &crate::KernelOwnerEdgeRole::WhenInput,
+                "conditional selector",
+            )?;
+            let arms = inputs(&crate::KernelOwnerEdgeRole::WhenArm)?;
+            match kind {
+                crate::KernelConditionalKind::When => CheckedExpressionKind::When { input, arms },
+                crate::KernelConditionalKind::While => CheckedExpressionKind::While { input, arms },
+            }
+        }
+        crate::KernelOwnerNodeKind::Then => CheckedExpressionKind::Then {
+            input: one_input(&crate::KernelOwnerEdgeRole::ThenInput, "THEN input")?,
+            output: inputs(&crate::KernelOwnerEdgeRole::ThenOutput)?
+                .into_iter()
+                .next(),
+        },
+        crate::KernelOwnerNodeKind::Infix { operation } => CheckedExpressionKind::Infix {
+            left: one_input(&crate::KernelOwnerEdgeRole::InfixLeft, "infix-left")?,
+            op: operation.to_string(),
+            right: one_input(&crate::KernelOwnerEdgeRole::InfixRight, "infix-right")?,
+        },
+        crate::KernelOwnerNodeKind::Draining => CheckedExpressionKind::Draining {
+            input: one_input(&crate::KernelOwnerEdgeRole::DrainingInput, "DRAINING")?,
+        },
+        crate::KernelOwnerNodeKind::Hold => CheckedExpressionKind::Hold {
+            initial: one_input(&crate::KernelOwnerEdgeRole::HoldInitial, "HOLD initial")?,
+            name: match payload {
+                crate::KernelExpressionSemanticPayload::HoldName(name) => name.to_string(),
+                _ => return Err(expression_payload_error(owner, expression, "HOLD name")),
+            },
+        },
+        crate::KernelOwnerNodeKind::MatchArm { .. } => {
+            let Some(crate::KernelExecutionShapeArtifact::MatchArm { bindings, .. }) = shape else {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} match arm {} has no exact execution shape",
+                    owner.0, expression.id.0,
+                )));
+            };
+            CheckedExpressionKind::MatchArm {
+                pattern: checked_match_pattern(payload)
+                    .ok_or_else(|| expression_payload_error(owner, expression, "match pattern"))?,
+                bindings: bindings
+                    .iter()
+                    .map(|binding| {
+                        layout.declaration(owner, KernelDeclarationReference::Local(*binding))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                output: inputs(&crate::KernelOwnerEdgeRole::MatchOutput)?
+                    .into_iter()
+                    .next(),
+            }
+        }
+        crate::KernelOwnerNodeKind::Arrow => CheckedExpressionKind::Invalid {
+            tokens: vec!["unconsumed_arrow".to_owned()],
+        },
+        crate::KernelOwnerNodeKind::Delimiter => CheckedExpressionKind::Delimiter,
+        crate::KernelOwnerNodeKind::Unknown => CheckedExpressionKind::Invalid {
+            tokens: match payload {
+                crate::KernelExpressionSemanticPayload::Invalid(tokens) => {
+                    tokens.iter().map(|token| token.to_string()).collect()
+                }
+                crate::KernelExpressionSemanticPayload::LexicalPath(path) => vec![
+                    "unresolved_value".to_owned(),
+                    path.iter()
+                        .map(|part| part.as_ref())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                ],
+                _ => vec!["unknown_expression".to_owned()],
+            },
+        },
+        crate::KernelOwnerNodeKind::Known(_)
+        | crate::KernelOwnerNodeKind::FormalRead { .. }
+        | crate::KernelOwnerNodeKind::ContextRead { .. }
+        | crate::KernelOwnerNodeKind::LexicalRead { .. }
+        | crate::KernelOwnerNodeKind::ValueRead { .. }
+        | crate::KernelOwnerNodeKind::DerivedRead { .. }
+        | crate::KernelOwnerNodeKind::PatternRead { .. }
+        | crate::KernelOwnerNodeKind::CollectionItemRead
+        | crate::KernelOwnerNodeKind::FreshOut => {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel definition {} read expression {} has no lexical authority",
+                owner.0, expression.id.0,
+            )));
+        }
+        crate::KernelOwnerNodeKind::UserCall { .. }
+        | crate::KernelOwnerNodeKind::RenderConstructor { .. }
+        | crate::KernelOwnerNodeKind::PureBuiltin { .. }
+        | crate::KernelOwnerNodeKind::HostEffect { .. } => {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel definition {} call expression {} has no call artifact",
+                owner.0, expression.id.0,
+            )));
+        }
+    })
+}
+
+fn checked_record_fields(
+    layout: &KernelCheckedLinkLayout,
+    owner: KernelOwnerId,
+    container_line: usize,
+    container_declaration: Option<DeclId>,
+    fields: &[crate::KernelExecutionRecordFieldArtifact],
+) -> Result<Vec<CheckedRecordField>, KernelCheckedLinkError> {
+    fields
+        .iter()
+        .map(|field| {
+            Ok(CheckedRecordField {
+                declaration: field
+                    .declaration
+                    .map(|declaration| layout.declaration(owner, declaration))
+                    .transpose()?
+                    .or(container_declaration),
+                name: field.name.to_string(),
+                value: layout.expression(owner, field.value)?,
+                spread: field.spread,
+                span: checked_nested_span(container_line, field.span),
+            })
+        })
+        .collect()
+}
+
+fn checked_nested_span(line: usize, span: crate::KernelSourceSpan) -> CheckedSpan {
+    CheckedSpan {
+        line,
+        start: span.start,
+        end: span.end,
+    }
+}
+
+fn checked_match_pattern(
+    payload: &crate::KernelExpressionSemanticPayload,
+) -> Option<CheckedMatchPattern> {
+    let crate::KernelExpressionSemanticPayload::MatchPattern(pattern) = payload else {
+        return None;
+    };
+    Some(match pattern {
+        crate::KernelMatchPatternPayload::Wildcard => CheckedMatchPattern::Wildcard,
+        crate::KernelMatchPatternPayload::Number(value) => CheckedMatchPattern::Number {
+            value: value.clone(),
+        },
+        crate::KernelMatchPatternPayload::Text(value) => CheckedMatchPattern::Text {
+            value: value.to_string(),
+        },
+        crate::KernelMatchPatternPayload::Tag { name, fields } => CheckedMatchPattern::Tag {
+            name: name.to_string(),
+            fields: fields.iter().map(|field| field.to_string()).collect(),
+        },
+        crate::KernelMatchPatternPayload::Binding(name) => CheckedMatchPattern::Binding {
+            name: name.to_string(),
+        },
+        crate::KernelMatchPatternPayload::Bits(value) => CheckedMatchPattern::Bits {
+            value: value.clone(),
+        },
+        crate::KernelMatchPatternPayload::Invalid => return None,
+    })
+}
+
+fn lexical_payload_path(payload: &crate::KernelExpressionSemanticPayload) -> Option<String> {
+    let crate::KernelExpressionSemanticPayload::LexicalPath(path) = payload else {
+        return None;
+    };
+    Some(
+        path.iter()
+            .map(|part| part.as_ref())
+            .collect::<Vec<_>>()
+            .join("."),
+    )
+}
+
+fn canonical_checked_source_read(
+    source_paths: &BTreeMap<DeclId, Vec<(Vec<String>, CheckedSourceId, DeclId)>>,
+    target: DeclId,
+    projection: Vec<String>,
+) -> (DeclId, Vec<String>, Option<CheckedSourceRead>) {
+    let Some(candidates) = source_paths.get(&target) else {
+        return (target, projection, None);
+    };
+    let mut matches = candidates.iter().filter_map(|(path, source, declaration)| {
+        projection
+            .strip_prefix(path.as_slice())
+            .map(|payload| (*source, *declaration, path.len(), payload))
+    });
+    let Some((source, declaration, path_len, payload)) = matches.next() else {
+        return (target, projection, None);
+    };
+    if matches
+        .next()
+        .is_some_and(|(_, _, candidate_len, _)| candidate_len == path_len)
+    {
+        return (target, projection, None);
+    }
+    let payload_projection = payload
+        .strip_prefix(&["event".to_owned()])
+        .or_else(|| payload.strip_prefix(&["events".to_owned()]))
+        .unwrap_or(payload)
+        .to_vec();
+    (
+        declaration,
+        payload.to_vec(),
+        Some(CheckedSourceRead {
+            source,
+            payload_projection,
+        }),
+    )
+}
+
+fn expression_payload_error(
+    owner: KernelOwnerId,
+    expression: &crate::KernelExpressionArtifact,
+    expected: &str,
+) -> KernelCheckedLinkError {
+    KernelCheckedLinkError::new(format!(
+        "kernel definition {} expression {} has no exact {expected} payload",
+        owner.0, expression.id.0,
+    ))
+}
+
 fn push_statement_resource(
     resources: &mut [Vec<CheckedResourceBinding>],
     statement: CheckedStatementId,
@@ -1077,6 +1899,9 @@ fn declaration_flow_type(
             owner.0,
         ))
     })?;
+    if let Some(flow_type) = &declaration.declared_flow_type {
+        return layout.relocate_flow_type(owner, flow_type);
+    }
     if declaration.kind == crate::KernelDeclarationKind::Function {
         if definition.linkage.public_declaration
             != Some(KernelDeclarationReference::Local(declaration.id))
@@ -1160,6 +1985,12 @@ fn declaration_flow_type(
             call,
             ordinal,
         ),
+        crate::KernelDeclarationOrigin::CallContext { .. } => {
+            Err(KernelCheckedLinkError::new(format!(
+                "kernel definition {} call-context declaration {} has no declared flow type",
+                owner.0, declaration.id.0,
+            )))
+        }
         crate::KernelDeclarationOrigin::Statement { .. }
         | crate::KernelDeclarationOrigin::RecordField { .. } => {
             let value = declaration.value.ok_or_else(|| {
@@ -1696,6 +2527,7 @@ mod tests {
                     expression: KernelExpressionId(0),
                     scope: KernelScopeReference::Containing,
                     declaration: Some(KernelDeclarationReference::Local(KernelDeclarationId(0))),
+                    declaration_scope: None,
                     span: crate::KernelSourceSpan {
                         line: 1,
                         start: 0,
@@ -1746,6 +2578,7 @@ mod tests {
                 name: name.into(),
                 kind: KernelDeclarationKind::Field,
                 value: Some(KernelExpressionId(0)),
+                declared_flow_type: None,
             }]
             .into_boxed_slice(),
             lexical_bindings: Box::new([]),

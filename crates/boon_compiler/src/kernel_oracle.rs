@@ -9,9 +9,9 @@
 #![cfg_attr(not(any(test, feature = "test-kernel-oracle")), allow(dead_code))]
 
 use boon_checked::{
-    CheckedDeclaration, CheckedListKeyPolicy, CheckedScope, CheckedStateKind, CheckedStatement,
-    DiagnosticSeverity, FlowMode, FlowType, ObjectShape, Type, TypeDiagnostic, Variant,
-    type_is_recursively_closed,
+    CheckedDeclaration, CheckedExpression, CheckedExpressionKind, CheckedListKeyPolicy,
+    CheckedScope, CheckedStateKind, CheckedStatement, DiagnosticSeverity, FlowMode, FlowType,
+    ObjectShape, Type, TypeDiagnostic, Variant, type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
     CheckDemand, KernelCallArgumentKind, KernelCallArgumentSource, KernelCallInputRole,
@@ -28,16 +28,16 @@ use boon_compiler_kernel::{
     KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
     KernelInheritedFormal, KernelLexicalAccess, KernelLexicalBindingInput,
     KernelLexicalBindingTarget, KernelLexicalBindingTargetInput, KernelListId, KernelListInput,
-    KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
-    KernelOwnerProgramInput, KernelParameterEvaluationScope, KernelParameterKind, KernelPattern,
-    KernelProjectInput, KernelProjectProgramInput, KernelPureBuiltinKind,
-    KernelRenderConstructorKind, KernelScopeId, KernelScopeKind, KernelScopeOrigin,
-    KernelScopePresentation, KernelScopeReference, KernelSession, KernelSolveWork, KernelSourceId,
-    KernelSourceInput, KernelSourceSpan, KernelStateId, KernelStateInput,
-    KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
-    KernelStatementParameter, KernelStatementPresentation, KernelStatementReference,
-    KernelStatementValueUse, KernelStructuralDeclarationInput, KernelTextTemplateSegment,
-    KernelTypeMismatch, KernelValueReference, is_kernel_host_effect,
+    KernelMatchPatternPayload, KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge,
+    KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelParameterEvaluationScope,
+    KernelParameterKind, KernelPattern, KernelProjectInput, KernelProjectProgramInput,
+    KernelPureBuiltinKind, KernelRenderConstructorKind, KernelScopeId, KernelScopeKind,
+    KernelScopeOrigin, KernelScopePresentation, KernelScopeReference, KernelSession,
+    KernelSolveWork, KernelSourceId, KernelSourceInput, KernelSourceSpan, KernelStateId,
+    KernelStateInput, KernelStatementChildReference, KernelStatementId, KernelStatementInput,
+    KernelStatementKind, KernelStatementParameter, KernelStatementPresentation,
+    KernelStatementReference, KernelStatementValueUse, KernelStructuralDeclarationInput,
+    KernelTextTemplateSegment, KernelTypeMismatch, KernelValueReference, is_kernel_host_effect,
     is_registered_kernel_host_effect, project_kernel_call_shape,
     project_kernel_source_expression_diagnostics,
 };
@@ -323,6 +323,10 @@ pub enum KernelOwnerOracleDeclarationOrigin {
         call: StableExpressionKey,
         ordinal: u32,
     },
+    CallContext {
+        call: StableExpressionKey,
+        ordinal: u32,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -486,6 +490,8 @@ pub struct KernelOwnerOracleReport {
     pub supported: Box<[KernelOwnerOracleEntry]>,
     pub checked_scopes: Box<[CheckedScope]>,
     pub checked_declarations: Box<[CheckedDeclaration]>,
+    pub checked_expressions: Box<[CheckedExpression]>,
+    pub checked_expression_keys: Box<[Option<StableExpressionKey>]>,
     pub checked_statements: Box<[CheckedStatement]>,
     pub checked_statement_keys: Box<[StableStatementKey]>,
     pub container_owners: Box<[StableCheckOwnerKey]>,
@@ -500,11 +506,11 @@ pub struct KernelOwnerOracleReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
-    pub basis_fingerprint_v11: [u8; 32],
+    pub basis_fingerprint_v12: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v13: [u8; 32],
+    pub artifact_fingerprint_v14: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v13: [u8; 32],
+    pub fingerprint_v14: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1092,6 +1098,8 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     let mut checked_link_references = 0;
     let mut checked_scopes: Box<[CheckedScope]> = Box::new([]);
     let mut checked_declarations: Box<[CheckedDeclaration]> = Box::new([]);
+    let mut checked_expressions: Box<[CheckedExpression]> = Box::new([]);
+    let mut checked_expression_keys: Box<[Option<StableExpressionKey>]> = Box::new([]);
     let mut checked_statements: Box<[CheckedStatement]> = Box::new([]);
     let mut checked_statement_keys: Box<[StableStatementKey]> = Box::new([]);
     let mut solve_us = 0;
@@ -1142,6 +1150,10 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         .into_vec();
                     let mut materialized_declarations = layout
                         .materialize_declarations(&checked)
+                        .map_err(|error| error.to_string())?
+                        .into_vec();
+                    let mut materialized_expressions = layout
+                        .materialize_expressions(&checked)
                         .map_err(|error| error.to_string())?
                         .into_vec();
                     let mut materialized_statements = layout
@@ -1256,6 +1268,28 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                                     )
                                 })?;
                         }
+                        for row in definition.expressions.start
+                            ..definition
+                                .expressions
+                                .start
+                                .checked_add(definition.expressions.len)
+                                .ok_or_else(|| {
+                                    "kernel checked expression range overflowed".to_owned()
+                                })?
+                        {
+                            let expression = materialized_expressions
+                                .get_mut(row as usize)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "kernel checked expression linker references missing row {row}"
+                                    )
+                                })?;
+                            relocate_direct_checked_expression_spans(
+                                expression,
+                                source.start_line,
+                                source.start_byte,
+                            )?;
+                        }
                         for row in definition.statements.start
                             ..definition
                                 .statements
@@ -1306,6 +1340,27 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                     }
                     checked_scopes = materialized_scopes.into_boxed_slice();
                     checked_declarations = materialized_declarations.into_boxed_slice();
+                    checked_expressions = materialized_expressions.into_boxed_slice();
+                    checked_expression_keys = checked
+                        .definitions
+                        .iter()
+                        .flat_map(|definition| {
+                            definition.relocations.expressions.iter().map(|relocation| {
+                                match relocation {
+                                    KernelExpressionRelocation::Authored(key) => Some(key.clone()),
+                                    KernelExpressionRelocation::SyntheticDefinitionResult => None,
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    if checked_expression_keys.len() != checked_expressions.len() {
+                        return Err(format!(
+                            "kernel checked expression linker has {} stable keys for {} rows",
+                            checked_expression_keys.len(),
+                            checked_expressions.len(),
+                        ));
+                    }
                     checked_statements = materialized_statements.into_boxed_slice();
                     checked_statement_keys = checked
                         .definitions
@@ -1364,11 +1419,11 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 .zip(&artifact.currentness)
                 .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
                     owner: prepared[*prepared_index].owner.clone(),
-                    basis_fingerprint_v11: receipt.basis_fingerprint_v11,
+                    basis_fingerprint_v12: receipt.basis_fingerprint_v12,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v13: receipt.artifact_fingerprint_v13,
+                    artifact_fingerprint_v14: receipt.artifact_fingerprint_v14,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v13: receipt.fingerprint_v13,
+                    fingerprint_v14: receipt.fingerprint_v14,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -2020,6 +2075,8 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         supported: supported.into_boxed_slice(),
         checked_scopes,
         checked_declarations,
+        checked_expressions,
+        checked_expression_keys,
         checked_statements,
         checked_statement_keys,
         container_owners: container_owners.into_boxed_slice(),
@@ -2594,6 +2651,71 @@ fn elapsed_us(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
 }
 
+fn relocate_direct_checked_span(
+    span: &mut boon_checked::CheckedSpan,
+    start_line: usize,
+    start_byte: usize,
+    label: &str,
+) -> Result<(), String> {
+    span.line = start_line
+        .checked_add(
+            span.line
+                .checked_sub(1)
+                .ok_or_else(|| format!("{label} has no source line"))?,
+        )
+        .ok_or_else(|| format!("{label} line overflowed"))?;
+    span.start = start_byte
+        .checked_add(span.start)
+        .ok_or_else(|| format!("{label} start overflowed"))?;
+    span.end = start_byte
+        .checked_add(span.end)
+        .ok_or_else(|| format!("{label} end overflowed"))?;
+    Ok(())
+}
+
+fn relocate_direct_checked_expression_spans(
+    expression: &mut CheckedExpression,
+    start_line: usize,
+    start_byte: usize,
+) -> Result<(), String> {
+    relocate_direct_checked_span(
+        &mut expression.span,
+        start_line,
+        start_byte,
+        &format!("kernel checked expression row {}", expression.id.0),
+    )?;
+    let structural_spans: &mut [_] = match &mut expression.kind {
+        CheckedExpressionKind::TaggedObject { fields, .. }
+        | CheckedExpressionKind::Object { fields } => fields.as_mut_slice(),
+        _ => &mut [],
+    };
+    for (ordinal, field) in structural_spans.iter_mut().enumerate() {
+        relocate_direct_checked_span(
+            &mut field.span,
+            start_line,
+            start_byte,
+            &format!(
+                "kernel checked expression row {} field {ordinal}",
+                expression.id.0,
+            ),
+        )?;
+    }
+    if let CheckedExpressionKind::Block { bindings, .. } = &mut expression.kind {
+        for (ordinal, binding) in bindings.iter_mut().enumerate() {
+            relocate_direct_checked_span(
+                &mut binding.span,
+                start_line,
+                start_byte,
+                &format!(
+                    "kernel checked expression row {} BLOCK binding {ordinal}",
+                    expression.id.0,
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn stable_kernel_declaration_origin(
     owner: &PreparedOwner,
     origin: &KernelDeclarationOrigin,
@@ -2624,6 +2746,12 @@ fn stable_kernel_declaration_origin(
         }
         KernelDeclarationOrigin::CallbackBinding { call, ordinal } => {
             KernelOwnerOracleDeclarationOrigin::CallbackBinding {
+                call: owner.expressions[call.0 as usize].clone(),
+                ordinal: *ordinal,
+            }
+        }
+        KernelDeclarationOrigin::CallContext { call, ordinal } => {
+            KernelOwnerOracleDeclarationOrigin::CallContext {
                 call: owner.expressions[call.0 as usize].clone(),
                 ordinal: *ordinal,
             }
@@ -2718,7 +2846,6 @@ enum PreparedLexicalTarget {
     Declaration(KernelDeclarationOrigin),
     OwnerPublic(StableCheckOwnerKey),
     Value(PreparedInputReference),
-    RuntimeContext,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3488,7 +3615,7 @@ fn compact_execution_shape_inputs(
     raw_expressions: &[&boon_syntax::AstExpr],
     local_by_syntax: &BTreeMap<usize, usize>,
     nodes: &[KernelOwnerNode],
-    statement_record_field_targets: &BTreeMap<(usize, String), PreparedLexicalTarget>,
+    expression_presentations: &[KernelExpressionPresentation],
     declarations: &[KernelDeclarationInput],
     node_count: usize,
     external_by_key: &mut BTreeMap<PreparedExternalExpression, usize>,
@@ -3511,33 +3638,24 @@ fn compact_execution_shape_inputs(
         .iter()
         .map(|declaration| (declaration.origin.clone(), declaration.id))
         .collect::<BTreeMap<_, _>>();
-    let structural_declaration = |target: &PreparedLexicalTarget| -> Result<Option<_>, String> {
-        Ok(match target {
-            PreparedLexicalTarget::Declaration(origin) => Some(
-                declaration_by_origin
-                    .get(origin)
-                    .copied()
-                    .map(KernelStructuralDeclarationInput::Local)
-                    .ok_or_else(|| {
-                        format!("structural execution target has no local declaration {origin:?}")
-                    })?,
-            ),
-            PreparedLexicalTarget::OwnerPublic(_) => {
-                Some(KernelStructuralDeclarationInput::ValueOwnerPublic)
-            }
-            PreparedLexicalTarget::Value(_) | PreparedLexicalTarget::RuntimeContext => None,
-        })
+    let structural_declaration = |declaration: KernelDeclarationReference| match declaration {
+        KernelDeclarationReference::Local(declaration) => {
+            KernelStructuralDeclarationInput::Local(declaration)
+        }
+        KernelDeclarationReference::OwnerPublic(_) => {
+            KernelStructuralDeclarationInput::ValueOwnerPublic
+        }
     };
-    let value_is_owner_result =
-        |value: KernelExpressionId, external_expressions: &[PreparedExternalExpression]| {
-            let index = value.0 as usize;
-            index >= node_count
-                && external_expressions
-                    .get(index - node_count)
-                    .is_some_and(|external| {
-                        matches!(external.target, PreparedExternalTarget::Result)
-                    })
-        };
+    let expression_declaration = |value: KernelExpressionId| {
+        expression_presentations
+            .get(value.0 as usize)
+            .and_then(|presentation| presentation.declaration)
+            .map(structural_declaration)
+            .or_else(|| {
+                ((value.0 as usize) >= node_count)
+                    .then_some(KernelStructuralDeclarationInput::ValueOwnerPublic)
+            })
+    };
     let mut shapes = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
         let expression = checked_kernel_expression(index)?;
@@ -3560,7 +3678,6 @@ fn compact_execution_shape_inputs(
                 shapes.push(KernelExecutionShapeInput::Conditional { expression, kind });
             }
             KernelOwnerNodeKind::Record { .. } => {
-                let syntax = raw_expressions.get(index).map(|expression| expression.id);
                 let fields = node
                     .inputs
                     .iter()
@@ -3571,36 +3688,35 @@ fn compact_execution_shape_inputs(
                                 "canonical record expression {index} has a non-field input"
                             ));
                         };
-                        let declaration = if *spread {
-                            None
-                        } else if let Some(target) = syntax.and_then(|syntax| {
-                            statement_record_field_targets.get(&(syntax, name.to_string()))
-                        }) {
-                            structural_declaration(target)?
-                        } else {
-                            declaration_by_origin
-                                .get(&KernelDeclarationOrigin::RecordField {
-                                    object: expression,
-                                    ordinal: checked_u32(
-                                        ordinal,
-                                        "execution record field ordinal",
-                                    )?,
-                                })
-                                .copied()
-                                .map(KernelStructuralDeclarationInput::Local)
-                                .or_else(|| {
-                                    value_is_owner_result(edge.expression, external_expressions)
-                                        .then_some(
-                                            KernelStructuralDeclarationInput::ValueOwnerPublic,
-                                        )
-                                })
-                        };
+                        let declaration = expression_declaration(edge.expression);
                         Ok(KernelExecutionRecordFieldInput {
                             ordinal: checked_u32(ordinal, "execution record field ordinal")?,
                             declaration,
                             name: name.clone(),
                             value: edge.expression,
                             spread: *spread,
+                            span: raw_expressions
+                                .get(index)
+                                .and_then(|expression| match &expression.kind {
+                                    AstExprKind::Object(fields)
+                                    | AstExprKind::TaggedObject { fields, .. } => {
+                                        fields.get(ordinal).map(|field| {
+                                            kernel_subspan(
+                                                view,
+                                                expression.line,
+                                                field.start,
+                                                field.end,
+                                            )
+                                        })
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap_or_else(|| {
+                                    raw_expressions
+                                        .get(index)
+                                        .map(|expression| kernel_expression_span(expression))
+                                        .unwrap_or_default()
+                                }),
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?
@@ -3655,6 +3771,12 @@ fn compact_execution_shape_inputs(
                                 ordinal: checked_u32(ordinal, "BLOCK binding ordinal")?,
                                 declaration,
                                 value,
+                                span: kernel_subspan(
+                                    view,
+                                    raw_expressions[index].line,
+                                    binding.start,
+                                    binding.end,
+                                ),
                             })
                         })
                         .collect::<Result<Vec<_>, String>>()?
@@ -4149,6 +4271,7 @@ fn compact_owner_view(
             return Err("owner repeats a parser expression identity".to_owned());
         }
     }
+    let child_owned_expressions = direct_child_owned_expression_indices(view, &local_by_syntax)?;
     let (fresh_output_inputs, output_bindings_by_scope) = direct_output_callback_bindings(
         &raw_expressions,
         owner_context_ordinal,
@@ -5380,6 +5503,7 @@ fn compact_owner_view(
             &lexical_binding_reads,
             &output_bindings_by_scope,
             &statement_record_field_targets,
+            &child_owned_expressions,
             value_surfaces,
             node_count,
             &definition_facts.statements,
@@ -5406,18 +5530,6 @@ fn compact_owner_view(
             .map(|ordinal| checked_u32(ordinal, "definition context formal ordinal"))
             .transpose()?,
     };
-    definition_facts.execution_shapes = compact_execution_shape_inputs(
-        view,
-        &owner,
-        &raw_expressions,
-        &local_by_syntax,
-        &nodes,
-        &statement_record_field_targets,
-        &definition_facts.declarations,
-        node_count,
-        &mut external_by_key,
-        &mut external_expressions,
-    )?;
     let mut diagnostics =
         project_kernel_source_expression_diagnostics(raw_expressions.iter().enumerate().map(
             |(index, expression)| {
@@ -5534,8 +5646,22 @@ fn compact_owner_view(
         &local_by_syntax,
         &nodes,
         &definition_facts,
+        &output_bindings_by_scope,
+        &child_owned_expressions,
     )?;
     definition_facts.presentation = presentation;
+    definition_facts.execution_shapes = compact_execution_shape_inputs(
+        view,
+        &owner,
+        &raw_expressions,
+        &local_by_syntax,
+        &nodes,
+        &definition_facts.presentation.expressions,
+        &definition_facts.declarations,
+        node_count,
+        &mut external_by_key,
+        &mut external_expressions,
+    )?;
     Ok(PreparedOwner {
         owner,
         expressions: expressions.into_boxed_slice(),
@@ -6221,25 +6347,23 @@ fn direct_lexical_binding_reads(
                 );
                 break;
             }
-            let call_surface = match &parent_expression.kind {
-                AstExprKind::Call { function, args, .. } => Some((function.as_str(), args)),
-                AstExprKind::Pipe { op, args, .. } => Some((op.as_str(), args)),
-                _ => None,
-            };
-            if let Some((function, arguments)) = call_surface
-                && let Some(context) = render_call_context_surface(function)
-                && root == context.name
-                && let Some(provider) = arguments
-                    .iter()
-                    .find(|argument| argument.named_name() == Some(context.provider))
-                    .map(|argument| argument.value)
-                && provider != cursor
+            if let Some(context) = render_call_context_instance(parent_expression)
+                && root == context.surface.name
+                && context.provider != cursor
             {
+                let call = KernelExpressionId(checked_u32(
+                    *local_by_syntax
+                        .get(&parent_expression.id)
+                        .ok_or_else(|| "call-context expression is not local".to_owned())?,
+                    "call-context expression",
+                )?);
                 reads.insert(
                     expression.id,
                     PreparedLexicalBinding {
-                        provider: PreparedLexicalProvider::Known(context.flow_type),
-                        target: PreparedLexicalTarget::RuntimeContext,
+                        provider: PreparedLexicalProvider::Known(context.surface.flow_type),
+                        target: PreparedLexicalTarget::Declaration(
+                            KernelDeclarationOrigin::CallContext { call, ordinal: 0 },
+                        ),
                         prefix: Box::new([]),
                         directional: false,
                         pattern: None,
@@ -6851,12 +6975,88 @@ fn kernel_syntax_expression_children(expression: &AstExpr) -> Vec<usize> {
     children
 }
 
+fn checked_presentation_statement_body_container(
+    statement: &AstStatement,
+    raw_expressions: &[&AstExpr],
+    local_by_syntax: &BTreeMap<usize, usize>,
+) -> Option<usize> {
+    fn is_container(expression: &AstExpr) -> bool {
+        matches!(
+            expression.kind,
+            AstExprKind::Block { .. }
+                | AstExprKind::Object(_)
+                | AstExprKind::ListLiteral { .. }
+                | AstExprKind::MapLiteral { .. }
+                | AstExprKind::SetLiteral { .. }
+        )
+    }
+
+    let direct = statement.expr?;
+    let direct_local = local_by_syntax.get(&direct).copied()?;
+    let expression = raw_expressions.get(direct_local).copied()?;
+    if is_container(expression) {
+        return Some(direct_local);
+    }
+    let output = match &expression.kind {
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        }
+        | AstExprKind::Then {
+            output: Some(output),
+            ..
+        } => *output,
+        _ => return None,
+    };
+    let output_local = local_by_syntax.get(&output).copied()?;
+    raw_expressions
+        .get(output_local)
+        .copied()
+        .filter(|output| is_container(output))
+        .map(|_| output_local)
+}
+
+/// Return the local placeholder expressions whose value authority belongs to
+/// a nested public owner. The parent syntax view retains these expressions so
+/// structural result edges remain explicit, but they are not independent
+/// lexical records in the parent definition.
+fn direct_child_owned_expression_indices(
+    view: UnitOwnerSyntaxView<'_>,
+    local_by_syntax: &BTreeMap<usize, usize>,
+) -> Result<BTreeSet<usize>, String> {
+    let mut expressions = BTreeSet::new();
+    for boundary in view.child_owners() {
+        if view
+            .stable_check_owner_for_local_statement(boundary.statement())
+            .is_none()
+        {
+            return Err("child owner boundary has no stable owner".to_owned());
+        }
+        for syntax in [
+            view.statement_for_local(boundary.statement())
+                .and_then(|statement| statement.expr),
+            view.child_owner_boundary_expression(boundary),
+            view.child_owner_result_expression(boundary),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(expression) = local_by_syntax.get(&syntax).copied() {
+                expressions.insert(expression);
+            }
+        }
+    }
+    Ok(expressions)
+}
+
 fn compact_checked_presentation(
     view: UnitOwnerSyntaxView<'_>,
     raw_expressions: &[&AstExpr],
     local_by_syntax: &BTreeMap<usize, usize>,
     nodes: &[KernelOwnerNode],
     facts: &KernelDefinitionFactsInput,
+    output_bindings_by_scope: &PreparedOutputBindingsByScope,
+    child_owned_expressions: &BTreeSet<usize>,
 ) -> Result<
     (
         KernelDefinitionPresentation,
@@ -6875,6 +7075,23 @@ fn compact_checked_presentation(
     {
         return Err("checked presentation input is not dense".to_owned());
     }
+    let root_list_publishes_containing_result = facts
+        .linkage
+        .root_statement
+        .map(|statement| statement.0 as usize)
+        .filter(|root| {
+            matches!(
+                facts.statements[*root].kind,
+                KernelStatementKind::List { .. }
+            )
+        })
+        .and_then(|root| {
+            let local = *view.statement_ids().get(root)?;
+            let expression = raw_statements.get(root)?.expr?;
+            let parent = view.statement_locator(local)?.parent()?;
+            Some(view.checked_statement_value_expression(parent) == Some(expression))
+        })
+        .unwrap_or(false);
     let dense_statement_by_local = view
         .statement_ids()
         .iter()
@@ -6901,12 +7118,22 @@ fn compact_checked_presentation(
             _ => None,
         })
         .collect::<BTreeMap<_, _>>();
-    let declaration_by_record_field = facts
+    let declaration_by_callback = facts
         .declarations
         .iter()
         .filter_map(|declaration| match declaration.origin {
-            KernelDeclarationOrigin::RecordField { object, ordinal } => {
-                Some(((object.0 as usize, ordinal as usize), declaration.id))
+            KernelDeclarationOrigin::CallbackBinding { call, ordinal } => {
+                Some(((call.0 as usize, ordinal), declaration.id))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let declaration_by_call_context = facts
+        .declarations
+        .iter()
+        .filter_map(|declaration| match declaration.origin {
+            KernelDeclarationOrigin::CallContext { call, ordinal } => {
+                Some(((call.0 as usize, ordinal), declaration.id))
             }
             _ => None,
         })
@@ -6930,10 +7157,18 @@ fn compact_checked_presentation(
         let direct = syntax
             .expr
             .and_then(|expression| local_by_syntax.get(&expression).copied());
+        let body_container = checked_presentation_statement_body_container(
+            syntax,
+            &raw_expressions,
+            local_by_syntax,
+        );
         let kind = if matches!(statement.kind, KernelStatementKind::Function { .. }) {
             KernelScopeKind::Function
-        } else if direct.is_some_and(|expression| {
-            matches!(nodes[expression].kind, KernelOwnerNodeKind::Record { .. })
+        } else if body_container.or(direct).is_some_and(|expression| {
+            matches!(
+                raw_expressions[expression].kind,
+                AstExprKind::Object(_) | AstExprKind::TaggedObject { .. }
+            )
         }) {
             KernelScopeKind::Record
         } else {
@@ -6995,6 +7230,8 @@ fn compact_checked_presentation(
     }
 
     let mut expression_boundaries = BTreeMap::<usize, KernelScopeId>::new();
+    let mut record_declaration_scopes = BTreeMap::<usize, KernelScopeId>::new();
+    let mut match_arm_scopes = BTreeMap::<usize, KernelScopeId>::new();
     for (statement, syntax) in facts.statements.iter().zip(raw_statements.iter()) {
         let Some(body) = body_scopes[statement.id.0 as usize] else {
             continue;
@@ -7002,15 +7239,23 @@ fn compact_checked_presentation(
         if let Some(expression) = syntax
             .expr
             .and_then(|expression| local_by_syntax.get(&expression).copied())
-            && matches!(nodes[expression].kind, KernelOwnerNodeKind::Record { .. })
+            && matches!(
+                raw_expressions[expression].kind,
+                AstExprKind::Object(_) | AstExprKind::TaggedObject { .. }
+            )
         {
             expression_boundaries.insert(expression, body);
+            record_declaration_scopes.insert(expression, body);
         }
     }
     for (expression, node) in nodes.iter().enumerate().take(raw_expressions.len()) {
-        let (kind, origin) = match &node.kind {
+        let (kind, origin, is_match_arm) = match &node.kind {
             KernelOwnerNodeKind::Record { .. }
-                if !expression_boundaries.contains_key(&expression) =>
+                if matches!(
+                    raw_expressions[expression].kind,
+                    AstExprKind::Object(_) | AstExprKind::TaggedObject { .. }
+                ) && !expression_boundaries.contains_key(&expression)
+                    && !child_owned_expressions.contains(&expression) =>
             {
                 (
                     KernelScopeKind::Record,
@@ -7020,6 +7265,7 @@ fn compact_checked_presentation(
                             "record scope expression",
                         )?),
                     },
+                    false,
                 )
             }
             KernelOwnerNodeKind::MatchArm { .. } => (
@@ -7030,6 +7276,7 @@ fn compact_checked_presentation(
                         "match scope expression",
                     )?),
                 },
+                true,
             ),
             _ => continue,
         };
@@ -7042,7 +7289,11 @@ fn compact_checked_presentation(
             origin,
             span: kernel_expression_span(raw_expressions[expression]),
         });
-        expression_boundaries.insert(expression, id);
+        if is_match_arm {
+            match_arm_scopes.insert(expression, id);
+        } else {
+            record_declaration_scopes.insert(expression, id);
+        }
     }
 
     let root_statement = facts
@@ -7100,6 +7351,96 @@ fn compact_checked_presentation(
         }
     }
 
+    let mut callback_output_scopes = Vec::new();
+    let mut callback_output_by_origin = BTreeMap::new();
+    for (call_syntax, bindings) in output_bindings_by_scope {
+        let call = local_by_syntax
+            .get(call_syntax)
+            .copied()
+            .ok_or_else(|| "OUT scope call expression is not local".to_owned())?;
+        for binding in bindings.iter() {
+            let declaration = declaration_by_callback
+                .get(&(call, binding.formal_ordinal))
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "OUT scope call expression {call} formal {} has no callback declaration",
+                        binding.formal_ordinal,
+                    )
+                })?;
+            let provider = local_by_syntax
+                .get(&binding.provider)
+                .copied()
+                .ok_or_else(|| "OUT scope provider expression is not local".to_owned())?;
+            let active_inputs = binding
+                .active_inputs
+                .iter()
+                .map(|input| {
+                    local_by_syntax
+                        .get(input)
+                        .copied()
+                        .ok_or_else(|| "OUT scope active input is not local".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let scope = KernelScopeId(checked_u32(scopes.len(), "callback OUT scope")?);
+            scopes.push(KernelScopePresentation {
+                id: scope,
+                parent: KernelScopeReference::Containing,
+                owner: Some(KernelDeclarationReference::Local(declaration)),
+                kind: KernelScopeKind::RepeatedOutput,
+                origin: KernelScopeOrigin::CallbackOutput {
+                    call: KernelExpressionId(checked_u32(call, "callback OUT call")?),
+                    formal_ordinal: binding.formal_ordinal,
+                },
+                span: kernel_expression_span(raw_expressions[call]),
+            });
+            if callback_output_by_origin
+                .insert((call, binding.formal_ordinal), scope)
+                .is_some()
+            {
+                return Err(format!(
+                    "OUT scope call expression {call} repeats formal {}",
+                    binding.formal_ordinal,
+                ));
+            }
+            callback_output_scopes.push((call, provider, active_inputs, scope));
+        }
+    }
+
+    let mut call_context_scope_by_origin = BTreeMap::new();
+    for (call, expression) in raw_expressions.iter().enumerate() {
+        if render_call_context_instance(expression).is_none() {
+            continue;
+        }
+        let ordinal = 0;
+        let declaration = declaration_by_call_context
+            .get(&(call, ordinal))
+            .copied()
+            .ok_or_else(|| {
+                format!("call-context expression {call} has no generated declaration")
+            })?;
+        let scope = KernelScopeId(checked_u32(scopes.len(), "call-context scope")?);
+        scopes.push(KernelScopePresentation {
+            id: scope,
+            parent: KernelScopeReference::Containing,
+            owner: Some(KernelDeclarationReference::Local(declaration)),
+            kind: KernelScopeKind::CallContext,
+            origin: KernelScopeOrigin::CallContext {
+                expression: KernelExpressionId(checked_u32(call, "call-context call")?),
+                context_ordinal: ordinal,
+            },
+            span: kernel_expression_span(expression),
+        });
+        if call_context_scope_by_origin
+            .insert((call, ordinal), scope)
+            .is_some()
+        {
+            return Err(format!(
+                "call-context expression {call} repeats context ordinal {ordinal}"
+            ));
+        }
+    }
+
     let repeated_output_by_parameter = scopes
         .iter()
         .filter_map(|scope| match scope.origin {
@@ -7133,6 +7474,7 @@ fn compact_checked_presentation(
                 expression: KernelExpressionId(checked_u32(index, "presentation expression")?),
                 scope: KernelScopeReference::Containing,
                 declaration: None,
+                declaration_scope: None,
                 span,
             })
         })
@@ -7145,9 +7487,9 @@ fn compact_checked_presentation(
         declaration: Option<KernelDeclarationReference>,
         force: bool,
         raw_expressions: &[&AstExpr],
-        local_by_syntax: &BTreeMap<usize, usize>,
+        nodes: &[KernelOwnerNode],
         boundaries: &BTreeMap<usize, KernelScopeId>,
-        declaration_by_record_field: &BTreeMap<(usize, usize), KernelDeclarationId>,
+        record_declaration_scopes: &BTreeMap<usize, KernelScopeId>,
         scopes: &mut [KernelScopePresentation],
         presentations: &mut [KernelExpressionPresentation],
         assigned: &mut [bool],
@@ -7162,11 +7504,31 @@ fn compact_checked_presentation(
         if !active.insert(expression) {
             return Ok(());
         }
+        if let Some(record_scope) = record_declaration_scopes.get(&expression).copied() {
+            let row = scopes
+                .get_mut(record_scope.0 as usize)
+                .ok_or_else(|| "record declaration references missing scope".to_owned())?;
+            if inherited_scope == KernelScopeReference::Local(record_scope) {
+                // Statement-body records reuse their existing body scope.
+            } else if row.parent == KernelScopeReference::Containing || force {
+                row.parent = inherited_scope;
+            } else if row.parent != inherited_scope {
+                return Err(format!(
+                    "record declaration scope has conflicting lexical parents: expression={expression} scope={record_scope:?} existing={:?} inherited={inherited_scope:?}",
+                    row.parent,
+                ));
+            }
+        }
         let scope = if let Some(boundary) = boundaries.get(&expression).copied() {
             let row = scopes
                 .get_mut(boundary.0 as usize)
                 .ok_or_else(|| "expression boundary references missing scope".to_owned())?;
-            if row.parent == KernelScopeReference::Containing || force {
+            if inherited_scope == KernelScopeReference::Local(boundary) {
+                // A statement-body container can itself own the boundary
+                // scope. Its parent was assigned from the statement before
+                // this body override; never turn that boundary into its own
+                // parent.
+            } else if row.parent == KernelScopeReference::Containing || force {
                 row.parent = inherited_scope;
             } else if row.parent != inherited_scope {
                 return Err(format!(
@@ -7183,59 +7545,29 @@ fn compact_checked_presentation(
             presentations[expression].declaration = declaration;
         }
         assigned[expression] = true;
-        let syntax = raw_expressions[expression];
-        let record_fields = match &syntax.kind {
-            AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => Some(fields),
-            _ => None,
-        };
-        if let Some(fields) = record_fields {
-            for (ordinal, field) in fields.iter().enumerate() {
-                let child = local_by_syntax.get(&field.value).copied();
-                let child_declaration = if field.spread {
-                    declaration
-                } else {
-                    declaration_by_record_field
-                        .get(&(expression, ordinal))
-                        .copied()
-                        .map(KernelDeclarationReference::Local)
-                        .or(declaration)
-                };
-                if let Some(child) = child {
-                    assign_expression_tree(
-                        child,
-                        scope,
-                        child_declaration,
-                        true,
-                        raw_expressions,
-                        local_by_syntax,
-                        boundaries,
-                        declaration_by_record_field,
-                        scopes,
-                        presentations,
-                        assigned,
-                        active,
-                    )?;
-                }
+        for input in nodes[expression]
+            .inputs
+            .iter()
+            .filter(|input| !matches!(input.role, KernelOwnerEdgeRole::ReadProvider))
+        {
+            let child = input.expression.0 as usize;
+            if child >= raw_expressions.len() {
+                continue;
             }
-        } else {
-            for child in kernel_syntax_expression_children(syntax) {
-                if let Some(child) = local_by_syntax.get(&child).copied() {
-                    assign_expression_tree(
-                        child,
-                        scope,
-                        declaration,
-                        force,
-                        raw_expressions,
-                        local_by_syntax,
-                        boundaries,
-                        declaration_by_record_field,
-                        scopes,
-                        presentations,
-                        assigned,
-                        active,
-                    )?;
-                }
-            }
+            assign_expression_tree(
+                child,
+                scope,
+                declaration,
+                force,
+                raw_expressions,
+                nodes,
+                boundaries,
+                record_declaration_scopes,
+                scopes,
+                presentations,
+                assigned,
+                active,
+            )?;
         }
         active.remove(&expression);
         Ok(())
@@ -7249,10 +7581,12 @@ fn compact_checked_presentation(
             .map(KernelDeclarationReference::Local)
             .or_else(|| statement_parents[index].and_then(|parent| inherited_declarations[parent]))
             .or_else(|| {
-                facts
-                    .linkage
-                    .public_declaration
-                    .filter(|_| statement_parents[index].is_none())
+                (statement_parents[index].is_none())
+                    .then_some(facts.linkage.public_declaration)
+                    .flatten()
+                    .filter(|declaration| {
+                        matches!(declaration, KernelDeclarationReference::Local(_))
+                    })
             });
         if let Some(expression) = raw_statements[index]
             .expr
@@ -7264,9 +7598,38 @@ fn compact_checked_presentation(
                 inherited_declarations[index],
                 true,
                 raw_expressions,
-                local_by_syntax,
+                nodes,
                 &expression_boundaries,
-                &declaration_by_record_field,
+                &record_declaration_scopes,
+                &mut scopes,
+                &mut presentations,
+                &mut assigned,
+                &mut BTreeSet::new(),
+            )?;
+        }
+        let split_list_root = facts.linkage.root_statement == Some(facts.statements[index].id)
+            && matches!(
+                facts.statements[index].kind,
+                KernelStatementKind::List { .. }
+            )
+            && !root_list_publishes_containing_result;
+        if !split_list_root
+            && let Some(container) = checked_presentation_statement_body_container(
+                raw_statements[index],
+                &raw_expressions,
+                local_by_syntax,
+            )
+            && let Some(body_scope) = body_scopes[index]
+        {
+            assign_expression_tree(
+                container,
+                KernelScopeReference::Local(body_scope),
+                inherited_declarations[index],
+                true,
+                raw_expressions,
+                nodes,
+                &expression_boundaries,
+                &record_declaration_scopes,
                 &mut scopes,
                 &mut presentations,
                 &mut assigned,
@@ -7282,15 +7645,213 @@ fn compact_checked_presentation(
                 facts.linkage.public_declaration,
                 false,
                 raw_expressions,
-                local_by_syntax,
+                nodes,
                 &expression_boundaries,
-                &declaration_by_record_field,
+                &record_declaration_scopes,
                 &mut scopes,
                 &mut presentations,
                 &mut assigned,
                 &mut BTreeSet::new(),
             )?;
         }
+    }
+    // A structural LIST owner can either publish the containing declaration's
+    // final value or feed a later pipeline in that declaration. In the latter
+    // case its item expressions are intermediate occurrences in the imported
+    // containing scope. Keep the LIST owner's authored scope rows for stable
+    // statement/declaration identity, but do not falsely move those
+    // occurrences into the intermediate LIST body. Generated callback and
+    // pattern scopes are applied below and can still refine this base scope.
+    if let Some(root) = facts
+        .linkage
+        .root_statement
+        .map(|statement| statement.0 as usize)
+        .filter(|root| {
+            matches!(
+                facts.statements[*root].kind,
+                KernelStatementKind::List { .. }
+            ) && !root_list_publishes_containing_result
+        })
+        && let Some(root_expression) = raw_statements[root]
+            .expr
+            .and_then(|expression| local_by_syntax.get(&expression).copied())
+    {
+        let base_scope = statement_scopes[root].expect("root LIST scope was assigned");
+        let mut pending = kernel_syntax_expression_children(raw_expressions[root_expression]);
+        let mut visited = BTreeSet::new();
+        while let Some(syntax) = pending.pop() {
+            let Some(expression) = local_by_syntax.get(&syntax).copied() else {
+                continue;
+            };
+            if !visited.insert(expression) {
+                continue;
+            }
+            presentations[expression].scope = base_scope;
+            pending.extend(kernel_syntax_expression_children(
+                raw_expressions[expression],
+            ));
+        }
+    }
+
+    let parent_by_expression = nodes
+        .iter()
+        .take(raw_expressions.len())
+        .enumerate()
+        .flat_map(|(parent, expression)| {
+            expression
+                .inputs
+                .iter()
+                .filter(|input| !matches!(input.role, KernelOwnerEdgeRole::ReadProvider))
+                .filter_map(move |input| {
+                    let child = input.expression.0 as usize;
+                    (child < raw_expressions.len()).then_some((child, parent))
+                })
+        })
+        .collect::<BTreeMap<_, _>>();
+    fn expression_depth(
+        expression: usize,
+        parents: &BTreeMap<usize, usize>,
+        active: &mut BTreeSet<usize>,
+    ) -> Result<usize, String> {
+        if !active.insert(expression) {
+            return Err("checked presentation expression parents contain a cycle".to_owned());
+        }
+        let depth = parents.get(&expression).copied().map_or(Ok(0), |parent| {
+            expression_depth(parent, parents, active).map(|depth| depth.saturating_add(1))
+        })?;
+        active.remove(&expression);
+        Ok(depth)
+    }
+    let mut ordered_match_arms = match_arm_scopes
+        .iter()
+        .map(|(expression, scope)| {
+            Ok((
+                expression_depth(*expression, &parent_by_expression, &mut BTreeSet::new())?,
+                *expression,
+                *scope,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    ordered_match_arms.sort_by_key(|(depth, expression, _)| (*depth, *expression));
+    let statement_by_expression = raw_statements
+        .iter()
+        .enumerate()
+        .filter_map(|(statement, syntax)| {
+            syntax
+                .expr
+                .and_then(|expression| local_by_syntax.get(&expression).copied())
+                .map(|expression| (expression, statement))
+        })
+        .collect::<BTreeMap<_, _>>();
+    // Callback OUT scopes are added after the authored lexical walk. Preserve
+    // the scope from which a declaration-less occurrence inherited its
+    // declaration before moving it into the generated RepeatedOutput scope;
+    // otherwise the linker falls back to the FreshOut scope owner.
+    for presentation in &mut presentations {
+        if presentation.declaration.is_none() {
+            presentation.declaration_scope = Some(presentation.scope);
+        }
+    }
+    let authored_expression_declarations = presentations
+        .iter()
+        .map(|presentation| (presentation.declaration, presentation.declaration_scope))
+        .collect::<Vec<_>>();
+    // Pattern scopes are authored lexical boundaries. Establish them before
+    // relocating output-scoped arguments so a callback nested in an arm keeps
+    // the arm as its parent, while a match nested inside a callback remains an
+    // authored Block below that callback scope.
+    for (_, expression, scope) in ordered_match_arms {
+        let parent = presentations[expression].scope;
+        scopes[scope.0 as usize].parent = parent;
+        presentations[expression].scope = KernelScopeReference::Local(scope);
+        let statement = statement_by_expression.get(&expression).copied();
+        if let Some(statement) = statement {
+            statement_scopes[statement] = Some(KernelScopeReference::Local(scope));
+            if let Some(body) = body_scopes[statement] {
+                scopes[body.0 as usize].parent = KernelScopeReference::Local(scope);
+                continue;
+            }
+        }
+        let output = match &raw_expressions[expression].kind {
+            AstExprKind::MatchArm {
+                output: Some(output),
+                ..
+            } => local_by_syntax.get(output).copied(),
+            _ => None,
+        };
+        if let Some(output) = output {
+            let declaration = presentations[output].declaration;
+            assign_expression_tree(
+                output,
+                KernelScopeReference::Local(scope),
+                declaration,
+                true,
+                raw_expressions,
+                nodes,
+                &expression_boundaries,
+                &record_declaration_scopes,
+                &mut scopes,
+                &mut presentations,
+                &mut assigned,
+                &mut BTreeSet::new(),
+            )?;
+        }
+    }
+    let mut callback_boundaries = expression_boundaries.clone();
+    callback_boundaries.extend(
+        match_arm_scopes
+            .iter()
+            .map(|(expression, scope)| (*expression, *scope)),
+    );
+    let mut ordered_callback_output_scopes = callback_output_scopes
+        .into_iter()
+        .map(|row @ (call, _, _, _)| {
+            Ok((
+                expression_depth(call, &parent_by_expression, &mut BTreeSet::new())?,
+                row,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    ordered_callback_output_scopes.sort_by_key(|(depth, (call, _, _, _))| (*depth, *call));
+    for (_, (call, provider, active_inputs, scope)) in ordered_callback_output_scopes {
+        let parent = presentations[call].scope;
+        scopes[scope.0 as usize].parent = parent;
+        let mut roots = Vec::with_capacity(active_inputs.len().saturating_add(1));
+        roots.push(provider);
+        roots.extend(active_inputs);
+        roots.sort_unstable();
+        roots.dedup();
+        for root in roots {
+            let declaration = presentations[root].declaration;
+            assign_expression_tree(
+                root,
+                KernelScopeReference::Local(scope),
+                declaration,
+                true,
+                raw_expressions,
+                nodes,
+                &callback_boundaries,
+                &record_declaration_scopes,
+                &mut scopes,
+                &mut presentations,
+                &mut assigned,
+                &mut BTreeSet::new(),
+            )?;
+        }
+    }
+    for (presentation, (declaration, declaration_scope)) in presentations
+        .iter_mut()
+        .zip(authored_expression_declarations)
+    {
+        presentation.declaration = declaration;
+        presentation.declaration_scope = declaration_scope;
+    }
+    // Context declarations are scoped to their exact call occurrence, while
+    // argument expressions retain their authored/evaluation scopes. Resolve
+    // the parent only after callback and match-arm placement has stabilized
+    // the call expression's final lexical scope.
+    for ((call, _), scope) in &call_context_scope_by_origin {
+        scopes[scope.0 as usize].parent = presentations[*call].scope;
     }
     if let Some(result) = facts.linkage.result_expression
         && result.0 as usize >= raw_expressions.len()
@@ -7367,12 +7928,12 @@ fn compact_checked_presentation(
                     })?;
                     let value = local_by_syntax.get(&field.value).copied();
                     (
-                        presentations[object_index].scope,
-                        value
-                            .and_then(|value| expression_boundaries.get(&value).copied())
-                            .filter(|scope| {
-                                scopes[scope.0 as usize].kind == KernelScopeKind::Record
-                            }),
+                        record_declaration_scopes
+                            .get(&object_index)
+                            .copied()
+                            .map(KernelScopeReference::Local)
+                            .unwrap_or(presentations[object_index].scope),
+                        value.and_then(|value| record_declaration_scopes.get(&value).copied()),
                         kernel_subspan(
                             view,
                             raw_expressions[object_index].line,
@@ -7386,8 +7947,21 @@ fn compact_checked_presentation(
                     None,
                     kernel_expression_span(raw_expressions[arm.0 as usize]),
                 ),
-                KernelDeclarationOrigin::CallbackBinding { call, .. } => (
+                KernelDeclarationOrigin::CallbackBinding { call, ordinal } => (
                     presentations[call.0 as usize].scope,
+                    callback_output_by_origin
+                        .get(&(call.0 as usize, ordinal))
+                        .copied(),
+                    kernel_expression_span(raw_expressions[call.0 as usize]),
+                ),
+                KernelDeclarationOrigin::CallContext { call, ordinal } => (
+                    call_context_scope_by_origin
+                        .get(&(call.0 as usize, ordinal))
+                        .copied()
+                        .map(KernelScopeReference::Local)
+                        .ok_or_else(|| {
+                            "call-context declaration has no generated scope".to_owned()
+                        })?,
                     None,
                     kernel_expression_span(raw_expressions[call.0 as usize]),
                 ),
@@ -7930,13 +8504,13 @@ fn compact_resource_facts(
             PreparedLexicalTarget::OwnerPublic(_) => {
                 Some(KernelDeclarationReference::OwnerPublic(KernelOwnerId(0)))
             }
-            PreparedLexicalTarget::Value(_) | PreparedLexicalTarget::RuntimeContext => None,
+            PreparedLexicalTarget::Value(_) => None,
         }
     };
     let target_owner = |target: &PreparedLexicalTarget| match target {
         PreparedLexicalTarget::OwnerPublic(owner) => owner.clone(),
         PreparedLexicalTarget::Declaration(_) => owner.clone(),
-        PreparedLexicalTarget::Value(_) | PreparedLexicalTarget::RuntimeContext => owner.clone(),
+        PreparedLexicalTarget::Value(_) => owner.clone(),
     };
     let canonical_projection = |target: &PreparedLexicalTarget,
                                 expression: KernelExpressionId|
@@ -8285,6 +8859,7 @@ fn compact_declaration_and_lexical_facts(
     lexical_binding_reads: &BTreeMap<usize, PreparedLexicalBinding>,
     output_bindings_by_scope: &PreparedOutputBindingsByScope,
     statement_record_field_targets: &BTreeMap<(usize, String), PreparedLexicalTarget>,
+    child_owned_expressions: &BTreeSet<usize>,
     value_surfaces: &BTreeMap<String, Vec<ValueSurface>>,
     node_count: usize,
     statements: &[KernelStatementInput],
@@ -8325,6 +8900,7 @@ fn compact_declaration_and_lexical_facts(
         Box<str>,
         KernelDeclarationKind,
         Option<KernelExpressionId>,
+        Option<FlowType>,
     )>::new();
     for statement in statements {
         let (name, kind, value) = match &statement.kind {
@@ -8386,6 +8962,7 @@ fn compact_declaration_and_lexical_facts(
             name,
             kind,
             value,
+            None,
         ));
         if let KernelStatementKind::Function { parameters, .. } = &statement.kind {
             pending.extend(parameters.iter().map(|parameter| {
@@ -8399,6 +8976,7 @@ fn compact_declaration_and_lexical_facts(
                         KernelParameterKind::Value => KernelDeclarationKind::ValueParameter,
                         KernelParameterKind::Out => KernelDeclarationKind::OutParameter,
                     },
+                    None,
                     None,
                 )
             }));
@@ -8433,11 +9011,30 @@ fn compact_declaration_and_lexical_facts(
                     binding.name.clone().into_boxed_str(),
                     KernelDeclarationKind::FreshOut,
                     None,
+                    None,
                 ));
             }
         }
+        if let Some(context) = render_call_context_instance(expression) {
+            pending.push((
+                KernelDeclarationOrigin::CallContext {
+                    call: object,
+                    ordinal: 0,
+                },
+                context.surface.name.into(),
+                KernelDeclarationKind::ElementState,
+                None,
+                Some(FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: context.surface.flow_type,
+                }),
+            ));
+        }
         match &expression.kind {
             AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
+                if child_owned_expressions.contains(&(object.0 as usize)) {
+                    continue;
+                }
                 for (ordinal, field) in fields.iter().enumerate() {
                     if field.spread
                         || statement_record_field_targets
@@ -8465,6 +9062,7 @@ fn compact_declaration_and_lexical_facts(
                             external_by_key,
                             external_expressions,
                         )?)?),
+                        None,
                     ));
                 }
             }
@@ -8478,6 +9076,7 @@ fn compact_declaration_and_lexical_facts(
                         name.into_boxed_str(),
                         KernelDeclarationKind::PatternBinding,
                         None,
+                        None,
                     ));
                 }
             }
@@ -8489,7 +9088,7 @@ fn compact_declaration_and_lexical_facts(
     let declarations = pending
         .into_iter()
         .enumerate()
-        .map(|(index, (origin, name, kind, value))| {
+        .map(|(index, (origin, name, kind, value, declared_flow_type))| {
             let id = KernelDeclarationId(checked_u32(index, "declaration index")?);
             if declaration_by_origin.insert(origin.clone(), id).is_some() {
                 return Err(format!(
@@ -8502,6 +9101,7 @@ fn compact_declaration_and_lexical_facts(
                 name,
                 kind,
                 value,
+                declared_flow_type,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -8596,9 +9196,6 @@ fn compact_declaration_and_lexical_facts(
                         external_expressions,
                     )?)?,
                 },
-                PreparedLexicalTarget::RuntimeContext => {
-                    KernelLexicalBindingTargetInput::RuntimeContext
-                }
             };
             let target_prefix = if matches!(
                 binding.target,
@@ -8889,6 +9486,11 @@ struct PreparedCallContextSurface {
     flow_type: Type,
 }
 
+struct PreparedCallContextInstance {
+    surface: PreparedCallContextSurface,
+    provider: usize,
+}
+
 /// Return call-local values supplied by the active render-constructor ABI.
 ///
 /// This is ordinary ABI metadata: `element` is not a Boon keyword, and other
@@ -8917,6 +9519,24 @@ fn render_call_context_surface(function: &str) -> Option<PreparedCallContextSurf
             )),
         }
     })
+}
+
+/// Resolve one ABI call context only when its provider formal is present.
+/// The provider supplies the constructor value; every other matched input may
+/// read the context declaration. This mirrors the callable contract without
+/// teaching the language about a particular UI library or tag spelling.
+fn render_call_context_instance(expression: &AstExpr) -> Option<PreparedCallContextInstance> {
+    let (function, arguments) = match &expression.kind {
+        AstExprKind::Call { function, args, .. } => (function.as_str(), args.as_slice()),
+        AstExprKind::Pipe { op, args, .. } => (op.as_str(), args.as_slice()),
+        _ => return None,
+    };
+    let surface = render_call_context_surface(function)?;
+    let provider = arguments
+        .iter()
+        .find(|argument| argument.named_name() == Some(surface.provider))?
+        .value;
+    Some(PreparedCallContextInstance { surface, provider })
 }
 
 fn prepared_lexical_read_node(
@@ -9497,6 +10117,67 @@ fn compact_expression_semantic_payload(kind: &AstExprKind) -> KernelExpressionSe
         AstExprKind::Hold { name, .. } => {
             KernelExpressionSemanticPayload::HoldName(name.clone().into_boxed_str())
         }
+        AstExprKind::MatchArm { pattern, .. } => {
+            KernelExpressionSemanticPayload::MatchPattern(match pattern {
+                AstMatchPattern::Wildcard => KernelMatchPatternPayload::Wildcard,
+                AstMatchPattern::Number { value } => ExactNumber::parse_strict(value, None)
+                    .map(KernelMatchPatternPayload::Number)
+                    .unwrap_or(KernelMatchPatternPayload::Invalid),
+                AstMatchPattern::Text { value } => {
+                    KernelMatchPatternPayload::Text(value.clone().into_boxed_str())
+                }
+                AstMatchPattern::Tag { name, fields } => KernelMatchPatternPayload::Tag {
+                    name: name.clone().into_boxed_str(),
+                    fields: fields
+                        .iter()
+                        .cloned()
+                        .map(String::into_boxed_str)
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                },
+                AstMatchPattern::Binding { name } => {
+                    KernelMatchPatternPayload::Binding(name.clone().into_boxed_str())
+                }
+                AstMatchPattern::Bits {
+                    width,
+                    radix,
+                    digits,
+                } => Bits::parse_encoded(*width, *radix, digits)
+                    .map(KernelMatchPatternPayload::Bits)
+                    .unwrap_or(KernelMatchPatternPayload::Invalid),
+                AstMatchPattern::Invalid { .. } => KernelMatchPatternPayload::Invalid,
+            })
+        }
+        AstExprKind::Delimiter => KernelExpressionSemanticPayload::Delimiter,
+        AstExprKind::Identifier(name) => KernelExpressionSemanticPayload::LexicalPath(
+            vec![name.clone().into_boxed_str()].into_boxed_slice(),
+        ),
+        AstExprKind::Path(path) => KernelExpressionSemanticPayload::LexicalPath(
+            path.iter()
+                .cloned()
+                .map(String::into_boxed_str)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
+        AstExprKind::Drain { path } => KernelExpressionSemanticPayload::LexicalPath(
+            match path {
+                boon_syntax::AstDrainPath::Binding { name } => vec![name.clone()],
+                boon_syntax::AstDrainPath::Field { binding, fields } => {
+                    std::iter::once(binding.clone())
+                        .chain(fields.iter().cloned())
+                        .collect()
+                }
+                boon_syntax::AstDrainPath::Passed { fields } => {
+                    std::iter::once("PASSED".to_owned())
+                        .chain(fields.iter().cloned())
+                        .collect()
+                }
+            }
+            .into_iter()
+            .map(String::into_boxed_str)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        ),
         AstExprKind::Unknown(tokens) => KernelExpressionSemanticPayload::Invalid(
             tokens
                 .iter()
@@ -11222,7 +11903,8 @@ mod tests {
                             .map(|parameter| parameter.decl_id)
                     }
                     KernelOwnerOracleDeclarationOrigin::PatternBinding { .. }
-                    | KernelOwnerOracleDeclarationOrigin::CallbackBinding { .. } => None,
+                    | KernelOwnerOracleDeclarationOrigin::CallbackBinding { .. }
+                    | KernelOwnerOracleDeclarationOrigin::CallContext { .. } => None,
                 };
                 if let Some(checked_declaration) = checked_declaration {
                     stable_declaration_by_checked
@@ -11507,6 +12189,492 @@ mod tests {
             }
         }
         mismatches
+    }
+
+    fn checked_expression_kind_signature(
+        kind: &CheckedExpressionKind,
+        expression_key: &dyn Fn(boon_checked::CheckedExprId) -> String,
+        declaration_key: &dyn Fn(DeclId) -> String,
+    ) -> String {
+        let expressions = |values: &[boon_checked::CheckedExprId]| {
+            values
+                .iter()
+                .map(|value| expression_key(*value))
+                .collect::<Vec<_>>()
+        };
+        match kind {
+            CheckedExpressionKind::Read {
+                target,
+                projection,
+                source,
+            } => format!(
+                "Read({},{projection:?},{:?})",
+                declaration_key(*target),
+                source.as_ref().map(|source| &source.payload_projection),
+            ),
+            CheckedExpressionKind::Passed {
+                projection, access, ..
+            } => format!("Passed({projection:?},{access:?})"),
+            CheckedExpressionKind::ExternalRead {
+                canonical_path,
+                external_identity,
+            } => format!("ExternalRead({canonical_path},{external_identity:?})"),
+            CheckedExpressionKind::Drain { target, projection } => {
+                format!("Drain({},{projection:?})", declaration_key(*target))
+            }
+            CheckedExpressionKind::Text { value } => format!("Text({value:?})"),
+            CheckedExpressionKind::TextTemplate { segments } => format!(
+                "TextTemplate({:?})",
+                segments
+                    .iter()
+                    .map(|segment| match segment {
+                        boon_checked::CheckedTextSegment::Static { value } => {
+                            format!("static:{value:?}")
+                        }
+                        boon_checked::CheckedTextSegment::Dynamic { value } => {
+                            format!("dynamic:{}", expression_key(*value))
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            CheckedExpressionKind::Number { value } => format!("Number({value:?})"),
+            CheckedExpressionKind::BytesByte { value } => format!("Byte({value})"),
+            CheckedExpressionKind::Absent => "Absent".to_owned(),
+            CheckedExpressionKind::Flush { payload } => {
+                format!("Flush({})", expression_key(*payload))
+            }
+            CheckedExpressionKind::Tag { name } => format!("Tag({name:?})"),
+            CheckedExpressionKind::TaggedObject { tag, fields } => format!(
+                "TaggedObject({tag:?},{:?})",
+                fields
+                    .iter()
+                    .map(|field| (
+                        field.name.clone(),
+                        field.spread,
+                        declaration_key_option(field.declaration, declaration_key),
+                        expression_key(field.value),
+                        field.span,
+                    ))
+                    .collect::<Vec<_>>(),
+            ),
+            CheckedExpressionKind::Source => "Source".to_owned(),
+            CheckedExpressionKind::Call { .. } => "Call".to_owned(),
+            CheckedExpressionKind::Draining { input } => {
+                format!("Draining({})", expression_key(*input))
+            }
+            CheckedExpressionKind::Hold { initial, name } => {
+                format!("Hold({},{name:?})", expression_key(*initial))
+            }
+            CheckedExpressionKind::Latest { branches } => {
+                format!("Latest({:?})", expressions(branches))
+            }
+            CheckedExpressionKind::When { input, arms } => {
+                format!("When({},{:?})", expression_key(*input), expressions(arms))
+            }
+            CheckedExpressionKind::While { input, arms } => {
+                format!("While({},{:?})", expression_key(*input), expressions(arms))
+            }
+            CheckedExpressionKind::Then { input, output } => format!(
+                "Then({},{:?})",
+                expression_key(*input),
+                output.map(expression_key),
+            ),
+            CheckedExpressionKind::Infix { left, op, right } => format!(
+                "Infix({},{op:?},{})",
+                expression_key(*left),
+                expression_key(*right),
+            ),
+            CheckedExpressionKind::MatchArm {
+                pattern,
+                bindings,
+                output,
+            } => format!(
+                "MatchArm({pattern:?},{:?},{:?})",
+                bindings
+                    .iter()
+                    .map(|binding| declaration_key(*binding))
+                    .collect::<Vec<_>>(),
+                output.map(expression_key),
+            ),
+            CheckedExpressionKind::Block { bindings, result } => format!(
+                "Block({:?},{:?})",
+                bindings
+                    .iter()
+                    .map(|binding| (
+                        declaration_key(binding.declaration),
+                        expression_key(binding.value),
+                        binding.span,
+                    ))
+                    .collect::<Vec<_>>(),
+                result.map(expression_key),
+            ),
+            CheckedExpressionKind::Object { fields } => format!(
+                "Object({:?})",
+                fields
+                    .iter()
+                    .map(|field| (
+                        field.name.clone(),
+                        field.spread,
+                        declaration_key_option(field.declaration, declaration_key),
+                        expression_key(field.value),
+                        field.span,
+                    ))
+                    .collect::<Vec<_>>(),
+            ),
+            CheckedExpressionKind::List { capacity, items } => {
+                format!("List({capacity:?},{:?})", expressions(items))
+            }
+            CheckedExpressionKind::Bytes { fixed_size, items } => {
+                format!("Bytes({fixed_size:?},{:?})", expressions(items))
+            }
+            CheckedExpressionKind::Delimiter => "Delimiter".to_owned(),
+            CheckedExpressionKind::Invalid { tokens } => format!("Invalid({tokens:?})"),
+            CheckedExpressionKind::MapEntry { key, value } => format!(
+                "MapEntry({},{})",
+                expression_key(*key),
+                expression_key(*value),
+            ),
+            CheckedExpressionKind::Map { entries } => {
+                format!("Map({:?})", expressions(entries))
+            }
+            CheckedExpressionKind::Set { items } => {
+                format!("Set({:?})", expressions(items))
+            }
+            CheckedExpressionKind::Bits { value } => format!("Bits({value:?})"),
+        }
+    }
+
+    fn declaration_key_option(
+        declaration: Option<DeclId>,
+        declaration_key: &dyn Fn(DeclId) -> String,
+    ) -> Option<String> {
+        declaration.map(declaration_key)
+    }
+
+    fn expression_inventory_mismatches(
+        report: &KernelOwnerOracleReport,
+        checked: &CheckedProgramFields,
+        checked_expression_by_stable: &BTreeMap<StableExpressionKey, boon_checked::CheckedExprId>,
+        stable_by_checked_expression: &BTreeMap<boon_checked::CheckedExprId, StableExpressionKey>,
+    ) -> Vec<String> {
+        let mut mismatches = Vec::new();
+        let mut mismatch_dimensions =
+            BTreeMap::<(bool, bool, bool, bool, bool, bool), usize>::new();
+        let mut kind_mismatches = BTreeMap::<(&'static str, &'static str), usize>::new();
+        let mut external_read_mismatches = BTreeMap::<(String, String), usize>::new();
+        let mut declaration_mismatches = BTreeMap::<&'static str, usize>::new();
+        let mut effect_mismatches = BTreeMap::<&'static str, usize>::new();
+        let mut effect_mismatch_shapes = BTreeMap::<[bool; 8], usize>::new();
+        let mut scope_mismatches = BTreeMap::<&'static str, usize>::new();
+        let mut scope_mismatch_pairs = BTreeMap::<(String, String), usize>::new();
+        let direct_by_stable = report
+            .checked_expression_keys
+            .iter()
+            .zip(report.checked_expressions.iter())
+            .filter_map(|(stable, expression)| Some((stable.clone()?, expression)))
+            .collect::<BTreeMap<_, _>>();
+        if direct_by_stable.len()
+            != report
+                .checked_expression_keys
+                .iter()
+                .filter(|key| key.is_some())
+                .count()
+        {
+            mismatches.push("kernel direct expression table repeats a stable identity".to_owned());
+        }
+        let direct_key = |expression: boon_checked::CheckedExprId| {
+            report
+                .checked_expression_keys
+                .get(expression.0 as usize)
+                .and_then(Option::as_ref)
+                .map(|key| format!("{key:?}"))
+                .unwrap_or_else(|| "<synthetic>".to_owned())
+        };
+        let current_key = |expression: boon_checked::CheckedExprId| {
+            stable_by_checked_expression
+                .get(&expression)
+                .map(|key| format!("{key:?}"))
+                .unwrap_or_else(|| "<synthetic>".to_owned())
+        };
+        let direct_declaration = |declaration: DeclId| {
+            report
+                .checked_declarations
+                .iter()
+                .find(|candidate| candidate.id == declaration)
+                .map(|declaration| {
+                    format!(
+                        "{:?}:{}:{:?}",
+                        declaration.kind, declaration.name, declaration.span,
+                    )
+                })
+                .unwrap_or_else(|| format!("<missing:{}>", declaration.0))
+        };
+        let current_declaration = |declaration: DeclId| {
+            checked
+                .declarations
+                .iter()
+                .find(|candidate| candidate.id == declaration)
+                .map(|declaration| {
+                    format!(
+                        "{:?}:{}:{:?}",
+                        declaration.kind, declaration.name, declaration.span,
+                    )
+                })
+                .unwrap_or_else(|| format!("<missing:{}>", declaration.0))
+        };
+        let direct_scope = |scope: boon_checked::LexicalScopeId| {
+            report
+                .checked_scopes
+                .iter()
+                .find(|candidate| candidate.id == scope)
+                .map(|scope| (scope.kind, scope.span))
+        };
+        let current_scope = |scope: boon_checked::LexicalScopeId| {
+            checked
+                .scopes
+                .iter()
+                .find(|candidate| candidate.id == scope)
+                .map(|scope| (scope.kind, scope.span))
+        };
+
+        for (stable, direct) in &direct_by_stable {
+            let Some(current) = checked_expression_by_stable
+                .get(stable)
+                .and_then(|expression| checked.expressions.get(expression.0 as usize))
+            else {
+                mismatches.push(format!(
+                    "kernel direct expression {stable:?} has no checked row"
+                ));
+                continue;
+            };
+            let direct_kind =
+                checked_expression_kind_signature(&direct.kind, &direct_key, &direct_declaration);
+            let current_kind = checked_expression_kind_signature(
+                &current.kind,
+                &current_key,
+                &current_declaration,
+            );
+            let direct_declaration_key = direct.declaration.map(&direct_declaration);
+            let current_declaration_key = current.declaration.map(&current_declaration);
+            let flush_matches = match (&direct.flush_type, &current.flush_type) {
+                (None, None) => true,
+                (Some(direct), Some(current)) => {
+                    alpha_normalize_owner(
+                        &FlowType {
+                            mode: FlowMode::Continuous,
+                            ty: direct.clone(),
+                        },
+                        [],
+                    )
+                    .0 == alpha_normalize_owner(
+                        &FlowType {
+                            mode: FlowMode::Continuous,
+                            ty: current.clone(),
+                        },
+                        [],
+                    )
+                    .0
+                }
+                (None, Some(_)) | (Some(_), None) => false,
+            };
+            let kind_matches = direct_kind == current_kind;
+            let declaration_matches = direct_declaration_key == current_declaration_key;
+            let effect_matches = direct.effect == current.effect;
+            let span_matches = direct.span == current.span;
+            let scope_matches = direct_scope(direct.scope_id) == current_scope(current.scope_id);
+            if !(kind_matches
+                && declaration_matches
+                && effect_matches
+                && span_matches
+                && scope_matches
+                && flush_matches)
+            {
+                *mismatch_dimensions
+                    .entry((
+                        kind_matches,
+                        declaration_matches,
+                        effect_matches,
+                        span_matches,
+                        scope_matches,
+                        flush_matches,
+                    ))
+                    .or_default() += 1;
+                if !kind_matches {
+                    *kind_mismatches
+                        .entry((
+                            checked_expression_kind_name(&direct.kind),
+                            checked_expression_kind_name(&current.kind),
+                        ))
+                        .or_default() += 1;
+                    if matches!(direct.kind, CheckedExpressionKind::ExternalRead { .. })
+                        && matches!(current.kind, CheckedExpressionKind::Read { .. })
+                    {
+                        *external_read_mismatches
+                            .entry((direct_kind.clone(), current_kind.clone()))
+                            .or_default() += 1;
+                    }
+                }
+                if !declaration_matches {
+                    *declaration_mismatches
+                        .entry(checked_expression_kind_name(&current.kind))
+                        .or_default() += 1;
+                }
+                if !effect_matches {
+                    *effect_mismatches
+                        .entry(checked_expression_kind_name(&current.kind))
+                        .or_default() += 1;
+                    *effect_mismatch_shapes
+                        .entry([
+                            direct.effect.reads_state,
+                            direct.effect.writes_state,
+                            direct.effect.emits_source,
+                            direct.effect.invokes_host,
+                            current.effect.reads_state,
+                            current.effect.writes_state,
+                            current.effect.emits_source,
+                            current.effect.invokes_host,
+                        ])
+                        .or_default() += 1;
+                }
+                if !scope_matches {
+                    *scope_mismatches
+                        .entry(checked_expression_kind_name(&current.kind))
+                        .or_default() += 1;
+                    let scope_pair = (
+                        format!("{:?}", direct_scope(direct.scope_id)),
+                        format!("{:?}", current_scope(current.scope_id)),
+                    );
+                    *scope_mismatch_pairs.entry(scope_pair).or_default() += 1;
+                }
+                mismatches.push(format!(
+                    "kernel direct expression {stable:?} differs from checked row: kind_match={} declaration_match={} effect_match={} span_match={} scope_match={} flush_match={flush_matches}; direct_kind={direct_kind}; current_kind={current_kind}; direct_declaration={direct_declaration_key:?}; current_declaration={current_declaration_key:?}; direct_effect={:?}; current_effect={:?}; direct_span={:?}; current_span={:?}; direct_scope={:?}; current_scope={:?}",
+                    direct_kind == current_kind,
+                    direct_declaration_key == current_declaration_key,
+                    direct.effect == current.effect,
+                    direct.span == current.span,
+                    direct_scope(direct.scope_id) == current_scope(current.scope_id),
+                    direct.effect,
+                    current.effect,
+                    direct.span,
+                    current.span,
+                    direct_scope(direct.scope_id),
+                    current_scope(current.scope_id),
+                ));
+            }
+        }
+        for stable in checked_expression_by_stable.keys() {
+            if !direct_by_stable.contains_key(stable) {
+                mismatches.push(format!(
+                    "checked expression {stable:?} has no direct kernel row"
+                ));
+            }
+        }
+        if !mismatch_dimensions.is_empty() {
+            eprintln!(
+                "kernel-expression-parity mismatch_dimensions={mismatch_dimensions:?} kind_mismatches={kind_mismatches:?} external_read_mismatches={external_read_mismatches:?} declaration_mismatches={declaration_mismatches:?} effect_mismatches={effect_mismatches:?} effect_mismatch_shapes={effect_mismatch_shapes:?} scope_mismatches={scope_mismatches:?} scope_mismatch_pairs={scope_mismatch_pairs:?}"
+            );
+        }
+        mismatches
+    }
+
+    fn checked_expression_kind_name(kind: &CheckedExpressionKind) -> &'static str {
+        match kind {
+            CheckedExpressionKind::Read { .. } => "read",
+            CheckedExpressionKind::Passed { .. } => "passed",
+            CheckedExpressionKind::ExternalRead { .. } => "external_read",
+            CheckedExpressionKind::Drain { .. } => "drain",
+            CheckedExpressionKind::Text { .. } => "text",
+            CheckedExpressionKind::TextTemplate { .. } => "text_template",
+            CheckedExpressionKind::Number { .. } => "number",
+            CheckedExpressionKind::BytesByte { .. } => "byte",
+            CheckedExpressionKind::Absent => "absent",
+            CheckedExpressionKind::Flush { .. } => "flush",
+            CheckedExpressionKind::Tag { .. } => "tag",
+            CheckedExpressionKind::TaggedObject { .. } => "tagged_object",
+            CheckedExpressionKind::Source => "source",
+            CheckedExpressionKind::Call { .. } => "call",
+            CheckedExpressionKind::Draining { .. } => "draining",
+            CheckedExpressionKind::Hold { .. } => "hold",
+            CheckedExpressionKind::Latest { .. } => "latest",
+            CheckedExpressionKind::When { .. } => "when",
+            CheckedExpressionKind::While { .. } => "while",
+            CheckedExpressionKind::Then { .. } => "then",
+            CheckedExpressionKind::Infix { .. } => "infix",
+            CheckedExpressionKind::MatchArm { .. } => "match_arm",
+            CheckedExpressionKind::Block { .. } => "block",
+            CheckedExpressionKind::Object { .. } => "object",
+            CheckedExpressionKind::List { .. } => "list",
+            CheckedExpressionKind::Bytes { .. } => "bytes",
+            CheckedExpressionKind::Delimiter => "delimiter",
+            CheckedExpressionKind::Invalid { .. } => "invalid",
+            CheckedExpressionKind::MapEntry { .. } => "map_entry",
+            CheckedExpressionKind::Map { .. } => "map",
+            CheckedExpressionKind::Set { .. } => "set",
+            CheckedExpressionKind::Bits { .. } => "bits",
+        }
+    }
+
+    fn direct_expression_parity_fixture(
+        source: &str,
+    ) -> (
+        ProjectSyntaxSnapshot,
+        CheckedProgramFields,
+        KernelOwnerOracleReport,
+    ) {
+        let parsed = parse_source("app/RUN.bn", source).expect("parse direct-expression fixture");
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            !checked.report.has_errors(),
+            "direct-expression fixture diagnostics: {:#?}",
+            checked.report.diagnostics
+        );
+        let (checked, _) = checked
+            .program
+            .expect("direct-expression fixture checks")
+            .into_parts();
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse direct-expression project");
+        let source_payloads = boon_typecheck::project_source_payload_abi_types(&project)
+            .expect("project direct-expression SOURCE ABI");
+        let report = kernel_owner_oracle_with_source_payloads(&project, &source_payloads);
+        assert!(
+            report
+                .unsupported
+                .iter()
+                .all(|(owner, _)| matches!(owner, StableCheckOwnerKey::UnitRoot(_))),
+            "every declared fixture owner must compile: {:#?}",
+            report.unsupported
+        );
+
+        let mut checked_expression_by_stable = BTreeMap::new();
+        let mut stable_by_checked_expression = BTreeMap::new();
+        for owner in project.stable_check_owner_keys() {
+            let view = project
+                .owner_view(&owner)
+                .expect("direct-expression owner has a view");
+            for (expression, stable) in view.expressions().zip(view.stable_expression_keys()) {
+                let Some(checked_expression) = project
+                    .expression_slot(expression.id)
+                    .and_then(|slot| checked.expressions.get(slot))
+                else {
+                    continue;
+                };
+                checked_expression_by_stable.insert(stable.clone(), checked_expression.id);
+                stable_by_checked_expression.insert(checked_expression.id, stable);
+            }
+        }
+        let mismatches = expression_inventory_mismatches(
+            &report,
+            &checked,
+            &checked_expression_by_stable,
+            &stable_by_checked_expression,
+        );
+        assert!(
+            mismatches.is_empty(),
+            "direct CheckedExpression parity: {mismatches:#?}"
+        );
+        (project, checked, report)
     }
 
     fn statement_inventory_mismatches(
@@ -12029,6 +13197,12 @@ mod tests {
                                 formal_ordinal: *ordinal,
                             }
                         }
+                        KernelOwnerOracleDeclarationOrigin::CallContext { call, ordinal } => {
+                            boon_checked::OwnerDeclarationStableKey::CallContext {
+                                call: call.clone(),
+                                ordinal: *ordinal,
+                            }
+                        }
                     };
                     Some(StableLexicalTarget::Declaration {
                         owner: owner.clone(),
@@ -12201,6 +13375,17 @@ mod tests {
                     | AstExprKind::Pipe {
                         op: function, args, ..
                     } => {
+                        if render_call_context_surface(function).is_some_and(|context| {
+                            args.iter()
+                                .any(|argument| argument.named_name() == Some(context.provider))
+                        }) {
+                            expected_origins.insert(
+                                KernelOwnerOracleDeclarationOrigin::CallContext {
+                                    call: expression.stable_key.clone(),
+                                    ordinal: 0,
+                                },
+                            );
+                        }
                         let Some(surface) = authoritative.get(function) else {
                             continue;
                         };
@@ -14786,6 +15971,181 @@ mod tests {
     }
 
     #[test]
+    fn direct_expression_rows_preserve_abi_delimiter_and_nested_list_presentation() {
+        let source = concat!(
+            "FUNCTION choose(kind) {\n",
+            "    kind |> WHEN {\n",
+            "        Record => [\n",
+            "            value: 1\n",
+            "            label: TEXT { chosen }\n",
+            "        ]\n",
+            "        __ => [value: 2]\n",
+            "    }\n",
+            "}\n",
+            "selected: choose(kind: Record)\n",
+            "final_rows:\n",
+            "    LIST {\n",
+            "        [value: 1]\n",
+            "        [value: 2]\n",
+            "    }\n",
+            "mapped_rows:\n",
+            "    LIST {\n",
+            "        [value: 1]\n",
+            "        [value: 2]\n",
+            "    }\n",
+            "    |> List/map(item, new: item)\n",
+            "view:\n",
+            "    Scene/Element/text(\n",
+            "        element: []\n",
+            "        style: [active: element.hovered]\n",
+            "        text: TEXT { Hello }\n",
+            "    )\n",
+        );
+        let (_project, _checked, report) = direct_expression_parity_fixture(source);
+
+        let element_states = report
+            .checked_declarations
+            .iter()
+            .filter(|declaration| declaration.kind == CheckedDeclarationKind::ElementState)
+            .collect::<Vec<_>>();
+        let [element_state] = element_states.as_slice() else {
+            panic!(
+                "render ABI must publish one ordinary call-context declaration: {element_states:#?}"
+            )
+        };
+        assert_eq!(element_state.name, "element");
+        assert_eq!(
+            report
+                .checked_scopes
+                .iter()
+                .find(|scope| scope.id == element_state.scope_id)
+                .expect("element state scope exists")
+                .kind,
+            boon_checked::CheckedScopeKind::CallContext,
+        );
+        let context_reads = report
+            .checked_expressions
+            .iter()
+            .filter(|expression| {
+                matches!(
+                    &expression.kind,
+                    CheckedExpressionKind::Read {
+                        target,
+                        projection,
+                        ..
+                    } if *target == element_state.id && projection == &["hovered"]
+                )
+            })
+            .collect::<Vec<_>>();
+        let [context_read] = context_reads.as_slice() else {
+            panic!("element.hovered must read the ABI declaration once: {context_reads:#?}")
+        };
+        assert_eq!(
+            context_read.flow_type.ty,
+            Type::VariantSet(
+                vec![
+                    Variant::Tag("False".to_owned()),
+                    Variant::Tag("True".to_owned()),
+                ]
+                .into(),
+            )
+        );
+
+        assert!(
+            report.checked_expressions.iter().any(|expression| {
+                matches!(&expression.kind, CheckedExpressionKind::Delimiter)
+                    && matches!(&expression.flow_type.ty, Type::Object(_))
+            }),
+            "a multiline delimiter must retain authored presentation while solving as a structural record"
+        );
+
+        fn list_surface<'a>(
+            report: &'a KernelOwnerOracleReport,
+            name: &str,
+        ) -> (
+            &'a boon_checked::CheckedDeclaration,
+            &'a boon_checked::CheckedStatement,
+            &'a boon_checked::CheckedExpression,
+        ) {
+            let declaration = report
+                .checked_declarations
+                .iter()
+                .find(|declaration| {
+                    declaration.kind == CheckedDeclarationKind::Field && declaration.name == name
+                })
+                .unwrap_or_else(|| panic!("missing `{name}` declaration"));
+            let field = report
+                .checked_statements
+                .iter()
+                .find(|statement| {
+                    matches!(
+                        &statement.kind,
+                        CheckedStatementKind::Field { declaration: field }
+                            if *field == declaration.id
+                    )
+                })
+                .unwrap_or_else(|| panic!("missing `{name}` field statement"));
+            let list_statement = field
+                .children
+                .iter()
+                .find_map(|child| {
+                    report.checked_statements.iter().find(|statement| {
+                        statement.id == *child
+                            && matches!(&statement.kind, CheckedStatementKind::List { .. })
+                    })
+                })
+                .unwrap_or_else(|| panic!("missing `{name}` LIST statement"));
+            let list = report
+                .checked_expressions
+                .iter()
+                .find(|expression| Some(expression.id) == list_statement.value)
+                .unwrap_or_else(|| panic!("missing `{name}` LIST expression"));
+            assert!(matches!(&list.kind, CheckedExpressionKind::List { .. }));
+            (declaration, field, list)
+        }
+
+        let (final_declaration, final_field, final_list) = list_surface(&report, "final_rows");
+        let (mapped_declaration, mapped_field, mapped_list) = list_surface(&report, "mapped_rows");
+        assert_eq!(final_field.value, Some(final_list.id));
+        assert_ne!(mapped_field.value, Some(mapped_list.id));
+        assert!(mapped_field.value.is_some_and(|value| {
+            report
+                .checked_expressions
+                .iter()
+                .find(|expression| expression.id == value)
+                .is_some_and(|expression| {
+                    matches!(&expression.kind, CheckedExpressionKind::Call { .. })
+                })
+        }));
+        assert_eq!(mapped_list.scope_id, mapped_declaration.body_scope.unwrap());
+        assert_ne!(final_list.scope_id, final_declaration.body_scope.unwrap());
+        assert_eq!(
+            report
+                .checked_scopes
+                .iter()
+                .find(|scope| scope.id == final_list.scope_id)
+                .expect("final LIST scope exists")
+                .kind,
+            boon_checked::CheckedScopeKind::Block,
+        );
+        let CheckedExpressionKind::List {
+            items: final_items, ..
+        } = &final_list.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(final_items.len(), 2);
+        let CheckedExpressionKind::List {
+            items: mapped_items,
+            ..
+        } = &mapped_list.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(mapped_items.len(), 2);
+    }
+
+    #[test]
     fn record_spreads_compile_as_ordered_residual_overlays() {
         let source = concat!(
             "FUNCTION base() {\n",
@@ -15852,7 +17212,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v13 != [0; 32]),
+                        && receipt.fingerprint_v14 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(
@@ -16285,6 +17645,12 @@ mod tests {
             &stable_by_checked_expression,
             &project,
         ));
+        mismatches.extend(expression_inventory_mismatches(
+            &report,
+            fields,
+            &checked_expression_by_stable,
+            &stable_by_checked_expression,
+        ));
         mismatches.extend(statement_inventory_mismatches(
             &report,
             fields,
@@ -16324,6 +17690,10 @@ mod tests {
                     "resource-state"
                 } else if mismatch.contains("LIST resource") {
                     "resource-list"
+                } else if mismatch.contains("direct expression")
+                    || mismatch.contains("checked expression")
+                {
+                    "expression"
                 } else if mismatch.contains("statement") {
                     "statement"
                 } else if mismatch.contains("collection") || mismatch.contains("source") {

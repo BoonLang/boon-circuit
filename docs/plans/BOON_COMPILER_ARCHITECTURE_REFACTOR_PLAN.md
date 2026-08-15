@@ -3444,6 +3444,44 @@ single dense linker projects `KernelCheckedSnapshot` into the existing
 and budget gates can production checked-image requests cut over and the old
 owner row builders be deleted.
 
+### Exact expression semantic payload authority
+
+The first post-relocation cut retains the non-structural value that each dense
+expression equation cannot reconstruct: exact text, ordered static/dynamic
+template segments, canonical exact numbers, bytes, canonical fixed-width bits,
+HOLD names, and invalid-token payloads. `KernelExpressionSemanticPayload` is a
+parallel compact row in `KernelDefinitionFactsInput` and
+`DefinitionArtifact`; structural expressions carry `None`. Production
+definitions have exactly one row per dense expression, including an explicit
+`None` for a synthetic definition result.
+
+This is not a parser dependency inside the kernel. The orchestration boundary
+converts parser values into stable `boon_data` values once, while the kernel
+validates dense cardinality, payload/node compatibility, exact BITS width, and
+the one-to-one ordering between text-template dynamic segments and
+`TextDynamic` inputs. Partial tables and incompatible payloads fail closed.
+Low-level type-only kernel programs may omit the table entirely.
+
+Payloads participate in definition basis, artifact, and exact-currentness
+fingerprints, advancing those domains to basis V5 and artifact/currentness V7.
+A payload-only edit changes exact currentness but not the public-result
+fingerprint when the solved public type is unchanged. The complete kernel suite
+is 92/92 green, parser-backed Counter/Todo coverage remains deterministic, and
+the full NovyWave differential remains exact for all 1,389 solved owners with
+zero unsupported owners.
+
+Fresh release measurements after this cut are 577.281 ms for production
+diagnostics including the retained parse profile (551.294 ms measured call
+wall) and 797.986 ms for the complete checked candidate including parse and
+SOURCE ABI projection. The candidate kernel portion is 709.317 ms, of which
+184.625 ms is checked-image publication. The corresponding debug checked
+candidate is 3,129.621 ms. The optimized Cargo rebuild itself is deliberately
+excluded from these compiler timings.
+
+The next dependency-bottom slice is exact call/execution payload authority.
+Once those rows are complete, the dense checked linker can consume
+`DefinitionArtifact` directly rather than re-reading source-shaped owner DTOs.
+
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not
 spend a full optimized rebuild on every small edit. Keep the latest accepted

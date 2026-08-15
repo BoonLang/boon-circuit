@@ -20,8 +20,8 @@ use boon_compiler_kernel::{
     KernelDeclarationInput, KernelDeclarationKind, KernelDeclarationOrigin,
     KernelDeclarationReference, KernelDefinitionFactsInput, KernelDefinitionRelocations,
     KernelDiagnosticKind, KernelDiagnosticSeverity, KernelDiagnosticSite, KernelExpressionId,
-    KernelExpressionRelocation, KernelExternalExpression, KernelExternalTarget,
-    KernelHostEffectArtifact, KernelInheritedFormal, KernelLexicalAccess,
+    KernelExpressionRelocation, KernelExpressionSemanticPayload, KernelExternalExpression,
+    KernelExternalTarget, KernelHostEffectArtifact, KernelInheritedFormal, KernelLexicalAccess,
     KernelLexicalBindingInput, KernelLexicalBindingTarget, KernelLexicalBindingTargetInput,
     KernelListId, KernelListInput, KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge,
     KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelParameterEvaluationScope,
@@ -29,10 +29,12 @@ use boon_compiler_kernel::{
     KernelPureBuiltinKind, KernelRenderConstructorKind, KernelSession, KernelSolveWork,
     KernelSourceId, KernelSourceInput, KernelStateId, KernelStateInput,
     KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
-    KernelStatementParameter, KernelStatementReference, KernelTypeMismatch, KernelValueReference,
-    is_kernel_host_effect, is_registered_kernel_host_effect, project_kernel_call_shape,
+    KernelStatementParameter, KernelStatementReference, KernelTextTemplateSegment,
+    KernelTypeMismatch, KernelValueReference, is_kernel_host_effect,
+    is_registered_kernel_host_effect, project_kernel_call_shape,
     project_kernel_source_expression_diagnostics,
 };
+use boon_data::{Bits, ExactNumber};
 use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
 use boon_syntax::{
     AstBlockBindingDeclaration, AstCallArgKind, AstExprKind, AstMatchPattern, AstParameterKind,
@@ -468,11 +470,11 @@ pub struct KernelOwnerOracleReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
-    pub basis_fingerprint_v4: [u8; 32],
+    pub basis_fingerprint_v5: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v6: [u8; 32],
+    pub artifact_fingerprint_v7: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v6: [u8; 32],
+    pub fingerprint_v7: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1096,11 +1098,11 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 .zip(&artifact.currentness)
                 .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
                     owner: prepared[*prepared_index].owner.clone(),
-                    basis_fingerprint_v4: receipt.basis_fingerprint_v4,
+                    basis_fingerprint_v5: receipt.basis_fingerprint_v5,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v6: receipt.artifact_fingerprint_v6,
+                    artifact_fingerprint_v7: receipt.artifact_fingerprint_v7,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v6: receipt.fingerprint_v6,
+                    fingerprint_v7: receipt.fingerprint_v7,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -1135,6 +1137,11 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         artifact.relocations.statements,
                         owner.definition_facts.relocations.statements,
                         "kernel definition artifacts retain every stable statement relocation"
+                    );
+                    assert_eq!(
+                        artifact.expression_payloads,
+                        owner.definition_facts.expression_payloads,
+                        "kernel definition artifacts retain every exact expression semantic payload"
                     );
                     let stable_provider = |value: KernelValueReference| match value {
                         KernelValueReference::Local(expression) => {
@@ -4552,6 +4559,12 @@ fn compact_owner_view(
             .into_boxed_slice(),
         statements: statements.clone(),
     };
+    definition_facts.expression_payloads = raw_expressions
+        .iter()
+        .map(|expression| compact_expression_semantic_payload(&expression.kind))
+        .chain(has_synthetic_result.then_some(KernelExpressionSemanticPayload::None))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     let render_slots = view
         .statements()
         .zip(statements.iter())
@@ -7633,6 +7646,68 @@ fn source_ast_edges(
             )
             .collect()),
         kind => compact_ast_edges(kind, expression.linked_input),
+    }
+}
+
+fn compact_expression_semantic_payload(kind: &AstExprKind) -> KernelExpressionSemanticPayload {
+    match kind {
+        AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
+            KernelExpressionSemanticPayload::Text(value.clone().into_boxed_str())
+        }
+        AstExprKind::TextTemplate { segments } => {
+            let mut dynamic_ordinal = 0_u32;
+            KernelExpressionSemanticPayload::TextTemplate(
+                segments
+                    .iter()
+                    .map(|segment| match segment {
+                        AstTextSegment::Static { value } => {
+                            KernelTextTemplateSegment::Static(value.clone().into_boxed_str())
+                        }
+                        AstTextSegment::Dynamic { .. } => {
+                            let ordinal = dynamic_ordinal;
+                            dynamic_ordinal = dynamic_ordinal
+                                .checked_add(1)
+                                .expect("text template dynamic segment count exceeds u32");
+                            KernelTextTemplateSegment::Dynamic(ordinal)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )
+        }
+        AstExprKind::Number(literal) => ExactNumber::parse_strict(literal, None).map_or_else(
+            |_| {
+                KernelExpressionSemanticPayload::Invalid(
+                    vec!["invalid_exact_number_literal".into()].into_boxed_slice(),
+                )
+            },
+            KernelExpressionSemanticPayload::Number,
+        ),
+        AstExprKind::ByteLiteral { value, .. } => KernelExpressionSemanticPayload::Byte(*value),
+        AstExprKind::BitsLiteral {
+            width,
+            radix,
+            digits,
+        } => Bits::parse_encoded(*width, *radix, digits).map_or_else(
+            |_| {
+                KernelExpressionSemanticPayload::Invalid(
+                    vec!["invalid_bits_literal".into()].into_boxed_slice(),
+                )
+            },
+            KernelExpressionSemanticPayload::Bits,
+        ),
+        AstExprKind::Hold { name, .. } => {
+            KernelExpressionSemanticPayload::HoldName(name.clone().into_boxed_str())
+        }
+        AstExprKind::Unknown(tokens) => KernelExpressionSemanticPayload::Invalid(
+            tokens
+                .iter()
+                .cloned()
+                .map(String::into_boxed_str)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
+        _ => KernelExpressionSemanticPayload::None,
     }
 }
 
@@ -13364,7 +13439,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v6 != [0; 32]),
+                        && receipt.fingerprint_v7 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(

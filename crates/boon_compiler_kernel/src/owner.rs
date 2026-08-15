@@ -497,6 +497,33 @@ pub enum KernelExpressionRelocation {
     SyntheticDefinitionResult,
 }
 
+/// Exact non-structural semantic payload retained for one dense expression.
+///
+/// The solver node owns type behavior and typed input edges. This parallel
+/// compact row owns data that cannot be reconstructed from those equations,
+/// such as literal values and static text-template segments. Structural rows
+/// use `None`; there is still exactly one payload row per dense expression in
+/// a production definition.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelExpressionSemanticPayload {
+    #[default]
+    None,
+    Text(Box<str>),
+    TextTemplate(Box<[KernelTextTemplateSegment]>),
+    Number(ExactNumber),
+    Byte(u8),
+    Bits(Bits),
+    HoldName(Box<str>),
+    Invalid(Box<[Box<str>]>),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelTextTemplateSegment {
+    Static(Box<str>),
+    /// Zero-based ordinal among the expression's `TextDynamic` input edges.
+    Dynamic(u32),
+}
+
 impl KernelDefinitionRelocations {
     pub fn is_empty(&self) -> bool {
         self.expressions.is_empty() && self.statements.is_empty()
@@ -510,6 +537,7 @@ impl KernelDefinitionRelocations {
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelDefinitionFactsInput {
     pub relocations: KernelDefinitionRelocations,
+    pub expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     pub statements: Box<[KernelStatementInput]>,
     pub declarations: Box<[KernelDeclarationInput]>,
     pub lexical_bindings: Box<[KernelLexicalBindingInput]>,
@@ -573,6 +601,7 @@ pub struct KernelOwnerProgram {
     expression_modes: Box<[FlowMode]>,
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
     relocations: KernelDefinitionRelocations,
+    expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     statements: Box<[KernelStatementArtifact]>,
     declarations: Box<[KernelDeclarationArtifact]>,
     lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
@@ -580,7 +609,7 @@ pub struct KernelOwnerProgram {
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
-    basis_fingerprint_v4: [u8; 32],
+    basis_fingerprint_v5: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -661,6 +690,7 @@ struct KernelProjectOwnerOutputs {
     expression_modes: Box<[FlowMode]>,
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
     relocations: KernelDefinitionRelocations,
+    expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     statements: Box<[KernelStatementArtifact]>,
     declarations: Box<[KernelDeclarationArtifact]>,
     lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
@@ -673,7 +703,7 @@ struct KernelProjectOwnerOutputs {
     /// requirements. That aggregate is useful to the solver, but is not a
     /// sound direct assignability contract for call diagnostics.
     syntax_discriminated_formals: Box<[u32]>,
-    basis_fingerprint_v4: [u8; 32],
+    basis_fingerprint_v5: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -1697,6 +1727,7 @@ pub struct DefinitionArtifact {
     /// Exact stable source identities retained for direct checked/semantic
     /// linking. Dense IDs remain definition-local and revision-local.
     pub relocations: KernelDefinitionRelocations,
+    pub expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     pub expressions: Box<[KernelExpressionArtifact]>,
     pub statements: Box<[KernelStatementArtifact]>,
     pub declarations: Box<[KernelDeclarationArtifact]>,
@@ -1781,7 +1812,7 @@ pub fn is_registered_kernel_host_effect(operation: &str) -> bool {
 
 impl KernelOwnerProgram {
     pub fn solve(self) -> Result<KernelDefinitionSnapshot, KernelSolveError> {
-        let basis_fingerprint_v4 = self.basis_fingerprint_v4;
+        let basis_fingerprint_v5 = self.basis_fingerprint_v5;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
             .output(self.result_output)
@@ -1839,6 +1870,7 @@ impl KernelOwnerProgram {
             result,
             formals: formal_flows,
             relocations: self.relocations,
+            expression_payloads: self.expression_payloads,
             expressions,
             statements: self.statements,
             declarations: self.declarations,
@@ -1852,7 +1884,7 @@ impl KernelOwnerProgram {
         };
         let (dependencies, currentness) = build_snapshot_receipts(
             std::slice::from_mut(&mut definition),
-            &[basis_fingerprint_v4],
+            &[basis_fingerprint_v5],
         )?;
         let [currentness] = currentness.as_ref() else {
             unreachable!("one standalone kernel definition produces one receipt")
@@ -2017,7 +2049,7 @@ impl KernelSolvedProject {
         let basis_fingerprints = self
             .owners
             .iter()
-            .map(|owner| owner.basis_fingerprint_v4)
+            .map(|owner| owner.basis_fingerprint_v5)
             .collect::<Vec<_>>();
         let mut definitions = self
             .owners
@@ -2645,6 +2677,7 @@ fn materialize_project_definition(
         result,
         formals: public_formals[owner_index].clone(),
         relocations: owner.relocations,
+        expression_payloads: owner.expression_payloads,
         expressions,
         statements: owner.statements,
         declarations: owner.declarations,
@@ -2664,43 +2697,114 @@ pub fn compile_owner_program(
     compile_owner_program_with_definition_facts(input, &KernelDefinitionFactsInput::default())
 }
 
-fn validate_definition_relocations(
+fn validate_definition_linker_facts(
     input: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
     definition: Option<usize>,
 ) -> Result<(), KernelOwnerBuildError> {
-    let relocations = &facts.relocations;
-    if relocations.is_empty() {
-        return Ok(());
-    }
     let label = definition
         .map(|definition| format!("definition {definition}"))
         .unwrap_or_else(|| "standalone definition".to_owned());
-    if !relocations.is_complete_for(input.nodes.len(), facts.statements.len()) {
+    let relocations = &facts.relocations;
+    if !relocations.is_empty() {
+        if !relocations.is_complete_for(input.nodes.len(), facts.statements.len()) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} has {} expression and {} statement relocations for {} expressions and {} statements",
+                relocations.expressions.len(),
+                relocations.statements.len(),
+                input.nodes.len(),
+                facts.statements.len(),
+            )));
+        }
+        if relocations
+            .expressions
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != relocations.expressions.len()
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} repeats a stable expression relocation"
+            )));
+        }
+        if relocations.statements.iter().collect::<BTreeSet<_>>().len()
+            != relocations.statements.len()
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} repeats a stable statement relocation"
+            )));
+        }
+    }
+
+    if facts.expression_payloads.is_empty() {
+        return Ok(());
+    }
+    if facts.expression_payloads.len() != input.nodes.len() {
         return Err(KernelOwnerBuildError::new(format!(
-            "kernel {label} has {} expression and {} statement relocations for {} expressions and {} statements",
-            relocations.expressions.len(),
-            relocations.statements.len(),
+            "kernel {label} has {} expression semantic payloads for {} expressions",
+            facts.expression_payloads.len(),
             input.nodes.len(),
-            facts.statements.len(),
         )));
     }
-    if relocations
-        .expressions
+    for (index, (node, payload)) in input
+        .nodes
         .iter()
-        .collect::<BTreeSet<_>>()
-        .len()
-        != relocations.expressions.len()
+        .zip(facts.expression_payloads.iter())
+        .enumerate()
     {
-        return Err(KernelOwnerBuildError::new(format!(
-            "kernel {label} repeats a stable expression relocation"
-        )));
-    }
-    if relocations.statements.iter().collect::<BTreeSet<_>>().len() != relocations.statements.len()
-    {
-        return Err(KernelOwnerBuildError::new(format!(
-            "kernel {label} repeats a stable statement relocation"
-        )));
+        let compatible = match payload {
+            KernelExpressionSemanticPayload::None => true,
+            KernelExpressionSemanticPayload::Text(_) => {
+                matches!(&node.kind, KernelOwnerNodeKind::Text)
+            }
+            KernelExpressionSemanticPayload::TextTemplate(segments) => {
+                if !matches!(&node.kind, KernelOwnerNodeKind::TextTemplate) {
+                    false
+                } else {
+                    let dynamic_input_count = node
+                        .inputs
+                        .iter()
+                        .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::TextDynamic))
+                        .count();
+                    let dynamic_ordinals = segments
+                        .iter()
+                        .filter_map(|segment| match segment {
+                            KernelTextTemplateSegment::Static(_) => None,
+                            KernelTextTemplateSegment::Dynamic(ordinal) => Some(*ordinal),
+                        })
+                        .collect::<BTreeSet<_>>();
+                    dynamic_ordinals.len() == dynamic_input_count
+                        && dynamic_ordinals
+                            .iter()
+                            .enumerate()
+                            .all(|(expected, ordinal)| usize::try_from(*ordinal) == Ok(expected))
+                }
+            }
+            KernelExpressionSemanticPayload::Number(_) => {
+                matches!(&node.kind, KernelOwnerNodeKind::Number)
+            }
+            KernelExpressionSemanticPayload::Byte(_) => {
+                matches!(&node.kind, KernelOwnerNodeKind::Byte)
+            }
+            KernelExpressionSemanticPayload::Bits(value) => {
+                matches!(&node.kind, KernelOwnerNodeKind::Bits(width) if *width == value.width())
+            }
+            KernelExpressionSemanticPayload::HoldName(_) => {
+                matches!(&node.kind, KernelOwnerNodeKind::Hold)
+            }
+            KernelExpressionSemanticPayload::Invalid(_) => matches!(
+                &node.kind,
+                KernelOwnerNodeKind::Unknown
+                    | KernelOwnerNodeKind::Number
+                    | KernelOwnerNodeKind::Bits(_)
+            ),
+        };
+        if !compatible {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} expression {index} semantic payload {payload:?} is incompatible with node {:?}",
+                node.kind,
+            )));
+        }
     }
     Ok(())
 }
@@ -2709,8 +2813,8 @@ pub fn compile_owner_program_with_definition_facts(
     input: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
-    validate_definition_relocations(input, facts, None)?;
-    let basis_fingerprint_v4 = definition_basis_fingerprint(input, facts)?;
+    validate_definition_linker_facts(input, facts, None)?;
+    let basis_fingerprint_v5 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
@@ -2863,6 +2967,7 @@ pub fn compile_owner_program_with_definition_facts(
         expression_modes,
         expression_artifacts: collect_expression_artifacts(input)?,
         relocations: facts.relocations.clone(),
+        expression_payloads: facts.expression_payloads.clone(),
         statements,
         declarations,
         lexical_bindings,
@@ -2870,7 +2975,7 @@ pub fn compile_owner_program_with_definition_facts(
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
         diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
-        basis_fingerprint_v4,
+        basis_fingerprint_v5,
     })
 }
 
@@ -4201,7 +4306,7 @@ pub fn compile_project_program_with_definition_facts(
         )));
     }
     for (definition, facts) in facts.iter().enumerate() {
-        validate_definition_relocations(&input.owners[definition], facts, Some(definition))?;
+        validate_definition_linker_facts(&input.owners[definition], facts, Some(definition))?;
         for statement in &facts.statements {
             for child in &statement.children {
                 if let KernelStatementChildReference::Owner(owner) = child
@@ -4467,6 +4572,7 @@ pub fn compile_project_program_with_definition_facts(
                     .into_boxed_slice(),
                 expression_artifacts: collect_expression_artifacts(owner)?,
                 relocations: facts[owner_index].relocations.clone(),
+                expression_payloads: facts[owner_index].expression_payloads.clone(),
                 statements,
                 declarations: collect_declaration_artifacts(owner, &facts[owner_index])?,
                 lexical_bindings: collect_lexical_binding_artifacts(owner, &facts[owner_index])?,
@@ -4488,7 +4594,7 @@ pub fn compile_project_program_with_definition_facts(
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice(),
                 syntax_discriminated_formals: syntax_discriminated_formals[owner_index].clone(),
-                basis_fingerprint_v4: definition_basis_fingerprint_with_buffer(
+                basis_fingerprint_v5: definition_basis_fingerprint_with_buffer(
                     owner,
                     &facts[owner_index],
                     &mut basis_fingerprint_scratch,
@@ -11908,16 +12014,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v4,
-            moved.currentness.basis_fingerprint_v4
+            solved.currentness.basis_fingerprint_v5,
+            moved.currentness.basis_fingerprint_v5
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v6,
-            moved.currentness.artifact_fingerprint_v6
+            solved.currentness.artifact_fingerprint_v7,
+            moved.currentness.artifact_fingerprint_v7
         );
         assert_ne!(
-            solved.currentness.fingerprint_v6,
-            moved.currentness.fingerprint_v6
+            solved.currentness.fingerprint_v7,
+            moved.currentness.fingerprint_v7
         );
 
         let mut missing = facts.clone();
@@ -11938,6 +12044,123 @@ mod tests {
             .err()
             .expect("duplicate relocations must fail closed");
         assert!(error.to_string().contains("repeats a stable expression"));
+    }
+
+    #[test]
+    fn expression_semantic_payloads_are_exact_dense_linker_authority() {
+        let input = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Text,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::TextTemplate,
+                    inputs: vec![edge(KernelOwnerEdgeRole::TextDynamic, 0)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Hold,
+                    inputs: vec![edge(KernelOwnerEdgeRole::HoldInitial, 1)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(3),
+        };
+        let facts = KernelDefinitionFactsInput {
+            expression_payloads: vec![
+                KernelExpressionSemanticPayload::Text("hello".into()),
+                KernelExpressionSemanticPayload::Number(ExactNumber::from_u64(42)),
+                KernelExpressionSemanticPayload::TextTemplate(
+                    vec![
+                        KernelTextTemplateSegment::Static("value=".into()),
+                        KernelTextTemplateSegment::Dynamic(0),
+                    ]
+                    .into_boxed_slice(),
+                ),
+                KernelExpressionSemanticPayload::HoldName("remembered".into()),
+            ]
+            .into_boxed_slice(),
+            ..KernelDefinitionFactsInput::default()
+        };
+
+        let solved = compile_owner_program_with_definition_facts(&input, &facts)
+            .unwrap()
+            .solve()
+            .unwrap();
+        assert_eq!(
+            solved.definition.expression_payloads,
+            facts.expression_payloads
+        );
+
+        let mut edited = facts.clone();
+        edited.expression_payloads[0] = KernelExpressionSemanticPayload::Text("goodbye".into());
+        let edited = compile_owner_program_with_definition_facts(&input, &edited)
+            .unwrap()
+            .solve()
+            .unwrap();
+        assert_eq!(solved.definition.result, edited.definition.result);
+        assert_eq!(
+            solved.currentness.public_result_fingerprint_v1,
+            edited.currentness.public_result_fingerprint_v1,
+        );
+        assert_ne!(
+            solved.currentness.basis_fingerprint_v5,
+            edited.currentness.basis_fingerprint_v5,
+        );
+        assert_ne!(
+            solved.currentness.artifact_fingerprint_v7,
+            edited.currentness.artifact_fingerprint_v7,
+        );
+        assert_ne!(
+            solved.currentness.fingerprint_v7,
+            edited.currentness.fingerprint_v7,
+        );
+
+        let mut missing = facts.clone();
+        missing.expression_payloads = Box::new([]);
+        // Empty payload tables remain permitted for low-level solver clients.
+        compile_owner_program_with_definition_facts(&input, &missing)
+            .expect("a low-level type-only program may omit linker payloads");
+        missing.expression_payloads =
+            vec![KernelExpressionSemanticPayload::None].into_boxed_slice();
+        let error = compile_owner_program_with_definition_facts(&input, &missing)
+            .err()
+            .expect("partial semantic payload tables must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("1 expression semantic payloads for 4")
+        );
+
+        let mut incompatible = facts.clone();
+        incompatible.expression_payloads[0] = KernelExpressionSemanticPayload::Byte(7);
+        let error = compile_owner_program_with_definition_facts(&input, &incompatible)
+            .err()
+            .expect("semantic payload kinds must match their dense solver nodes");
+        assert!(error.to_string().contains("incompatible with node Text"));
+
+        let mut invalid_template = facts;
+        invalid_template.expression_payloads[2] = KernelExpressionSemanticPayload::TextTemplate(
+            vec![KernelTextTemplateSegment::Dynamic(1)].into_boxed_slice(),
+        );
+        let error = compile_owner_program_with_definition_facts(&input, &invalid_template)
+            .err()
+            .expect("template segment ordinals must match the dense dynamic edges");
+        assert!(
+            error
+                .to_string()
+                .contains("incompatible with node TextTemplate")
+        );
     }
 
     #[test]
@@ -11976,6 +12199,7 @@ mod tests {
         };
         let facts = KernelDefinitionFactsInput {
             relocations: KernelDefinitionRelocations::default(),
+            expression_payloads: Box::new([]),
             statements: vec![KernelStatementInput {
                 id: KernelStatementId(0),
                 kind: KernelStatementKind::Field {
@@ -12201,6 +12425,7 @@ mod tests {
         .into_boxed_slice();
         let facts = KernelDefinitionFactsInput {
             relocations: KernelDefinitionRelocations::default(),
+            expression_payloads: Box::new([]),
             statements,
             declarations,
             lexical_bindings: Box::new([]),

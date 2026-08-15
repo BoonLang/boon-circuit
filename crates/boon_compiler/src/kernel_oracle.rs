@@ -17,12 +17,13 @@ use boon_compiler_kernel::{
     KernelCallPassInput, KernelCallShapeArgument, KernelCallShapeInput, KernelCallShapeParameter,
     KernelCallShapeResolution, KernelCallSyntaxArgument, KernelCallSyntaxInput, KernelCallTarget,
     KernelCallTypeSubstitution, KernelCallableKind, KernelCheckProduct, KernelCollectionKind,
-    KernelCompileWork, KernelDeclarationId, KernelDeclarationInput, KernelDeclarationKind,
-    KernelDeclarationOrigin, KernelDeclarationReference, KernelDefinitionFactsInput,
-    KernelDefinitionRelocations, KernelDiagnosticKind, KernelDiagnosticSeverity,
-    KernelDiagnosticSite, KernelExpressionId, KernelExpressionRelocation,
-    KernelExpressionSemanticPayload, KernelExternalExpression, KernelExternalTarget,
-    KernelHostEffectArtifact, KernelInheritedFormal, KernelLexicalAccess,
+    KernelCompileWork, KernelConditionalKind, KernelDeclarationId, KernelDeclarationInput,
+    KernelDeclarationKind, KernelDeclarationOrigin, KernelDeclarationReference,
+    KernelDefinitionFactsInput, KernelDefinitionRelocations, KernelDiagnosticKind,
+    KernelDiagnosticSeverity, KernelDiagnosticSite, KernelExecutionBlockBindingInput,
+    KernelExecutionRecordFieldInput, KernelExecutionShapeInput, KernelExpressionId,
+    KernelExpressionRelocation, KernelExpressionSemanticPayload, KernelExternalExpression,
+    KernelExternalTarget, KernelHostEffectArtifact, KernelInheritedFormal, KernelLexicalAccess,
     KernelLexicalBindingInput, KernelLexicalBindingTarget, KernelLexicalBindingTargetInput,
     KernelListId, KernelListInput, KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge,
     KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelParameterEvaluationScope,
@@ -30,8 +31,8 @@ use boon_compiler_kernel::{
     KernelPureBuiltinKind, KernelRenderConstructorKind, KernelSession, KernelSolveWork,
     KernelSourceId, KernelSourceInput, KernelStateId, KernelStateInput,
     KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
-    KernelStatementParameter, KernelStatementReference, KernelTextTemplateSegment,
-    KernelTypeMismatch, KernelValueReference, is_kernel_host_effect,
+    KernelStatementParameter, KernelStatementReference, KernelStructuralDeclarationInput,
+    KernelTextTemplateSegment, KernelTypeMismatch, KernelValueReference, is_kernel_host_effect,
     is_registered_kernel_host_effect, project_kernel_call_shape,
     project_kernel_source_expression_diagnostics,
 };
@@ -53,6 +54,7 @@ pub struct KernelOwnerOracleEntry {
     pub formals: Box<[FlowType]>,
     pub result: FlowType,
     pub expressions: Box<[(StableExpressionKey, FlowType)]>,
+    pub execution_shape_count: usize,
     pub statements: Box<[KernelOwnerOracleStatement]>,
     pub declarations: Box<[KernelOwnerOracleDeclaration]>,
     pub lexical_bindings: Box<[KernelOwnerOracleLexicalBinding]>,
@@ -488,11 +490,11 @@ pub struct KernelOwnerOracleReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
-    pub basis_fingerprint_v6: [u8; 32],
+    pub basis_fingerprint_v7: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v8: [u8; 32],
+    pub artifact_fingerprint_v9: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v8: [u8; 32],
+    pub fingerprint_v9: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1116,11 +1118,11 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 .zip(&artifact.currentness)
                 .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
                     owner: prepared[*prepared_index].owner.clone(),
-                    basis_fingerprint_v6: receipt.basis_fingerprint_v6,
+                    basis_fingerprint_v7: receipt.basis_fingerprint_v7,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v8: receipt.artifact_fingerprint_v8,
+                    artifact_fingerprint_v9: receipt.artifact_fingerprint_v9,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v8: receipt.fingerprint_v8,
+                    fingerprint_v9: receipt.fingerprint_v9,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -1187,6 +1189,19 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                             authored.pass.map(|pass| pass.final_clause),
                         );
                     }
+                    assert_eq!(
+                        artifact.execution_shapes.len(),
+                        owner.definition_facts.execution_shapes.len(),
+                        "kernel definition artifacts retain every lossy structural execution shape"
+                    );
+                    for (linked, authored) in artifact
+                        .execution_shapes
+                        .iter()
+                        .zip(owner.definition_facts.execution_shapes.iter())
+                    {
+                        assert_eq!(linked.expression(), authored.expression());
+                    }
+                    let execution_shape_count = artifact.execution_shapes.len();
                     let stable_provider = |value: KernelValueReference| match value {
                         KernelValueReference::Local(expression) => {
                             KernelOwnerOracleValueReference::Expression(
@@ -1649,6 +1664,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         formals: artifact.formals,
                         result: artifact.result,
                         expressions,
+                        execution_shape_count,
                         statements,
                         declarations,
                         lexical_bindings,
@@ -3143,6 +3159,242 @@ fn compact_call_syntax_input(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn compact_execution_shape_inputs(
+    view: UnitOwnerSyntaxView<'_>,
+    owner: &StableCheckOwnerKey,
+    raw_expressions: &[&boon_syntax::AstExpr],
+    local_by_syntax: &BTreeMap<usize, usize>,
+    nodes: &[KernelOwnerNode],
+    statement_record_field_targets: &BTreeMap<(usize, String), PreparedLexicalTarget>,
+    declarations: &[KernelDeclarationInput],
+    node_count: usize,
+    external_by_key: &mut BTreeMap<PreparedExternalExpression, usize>,
+    external_expressions: &mut Vec<PreparedExternalExpression>,
+) -> Result<Box<[KernelExecutionShapeInput]>, String> {
+    let dense_statement_by_syntax = view
+        .statement_ids()
+        .iter()
+        .copied()
+        .zip(view.statements())
+        .enumerate()
+        .map(|(dense, (_, statement))| {
+            Ok((
+                statement.id,
+                KernelStatementId(checked_u32(dense, "execution-shape statement")?),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let declaration_by_origin = declarations
+        .iter()
+        .map(|declaration| (declaration.origin.clone(), declaration.id))
+        .collect::<BTreeMap<_, _>>();
+    let structural_declaration = |target: &PreparedLexicalTarget| -> Result<Option<_>, String> {
+        Ok(match target {
+            PreparedLexicalTarget::Declaration(origin) => Some(
+                declaration_by_origin
+                    .get(origin)
+                    .copied()
+                    .map(KernelStructuralDeclarationInput::Local)
+                    .ok_or_else(|| {
+                        format!("structural execution target has no local declaration {origin:?}")
+                    })?,
+            ),
+            PreparedLexicalTarget::OwnerPublic(_) => {
+                Some(KernelStructuralDeclarationInput::ValueOwnerPublic)
+            }
+            PreparedLexicalTarget::Value(_) | PreparedLexicalTarget::RuntimeContext => None,
+        })
+    };
+    let value_is_owner_result =
+        |value: KernelExpressionId, external_expressions: &[PreparedExternalExpression]| {
+            let index = value.0 as usize;
+            index >= node_count
+                && external_expressions
+                    .get(index - node_count)
+                    .is_some_and(|external| {
+                        matches!(external.target, PreparedExternalTarget::Result)
+                    })
+        };
+    let mut shapes = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let expression = checked_kernel_expression(index)?;
+        match &node.kind {
+            KernelOwnerNodeKind::When => {
+                let kind = match raw_expressions
+                    .get(index)
+                    .map(|expression| &expression.kind)
+                {
+                    Some(AstExprKind::When { .. }) => KernelConditionalKind::When,
+                    Some(AstExprKind::Pipe { op, .. }) if op == "WHILE" => {
+                        KernelConditionalKind::While
+                    }
+                    source => {
+                        return Err(format!(
+                            "canonical WHEN expression {index} has no exact WHEN/WHILE source: {source:?}"
+                        ));
+                    }
+                };
+                shapes.push(KernelExecutionShapeInput::Conditional { expression, kind });
+            }
+            KernelOwnerNodeKind::Record { .. } => {
+                let syntax = raw_expressions.get(index).map(|expression| expression.id);
+                let fields = node
+                    .inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, edge)| {
+                        let KernelOwnerEdgeRole::RecordField { name, spread } = &edge.role else {
+                            return Err(format!(
+                                "canonical record expression {index} has a non-field input"
+                            ));
+                        };
+                        let declaration = if *spread {
+                            None
+                        } else if let Some(target) = syntax.and_then(|syntax| {
+                            statement_record_field_targets.get(&(syntax, name.to_string()))
+                        }) {
+                            structural_declaration(target)?
+                        } else {
+                            declaration_by_origin
+                                .get(&KernelDeclarationOrigin::RecordField {
+                                    object: expression,
+                                    ordinal: checked_u32(
+                                        ordinal,
+                                        "execution record field ordinal",
+                                    )?,
+                                })
+                                .copied()
+                                .map(KernelStructuralDeclarationInput::Local)
+                                .or_else(|| {
+                                    value_is_owner_result(edge.expression, external_expressions)
+                                        .then_some(
+                                            KernelStructuralDeclarationInput::ValueOwnerPublic,
+                                        )
+                                })
+                        };
+                        Ok(KernelExecutionRecordFieldInput {
+                            ordinal: checked_u32(ordinal, "execution record field ordinal")?,
+                            declaration,
+                            name: name.clone(),
+                            value: edge.expression,
+                            spread: *spread,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+                    .into_boxed_slice();
+                shapes.push(KernelExecutionShapeInput::Record { expression, fields });
+            }
+            KernelOwnerNodeKind::Block => {
+                let bindings = match raw_expressions.get(index).map(|expression| &expression.kind) {
+                    Some(AstExprKind::Block { bindings, .. }) => bindings
+                        .iter()
+                        .enumerate()
+                        .map(|(ordinal, binding)| {
+                            let declaration = match binding.declaration {
+                                AstBlockBindingDeclaration::Local { statement } => {
+                                    let statement = dense_statement_by_syntax
+                                        .get(&statement)
+                                        .copied()
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "BLOCK expression {index} binding {ordinal} references statement {statement} outside its owner"
+                                            )
+                                        })?;
+                                    let origin = KernelDeclarationOrigin::Statement {
+                                        statement,
+                                    };
+                                    KernelStructuralDeclarationInput::Local(
+                                        declaration_by_origin.get(&origin).copied().ok_or_else(
+                                            || {
+                                                format!(
+                                                    "BLOCK expression {index} binding {ordinal} has no declaration {origin:?}"
+                                                )
+                                            },
+                                        )?,
+                                    )
+                                }
+                                AstBlockBindingDeclaration::Child { .. } => {
+                                    KernelStructuralDeclarationInput::ValueOwnerPublic
+                                }
+                            };
+                            let value = prepared_input_reference_index(
+                                PreparedInputReference::Syntax(binding.value),
+                                view,
+                                owner,
+                                raw_expressions.get(index).map(|expression| expression.id),
+                                local_by_syntax,
+                                node_count,
+                                external_by_key,
+                                external_expressions,
+                            )
+                            .and_then(checked_kernel_expression)?;
+                            Ok(KernelExecutionBlockBindingInput {
+                                ordinal: checked_u32(ordinal, "BLOCK binding ordinal")?,
+                                declaration,
+                                value,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, String>>()?
+                        .into_boxed_slice(),
+                    // A synthetic definition-result alias is represented by a
+                    // BLOCK node without authored bindings.
+                    None if index >= raw_expressions.len() => Box::new([]),
+                    source => {
+                        return Err(format!(
+                            "canonical BLOCK expression {index} has no exact BLOCK source: {source:?}"
+                        ));
+                    }
+                };
+                let result = node
+                    .inputs
+                    .iter()
+                    .find(|edge| edge.role == KernelOwnerEdgeRole::BlockResult)
+                    .map(|edge| edge.expression);
+                shapes.push(KernelExecutionShapeInput::Block {
+                    expression,
+                    bindings,
+                    result,
+                });
+            }
+            KernelOwnerNodeKind::MatchArm { .. } => {
+                let bindings = pattern_variable_names(match raw_expressions
+                    .get(index)
+                    .map(|expression| &expression.kind)
+                {
+                    Some(AstExprKind::MatchArm { pattern, .. }) => pattern,
+                    source => {
+                        return Err(format!(
+                            "canonical match arm {index} has no exact match source: {source:?}"
+                        ));
+                    }
+                })
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, _)| {
+                    let origin = KernelDeclarationOrigin::PatternBinding {
+                        arm: expression,
+                        ordinal: checked_u32(ordinal, "execution pattern binding ordinal")?,
+                    };
+                    declaration_by_origin.get(&origin).copied().ok_or_else(|| {
+                        format!(
+                            "match expression {index} binding {ordinal} has no declaration {origin:?}"
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?
+                .into_boxed_slice();
+                shapes.push(KernelExecutionShapeInput::MatchArm {
+                    expression,
+                    bindings,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(shapes.into_boxed_slice())
+}
+
 fn compact_call_shape_input(
     expression: KernelExpressionId,
     syntax: &boon_syntax::AstExpr,
@@ -3751,7 +4003,7 @@ fn compact_owner_view(
     public_child_owner_fields.retain(|(name, _)| public_field_names.insert(name.clone()));
     let public_child_owner_fields = public_child_owner_fields.into_boxed_slice();
     let statement_record_field_targets =
-        direct_statement_record_field_targets(view, &owner, &raw_expressions);
+        direct_statement_record_field_targets(view, &owner, &raw_expressions, &structured_records);
     let lexical_binding_reads = direct_lexical_binding_reads(
         view,
         &owner,
@@ -4781,6 +5033,18 @@ fn compact_owner_view(
         )?;
     definition_facts.declarations = declarations;
     definition_facts.lexical_bindings = lexical_bindings;
+    definition_facts.execution_shapes = compact_execution_shape_inputs(
+        view,
+        &owner,
+        &raw_expressions,
+        &local_by_syntax,
+        &nodes,
+        &statement_record_field_targets,
+        &definition_facts.declarations,
+        node_count,
+        &mut external_by_key,
+        &mut external_expressions,
+    )?;
     let mut diagnostics =
         project_kernel_source_expression_diagnostics(raw_expressions.iter().enumerate().map(
             |(index, expression)| {
@@ -5199,6 +5463,7 @@ fn direct_statement_record_field_targets(
     view: UnitOwnerSyntaxView<'_>,
     owner: &StableCheckOwnerKey,
     raw_expressions: &[&boon_syntax::AstExpr],
+    structured_records: &BTreeMap<usize, Vec<PreparedRecordEntry>>,
 ) -> BTreeMap<(usize, String), PreparedLexicalTarget> {
     let expressions = raw_expressions
         .iter()
@@ -5250,29 +5515,54 @@ fn direct_statement_record_field_targets(
             | AstExprKind::Then {
                 output: Some(output),
                 ..
-            } if expressions
-                .get(output)
-                .is_some_and(|output| matches!(output.kind, AstExprKind::Object(_))) =>
+            } if expressions.get(output).is_some_and(|output| {
+                matches!(output.kind, AstExprKind::Object(_))
+                    || structured_records.contains_key(&output.id)
+            }) =>
             {
                 Some(*output)
             }
+            _ if structured_records.contains_key(&direct) => Some(direct),
             _ => None,
         };
         let Some(container) = container else {
             continue;
         };
-        let Some(AstExprKind::Object(fields)) = expressions
+        let fields = match expressions
             .get(&container)
             .map(|expression| &expression.kind)
-        else {
-            continue;
+        {
+            Some(AstExprKind::Object(fields)) if !fields.is_empty() => fields
+                .iter()
+                .map(|field| {
+                    (
+                        field.name.as_str(),
+                        field.spread,
+                        PreparedInputReference::Syntax(field.value),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            _ => structured_records
+                .get(&container)
+                .into_iter()
+                .flatten()
+                .map(|field| match field {
+                    PreparedRecordEntry::Field { name, value } => {
+                        (name.as_str(), false, value.clone())
+                    }
+                    PreparedRecordEntry::Spread { value } => ("", true, value.clone()),
+                })
+                .collect(),
         };
-        for field in fields.iter().filter(|field| !field.spread) {
+        for (field_name, spread, field_value) in fields {
+            if spread {
+                continue;
+            }
             let statement_target = statement
                 .children
                 .iter()
                 .enumerate()
-                .find(|(_, child)| statement_binding_name(&child.kind) == Some(&field.name))
+                .find(|(_, child)| statement_binding_name(&child.kind) == Some(field_name))
                 .and_then(|(child_index, _)| {
                     statement_by_placement
                         .get(&(Some(statement_id), child_index))
@@ -5286,13 +5576,17 @@ fn direct_statement_record_field_targets(
                         &dense_statement_by_syntax,
                     )
                 });
-            let target = statement_target.or_else(|| {
-                view.stable_check_owner_for_syntax_expression(field.value)
+            let target = statement_target.or_else(|| match &field_value {
+                PreparedInputReference::Syntax(value) => view
+                    .stable_check_owner_for_syntax_expression(*value)
                     .filter(|field_owner| field_owner != owner)
-                    .map(PreparedLexicalTarget::OwnerPublic)
+                    .map(PreparedLexicalTarget::OwnerPublic),
+                PreparedInputReference::OwnerResult(owner) => {
+                    Some(PreparedLexicalTarget::OwnerPublic(owner.clone()))
+                }
             });
             if let Some(target) = target {
-                targets.insert((container, field.name.clone()), target);
+                targets.insert((container, field_name.to_owned()), target);
             }
         }
     }
@@ -13676,7 +13970,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v8 != [0; 32]),
+                        && receipt.fingerprint_v9 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(
@@ -13766,11 +14060,16 @@ mod tests {
             );
         }
         eprintln!(
-            "kernel-novywave definition_artifacts expression_rows={} statement_rows={} declaration_rows={} lexical_binding_rows={} source_resource_rows={} hold_state_rows={} persistent_list_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={} dependency_edges={} reverse_consumer_edges={}",
+            "kernel-novywave definition_artifacts expression_rows={} execution_shape_rows={} statement_rows={} declaration_rows={} lexical_binding_rows={} source_resource_rows={} hold_state_rows={} persistent_list_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={} dependency_edges={} reverse_consumer_edges={}",
             report
                 .supported
                 .iter()
                 .map(|owner| owner.expressions.len())
+                .sum::<usize>(),
+            report
+                .supported
+                .iter()
+                .map(|owner| owner.execution_shape_count)
                 .sum::<usize>(),
             report
                 .supported

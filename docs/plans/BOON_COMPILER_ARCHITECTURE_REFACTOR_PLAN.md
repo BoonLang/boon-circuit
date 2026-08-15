@@ -3516,11 +3516,55 @@ deep oracle comparison. No fresh optimized rebuild was spent on this adjacent
 metadata slice; the preceding semantic-payload release receipt remains the
 current optimized baseline.
 
-The next dependency-bottom slice is structural execution payload authority:
-retain the exact expression forms and declaration-bearing execution edges that
-canonical type equations deliberately omit. Once those rows are complete, the
-dense checked linker can consume `DefinitionArtifact` directly rather than
-re-reading source-shaped owner DTOs.
+### Sparse structural execution authority
+
+The structural execution cut is complete. Canonical type equations continue to
+own solved value flow; they are not duplicated as a second checked-expression
+enum. `KernelExecutionShapeInput` and `DefinitionArtifact` retain only the
+structure that those equations intentionally erase:
+
+- the authored distinction between `WHEN` and `WHILE`;
+- ordered record fields, spread flags, and exact local or child-public
+  declaration authority;
+- ordered `BLOCK` bindings with their declaration/value pairs and final result;
+- exact match-arm pattern-binding declarations.
+
+Every production definition supplies one sorted shape row for every canonical
+record, block, conditional, and match-arm node. The kernel checks exact
+cardinality, dense ordinals, node compatibility, declaration ownership, and all
+local/external value bounds before solving. Low-level type-only fixtures may
+omit the source-shaped table. External declaration authority and external value
+identity remain deliberately separate: a child owner's public declaration can
+name one external expression while its canonical public result is another.
+
+The first full NovyWave run found a real namespace boundary rather than a type
+failure. Raw parser `BLOCK` bindings carry packed syntax statement IDs; the
+artifact table requires definition-local dense rows. Directly casting the
+packed ID pruned 386 owners. Mapping it through the immutable owner view's exact
+syntax-to-dense statement table restored all 1,389 owners and is now covered by
+the full differential gate. This is a general project-link rule, not a
+NovyWave-specific case.
+
+Structural rows participate in the definition basis, artifact, and exact
+currentness fingerprints, advancing those domains to basis V7 and
+artifact/currentness V9. The complete kernel suite is 94/94 green,
+parser-backed Counter/Todo coverage remains deterministic, and the full
+NovyWave differential retains 3,601 execution-shape rows, 15,575 expressions,
+5,541 statements, and 1,821 calls with zero unsupported owners.
+
+The fresh release candidate is 817.964 ms including retained parsing and the
+SOURCE ABI pass, with 729.247 ms in the kernel path. Of that kernel time,
+196.152 ms is still compatibility checked-image publication. The corresponding
+debug candidate is 3,201.560 ms. The optimized Cargo rebuild took 3 minutes 20
+seconds and is excluded from every Boon timing. This adjacent authority cut is
+effectively flat against the prior 797.986 ms release receipt; it was not
+expected to improve latency before the direct linker deletes reconstruction.
+
+The next dependency-bottom slice is the direct `DefinitionArtifact` to
+`boon_checked` linker. It must consume relocations, semantic payloads, authored
+call surfaces, and sparse structural execution rows without re-reading
+source-shaped owner DTOs. Once that linker is exact, production checked-image
+requests can cut over and the superseded assembly path can be deleted.
 
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not

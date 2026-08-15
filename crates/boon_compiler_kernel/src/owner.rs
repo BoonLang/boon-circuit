@@ -551,6 +551,78 @@ pub struct KernelCallPassInput {
     pub final_clause: bool,
 }
 
+/// Source-level execution distinction retained only where the canonical type
+/// equation is intentionally lossy.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelConditionalKind {
+    When,
+    While,
+}
+
+/// Declaration authority attached to one structural execution value before
+/// cross-definition references have been linked.
+///
+/// `ValueOwnerPublic` is not a magic owner ID. It requires the associated
+/// value to come from an external definition and is converted to that exact
+/// owner's public declaration while the immutable artifact is built. The
+/// value itself may name either one exported expression or the aggregate
+/// result; declaration identity and value relocation are distinct facts.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelStructuralDeclarationInput {
+    Local(KernelDeclarationId),
+    ValueOwnerPublic,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelExecutionRecordFieldInput {
+    pub ordinal: u32,
+    pub declaration: Option<KernelStructuralDeclarationInput>,
+    pub name: Box<str>,
+    pub value: KernelExpressionId,
+    pub spread: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelExecutionBlockBindingInput {
+    pub ordinal: u32,
+    pub declaration: KernelStructuralDeclarationInput,
+    pub value: KernelExpressionId,
+}
+
+/// Sparse exact execution rows for expression shapes whose runtime/checked
+/// representation cannot be reconstructed from normalized solver edges.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelExecutionShapeInput {
+    Conditional {
+        expression: KernelExpressionId,
+        kind: KernelConditionalKind,
+    },
+    Record {
+        expression: KernelExpressionId,
+        fields: Box<[KernelExecutionRecordFieldInput]>,
+    },
+    Block {
+        expression: KernelExpressionId,
+        bindings: Box<[KernelExecutionBlockBindingInput]>,
+        result: Option<KernelExpressionId>,
+    },
+    MatchArm {
+        expression: KernelExpressionId,
+        bindings: Box<[KernelDeclarationId]>,
+    },
+}
+
+impl KernelExecutionShapeInput {
+    pub const fn expression(&self) -> KernelExpressionId {
+        match self {
+            Self::Conditional { expression, .. }
+            | Self::Record { expression, .. }
+            | Self::Block { expression, .. }
+            | Self::MatchArm { expression, .. } => *expression,
+        }
+    }
+}
+
 impl KernelDefinitionRelocations {
     pub fn is_empty(&self) -> bool {
         self.expressions.is_empty() && self.statements.is_empty()
@@ -566,6 +638,7 @@ pub struct KernelDefinitionFactsInput {
     pub relocations: KernelDefinitionRelocations,
     pub expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     pub call_syntax: Box<[KernelCallSyntaxInput]>,
+    pub execution_shapes: Box<[KernelExecutionShapeInput]>,
     pub statements: Box<[KernelStatementInput]>,
     pub declarations: Box<[KernelDeclarationInput]>,
     pub lexical_bindings: Box<[KernelLexicalBindingInput]>,
@@ -631,6 +704,7 @@ pub struct KernelOwnerProgram {
     relocations: KernelDefinitionRelocations,
     expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     call_syntax: Box<[KernelCallSyntaxArtifact]>,
+    execution_shapes: Box<[KernelExecutionShapeArtifact]>,
     statements: Box<[KernelStatementArtifact]>,
     declarations: Box<[KernelDeclarationArtifact]>,
     lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
@@ -638,7 +712,7 @@ pub struct KernelOwnerProgram {
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
-    basis_fingerprint_v6: [u8; 32],
+    basis_fingerprint_v7: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -721,6 +795,7 @@ struct KernelProjectOwnerOutputs {
     relocations: KernelDefinitionRelocations,
     expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     call_syntax: Box<[KernelCallSyntaxArtifact]>,
+    execution_shapes: Box<[KernelExecutionShapeArtifact]>,
     statements: Box<[KernelStatementArtifact]>,
     declarations: Box<[KernelDeclarationArtifact]>,
     lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
@@ -733,7 +808,7 @@ struct KernelProjectOwnerOutputs {
     /// requirements. That aggregate is useful to the solver, but is not a
     /// sound direct assignability contract for call diagnostics.
     syntax_discriminated_formals: Box<[u32]>,
-    basis_fingerprint_v6: [u8; 32],
+    basis_fingerprint_v7: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -855,6 +930,54 @@ pub struct KernelCallSyntaxArgumentArtifact {
 pub struct KernelCallPassArtifact {
     pub value: KernelValueReference,
     pub final_clause: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelExecutionRecordFieldArtifact {
+    pub ordinal: u32,
+    pub declaration: Option<KernelDeclarationReference>,
+    pub name: Box<str>,
+    pub value: KernelValueReference,
+    pub spread: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelExecutionBlockBindingArtifact {
+    pub ordinal: u32,
+    pub declaration: KernelDeclarationReference,
+    pub value: KernelValueReference,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelExecutionShapeArtifact {
+    Conditional {
+        expression: KernelExpressionId,
+        kind: KernelConditionalKind,
+    },
+    Record {
+        expression: KernelExpressionId,
+        fields: Box<[KernelExecutionRecordFieldArtifact]>,
+    },
+    Block {
+        expression: KernelExpressionId,
+        bindings: Box<[KernelExecutionBlockBindingArtifact]>,
+        result: Option<KernelValueReference>,
+    },
+    MatchArm {
+        expression: KernelExpressionId,
+        bindings: Box<[KernelDeclarationId]>,
+    },
+}
+
+impl KernelExecutionShapeArtifact {
+    pub const fn expression(&self) -> KernelExpressionId {
+        match self {
+            Self::Conditional { expression, .. }
+            | Self::Record { expression, .. }
+            | Self::Block { expression, .. }
+            | Self::MatchArm { expression, .. } => *expression,
+        }
+    }
 }
 
 pub type KernelCallValueReference = KernelValueReference;
@@ -1782,6 +1905,7 @@ pub struct DefinitionArtifact {
     pub relocations: KernelDefinitionRelocations,
     pub expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     pub call_syntax: Box<[KernelCallSyntaxArtifact]>,
+    pub execution_shapes: Box<[KernelExecutionShapeArtifact]>,
     pub expressions: Box<[KernelExpressionArtifact]>,
     pub statements: Box<[KernelStatementArtifact]>,
     pub declarations: Box<[KernelDeclarationArtifact]>,
@@ -1866,7 +1990,7 @@ pub fn is_registered_kernel_host_effect(operation: &str) -> bool {
 
 impl KernelOwnerProgram {
     pub fn solve(self) -> Result<KernelDefinitionSnapshot, KernelSolveError> {
-        let basis_fingerprint_v6 = self.basis_fingerprint_v6;
+        let basis_fingerprint_v7 = self.basis_fingerprint_v7;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
             .output(self.result_output)
@@ -1926,6 +2050,7 @@ impl KernelOwnerProgram {
             relocations: self.relocations,
             expression_payloads: self.expression_payloads,
             call_syntax: self.call_syntax,
+            execution_shapes: self.execution_shapes,
             expressions,
             statements: self.statements,
             declarations: self.declarations,
@@ -1939,7 +2064,7 @@ impl KernelOwnerProgram {
         };
         let (dependencies, currentness) = build_snapshot_receipts(
             std::slice::from_mut(&mut definition),
-            &[basis_fingerprint_v6],
+            &[basis_fingerprint_v7],
         )?;
         let [currentness] = currentness.as_ref() else {
             unreachable!("one standalone kernel definition produces one receipt")
@@ -2104,7 +2229,7 @@ impl KernelSolvedProject {
         let basis_fingerprints = self
             .owners
             .iter()
-            .map(|owner| owner.basis_fingerprint_v6)
+            .map(|owner| owner.basis_fingerprint_v7)
             .collect::<Vec<_>>();
         let mut definitions = self
             .owners
@@ -2734,6 +2859,7 @@ fn materialize_project_definition(
         relocations: owner.relocations,
         expression_payloads: owner.expression_payloads,
         call_syntax: owner.call_syntax,
+        execution_shapes: owner.execution_shapes,
         expressions,
         statements: owner.statements,
         declarations: owner.declarations,
@@ -2864,6 +2990,8 @@ fn validate_definition_linker_facts(
         }
     }
 
+    validate_execution_shapes(input, facts, &label, relocations)?;
+
     let call_count = input
         .nodes
         .iter()
@@ -2974,12 +3102,229 @@ fn validate_definition_linker_facts(
     Ok(())
 }
 
+fn validate_execution_shapes(
+    input: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+    label: &str,
+    relocations: &KernelDefinitionRelocations,
+) -> Result<(), KernelOwnerBuildError> {
+    let expected = input
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                KernelOwnerNodeKind::Record { .. }
+                    | KernelOwnerNodeKind::Block
+                    | KernelOwnerNodeKind::When
+                    | KernelOwnerNodeKind::MatchArm { .. }
+            )
+        })
+        .count();
+    if facts.execution_shapes.is_empty() {
+        if !relocations.is_empty() && expected != 0 {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} has no execution-shape rows for {expected} lossy structural expressions"
+            )));
+        }
+        return Ok(());
+    }
+    if facts.execution_shapes.len() != expected {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel {label} has {} execution-shape rows for {expected} lossy structural expressions",
+            facts.execution_shapes.len(),
+        )));
+    }
+    let namespace_len = input
+        .nodes
+        .len()
+        .checked_add(input.external_expressions.len())
+        .ok_or_else(|| {
+            KernelOwnerBuildError::new(format!(
+                "kernel {label} execution input namespace overflows usize"
+            ))
+        })?;
+    let mut previous = None;
+    for shape in &facts.execution_shapes {
+        let expression = shape.expression();
+        let index = expression.0 as usize;
+        let Some(node) = input.nodes.get(index) else {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} execution shape references missing expression {index}"
+            )));
+        };
+        if previous.is_some_and(|previous| previous >= expression) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} execution-shape rows are not strictly ordered by expression"
+            )));
+        }
+        previous = Some(expression);
+        match shape {
+            KernelExecutionShapeInput::Conditional { .. } => {
+                if !matches!(node.kind, KernelOwnerNodeKind::When) {
+                    return Err(KernelOwnerBuildError::new(format!(
+                        "kernel {label} conditional execution shape {index} does not name a WHEN node"
+                    )));
+                }
+            }
+            KernelExecutionShapeInput::Record { fields, .. } => {
+                if !matches!(node.kind, KernelOwnerNodeKind::Record { .. })
+                    || fields.len() != node.inputs.len()
+                {
+                    return Err(KernelOwnerBuildError::new(format!(
+                        "kernel {label} record execution shape {index} differs from its canonical field table"
+                    )));
+                }
+                for (ordinal, (field, edge)) in fields.iter().zip(&node.inputs).enumerate() {
+                    if usize::try_from(field.ordinal) != Ok(ordinal)
+                        || field.value != edge.expression
+                        || field.value.0 as usize >= namespace_len
+                        || !matches!(
+                            &edge.role,
+                            KernelOwnerEdgeRole::RecordField { name, spread }
+                                if name == &field.name && spread == &field.spread
+                        )
+                    {
+                        return Err(KernelOwnerBuildError::new(format!(
+                            "kernel {label} record execution shape {index} has an invalid field at ordinal {ordinal}"
+                        )));
+                    }
+                    if let Some(declaration) = field.declaration {
+                        validate_structural_declaration(
+                            input,
+                            facts,
+                            declaration,
+                            field.value,
+                            index,
+                        )?;
+                    }
+                }
+            }
+            KernelExecutionShapeInput::Block {
+                bindings, result, ..
+            } => {
+                if !matches!(node.kind, KernelOwnerNodeKind::Block) {
+                    return Err(KernelOwnerBuildError::new(format!(
+                        "kernel {label} BLOCK execution shape {index} does not name a BLOCK node"
+                    )));
+                }
+                for (ordinal, binding) in bindings.iter().enumerate() {
+                    if usize::try_from(binding.ordinal) != Ok(ordinal)
+                        || binding.value.0 as usize >= namespace_len
+                    {
+                        return Err(KernelOwnerBuildError::new(format!(
+                            "kernel {label} BLOCK execution shape {index} has an invalid binding at ordinal {ordinal}"
+                        )));
+                    }
+                    validate_structural_declaration(
+                        input,
+                        facts,
+                        binding.declaration,
+                        binding.value,
+                        index,
+                    )?;
+                }
+                let canonical_results = node
+                    .inputs
+                    .iter()
+                    .filter(|edge| edge.role == KernelOwnerEdgeRole::BlockResult)
+                    .map(|edge| edge.expression)
+                    .collect::<Vec<_>>();
+                if canonical_results.as_slice() != result.as_slice()
+                    || result.is_some_and(|value| value.0 as usize >= namespace_len)
+                {
+                    return Err(KernelOwnerBuildError::new(format!(
+                        "kernel {label} BLOCK execution shape {index} has a result different from its canonical edge"
+                    )));
+                }
+            }
+            KernelExecutionShapeInput::MatchArm { bindings, .. } => {
+                let KernelOwnerNodeKind::MatchArm { pattern } = &node.kind else {
+                    return Err(KernelOwnerBuildError::new(format!(
+                        "kernel {label} match execution shape {index} does not name a match arm"
+                    )));
+                };
+                let expected_names = match pattern {
+                    KernelPattern::Binding { name } => std::slice::from_ref(name),
+                    KernelPattern::Tag { fields, .. } => fields,
+                    KernelPattern::Wildcard
+                    | KernelPattern::Number
+                    | KernelPattern::Text
+                    | KernelPattern::Bits { .. }
+                    | KernelPattern::Invalid => &[],
+                };
+                if bindings.len() != expected_names.len() {
+                    return Err(KernelOwnerBuildError::new(format!(
+                        "kernel {label} match execution shape {index} has {} bindings for {} pattern names",
+                        bindings.len(),
+                        expected_names.len(),
+                    )));
+                }
+                for (ordinal, (binding, name)) in
+                    bindings.iter().zip(expected_names.iter()).enumerate()
+                {
+                    let Some(declaration) = facts.declarations.get(binding.0 as usize) else {
+                        return Err(KernelOwnerBuildError::new(format!(
+                            "kernel {label} match execution shape {index} references missing declaration {}",
+                            binding.0,
+                        )));
+                    };
+                    if declaration.name.as_ref() != name.as_ref()
+                        || declaration.kind != KernelDeclarationKind::PatternBinding
+                        || declaration.origin
+                            != (KernelDeclarationOrigin::PatternBinding {
+                                arm: expression,
+                                ordinal: u32::try_from(ordinal)
+                                    .expect("pattern binding count exceeds u32"),
+                            })
+                    {
+                        return Err(KernelOwnerBuildError::new(format!(
+                            "kernel {label} match execution shape {index} has an invalid binding at ordinal {ordinal}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_structural_declaration(
+    input: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+    declaration: KernelStructuralDeclarationInput,
+    value: KernelExpressionId,
+    consumer: usize,
+) -> Result<(), KernelOwnerBuildError> {
+    match declaration {
+        KernelStructuralDeclarationInput::Local(declaration) => {
+            if declaration.0 as usize >= facts.declarations.len() {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel structural expression {consumer} references missing declaration {}",
+                    declaration.0,
+                )));
+            }
+        }
+        KernelStructuralDeclarationInput::ValueOwnerPublic => {
+            if !matches!(
+                kernel_value_reference(input, value, consumer)?,
+                KernelValueReference::External(_)
+            ) {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel structural expression {consumer} marks a local value as an owner-public declaration"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn compile_owner_program_with_definition_facts(
     input: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
     validate_definition_linker_facts(input, facts, None)?;
-    let basis_fingerprint_v6 = definition_basis_fingerprint(input, facts)?;
+    let basis_fingerprint_v7 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
@@ -3134,6 +3479,7 @@ pub fn compile_owner_program_with_definition_facts(
         relocations: facts.relocations.clone(),
         expression_payloads: facts.expression_payloads.clone(),
         call_syntax: collect_call_syntax_artifacts(input, facts)?,
+        execution_shapes: collect_execution_shape_artifacts(input, facts)?,
         statements,
         declarations,
         lexical_bindings,
@@ -3141,7 +3487,7 @@ pub fn compile_owner_program_with_definition_facts(
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
         diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
-        basis_fingerprint_v6,
+        basis_fingerprint_v7,
     })
 }
 
@@ -4189,6 +4535,110 @@ fn collect_call_syntax_artifacts(
         .map(Vec::into_boxed_slice)
 }
 
+fn collect_execution_shape_artifacts(
+    input: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<Box<[KernelExecutionShapeArtifact]>, KernelOwnerBuildError> {
+    facts
+        .execution_shapes
+        .iter()
+        .map(|shape| {
+            let expression = shape.expression();
+            let consumer = expression.0 as usize;
+            Ok(match shape {
+                KernelExecutionShapeInput::Conditional { kind, .. } => {
+                    KernelExecutionShapeArtifact::Conditional {
+                        expression,
+                        kind: *kind,
+                    }
+                }
+                KernelExecutionShapeInput::Record { fields, .. } => {
+                    KernelExecutionShapeArtifact::Record {
+                        expression,
+                        fields: fields
+                            .iter()
+                            .map(|field| {
+                                Ok(KernelExecutionRecordFieldArtifact {
+                                    ordinal: field.ordinal,
+                                    declaration: field
+                                        .declaration
+                                        .map(|declaration| {
+                                            link_structural_declaration(
+                                                input,
+                                                declaration,
+                                                field.value,
+                                                consumer,
+                                            )
+                                        })
+                                        .transpose()?,
+                                    name: field.name.clone(),
+                                    value: kernel_value_reference(input, field.value, consumer)?,
+                                    spread: field.spread,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?
+                            .into_boxed_slice(),
+                    }
+                }
+                KernelExecutionShapeInput::Block {
+                    bindings, result, ..
+                } => KernelExecutionShapeArtifact::Block {
+                    expression,
+                    bindings: bindings
+                        .iter()
+                        .map(|binding| {
+                            Ok(KernelExecutionBlockBindingArtifact {
+                                ordinal: binding.ordinal,
+                                declaration: link_structural_declaration(
+                                    input,
+                                    binding.declaration,
+                                    binding.value,
+                                    consumer,
+                                )?,
+                                value: kernel_value_reference(input, binding.value, consumer)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?
+                        .into_boxed_slice(),
+                    result: result
+                        .map(|result| kernel_value_reference(input, result, consumer))
+                        .transpose()?,
+                },
+                KernelExecutionShapeInput::MatchArm { bindings, .. } => {
+                    KernelExecutionShapeArtifact::MatchArm {
+                        expression,
+                        bindings: bindings.clone(),
+                    }
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
+}
+
+fn link_structural_declaration(
+    input: &KernelOwnerProgramInput,
+    declaration: KernelStructuralDeclarationInput,
+    value: KernelExpressionId,
+    consumer: usize,
+) -> Result<KernelDeclarationReference, KernelOwnerBuildError> {
+    match declaration {
+        KernelStructuralDeclarationInput::Local(declaration) => {
+            Ok(KernelDeclarationReference::Local(declaration))
+        }
+        KernelStructuralDeclarationInput::ValueOwnerPublic => {
+            let KernelValueReference::External(KernelExternalExpression { owner, .. }) =
+                kernel_value_reference(input, value, consumer)?
+            else {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel structural expression {consumer} lost its external owner declaration"
+                )));
+            };
+            Ok(KernelDeclarationReference::OwnerPublic(owner))
+        }
+    }
+}
+
 fn collect_call_artifacts(
     input: &KernelOwnerProgramInput,
 ) -> Result<Box<[PendingKernelCallArtifact]>, KernelOwnerBuildError> {
@@ -4784,6 +5234,7 @@ pub fn compile_project_program_with_definition_facts(
                 relocations: facts[owner_index].relocations.clone(),
                 expression_payloads: facts[owner_index].expression_payloads.clone(),
                 call_syntax: collect_call_syntax_artifacts(owner, &facts[owner_index])?,
+                execution_shapes: collect_execution_shape_artifacts(owner, &facts[owner_index])?,
                 statements,
                 declarations: collect_declaration_artifacts(owner, &facts[owner_index])?,
                 lexical_bindings: collect_lexical_binding_artifacts(owner, &facts[owner_index])?,
@@ -4805,7 +5256,7 @@ pub fn compile_project_program_with_definition_facts(
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice(),
                 syntax_discriminated_formals: syntax_discriminated_formals[owner_index].clone(),
-                basis_fingerprint_v6: definition_basis_fingerprint_with_buffer(
+                basis_fingerprint_v7: definition_basis_fingerprint_with_buffer(
                     owner,
                     &facts[owner_index],
                     &mut basis_fingerprint_scratch,
@@ -12225,16 +12676,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v6,
-            moved.currentness.basis_fingerprint_v6
+            solved.currentness.basis_fingerprint_v7,
+            moved.currentness.basis_fingerprint_v7
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v8,
-            moved.currentness.artifact_fingerprint_v8
+            solved.currentness.artifact_fingerprint_v9,
+            moved.currentness.artifact_fingerprint_v9
         );
         assert_ne!(
-            solved.currentness.fingerprint_v8,
-            moved.currentness.fingerprint_v8
+            solved.currentness.fingerprint_v9,
+            moved.currentness.fingerprint_v9
         );
 
         let mut missing = facts.clone();
@@ -12325,16 +12776,16 @@ mod tests {
             edited.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v6,
-            edited.currentness.basis_fingerprint_v6,
+            solved.currentness.basis_fingerprint_v7,
+            edited.currentness.basis_fingerprint_v7,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v8,
-            edited.currentness.artifact_fingerprint_v8,
+            solved.currentness.artifact_fingerprint_v9,
+            edited.currentness.artifact_fingerprint_v9,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v8,
-            edited.currentness.fingerprint_v8,
+            solved.currentness.fingerprint_v9,
+            edited.currentness.fingerprint_v9,
         );
 
         let mut missing = facts.clone();
@@ -12463,16 +12914,16 @@ mod tests {
             renamed.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v6,
-            renamed.currentness.basis_fingerprint_v6,
+            solved.currentness.basis_fingerprint_v7,
+            renamed.currentness.basis_fingerprint_v7,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v8,
-            renamed.currentness.artifact_fingerprint_v8,
+            solved.currentness.artifact_fingerprint_v9,
+            renamed.currentness.artifact_fingerprint_v9,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v8,
-            renamed.currentness.fingerprint_v8,
+            solved.currentness.fingerprint_v9,
+            renamed.currentness.fingerprint_v9,
         );
 
         let mut partial = facts.clone();
@@ -12488,6 +12939,182 @@ mod tests {
             .err()
             .expect("authored call argument ordinals must be dense");
         assert!(error.to_string().contains("invalid authored argument"));
+    }
+
+    #[test]
+    fn execution_shapes_retain_only_structure_lost_by_type_equations() {
+        let input = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Text,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record { tag: None },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::RecordField {
+                            name: "value".into(),
+                            spread: false,
+                        },
+                        0,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Block,
+                    inputs: vec![edge(KernelOwnerEdgeRole::BlockResult, 2)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::MatchArm {
+                        pattern: KernelPattern::Binding { name: "row".into() },
+                    },
+                    inputs: vec![edge(KernelOwnerEdgeRole::MatchOutput, 3)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::When,
+                    inputs: vec![
+                        edge(KernelOwnerEdgeRole::WhenInput, 0),
+                        edge(KernelOwnerEdgeRole::WhenArm, 4),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(5),
+        };
+        let declarations = vec![
+            KernelDeclarationInput {
+                id: KernelDeclarationId(0),
+                origin: KernelDeclarationOrigin::Statement {
+                    statement: KernelStatementId(0),
+                },
+                name: "local".into(),
+                kind: KernelDeclarationKind::Field,
+                value: Some(KernelExpressionId(1)),
+            },
+            KernelDeclarationInput {
+                id: KernelDeclarationId(1),
+                origin: KernelDeclarationOrigin::RecordField {
+                    object: KernelExpressionId(2),
+                    ordinal: 0,
+                },
+                name: "value".into(),
+                kind: KernelDeclarationKind::Field,
+                value: Some(KernelExpressionId(0)),
+            },
+            KernelDeclarationInput {
+                id: KernelDeclarationId(2),
+                origin: KernelDeclarationOrigin::PatternBinding {
+                    arm: KernelExpressionId(4),
+                    ordinal: 0,
+                },
+                name: "row".into(),
+                kind: KernelDeclarationKind::PatternBinding,
+                value: None,
+            },
+        ]
+        .into_boxed_slice();
+        let shapes = vec![
+            KernelExecutionShapeInput::Record {
+                expression: KernelExpressionId(2),
+                fields: vec![KernelExecutionRecordFieldInput {
+                    ordinal: 0,
+                    declaration: Some(KernelStructuralDeclarationInput::Local(
+                        KernelDeclarationId(1),
+                    )),
+                    name: "value".into(),
+                    value: KernelExpressionId(0),
+                    spread: false,
+                }]
+                .into_boxed_slice(),
+            },
+            KernelExecutionShapeInput::Block {
+                expression: KernelExpressionId(3),
+                bindings: vec![KernelExecutionBlockBindingInput {
+                    ordinal: 0,
+                    declaration: KernelStructuralDeclarationInput::Local(KernelDeclarationId(0)),
+                    value: KernelExpressionId(1),
+                }]
+                .into_boxed_slice(),
+                result: Some(KernelExpressionId(2)),
+            },
+            KernelExecutionShapeInput::MatchArm {
+                expression: KernelExpressionId(4),
+                bindings: vec![KernelDeclarationId(2)].into_boxed_slice(),
+            },
+            KernelExecutionShapeInput::Conditional {
+                expression: KernelExpressionId(5),
+                kind: KernelConditionalKind::While,
+            },
+        ]
+        .into_boxed_slice();
+        let facts = KernelDefinitionFactsInput {
+            execution_shapes: shapes,
+            statements: vec![KernelStatementInput {
+                id: KernelStatementId(0),
+                kind: KernelStatementKind::Field {
+                    name: "local".into(),
+                },
+                value: Some(KernelExpressionId(1)),
+                children: Box::new([]),
+            }]
+            .into_boxed_slice(),
+            declarations,
+            ..KernelDefinitionFactsInput::default()
+        };
+        let solved = compile_owner_program_with_definition_facts(&input, &facts)
+            .unwrap()
+            .solve()
+            .unwrap();
+        assert_eq!(solved.definition.execution_shapes.len(), 4);
+        assert!(matches!(
+            &solved.definition.execution_shapes[1],
+            KernelExecutionShapeArtifact::Block { bindings, result, .. }
+                if matches!(bindings.as_ref(), [KernelExecutionBlockBindingArtifact {
+                    declaration: KernelDeclarationReference::Local(KernelDeclarationId(0)),
+                    value: KernelValueReference::Local(KernelExpressionId(1)),
+                    ..
+                }])
+                    && *result == Some(KernelValueReference::Local(KernelExpressionId(2)))
+        ));
+        assert!(matches!(
+            solved.definition.execution_shapes[3],
+            KernelExecutionShapeArtifact::Conditional {
+                kind: KernelConditionalKind::While,
+                ..
+            }
+        ));
+
+        let mut partial = facts.clone();
+        partial.execution_shapes = partial.execution_shapes[..3].to_vec().into_boxed_slice();
+        let error = compile_owner_program_with_definition_facts(&input, &partial)
+            .err()
+            .expect("every lossy structural expression needs one exact shape row");
+        assert!(error.to_string().contains("execution-shape rows for 4"));
+
+        let mut false_external = facts;
+        let KernelExecutionShapeInput::Record { fields, .. } =
+            &mut false_external.execution_shapes[0]
+        else {
+            unreachable!()
+        };
+        fields[0].declaration = Some(KernelStructuralDeclarationInput::ValueOwnerPublic);
+        let error = compile_owner_program_with_definition_facts(&input, &false_external)
+            .err()
+            .expect("a local structural value cannot claim an external public declaration");
+        assert!(error.to_string().contains("marks a local value"));
     }
 
     #[test]
@@ -12528,6 +13155,7 @@ mod tests {
             relocations: KernelDefinitionRelocations::default(),
             expression_payloads: Box::new([]),
             call_syntax: Box::new([]),
+            execution_shapes: Box::new([]),
             statements: vec![KernelStatementInput {
                 id: KernelStatementId(0),
                 kind: KernelStatementKind::Field {
@@ -12755,6 +13383,7 @@ mod tests {
             relocations: KernelDefinitionRelocations::default(),
             expression_payloads: Box::new([]),
             call_syntax: Box::new([]),
+            execution_shapes: Box::new([]),
             statements,
             declarations,
             lexical_bindings: Box::new([]),

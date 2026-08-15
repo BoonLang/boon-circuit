@@ -125,6 +125,10 @@ pub enum KernelSummaryNode {
     },
     Select {
         selector: KernelSummaryValueId,
+        /// Only authored WHEN selection creates checked-call syntax provenance.
+        /// Internal ABI/render specialization may use the same compact branch
+        /// evaluator without relabelling the enclosing call.
+        syntax_discriminating: bool,
         arms: Box<[KernelSummarySelectArm]>,
     },
     Record {
@@ -157,6 +161,10 @@ pub enum KernelSummaryCallInput {
     Projection {
         provider: TypeVariableId,
         steps: Box<[KernelSummaryProjectionStep]>,
+        /// Ordinary argument reads start parameter-derived in the called
+        /// definition. Context reads deliberately preserve the caller value's
+        /// provenance instead.
+        parameter_derived: bool,
     },
 }
 
@@ -222,6 +230,11 @@ pub enum KernelOperation {
     Select {
         output: TypeVariableId,
         selector: TypeVariableId,
+        /// The selector is derived from an invocation formal. A singleton
+        /// selector therefore proves that this occurrence chose one authored
+        /// syntax branch rather than merely joining a definition's principal
+        /// result surface.
+        selector_parameter_derived: bool,
         arms: Box<[KernelSelectArm]>,
     },
     /// One ordered record assembly. Spread fields and explicit fields replace
@@ -513,10 +526,21 @@ impl ComponentProgramBuilder {
         selector: TypeVariableId,
         arms: impl IntoIterator<Item = KernelSelectArm>,
     ) -> OperationId {
+        self.add_select_with_parameter_provenance(output, selector, false, arms)
+    }
+
+    pub fn add_select_with_parameter_provenance(
+        &mut self,
+        output: TypeVariableId,
+        selector: TypeVariableId,
+        selector_parameter_derived: bool,
+        arms: impl IntoIterator<Item = KernelSelectArm>,
+    ) -> OperationId {
         self.mark_authoritative(output);
         self.push_operation(KernelOperation::Select {
             output,
             selector,
+            selector_parameter_derived,
             arms: arms.into_iter().collect::<Vec<_>>().into_boxed_slice(),
         })
     }
@@ -1064,6 +1088,7 @@ fn collect_operation_variables(
             output: variable,
             selector,
             arms,
+            ..
         } => {
             output.insert(*variable);
             output.insert(*selector);

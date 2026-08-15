@@ -1031,6 +1031,10 @@ struct PendingKernelCallArtifact {
     /// arm for this authored occurrence. The final solved result still has to
     /// expose a concrete outer shape before this becomes public authority.
     syntax_discriminated_candidate: bool,
+    /// Full-invocation fallback for a result graph that cannot use immutable
+    /// summary bytecode. This observes only a root authored SELECT and cannot
+    /// inherit selection provenance from an argument.
+    syntax_discriminated_root_output: Option<OutputId>,
 }
 
 #[derive(Clone, Debug)]
@@ -2874,14 +2878,23 @@ fn project_call_facts_and_diagnostics(
             } else {
                 Box::new([])
             };
-            let result_is_concrete = owner
+            let result_output = owner
                 .expressions
                 .get(call.expression.0 as usize)
-                .and_then(|output| artifact.output(*output))
+                .and_then(|output| artifact.output(*output));
+            let result_is_concrete = result_output
                 .is_some_and(|output| type_has_concrete_outer_shape(&output.flow_type.ty));
             owner_call_facts.push(SolvedKernelCallFacts {
                 type_substitutions: substitutions,
-                syntax_discriminated_result: call.syntax_discriminated_candidate
+                syntax_discriminated_result: (call.syntax_discriminated_candidate
+                    || (matches!(&call.target, KernelCallTarget::User { .. })
+                        && result_output.is_some_and(|output| {
+                            output.call_syntax_selected
+                                || call
+                                    .syntax_discriminated_root_output
+                                    .and_then(|output| artifact.output(output))
+                                    .is_some_and(|output| output.syntax_selected_here)
+                        })))
                     && result_is_concrete,
             });
         }
@@ -4293,7 +4306,11 @@ pub fn compile_owner_program_with_definition_facts(
         declarations,
         lexical_bindings,
         resources,
-        calls: collect_call_artifacts(input, &vec![false; input.nodes.len()])?,
+        calls: collect_call_artifacts(
+            input,
+            &vec![false; input.nodes.len()],
+            &vec![None; input.nodes.len()],
+        )?,
         effects: collect_host_effect_artifacts(input)?,
         diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
         basis_fingerprint_v12,
@@ -5601,6 +5618,7 @@ fn link_structural_declaration(
 fn collect_call_artifacts(
     input: &KernelOwnerProgramInput,
     syntax_discriminated_candidates: &[bool],
+    syntax_discriminated_root_outputs: &[Option<OutputId>],
 ) -> Result<Box<[PendingKernelCallArtifact]>, KernelOwnerBuildError> {
     input
         .nodes
@@ -5666,6 +5684,10 @@ fn collect_call_artifacts(
                         .get(expression)
                         .copied()
                         .unwrap_or(false),
+                    syntax_discriminated_root_output: syntax_discriminated_root_outputs
+                        .get(expression)
+                        .copied()
+                        .flatten(),
                 })
             })())
         })
@@ -6052,6 +6074,11 @@ pub fn compile_project_program_with_definition_facts(
         .iter()
         .map(|owner| vec![false; owner.nodes.len()])
         .collect::<Vec<_>>();
+    let mut syntax_discriminated_call_root_outputs = input
+        .owners
+        .iter()
+        .map(|owner| vec![None; owner.nodes.len()])
+        .collect::<Vec<_>>();
     let syntax_discriminated_formals = project_syntax_discriminated_formals(input);
     let direct_summaries = compile_direct_result_summaries(&mut builder, input);
     for summary in direct_summaries.iter().flatten() {
@@ -6157,6 +6184,7 @@ pub fn compile_project_program_with_definition_facts(
                     instance.expression_modes[index],
                     true,
                     Some(&mut syntax_discriminated_call_candidates[owner_index][index]),
+                    Some(&mut syntax_discriminated_call_root_outputs[owner_index][index]),
                 )?;
             } else {
                 let equation = node_mode_equation(&mut mode_builder, &context, index, node)?;
@@ -6224,6 +6252,7 @@ pub fn compile_project_program_with_definition_facts(
                 calls: collect_call_artifacts(
                     owner,
                     &syntax_discriminated_call_candidates[owner_index],
+                    &syntax_discriminated_call_root_outputs[owner_index],
                 )?,
                 effects: collect_host_effect_artifacts(owner)?,
                 diagnostics: collect_definition_diagnostic_artifacts(
@@ -7279,6 +7308,7 @@ fn compile_residual_type_module(
             local.expression_modes[index],
             false,
             None,
+            None,
         )?;
     }
     Ok(Arc::new(ResidualTypeModule {
@@ -7663,6 +7693,7 @@ fn instantiate_owner(
                     instance.expression_modes[index],
                     true,
                     None,
+                    None,
                 )?;
             } else {
                 let equation = node_mode_equation(mode_builder, &context, index, node)?;
@@ -7924,6 +7955,7 @@ enum DirectSummaryInput {
     FormalProjection {
         formal: u32,
         fields: Box<[crate::NameId]>,
+        parameter_derived: bool,
     },
     External {
         owner: KernelOwnerId,
@@ -7973,7 +8005,8 @@ struct DirectSummaryPlanCompiler<'a> {
     summaries: &'a [Option<Arc<CompiledDirectSummary>>],
     nodes: Vec<KernelSummaryNode>,
     inputs: Vec<DirectSummaryInput>,
-    formal_projection_inputs: HashMap<(u32, Box<[crate::NameId]>), (u32, KernelSummaryValueId)>,
+    formal_projection_inputs:
+        HashMap<(u32, Box<[crate::NameId]>, bool), (u32, KernelSummaryValueId)>,
 }
 
 impl DirectSummaryPlanCompiler<'_> {
@@ -8001,8 +8034,9 @@ impl DirectSummaryPlanCompiler<'_> {
         &mut self,
         formal: u32,
         fields: Box<[crate::NameId]>,
+        parameter_derived: bool,
     ) -> PlannedSummaryValue {
-        let key = (formal, fields.clone());
+        let key = (formal, fields.clone(), parameter_derived);
         if let Some((input, value)) = self.formal_projection_inputs.get(&key).copied() {
             return PlannedSummaryValue {
                 value,
@@ -8012,8 +8046,11 @@ impl DirectSummaryPlanCompiler<'_> {
         }
         let input =
             u32::try_from(self.inputs.len()).expect("kernel summary input count exceeds u32");
-        self.inputs
-            .push(DirectSummaryInput::FormalProjection { formal, fields });
+        self.inputs.push(DirectSummaryInput::FormalProjection {
+            formal,
+            fields,
+            parameter_derived,
+        });
         let value = self.push_node(KernelSummaryNode::Input(input));
         self.formal_projection_inputs.insert(key, (input, value));
         PlannedSummaryValue {
@@ -8040,13 +8077,18 @@ impl DirectSummaryPlanCompiler<'_> {
             let DirectSummaryInput::FormalProjection {
                 formal,
                 fields: prefix,
+                parameter_derived,
             } = self.inputs.get(input as usize)?.clone()
             else {
                 return None;
             };
             let mut projection = prefix.into_vec();
             projection.extend(fields);
-            return Some(self.push_formal_projection(formal, projection.into_boxed_slice()));
+            return Some(self.push_formal_projection(
+                formal,
+                projection.into_boxed_slice(),
+                parameter_derived,
+            ));
         }
         Some(PlannedSummaryValue {
             value: self.push_node(KernelSummaryNode::Projection {
@@ -8070,13 +8112,14 @@ impl DirectSummaryPlanCompiler<'_> {
         let DirectSummaryInput::FormalProjection {
             formal,
             fields: prefix,
+            parameter_derived,
         } = self.inputs.get(input as usize)?.clone()
         else {
             return None;
         };
         let mut projection = prefix.into_vec();
         projection.extend_from_slice(fields);
-        Some(self.push_formal_projection(formal, projection.into_boxed_slice()))
+        Some(self.push_formal_projection(formal, projection.into_boxed_slice(), parameter_derived))
     }
 
     fn compile_shared_invoke(
@@ -8091,16 +8134,18 @@ impl DirectSummaryPlanCompiler<'_> {
         let mut modes = Vec::with_capacity(summary.inputs.len());
         for input in summary.inputs.iter() {
             let value = match input {
-                DirectSummaryInput::FormalProjection { formal, fields } => {
-                    match actuals.get(*formal as usize)? {
-                        PlannedSummaryActual::Formal(formal) => {
-                            self.push_formal_projection(*formal, fields.clone())
-                        }
-                        PlannedSummaryActual::Value(value) => {
-                            self.project_interned_formal_value(*value, fields)?
-                        }
+                DirectSummaryInput::FormalProjection {
+                    formal,
+                    fields,
+                    parameter_derived,
+                } => match actuals.get(*formal as usize)? {
+                    PlannedSummaryActual::Formal(formal) => {
+                        self.push_formal_projection(*formal, fields.clone(), *parameter_derived)
                     }
-                }
+                    PlannedSummaryActual::Value(value) => {
+                        self.project_interned_formal_value(*value, fields)?
+                    }
+                },
                 DirectSummaryInput::External { owner, expression } => {
                     let input = u32::try_from(self.inputs.len())
                         .expect("kernel summary input count exceeds u32");
@@ -8220,8 +8265,7 @@ impl DirectSummaryPlanCompiler<'_> {
                     let value = self.builder.terms_mut().variant_set([tag]);
                     Some(term_value(self, value))
                 }
-                KernelOwnerNodeKind::FormalRead { formal, fields }
-                | KernelOwnerNodeKind::ContextRead { formal, fields } => {
+                KernelOwnerNodeKind::FormalRead { formal, fields } => {
                     let actual = actuals.get(*formal as usize)?;
                     match actual {
                         PlannedSummaryActual::Formal(formal) => {
@@ -8230,7 +8274,23 @@ impl DirectSummaryPlanCompiler<'_> {
                                 .map(|field| self.builder.terms_mut().intern_name(field))
                                 .collect::<Vec<_>>()
                                 .into_boxed_slice();
-                            Some(self.push_formal_projection(*formal, fields))
+                            Some(self.push_formal_projection(*formal, fields, true))
+                        }
+                        PlannedSummaryActual::Value(value) => {
+                            self.project_value(*value, fields, fixed_mode)
+                        }
+                    }
+                }
+                KernelOwnerNodeKind::ContextRead { formal, fields } => {
+                    let actual = actuals.get(*formal as usize)?;
+                    match actual {
+                        PlannedSummaryActual::Formal(formal) => {
+                            let fields = fields
+                                .iter()
+                                .map(|field| self.builder.terms_mut().intern_name(field))
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice();
+                            Some(self.push_formal_projection(*formal, fields, false))
                         }
                         PlannedSummaryActual::Value(value) => {
                             self.project_value(*value, fields, fixed_mode)
@@ -8557,6 +8617,7 @@ impl DirectSummaryPlanCompiler<'_> {
                                 let stack_value = self.push_node(KernelSummaryNode::Term(stack));
                                 self.push_node(KernelSummaryNode::Select {
                                     selector: direction,
+                                    syntax_discriminating: false,
                                     arms: vec![
                                         KernelSummarySelectArm {
                                             pattern: KernelPattern::Tag {
@@ -8711,6 +8772,7 @@ impl DirectSummaryPlanCompiler<'_> {
                     Some(PlannedSummaryValue {
                         value: self.push_node(KernelSummaryNode::Select {
                             selector: selector.value,
+                            syntax_discriminating: true,
                             arms: arms.into_boxed_slice(),
                         }),
                         mode: selector.mode,
@@ -8934,7 +8996,7 @@ fn fold_constant_summary_nodes(
                 inputs,
                 values,
             } => constant_summary_collection(builder, *kind, inputs, values, &constants),
-            KernelSummaryNode::Select { selector, arms } => {
+            KernelSummaryNode::Select { selector, arms, .. } => {
                 constant_summary_select(builder, *selector, arms, &constants)
             }
             KernelSummaryNode::Record { tag, entries } => {
@@ -8948,7 +9010,7 @@ fn fold_constant_summary_nodes(
                 folded = folded.saturating_add(1);
             }
         } else if let KernelSummaryNode::Record { tag, entries } = &node
-            && let Some((selector, variants)) =
+            && let Some((selector, syntax_discriminating, variants)) =
                 fuse_constant_summary_record_selectors(builder, *tag, entries, nodes, &constants)
         {
             let arms = variants
@@ -8963,7 +9025,11 @@ fn fold_constant_summary_nodes(
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
-            nodes[index] = KernelSummaryNode::Select { selector, arms };
+            nodes[index] = KernelSummaryNode::Select {
+                selector,
+                syntax_discriminating,
+                arms,
+            };
             fused_records = fused_records.saturating_add(1);
         }
         index += 1;
@@ -8981,10 +9047,11 @@ fn fuse_constant_summary_record_selectors(
     entries: &[KernelSummaryRecordEntry],
     nodes: &[KernelSummaryNode],
     constants: &[Option<TypeTermId>],
-) -> Option<(KernelSummaryValueId, Vec<(KernelPattern, TypeTermId)>)> {
+) -> Option<(KernelSummaryValueId, bool, Vec<(KernelPattern, TypeTermId)>)> {
     let mut selector = None;
     let mut patterns = None::<Vec<KernelPattern>>;
     let mut has_dynamic_field = false;
+    let mut syntax_discriminating = false;
     for entry in entries {
         let KernelSummaryRecordEntry::Field { value, .. } = entry else {
             return None;
@@ -8994,6 +9061,7 @@ fn fuse_constant_summary_record_selectors(
         }
         let KernelSummaryNode::Select {
             selector: field_selector,
+            syntax_discriminating: field_syntax_discriminating,
             arms,
         } = nodes.get(value.0 as usize)?
         else {
@@ -9024,6 +9092,7 @@ fn fuse_constant_summary_record_selectors(
             return None;
         }
         patterns.get_or_insert(field_patterns);
+        syntax_discriminating |= *field_syntax_discriminating;
         has_dynamic_field = true;
     }
     if !has_dynamic_field {
@@ -9052,7 +9121,7 @@ fn fuse_constant_summary_record_selectors(
         let record = intern_constant_summary_record(builder, tag, fields);
         variants.push((pattern, record));
     }
-    Some((selector, variants))
+    Some((selector, syntax_discriminating, variants))
 }
 
 /// Hash-cons pure nodes inside one immutable definition summary.
@@ -9202,7 +9271,7 @@ fn canonicalize_summary_node(
             }
             false
         }
-        KernelSummaryNode::Select { selector, arms } => {
+        KernelSummaryNode::Select { selector, arms, .. } => {
             let (canonical_selector, mut pure) = canonicalize_summary_value(
                 *selector,
                 old_nodes,
@@ -9336,7 +9405,7 @@ fn pure_summary_node_hash(node: &KernelSummaryNode) -> u64 {
             inputs.hash(&mut hasher);
             values.hash(&mut hasher);
         }
-        KernelSummaryNode::Select { selector, arms } => {
+        KernelSummaryNode::Select { selector, arms, .. } => {
             4_u8.hash(&mut hasher);
             selector.hash(&mut hasher);
             for arm in arms {
@@ -9422,7 +9491,7 @@ fn compact_summary_result(
             KernelSummaryNode::Invoke {
                 inputs: arguments, ..
             } => pending.extend(arguments.iter().copied()),
-            KernelSummaryNode::Select { selector, arms } => {
+            KernelSummaryNode::Select { selector, arms, .. } => {
                 pending.push(*selector);
                 pending.extend(arms.iter().map(|arm| arm.output));
             }
@@ -9550,7 +9619,7 @@ fn relocate_summary_node(
                 *argument = relocated_summary_value(*argument, values);
             }
         }
-        KernelSummaryNode::Select { selector, arms } => {
+        KernelSummaryNode::Select { selector, arms, .. } => {
             *selector = relocated_summary_value(*selector, values);
             for arm in arms {
                 arm.output = relocated_summary_value(arm.output, values);
@@ -9971,7 +10040,11 @@ fn emit_compiled_direct_summary(
     let mut input_modes = Vec::with_capacity(summary.inputs.len());
     for input in summary.inputs.iter() {
         match input {
-            DirectSummaryInput::FormalProjection { formal, fields } => {
+            DirectSummaryInput::FormalProjection {
+                formal,
+                fields,
+                parameter_derived,
+            } => {
                 let actual = actuals.get(*formal as usize).ok_or_else(|| {
                     KernelOwnerBuildError::new(format!(
                         "compiled direct summary reads missing formal {formal}"
@@ -10015,6 +10088,7 @@ fn emit_compiled_direct_summary(
                 call_inputs.push(KernelSummaryCallInput::Projection {
                     provider: actual.variable,
                     steps: steps.into_boxed_slice(),
+                    parameter_derived: *parameter_derived,
                 });
                 input_modes.push(projected_mode_variable(
                     mode_builder,
@@ -10089,6 +10163,7 @@ fn compile_node(
     output_mode: ModeVariableId,
     compile_mode: bool,
     mut syntax_discriminated_result: Option<&mut bool>,
+    mut syntax_discriminated_root_output: Option<&mut Option<OutputId>>,
 ) -> Result<(), KernelOwnerBuildError> {
     match &node.kind {
         KernelOwnerNodeKind::Known(ty) | KernelOwnerNodeKind::Source(ty) => {
@@ -10662,6 +10737,14 @@ fn compile_node(
                 specialization,
                 stack,
             )?;
+            if let Some(receipt) = syntax_discriminated_root_output.as_deref_mut()
+                && matches!(target_owner.nodes[result].kind, KernelOwnerNodeKind::When)
+            {
+                *receipt = Some(builder.add_output(
+                    instance.expressions[result],
+                    target_owner.nodes[result].mode,
+                ));
+            }
             let provider = builder.variable_term(instance.expressions[result]);
             builder.add_publish(output, [provider], PublishMode::Replace);
             mode_builder.set(
@@ -10905,11 +10988,21 @@ fn compile_node(
         }
         KernelOwnerNodeKind::When => {
             let mut selector = None;
+            let mut selector_parameter_derived = false;
             let mut arms = Vec::new();
             let possible_arms = possible_when_arm_references(context, index, node)?;
             for edge in &node.inputs {
                 match edge.role {
                     KernelOwnerEdgeRole::WhenInput => {
+                        let selector_expression = edge.expression.0 as usize;
+                        selector_parameter_derived = selector_expression
+                            < context.input.nodes.len()
+                            && context
+                                .formal_dependent_expressions
+                                .get(context.owner.0 as usize)
+                                .and_then(|dependencies| dependencies.get(selector_expression))
+                                .copied()
+                                .unwrap_or(false);
                         if selector
                             .replace(edge_variable(context, index, edge)?)
                             .is_some()
@@ -10966,7 +11059,12 @@ fn compile_node(
                     }
                 }
             }
-            builder.add_select(output, selector, arms);
+            builder.add_select_with_parameter_provenance(
+                output,
+                selector,
+                selector_parameter_derived,
+                arms,
+            );
         }
         KernelOwnerNodeKind::Then => {
             let has_output = node
@@ -17302,6 +17400,7 @@ mod tests {
             KernelSummaryNode::Term(text),
             KernelSummaryNode::Select {
                 selector: KernelSummaryValueId(0),
+                syntax_discriminating: true,
                 arms: vec![
                     KernelSummarySelectArm {
                         pattern: KernelPattern::Tag {
@@ -18066,7 +18165,7 @@ mod tests {
     }
 
     #[test]
-    fn singleton_syntax_selection_exposes_only_the_nested_state_initializer() {
+    fn solved_nested_selector_receipt_exposes_only_the_nested_state_initializer() {
         let stateful = KernelOwnerProgramInput {
             nodes: vec![
                 KernelOwnerNode {
@@ -18111,7 +18210,7 @@ mod tests {
                 KernelOwnerNode {
                     kind: KernelOwnerNodeKind::FormalRead {
                         formal: 0,
-                        fields: Box::new([]),
+                        fields: vec!["kind".into()].into_boxed_slice(),
                     },
                     inputs: Box::new([]),
                     mode: FlowMode::Continuous,
@@ -18170,11 +18269,23 @@ mod tests {
                     mode: FlowMode::Continuous,
                 },
                 KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Record { tag: None },
+                    inputs: vec![edge(
+                        KernelOwnerEdgeRole::RecordField {
+                            name: "kind".into(),
+                            spread: false,
+                        },
+                        0,
+                    )]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
                     kind: KernelOwnerNodeKind::UserCall {
                         target: KernelOwnerId(1),
                         inherited_formal: None,
                     },
-                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 0)]
+                    inputs: vec![edge(KernelOwnerEdgeRole::CallArgument { ordinal: 0 }, 1)]
                         .into_boxed_slice(),
                     mode: FlowMode::Continuous,
                 },
@@ -18194,14 +18305,14 @@ mod tests {
                                 name: "selected".into(),
                                 spread: false,
                             },
-                            1,
+                            2,
                         ),
                         edge(
                             KernelOwnerEdgeRole::RecordField {
                                 name: "direct".into(),
                                 spread: false,
                             },
-                            2,
+                            3,
                         ),
                     ]
                     .into_boxed_slice(),
@@ -18211,15 +18322,13 @@ mod tests {
             .into_boxed_slice(),
             formal_count: 0,
             external_expressions: Box::new([]),
-            result: KernelExpressionId(3),
+            result: KernelExpressionId(4),
         };
 
-        let wrapper_dependencies = owner_expressions_depend_on_formals(&wrapper);
-        let wrapper_variants =
-            infer_static_variants(&wrapper, &[Some(BTreeSet::from(["UseState".into()]))]);
+        let wrapper_variants = infer_static_variants(&wrapper, &[None]);
         assert!(
-            syntax_selected_call_nodes(&wrapper, &wrapper_variants, &wrapper_dependencies)[1],
-            "the nested stateful call must retain syntax-selection provenance",
+            wrapper_variants[0].is_none(),
+            "the nested selector must remain unknown to the compile-time root-tag shortcut",
         );
 
         let artifact = compile_project_program(&KernelProjectProgramInput {
@@ -18247,12 +18356,30 @@ mod tests {
             full
         );
         assert_eq!(
-            state_type(&artifact.definitions[2].expressions[1].flow_type.ty),
+            state_type(&artifact.definitions[2].expressions[2].flow_type.ty),
             Type::VariantSet(vec![Variant::Tag("Closed".to_owned())].into()),
         );
         assert_eq!(
-            state_type(&artifact.definitions[2].expressions[2].flow_type.ty),
+            state_type(&artifact.definitions[2].expressions[3].flow_type.ty),
             full
+        );
+        assert!(
+            artifact.definitions[2]
+                .calls
+                .iter()
+                .find(|call| call.expression == KernelExpressionId(2))
+                .expect("caller has the selected wrapper call")
+                .syntax_discriminated_result,
+            "the solved root SELECT must publish an exact call receipt",
+        );
+        assert!(
+            !artifact.definitions[2]
+                .calls
+                .iter()
+                .find(|call| call.expression == KernelExpressionId(3))
+                .expect("caller has the direct stateful call")
+                .syntax_discriminated_result,
+            "a forwarded state value must not inherit the wrapper's receipt",
         );
     }
 

@@ -19088,7 +19088,7 @@ mod tests {
             &report,
             fields,
             &stable_by_checked_expression,
-            false,
+            true,
         ));
         eprintln!(
             "kernel-novywave direct_call_syntax_provenance_mismatches={}",

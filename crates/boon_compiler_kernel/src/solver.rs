@@ -43,7 +43,7 @@ struct VariableCell {
 
 #[derive(Default)]
 struct SummaryScratch {
-    values: Vec<TypeTermId>,
+    values: Vec<SummaryValue>,
     value_seen: Vec<u32>,
     active: Vec<u32>,
     generation: u32,
@@ -54,11 +54,25 @@ impl SummaryScratch {
         self.generation =
             next_generation(&mut self.generation, &mut self.value_seen, &mut self.active);
         if self.values.len() < value_count {
-            self.values.resize(value_count, placeholder);
+            self.values.resize(
+                value_count,
+                SummaryValue {
+                    term: placeholder,
+                    parameter_derived: false,
+                    syntax_selected: false,
+                },
+            );
             self.value_seen.resize(value_count, 0);
             self.active.resize(value_count, 0);
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SummaryValue {
+    term: TypeTermId,
+    parameter_derived: bool,
+    syntax_selected: bool,
 }
 
 /// Evaluate one compact component to quiescence.
@@ -134,6 +148,15 @@ fn validate_single_writers(program: &ComponentProgram) -> Result<(), KernelSolve
 struct ComponentSolver {
     program: SolverStateProgram,
     cells: Vec<VariableCell>,
+    /// Occurrence provenance is deliberately separate from union-find type
+    /// equality. Equality may constrain two types in both directions, while
+    /// syntax selection follows only authored provider-to-consumer operations.
+    syntax_selected: Vec<bool>,
+    /// Local authored SELECT receipts. These never follow type equality or
+    /// provider flow and let a full invocation expose its own root selection
+    /// without inheriting a caller value's provenance.
+    syntax_selected_here: Vec<bool>,
+    call_syntax_selected: Vec<bool>,
     pending: VecDeque<OperationId>,
     queued: Vec<bool>,
     replayable: Vec<bool>,
@@ -318,6 +341,9 @@ impl ComponentSolver {
                 outputs,
             },
             cells,
+            syntax_selected: vec![false; variable_count],
+            syntax_selected_here: vec![false; variable_count],
+            call_syntax_selected: vec![false; variable_count],
             pending,
             queued,
             replayable,
@@ -376,6 +402,9 @@ impl ComponentSolver {
                     mode: output.mode,
                     ty: self.program.terms.export_checked_type(term),
                 },
+                syntax_selected: self.variable_syntax_selected(output.variable),
+                syntax_selected_here: self.syntax_selected_here[output.variable.0 as usize],
+                call_syntax_selected: self.call_syntax_selected[output.variable.0 as usize],
             });
         }
         let term_work = self.program.terms.work();
@@ -521,8 +550,11 @@ impl ComponentSolver {
             }
             KernelOperation::Alias { provider, consumer } => {
                 self.work.union_operations = self.work.union_operations.saturating_add(1);
-                let provider = self.program.terms.variable(*provider);
+                let provider_variable = *provider;
+                let provider = self.program.terms.variable(provider_variable);
                 self.bind_equal(*consumer, provider);
+                let selected = self.variable_syntax_selected(provider_variable);
+                self.set_syntax_selected(*consumer, selected);
             }
             KernelOperation::Publish {
                 output,
@@ -552,8 +584,9 @@ impl ComponentSolver {
             KernelOperation::Select {
                 output,
                 selector,
+                selector_parameter_derived,
                 arms,
-            } => self.select(*output, *selector, arms),
+            } => self.select(*output, *selector, *selector_parameter_derived, arms),
             KernelOperation::Record {
                 output,
                 tag,
@@ -584,8 +617,12 @@ impl ComponentSolver {
             }
             KernelOperation::Alias { provider, consumer } => {
                 self.work.union_operations = self.work.union_operations.saturating_add(1);
-                let provider = self.program.terms.variable(variable(*provider));
-                self.bind_equal(variable(*consumer), provider);
+                let provider_variable = variable(*provider);
+                let provider = self.program.terms.variable(provider_variable);
+                let consumer = variable(*consumer);
+                self.bind_equal(consumer, provider);
+                let selected = self.variable_syntax_selected(provider_variable);
+                self.set_syntax_selected(consumer, selected);
             }
             KernelOperation::Publish {
                 output,
@@ -631,12 +668,14 @@ impl ComponentSolver {
             KernelOperation::Select {
                 output,
                 selector,
+                selector_parameter_derived,
                 arms,
             } => self.select_residual(
                 frame_index,
                 frame,
                 variable(*output),
                 variable(*selector),
+                *selector_parameter_derived,
                 arms,
             ),
             KernelOperation::Record {
@@ -661,6 +700,11 @@ impl ComponentSolver {
         inputs: &[TypeTermId],
         mode: PublishMode,
     ) -> Result<(), KernelSolveError> {
+        let mut syntax_selected = false;
+        for input in inputs {
+            let input = self.import_frame_term(frame_index, frame, *input);
+            syntax_selected |= self.term_syntax_selected(input);
+        }
         match mode {
             PublishMode::Unify => {
                 let output = self.program.terms.variable(output);
@@ -707,6 +751,7 @@ impl ComponentSolver {
                 self.replace_binding(output, provider, true);
             }
         }
+        self.set_syntax_selected(output, syntax_selected);
         Ok(())
     }
 
@@ -736,6 +781,7 @@ impl ComponentSolver {
         frame: &ResidualOperationFrame,
         output: TypeVariableId,
         selector: TypeVariableId,
+        selector_parameter_derived: bool,
         arms: &[KernelSelectArm],
     ) {
         let selector_term = self.program.terms.variable(selector);
@@ -745,11 +791,13 @@ impl ComponentSolver {
             TypeTerm::VariantSet(variants) if variants.len() == 1
         );
         let mut candidates = Vec::new();
+        let mut syntax_selected = singleton && selector_parameter_derived;
         for arm in arms {
             if singleton && !self.pattern_accepts(selector, &arm.pattern) {
                 continue;
             }
             let candidate = self.import_frame_term(frame_index, frame, arm.output);
+            syntax_selected |= self.term_syntax_selected(candidate);
             let candidate = self.resolve_term(candidate);
             if matches!(self.program.terms.term(candidate), TypeTerm::Absent) {
                 continue;
@@ -761,6 +809,8 @@ impl ComponentSolver {
         }
         let provider = self.join_select_candidates(candidates);
         self.replace_binding(output, provider, true);
+        self.syntax_selected_here[output.0 as usize] = singleton && selector_parameter_derived;
+        self.set_syntax_selected(output, syntax_selected);
     }
 
     fn record_residual(
@@ -772,16 +822,19 @@ impl ComponentSolver {
         entries: &[KernelRecordEntry],
     ) -> Result<(), KernelSolveError> {
         let mut fields = Vec::<(NameId, TypeTermId)>::new();
+        let mut syntax_selected = false;
         for entry in entries {
             match entry {
                 KernelRecordEntry::Field { name, value } => {
                     let name = self.import_frame_name(frame_index, frame, *name);
                     let value = self.import_frame_term(frame_index, frame, *value);
+                    syntax_selected |= self.term_syntax_selected(value);
                     let value = self.resolve_term_head(value);
                     insert_record_field(&mut fields, name, value);
                 }
                 KernelRecordEntry::Spread { value } => {
                     let value = self.import_frame_term(frame_index, frame, *value);
+                    syntax_selected |= self.term_syntax_selected(value);
                     let value = self.resolve_term_head(value);
                     self.merge_record_spread(value, &mut fields)?;
                 }
@@ -797,6 +850,7 @@ impl ComponentSolver {
             object
         };
         self.replace_binding(output, provider, true);
+        self.set_syntax_selected(output, syntax_selected);
         Ok(())
     }
 
@@ -824,6 +878,10 @@ impl ComponentSolver {
         inputs: &[TypeTermId],
         mode: PublishMode,
     ) -> Result<(), KernelSolveError> {
+        let syntax_selected = inputs
+            .iter()
+            .copied()
+            .any(|input| self.term_syntax_selected(input));
         match mode {
             PublishMode::Unify => {
                 let output = self.program.terms.variable(output);
@@ -866,6 +924,7 @@ impl ComponentSolver {
                 self.replace_binding(output, provider, true);
             }
         }
+        self.set_syntax_selected(output, syntax_selected);
         Ok(())
     }
 
@@ -876,8 +935,14 @@ impl ComponentSolver {
         inputs: &[TypeTermId],
         values: &[TypeTermId],
     ) {
+        let syntax_selected = inputs
+            .iter()
+            .chain(values)
+            .copied()
+            .any(|input| self.term_syntax_selected(input));
         let provider = self.collection_type(kind, inputs, values);
         self.replace_binding(output, provider, true);
+        self.set_syntax_selected(output, syntax_selected);
     }
 
     fn collection_type(
@@ -932,6 +997,8 @@ impl ComponentSolver {
         field: Option<NameId>,
         consumer: TypeVariableId,
     ) {
+        let syntax_selected = self.variable_syntax_selected(provider);
+        self.set_syntax_selected(consumer, syntax_selected);
         let provider = self.root(provider);
         let authoritative = self.cells[provider.0 as usize].authoritative_provider;
         let provider_term = self.program.terms.variable(provider);
@@ -994,6 +1061,8 @@ impl ComponentSolver {
         fields: &[NameId],
         consumer: TypeVariableId,
     ) {
+        let syntax_selected = self.variable_syntax_selected(provider);
+        self.set_syntax_selected(consumer, syntax_selected);
         let provider = self.root(provider);
         let authoritative = self.cells[provider.0 as usize].authoritative_provider;
         let provider_term = self.program.terms.variable(provider);
@@ -1116,6 +1185,8 @@ impl ComponentSolver {
     }
 
     fn project_collection_item(&mut self, provider: TypeVariableId, consumer: TypeVariableId) {
+        let syntax_selected = self.variable_syntax_selected(provider);
+        self.set_syntax_selected(consumer, syntax_selected);
         let provider = self.root(provider);
         let authoritative = self.cells[provider.0 as usize].authoritative_provider;
         let provider_term = self.program.terms.variable(provider);
@@ -1160,6 +1231,7 @@ impl ComponentSolver {
         &mut self,
         output: TypeVariableId,
         selector: TypeVariableId,
+        selector_parameter_derived: bool,
         arms: &[KernelSelectArm],
     ) {
         let selector_term = self.program.terms.variable(selector);
@@ -1169,10 +1241,12 @@ impl ComponentSolver {
             TypeTerm::VariantSet(variants) if variants.len() == 1
         );
         let mut candidates = Vec::new();
+        let mut syntax_selected = singleton && selector_parameter_derived;
         for arm in arms {
             if singleton && !self.pattern_accepts(selector, &arm.pattern) {
                 continue;
             }
+            syntax_selected |= self.term_syntax_selected(arm.output);
             let candidate = self.resolve_term(arm.output);
             if matches!(self.program.terms.term(candidate), TypeTerm::Absent) {
                 continue;
@@ -1184,6 +1258,8 @@ impl ComponentSolver {
         }
         let provider = self.join_select_candidates(candidates);
         self.replace_binding(output, provider, true);
+        self.syntax_selected_here[output.0 as usize] = singleton && selector_parameter_derived;
+        self.set_syntax_selected(output, syntax_selected);
     }
 
     /// Preserve unresolved arm identities until the invocation frame closes.
@@ -1231,13 +1307,16 @@ impl ComponentSolver {
         entries: &[KernelRecordEntry],
     ) -> Result<(), KernelSolveError> {
         let mut fields = Vec::<(NameId, TypeTermId)>::new();
+        let mut syntax_selected = false;
         for entry in entries {
             match entry {
                 KernelRecordEntry::Field { name, value } => {
+                    syntax_selected |= self.term_syntax_selected(*value);
                     let value = self.resolve_term_head(*value);
                     insert_record_field(&mut fields, *name, value);
                 }
                 KernelRecordEntry::Spread { value } => {
+                    syntax_selected |= self.term_syntax_selected(*value);
                     let value = self.resolve_term_head(*value);
                     self.merge_record_spread(value, &mut fields)?;
                 }
@@ -1252,6 +1331,7 @@ impl ComponentSolver {
             object
         };
         self.replace_binding(output, provider, true);
+        self.set_syntax_selected(output, syntax_selected);
         Ok(())
     }
 
@@ -1263,7 +1343,9 @@ impl ComponentSolver {
     ) -> Result<(), KernelSolveError> {
         self.work.summary_call_activations = self.work.summary_call_activations.saturating_add(1);
         let result = self.evaluate_summary_program(program, inputs)?;
-        self.replace_binding(output, result, true);
+        self.replace_binding(output, result.term, true);
+        self.set_syntax_selected(output, result.syntax_selected);
+        self.call_syntax_selected[output.0 as usize] = result.syntax_selected;
         Ok(())
     }
 
@@ -1271,7 +1353,7 @@ impl ComponentSolver {
         &mut self,
         program: &KernelSummaryProgram,
         inputs: &[KernelSummaryCallInput],
-    ) -> Result<TypeTermId, KernelSolveError> {
+    ) -> Result<SummaryValue, KernelSolveError> {
         let mut resolve_input = |solver: &mut ComponentSolver, input_index: u32| {
             solver.evaluate_summary_call_input(inputs, input_index)
         };
@@ -1284,8 +1366,8 @@ impl ComponentSolver {
         resolve_input: &mut dyn FnMut(
             &mut ComponentSolver,
             u32,
-        ) -> Result<TypeTermId, KernelSolveError>,
-    ) -> Result<TypeTermId, KernelSolveError> {
+        ) -> Result<SummaryValue, KernelSolveError>,
+    ) -> Result<SummaryValue, KernelSolveError> {
         let mut scratch = self.summary_scratch_pool.pop().unwrap_or_default();
         scratch.begin(program.nodes.len(), self.program.terms.absent());
         let mut node_evaluations = 0_u64;
@@ -1313,7 +1395,7 @@ impl ComponentSolver {
         &mut self,
         inputs: &[KernelSummaryCallInput],
         input_index: u32,
-    ) -> Result<TypeTermId, KernelSolveError> {
+    ) -> Result<SummaryValue, KernelSolveError> {
         let input = inputs.get(input_index as usize).ok_or_else(|| {
             KernelSolveError::new(format!(
                 "kernel summary input {input_index} is out of range for {} inputs",
@@ -1321,8 +1403,20 @@ impl ComponentSolver {
             ))
         })?;
         match input {
-            KernelSummaryCallInput::Term(term) => Ok(self.resolve_term_head(*term)),
-            KernelSummaryCallInput::Projection { provider, steps } => {
+            KernelSummaryCallInput::Term(term) => Ok(SummaryValue {
+                term: self.resolve_term_head(*term),
+                parameter_derived: false,
+                // A checked call row reports selection performed by the
+                // target's result construction. Caller-side provenance starts
+                // a fresh frame here; nested invokes inside this summary still
+                // compose their selection facts normally.
+                syntax_selected: false,
+            }),
+            KernelSummaryCallInput::Projection {
+                provider,
+                steps,
+                parameter_derived,
+            } => {
                 if steps.is_empty() {
                     return Err(KernelSolveError::new(format!(
                         "kernel summary input {input_index} has an empty projection program"
@@ -1334,7 +1428,11 @@ impl ComponentSolver {
                     provider = step.consumer;
                 }
                 let provider = self.program.terms.variable(provider);
-                Ok(self.resolve_term_head(provider))
+                Ok(SummaryValue {
+                    term: self.resolve_term_head(provider),
+                    parameter_derived: *parameter_derived,
+                    syntax_selected: false,
+                })
             }
         }
     }
@@ -1345,11 +1443,11 @@ impl ComponentSolver {
         resolve_input: &mut dyn FnMut(
             &mut ComponentSolver,
             u32,
-        ) -> Result<TypeTermId, KernelSolveError>,
+        ) -> Result<SummaryValue, KernelSolveError>,
         value: crate::KernelSummaryValueId,
         scratch: &mut SummaryScratch,
         node_evaluations: &mut u64,
-    ) -> Result<TypeTermId, KernelSolveError> {
+    ) -> Result<SummaryValue, KernelSolveError> {
         let index = value.0 as usize;
         let Some(node) = program.nodes.get(index) else {
             return Err(KernelSolveError::new(format!(
@@ -1372,7 +1470,11 @@ impl ComponentSolver {
         *node_evaluations = node_evaluations.saturating_add(1);
         let evaluated = (|| match node {
             KernelSummaryNode::Input(input_index) => resolve_input(self, *input_index),
-            KernelSummaryNode::Term(term) => Ok(*term),
+            KernelSummaryNode::Term(term) => Ok(SummaryValue {
+                term: *term,
+                parameter_derived: false,
+                syntax_selected: false,
+            }),
             KernelSummaryNode::Projection { provider, fields } => {
                 let mut provider = self.evaluate_summary_value(
                     program,
@@ -1382,46 +1484,57 @@ impl ComponentSolver {
                     node_evaluations,
                 )?;
                 for field in fields {
-                    provider = self.project_field(provider, *field).unwrap_or_else(|| {
-                        let field = self.program.terms.name(*field);
-                        self.program.terms.unresolved_shape(format!(
-                            "authoritative summary value omits projection `{field}`"
-                        ))
-                    });
+                    provider.term =
+                        self.project_field(provider.term, *field)
+                            .unwrap_or_else(|| {
+                                let field = self.program.terms.name(*field);
+                                self.program.terms.unresolved_shape(format!(
+                                    "authoritative summary value omits projection `{field}`"
+                                ))
+                            });
                 }
-                Ok(self.resolve_term_head(provider))
+                provider.term = self.resolve_term_head(provider.term);
+                Ok(provider)
             }
             KernelSummaryNode::Constrain { value, expected } => {
-                let actual = self.evaluate_summary_value(
+                let mut actual = self.evaluate_summary_value(
                     program,
                     resolve_input,
                     *value,
                     scratch,
                     node_evaluations,
                 )?;
-                self.unify_terms(actual, *expected);
-                Ok(self.resolve_term_head(actual))
+                self.unify_terms(actual.term, *expected);
+                actual.term = self.resolve_term_head(actual.term);
+                Ok(actual)
             }
             KernelSummaryNode::Sequence {
                 inputs: dependencies,
                 result,
             } => {
+                let mut parameter_derived = false;
+                let mut syntax_selected = false;
                 for dependency in dependencies {
-                    self.evaluate_summary_value(
+                    let dependency = self.evaluate_summary_value(
                         program,
                         resolve_input,
                         *dependency,
                         scratch,
                         node_evaluations,
                     )?;
+                    parameter_derived |= dependency.parameter_derived;
+                    syntax_selected |= dependency.syntax_selected;
                 }
-                self.evaluate_summary_value(
+                let mut result = self.evaluate_summary_value(
                     program,
                     resolve_input,
                     *result,
                     scratch,
                     node_evaluations,
-                )
+                )?;
+                result.parameter_derived |= parameter_derived;
+                result.syntax_selected |= syntax_selected;
+                Ok(result)
             }
             KernelSummaryNode::Collection {
                 kind,
@@ -1448,7 +1561,21 @@ impl ComponentSolver {
                         node_evaluations,
                     )?);
                 }
-                Ok(self.collection_type(*kind, &items, &values))
+                Ok(SummaryValue {
+                    term: self.collection_type(
+                        *kind,
+                        &items.iter().map(|value| value.term).collect::<Vec<_>>(),
+                        &values.iter().map(|value| value.term).collect::<Vec<_>>(),
+                    ),
+                    parameter_derived: items
+                        .iter()
+                        .chain(&values)
+                        .any(|value| value.parameter_derived),
+                    syntax_selected: items
+                        .iter()
+                        .chain(&values)
+                        .any(|value| value.syntax_selected),
+                })
             }
             KernelSummaryNode::Invoke {
                 program: nested,
@@ -1471,7 +1598,11 @@ impl ComponentSolver {
                 };
                 self.evaluate_summary_program_with(nested, &mut resolve_nested_input)
             }
-            KernelSummaryNode::Select { selector, arms } => {
+            KernelSummaryNode::Select {
+                selector,
+                syntax_discriminating,
+                arms,
+            } => {
                 let selector = self.evaluate_summary_value(
                     program,
                     resolve_input,
@@ -1479,83 +1610,110 @@ impl ComponentSolver {
                     scratch,
                     node_evaluations,
                 )?;
-                let selector = self.resolve_term(selector);
+                let selector_term = self.resolve_term(selector.term);
                 let singleton = matches!(
-                    self.program.terms.term(selector),
+                    self.program.terms.term(selector_term),
                     TypeTerm::VariantSet(variants) if variants.len() == 1
                 );
                 if singleton {
                     for arm in arms {
-                        if !self.pattern_accepts(selector, &arm.pattern) {
+                        if !self.pattern_accepts(selector_term, &arm.pattern) {
                             continue;
                         }
-                        let candidate = self.evaluate_summary_value(
+                        let mut candidate = self.evaluate_summary_value(
                             program,
                             resolve_input,
                             arm.output,
                             scratch,
                             node_evaluations,
                         )?;
-                        let candidate = self.resolve_term(candidate);
-                        if !matches!(self.program.terms.term(candidate), TypeTerm::Absent) {
+                        candidate.term = self.resolve_term(candidate.term);
+                        if !matches!(self.program.terms.term(candidate.term), TypeTerm::Absent) {
+                            candidate.parameter_derived |= selector.parameter_derived;
+                            candidate.syntax_selected |=
+                                *syntax_discriminating && selector.parameter_derived;
                             return Ok(candidate);
                         }
                     }
-                    return Ok(self.program.terms.absent());
+                    return Ok(SummaryValue {
+                        term: self.program.terms.absent(),
+                        parameter_derived: selector.parameter_derived,
+                        syntax_selected: *syntax_discriminating && selector.parameter_derived,
+                    });
                 }
                 let mut candidates = Vec::new();
                 for arm in arms {
-                    let candidate = self.evaluate_summary_value(
+                    let mut candidate = self.evaluate_summary_value(
                         program,
                         resolve_input,
                         arm.output,
                         scratch,
                         node_evaluations,
                     )?;
-                    let candidate = self.resolve_term(candidate);
-                    if matches!(self.program.terms.term(candidate), TypeTerm::Absent) {
+                    candidate.term = self.resolve_term(candidate.term);
+                    if matches!(self.program.terms.term(candidate.term), TypeTerm::Absent) {
                         continue;
                     }
                     candidates.push(candidate);
                 }
-                Ok(self.join_select_candidates(candidates))
+                Ok(SummaryValue {
+                    term: self.join_select_candidates(
+                        candidates.iter().map(|candidate| candidate.term).collect(),
+                    ),
+                    parameter_derived: selector.parameter_derived
+                        || candidates
+                            .iter()
+                            .any(|candidate| candidate.parameter_derived),
+                    syntax_selected: candidates.iter().any(|candidate| candidate.syntax_selected),
+                })
             }
             KernelSummaryNode::Record { tag, entries } => {
                 let mut fields = Vec::<(NameId, TypeTermId)>::new();
+                let mut parameter_derived = false;
+                let mut syntax_selected = false;
                 for entry in entries {
                     match entry {
                         KernelSummaryRecordEntry::Field { name, value } => {
-                            let value = self.evaluate_summary_value(
+                            let mut value = self.evaluate_summary_value(
                                 program,
                                 resolve_input,
                                 *value,
                                 scratch,
                                 node_evaluations,
                             )?;
-                            let value = self.resolve_term_head(value);
-                            insert_record_field(&mut fields, *name, value);
+                            parameter_derived |= value.parameter_derived;
+                            syntax_selected |= value.syntax_selected;
+                            value.term = self.resolve_term_head(value.term);
+                            insert_record_field(&mut fields, *name, value.term);
                         }
                         KernelSummaryRecordEntry::Spread { value } => {
-                            let value = self.evaluate_summary_value(
+                            let mut value = self.evaluate_summary_value(
                                 program,
                                 resolve_input,
                                 *value,
                                 scratch,
                                 node_evaluations,
                             )?;
-                            let value = self.resolve_term_head(value);
-                            self.merge_record_spread(value, &mut fields)?;
+                            parameter_derived |= value.parameter_derived;
+                            syntax_selected |= value.syntax_selected;
+                            value.term = self.resolve_term_head(value.term);
+                            self.merge_record_spread(value.term, &mut fields)?;
                         }
                     }
                 }
                 let object = self.program.terms.object(fields, false);
-                if let Some(tag) = tag {
+                let term = if let Some(tag) = tag {
                     let tag = self.program.terms.name(*tag).to_owned();
                     let variant = self.program.terms.tagged_variant(tag, object);
-                    Ok(self.program.terms.variant_set([variant]))
+                    self.program.terms.variant_set([variant])
                 } else {
-                    Ok(object)
-                }
+                    object
+                };
+                Ok(SummaryValue {
+                    term,
+                    parameter_derived,
+                    syntax_selected,
+                })
             }
         })();
         scratch.active[index] = 0;
@@ -2120,6 +2278,38 @@ impl ComponentSolver {
         self.schedule_variable(variable);
     }
 
+    fn set_syntax_selected(&mut self, variable: TypeVariableId, selected: bool) {
+        let index = variable.0 as usize;
+        if self.syntax_selected[index] == selected {
+            return;
+        }
+        self.syntax_selected[index] = selected;
+        self.touch(variable);
+    }
+
+    fn variable_syntax_selected(&self, variable: TypeVariableId) -> bool {
+        let root = self.root_readonly(variable);
+        let mut member = Some(self.equivalence_head[root.0 as usize]);
+        while let Some(variable) = member {
+            if self.syntax_selected[variable.0 as usize] {
+                return true;
+            }
+            member = self.equivalence_next[variable.0 as usize];
+        }
+        false
+    }
+
+    fn term_syntax_selected(&mut self, term: TypeTermId) -> bool {
+        self.collect_term_variables(term);
+        let variables = std::mem::take(&mut self.term_variable_buffer);
+        let selected = variables
+            .iter()
+            .copied()
+            .any(|variable| self.variable_syntax_selected(variable));
+        self.term_variable_buffer = variables;
+        selected
+    }
+
     fn schedule_variable(&mut self, variable: TypeVariableId) {
         self.schedule_generation = self.schedule_generation.wrapping_add(1);
         if self.schedule_generation == 0 {
@@ -2397,6 +2587,7 @@ mod tests {
                 },
                 KernelSummaryNode::Select {
                     selector: crate::KernelSummaryValueId(0),
+                    syntax_discriminating: true,
                     arms: vec![
                         KernelSummarySelectArm {
                             pattern: KernelPattern::Tag {
@@ -2431,6 +2622,7 @@ mod tests {
                         consumer: projected,
                     }]
                     .into_boxed_slice(),
+                    parameter_derived: true,
                 },
             ],
         );
@@ -2445,6 +2637,10 @@ mod tests {
         assert_eq!(
             artifact.output(result_output).unwrap().flow_type.ty,
             Type::Text
+        );
+        assert!(
+            !artifact.output(result_output).unwrap().call_syntax_selected,
+            "a concrete/context selector must not be reported as call-site syntax specialization"
         );
     }
 
@@ -2477,6 +2673,7 @@ mod tests {
                 },
                 KernelSummaryNode::Select {
                     selector: crate::KernelSummaryValueId(0),
+                    syntax_discriminating: true,
                     arms: vec![
                         KernelSummarySelectArm {
                             pattern: KernelPattern::Tag {
@@ -2528,6 +2725,7 @@ mod tests {
                         consumer: projected,
                     }]
                     .into_boxed_slice(),
+                    parameter_derived: true,
                 },
             ],
         );
@@ -2542,6 +2740,88 @@ mod tests {
         assert_eq!(
             artifact.output(result_output).unwrap().flow_type.ty,
             Type::Text
+        );
+        assert!(
+            !artifact.output(result_output).unwrap().call_syntax_selected,
+            "nested summary calls must preserve a non-parameter selector provenance"
+        );
+    }
+
+    #[test]
+    fn nested_summary_call_preserves_parameter_derived_selector_provenance() {
+        let mut builder = ComponentProgramBuilder::new();
+        let actual = builder.new_authoritative_provider();
+        let projected = builder.new_variable();
+        let output = builder.new_authoritative_provider();
+        let kind = builder.terms_mut().intern_name("kind");
+        let true_tag = builder.terms_mut().variant_tag("True");
+        let true_type = builder.terms_mut().variant_set([true_tag]);
+        let actual_type = builder.terms_mut().object([(kind, true_type)], false);
+        builder.add_publish(actual, [actual_type], PublishMode::Replace);
+
+        let text = builder.terms().text();
+        let number = builder.terms().number();
+        let child = Arc::new(KernelSummaryProgram {
+            definition: 1,
+            nodes: vec![
+                KernelSummaryNode::Input(0),
+                KernelSummaryNode::Term(text),
+                KernelSummaryNode::Term(number),
+                KernelSummaryNode::Select {
+                    selector: crate::KernelSummaryValueId(0),
+                    syntax_discriminating: true,
+                    arms: vec![
+                        KernelSummarySelectArm {
+                            pattern: KernelPattern::Tag {
+                                name: "True".into(),
+                                fields: Box::new([]),
+                            },
+                            output: crate::KernelSummaryValueId(1),
+                        },
+                        KernelSummarySelectArm {
+                            pattern: KernelPattern::Wildcard,
+                            output: crate::KernelSummaryValueId(2),
+                        },
+                    ]
+                    .into_boxed_slice(),
+                },
+            ]
+            .into_boxed_slice(),
+            result: crate::KernelSummaryValueId(3),
+        });
+        let parent = Arc::new(KernelSummaryProgram {
+            definition: 0,
+            nodes: vec![
+                KernelSummaryNode::Input(0),
+                KernelSummaryNode::Invoke {
+                    program: child,
+                    inputs: vec![crate::KernelSummaryValueId(0)].into_boxed_slice(),
+                },
+            ]
+            .into_boxed_slice(),
+            result: crate::KernelSummaryValueId(1),
+        });
+        builder.add_summary_call(
+            output,
+            parent,
+            [KernelSummaryCallInput::Projection {
+                provider: actual,
+                steps: vec![crate::KernelSummaryProjectionStep {
+                    field: Some(kind),
+                    consumer: projected,
+                }]
+                .into_boxed_slice(),
+                parameter_derived: true,
+            }],
+        );
+        let result_output = builder.add_output(output, FlowMode::Continuous);
+
+        let artifact = solve_component(builder.finish()).unwrap();
+        let result = artifact.output(result_output).unwrap();
+        assert_eq!(result.flow_type.ty, Type::Text);
+        assert!(
+            result.call_syntax_selected,
+            "nested summary invocation must preserve the outer call parameter provenance"
         );
     }
 
@@ -2581,6 +2861,7 @@ mod tests {
                     consumer: projected,
                 }]
                 .into_boxed_slice(),
+                parameter_derived: true,
             }],
         );
         let actual_output = builder.add_output(actual, FlowMode::Continuous);
@@ -2640,6 +2921,7 @@ mod tests {
                     consumer: projected,
                 }]
                 .into_boxed_slice(),
+                parameter_derived: true,
             }],
         );
         let actual_output = builder.add_output(actual, FlowMode::Continuous);

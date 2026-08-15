@@ -44,6 +44,18 @@ pub struct KernelSolveWork {
 pub struct ArtifactOutput {
     pub id: OutputId,
     pub flow_type: FlowType,
+    /// Whether this exact runtime occurrence contains a value constructed by
+    /// selecting one singleton, invocation-parameter-derived syntax branch.
+    pub syntax_selected: bool,
+    /// Whether this exact output cell is itself the authored SELECT that
+    /// chose a singleton, parameter-derived branch. Unlike `syntax_selected`,
+    /// this bit does not propagate through aliases, records, or call inputs.
+    pub syntax_selected_here: bool,
+    /// Whether the directional writer for this output is a user-definition
+    /// summary call whose own result construction selected syntax. This is the
+    /// narrow authority for checked-call metadata; ordinary forwarded value
+    /// provenance must not relabel a call site.
+    pub call_syntax_selected: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

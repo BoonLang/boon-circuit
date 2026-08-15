@@ -3646,6 +3646,47 @@ surfaces, sparse structural execution rows, and the remaining checked-row
 effect/use facts. Once those rows are exact, production checked-image requests
 can cut over and the superseded assembly path can be deleted.
 
+### Direct checked lexical-scope rows
+
+The first real checked-row family now materializes directly. The prefix linker
+consumes each definition's compact presentation and emits the final
+`CheckedScope` table in one pass: one project-root row followed by relocated
+definition-local rows with resolved parents, owning declarations, structural
+kinds, and source spans. The kernel remains parser-independent and stores spans
+relative to their immutable source unit; the `boon_compiler` orchestration
+boundary applies each unit's project line/byte offset exactly once while
+projecting the snapshot into `boon_checked`.
+
+This cut deliberately does **not** reproduce the old assembler's numeric scope
+IDs or construction order. A full NovyWave audit showed why that would preserve
+the wrong architecture: the legacy table drops many parser lexical-record
+scopes and creates invocation-time `CallContext`/FreshOut scopes while assembling
+owner shards. Those rows are compatibility-construction details, not stable
+language identity. The permanent kernel instead owns coherent dense IDs and
+will add explicit call-occurrence scope facts where downstream behavior needs
+them. Parity is therefore checked through relocated references, scope kinds,
+source authority, and downstream checked/semantic behavior rather than raw old
+row numbers.
+
+The materializer rejects missing definitions, out-of-range parents and owners,
+row-order drift, and total-count disagreement before returning a table. Focused
+coverage proves root and nested scope rows plus two independent repeated-OUT
+scopes, while the complete kernel suite is 96/96 and the compiler library suite
+is 99/99 green. The restored full NovyWave debug differential remains exact for
+all 1,389 definitions and 15,575 expression artifacts with zero unsupported
+owners. It records 4,534 compact definition scope rows (4,535 final rows with
+the project root), 102,596 validated linker references, and a 3,344.883 ms
+candidate including parse and SOURCE ABI projection. The direct link layout is
+5.176 ms; the debug kernel path is 3,191.110 ms. This is a dependency-bottom
+ownership cut, not a latency claim; the accepted release baseline remains the
+preceding 850.730 ms candidate until the next architecture boundary.
+
+The next cut is direct `CheckedDeclaration` materialization. Declarations are
+the remaining anchor required before statements and expressions can be emitted
+without the legacy owner-shard builder. Dynamic FreshOut/call-context facts will
+be modeled explicitly in compact call artifacts instead of reverse-engineering
+the old assembler's scope table.
+
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not
 spend a full optimized rebuild on every small edit. Keep the latest accepted

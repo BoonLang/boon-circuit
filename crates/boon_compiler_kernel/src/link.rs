@@ -4,8 +4,8 @@ use crate::{
     KernelStatementChildReference, KernelStatementReference, KernelValueReference,
 };
 use boon_checked::{
-    CheckedCallId, CheckedExprId, CheckedListId, CheckedSourceId, CheckedStateId,
-    CheckedStatementId, ContextFormalId, DeclId, LexicalScopeId,
+    CheckedCallId, CheckedExprId, CheckedListId, CheckedScope, CheckedScopeKind, CheckedSourceId,
+    CheckedSpan, CheckedStateId, CheckedStatementId, ContextFormalId, DeclId, LexicalScopeId,
 };
 use std::error::Error;
 use std::fmt;
@@ -290,6 +290,75 @@ impl KernelCheckedLinkLayout {
                     .resolve(scope.0, "imported scope")?,
             )),
         }
+    }
+
+    /// Consume compact definition presentation into the final checked lexical
+    /// scope namespace without reopening parser arenas or owner-shard rows.
+    pub fn materialize_scopes(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<Box<[CheckedScope]>, KernelCheckedLinkError> {
+        if snapshot.definitions.len() != self.definitions.len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked scope materializer has {} definitions for a {}-definition layout",
+                snapshot.definitions.len(),
+                self.definitions.len(),
+            )));
+        }
+        let mut scopes = Vec::with_capacity(self.totals.scopes as usize);
+        scopes.push(CheckedScope {
+            id: LexicalScopeId(0),
+            parent: None,
+            owner: None,
+            kind: CheckedScopeKind::Root,
+            span: CheckedSpan::default(),
+        });
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+                KernelCheckedLinkError::new(
+                    "kernel checked scope materializer definition count exceeds u32",
+                )
+            })?);
+            let layout = self.definition(owner)?;
+            for scope in &definition.presentation.scopes {
+                let id = LexicalScopeId(layout.scopes.resolve(scope.id.0, "scope row")?);
+                if id.0 as usize != scopes.len() {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel checked scope materializer expected row {} but linked {}",
+                        scopes.len(),
+                        id.0,
+                    )));
+                }
+                scopes.push(CheckedScope {
+                    id,
+                    parent: Some(self.scope(owner, scope.parent)?),
+                    owner: scope
+                        .owner
+                        .map(|declaration| self.declaration(owner, declaration))
+                        .transpose()?,
+                    kind: match scope.kind {
+                        crate::KernelScopeKind::Function => CheckedScopeKind::Function,
+                        crate::KernelScopeKind::Block => CheckedScopeKind::Block,
+                        crate::KernelScopeKind::Record => CheckedScopeKind::Record,
+                        crate::KernelScopeKind::RepeatedOutput => CheckedScopeKind::RepeatedOutput,
+                        crate::KernelScopeKind::CallContext => CheckedScopeKind::CallContext,
+                    },
+                    span: CheckedSpan {
+                        line: scope.span.line,
+                        start: scope.span.start,
+                        end: scope.span.end,
+                    },
+                });
+            }
+        }
+        if scopes.len() != self.totals.scopes as usize {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked scope materializer produced {} rows for a {}-row layout",
+                scopes.len(),
+                self.totals.scopes,
+            )));
+        }
+        Ok(scopes.into_boxed_slice())
     }
 
     pub fn declaration(
@@ -954,6 +1023,16 @@ mod tests {
                 .unwrap(),
             LexicalScopeId(1)
         );
+        let materialized_scopes = scoped_layout
+            .materialize_scopes(&scoped)
+            .expect("compact scopes materialize directly into checked rows");
+        assert_eq!(materialized_scopes.len(), 2);
+        assert_eq!(materialized_scopes[0].kind, CheckedScopeKind::Root);
+        assert_eq!(materialized_scopes[0].parent, None);
+        assert_eq!(materialized_scopes[1].id, LexicalScopeId(1));
+        assert_eq!(materialized_scopes[1].parent, Some(LexicalScopeId(0)));
+        assert_eq!(materialized_scopes[1].owner, Some(DeclId(0)));
+        assert_eq!(materialized_scopes[1].kind, CheckedScopeKind::Block);
 
         let mut missing_scope = scoped.clone();
         missing_scope.definitions[1].presentation.containing_scope = KernelScopeReference::Owner {

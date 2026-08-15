@@ -9,8 +9,8 @@
 #![cfg_attr(not(any(test, feature = "test-kernel-oracle")), allow(dead_code))]
 
 use boon_checked::{
-    CheckedListKeyPolicy, CheckedStateKind, DiagnosticSeverity, FlowMode, FlowType, ObjectShape,
-    Type, TypeDiagnostic, Variant, type_is_recursively_closed,
+    CheckedListKeyPolicy, CheckedScope, CheckedStateKind, DiagnosticSeverity, FlowMode, FlowType,
+    ObjectShape, Type, TypeDiagnostic, Variant, type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
     CheckDemand, KernelCallArgumentKind, KernelCallArgumentSource, KernelCallInputRole,
@@ -482,6 +482,7 @@ pub enum KernelOwnerOracleStatementChild {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct KernelOwnerOracleReport {
     pub supported: Box<[KernelOwnerOracleEntry]>,
+    pub checked_scopes: Box<[CheckedScope]>,
     pub container_owners: Box<[StableCheckOwnerKey]>,
     pub unsupported: Box<[(StableCheckOwnerKey, String)]>,
     pub root_blockers: Box<[KernelOwnerBlockerImpact]>,
@@ -1090,6 +1091,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     let mut checked_image_us = 0;
     let mut checked_link_layout_us = 0;
     let mut checked_link_references = 0;
+    let mut checked_scopes: Box<[CheckedScope]> = Box::new([]);
     let mut solve_us = 0;
     let mut compile_work = KernelCompileWork::default();
     let artifact = if project_is_empty {
@@ -1126,15 +1128,76 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 solve_us = graph_solve_us.saturating_add(checked_image_us);
                 checked.and_then(|checked| {
                     let checked_link_started = Instant::now();
-                    let layout = KernelCheckedLinkLayout::new(
-                        input
-                            .as_ref()
-                            .expect("a solved kernel graph retains its immutable input"),
-                        &checked,
-                    )
-                    .map_err(|error| error.to_string())?;
+                    let kernel_input = input
+                        .as_ref()
+                        .expect("a solved kernel graph retains its immutable input");
+                    let layout = KernelCheckedLinkLayout::new(kernel_input, &checked)
+                        .map_err(|error| error.to_string())?;
                     checked_link_layout_us = elapsed_us(checked_link_started.elapsed());
                     checked_link_references = layout.totals().resolved_references;
+                    let mut materialized_scopes = layout
+                        .materialize_scopes(&checked)
+                        .map_err(|error| error.to_string())?
+                        .into_vec();
+                    for definition in layout.definitions() {
+                        let key = kernel_input
+                            .links()
+                            .definition_key(definition.owner)
+                            .ok_or_else(|| {
+                                format!(
+                                    "kernel checked scope linker has no stable key for definition {}",
+                                    definition.owner.0,
+                                )
+                            })?;
+                        let source = project
+                            .source_layouts()
+                            .iter()
+                            .find(|source| &source.source_unit_id == key.source_unit_id())
+                            .ok_or_else(|| {
+                                format!(
+                                    "kernel checked scope linker has no source layout for {:?}",
+                                    key.source_unit_id(),
+                                )
+                            })?;
+                        for row in definition.scopes.start
+                            ..definition
+                                .scopes
+                                .start
+                                .checked_add(definition.scopes.len)
+                                .ok_or_else(|| {
+                                    "kernel checked scope range overflowed".to_owned()
+                                })?
+                        {
+                            let scope = materialized_scopes
+                                .get_mut(row as usize)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "kernel checked scope linker references missing row {row}"
+                                    )
+                                })?;
+                            scope.span.line = source
+                                .start_line
+                                .checked_add(scope.span.line.checked_sub(1).ok_or_else(|| {
+                                    format!("kernel checked scope row {row} has no source line")
+                                })?)
+                                .ok_or_else(|| {
+                                    format!("kernel checked scope row {row} line overflowed")
+                                })?;
+                            scope.span.start = source
+                                .start_byte
+                                .checked_add(scope.span.start)
+                                .ok_or_else(|| {
+                                    format!("kernel checked scope row {row} start overflowed")
+                                })?;
+                            scope.span.end = source
+                                .start_byte
+                                .checked_add(scope.span.end)
+                                .ok_or_else(|| {
+                                    format!("kernel checked scope row {row} end overflowed")
+                                })?;
+                        }
+                    }
+                    checked_scopes = materialized_scopes.into_boxed_slice();
                     Ok(checked)
                 })
             })
@@ -1832,6 +1895,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         .collect::<Vec<_>>();
     let report = KernelOwnerOracleReport {
         supported: supported.into_boxed_slice(),
+        checked_scopes,
         container_owners: container_owners.into_boxed_slice(),
         unsupported: unsupported.into_boxed_slice(),
         root_blockers: root_blockers.into_boxed_slice(),
@@ -12889,6 +12953,15 @@ mod tests {
             oracle.unsupported.is_empty(),
             "wrapped OUT project must compile entirely in the dense kernel: {:#?}",
             oracle.unsupported
+        );
+        assert_eq!(
+            oracle
+                .checked_scopes
+                .iter()
+                .filter(|scope| { scope.kind == boon_checked::CheckedScopeKind::RepeatedOutput })
+                .count(),
+            2,
+            "each callable OUT parameter must retain one repeated-output scope"
         );
         let owner_named = |name: &str| {
             oracle

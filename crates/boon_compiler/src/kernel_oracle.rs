@@ -9,8 +9,9 @@
 #![cfg_attr(not(any(test, feature = "test-kernel-oracle")), allow(dead_code))]
 
 use boon_checked::{
-    CheckedDeclaration, CheckedListKeyPolicy, CheckedScope, CheckedStateKind, DiagnosticSeverity,
-    FlowMode, FlowType, ObjectShape, Type, TypeDiagnostic, Variant, type_is_recursively_closed,
+    CheckedDeclaration, CheckedListKeyPolicy, CheckedScope, CheckedStateKind, CheckedStatement,
+    DiagnosticSeverity, FlowMode, FlowType, ObjectShape, Type, TypeDiagnostic, Variant,
+    type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
     CheckDemand, KernelCallArgumentKind, KernelCallArgumentSource, KernelCallInputRole,
@@ -35,9 +36,10 @@ use boon_compiler_kernel::{
     KernelSourceInput, KernelSourceSpan, KernelStateId, KernelStateInput,
     KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
     KernelStatementParameter, KernelStatementPresentation, KernelStatementReference,
-    KernelStructuralDeclarationInput, KernelTextTemplateSegment, KernelTypeMismatch,
-    KernelValueReference, is_kernel_host_effect, is_registered_kernel_host_effect,
-    project_kernel_call_shape, project_kernel_source_expression_diagnostics,
+    KernelStatementValueUse, KernelStructuralDeclarationInput, KernelTextTemplateSegment,
+    KernelTypeMismatch, KernelValueReference, is_kernel_host_effect,
+    is_registered_kernel_host_effect, project_kernel_call_shape,
+    project_kernel_source_expression_diagnostics,
 };
 use boon_data::{Bits, ExactNumber};
 use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
@@ -484,6 +486,8 @@ pub struct KernelOwnerOracleReport {
     pub supported: Box<[KernelOwnerOracleEntry]>,
     pub checked_scopes: Box<[CheckedScope]>,
     pub checked_declarations: Box<[CheckedDeclaration]>,
+    pub checked_statements: Box<[CheckedStatement]>,
+    pub checked_statement_keys: Box<[StableStatementKey]>,
     pub container_owners: Box<[StableCheckOwnerKey]>,
     pub unsupported: Box<[(StableCheckOwnerKey, String)]>,
     pub root_blockers: Box<[KernelOwnerBlockerImpact]>,
@@ -496,11 +500,11 @@ pub struct KernelOwnerOracleReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
-    pub basis_fingerprint_v10: [u8; 32],
+    pub basis_fingerprint_v11: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v12: [u8; 32],
+    pub artifact_fingerprint_v13: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v12: [u8; 32],
+    pub fingerprint_v13: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -624,11 +628,6 @@ fn prepare_kernel_project_projection(
                 .entry((synthetic.anchor.clone(), synthetic.kind))
                 .or_default();
             let projection = match synthetic.kind {
-                PreparedResourceSyntheticKind::State => owner
-                    .definition_facts
-                    .states
-                    .get_mut(synthetic.row)
-                    .map(|state| &mut state.projection),
                 PreparedResourceSyntheticKind::List => owner
                     .definition_facts
                     .lists
@@ -641,7 +640,6 @@ fn prepare_kernel_project_projection(
                 "a synthetic resource path must begin without a structural projection"
             );
             let prefix = match synthetic.kind {
-                PreparedResourceSyntheticKind::State => "state",
                 PreparedResourceSyntheticKind::List => "list",
             };
             *projection = vec![format!("{prefix}_{ordinal}").into_boxed_str()].into_boxed_slice();
@@ -1094,6 +1092,8 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     let mut checked_link_references = 0;
     let mut checked_scopes: Box<[CheckedScope]> = Box::new([]);
     let mut checked_declarations: Box<[CheckedDeclaration]> = Box::new([]);
+    let mut checked_statements: Box<[CheckedStatement]> = Box::new([]);
+    let mut checked_statement_keys: Box<[StableStatementKey]> = Box::new([]);
     let mut solve_us = 0;
     let mut compile_work = KernelCompileWork::default();
     let artifact = if project_is_empty {
@@ -1135,7 +1135,6 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         .expect("a solved kernel graph retains its immutable input");
                     let layout = KernelCheckedLinkLayout::new(kernel_input, &checked)
                         .map_err(|error| error.to_string())?;
-                    checked_link_layout_us = elapsed_us(checked_link_started.elapsed());
                     checked_link_references = layout.totals().resolved_references;
                     let mut materialized_scopes = layout
                         .materialize_scopes(&checked)
@@ -1143,6 +1142,10 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         .into_vec();
                     let mut materialized_declarations = layout
                         .materialize_declarations(&checked)
+                        .map_err(|error| error.to_string())?
+                        .into_vec();
+                    let mut materialized_statements = layout
+                        .materialize_statements(&checked)
                         .map_err(|error| error.to_string())?
                         .into_vec();
                     for definition in layout.definitions() {
@@ -1253,9 +1256,71 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                                     )
                                 })?;
                         }
+                        for row in definition.statements.start
+                            ..definition
+                                .statements
+                                .start
+                                .checked_add(definition.statements.len)
+                                .ok_or_else(|| {
+                                    "kernel checked statement range overflowed".to_owned()
+                                })?
+                        {
+                            let statement = materialized_statements
+                                .get_mut(row as usize)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "kernel checked statement linker references missing row {row}"
+                                    )
+                                })?;
+                            statement.span.line = source
+                                .start_line
+                                .checked_add(statement.span.line.checked_sub(1).ok_or_else(
+                                    || {
+                                        format!(
+                                            "kernel checked statement row {row} has no source line"
+                                        )
+                                    },
+                                )?)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "kernel checked statement row {row} line overflowed"
+                                    )
+                                })?;
+                            statement.span.start = source
+                                .start_byte
+                                .checked_add(statement.span.start)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "kernel checked statement row {row} start overflowed"
+                                    )
+                                })?;
+                            statement.span.end = source
+                                .start_byte
+                                .checked_add(statement.span.end)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "kernel checked statement row {row} end overflowed"
+                                    )
+                                })?;
+                        }
                     }
                     checked_scopes = materialized_scopes.into_boxed_slice();
                     checked_declarations = materialized_declarations.into_boxed_slice();
+                    checked_statements = materialized_statements.into_boxed_slice();
+                    checked_statement_keys = checked
+                        .definitions
+                        .iter()
+                        .flat_map(|definition| definition.relocations.statements.iter().cloned())
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    if checked_statement_keys.len() != checked_statements.len() {
+                        return Err(format!(
+                            "kernel checked statement linker has {} stable keys for {} rows",
+                            checked_statement_keys.len(),
+                            checked_statements.len(),
+                        ));
+                    }
+                    checked_link_layout_us = elapsed_us(checked_link_started.elapsed());
                     Ok(checked)
                 })
             })
@@ -1299,11 +1364,11 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 .zip(&artifact.currentness)
                 .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
                     owner: prepared[*prepared_index].owner.clone(),
-                    basis_fingerprint_v10: receipt.basis_fingerprint_v10,
+                    basis_fingerprint_v11: receipt.basis_fingerprint_v11,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v12: receipt.artifact_fingerprint_v12,
+                    artifact_fingerprint_v13: receipt.artifact_fingerprint_v13,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v12: receipt.fingerprint_v12,
+                    fingerprint_v13: receipt.fingerprint_v13,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -1955,6 +2020,8 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         supported: supported.into_boxed_slice(),
         checked_scopes,
         checked_declarations,
+        checked_statements,
+        checked_statement_keys,
         container_owners: container_owners.into_boxed_slice(),
         unsupported: unsupported.into_boxed_slice(),
         root_blockers: root_blockers.into_boxed_slice(),
@@ -2636,7 +2703,6 @@ struct PreparedResourceOwnerTarget {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum PreparedResourceSyntheticKind {
-    State,
     List,
 }
 
@@ -4939,6 +5005,9 @@ fn compact_owner_view(
         let mode = match &kind {
             KernelOwnerNodeKind::Source(_) => FlowMode::PresentOrAbsent,
             KernelOwnerNodeKind::Then => FlowMode::PresentOrAbsent,
+            KernelOwnerNodeKind::PureBuiltin {
+                kind: KernelPureBuiltinKind::ListLatest,
+            } => FlowMode::PresentOrAbsent,
             KernelOwnerNodeKind::Absent => FlowMode::Absent,
             _ => FlowMode::Continuous,
         };
@@ -6655,6 +6724,11 @@ fn compact_statement_facts(
                 id: KernelStatementId(checked_u32(index, "statement index")?),
                 kind,
                 value,
+                value_use: if kernel_render_slot_name(owner, &stable[index], statement).is_some() {
+                    KernelStatementValueUse::RenderSlot
+                } else {
+                    KernelStatementValueUse::RuntimeValue
+                },
                 children,
             })
         })
@@ -7554,6 +7628,134 @@ fn project_inline_list_authority_owner(
     None
 }
 
+/// `LATEST` expressions used only to merge authored HOLD updates are not
+/// independent runtime cells. The dense graph already owns the exact HOLD
+/// update edges, so classify them directly instead of reconstructing
+/// statement bodies after type solving.
+fn kernel_hold_update_mergers(nodes: &[KernelOwnerNode]) -> BTreeSet<KernelExpressionId> {
+    let mut pending = nodes
+        .iter()
+        .filter(|node| matches!(node.kind, KernelOwnerNodeKind::Hold))
+        .flat_map(|node| {
+            node.inputs
+                .iter()
+                .filter(|input| input.role == KernelOwnerEdgeRole::HoldUpdate)
+                .map(|input| input.expression)
+        })
+        .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    let mut mergers = BTreeSet::new();
+    while let Some(expression) = pending.pop() {
+        if !visited.insert(expression) {
+            continue;
+        }
+        let Some(node) = nodes.get(expression.0 as usize) else {
+            continue;
+        };
+        if matches!(node.kind, KernelOwnerNodeKind::Hold) {
+            continue;
+        }
+        if matches!(node.kind, KernelOwnerNodeKind::Latest) {
+            mergers.insert(expression);
+        }
+        pending.extend(
+            node.inputs
+                .iter()
+                .filter(|input| (input.expression.0 as usize) < nodes.len())
+                .map(|input| input.expression),
+        );
+    }
+    mergers
+}
+
+/// A startup initializer may inspect ordinary values, but it cannot itself
+/// invoke a host effect, emit a SOURCE, or depend on a foreign state root.
+/// Stateful carriers follow only their initial branch; authored updates are
+/// deliberately outside initialization.
+fn kernel_initializer_is_startup_safe(nodes: &[KernelOwnerNode], root: KernelExpressionId) -> bool {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(expression) = pending.pop() {
+        if !visited.insert(expression) {
+            continue;
+        }
+        let Some(node) = nodes.get(expression.0 as usize) else {
+            return false;
+        };
+        match &node.kind {
+            KernelOwnerNodeKind::Source(_) | KernelOwnerNodeKind::HostEffect { .. } => {
+                return false;
+            }
+            KernelOwnerNodeKind::Hold => {
+                let Some(initial) = node
+                    .inputs
+                    .iter()
+                    .find(|input| input.role == KernelOwnerEdgeRole::HoldInitial)
+                else {
+                    return false;
+                };
+                if initial.expression.0 as usize >= nodes.len() {
+                    return false;
+                }
+                pending.push(initial.expression);
+            }
+            KernelOwnerNodeKind::Latest => {
+                let Some(initial) = node
+                    .inputs
+                    .iter()
+                    .find(|input| input.role == KernelOwnerEdgeRole::LatestBranch)
+                else {
+                    return false;
+                };
+                if initial.expression.0 as usize >= nodes.len() {
+                    return false;
+                }
+                pending.push(initial.expression);
+            }
+            _ => pending.extend(
+                node.inputs
+                    .iter()
+                    .filter(|input| (input.expression.0 as usize) < nodes.len())
+                    .map(|input| input.expression),
+            ),
+        }
+    }
+    true
+}
+
+/// Owner partitioning can move a HOLD update body into a child definition, so
+/// its local graph no longer contains the parent HOLD node. The parser's
+/// immutable statement locator retains that containment edge. A LATEST below
+/// an authored HOLD body is therefore an update merger even when the type
+/// component sees the body through an external-result edge.
+fn kernel_latest_is_in_hold_update(
+    view: UnitOwnerSyntaxView<'_>,
+    containing_statements: &BTreeMap<usize, KernelStatementId>,
+    syntax_expression: usize,
+) -> bool {
+    let Some(statement) = containing_statements
+        .get(&syntax_expression)
+        .and_then(|statement| view.statement_ids().get(statement.0 as usize))
+        .copied()
+    else {
+        return false;
+    };
+    let mut current = statement;
+    while let Some(parent) = view
+        .statement_locator(current)
+        .and_then(|locator| locator.parent())
+    {
+        if view
+            .statement_for_local(parent)
+            .is_some_and(|statement| matches!(statement.kind, AstStatementKind::Hold { .. }))
+        {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
 fn compact_resource_facts(
     view: UnitOwnerSyntaxView<'_>,
     owner: &StableCheckOwnerKey,
@@ -7678,6 +7880,7 @@ fn compact_resource_facts(
     let mut lists = Vec::new();
     let mut state_count = 0usize;
     let mut list_count = 0usize;
+    let hold_update_mergers = kernel_hold_update_mergers(nodes);
 
     let canonical_target = |expression: KernelExpressionId,
                             exact_statement: bool,
@@ -7817,7 +8020,7 @@ fn compact_resource_facts(
                     });
                 }
             }
-            KernelOwnerNodeKind::Hold => {
+            KernelOwnerNodeKind::Hold | KernelOwnerNodeKind::Latest => {
                 let Some(target) = canonical_target(dense, true, false) else {
                     continue;
                 };
@@ -7828,61 +8031,107 @@ fn compact_resource_facts(
                 else {
                     continue;
                 };
-                let binding_target = containing_statements
-                    .get(&expression.id)
-                    .and_then(|statement| view.statement_ids().get(statement.0 as usize).copied())
-                    .and_then(|statement| {
-                        view.statement_for_local(statement)
-                            .and_then(|statement_input| {
-                                (statement_input.expr == Some(expression.id)
-                                    && matches!(
-                                        statement_input.kind,
-                                        AstStatementKind::Hold { .. }
-                                    ))
-                                .then_some(statement)
+                let (kind, initial, binding_target) = match &nodes[dense.0 as usize].kind {
+                    KernelOwnerNodeKind::Hold => {
+                        let binding_target = containing_statements
+                            .get(&expression.id)
+                            .and_then(|statement| {
+                                view.statement_ids().get(statement.0 as usize).copied()
                             })
-                    })
-                    .map(|statement| {
-                        prepared_hold_alias_lexical_target(
-                            view,
-                            owner,
-                            statement,
-                            &dense_statement_by_id,
-                        )
-                    })
-                    .transpose()?
-                    .flatten()
-                    .or_else(|| {
-                        declarations_by_value.get(&dense).and_then(|declarations| {
-                            declarations
-                                .iter()
-                                .find(|declaration| {
-                                    matches!(
-                                        declaration.origin,
-                                        KernelDeclarationOrigin::RecordField { .. }
-                                    )
+                            .and_then(|statement| {
+                                view.statement_for_local(statement)
+                                    .and_then(|statement_input| {
+                                        (statement_input.expr == Some(expression.id)
+                                            && matches!(
+                                                statement_input.kind,
+                                                AstStatementKind::Hold { .. }
+                                            ))
+                                        .then_some(statement)
+                                    })
+                            })
+                            .map(|statement| {
+                                prepared_hold_alias_lexical_target(
+                                    view,
+                                    owner,
+                                    statement,
+                                    &dense_statement_by_id,
+                                )
+                            })
+                            .transpose()?
+                            .flatten()
+                            .or_else(|| {
+                                declarations_by_value.get(&dense).and_then(|declarations| {
+                                    declarations
+                                        .iter()
+                                        .find(|declaration| {
+                                            matches!(
+                                                declaration.origin,
+                                                KernelDeclarationOrigin::RecordField { .. }
+                                            )
+                                        })
+                                        .map(|declaration| {
+                                            PreparedLexicalTarget::Declaration(
+                                                declaration.origin.clone(),
+                                            )
+                                        })
                                 })
-                                .map(|declaration| {
-                                    PreparedLexicalTarget::Declaration(declaration.origin.clone())
-                                })
-                        })
-                    })
-                    .unwrap_or_else(|| target.clone());
+                            })
+                            .unwrap_or_else(|| target.clone());
+                        let Some(initial) = nodes[dense.0 as usize]
+                            .inputs
+                            .iter()
+                            .find(|input| input.role == KernelOwnerEdgeRole::HoldInitial)
+                            .map(|input| input.expression)
+                        else {
+                            return Err(format!(
+                                "HOLD resource expression {} has no initial",
+                                expression.id
+                            ));
+                        };
+                        (CheckedStateKind::Hold, initial, binding_target)
+                    }
+                    KernelOwnerNodeKind::Latest => {
+                        if hold_update_mergers.contains(&dense)
+                            || kernel_latest_is_in_hold_update(
+                                view,
+                                &containing_statements,
+                                expression.id,
+                            )
+                        {
+                            continue;
+                        }
+                        let Some(initial) = nodes[dense.0 as usize]
+                            .inputs
+                            .iter()
+                            .find(|input| input.role == KernelOwnerEdgeRole::LatestBranch)
+                            .map(|input| input.expression)
+                        else {
+                            continue;
+                        };
+                        if initial.0 as usize >= nodes.len()
+                            || nodes[initial.0 as usize].mode != FlowMode::Continuous
+                            || !kernel_initializer_is_startup_safe(nodes, initial)
+                        {
+                            continue;
+                        }
+                        (CheckedStateKind::InitialLatest, initial, target.clone())
+                    }
+                    _ => unreachable!("state match accepts only HOLD and LATEST"),
+                };
                 let Some(binding_declaration) = local_reference(&binding_target) else {
                     continue;
                 };
-                let Some(initial) = nodes[dense.0 as usize]
-                    .inputs
-                    .iter()
-                    .find(|input| input.role == KernelOwnerEdgeRole::HoldInitial)
-                    .map(|input| input.expression)
-                else {
-                    return Err(format!(
-                        "HOLD resource expression {} has no initial",
-                        expression.id
-                    ));
-                };
                 let (projection, declaration_result) = canonical_projection(&target, dense);
+                let function_declaration = matches!(
+                    target,
+                    PreparedLexicalTarget::Declaration(ref origin)
+                        if declaration_by_origin
+                            .get(origin)
+                            .and_then(|declaration| facts.declarations.get(declaration.0 as usize))
+                            .is_some_and(|declaration| declaration.kind == KernelDeclarationKind::Function)
+                );
+                let synthetic_path =
+                    projection.is_empty() && (!declaration_result || function_declaration);
                 let row = states.len();
                 states.push(KernelStateInput {
                     id: KernelStateId(checked_u32(row, "state resource row")?),
@@ -7892,7 +8141,8 @@ fn compact_resource_facts(
                     expression: dense,
                     initial,
                     projection: projection.into_boxed_slice(),
-                    kind: CheckedStateKind::Hold,
+                    synthetic_path,
+                    kind,
                 });
                 push_owner_target(
                     &mut owner_targets,
@@ -7908,23 +8158,6 @@ fn compact_resource_facts(
                     owner_targets.push(PreparedResourceOwnerTarget {
                         field: PreparedResourceOwnerField::StateStatement(row),
                         owner,
-                    });
-                }
-                let function_declaration = matches!(
-                    target,
-                    PreparedLexicalTarget::Declaration(ref origin)
-                        if declaration_by_origin
-                            .get(origin)
-                            .and_then(|declaration| facts.declarations.get(declaration.0 as usize))
-                            .is_some_and(|declaration| declaration.kind == KernelDeclarationKind::Function)
-                );
-                if states[row].projection.is_empty()
-                    && (!declaration_result || function_declaration)
-                {
-                    synthetic_paths.push(PreparedResourceSyntheticPath {
-                        kind: PreparedResourceSyntheticKind::State,
-                        row,
-                        anchor: target_owner(&target),
                     });
                 }
                 state_count = state_count.saturating_add(1);
@@ -11111,9 +11344,6 @@ mod tests {
         }
         let mut current_states = BTreeMap::new();
         for state in &checked.states {
-            if state.kind != CheckedStateKind::Hold {
-                continue;
-            }
             let Some(stable) = stable_by_checked_expression.get(&state.expression).cloned() else {
                 continue;
             };
@@ -11162,7 +11392,8 @@ mod tests {
         for (stable, kernel) in &kernel_states {
             let Some(current) = current_states.get(stable) else {
                 mismatches.push(format!(
-                    "kernel HOLD state {stable:?} has no checked state row"
+                    "kernel state {stable:?} has no checked state row: kind={:?}",
+                    kernel.kind,
                 ));
                 continue;
             };
@@ -11183,15 +11414,13 @@ mod tests {
                 || current.kind != kernel.kind
             {
                 mismatches.push(format!(
-                    "kernel HOLD state {stable:?} differs from checked row: kernel={kernel:?} checked={current:?} checked_declaration={current_declaration:?} checked_binding={current_binding:?} checked_statement={current_statement:?} checked_initial={current_initial:?} checked_path={current_path:?}"
+                    "kernel state {stable:?} differs from checked row: kernel={kernel:?} checked={current:?} checked_declaration={current_declaration:?} checked_binding={current_binding:?} checked_statement={current_statement:?} checked_initial={current_initial:?} checked_path={current_path:?}"
                 ));
             }
         }
         for stable in current_states.keys() {
             if !kernel_states.contains_key(stable) {
-                mismatches.push(format!(
-                    "checked HOLD state {stable:?} has no kernel state row"
-                ));
+                mismatches.push(format!("checked state {stable:?} has no kernel state row"));
             }
         }
 
@@ -11315,6 +11544,68 @@ mod tests {
                     ));
                 }
             }
+        }
+        if kernel_statements.len() != report.checked_statements.len() {
+            mismatches.push(format!(
+                "kernel direct statement table has {} rows for {} statement artifacts",
+                report.checked_statements.len(),
+                kernel_statements.len(),
+            ));
+        }
+        let direct_by_stable = report
+            .checked_statement_keys
+            .iter()
+            .zip(report.checked_statements.iter())
+            .map(|(stable, direct)| (stable.clone(), direct))
+            .collect::<BTreeMap<_, _>>();
+        if direct_by_stable.len() != report.checked_statement_keys.len() {
+            mismatches.push("kernel direct statement table repeats a stable identity".to_owned());
+        }
+        let direct_stable_by_id = direct_by_stable
+            .iter()
+            .map(|(stable, statement)| (statement.id, stable.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let direct_state_statements = direct_by_stable
+            .iter()
+            .flat_map(|(stable, statement)| {
+                statement.resources.iter().filter_map(|resource| {
+                    matches!(resource, boon_checked::CheckedResourceBinding::State { .. })
+                        .then_some(stable.clone())
+                })
+            })
+            .fold(
+                BTreeMap::<StableStatementKey, usize>::new(),
+                |mut counts, stable| {
+                    *counts.entry(stable).or_default() += 1;
+                    counts
+                },
+            );
+        let artifact_state_statements = report
+            .supported
+            .iter()
+            .flat_map(|owner| owner.states.iter().map(|state| state.statement.clone()))
+            .fold(
+                BTreeMap::<StableStatementKey, usize>::new(),
+                |mut counts, stable| {
+                    *counts.entry(stable).or_default() += 1;
+                    counts
+                },
+            );
+        if direct_state_statements != artifact_state_statements {
+            let first_difference = direct_state_statements
+                .iter()
+                .chain(artifact_state_statements.iter())
+                .find_map(|(stable, _)| {
+                    (direct_state_statements.get(stable) != artifact_state_statements.get(stable))
+                        .then_some(stable)
+                });
+            mismatches.push(format!(
+                "kernel direct state-resource statements differ from artifacts at {first_difference:?}: direct={:?} artifact={:?} direct_paths={} artifact_paths={}",
+                first_difference.and_then(|stable| direct_state_statements.get(stable)),
+                first_difference.and_then(|stable| artifact_state_statements.get(stable)),
+                direct_state_statements.len(),
+                artifact_state_statements.len(),
+            ));
         }
 
         let mut checked_by_stable = BTreeMap::new();
@@ -11465,6 +11756,126 @@ mod tests {
                 mismatches.push(format!(
                     "kernel statement {stable:?} kind {:?} differs from checked {:?}",
                     kernel.kind, current.kind
+                ));
+            }
+            let Some(direct) = direct_by_stable.get(stable).copied() else {
+                mismatches.push(format!(
+                    "kernel statement {stable:?} has no direct checked statement row"
+                ));
+                continue;
+            };
+            let direct_kind_matches = match (&direct.kind, &current.kind) {
+                (CheckedStatementKind::Function { .. }, CheckedStatementKind::Function { .. })
+                | (CheckedStatementKind::Field { .. }, CheckedStatementKind::Field { .. })
+                | (CheckedStatementKind::Block, CheckedStatementKind::Block)
+                | (CheckedStatementKind::Spread, CheckedStatementKind::Spread)
+                | (CheckedStatementKind::Expression, CheckedStatementKind::Expression) => true,
+                (
+                    CheckedStatementKind::Source {
+                        event: direct_event,
+                        ..
+                    },
+                    CheckedStatementKind::Source {
+                        event: current_event,
+                        ..
+                    },
+                ) => direct_event == current_event,
+                (
+                    CheckedStatementKind::Hold {
+                        name: direct_name, ..
+                    },
+                    CheckedStatementKind::Hold {
+                        name: current_name, ..
+                    },
+                ) => direct_name == current_name,
+                (
+                    CheckedStatementKind::List {
+                        capacity: direct_capacity,
+                        ..
+                    },
+                    CheckedStatementKind::List {
+                        capacity: current_capacity,
+                        ..
+                    },
+                ) => direct_capacity == current_capacity,
+                _ => false,
+            };
+            let statement_declaration = |kind: &CheckedStatementKind| match kind {
+                CheckedStatementKind::Function { declaration }
+                | CheckedStatementKind::Field { declaration } => Some(*declaration),
+                CheckedStatementKind::Source { declaration, .. }
+                | CheckedStatementKind::Hold { declaration, .. }
+                | CheckedStatementKind::List { declaration, .. } => *declaration,
+                CheckedStatementKind::Block
+                | CheckedStatementKind::Spread
+                | CheckedStatementKind::Expression => None,
+            };
+            let direct_declaration = statement_declaration(&direct.kind).and_then(|declaration| {
+                report
+                    .checked_declarations
+                    .iter()
+                    .find(|candidate| candidate.id == declaration)
+            });
+            let current_declaration =
+                statement_declaration(&current.kind).and_then(|declaration| {
+                    checked
+                        .declarations
+                        .iter()
+                        .find(|candidate| candidate.id == declaration)
+                });
+            let declaration_matches = match (direct_declaration, current_declaration) {
+                (None, None) => {
+                    statement_declaration(&direct.kind).is_none()
+                        && statement_declaration(&current.kind).is_none()
+                }
+                (Some(direct), Some(current)) => {
+                    direct.kind == current.kind
+                        && direct.name == current.name
+                        && direct.span == current.span
+                }
+                (None, Some(_)) | (Some(_), None) => false,
+            };
+            let direct_children = direct
+                .children
+                .iter()
+                .filter_map(|child| direct_stable_by_id.get(child).cloned())
+                .collect::<Vec<_>>();
+            let current_children = current
+                .children
+                .iter()
+                .filter_map(|child| stable_by_checked.get(child).cloned())
+                .collect::<Vec<_>>();
+            let resource_kinds = |statement: &CheckedStatement| {
+                statement
+                    .resources
+                    .iter()
+                    .map(|resource| match resource {
+                        boon_checked::CheckedResourceBinding::Source { .. } => "source",
+                        boon_checked::CheckedResourceBinding::State { .. } => "state",
+                        boon_checked::CheckedResourceBinding::ListAuthority { .. } => {
+                            "list_authority"
+                        }
+                        boon_checked::CheckedResourceBinding::ListAlias { .. } => "list_alias",
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let direct_resources = resource_kinds(direct);
+            let current_resources = resource_kinds(current);
+            if !(direct_kind_matches
+                && declaration_matches
+                && direct.span == current.span
+                && direct.value_use == current.value_use
+                && direct.value.is_some() == current.value.is_some()
+                && direct_children == current_children
+                && direct_resources == current_resources)
+            {
+                mismatches.push(format!(
+                    "kernel direct statement {stable:?} differs from checked row: kind_matches={direct_kind_matches} declaration_matches={declaration_matches} span_matches={} value_use_matches={} value_presence_matches={} children_match={} resources_match={} direct={direct:?} current={current:?}",
+                    direct.span == current.span,
+                    direct.value_use == current.value_use,
+                    direct.value.is_some() == current.value.is_some(),
+                    direct_children == current_children,
+                    direct_resources == current_resources,
                 ));
             }
             let kernel_value = kernel.value.as_ref().and_then(value_expression);
@@ -12643,6 +13054,47 @@ mod tests {
         assert_ne!(direct_declaration.id.0, 0);
         assert_eq!(direct_declaration.flow_type, declaration.flow_type);
         assert_eq!(direct_declaration.span, declaration.span);
+        let current_statement = checked
+            .statements
+            .iter()
+            .find(|statement| {
+                matches!(
+                    statement.kind,
+                    CheckedStatementKind::List {
+                        declaration: Some(candidate),
+                        capacity: None,
+                    } if candidate == declaration.id
+                )
+            })
+            .expect("current LIST statement");
+        let direct_statement = oracle
+            .checked_statements
+            .iter()
+            .find(|statement| {
+                matches!(
+                    statement.kind,
+                    CheckedStatementKind::List {
+                        declaration: Some(candidate),
+                        capacity: None,
+                    } if candidate == direct_declaration.id
+                )
+            })
+            .expect("kernel links the LIST statement directly");
+        assert_eq!(direct_statement.span, current_statement.span);
+        assert_eq!(
+            direct_statement.children.len(),
+            current_statement.children.len()
+        );
+        assert_eq!(direct_statement.value_use, current_statement.value_use);
+        assert!(direct_statement.value.is_some());
+        assert!(matches!(
+            direct_statement.resources.as_slice(),
+            [boon_checked::CheckedResourceBinding::ListAuthority { .. }]
+        ));
+        assert!(matches!(
+            current_statement.resources.as_slice(),
+            [boon_checked::CheckedResourceBinding::ListAuthority { .. }]
+        ));
         let [collection] = owner.collections.as_ref() else {
             panic!("LIST fixture must publish one collection artifact")
         };
@@ -12715,6 +13167,135 @@ mod tests {
     }
 
     #[test]
+    fn initial_latest_statement_resources_use_the_solved_startup_mode() {
+        let source = concat!(
+            "trigger: SOURCE\n",
+            "other_trigger: SOURCE\n",
+            "steady:\n",
+            "    LATEST {\n",
+            "        0\n",
+            "        trigger |> THEN { 1 }\n",
+            "    }\n",
+            "event_only:\n",
+            "    LATEST {\n",
+            "        trigger |> THEN { 1 }\n",
+            "        other_trigger |> THEN { 2 }\n",
+            "    }\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse InitialLatest statement fixture");
+        let source_payloads = boon_typecheck::project_source_payload_abi_types(&project)
+            .expect("project fixture SOURCE payload ABI");
+        let oracle = kernel_owner_oracle_with_source_payloads(&project, &source_payloads);
+        assert!(
+            oracle.unsupported.is_empty(),
+            "InitialLatest fixture must compile completely: {:#?}",
+            oracle.unsupported,
+        );
+
+        let parsed = parse_source("app/RUN.bn", source).expect("parse current fixture");
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            checked.report.diagnostics.is_empty(),
+            "current checker diagnostics: {:#?}",
+            checked.report.diagnostics,
+        );
+        let (checked, _) = checked.program.expect("fixture checks").into_parts();
+        let direct_statement = |name: &str| {
+            let declaration = oracle
+                .checked_declarations
+                .iter()
+                .find(|declaration| declaration.name == name)
+                .unwrap_or_else(|| panic!("kernel must publish declaration {name}"));
+            oracle
+                .checked_statements
+                .iter()
+                .find(|statement| {
+                    matches!(
+                        statement.kind,
+                        CheckedStatementKind::Field { declaration: candidate }
+                            if candidate == declaration.id
+                    )
+                })
+                .unwrap_or_else(|| panic!("kernel must publish statement {name}"))
+        };
+        let steady = direct_statement("steady");
+        assert!(matches!(
+            steady.resources.as_slice(),
+            [boon_checked::CheckedResourceBinding::State { .. }]
+        ));
+        let event_only = direct_statement("event_only");
+        assert!(
+            event_only.resources.iter().all(|resource| !matches!(
+                resource,
+                boon_checked::CheckedResourceBinding::State { .. }
+            )),
+            "an event-only LATEST must not allocate a persistent state: {event_only:#?}",
+        );
+        assert_eq!(
+            oracle
+                .supported
+                .iter()
+                .flat_map(|owner| &owner.states)
+                .filter(|state| state.kind == CheckedStateKind::InitialLatest)
+                .count(),
+            checked
+                .states
+                .iter()
+                .filter(|state| state.kind == CheckedStateKind::InitialLatest)
+                .count(),
+        );
+        assert_eq!(
+            oracle
+                .supported
+                .iter()
+                .flat_map(|owner| &owner.states)
+                .filter(|state| state.kind == CheckedStateKind::InitialLatest)
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn render_value_use_comes_from_authored_context_not_a_ui_empty_tag() {
+        let source = "document: [\n    root: 1\n]\n";
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse render-slot context fixture");
+        let oracle = kernel_owner_oracle(&project);
+        let declaration = oracle
+            .checked_declarations
+            .iter()
+            .find(|declaration| declaration.name == "root")
+            .expect("kernel links the nested root declaration");
+        let statement = oracle
+            .checked_statements
+            .iter()
+            .find(|statement| {
+                matches!(
+                    statement.kind,
+                    CheckedStatementKind::Field { declaration: candidate }
+                        if candidate == declaration.id
+                )
+            })
+            .expect("kernel links the nested root statement");
+        assert_eq!(
+            statement.value_use,
+            boon_checked::CheckedValueUse::RenderSlot,
+        );
+        assert!(
+            oracle.checked_statements.iter().all(|statement| {
+                !matches!(statement.kind, CheckedStatementKind::Field { declaration }
+                if oracle.checked_declarations.iter().any(|candidate| {
+                    candidate.id == declaration && candidate.name == "document"
+                })) || statement.value_use == boon_checked::CheckedValueUse::RuntimeValue
+            }),
+            "the enclosing document value remains an ordinary runtime value",
+        );
+    }
+
+    #[test]
     fn parsed_source_retains_payload_identity_in_the_expression_artifact() {
         let source = "signal: SOURCE\n";
         let project =
@@ -12740,6 +13321,19 @@ mod tests {
         assert_eq!(&source.payload_type, payload_type);
         assert_eq!(source.flow_type, owner.result);
         assert_eq!(source.flow_type.mode, FlowMode::PresentOrAbsent);
+        let source_statement = oracle
+            .checked_statements
+            .iter()
+            .find(|statement| matches!(statement.kind, CheckedStatementKind::Source { .. }))
+            .expect("kernel links the SOURCE statement directly");
+        assert!(matches!(
+            source_statement.resources.as_slice(),
+            [boon_checked::CheckedResourceBinding::Source { .. }]
+        ));
+        assert_eq!(
+            source_statement.value_use,
+            boon_checked::CheckedValueUse::RuntimeValue
+        );
     }
 
     #[test]
@@ -15258,7 +15852,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v12 != [0; 32]),
+                        && receipt.fingerprint_v13 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(
@@ -15276,6 +15870,21 @@ mod tests {
             }
             assert!(first.work.operations > 0);
             assert!(first.work.activations < first.work.operations.saturating_mul(8));
+            let direct_render_slots = first
+                .checked_statements
+                .iter()
+                .filter(|statement| {
+                    statement.value_use == boon_checked::CheckedValueUse::RenderSlot
+                })
+                .count();
+            let checked_render_slots = checked
+                .statements
+                .iter()
+                .filter(|statement| {
+                    statement.value_use == boon_checked::CheckedValueUse::RenderSlot
+                })
+                .count();
+            assert_eq!(direct_render_slots, checked_render_slots);
             if std::env::var_os("BOON_KERNEL_ORACLE_TRACE").is_some() {
                 eprintln!(
                     "kernel-oracle {project_path}: supported={}/{} operations={} activations={} mutations={} dynamic_edges={} elapsed_us={}",
@@ -15348,7 +15957,7 @@ mod tests {
             );
         }
         eprintln!(
-            "kernel-novywave definition_artifacts expression_rows={} scope_rows={} execution_shape_rows={} statement_rows={} declaration_rows={} lexical_binding_rows={} source_resource_rows={} hold_state_rows={} persistent_list_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={} dependency_edges={} reverse_consumer_edges={}",
+            "kernel-novywave definition_artifacts expression_rows={} scope_rows={} execution_shape_rows={} statement_rows={} declaration_rows={} lexical_binding_rows={} source_resource_rows={} state_resource_rows={} persistent_list_rows={} collection_rows={} source_expression_rows={} call_rows={} host_effect_rows={} dependency_edges={} reverse_consumer_edges={}",
             report
                 .supported
                 .iter()

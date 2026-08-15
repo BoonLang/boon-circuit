@@ -322,11 +322,22 @@ pub enum KernelStatementKind {
     Expression,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelStatementValueUse {
+    #[default]
+    RuntimeValue,
+    RenderSlot,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelStatementInput {
     pub id: KernelStatementId,
     pub kind: KernelStatementKind,
     pub value: Option<KernelExpressionId>,
+    /// Runtime consumption class supplied by the active library/renderer ABI.
+    /// The dense kernel retains this opaque checked contract; it never
+    /// classifies UI tags or field names itself.
+    pub value_use: KernelStatementValueUse,
     pub children: Box<[KernelStatementChildReference]>,
 }
 
@@ -587,6 +598,9 @@ pub struct KernelStateInput {
     pub expression: KernelExpressionId,
     pub initial: KernelExpressionId,
     pub projection: Box<[Box<str>]>,
+    /// The final `state_N` projection is allocated after solved startup-mode
+    /// filtering, so rejected InitialLatest candidates cannot leave gaps.
+    pub synthetic_path: bool,
     pub kind: CheckedStateKind,
 }
 
@@ -855,7 +869,7 @@ pub struct KernelOwnerProgram {
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
-    basis_fingerprint_v10: [u8; 32],
+    basis_fingerprint_v11: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -953,7 +967,7 @@ struct KernelProjectOwnerOutputs {
     /// requirements. That aggregate is useful to the solver, but is not a
     /// sound direct assignability contract for call diagnostics.
     syntax_discriminated_formals: Box<[u32]>,
-    basis_fingerprint_v10: [u8; 32],
+    basis_fingerprint_v11: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -994,13 +1008,13 @@ struct PendingKernelSourceArtifact {
 
 #[derive(Clone, Debug)]
 struct PendingKernelStateArtifact {
-    id: KernelStateId,
     binding_declaration: KernelDeclarationReference,
     declaration: KernelDeclarationReference,
     statement: KernelStatementReference,
     expression: KernelExpressionId,
     initial: KernelValueReference,
     path: KernelSemanticPath,
+    synthetic_path: bool,
     kind: CheckedStateKind,
 }
 
@@ -1150,6 +1164,7 @@ pub struct KernelStatementArtifact {
     pub id: KernelStatementId,
     pub kind: KernelStatementKind,
     pub value: Option<KernelValueReference>,
+    pub value_use: KernelStatementValueUse,
     pub children: Box<[KernelStatementChildReference]>,
 }
 
@@ -2140,7 +2155,7 @@ pub fn is_registered_kernel_host_effect(operation: &str) -> bool {
 
 impl KernelOwnerProgram {
     pub fn solve(self) -> Result<KernelDefinitionSnapshot, KernelSolveError> {
-        let basis_fingerprint_v10 = self.basis_fingerprint_v10;
+        let basis_fingerprint_v11 = self.basis_fingerprint_v11;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
             .output(self.result_output)
@@ -2190,8 +2205,19 @@ impl KernelOwnerProgram {
             std::slice::from_ref(&formal_flows),
             std::slice::from_ref(&result),
         );
-        let (sources, states, lists) =
-            materialize_resource_artifacts(self.resources, &expression_flows, None);
+        let mut state_path_ordinals = BTreeMap::new();
+        let synthetic_state_ordinals = allocate_synthetic_state_ordinals(
+            KernelOwnerId(0),
+            &self.resources.states,
+            &self.expression_modes,
+            &mut state_path_ordinals,
+        );
+        let (sources, states, lists) = materialize_resource_artifacts(
+            self.resources,
+            &expression_flows,
+            None,
+            &synthetic_state_ordinals,
+        );
         let expressions =
             materialize_expression_artifacts(self.expression_artifacts, expression_flows);
         let mut definition = DefinitionArtifact {
@@ -2216,7 +2242,7 @@ impl KernelOwnerProgram {
         };
         let (dependencies, currentness) = build_snapshot_receipts(
             std::slice::from_mut(&mut definition),
-            &[basis_fingerprint_v10],
+            &[basis_fingerprint_v11],
         )?;
         let [currentness] = currentness.as_ref() else {
             unreachable!("one standalone kernel definition produces one receipt")
@@ -2381,26 +2407,31 @@ impl KernelSolvedProject {
         let basis_fingerprints = self
             .owners
             .iter()
-            .map(|owner| owner.basis_fingerprint_v10)
+            .map(|owner| owner.basis_fingerprint_v11)
             .collect::<Vec<_>>();
+        let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(&self.owners);
         let mut definitions = self
             .owners
             .into_vec()
             .into_iter()
             .enumerate()
+            .zip(synthetic_state_ordinals.into_vec())
             .zip(self.call_facts.into_vec())
             .zip(self.diagnostics.into_vec())
-            .map(|(((owner_index, owner), call_facts), diagnostics)| {
-                materialize_project_definition(
-                    owner_index,
-                    owner,
-                    &self.artifact,
-                    &self.public_results,
-                    &self.public_formals,
-                    call_facts,
-                    diagnostics,
-                )
-            })
+            .map(
+                |((((owner_index, owner), synthetic_state_ordinals), call_facts), diagnostics)| {
+                    materialize_project_definition(
+                        owner_index,
+                        owner,
+                        &self.artifact,
+                        &self.public_results,
+                        &self.public_formals,
+                        call_facts,
+                        diagnostics,
+                        &synthetic_state_ordinals,
+                    )
+                },
+            )
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let (dependencies, currentness) =
@@ -2437,13 +2468,15 @@ impl KernelSolvedProject {
                 owner.0
             )));
         }
+        let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(&self.owners);
         let mut demanded_iter = demanded.into_iter().peekable();
         let mut definitions = Vec::with_capacity(demanded_iter.len());
-        for (((owner_index, owner), call_facts), diagnostics) in self
+        for ((((owner_index, owner), synthetic_state_ordinals), call_facts), diagnostics) in self
             .owners
             .into_vec()
             .into_iter()
             .enumerate()
+            .zip(synthetic_state_ordinals.into_vec())
             .zip(self.call_facts.into_vec())
             .zip(self.diagnostics.into_vec())
         {
@@ -2463,6 +2496,7 @@ impl KernelSolvedProject {
                 &self.public_formals,
                 call_facts,
                 diagnostics,
+                &synthetic_state_ordinals,
             );
             alpha_normalize_definition(&mut definition);
             definitions.push(KernelDemandedDefinitionArtifact {
@@ -2983,6 +3017,7 @@ fn materialize_project_definition(
     public_formals: &[Box<[FlowType]>],
     call_facts: Box<[SolvedKernelCallFacts]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
+    synthetic_state_ordinals: &[Option<u32>],
 ) -> DefinitionArtifact {
     let result = public_results[owner_index].clone();
     let expression_flows = owner
@@ -3001,8 +3036,12 @@ fn materialize_project_definition(
         .collect::<Vec<_>>()
         .into_boxed_slice();
     let calls = materialize_project_call_artifacts(owner.calls, call_facts, &expression_flows);
-    let (sources, states, lists) =
-        materialize_resource_artifacts(owner.resources, &expression_flows, Some(public_results));
+    let (sources, states, lists) = materialize_resource_artifacts(
+        owner.resources,
+        &expression_flows,
+        Some(public_results),
+        synthetic_state_ordinals,
+    );
     let expressions =
         materialize_expression_artifacts(owner.expression_artifacts, expression_flows);
     DefinitionArtifact {
@@ -3868,7 +3907,7 @@ pub fn compile_owner_program_with_definition_facts(
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
     validate_definition_linker_facts(input, facts, None)?;
-    let basis_fingerprint_v10 = definition_basis_fingerprint(input, facts)?;
+    let basis_fingerprint_v11 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
@@ -4033,7 +4072,7 @@ pub fn compile_owner_program_with_definition_facts(
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
         diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
-        basis_fingerprint_v10,
+        basis_fingerprint_v11,
     })
 }
 
@@ -4159,6 +4198,7 @@ fn collect_statement_artifacts(
                     .value
                     .map(|value| kernel_value_reference(owner, value, statement.id.0 as usize))
                     .transpose()?,
+                value_use: statement.value_use,
                 children: statement.children.clone(),
             })
         })
@@ -4524,6 +4564,11 @@ fn collect_resource_artifacts(
             )?;
             validate_resource_declaration(facts, state.declaration, "kernel state row")?;
             validate_resource_statement(facts, state.statement, "kernel state row")?;
+            if state.synthetic_path && !state.projection.is_empty() {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel synthetic state row {index} already has a structural projection",
+                )));
+            }
             let expression = checked_expression_index(
                 state.expression,
                 owner.nodes.len(),
@@ -4532,6 +4577,7 @@ fn collect_resource_artifacts(
             if !matches!(
                 (&owner.nodes[expression].kind, state.kind),
                 (KernelOwnerNodeKind::Hold, CheckedStateKind::Hold)
+                    | (KernelOwnerNodeKind::Latest, CheckedStateKind::InitialLatest)
             ) {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel state row {index} kind {:?} is incompatible with expression {expression} kind {:?}",
@@ -4545,7 +4591,6 @@ fn collect_resource_artifacts(
             }
             let initial = kernel_value_reference(owner, state.initial, expression)?;
             Ok(PendingKernelStateArtifact {
-                id: state.id,
                 binding_declaration: state.binding_declaration,
                 declaration: state.declaration,
                 statement: state.statement,
@@ -4555,6 +4600,7 @@ fn collect_resource_artifacts(
                     anchor: state.declaration,
                     projection: state.projection.clone(),
                 },
+                synthetic_path: state.synthetic_path,
                 kind: state.kind,
             })
         })
@@ -4619,15 +4665,82 @@ fn collect_resource_artifacts(
     })
 }
 
+fn state_candidate_survives(
+    state: &PendingKernelStateArtifact,
+    expression_modes: &[FlowMode],
+) -> bool {
+    if state.kind != CheckedStateKind::InitialLatest {
+        return true;
+    }
+    let KernelValueReference::Local(initial) = state.initial else {
+        return false;
+    };
+    expression_modes
+        .get(initial.0 as usize)
+        .is_some_and(|mode| *mode == FlowMode::Continuous)
+}
+
+fn allocate_synthetic_state_ordinals(
+    owner: KernelOwnerId,
+    states: &[PendingKernelStateArtifact],
+    expression_modes: &[FlowMode],
+    next_by_anchor: &mut BTreeMap<KernelOwnerId, u32>,
+) -> Box<[Option<u32>]> {
+    states
+        .iter()
+        .map(|state| {
+            if !state.synthetic_path || !state_candidate_survives(state, expression_modes) {
+                return None;
+            }
+            let anchor = match state.path.anchor {
+                KernelDeclarationReference::Local(_) => owner,
+                KernelDeclarationReference::OwnerPublic(owner) => owner,
+            };
+            let next = next_by_anchor.entry(anchor).or_default();
+            let ordinal = *next;
+            *next = next
+                .checked_add(1)
+                .expect("kernel synthetic state-path ordinal exceeds u32");
+            Some(ordinal)
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn allocate_project_synthetic_state_ordinals(
+    owners: &[KernelProjectOwnerOutputs],
+) -> Box<[Box<[Option<u32>]>]> {
+    let mut next_by_anchor = BTreeMap::new();
+    owners
+        .iter()
+        .enumerate()
+        .map(|(owner, definition)| {
+            allocate_synthetic_state_ordinals(
+                KernelOwnerId(u32::try_from(owner).expect("kernel definition count exceeds u32")),
+                &definition.resources.states,
+                &definition.expression_modes,
+                &mut next_by_anchor,
+            )
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
 fn materialize_resource_artifacts(
     pending: PendingKernelResources,
     expressions: &[FlowType],
     public_results: Option<&[FlowType]>,
+    synthetic_state_ordinals: &[Option<u32>],
 ) -> (
     Box<[KernelSourceArtifact]>,
     Box<[KernelStateArtifact]>,
     Box<[KernelListArtifact]>,
 ) {
+    assert_eq!(
+        pending.states.len(),
+        synthetic_state_ordinals.len(),
+        "kernel synthetic state-path table must cover every candidate state",
+    );
     let sources = pending
         .sources
         .into_vec()
@@ -4647,16 +4760,53 @@ fn materialize_resource_artifacts(
         .states
         .into_vec()
         .into_iter()
-        .map(|state| KernelStateArtifact {
-            id: state.id,
-            binding_declaration: state.binding_declaration,
-            declaration: state.declaration,
-            statement: state.statement,
-            expression: state.expression,
-            initial: state.initial,
-            path: state.path,
-            kind: state.kind,
-            flow_type: expressions[state.expression.0 as usize].clone(),
+        .zip(synthetic_state_ordinals.iter().copied())
+        // Syntax identifies a conservative InitialLatest candidate before
+        // solving. Cross-definition inputs can still change the initializer's
+        // mode, so the solved expression table is the final cell-authority
+        // decision. HOLD rows are unconditional.
+        .filter(|(state, _)| {
+            if state.kind != CheckedStateKind::InitialLatest {
+                return true;
+            }
+            let KernelValueReference::Local(initial) = state.initial else {
+                return false;
+            };
+            expressions
+                .get(initial.0 as usize)
+                .is_some_and(|initial| initial.mode == FlowMode::Continuous)
+        })
+        .enumerate()
+        .map(|(index, (state, synthetic_ordinal))| {
+            let mut path = state.path;
+            if state.synthetic_path {
+                let ordinal = synthetic_ordinal
+                    .expect("surviving synthetic state candidate has no allocated path ordinal");
+                assert!(
+                    path.projection.is_empty(),
+                    "synthetic state path must begin without a structural projection",
+                );
+                path.projection =
+                    vec![format!("state_{ordinal}").into_boxed_str()].into_boxed_slice();
+            } else {
+                assert!(
+                    synthetic_ordinal.is_none(),
+                    "structural state path unexpectedly received a synthetic ordinal",
+                );
+            }
+            KernelStateArtifact {
+                id: KernelStateId(
+                    u32::try_from(index).expect("kernel materialized state count exceeds u32"),
+                ),
+                binding_declaration: state.binding_declaration,
+                declaration: state.declaration,
+                statement: state.statement,
+                expression: state.expression,
+                initial: state.initial,
+                path,
+                kind: state.kind,
+                flow_type: expressions[state.expression.0 as usize].clone(),
+            }
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
@@ -5814,7 +5964,7 @@ pub fn compile_project_program_with_definition_facts(
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice(),
                 syntax_discriminated_formals: syntax_discriminated_formals[owner_index].clone(),
-                basis_fingerprint_v10: definition_basis_fingerprint_with_buffer(
+                basis_fingerprint_v11: definition_basis_fingerprint_with_buffer(
                     owner,
                     &facts[owner_index],
                     &mut basis_fingerprint_scratch,
@@ -13126,6 +13276,7 @@ mod tests {
                     id: KernelStatementId(0),
                     kind: KernelStatementKind::Block,
                     value: Some(KernelExpressionId(1)),
+                    value_use: KernelStatementValueUse::RuntimeValue,
                     children: vec![KernelStatementChildReference::Local(KernelStatementId(1))]
                         .into_boxed_slice(),
                 },
@@ -13133,6 +13284,7 @@ mod tests {
                     id: KernelStatementId(1),
                     kind: KernelStatementKind::Expression,
                     value: Some(KernelExpressionId(0)),
+                    value_use: KernelStatementValueUse::RuntimeValue,
                     children: Box::new([]),
                 },
             ]
@@ -13156,6 +13308,33 @@ mod tests {
             [KernelStatementChildReference::Local(KernelStatementId(1))]
         );
         assert_eq!(artifact.definition.statements[1].id, KernelStatementId(1));
+
+        let mut render_slot = facts.clone();
+        render_slot.statements[0].value_use = KernelStatementValueUse::RenderSlot;
+        let render_slot = compile_owner_program_with_definition_facts(&input, &render_slot)
+            .unwrap()
+            .solve()
+            .unwrap();
+        assert_eq!(
+            render_slot.definition.statements[0].value_use,
+            KernelStatementValueUse::RenderSlot,
+        );
+        assert_eq!(
+            artifact.currentness.public_result_fingerprint_v1,
+            render_slot.currentness.public_result_fingerprint_v1,
+        );
+        assert_ne!(
+            artifact.currentness.basis_fingerprint_v11,
+            render_slot.currentness.basis_fingerprint_v11,
+        );
+        assert_ne!(
+            artifact.currentness.artifact_fingerprint_v13,
+            render_slot.currentness.artifact_fingerprint_v13,
+        );
+        assert_ne!(
+            artifact.currentness.fingerprint_v13,
+            render_slot.currentness.fingerprint_v13,
+        );
 
         let mut invalid = facts.clone();
         invalid.statements[1].id = KernelStatementId(4);
@@ -13210,6 +13389,7 @@ mod tests {
                 id: KernelStatementId(0),
                 kind: KernelStatementKind::Expression,
                 value: Some(KernelExpressionId(1)),
+                value_use: KernelStatementValueUse::RuntimeValue,
                 children: Box::new([]),
             }]
             .into_boxed_slice(),
@@ -13234,16 +13414,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v10,
-            moved.currentness.basis_fingerprint_v10
+            solved.currentness.basis_fingerprint_v11,
+            moved.currentness.basis_fingerprint_v11
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v12,
-            moved.currentness.artifact_fingerprint_v12
+            solved.currentness.artifact_fingerprint_v13,
+            moved.currentness.artifact_fingerprint_v13
         );
         assert_ne!(
-            solved.currentness.fingerprint_v12,
-            moved.currentness.fingerprint_v12
+            solved.currentness.fingerprint_v13,
+            moved.currentness.fingerprint_v13
         );
 
         let mut missing = facts.clone();
@@ -13327,16 +13507,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v10,
-            moved.currentness.basis_fingerprint_v10
+            solved.currentness.basis_fingerprint_v11,
+            moved.currentness.basis_fingerprint_v11
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v12,
-            moved.currentness.artifact_fingerprint_v12
+            solved.currentness.artifact_fingerprint_v13,
+            moved.currentness.artifact_fingerprint_v13
         );
         assert_ne!(
-            solved.currentness.fingerprint_v12,
-            moved.currentness.fingerprint_v12
+            solved.currentness.fingerprint_v13,
+            moved.currentness.fingerprint_v13
         );
 
         let mut missing = facts.clone();
@@ -13434,16 +13614,16 @@ mod tests {
             edited.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v10,
-            edited.currentness.basis_fingerprint_v10,
+            solved.currentness.basis_fingerprint_v11,
+            edited.currentness.basis_fingerprint_v11,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v12,
-            edited.currentness.artifact_fingerprint_v12,
+            solved.currentness.artifact_fingerprint_v13,
+            edited.currentness.artifact_fingerprint_v13,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v12,
-            edited.currentness.fingerprint_v12,
+            solved.currentness.fingerprint_v13,
+            edited.currentness.fingerprint_v13,
         );
 
         let mut missing = facts.clone();
@@ -13572,16 +13752,16 @@ mod tests {
             renamed.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v10,
-            renamed.currentness.basis_fingerprint_v10,
+            solved.currentness.basis_fingerprint_v11,
+            renamed.currentness.basis_fingerprint_v11,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v12,
-            renamed.currentness.artifact_fingerprint_v12,
+            solved.currentness.artifact_fingerprint_v13,
+            renamed.currentness.artifact_fingerprint_v13,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v12,
-            renamed.currentness.fingerprint_v12,
+            solved.currentness.fingerprint_v13,
+            renamed.currentness.fingerprint_v13,
         );
 
         let mut partial = facts.clone();
@@ -13727,6 +13907,7 @@ mod tests {
                     name: "local".into(),
                 },
                 value: Some(KernelExpressionId(1)),
+                value_use: KernelStatementValueUse::RuntimeValue,
                 children: Box::new([]),
             }]
             .into_boxed_slice(),
@@ -13780,16 +13961,16 @@ mod tests {
             different_selector.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v10,
-            different_selector.currentness.basis_fingerprint_v10,
+            solved.currentness.basis_fingerprint_v11,
+            different_selector.currentness.basis_fingerprint_v11,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v12,
-            different_selector.currentness.artifact_fingerprint_v12,
+            solved.currentness.artifact_fingerprint_v13,
+            different_selector.currentness.artifact_fingerprint_v13,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v12,
-            different_selector.currentness.fingerprint_v12,
+            solved.currentness.fingerprint_v13,
+            different_selector.currentness.fingerprint_v13,
         );
 
         let mut partial = facts.clone();
@@ -13859,6 +14040,7 @@ mod tests {
                     name: "root".into(),
                 },
                 value: Some(KernelExpressionId(1)),
+                value_use: KernelStatementValueUse::RuntimeValue,
                 children: Box::new([]),
             }]
             .into_boxed_slice(),
@@ -14021,6 +14203,7 @@ mod tests {
                     name: "root".into(),
                 },
                 value: Some(KernelExpressionId(6)),
+                value_use: KernelStatementValueUse::RuntimeValue,
                 children: vec![
                     KernelStatementChildReference::Local(KernelStatementId(1)),
                     KernelStatementChildReference::Local(KernelStatementId(2)),
@@ -14035,6 +14218,7 @@ mod tests {
                     event: None,
                 },
                 value: Some(KernelExpressionId(0)),
+                value_use: KernelStatementValueUse::RuntimeValue,
                 children: Box::new([]),
             },
             KernelStatementInput {
@@ -14044,6 +14228,7 @@ mod tests {
                     name: Some("state".into()),
                 },
                 value: Some(KernelExpressionId(3)),
+                value_use: KernelStatementValueUse::RuntimeValue,
                 children: Box::new([]),
             },
             KernelStatementInput {
@@ -14053,6 +14238,7 @@ mod tests {
                     capacity: Some(4),
                 },
                 value: Some(KernelExpressionId(5)),
+                value_use: KernelStatementValueUse::RuntimeValue,
                 children: Box::new([]),
             },
         ]
@@ -14103,6 +14289,7 @@ mod tests {
                 expression: KernelExpressionId(3),
                 initial: KernelExpressionId(1),
                 projection: Box::new([]),
+                synthetic_path: false,
                 kind: CheckedStateKind::Hold,
             }]
             .into_boxed_slice(),
@@ -14163,6 +14350,103 @@ mod tests {
             .err()
             .expect("a SOURCE artifact must name a SOURCE node");
         assert!(error.to_string().contains("is not a literal SOURCE"));
+    }
+
+    #[test]
+    fn filtered_initial_latest_candidates_do_not_leave_synthetic_path_gaps() {
+        let input = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Known(Type::Number),
+                    inputs: Box::new([]),
+                    mode: FlowMode::PresentOrAbsent,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Number,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Latest,
+                    inputs: vec![edge(KernelOwnerEdgeRole::LatestBranch, 0)].into_boxed_slice(),
+                    mode: FlowMode::PresentOrAbsent,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Latest,
+                    inputs: vec![edge(KernelOwnerEdgeRole::LatestBranch, 1)].into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(3),
+        };
+        let statements = ["event_only", "steady"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| KernelStatementInput {
+                id: KernelStatementId(u32::try_from(index).unwrap()),
+                kind: KernelStatementKind::Field { name: name.into() },
+                value: Some(KernelExpressionId(u32::try_from(index + 2).unwrap())),
+                value_use: KernelStatementValueUse::RuntimeValue,
+                children: Box::new([]),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let declarations = ["event_only", "steady"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| KernelDeclarationInput {
+                id: KernelDeclarationId(u32::try_from(index).unwrap()),
+                origin: KernelDeclarationOrigin::Statement {
+                    statement: KernelStatementId(u32::try_from(index).unwrap()),
+                },
+                name: name.into(),
+                kind: KernelDeclarationKind::Field,
+                value: Some(KernelExpressionId(u32::try_from(index + 2).unwrap())),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let states = (0..2)
+            .map(|index| KernelStateInput {
+                id: KernelStateId(index),
+                binding_declaration: KernelDeclarationReference::Local(KernelDeclarationId(index)),
+                declaration: KernelDeclarationReference::Local(KernelDeclarationId(index)),
+                statement: KernelStatementReference::Local(KernelStatementId(index)),
+                expression: KernelExpressionId(index + 2),
+                initial: KernelExpressionId(index),
+                projection: Box::new([]),
+                synthetic_path: true,
+                kind: CheckedStateKind::InitialLatest,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let facts = KernelDefinitionFactsInput {
+            statements,
+            declarations,
+            states,
+            ..KernelDefinitionFactsInput::default()
+        };
+
+        let solved = compile_owner_program_with_definition_facts(&input, &facts)
+            .unwrap()
+            .solve()
+            .unwrap();
+        let [state] = solved.definition.states.as_ref() else {
+            panic!("only the continuous initializer may allocate state")
+        };
+        assert_eq!(state.id, KernelStateId(0));
+        assert_eq!(state.expression, KernelExpressionId(3));
+        assert_eq!(state.path.projection.len(), 1);
+        assert_eq!(state.path.projection[0].as_ref(), "state_0");
+
+        let mut invalid = facts;
+        invalid.states[1].projection = vec!["nested".into()].into_boxed_slice();
+        let error = compile_owner_program_with_definition_facts(&input, &invalid)
+            .err()
+            .expect("synthetic state paths are allocated only after solving");
+        assert!(error.to_string().contains("structural projection"));
     }
 
     #[test]

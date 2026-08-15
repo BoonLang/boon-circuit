@@ -3750,10 +3750,53 @@ appended after definition rows while their recursive type contracts move out of
 numeric interleaving would preserve a construction accident rather than a
 language contract.
 
-The next dependency-bottom cut is direct `CheckedStatement` authority, followed
-by expression rows. That requires compact effect summaries and exact statement
-resource/value-use facts; those will be added once as definition artifacts
-rather than recovered from source or copied from owner shards.
+### Direct checked statement rows
+
+The third checked-row family now materializes directly. The prefix linker emits
+all 5,541 NovyWave `CheckedStatement` rows from compact statement artifacts,
+presentation spans, declaration relocations, and a dense reverse resource
+table. It attaches 117 SOURCE, 103 state, and 133 persistent-LIST authorities
+without walking expression trees or invoking the owner-shard assembler. Child
+statements, including child-owner public statements, relocate through the same
+global layout as scopes and declarations.
+
+`KernelStatementValueUse` retains the renderer/library ABI's opaque runtime
+consumption class. The orchestration boundary derives render slots from
+authored render containment and registered constructors; the dependency-bottom
+kernel neither recognizes UI tags nor treats `NoElement` or any other library
+value specially. A parser-backed regression proves that a nested `document`
+`root` is a render slot while the enclosing document remains an ordinary
+runtime value.
+
+The resource cut exposed one useful ownership fact previously hidden inside
+checked-image assembly. `LATEST` syntax is only a candidate state cell. A
+candidate becomes `InitialLatest` when its first branch is startup-safe and its
+solved mode is continuous; event-only candidates and `LATEST` nodes that merely
+merge HOLD updates are not cells. Candidate classification uses compact syntax
+and mode equations, while final synthetic `state_N` paths are allocated only
+after solved-mode filtering. Thus rejected candidates cannot leave state-ID or
+path gaps, including in sparse demanded-definition products. Focused tests lock
+the positive/event-only boundary and the synthetic-path gap case.
+
+Statement value use and the expanded state facts advance definition basis to
+V11 and artifact/currentness to V13. The complete debug NovyWave differential
+is exact for all 1,389 definitions with zero unsupported owners. Its current
+candidate sample is 3,486.896 ms, including 70.114 ms of direct checked linking
+and 449.820 ms of legacy compatibility checked-image publication. The fresh
+optimized boundary sample is 869.407 ms, with 780.080 ms in the kernel path,
+24.472 ms in direct linking, and 192.096 ms in compatibility publication. That
+is effectively flat against the preceding 865.855 ms declaration checkpoint,
+so this is an ownership milestone rather than a speed claim. The optimized
+Rust rebuild took 3 minutes 28 seconds and is excluded. The production
+diagnostics-only route materializes zero definitions and records 605.811 ms
+total (581.305 ms wall) in the adjacent optimized run, already below the
+flag-day 2-second gate but still above the final 250 ms objective.
+
+The next dependency-bottom cut is direct checked expression authority, followed
+by calls and the remaining global checked tables. That cut must consume the
+same relocated alpha ranges, semantic payloads, execution shapes, effect facts,
+and resource rows, then delete the roughly 192 ms compatibility checked-image
+publisher rather than retaining two assemblers.
 
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not

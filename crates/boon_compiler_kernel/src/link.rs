@@ -5,9 +5,10 @@ use crate::{
 };
 use boon_checked::{
     CheckedCallId, CheckedDeclaration, CheckedDeclarationKind, CheckedExprId, CheckedListId,
-    CheckedScope, CheckedScopeKind, CheckedSourceId, CheckedSpan, CheckedStateId,
-    CheckedStatementId, ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId, ObjectShape,
-    Type, TypeVar, Variant,
+    CheckedResourceBinding, CheckedScope, CheckedScopeKind, CheckedSourceId, CheckedSpan,
+    CheckedStateId, CheckedStatement, CheckedStatementId, CheckedStatementKind, CheckedValueUse,
+    ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId, ObjectShape, Type, TypeVar,
+    Variant,
 };
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -480,6 +481,162 @@ impl KernelCheckedLinkLayout {
         Ok(declarations.into_boxed_slice())
     }
 
+    /// Emit definition statements directly into the final checked namespace.
+    ///
+    /// Resource ownership is already explicit in the solved SOURCE, HOLD, and
+    /// LIST artifacts. Build one dense reverse table from those authorities
+    /// instead of rediscovering resources by walking expression trees or
+    /// replaying the legacy owner assembler.
+    pub fn materialize_statements(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<Box<[CheckedStatement]>, KernelCheckedLinkError> {
+        if snapshot.definitions.len() != self.definitions.len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked statement materializer has {} definitions for a {}-definition layout",
+                snapshot.definitions.len(),
+                self.definitions.len(),
+            )));
+        }
+
+        let mut resources =
+            vec![Vec::<CheckedResourceBinding>::new(); self.totals.statements as usize];
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+                KernelCheckedLinkError::new(
+                    "kernel checked statement materializer definition count exceeds u32",
+                )
+            })?);
+            for source in &definition.sources {
+                push_statement_resource(
+                    &mut resources,
+                    self.statement(owner, source.statement)?,
+                    CheckedResourceBinding::Source {
+                        source: self.source(owner, source.id.0)?,
+                    },
+                )?;
+            }
+        }
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+                KernelCheckedLinkError::new(
+                    "kernel checked statement materializer definition count exceeds u32",
+                )
+            })?);
+            for state in &definition.states {
+                push_statement_resource(
+                    &mut resources,
+                    self.statement(owner, state.statement)?,
+                    CheckedResourceBinding::State {
+                        state: self.state(owner, state.id.0)?,
+                    },
+                )?;
+            }
+        }
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+                KernelCheckedLinkError::new(
+                    "kernel checked statement materializer definition count exceeds u32",
+                )
+            })?);
+            for list in &definition.lists {
+                push_statement_resource(
+                    &mut resources,
+                    self.statement(owner, list.statement)?,
+                    CheckedResourceBinding::ListAuthority {
+                        list: self.list(owner, list.id.0)?,
+                    },
+                )?;
+            }
+        }
+
+        let mut statements = Vec::with_capacity(self.totals.statements as usize);
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+                KernelCheckedLinkError::new(
+                    "kernel checked statement materializer definition count exceeds u32",
+                )
+            })?);
+            if definition.statements.len() != definition.presentation.statements.len() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} has {} statement artifacts but {} statement presentations",
+                    owner.0,
+                    definition.statements.len(),
+                    definition.presentation.statements.len(),
+                )));
+            }
+            for (statement, presentation) in definition
+                .statements
+                .iter()
+                .zip(definition.presentation.statements.iter())
+            {
+                if statement.id != presentation.statement {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {} statement artifact {} has presentation {}",
+                        owner.0, statement.id.0, presentation.statement.0,
+                    )));
+                }
+                let id = self.statement(owner, KernelStatementReference::Local(statement.id))?;
+                if id.0 as usize != statements.len() {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel checked statement materializer expected row {} but linked {}",
+                        statements.len(),
+                        id.0,
+                    )));
+                }
+                let declaration = statement_declaration_authority(definition, statement)?
+                    .map(|declaration| self.declaration(owner, declaration))
+                    .transpose()?;
+                statements.push(CheckedStatement {
+                    id,
+                    scope_id: self.scope(owner, presentation.scope)?,
+                    kind: checked_statement_kind(&statement.kind, declaration)?,
+                    resources: std::mem::take(&mut resources[id.0 as usize]),
+                    value: statement
+                        .value
+                        .map(|value| self.expression(owner, value))
+                        .transpose()?,
+                    value_use: match statement.value_use {
+                        crate::KernelStatementValueUse::RuntimeValue => {
+                            CheckedValueUse::RuntimeValue
+                        }
+                        crate::KernelStatementValueUse::RenderSlot => CheckedValueUse::RenderSlot,
+                    },
+                    children: statement
+                        .children
+                        .iter()
+                        .map(|child| match child {
+                            KernelStatementChildReference::Local(child) => {
+                                self.statement(owner, KernelStatementReference::Local(*child))
+                            }
+                            KernelStatementChildReference::Owner(child) => {
+                                self.statement(owner, KernelStatementReference::OwnerPublic(*child))
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    span: CheckedSpan {
+                        line: presentation.span.line,
+                        start: presentation.span.start,
+                        end: presentation.span.end,
+                    },
+                });
+            }
+        }
+        if statements.len() != self.totals.statements as usize {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked statement materializer produced {} rows for a {}-row layout",
+                statements.len(),
+                self.totals.statements,
+            )));
+        }
+        if resources.iter().any(|resources| !resources.is_empty()) {
+            return Err(KernelCheckedLinkError::new(
+                "kernel checked statement materializer left resource bindings unattached",
+            ));
+        }
+        Ok(statements.into_boxed_slice())
+    }
+
     pub fn declaration(
         &self,
         owner: KernelOwnerId,
@@ -818,6 +975,94 @@ fn checked_declaration_kind(kind: crate::KernelDeclarationKind) -> CheckedDeclar
         crate::KernelDeclarationKind::PatternBinding => CheckedDeclarationKind::PatternBinding,
         crate::KernelDeclarationKind::FreshOut => CheckedDeclarationKind::FreshOut,
     }
+}
+
+fn statement_declaration_authority(
+    definition: &crate::DefinitionArtifact,
+    statement: &crate::KernelStatementArtifact,
+) -> Result<Option<KernelDeclarationReference>, KernelCheckedLinkError> {
+    let mut declarations = definition.declarations.iter().filter_map(|declaration| {
+        matches!(
+            declaration.origin,
+            crate::KernelDeclarationOrigin::Statement { statement: candidate }
+                if candidate == statement.id
+        )
+        .then_some(KernelDeclarationReference::Local(declaration.id))
+    });
+    let declaration = declarations.next();
+    if declarations.next().is_some() {
+        return Err(KernelCheckedLinkError::new(format!(
+            "kernel statement {} has more than one declaration authority",
+            statement.id.0,
+        )));
+    }
+    let owns_authored_declaration = matches!(
+        &statement.kind,
+        crate::KernelStatementKind::Function { .. }
+            | crate::KernelStatementKind::Field { .. }
+            | crate::KernelStatementKind::Source { field: Some(_), .. }
+            | crate::KernelStatementKind::Hold { field: Some(_), .. }
+            | crate::KernelStatementKind::List { field: Some(_), .. }
+    );
+    Ok(declaration.or_else(|| {
+        (owns_authored_declaration && definition.linkage.root_statement == Some(statement.id))
+            .then_some(definition.linkage.public_declaration)
+            .flatten()
+    }))
+}
+
+fn checked_statement_kind(
+    kind: &crate::KernelStatementKind,
+    declaration: Option<DeclId>,
+) -> Result<CheckedStatementKind, KernelCheckedLinkError> {
+    Ok(match kind {
+        crate::KernelStatementKind::Function { .. } => CheckedStatementKind::Function {
+            declaration: declaration.ok_or_else(|| {
+                KernelCheckedLinkError::new("kernel function statement has no declaration")
+            })?,
+        },
+        crate::KernelStatementKind::Field { .. } => CheckedStatementKind::Field {
+            declaration: declaration.ok_or_else(|| {
+                KernelCheckedLinkError::new("kernel field statement has no declaration")
+            })?,
+        },
+        crate::KernelStatementKind::Source { event, .. } => CheckedStatementKind::Source {
+            declaration,
+            event: event.as_deref().map(str::to_owned),
+        },
+        crate::KernelStatementKind::Hold { name, .. } => CheckedStatementKind::Hold {
+            declaration,
+            name: name.as_deref().map(str::to_owned),
+        },
+        crate::KernelStatementKind::List { capacity, .. } => CheckedStatementKind::List {
+            declaration,
+            capacity: *capacity,
+        },
+        crate::KernelStatementKind::Block => CheckedStatementKind::Block,
+        crate::KernelStatementKind::Spread => CheckedStatementKind::Spread,
+        crate::KernelStatementKind::Expression => CheckedStatementKind::Expression,
+    })
+}
+
+fn push_statement_resource(
+    resources: &mut [Vec<CheckedResourceBinding>],
+    statement: CheckedStatementId,
+    resource: CheckedResourceBinding,
+) -> Result<(), KernelCheckedLinkError> {
+    let bindings = resources.get_mut(statement.0 as usize).ok_or_else(|| {
+        KernelCheckedLinkError::new(format!(
+            "kernel resource references missing checked statement {}",
+            statement.0,
+        ))
+    })?;
+    if bindings.contains(&resource) {
+        return Err(KernelCheckedLinkError::new(format!(
+            "kernel checked statement {} repeats resource binding {resource:?}",
+            statement.0,
+        )));
+    }
+    bindings.push(resource);
+    Ok(())
 }
 
 fn declaration_flow_type(
@@ -1394,7 +1639,7 @@ mod tests {
         KernelLexicalAccess, KernelLexicalBindingInput, KernelLexicalBindingTargetInput,
         KernelOwnerEdgeRole, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
         KernelOwnerProgramInput, KernelProjectProgramInput, KernelSession, KernelStatementId,
-        KernelStatementInput, KernelStatementKind,
+        KernelStatementInput, KernelStatementKind, KernelStatementValueUse,
     };
     use boon_checked::FlowMode;
     use boon_syntax::{
@@ -1489,6 +1734,7 @@ mod tests {
                 id: KernelStatementId(0),
                 kind: KernelStatementKind::Field { name: name.into() },
                 value: Some(KernelExpressionId(0)),
+                value_use: KernelStatementValueUse::RuntimeValue,
                 children: Box::new([]),
             }]
             .into_boxed_slice(),
@@ -1673,6 +1919,39 @@ mod tests {
         assert_eq!(materialized_declarations[1].id, DeclId(2));
         assert_eq!(materialized_declarations[1].name, "consumer");
         assert_eq!(materialized_declarations[1].flow_type.ty, Type::Number);
+        scoped.definitions[1].statements[0].value_use = KernelStatementValueUse::RenderSlot;
+        let materialized_statements = scoped_layout
+            .materialize_statements(&scoped)
+            .expect("definition statements materialize without an owner-shard assembler");
+        assert_eq!(materialized_statements.len(), 2);
+        assert_eq!(materialized_statements[0].id, CheckedStatementId(0));
+        assert_eq!(materialized_statements[0].scope_id, LexicalScopeId(0));
+        assert_eq!(
+            materialized_statements[0].kind,
+            CheckedStatementKind::Field {
+                declaration: DeclId(1)
+            }
+        );
+        assert_eq!(materialized_statements[0].value, Some(CheckedExprId(0)));
+        assert_eq!(
+            materialized_statements[0].value_use,
+            CheckedValueUse::RuntimeValue
+        );
+        assert!(materialized_statements[0].resources.is_empty());
+        assert!(materialized_statements[0].children.is_empty());
+        assert_eq!(materialized_statements[1].id, CheckedStatementId(1));
+        assert_eq!(
+            materialized_statements[1].kind,
+            CheckedStatementKind::Field {
+                declaration: DeclId(2)
+            }
+        );
+        assert_eq!(materialized_statements[1].value, Some(CheckedExprId(1)));
+        assert_eq!(
+            materialized_statements[1].value_use,
+            CheckedValueUse::RenderSlot
+        );
+        assert_eq!(materialized_statements[1].children, [CheckedStatementId(0)]);
 
         let mut generic = (*snapshot).clone();
         for definition in &mut generic.definitions {

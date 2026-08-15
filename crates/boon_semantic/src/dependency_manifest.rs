@@ -2374,6 +2374,10 @@ struct DenseManifestProjectionIndexV7 {
     checked_dependency_row_count: usize,
     execution_row_count: usize,
     execution_dependency_row_count: usize,
+    /// Projection import hashes thousands of small canonical records. Reuse
+    /// one encoding arena for the complete seal instead of allocating once
+    /// per stable key and graph identity.
+    hash_scratch: Vec<u8>,
 }
 
 impl DenseManifestProjectionIndexV7 {
@@ -2388,6 +2392,7 @@ impl DenseManifestProjectionIndexV7 {
             checked_dependency_row_count: 0,
             execution_row_count: 0,
             execution_dependency_row_count: 0,
+            hash_scratch: Vec::new(),
         }
     }
 
@@ -2402,11 +2407,15 @@ impl DenseManifestProjectionIndexV7 {
                 "V7 projection {key:?} is registered more than once"
             )));
         }
-        let stable_key_digest =
-            canonical_dependency_hash(DEPENDENCY_PROJECTION_KEY_DOMAIN_V7, &key)?;
-        let graph_identity_digest = canonical_dependency_hash(
+        let stable_key_digest = canonical_dependency_hash_with_buffer(
+            DEPENDENCY_PROJECTION_KEY_DOMAIN_V7,
+            &key,
+            &mut self.hash_scratch,
+        )?;
+        let graph_identity_digest = canonical_dependency_hash_with_buffer(
             DEPENDENCY_PROJECTION_NODE_DOMAIN_V7,
             &DependencyProjectionNodeV7::Projection(key.clone()),
+            &mut self.hash_scratch,
         )?;
         let id = self
             .graph
@@ -2524,6 +2533,7 @@ impl DenseManifestProjectionIndexV7 {
     }
 
     fn receipt_members(&self) -> Result<Vec<[u8; 32]>, CallableDependencyManifestError> {
+        let mut hash_scratch = Vec::new();
         self.ids
             .iter()
             .map(|(key, id)| {
@@ -2532,9 +2542,10 @@ impl DenseManifestProjectionIndexV7 {
                         "V7 projection {key:?} has no local receipt"
                     ))
                 })?;
-                canonical_dependency_hash(
+                canonical_dependency_hash_with_buffer(
                     DEPENDENCY_PROJECTION_RECEIPT_MEMBER_DOMAIN_V7,
                     &(key, receipt),
+                    &mut hash_scratch,
                 )
             })
             .collect()
@@ -2545,13 +2556,22 @@ impl DenseManifestProjectionIndexV7 {
         owners: &BTreeSet<SemanticDependencyStableOwnerV4>,
     ) -> Result<SealedManifestRequestGraphV7, CallableDependencyManifestError> {
         let mut owner_ids = BTreeMap::new();
+        let mut hash_scratch = std::mem::take(&mut self.hash_scratch);
         for owner in owners.iter().copied() {
             let node = DependencyProjectionNodeV7::Owner(owner);
             let id = self
                 .graph
                 .register(
-                    canonical_dependency_hash(DEPENDENCY_PROJECTION_NODE_DOMAIN_V7, &node)?,
-                    canonical_dependency_hash(DEPENDENCY_PROJECTION_NODE_DOMAIN_V7, &owner)?,
+                    canonical_dependency_hash_with_buffer(
+                        DEPENDENCY_PROJECTION_NODE_DOMAIN_V7,
+                        &node,
+                        &mut hash_scratch,
+                    )?,
+                    canonical_dependency_hash_with_buffer(
+                        DEPENDENCY_PROJECTION_NODE_DOMAIN_V7,
+                        &owner,
+                        &mut hash_scratch,
+                    )?,
                 )
                 .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
             owner_ids.insert(owner, id);
@@ -4159,13 +4179,19 @@ impl DependencyCollector {
         payload: &impl Serialize,
     ) -> Result<[u8; 32], CallableDependencyManifestError> {
         self.claim_subject(&subject)?;
+        // OUT and reactive components are each committed under both the row
+        // and component domains. They used to be serialized twice by the
+        // streaming helper. The collector already owns a reusable arena, so
+        // encode once and feed both hashes without introducing per-component
+        // storage or a cache with cross-revision lifetime.
         let [payload_digest, component_digest] =
-            boon_contract::canonical_serde_hashes_v1_streaming(
+            boon_contract::canonical_serde_hashes_v1_with_buffer(
                 [
                     DEPENDENCY_RECORD_PAYLOAD_DOMAIN,
                     DEPENDENCY_COMPONENT_DIGEST_DOMAIN,
                 ],
                 payload,
+                &mut self.hash_scratch,
             )
             .map_err(|error| {
                 CallableDependencyManifestError::new(format!(
@@ -6132,7 +6158,6 @@ fn canonical_dependency_hash_streaming(
     })
 }
 
-#[cfg(test)]
 fn canonical_dependency_hash_with_buffer(
     domain: &[u8],
     payload: &impl Serialize,

@@ -722,6 +722,14 @@ struct ExecutionImageHandoffBuilderV3<'a> {
         u32,
         PendingExecutionProjectionIdV3,
     )>,
+    /// Canonical encoding is the hot part of executable receipt sealing. Keep
+    /// one pass-owned byte arena instead of allocating a fresh `Vec` for every
+    /// projection key, row payload, row fingerprint, and shard.
+    hash_scratch: Vec<u8>,
+    /// Row fingerprints commit relocation stable keys rather than dense IDs.
+    /// Most rows have only a few relocations, so retaining one arena removes a
+    /// second allocation from every dependency-bearing row.
+    relocation_digest_scratch: Vec<[u8; 32]>,
 }
 
 impl<'a> ExecutionImageHandoffBuilderV3<'a> {
@@ -746,6 +754,8 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
             stable_digest_ids: BTreeMap::new(),
             projections: Vec::new(),
             entity_routes: Vec::new(),
+            hash_scratch: Vec::new(),
+            relocation_digest_scratch: Vec::new(),
         })
     }
 
@@ -811,9 +821,11 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
         if let Some(id) = self.ids.get(&identity) {
             return Ok(*id);
         }
-        let stable_key_digest = boon_contract::canonical_serde_hash_v1(
+        let fingerprint = self.stable_fingerprint(identity)?;
+        let stable_key_digest = boon_contract::canonical_serde_hash_v1_with_buffer(
             EXECUTION_IMAGE_PROJECTION_KEY_DOMAIN_V3,
-            &self.stable_fingerprint(identity)?,
+            &fingerprint,
+            &mut self.hash_scratch,
         )
         .map_err(|error| format!("failed to hash execution V3 projection key: {error}"))?;
         if let Some(previous) = self.stable_digest_ids.get(&stable_key_digest).copied() {
@@ -857,23 +869,29 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
             .sort_unstable_by_key(|target| stable_key_digests[target.as_usize()].stable_key_digest);
         relocations.dedup_by_key(|target| stable_key_digests[target.as_usize()].stable_key_digest);
         relocations.retain(|target| *target != projection);
-        let payload_digest =
-            boon_contract::canonical_serde_hash_v1(EXECUTION_IMAGE_ROW_PAYLOAD_DOMAIN_V3, payload)
-                .map_err(|error| format!("failed to hash execution V3 row payload: {error}"))?;
-        let relocation_stable_key_digests = relocations
-            .iter()
-            .map(|target| self.projections[target.as_usize()].stable_key_digest)
-            .collect::<Vec<_>>();
+        let payload_digest = boon_contract::canonical_serde_hash_v1_with_buffer(
+            EXECUTION_IMAGE_ROW_PAYLOAD_DOMAIN_V3,
+            payload,
+            &mut self.hash_scratch,
+        )
+        .map_err(|error| format!("failed to hash execution V3 row payload: {error}"))?;
+        self.relocation_digest_scratch.clear();
+        self.relocation_digest_scratch.extend(
+            relocations
+                .iter()
+                .map(|target| self.projections[target.as_usize()].stable_key_digest),
+        );
         let projection_stable_key_digest =
             self.projections[projection.as_usize()].stable_key_digest;
-        let digest = boon_contract::canonical_serde_hash_v1(
+        let digest = boon_contract::canonical_serde_hash_v1_with_buffer(
             EXECUTION_IMAGE_ROW_DOMAIN_V3,
             &ExecutionImageRowFingerprintV3 {
                 projection_stable_key_digest,
                 domain,
                 payload_digest,
-                relocation_stable_key_digests: &relocation_stable_key_digests,
+                relocation_stable_key_digests: &self.relocation_digest_scratch,
             },
+            &mut self.hash_scratch,
         )
         .map_err(|error| format!("failed to hash execution V3 row: {error}"))?;
         let has_relocations = !relocations.is_empty();
@@ -916,6 +934,8 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
             stable_digest_ids,
             mut projections,
             mut entity_routes,
+            mut hash_scratch,
+            relocation_digest_scratch: _,
         } = self;
         let mut canonical_projection_by_pending =
             vec![ExecutionImageProjectionIdV3(u32::MAX); projections.len()];
@@ -956,9 +976,10 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
                     .iter()
                     .map(|target| canonical_projection_by_pending[target.as_usize()]),
             );
-            let local_content_digest = boon_contract::canonical_serde_hash_v1(
+            let local_content_digest = boon_contract::canonical_serde_hash_v1_with_buffer(
                 EXECUTION_IMAGE_SHARD_DOMAIN_V3,
                 &(pending.stable_key_digest, &pending.row_digests),
+                &mut hash_scratch,
             )
             .map_err(|error| format!("failed to hash execution V3 shard: {error}"))?;
             sealed_projections.push(ExecutionImageProjectionV3 {
@@ -998,7 +1019,7 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
             )
             .collect::<Vec<_>>();
         let invocation_overlays = construction_image.routes.invocations.clone();
-        let local_image_digest = boon_contract::canonical_serde_hash_v1(
+        let local_image_digest = boon_contract::canonical_serde_hash_v1_with_buffer(
             EXECUTION_IMAGE_HANDOFF_DOMAIN_V3,
             &(
                 EXECUTION_IMAGE_HANDOFF_SCHEMA_V3,
@@ -1009,6 +1030,7 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
                 &relocation_arena,
                 &entity_routes,
             ),
+            &mut hash_scratch,
         )
         .map_err(|error| format!("failed to hash execution V3 handoff: {error}"))?;
         if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
@@ -1650,6 +1672,7 @@ pub(crate) fn execution_construction_routes_v3(
     let mut invocations =
         Vec::<ExecutionInvocationOverlayV3>::with_capacity(out.call_instances.len());
     let mut stable_digest_owner = BTreeMap::<[u8; 32], OutCallInstanceId>::new();
+    let mut hash_scratch = Vec::new();
     for instance in &out.call_instances {
         if instance.id.as_usize() != invocations.len() {
             return Err(format!(
@@ -1709,9 +1732,10 @@ pub(crate) fn execution_construction_routes_v3(
                     checked_call.0
                 ));
             }
-            let digest = boon_contract::canonical_serde_hash_v1(
+            let digest = boon_contract::canonical_serde_hash_v1_with_buffer(
                 EXECUTION_INVOCATION_PATH_DOMAIN_V2,
                 &(parent_path_digest, projection_record.stable_key_digest),
+                &mut hash_scratch,
             )
             .map_err(|error| format!("failed to hash execution V3 invocation path: {error}"))?;
             (Some(projection), Some(digest))
@@ -1739,13 +1763,14 @@ pub(crate) fn execution_construction_routes_v3(
                 )
             })?
             .stable_key_digest;
-        let stable_key_digest = boon_contract::canonical_serde_hash_v1(
+        let stable_key_digest = boon_contract::canonical_serde_hash_v1_with_buffer(
             EXECUTION_INVOCATION_OVERLAY_DOMAIN_V3,
             &ExecutionInvocationOverlayFingerprintV3 {
                 root,
                 definition_digest,
                 path_digest: stable_path_digest,
             },
+            &mut hash_scratch,
         )
         .map_err(|error| format!("failed to hash execution V3 invocation overlay: {error}"))?;
         if let Some(previous) = stable_digest_owner.insert(stable_key_digest, instance.id) {
@@ -1765,7 +1790,7 @@ pub(crate) fn execution_construction_routes_v3(
         });
     }
     #[cfg(test)]
-    let local_digest = boon_contract::canonical_serde_hash_v1(
+    let local_digest = boon_contract::canonical_serde_hash_v1_with_buffer(
         EXECUTION_CONSTRUCTION_ROUTES_DOMAIN_V3,
         &(
             EXECUTION_CONSTRUCTION_ROUTES_SCHEMA_V3,
@@ -1776,6 +1801,7 @@ pub(crate) fn execution_construction_routes_v3(
             &invocations,
             &owner_occurrences,
         ),
+        &mut hash_scratch,
     )
     .map_err(|error| format!("failed to hash execution V3 construction routes: {error}"))?;
     let routes = ExecutionConstructionRoutesV3 {

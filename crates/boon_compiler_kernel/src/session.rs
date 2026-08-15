@@ -1,5 +1,5 @@
 use crate::{
-    KernelCheckedSnapshot, KernelCompileWork, KernelDefinitionFactsInput,
+    KernelAbiInput, KernelCheckedSnapshot, KernelCompileWork, KernelDefinitionFactsInput,
     KernelDemandedDefinitionSnapshot, KernelInterfaceSnapshot, KernelOwnerBuildError,
     KernelOwnerId, KernelProjectProgramInput, KernelSolveError, KernelSolvedProject,
     compile_project_program_with_definition_facts,
@@ -21,6 +21,7 @@ pub struct KernelProjectInput {
     links: KernelResolvedProjectLinkOverlay,
     program: KernelProjectProgramInput,
     definition_facts: Box<[KernelDefinitionFactsInput]>,
+    abi: KernelAbiInput,
 }
 
 /// One immutable normalized syntax unit. Definitions retain their stable
@@ -57,6 +58,20 @@ impl KernelProjectInput {
         program: KernelProjectProgramInput,
         definition_facts: Box<[KernelDefinitionFactsInput]>,
         definition_keys: Box<[StableCheckOwnerKey]>,
+    ) -> Result<Self, KernelOwnerBuildError> {
+        Self::new_with_abi(
+            program,
+            definition_facts,
+            definition_keys,
+            KernelAbiInput::default(),
+        )
+    }
+
+    pub fn new_with_abi(
+        program: KernelProjectProgramInput,
+        definition_facts: Box<[KernelDefinitionFactsInput]>,
+        definition_keys: Box<[StableCheckOwnerKey]>,
+        abi: KernelAbiInput,
     ) -> Result<Self, KernelOwnerBuildError> {
         if program.owners.len() != definition_facts.len() {
             return Err(KernelOwnerBuildError::new(format!(
@@ -130,6 +145,7 @@ impl KernelProjectInput {
             },
             program,
             definition_facts,
+            abi,
         })
     }
 
@@ -151,6 +167,10 @@ impl KernelProjectInput {
 
     pub fn definition_facts(&self) -> &[KernelDefinitionFactsInput] {
         &self.definition_facts
+    }
+
+    pub const fn abi(&self) -> &KernelAbiInput {
+        &self.abi
     }
 
     pub fn compile(&self) -> Result<crate::KernelProjectProgram, KernelOwnerBuildError> {

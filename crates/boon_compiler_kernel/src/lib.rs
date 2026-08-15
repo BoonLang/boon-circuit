@@ -5,6 +5,7 @@
 //! terms, dense variables, and deterministic mutation-driven work queues.
 //! `boon_checked` is only the public projection boundary.
 
+mod abi;
 mod artifact;
 mod link;
 mod owner;
@@ -14,6 +15,7 @@ mod session;
 mod solver;
 mod term;
 
+pub use abi::*;
 pub use artifact::*;
 pub use link::*;
 pub use owner::*;

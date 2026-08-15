@@ -740,6 +740,7 @@ pub struct KernelCallSyntaxArgument {
 pub struct KernelCallPassInput {
     pub value: KernelExpressionId,
     pub final_clause: bool,
+    pub span: KernelSourceSpan,
 }
 
 /// Source-level execution distinction retained only where the canonical type
@@ -1026,11 +1027,16 @@ struct PendingKernelCallArtifact {
     expression: KernelExpressionId,
     target: KernelCallTarget,
     inputs: Box<[KernelCallInputArtifact]>,
+    /// The target result graph selected one singleton, formal-derived syntax
+    /// arm for this authored occurrence. The final solved result still has to
+    /// expose a concrete outer shape before this becomes public authority.
+    syntax_discriminated_candidate: bool,
 }
 
 #[derive(Clone, Debug)]
 struct SolvedKernelCallFacts {
     type_substitutions: Box<[KernelCallTypeSubstitution]>,
+    syntax_discriminated_result: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1133,6 +1139,7 @@ pub struct KernelCallSyntaxArgumentArtifact {
 pub struct KernelCallPassArtifact {
     pub value: KernelValueReference,
     pub final_clause: bool,
+    pub span: KernelSourceSpan,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -1261,6 +1268,9 @@ pub struct KernelCallArtifact {
     /// Target-definition-local substitutions, independent of the solver's
     /// revision-local variable namespace.
     pub type_substitutions: Box<[KernelCallTypeSubstitution]>,
+    /// True when this exact occurrence selected a singleton syntax branch and
+    /// therefore owns its result independently of the callable principal.
+    pub syntax_discriminated_result: bool,
     pub result: FlowType,
 }
 
@@ -2864,8 +2874,15 @@ fn project_call_facts_and_diagnostics(
             } else {
                 Box::new([])
             };
+            let result_is_concrete = owner
+                .expressions
+                .get(call.expression.0 as usize)
+                .and_then(|output| artifact.output(*output))
+                .is_some_and(|output| type_has_concrete_outer_shape(&output.flow_type.ty));
             owner_call_facts.push(SolvedKernelCallFacts {
                 type_substitutions: substitutions,
+                syntax_discriminated_result: call.syntax_discriminated_candidate
+                    && result_is_concrete,
             });
         }
         diagnostics.sort_unstable_by(|left, right| left.site.cmp(&right.site));
@@ -4200,6 +4217,7 @@ pub fn compile_owner_program_with_definition_facts(
         reachable: (0..input.nodes.len())
             .collect::<Vec<_>>()
             .into_boxed_slice(),
+        result_syntax_selected: false,
         syntax_selected_calls: vec![false; input.nodes.len()].into_boxed_slice(),
         invocation_dependencies: formal_dependent_expressions[0].clone(),
         transparent_type_providers: vec![None; input.nodes.len()].into_boxed_slice(),
@@ -4275,7 +4293,7 @@ pub fn compile_owner_program_with_definition_facts(
         declarations,
         lexical_bindings,
         resources,
-        calls: collect_call_artifacts(input)?,
+        calls: collect_call_artifacts(input, &vec![false; input.nodes.len()])?,
         effects: collect_host_effect_artifacts(input)?,
         diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
         basis_fingerprint_v12,
@@ -5103,6 +5121,8 @@ fn materialize_call_artifacts(
                 target: call.target,
                 inputs: call.inputs,
                 type_substitutions,
+                syntax_discriminated_result: call.syntax_discriminated_candidate
+                    && type_has_concrete_outer_shape(&expressions[call.expression.0 as usize].ty),
                 result: expressions[call.expression.0 as usize].clone(),
             }
         })
@@ -5129,6 +5149,7 @@ fn materialize_project_call_artifacts(
             target: call.target,
             inputs: call.inputs,
             type_substitutions: facts.type_substitutions,
+            syntax_discriminated_result: facts.syntax_discriminated_result,
             result: expressions[call.expression.0 as usize].clone(),
         })
         .collect::<Vec<_>>()
@@ -5460,6 +5481,7 @@ fn collect_call_syntax_artifacts(
                         Ok(KernelCallPassArtifact {
                             value: kernel_value_reference(input, pass.value, call_index)?,
                             final_clause: pass.final_clause,
+                            span: pass.span,
                         })
                     })
                     .transpose()?,
@@ -5578,6 +5600,7 @@ fn link_structural_declaration(
 
 fn collect_call_artifacts(
     input: &KernelOwnerProgramInput,
+    syntax_discriminated_candidates: &[bool],
 ) -> Result<Box<[PendingKernelCallArtifact]>, KernelOwnerBuildError> {
     input
         .nodes
@@ -5639,6 +5662,10 @@ fn collect_call_artifacts(
                     ),
                     target,
                     inputs: inputs.into_boxed_slice(),
+                    syntax_discriminated_candidate: syntax_discriminated_candidates
+                        .get(expression)
+                        .copied()
+                        .unwrap_or(false),
                 })
             })())
         })
@@ -6020,6 +6047,11 @@ pub fn compile_project_program_with_definition_facts(
         );
         validate_owner_input(owner_id, owner, &principals)?;
     }
+    let mut syntax_discriminated_call_candidates = input
+        .owners
+        .iter()
+        .map(|owner| vec![false; owner.nodes.len()])
+        .collect::<Vec<_>>();
     let syntax_discriminated_formals = project_syntax_discriminated_formals(input);
     let direct_summaries = compile_direct_result_summaries(&mut builder, input);
     for summary in direct_summaries.iter().flatten() {
@@ -6081,6 +6113,7 @@ pub fn compile_project_program_with_definition_facts(
             reachable: (0..owner.nodes.len())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            result_syntax_selected: false,
             syntax_selected_calls: vec![false; owner.nodes.len()].into_boxed_slice(),
             invocation_dependencies: formal_dependent_expressions[owner_index].clone(),
             transparent_type_providers: vec![None; owner.nodes.len()].into_boxed_slice(),
@@ -6123,6 +6156,7 @@ pub fn compile_project_program_with_definition_facts(
                     instance.expressions[index],
                     instance.expression_modes[index],
                     true,
+                    Some(&mut syntax_discriminated_call_candidates[owner_index][index]),
                 )?;
             } else {
                 let equation = node_mode_equation(&mut mode_builder, &context, index, node)?;
@@ -6187,7 +6221,10 @@ pub fn compile_project_program_with_definition_facts(
                 declarations: collect_declaration_artifacts(owner, &facts[owner_index])?,
                 lexical_bindings: collect_lexical_binding_artifacts(owner, &facts[owner_index])?,
                 resources,
-                calls: collect_call_artifacts(owner)?,
+                calls: collect_call_artifacts(
+                    owner,
+                    &syntax_discriminated_call_candidates[owner_index],
+                )?,
                 effects: collect_host_effect_artifacts(owner)?,
                 diagnostics: collect_definition_diagnostic_artifacts(
                     owner_id,
@@ -6351,6 +6388,7 @@ struct SpecializationKey {
 struct OwnerSpecialization {
     static_variants: Vec<Option<StaticVariantSet>>,
     reachable: Box<[usize]>,
+    result_syntax_selected: bool,
     syntax_selected_calls: Box<[bool]>,
     invocation_dependencies: Box<[bool]>,
     transparent_type_providers: Box<[Option<usize>]>,
@@ -6830,6 +6868,25 @@ fn infer_static_variants(
     variants
 }
 
+fn type_has_concrete_outer_shape(ty: &Type) -> bool {
+    match ty {
+        Type::Object(_) => true,
+        Type::VariantSet(variants) => !variants.is_empty(),
+        Type::Union(members) => !members.is_empty(),
+        Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_) => false,
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::List(_)
+        | Type::Map { .. }
+        | Type::Set(_)
+        | Type::Function { .. }
+        | Type::RenderContract => true,
+    }
+}
+
 fn merge_static_edge_variants(
     owner: &KernelOwnerProgramInput,
     node: &KernelOwnerNode,
@@ -7221,6 +7278,7 @@ fn compile_residual_type_module(
             local.expressions[index],
             local.expression_modes[index],
             false,
+            None,
         )?;
     }
     Ok(Arc::new(ResidualTypeModule {
@@ -7351,6 +7409,97 @@ fn principal_external_variables(
         .collect()
 }
 
+fn specialize_owner(
+    specializations: &mut HashMap<SpecializationKey, OwnerSpecialization>,
+    compile_work: &mut KernelCompileWork,
+    project: &KernelProjectProgramInput,
+    formal_dependent_expressions: &[Box<[bool]>],
+    target: KernelOwnerId,
+    actuals: &[CallActual],
+    initial_state_surface: bool,
+) -> Result<(SpecializationKey, OwnerSpecialization), KernelOwnerBuildError> {
+    let formal_static_variants = actuals
+        .iter()
+        .map(|actual| actual.static_variants.clone())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    specialize_owner_static(
+        specializations,
+        compile_work,
+        project,
+        formal_dependent_expressions,
+        target,
+        formal_static_variants,
+        initial_state_surface,
+    )
+}
+
+fn specialize_owner_static(
+    specializations: &mut HashMap<SpecializationKey, OwnerSpecialization>,
+    compile_work: &mut KernelCompileWork,
+    project: &KernelProjectProgramInput,
+    formal_dependent_expressions: &[Box<[bool]>],
+    target: KernelOwnerId,
+    formal_static_variants: Box<[Option<StaticVariantSet>]>,
+    initial_state_surface: bool,
+) -> Result<(SpecializationKey, OwnerSpecialization), KernelOwnerBuildError> {
+    let owner = project.owners.get(target.0 as usize).ok_or_else(|| {
+        KernelOwnerBuildError::new(format!("user call targets missing owner {}", target.0))
+    })?;
+    let key = SpecializationKey {
+        target,
+        static_variants: formal_static_variants.clone(),
+        initial_state_surface,
+    };
+    if let Some(specialization) = specializations.get(&key) {
+        compile_work.reused_specialization_plans =
+            compile_work.reused_specialization_plans.saturating_add(1);
+        return Ok((key, specialization.clone()));
+    }
+    let static_variants = infer_static_variants(owner, &formal_static_variants);
+    let result =
+        checked_expression_index(owner.result, owner.nodes.len(), "specialized owner result")?;
+    let reachable = reachable_owner_nodes(owner, result, &static_variants)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let dependencies = &formal_dependent_expressions[target.0 as usize];
+    let local_result_syntax_selected = reachable.iter().copied().any(|expression| {
+        let node = &owner.nodes[expression];
+        if !matches!(node.kind, KernelOwnerNodeKind::When) {
+            return false;
+        }
+        node.inputs
+            .iter()
+            .find(|edge| matches!(edge.role, KernelOwnerEdgeRole::WhenInput))
+            .map(|edge| edge.expression.0 as usize)
+            .filter(|selector| *selector < owner.nodes.len())
+            .is_some_and(|selector| {
+                dependencies.get(selector).copied().unwrap_or(false)
+                    && static_variants
+                        .get(selector)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|variants| variants.len() == 1)
+            })
+    });
+    let syntax_selected_calls = syntax_selected_call_nodes(owner, &static_variants, dependencies);
+    let specialization = OwnerSpecialization {
+        invocation_dependencies: invocation_expression_dependencies(
+            owner,
+            dependencies,
+            &syntax_selected_calls,
+        ),
+        reachable,
+        result_syntax_selected: local_result_syntax_selected,
+        syntax_selected_calls,
+        static_variants,
+        transparent_type_providers: transparent_type_providers(owner),
+    };
+    specializations.insert(key.clone(), specialization.clone());
+    compile_work.specialization_plans = compile_work.specialization_plans.saturating_add(1);
+    Ok((key, specialization))
+}
+
 fn instantiate_owner(
     builder: &mut ComponentProgramBuilder,
     mode_builder: &mut ModeProgramBuilder,
@@ -7363,11 +7512,13 @@ fn instantiate_owner(
     formal_dependent_results: &[bool],
     formal_dependent_expressions: &[Box<[bool]>],
     direct_summaries: &[Option<Arc<CompiledDirectSummary>>],
-    target: KernelOwnerId,
     actuals: &[CallActual],
-    initial_state_surface: bool,
+    specialization_key: SpecializationKey,
+    specialization: OwnerSpecialization,
     stack: &mut Vec<KernelOwnerId>,
 ) -> Result<OwnerInstance, KernelOwnerBuildError> {
+    let target = specialization_key.target;
+    let initial_state_surface = specialization_key.initial_state_surface;
     compile_work.max_call_depth = compile_work.max_call_depth.max(stack.len() as u64);
     let owner = project.owners.get(target.0 as usize).ok_or_else(|| {
         KernelOwnerBuildError::new(format!("user call targets missing owner {}", target.0))
@@ -7389,46 +7540,7 @@ fn instantiate_owner(
         });
     }
 
-    let formal_static_variants = actuals
-        .iter()
-        .map(|actual| actual.static_variants.clone())
-        .collect::<Vec<_>>();
-    let specialization_key = SpecializationKey {
-        target,
-        static_variants: formal_static_variants.clone().into_boxed_slice(),
-        initial_state_surface,
-    };
-    let specialization = if let Some(specialization) = specializations.get(&specialization_key) {
-        compile_work.reused_specialization_plans =
-            compile_work.reused_specialization_plans.saturating_add(1);
-        specialization.clone()
-    } else {
-        let static_variants = infer_static_variants(owner, &formal_static_variants);
-        let result =
-            checked_expression_index(owner.result, owner.nodes.len(), "specialized owner result")?;
-        let syntax_selected_calls = syntax_selected_call_nodes(
-            owner,
-            &static_variants,
-            &formal_dependent_expressions[target.0 as usize],
-        );
-        let specialization = OwnerSpecialization {
-            reachable: reachable_owner_nodes(owner, result, &static_variants)
-                .into_iter()
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            invocation_dependencies: invocation_expression_dependencies(
-                owner,
-                &formal_dependent_expressions[target.0 as usize],
-                &syntax_selected_calls,
-            ),
-            syntax_selected_calls,
-            static_variants,
-            transparent_type_providers: transparent_type_providers(owner),
-        };
-        specializations.insert(specialization_key.clone(), specialization.clone());
-        compile_work.specialization_plans = compile_work.specialization_plans.saturating_add(1);
-        specialization
-    };
+    let formal_static_variants = specialization_key.static_variants.to_vec();
     let key = InvocationKey {
         target,
         actuals: actuals
@@ -7550,6 +7662,7 @@ fn instantiate_owner(
                     instance.expressions[index],
                     instance.expression_modes[index],
                     true,
+                    None,
                 )?;
             } else {
                 let equation = node_mode_equation(mode_builder, &context, index, node)?;
@@ -9975,6 +10088,7 @@ fn compile_node(
     output: TypeVariableId,
     output_mode: ModeVariableId,
     compile_mode: bool,
+    mut syntax_discriminated_result: Option<&mut bool>,
 ) -> Result<(), KernelOwnerBuildError> {
     match &node.kind {
         KernelOwnerNodeKind::Known(ty) | KernelOwnerNodeKind::Source(ty) => {
@@ -10425,6 +10539,24 @@ fn compile_node(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let initial_state_surface = context.initial_state_surface
+                || context
+                    .syntax_selected_calls
+                    .and_then(|calls| calls.get(index))
+                    .copied()
+                    .unwrap_or(false);
+            let (specialization_key, specialization) = specialize_owner(
+                specializations,
+                compile_work,
+                project,
+                context.formal_dependent_expressions,
+                *target,
+                &actuals,
+                initial_state_surface,
+            )?;
+            if let Some(selected) = syntax_discriminated_result.as_deref_mut() {
+                *selected = specialization.result_syntax_selected;
+            }
             let result = checked_expression_index(
                 target_owner.result,
                 target_owner.nodes.len(),
@@ -10525,14 +10657,9 @@ fn compile_node(
                 context.formal_dependent_results,
                 context.formal_dependent_expressions,
                 context.direct_summaries,
-                *target,
                 &actuals,
-                context.initial_state_surface
-                    || context
-                        .syntax_selected_calls
-                        .and_then(|calls| calls.get(index))
-                        .copied()
-                        .unwrap_or(false),
+                specialization_key,
+                specialization,
                 stack,
             )?;
             let provider = builder.variable_term(instance.expressions[result]);

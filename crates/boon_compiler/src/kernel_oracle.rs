@@ -9,16 +9,18 @@
 #![cfg_attr(not(any(test, feature = "test-kernel-oracle")), allow(dead_code))]
 
 use boon_checked::{
-    CheckedCallableSignature, CheckedContextFormal, CheckedDeclaration, CheckedExpression,
-    CheckedExpressionKind, CheckedList, CheckedListKeyPolicy, CheckedScope, CheckedSource,
-    CheckedState, CheckedStateKind, CheckedStatement, DiagnosticSeverity, FlowMode, FlowType,
-    ObjectShape, Type, TypeDiagnostic, Variant, type_is_recursively_closed,
+    CheckedCall, CheckedCallableSignature, CheckedContextFormal, CheckedDeclaration,
+    CheckedExpression, CheckedExpressionKind, CheckedList, CheckedListKeyPolicy, CheckedScope,
+    CheckedSource, CheckedState, CheckedStateKind, CheckedStatement, DiagnosticSeverity, FlowMode,
+    FlowType, ObjectShape, Type, TypeDiagnostic, Variant, type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
-    CheckDemand, KernelCallArgumentKind, KernelCallArgumentSource, KernelCallInputRole,
-    KernelCallPassInput, KernelCallShapeArgument, KernelCallShapeInput, KernelCallShapeParameter,
-    KernelCallShapeResolution, KernelCallSyntaxArgument, KernelCallSyntaxInput, KernelCallTarget,
-    KernelCallTypeSubstitution, KernelCallableKind, KernelCheckProduct, KernelCheckedLinkLayout,
+    CheckDemand, KernelAbiCallContextInput, KernelAbiContextualOperation, KernelAbiInput,
+    KernelAbiParameterInput, KernelAbiResultSpecialization, KernelCallArgumentKind,
+    KernelCallArgumentSource, KernelCallInputRole, KernelCallPassInput, KernelCallShapeArgument,
+    KernelCallShapeInput, KernelCallShapeParameter, KernelCallShapeResolution,
+    KernelCallSyntaxArgument, KernelCallSyntaxInput, KernelCallTarget, KernelCallTypeSubstitution,
+    KernelCallableAbiInput, KernelCallableKind, KernelCheckProduct, KernelCheckedLinkLayout,
     KernelCollectionKind, KernelCompileWork, KernelConditionalKind, KernelDeclarationId,
     KernelDeclarationInput, KernelDeclarationKind, KernelDeclarationOrigin,
     KernelDeclarationPresentation, KernelDeclarationReference, KernelDefinitionFactsInput,
@@ -497,6 +499,7 @@ pub struct KernelOwnerOracleReport {
     pub checked_statement_keys: Box<[StableStatementKey]>,
     pub checked_callables: Box<[CheckedCallableSignature]>,
     pub checked_context_formals: Box<[CheckedContextFormal]>,
+    pub checked_calls: Box<[CheckedCall]>,
     pub checked_sources: Box<[CheckedSource]>,
     pub checked_states: Box<[CheckedState]>,
     pub checked_lists: Box<[CheckedList]>,
@@ -581,6 +584,7 @@ struct PreparedKernelProjectProjection {
     project_input: KernelProjectProgramInput,
     definition_facts: Box<[KernelDefinitionFactsInput]>,
     definition_keys: Box<[StableCheckOwnerKey]>,
+    abi: KernelAbiInput,
     project_is_empty: bool,
     owner_projection_us: u64,
     direct_projection_elapsed: Duration,
@@ -594,10 +598,13 @@ fn prepare_kernel_project_projection(
     let owner_order = project.stable_check_owner_keys().collect::<Vec<_>>();
     let input_owners = owner_order.len();
     let value_surfaces = project_value_surfaces(project);
-    let authoritative_call_shapes = project_kernel_authoritative_call_shapes();
+    let kernel_abi = project_kernel_abi(project, boon_checked::ProgramRole::Client);
+    let authoritative_call_shapes = kernel_abi
+        .as_ref()
+        .map(project_kernel_authoritative_call_shapes_from_abi);
     let callable_surfaces = authoritative_call_shapes
         .as_ref()
-        .map_err(Clone::clone)
+        .map_err(|error| (*error).clone())
         .and_then(|authoritative| project_callable_surfaces(project, authoritative));
     let owner_projection_started = Instant::now();
     let mut direct_projection_elapsed = Duration::ZERO;
@@ -1066,6 +1073,7 @@ fn prepare_kernel_project_projection(
         project_input,
         definition_facts,
         definition_keys,
+        abi: kernel_abi.unwrap_or_default(),
         project_is_empty,
         owner_projection_us,
         direct_projection_elapsed,
@@ -1091,6 +1099,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         project_input,
         definition_facts,
         definition_keys,
+        abi,
         project_is_empty,
         owner_projection_us,
         direct_projection_elapsed,
@@ -1110,6 +1119,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     let mut checked_statement_keys: Box<[StableStatementKey]> = Box::new([]);
     let mut checked_callables: Box<[CheckedCallableSignature]> = Box::new([]);
     let mut checked_context_formals: Box<[CheckedContextFormal]> = Box::new([]);
+    let mut checked_calls: Box<[CheckedCall]> = Box::new([]);
     let mut checked_sources: Box<[CheckedSource]> = Box::new([]);
     let mut checked_states: Box<[CheckedState]> = Box::new([]);
     let mut checked_lists: Box<[CheckedList]> = Box::new([]);
@@ -1119,8 +1129,9 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         None
     } else {
         let compile_started = Instant::now();
-        let input = KernelProjectInput::new(project_input, definition_facts, definition_keys)
-            .map_err(|error| error.to_string());
+        let input =
+            KernelProjectInput::new_with_abi(project_input, definition_facts, definition_keys, abi)
+                .map_err(|error| error.to_string());
         let compiled = input
             .as_ref()
             .map_err(Clone::clone)
@@ -1183,9 +1194,24 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         .materialize_lists(&checked)
                         .map_err(|error| error.to_string())?
                         .into_vec();
-                    let (mut materialized_callables, materialized_context_formals) = layout
+                    let (materialized_callables, materialized_context_formals) = layout
                         .materialize_user_callables(&checked, boon_checked::ProgramRole::Client)
                         .map_err(|error| error.to_string())?;
+                    let mut materialized_callables = materialized_callables.into_vec();
+                    let (materialized_abi_callables, materialized_abi_declarations) = layout
+                        .materialize_abi_callables(kernel_input.abi())
+                        .map_err(|error| error.to_string())?;
+                    materialized_callables.extend(materialized_abi_callables.into_vec());
+                    materialized_declarations.extend(materialized_abi_declarations.into_vec());
+                    let mut materialized_calls = layout
+                        .materialize_calls(
+                            kernel_input,
+                            &checked,
+                            &materialized_callables,
+                            &materialized_declarations,
+                        )
+                        .map_err(|error| error.to_string())?
+                        .into_vec();
                     for definition in layout.definitions() {
                         let key = kernel_input
                             .links()
@@ -1432,6 +1458,33 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                                 &format!("kernel checked LIST row {row}"),
                             )?;
                         }
+                        for row in definition.calls.start
+                            ..definition
+                                .calls
+                                .start
+                                .checked_add(definition.calls.len)
+                                .ok_or_else(|| "kernel checked call range overflowed".to_owned())?
+                        {
+                            let call = materialized_calls.get_mut(row as usize).ok_or_else(|| {
+                                format!("kernel checked call linker references missing row {row}")
+                            })?;
+                            relocate_direct_checked_span(
+                                &mut call.span,
+                                source.start_line,
+                                source.start_byte,
+                                &format!("kernel checked call row {row}"),
+                            )?;
+                            if let boon_checked::CheckedContextBinding::Explicit { span, .. } =
+                                &mut call.context_binding
+                            {
+                                relocate_direct_checked_span(
+                                    span,
+                                    source.start_line,
+                                    source.start_byte,
+                                    &format!("kernel checked call row {row} PASS"),
+                                )?;
+                            }
+                        }
                         if let Some(callable) = materialized_callables
                             .iter_mut()
                             .find(|callable| callable.decl_id == definition.public_declaration)
@@ -1498,8 +1551,9 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                     checked_sources = materialized_sources.into_boxed_slice();
                     checked_states = materialized_states.into_boxed_slice();
                     checked_lists = materialized_lists.into_boxed_slice();
-                    checked_callables = materialized_callables;
+                    checked_callables = materialized_callables.into_boxed_slice();
                     checked_context_formals = materialized_context_formals;
+                    checked_calls = materialized_calls.into_boxed_slice();
                     checked_link_layout_us = elapsed_us(checked_link_started.elapsed());
                     Ok(checked)
                 })
@@ -2206,6 +2260,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         checked_statement_keys,
         checked_callables,
         checked_context_formals,
+        checked_calls,
         checked_sources,
         checked_states,
         checked_lists,
@@ -2264,6 +2319,7 @@ pub(crate) fn compiler_diagnostics_from_kernel(
         project_input,
         definition_facts,
         definition_keys,
+        abi,
         ..
     } = prepare_kernel_project_projection(&project, &source_payloads);
     if !unsupported.is_empty() {
@@ -2286,8 +2342,9 @@ pub(crate) fn compiler_diagnostics_from_kernel(
         ));
     }
 
-    let input = KernelProjectInput::new(project_input, definition_facts, definition_keys)
-        .map_err(|error| format!("cannot build dense kernel diagnostics input: {error}"))?;
+    let input =
+        KernelProjectInput::new_with_abi(project_input, definition_facts, definition_keys, abi)
+            .map_err(|error| format!("cannot build dense kernel diagnostics input: {error}"))?;
     let mut session = KernelSession::new(input);
     let checked = session
         .check(CheckDemand::Diagnostics)
@@ -3098,6 +3155,196 @@ struct CallableSurface {
     context_ordinal: Option<usize>,
 }
 
+fn project_kernel_abi(
+    project: &ProjectSyntaxSnapshot,
+    role: boon_checked::ProgramRole,
+) -> Result<KernelAbiInput, String> {
+    let environment = boon_typecheck::project_owner_abi_environment(
+        project,
+        &boon_checked::ExternalTypeEnvironment::empty(role),
+    )
+    .map_err(|error| error.to_string())?;
+    KernelAbiInput::new(
+        role,
+        environment
+            .callables
+            .into_vec()
+            .into_iter()
+            .map(|callable| KernelCallableAbiInput {
+                name: callable.name.into_boxed_str(),
+                kind: match callable.kind {
+                    boon_checked::CheckedCallableKind::User => KernelCallableKind::User,
+                    boon_checked::CheckedCallableKind::Builtin => KernelCallableKind::Builtin,
+                    boon_checked::CheckedCallableKind::External => KernelCallableKind::External,
+                },
+                intrinsic: callable.intrinsic,
+                external_identity: callable.external_identity,
+                parameters: callable
+                    .parameters
+                    .into_vec()
+                    .into_iter()
+                    .map(|parameter| KernelAbiParameterInput {
+                        name: parameter.name.into_boxed_str(),
+                        kind: parameter.kind,
+                        ordinal: parameter.ordinal,
+                        flow_type: parameter.flow_type,
+                        requirement: parameter.requirement,
+                        evaluation_scope: match parameter.evaluation_scope {
+                            boon_typecheck::OwnerAbiEvaluationScope::Parent => {
+                                KernelParameterEvaluationScope::Parent
+                            }
+                            boon_typecheck::OwnerAbiEvaluationScope::Output {
+                                parameter_ordinal,
+                            } => KernelParameterEvaluationScope::Output { parameter_ordinal },
+                        },
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                contexts: callable
+                    .contexts
+                    .into_vec()
+                    .into_iter()
+                    .map(|context| KernelAbiCallContextInput {
+                        name: context.name.into_boxed_str(),
+                        kind: context.kind,
+                        provider_parameter_ordinal: context.provider_parameter_ordinal,
+                        flow_type: context.flow_type,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                result: callable.result,
+                result_specialization: match callable.result_specialization {
+                    boon_typecheck::OwnerAbiResultSpecialization::Fixed => {
+                        KernelAbiResultSpecialization::Fixed
+                    }
+                    boon_typecheck::OwnerAbiResultSpecialization::RenderConstructor => {
+                        KernelAbiResultSpecialization::RenderConstructor
+                    }
+                },
+                role: callable.role,
+                effect: callable.effect,
+                contextual_operation: callable.contextual_operation.map(
+                    |operation| match operation {
+                        boon_typecheck::OwnerAbiContextualOperation::Map { list, row, body } => {
+                            KernelAbiContextualOperation::Map { list, row, body }
+                        }
+                        boon_typecheck::OwnerAbiContextualOperation::Filter {
+                            list,
+                            row,
+                            predicate,
+                        } => KernelAbiContextualOperation::Filter {
+                            list,
+                            row,
+                            predicate,
+                        },
+                        boon_typecheck::OwnerAbiContextualOperation::Retain {
+                            list,
+                            row,
+                            predicate,
+                        } => KernelAbiContextualOperation::Retain {
+                            list,
+                            row,
+                            predicate,
+                        },
+                        boon_typecheck::OwnerAbiContextualOperation::Remove {
+                            list,
+                            row,
+                            predicate,
+                        } => KernelAbiContextualOperation::Remove {
+                            list,
+                            row,
+                            predicate,
+                        },
+                        boon_typecheck::OwnerAbiContextualOperation::Every {
+                            list,
+                            row,
+                            predicate,
+                        } => KernelAbiContextualOperation::Every {
+                            list,
+                            row,
+                            predicate,
+                        },
+                        boon_typecheck::OwnerAbiContextualOperation::Any {
+                            list,
+                            row,
+                            predicate,
+                        } => KernelAbiContextualOperation::Any {
+                            list,
+                            row,
+                            predicate,
+                        },
+                        boon_typecheck::OwnerAbiContextualOperation::Find {
+                            list,
+                            row,
+                            predicate,
+                        } => KernelAbiContextualOperation::Find {
+                            list,
+                            row,
+                            predicate,
+                        },
+                        boon_typecheck::OwnerAbiContextualOperation::SortBy {
+                            list,
+                            row,
+                            key,
+                            direction,
+                        } => KernelAbiContextualOperation::SortBy {
+                            list,
+                            row,
+                            key,
+                            direction,
+                        },
+                        boon_typecheck::OwnerAbiContextualOperation::ThenBy {
+                            list,
+                            row,
+                            key,
+                            direction,
+                        } => KernelAbiContextualOperation::ThenBy {
+                            list,
+                            row,
+                            key,
+                            direction,
+                        },
+                    },
+                ),
+            }),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn project_kernel_authoritative_call_shapes_from_abi(
+    abi: &KernelAbiInput,
+) -> BTreeMap<String, AuthoritativeCallSurface> {
+    abi.callables()
+        .iter()
+        .map(|callable| {
+            (
+                callable.name.to_string(),
+                AuthoritativeCallSurface {
+                    kind: callable.kind,
+                    parameters: callable
+                        .parameters
+                        .iter()
+                        .map(|parameter| KernelCallShapeParameter {
+                            ordinal: parameter.ordinal,
+                            kind: match parameter.kind {
+                                boon_checked::CheckedParameterKind::Value => {
+                                    KernelParameterKind::Value
+                                }
+                                boon_checked::CheckedParameterKind::Out => KernelParameterKind::Out,
+                            },
+                            name: parameter.name.clone(),
+                            optional: parameter.requirement.is_optional(),
+                            evaluation_scope: parameter.evaluation_scope,
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                },
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn project_kernel_authoritative_call_shapes()
 -> Result<BTreeMap<String, AuthoritativeCallSurface>, String> {
     boon_typecheck::project_authoritative_callable_shapes_v1()?
@@ -3732,6 +3979,7 @@ fn compact_call_syntax_input(
                 Ok::<_, String>(KernelCallPassInput {
                     value: dense_expression(pass.value, "PASS value")?,
                     final_clause: pass.final_clause,
+                    span: kernel_subspan(view, syntax.line, pass.start, pass.end),
                 })
             })
             .transpose()?,
@@ -11163,10 +11411,15 @@ mod tests {
             .iter()
             .filter(|callable| callable.kind == boon_checked::CheckedCallableKind::User)
             .count();
-        if report.checked_callables.len() != current_user_count {
+        let direct_user_count = report
+            .checked_callables
+            .iter()
+            .filter(|callable| callable.kind == boon_checked::CheckedCallableKind::User)
+            .count();
+        if direct_user_count != current_user_count {
             mismatches.push(format!(
                 "kernel direct callable table has {} user rows but checked has {current_user_count}",
-                report.checked_callables.len(),
+                direct_user_count,
             ));
         }
 
@@ -11238,7 +11491,11 @@ mod tests {
                 }
             };
 
-        for direct in &report.checked_callables {
+        for direct in report
+            .checked_callables
+            .iter()
+            .filter(|callable| callable.kind == boon_checked::CheckedCallableKind::User)
+        {
             let Some(direct_body) = direct.body else {
                 mismatches.push(format!(
                     "kernel direct user callable {:?} has no body",
@@ -11435,6 +11692,345 @@ mod tests {
             }
         }
         mismatches
+    }
+
+    fn normalized_checked_call_substitutions(
+        call: &boon_checked::CheckedCall,
+        callables: &[CheckedCallableSignature],
+        context_formals: &[CheckedContextFormal],
+    ) -> Option<Box<[KernelCallTypeSubstitution]>> {
+        let callable = callables
+            .iter()
+            .find(|callable| callable.decl_id == call.callable)?;
+        let mut parameters = callable.parameters.iter().collect::<Vec<_>>();
+        parameters.sort_unstable_by_key(|parameter| parameter.ordinal);
+        let mut variables = BTreeMap::new();
+        for parameter in parameters {
+            collect_callable_type_parameter_ids(&parameter.flow_type.ty, &mut variables);
+        }
+        if let Some(formal) = callable.context_formal {
+            let context = context_formals
+                .iter()
+                .find(|context| context.id == formal)?;
+            collect_callable_type_parameter_ids(&context.scheme.flow_type.ty, &mut variables);
+        }
+        collect_callable_type_parameter_ids(&callable.result.ty, &mut variables);
+        let mut substitutions = call
+            .type_substitutions
+            .iter()
+            .filter_map(|substitution| {
+                Some(KernelCallTypeSubstitution {
+                    variable: *variables.get(&substitution.variable)?,
+                    value: substitution.value.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if substitutions.len() != call.type_substitutions.len() {
+            return None;
+        }
+        substitutions.sort_unstable_by_key(|substitution| substitution.variable);
+        Some(normalized_kernel_call_type_substitutions(&substitutions))
+    }
+
+    fn direct_call_inventory_mismatches(
+        report: &KernelOwnerOracleReport,
+        checked: &CheckedProgramFields,
+        stable_by_checked_expression: &BTreeMap<boon_checked::CheckedExprId, StableExpressionKey>,
+        require_syntax_provenance_parity: bool,
+    ) -> Vec<String> {
+        let mut mismatches = Vec::new();
+        let direct_stable = |expression: boon_checked::CheckedExprId| {
+            report
+                .checked_expression_keys
+                .get(expression.0 as usize)
+                .and_then(Option::as_ref)
+                .cloned()
+        };
+        let direct_declaration = |id: boon_checked::DeclId| {
+            report
+                .checked_declarations
+                .iter()
+                .find(|declaration| declaration.id == id)
+                .map(|declaration| (declaration.kind, declaration.name.clone(), declaration.span))
+        };
+        let current_declaration = |id: boon_checked::DeclId| {
+            checked
+                .declarations
+                .iter()
+                .find(|declaration| declaration.id == id)
+                .map(|declaration| (declaration.kind, declaration.name.clone(), declaration.span))
+        };
+        let direct_scope = |id: boon_checked::LexicalScopeId| {
+            report
+                .checked_scopes
+                .iter()
+                .find(|scope| scope.id == id)
+                .map(|scope| (scope.kind, scope.span))
+        };
+        let current_scope = |id: boon_checked::LexicalScopeId| {
+            checked
+                .scopes
+                .iter()
+                .find(|scope| scope.id == id)
+                .map(|scope| (scope.kind, scope.span))
+        };
+        let callable_key = |callable: boon_checked::DeclId,
+                            callables: &[CheckedCallableSignature]| {
+            callables
+                .iter()
+                .find(|candidate| candidate.decl_id == callable)
+                .map(|candidate| {
+                    (
+                        candidate.name.clone(),
+                        candidate.kind,
+                        candidate.role,
+                        candidate.intrinsic,
+                        candidate.external_identity,
+                    )
+                })
+        };
+        let entry_signature = |call: &boon_checked::CheckedCall,
+                               callables: &[CheckedCallableSignature],
+                               expression_key: &dyn Fn(
+            boon_checked::CheckedExprId,
+        ) -> Option<StableExpressionKey>,
+                               declaration_key: &dyn Fn(
+            boon_checked::DeclId,
+        ) -> Option<(
+            CheckedDeclarationKind,
+            String,
+            boon_checked::CheckedSpan,
+        )>,
+                               scope_key: &dyn Fn(
+            boon_checked::LexicalScopeId,
+        ) -> Option<(
+            boon_checked::CheckedScopeKind,
+            boon_checked::CheckedSpan,
+        )>| {
+            let callable = callables
+                .iter()
+                .find(|callable| callable.decl_id == call.callable);
+            let parameter_ordinal = |formal: boon_checked::DeclId| {
+                callable.and_then(|callable| {
+                    callable
+                        .parameters
+                        .iter()
+                        .find(|parameter| parameter.decl_id == formal)
+                        .map(|parameter| parameter.ordinal)
+                })
+            };
+            let evaluation_ordinal = |scope: boon_checked::CheckedEvaluationScope| match scope {
+                boon_checked::CheckedEvaluationScope::Parent => Some(None),
+                boon_checked::CheckedEvaluationScope::Output { formal } => {
+                    Some(Some(parameter_ordinal(formal)?))
+                }
+            };
+            call.entries
+                .iter()
+                .map(|entry| match entry {
+                    boon_checked::CheckedCallEntry::Input {
+                        formal,
+                        name,
+                        value,
+                        from_pipe,
+                        evaluation_scope,
+                    } => format!(
+                        "input:{:?}:{name}:{:?}:{from_pipe:?}:{:?}",
+                        parameter_ordinal(*formal),
+                        expression_key(*value),
+                        evaluation_ordinal(*evaluation_scope),
+                    ),
+                    boon_checked::CheckedCallEntry::FreshOut {
+                        formal,
+                        name,
+                        output,
+                        scope_id,
+                    } => format!(
+                        "fresh:{:?}:{name}:{:?}:{:?}",
+                        parameter_ordinal(*formal),
+                        declaration_key(*output),
+                        scope_key(*scope_id),
+                    ),
+                    boon_checked::CheckedCallEntry::ForwardOut {
+                        formal,
+                        name,
+                        target,
+                        target_name,
+                    } => format!(
+                        "forward:{:?}:{name}:{:?}:{target_name}",
+                        parameter_ordinal(*formal),
+                        declaration_key(*target),
+                    ),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let direct_by_stable = report
+            .checked_calls
+            .iter()
+            .filter_map(|call| Some((direct_stable(call.expression)?, call)))
+            .collect::<BTreeMap<_, _>>();
+        let current_by_stable = checked
+            .calls
+            .iter()
+            .filter_map(|call| {
+                Some((
+                    stable_by_checked_expression.get(&call.expression)?.clone(),
+                    call,
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if direct_by_stable.len() != report.checked_calls.len() {
+            mismatches.push(
+                "kernel direct call table contains a missing or repeated stable expression"
+                    .to_owned(),
+            );
+        }
+        for (stable, direct) in &direct_by_stable {
+            let Some(current) = current_by_stable.get(stable) else {
+                mismatches.push(format!(
+                    "kernel direct call {stable:?} has no current checked row"
+                ));
+                continue;
+            };
+            let direct_callable = callable_key(direct.callable, &report.checked_callables);
+            let current_callable = callable_key(current.callable, &checked.callables);
+            let direct_owner = direct
+                .owner_callable
+                .and_then(|owner| callable_key(owner, &report.checked_callables));
+            let current_owner = current
+                .owner_callable
+                .and_then(|owner| callable_key(owner, &checked.callables));
+            let direct_entries = entry_signature(
+                direct,
+                &report.checked_callables,
+                &direct_stable,
+                &direct_declaration,
+                &direct_scope,
+            );
+            let current_entries = entry_signature(
+                current,
+                &checked.callables,
+                &|expression| stable_by_checked_expression.get(&expression).cloned(),
+                &current_declaration,
+                &current_scope,
+            );
+            let direct_contexts = direct
+                .contexts
+                .iter()
+                .map(|context| {
+                    (
+                        direct_declaration(context.declaration),
+                        context.signature,
+                        direct_scope(context.scope_id),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let current_contexts = current
+                .contexts
+                .iter()
+                .map(|context| {
+                    (
+                        current_declaration(context.declaration),
+                        context.signature,
+                        current_scope(context.scope_id),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let direct_binding = match direct.context_binding {
+                boon_checked::CheckedContextBinding::Explicit { value, span } => {
+                    format!("explicit:{:?}:{span:?}", direct_stable(value))
+                }
+                boon_checked::CheckedContextBinding::Inherited { .. } => "inherited".to_owned(),
+                boon_checked::CheckedContextBinding::None => "none".to_owned(),
+            };
+            let current_binding = match current.context_binding {
+                boon_checked::CheckedContextBinding::Explicit { value, span } => format!(
+                    "explicit:{:?}:{span:?}",
+                    stable_by_checked_expression.get(&value)
+                ),
+                boon_checked::CheckedContextBinding::Inherited { .. } => "inherited".to_owned(),
+                boon_checked::CheckedContextBinding::None => "none".to_owned(),
+            };
+            let direct_substitutions = normalized_checked_call_substitutions(
+                direct,
+                &report.checked_callables,
+                &report.checked_context_formals,
+            );
+            let current_substitutions = normalized_checked_call_substitutions(
+                current,
+                &checked.callables,
+                &checked.context_formals,
+            );
+            if direct.function != current.function
+                || direct.intrinsic != current.intrinsic
+                || direct.role != current.role
+                || direct.span != current.span
+                || (require_syntax_provenance_parity
+                    && direct.syntax_discriminated_result != current.syntax_discriminated_result)
+                || direct_callable != current_callable
+                || direct_owner != current_owner
+                || direct_entries != current_entries
+                || direct_contexts != current_contexts
+                || direct_binding != current_binding
+            {
+                mismatches.push(format!(
+                    "kernel direct call {stable:?} differs: direct_function={:?} current_function={:?} direct_callable={direct_callable:?} current_callable={current_callable:?} direct_owner={direct_owner:?} current_owner={current_owner:?} direct_entries={direct_entries:?} current_entries={current_entries:?} direct_contexts={direct_contexts:?} current_contexts={current_contexts:?} direct_binding={direct_binding:?} current_binding={current_binding:?} direct_substitutions={direct_substitutions:?} current_substitutions={current_substitutions:?} direct_discriminated={} current_discriminated={} direct_span={:?} current_span={:?} direct_result={:?} current_result={:?}",
+                    direct.function,
+                    current.function,
+                    direct.syntax_discriminated_result,
+                    current.syntax_discriminated_result,
+                    direct.span,
+                    current.span,
+                    direct.result,
+                    current.result,
+                ));
+            }
+        }
+        for stable in current_by_stable.keys() {
+            if !direct_by_stable.contains_key(stable) {
+                mismatches.push(format!(
+                    "current checked call {stable:?} has no kernel direct row"
+                ));
+            }
+        }
+        mismatches
+    }
+
+    fn direct_call_syntax_provenance_mismatch_count(
+        report: &KernelOwnerOracleReport,
+        checked: &CheckedProgramFields,
+        stable_by_checked_expression: &BTreeMap<boon_checked::CheckedExprId, StableExpressionKey>,
+    ) -> usize {
+        let direct_by_stable = report
+            .checked_calls
+            .iter()
+            .filter_map(|call| {
+                Some((
+                    report
+                        .checked_expression_keys
+                        .get(call.expression.0 as usize)?
+                        .as_ref()?
+                        .clone(),
+                    call.syntax_discriminated_result,
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+        checked
+            .calls
+            .iter()
+            .filter_map(|call| {
+                Some((
+                    stable_by_checked_expression.get(&call.expression)?,
+                    call.syntax_discriminated_result,
+                ))
+            })
+            .filter(|(stable, current)| {
+                direct_by_stable
+                    .get(*stable)
+                    .is_some_and(|direct| direct != current)
+            })
+            .count()
     }
 
     fn collect_callable_type_parameter_ids(
@@ -13079,12 +13675,18 @@ mod tests {
                 stable_by_checked_expression.insert(checked_expression.id, stable);
             }
         }
-        let mismatches = expression_inventory_mismatches(
+        let mut mismatches = expression_inventory_mismatches(
             &report,
             &checked,
             &checked_expression_by_stable,
             &stable_by_checked_expression,
         );
+        mismatches.extend(direct_call_inventory_mismatches(
+            &report,
+            &checked,
+            &stable_by_checked_expression,
+            true,
+        ));
         assert!(
             mismatches.is_empty(),
             "direct CheckedExpression parity: {mismatches:#?}"
@@ -16693,6 +17295,11 @@ mod tests {
             parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
                 .expect("parse explicit PASS fixture");
         let oracle = kernel_owner_oracle(&project);
+        assert!(
+            oracle.unsupported.is_empty(),
+            "explicit PASS fixture must compile: {:#?}",
+            oracle.unsupported,
+        );
         let results = oracle
             .supported
             .iter()
@@ -16739,12 +17346,19 @@ mod tests {
             .program
             .expect("callable fixture checks")
             .into_parts();
-        let [direct] = report.checked_callables.as_ref() else {
-            panic!(
-                "kernel must materialize one user callable: {:#?}",
-                report.checked_callables
-            )
-        };
+        let direct = report
+            .checked_callables
+            .iter()
+            .find(|callable| {
+                callable.kind == boon_checked::CheckedCallableKind::User
+                    && callable.name == "contextual"
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "kernel must materialize contextual user callable: {:#?}",
+                    report.checked_callables
+                )
+            });
         let current = checked
             .callables
             .iter()
@@ -16857,6 +17471,143 @@ mod tests {
         )
         .0;
         assert_eq!(direct_context, current_context);
+    }
+
+    #[test]
+    fn referenced_abi_callable_materializes_from_the_kernel_project_contract() {
+        let source = concat!(
+            "rows:\n",
+            "    LIST {\n",
+            "        1\n",
+            "        2\n",
+            "    }\n",
+            "    |> List/map(item, new: item)\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse direct ABI fixture");
+        let report = kernel_owner_oracle(&project);
+        assert!(
+            report.unsupported.is_empty(),
+            "direct ABI fixture must compile: {:#?}",
+            report.unsupported,
+        );
+        let parsed = parse_source("app/RUN.bn", source).expect("parse current ABI fixture");
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            !checked.report.has_errors(),
+            "current ABI diagnostics: {:#?}",
+            checked.report.diagnostics,
+        );
+        let (checked, _) = checked.program.expect("ABI fixture checks").into_parts();
+        let direct = report
+            .checked_callables
+            .iter()
+            .find(|callable| callable.name == "List/map")
+            .expect("kernel materializes referenced List/map ABI");
+        let current = checked
+            .callables
+            .iter()
+            .find(|callable| callable.name == "List/map")
+            .expect("current checker materializes referenced List/map ABI");
+        assert_eq!(direct.kind, current.kind);
+        assert_eq!(direct.role, current.role);
+        assert_eq!(direct.intrinsic, current.intrinsic);
+        assert_eq!(direct.external_identity, current.external_identity);
+        assert_eq!(direct.effect, current.effect);
+        assert!(direct.body.is_none());
+        assert!(direct.result_expression.is_none());
+        assert_eq!(direct.parameters.len(), current.parameters.len());
+        for (direct_parameter, current_parameter) in
+            direct.parameters.iter().zip(&current.parameters)
+        {
+            assert_eq!(direct_parameter.name, current_parameter.name);
+            assert_eq!(direct_parameter.kind, current_parameter.kind);
+            assert_eq!(direct_parameter.ordinal, current_parameter.ordinal);
+            assert_eq!(direct_parameter.requirement, current_parameter.requirement);
+            let output_ordinal =
+                |callable: &CheckedCallableSignature,
+                 scope: boon_checked::CheckedEvaluationScope| {
+                    match scope {
+                        boon_checked::CheckedEvaluationScope::Parent => None,
+                        boon_checked::CheckedEvaluationScope::Output { formal } => callable
+                            .parameters
+                            .iter()
+                            .find(|parameter| parameter.decl_id == formal)
+                            .map(|parameter| parameter.ordinal),
+                    }
+                };
+            assert_eq!(
+                output_ordinal(direct, direct_parameter.evaluation_scope),
+                output_ordinal(current, current_parameter.evaluation_scope),
+            );
+            let direct_declaration = report
+                .checked_declarations
+                .iter()
+                .find(|declaration| declaration.id == direct_parameter.decl_id)
+                .expect("direct ABI parameter declaration");
+            let current_declaration = checked
+                .declarations
+                .iter()
+                .find(|declaration| declaration.id == current_parameter.decl_id)
+                .expect("current ABI parameter declaration");
+            assert_eq!(direct_declaration.name, current_declaration.name);
+            assert_eq!(direct_declaration.kind, current_declaration.kind);
+        }
+        let direct_surface = alpha_normalize_callable_surface(
+            &direct
+                .parameters
+                .iter()
+                .map(|parameter| parameter.flow_type.clone())
+                .chain(
+                    direct
+                        .contexts
+                        .iter()
+                        .map(|context| context.flow_type.clone()),
+                )
+                .collect::<Vec<_>>(),
+            &direct.result,
+        );
+        let current_surface = alpha_normalize_callable_surface(
+            &current
+                .parameters
+                .iter()
+                .map(|parameter| parameter.flow_type.clone())
+                .chain(
+                    current
+                        .contexts
+                        .iter()
+                        .map(|context| context.flow_type.clone()),
+                )
+                .collect::<Vec<_>>(),
+            &current.result,
+        );
+        assert_eq!(direct_surface, current_surface);
+        let parameter_ordinal =
+            |callable: &CheckedCallableSignature, declaration: boon_checked::DeclId| {
+                callable
+                    .parameters
+                    .iter()
+                    .find(|parameter| parameter.decl_id == declaration)
+                    .map(|parameter| parameter.ordinal)
+            };
+        let Some(boon_checked::CheckedContextualOperation::Map { list, row, body }) =
+            direct.contextual_operation
+        else {
+            panic!("direct List/map ABI lost its contextual operation")
+        };
+        assert_eq!(parameter_ordinal(direct, list), Some(0));
+        assert_eq!(parameter_ordinal(direct, row), Some(1));
+        assert_eq!(parameter_ordinal(direct, body), Some(2));
+        assert_eq!(direct.contexts.len(), current.contexts.len());
+        for (direct_context, current_context) in direct.contexts.iter().zip(&current.contexts) {
+            assert_eq!(direct_context.name, current_context.name);
+            assert_eq!(direct_context.kind, current_context.kind);
+            assert_eq!(
+                parameter_ordinal(direct, direct_context.provider),
+                parameter_ordinal(current, current_context.provider),
+            );
+        }
     }
 
     #[test]
@@ -18333,6 +19084,20 @@ mod tests {
         mismatches.extend(direct_callable_inventory_mismatches(
             &report, fields, &project,
         ));
+        mismatches.extend(direct_call_inventory_mismatches(
+            &report,
+            fields,
+            &stable_by_checked_expression,
+            false,
+        ));
+        eprintln!(
+            "kernel-novywave direct_call_syntax_provenance_mismatches={}",
+            direct_call_syntax_provenance_mismatch_count(
+                &report,
+                fields,
+                &stable_by_checked_expression,
+            )
+        );
         mismatches.extend(call_and_effect_inventory_mismatches(
             &report,
             fields,

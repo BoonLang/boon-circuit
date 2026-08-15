@@ -734,6 +734,7 @@ pub struct KernelCallSyntaxArgument {
     pub kind: KernelCallArgumentKind,
     pub name: Box<str>,
     pub value: KernelExpressionId,
+    pub span: KernelSourceSpan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -1137,6 +1138,7 @@ pub struct KernelCallSyntaxArgumentArtifact {
     pub kind: KernelCallArgumentKind,
     pub name: Box<str>,
     pub value: KernelValueReference,
+    pub span: KernelSourceSpan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -5488,6 +5490,7 @@ fn collect_call_syntax_artifacts(
                             kind: argument.kind,
                             name: argument.name.clone(),
                             value: kernel_value_reference(input, argument.value, call_index)?,
+                            span: argument.span,
                         })
                     })
                     .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?
@@ -14179,6 +14182,7 @@ mod tests {
                 kind: KernelCallArgumentKind::Named,
                 name: "other".into(),
                 value: KernelExpressionId(1),
+                span: KernelSourceSpan::default(),
             }]
             .into_boxed_slice(),
             pass: None,

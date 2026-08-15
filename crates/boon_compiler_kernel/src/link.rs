@@ -6,18 +6,19 @@ use crate::{
     KernelValueReference, derive_kernel_call_type_substitutions,
 };
 use boon_checked::{
-    CheckedBlockBinding, CheckedCall, CheckedCallEntry, CheckedCallId, CheckedCallableContext,
-    CheckedCallableKind, CheckedCallableSignature, CheckedContextBinding, CheckedContextFormal,
-    CheckedContextScheme, CheckedContextTypeSubstitution, CheckedContextualOperation,
-    CheckedDeclaration, CheckedDeclarationKind, CheckedEffectSummary, CheckedEvaluationScope,
-    CheckedExprId, CheckedExpression, CheckedExpressionKind, CheckedList, CheckedListId,
-    CheckedMatchPattern, CheckedParameter, CheckedParameterKind, CheckedParameterRequirement,
-    CheckedPassedAccess, CheckedRecordField, CheckedResourceBinding, CheckedScope,
-    CheckedScopeKind, CheckedSemanticPath, CheckedSource, CheckedSourceId, CheckedSourceRead,
-    CheckedSpan, CheckedState, CheckedStateId, CheckedStatement, CheckedStatementId,
-    CheckedStatementKind, CheckedTextSegment, CheckedTypeSubstitution, CheckedValueUse,
-    ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId, ObjectShape, ProgramRole, Type,
-    TypeVar, Variant,
+    CheckedBlockBinding, CheckedCall, CheckedCallEntry, CheckedCallId, CheckedCallResultPath,
+    CheckedCallableContext, CheckedCallableKind, CheckedCallableSignature, CheckedContextBinding,
+    CheckedContextFormal, CheckedContextScheme, CheckedContextTypeSubstitution,
+    CheckedContextualOperation, CheckedDeclaration, CheckedDeclarationKind, CheckedEffectSummary,
+    CheckedEvaluationScope, CheckedExprId, CheckedExpression, CheckedExpressionKind, CheckedList,
+    CheckedListId, CheckedMatchPattern, CheckedParameter, CheckedParameterKind,
+    CheckedParameterRequirement, CheckedPassedAccess, CheckedPatternBinding, CheckedRecordField,
+    CheckedResourceBinding, CheckedResourceProjectionRequirement, CheckedScope, CheckedScopeKind,
+    CheckedSemanticPath, CheckedSource, CheckedSourceId, CheckedSourceRead, CheckedSpan,
+    CheckedState, CheckedStateId, CheckedStatement, CheckedStatementId, CheckedStatementKind,
+    CheckedTextSegment, CheckedTypeSubstitution, CheckedValueUse, ContextFormalId, DeclId,
+    FlowMode, FlowType, LexicalScopeId, ObjectShape, ProgramRole, SemanticOccurrence,
+    SemanticOccurrenceKind, Type, TypeVar, Variant,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -97,6 +98,204 @@ pub struct KernelCheckedLinkTotals {
     pub states: u32,
     pub lists: u32,
     pub resolved_references: u64,
+}
+
+/// Complete dense checked rows materialized from one kernel snapshot.
+///
+/// This is the single projection seam between definition-local kernel
+/// artifacts and the existing checked model. Source-unit coordinate rebasing
+/// and project-level semantic indexes remain orchestration concerns; callers
+/// must not re-run per-row linker methods independently.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelCheckedRows {
+    pub scopes: Box<[CheckedScope]>,
+    pub declarations: Box<[CheckedDeclaration]>,
+    pub expressions: Box<[CheckedExpression]>,
+    pub statements: Box<[CheckedStatement]>,
+    pub callables: Box<[CheckedCallableSignature]>,
+    pub context_formals: Box<[CheckedContextFormal]>,
+    pub calls: Box<[CheckedCall]>,
+    pub call_result_paths: Box<[CheckedCallResultPath]>,
+    pub pattern_bindings: Box<[CheckedPatternBinding]>,
+    pub resource_projection_requirements: Box<[CheckedResourceProjectionRequirement]>,
+    pub sources: Box<[CheckedSource]>,
+    pub states: Box<[CheckedState]>,
+    pub lists: Box<[CheckedList]>,
+    pub occurrences: Box<[SemanticOccurrence]>,
+    occurrence_ranges: Box<[KernelCheckedRowRange]>,
+}
+
+impl KernelCheckedRows {
+    /// Rebase every source-bearing row owned by one definition from source-unit
+    /// coordinates into the project-wide checked coordinate system.
+    ///
+    /// Keeping this operation beside the row materializer prevents the compiler
+    /// facade from maintaining one relocation loop per table and guarantees new
+    /// source-bearing tables participate in the same pass.
+    pub fn rebase_definition_spans(
+        &mut self,
+        layout: &KernelCheckedLinkLayout,
+        owner: KernelOwnerId,
+        start_line: usize,
+        start_byte: usize,
+    ) -> Result<(), KernelCheckedLinkError> {
+        let definition = layout.definition(owner)?;
+        for row in checked_range(definition.scopes)? {
+            let scope = self.scopes.get_mut(row).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel checked scope linker references missing row {row}"
+                ))
+            })?;
+            rebase_checked_span(
+                &mut scope.span,
+                start_line,
+                start_byte,
+                &format!("kernel checked scope row {row}"),
+            )?;
+        }
+        for declaration_id in checked_range(definition.declarations)? {
+            let row = declaration_id.checked_sub(1).ok_or_else(|| {
+                KernelCheckedLinkError::new(
+                    "kernel checked declaration row uses reserved identity zero",
+                )
+            })?;
+            let declaration = self.declarations.get_mut(row).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel checked declaration linker references missing row {declaration_id}"
+                ))
+            })?;
+            rebase_checked_span(
+                &mut declaration.span,
+                start_line,
+                start_byte,
+                &format!("kernel checked declaration row {declaration_id}"),
+            )?;
+        }
+        for row in checked_range(definition.expressions)? {
+            let expression = self.expressions.get_mut(row).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel checked expression linker references missing row {row}"
+                ))
+            })?;
+            rebase_checked_expression_spans(expression, start_line, start_byte)?;
+        }
+        for row in checked_range(definition.statements)? {
+            let statement = self.statements.get_mut(row).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel checked statement linker references missing row {row}"
+                ))
+            })?;
+            rebase_checked_span(
+                &mut statement.span,
+                start_line,
+                start_byte,
+                &format!("kernel checked statement row {row}"),
+            )?;
+        }
+        for row in checked_range(definition.sources)? {
+            let source = self.sources.get_mut(row).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel checked SOURCE linker references missing row {row}"
+                ))
+            })?;
+            rebase_checked_span(
+                &mut source.span,
+                start_line,
+                start_byte,
+                &format!("kernel checked SOURCE row {row}"),
+            )?;
+        }
+        for row in checked_range(definition.states)? {
+            let state = self.states.get_mut(row).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel checked state linker references missing row {row}"
+                ))
+            })?;
+            rebase_checked_span(
+                &mut state.span,
+                start_line,
+                start_byte,
+                &format!("kernel checked state row {row}"),
+            )?;
+        }
+        for row in checked_range(definition.lists)? {
+            let list = self.lists.get_mut(row).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel checked LIST linker references missing row {row}"
+                ))
+            })?;
+            rebase_checked_span(
+                &mut list.span,
+                start_line,
+                start_byte,
+                &format!("kernel checked LIST row {row}"),
+            )?;
+        }
+        for row in checked_range(definition.calls)? {
+            let call = self.calls.get_mut(row).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel checked call linker references missing row {row}"
+                ))
+            })?;
+            rebase_checked_span(
+                &mut call.span,
+                start_line,
+                start_byte,
+                &format!("kernel checked call row {row}"),
+            )?;
+            if let CheckedContextBinding::Explicit { span, .. } = &mut call.context_binding {
+                rebase_checked_span(
+                    span,
+                    start_line,
+                    start_byte,
+                    &format!("kernel checked call row {row} PASS"),
+                )?;
+            }
+        }
+        let occurrence_range = *self
+            .occurrence_ranges
+            .get(owner.0 as usize)
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel checked occurrence ranges omit definition {}",
+                    owner.0,
+                ))
+            })?;
+        for row in checked_range(occurrence_range)? {
+            let occurrence = self.occurrences.get_mut(row).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel checked occurrence linker references missing row {row}"
+                ))
+            })?;
+            rebase_checked_span(
+                &mut occurrence.span,
+                start_line,
+                start_byte,
+                &format!("kernel checked occurrence row {row}"),
+            )?;
+        }
+        if let Some(callable) = self
+            .callables
+            .iter_mut()
+            .find(|callable| callable.decl_id == definition.public_declaration)
+        {
+            for parameter in &mut callable.parameters {
+                parameter.start = start_byte.checked_add(parameter.start).ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel checked callable {} parameter start overflowed",
+                        callable.name,
+                    ))
+                })?;
+                parameter.end = start_byte.checked_add(parameter.end).ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel checked callable {} parameter end overflowed",
+                        callable.name,
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One prefix-sum relocation plan for a complete kernel checked snapshot.
@@ -363,6 +562,453 @@ impl KernelCheckedLinkLayout {
         };
         layout.validate_references(snapshot)?;
         Ok(layout)
+    }
+
+    /// Materialize every currently kernel-owned checked row through this one
+    /// relocation plan. ABI rows are appended before calls are linked so call
+    /// targets resolve in the same namespace as user definitions.
+    pub fn materialize_rows(
+        &self,
+        project: &KernelProjectInput,
+        snapshot: &KernelCheckedSnapshot,
+        role: ProgramRole,
+    ) -> Result<KernelCheckedRows, KernelCheckedLinkError> {
+        let scopes = self.materialize_scopes(snapshot)?;
+        let mut declarations = self.materialize_declarations(snapshot)?.into_vec();
+        let expressions = self.materialize_expressions(snapshot)?;
+        let statements = self.materialize_statements(snapshot)?;
+        let sources = self.materialize_sources(snapshot)?;
+        let states = self.materialize_states(snapshot)?;
+        let lists = self.materialize_lists(snapshot)?;
+        let (user_callables, context_formals) = self.materialize_user_callables(snapshot, role)?;
+        let mut callables = user_callables.into_vec();
+        let (abi_callables, abi_declarations) = self.materialize_abi_callables(project.abi())?;
+        callables.extend(abi_callables);
+        declarations.extend(abi_declarations);
+        let calls = self.materialize_calls(project, snapshot, &callables, &declarations)?;
+        let call_result_paths =
+            self.materialize_call_result_paths(&declarations, &callables, &expressions, &calls)?;
+        let pattern_bindings = self.materialize_pattern_bindings(snapshot)?;
+        let resource_projection_requirements = checked_resource_projection_requirements(
+            &declarations,
+            &callables,
+            &calls,
+            &expressions,
+            &sources,
+        );
+        let (occurrences, occurrence_ranges) =
+            self.materialize_occurrences(snapshot, &declarations, &expressions, &calls)?;
+        Ok(KernelCheckedRows {
+            scopes,
+            declarations: declarations.into_boxed_slice(),
+            expressions,
+            statements,
+            callables: callables.into_boxed_slice(),
+            context_formals,
+            calls,
+            call_result_paths,
+            pattern_bindings,
+            resource_projection_requirements,
+            sources,
+            states,
+            lists,
+            occurrences,
+            occurrence_ranges,
+        })
+    }
+
+    /// Link pattern-binding declaration authority directly from the exact
+    /// match-arm execution shape retained by each definition artifact.
+    ///
+    /// The selector is intentionally not rediscovered from a surrounding WHEN
+    /// expression: static arm pruning can remove that structural edge while
+    /// the binding still owns its authored selector occurrence.
+    pub fn materialize_pattern_bindings(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<Box<[CheckedPatternBinding]>, KernelCheckedLinkError> {
+        self.validate_snapshot_definition_count(snapshot, "pattern binding")?;
+        let mut bindings = Vec::new();
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = checked_owner_id(owner_index, "pattern binding")?;
+            for shape in &definition.execution_shapes {
+                let crate::KernelExecutionShapeArtifact::MatchArm {
+                    expression,
+                    selector,
+                    bindings: arm_bindings,
+                } = shape
+                else {
+                    continue;
+                };
+                let arm = definition
+                    .expressions
+                    .get(expression.0 as usize)
+                    .filter(|arm| arm.id == *expression)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {} match-arm shape references missing expression {}",
+                            owner.0, expression.0,
+                        ))
+                    })?;
+                let crate::KernelOwnerNodeKind::MatchArm { pattern } = &arm.kind else {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {} expression {} has a match-arm shape but kind {:?}",
+                        owner.0, expression.0, arm.kind,
+                    )));
+                };
+                for (ordinal, binding) in arm_bindings.iter().enumerate() {
+                    let declaration = definition
+                        .declarations
+                        .get(binding.0 as usize)
+                        .filter(|declaration| declaration.id == *binding)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition {} match arm {} references missing binding declaration {}",
+                                owner.0, expression.0, binding.0,
+                            ))
+                        })?;
+                    if !matches!(
+                        declaration.origin,
+                        crate::KernelDeclarationOrigin::PatternBinding {
+                            arm: declaration_arm,
+                            ordinal: declaration_ordinal,
+                        } if declaration_arm == *expression
+                            && declaration_ordinal as usize == ordinal
+                    ) || declaration.kind != crate::KernelDeclarationKind::PatternBinding
+                    {
+                        return Err(KernelCheckedLinkError::new(format!(
+                            "kernel definition {} match arm {} binding {} has inconsistent declaration authority",
+                            owner.0, expression.0, binding.0,
+                        )));
+                    }
+                    let projection = match pattern {
+                        crate::KernelPattern::Tag { fields, .. }
+                            if fields
+                                .iter()
+                                .any(|field| field.as_ref() == declaration.name.as_ref()) =>
+                        {
+                            vec![declaration.name.to_string()]
+                        }
+                        _ => Vec::new(),
+                    };
+                    bindings.push(CheckedPatternBinding {
+                        declaration: self
+                            .declaration(owner, KernelDeclarationReference::Local(*binding))?,
+                        selector: self.expression(owner, *selector)?,
+                        projection,
+                    });
+                }
+            }
+        }
+        bindings.sort_unstable_by_key(|binding| binding.declaration);
+        Ok(bindings.into_boxed_slice())
+    }
+
+    /// Derive each call's stable storage path from the already-linked checked
+    /// expression graph. This is a single linear-table postpass; it performs no
+    /// type inference and does not reopen source-shaped owner products.
+    pub fn materialize_call_result_paths(
+        &self,
+        declarations: &[CheckedDeclaration],
+        callables: &[CheckedCallableSignature],
+        expressions: &[CheckedExpression],
+        calls: &[CheckedCall],
+    ) -> Result<Box<[CheckedCallResultPath]>, KernelCheckedLinkError> {
+        let declaration_values = declarations
+            .iter()
+            .filter_map(|declaration| declaration.value.map(|value| (declaration.id, value)))
+            .collect::<BTreeMap<_, _>>();
+        let callable_results = callables
+            .iter()
+            .filter_map(|callable| {
+                callable
+                    .result_expression
+                    .map(|expression| (callable.decl_id, expression))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let calls_by_id = calls
+            .iter()
+            .map(|call| (call.id, call))
+            .collect::<BTreeMap<_, _>>();
+        if calls_by_id.len() != calls.len() {
+            return Err(KernelCheckedLinkError::new(
+                "kernel checked call-result path materializer received duplicate call IDs",
+            ));
+        }
+        let mut paths = Vec::new();
+        for call in calls {
+            let expression = expressions
+                .get(call.expression.0 as usize)
+                .filter(|expression| expression.id == call.expression)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel checked call {} references missing expression {}",
+                        call.id.0, call.expression.0,
+                    ))
+                })?;
+            let Some(anchor) = expression.declaration else {
+                continue;
+            };
+            let Some(root) = declaration_values
+                .get(&anchor)
+                .copied()
+                .or_else(|| callable_results.get(&anchor).copied())
+            else {
+                continue;
+            };
+            let Some(projection) =
+                checked_projection_to_expression(expressions, &calls_by_id, root, call.expression)
+            else {
+                continue;
+            };
+            paths.push(CheckedCallResultPath {
+                call: call.id,
+                path: CheckedSemanticPath { anchor, projection },
+            });
+        }
+        paths.sort_unstable_by_key(|path| path.call);
+        Ok(paths.into_boxed_slice())
+    }
+
+    /// Emit the complete semantic occurrence inventory while source-local
+    /// declaration/call/expression spans are still available. Rows remain
+    /// grouped by definition so project coordinate rebasing is one bounded
+    /// range update per source owner.
+    pub fn materialize_occurrences(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        declarations: &[CheckedDeclaration],
+        expressions: &[CheckedExpression],
+        calls: &[CheckedCall],
+    ) -> Result<(Box<[SemanticOccurrence]>, Box<[KernelCheckedRowRange]>), KernelCheckedLinkError>
+    {
+        self.validate_snapshot_definition_count(snapshot, "occurrence")?;
+        let declaration_by_id = declarations
+            .iter()
+            .map(|declaration| (declaration.id, declaration))
+            .collect::<BTreeMap<_, _>>();
+        let mut occurrences = Vec::new();
+        let mut ranges = Vec::with_capacity(snapshot.definitions.len());
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = checked_owner_id(owner_index, "occurrence")?;
+            let linked = self.definition(owner)?;
+            let range_start = u32::try_from(occurrences.len()).map_err(|_| {
+                KernelCheckedLinkError::new("kernel checked occurrence count exceeds u32")
+            })?;
+            let mut declared = BTreeSet::new();
+
+            // Authored declarations precede call-generated occurrences. Inline
+            // record fields are lexical projection anchors, not authored-name
+            // occurrences in the public checked index. Fresh OUT and
+            // call-context declarations are emitted at their exact call
+            // position below, matching their source authority.
+            for declaration in &definition.declarations {
+                if matches!(
+                    declaration.origin,
+                    crate::KernelDeclarationOrigin::RecordField { .. }
+                        | crate::KernelDeclarationOrigin::CallbackBinding { .. }
+                        | crate::KernelDeclarationOrigin::CallContext { .. }
+                ) {
+                    continue;
+                }
+                let target =
+                    self.declaration(owner, KernelDeclarationReference::Local(declaration.id))?;
+                let row = declaration_by_id.get(&target).copied().ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel definition {} occurrence references missing declaration {}",
+                        owner.0, target.0,
+                    ))
+                })?;
+                if !declared.insert(target) {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {} repeats declaration occurrence {}",
+                        owner.0, target.0,
+                    )));
+                }
+                occurrences.push(SemanticOccurrence {
+                    target,
+                    kind: SemanticOccurrenceKind::Declaration,
+                    span: row.span,
+                });
+            }
+
+            let mut syntax_by_expression = BTreeMap::new();
+            for syntax in &definition.call_syntax {
+                if syntax_by_expression
+                    .insert(syntax.expression, syntax)
+                    .is_some()
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {} repeats authored call expression {}",
+                        owner.0, syntax.expression.0,
+                    )));
+                }
+            }
+            for (ordinal, artifact_call) in definition.calls.iter().enumerate() {
+                let row = linked.calls.start as usize + ordinal;
+                let call = calls
+                    .get(row)
+                    .filter(|call| call.id.0 as usize == row)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {} occurrence references missing call row {row}",
+                            owner.0,
+                        ))
+                    })?;
+                let syntax = syntax_by_expression
+                    .get(&artifact_call.expression)
+                    .copied()
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {} call expression {} has no authored occurrence surface",
+                            owner.0, artifact_call.expression.0,
+                        ))
+                    })?;
+                for entry in &call.entries {
+                    match entry {
+                        CheckedCallEntry::FreshOut { output, .. } => {
+                            let declaration = declaration_by_id.get(output).copied().ok_or_else(|| {
+                                KernelCheckedLinkError::new(format!(
+                                    "kernel definition {} FreshOut occurrence references missing declaration {}",
+                                    owner.0, output.0,
+                                ))
+                            })?;
+                            if !declared.insert(*output) {
+                                return Err(KernelCheckedLinkError::new(format!(
+                                    "kernel definition {} repeats FreshOut occurrence {}",
+                                    owner.0, output.0,
+                                )));
+                            }
+                            occurrences.push(SemanticOccurrence {
+                                target: *output,
+                                kind: SemanticOccurrenceKind::FreshOut,
+                                span: declaration.span,
+                            });
+                        }
+                        CheckedCallEntry::ForwardOut { name, target, .. } => {
+                            let mut arguments = syntax.arguments.iter().filter(|argument| {
+                                argument.kind == KernelCallArgumentKind::Named
+                                    && argument.name.as_ref() == name
+                            });
+                            let argument = arguments.next().ok_or_else(|| {
+                                KernelCheckedLinkError::new(format!(
+                                    "kernel definition {} ForwardOut `{name}` has no authored argument occurrence",
+                                    owner.0,
+                                ))
+                            })?;
+                            if arguments.next().is_some() {
+                                return Err(KernelCheckedLinkError::new(format!(
+                                    "kernel definition {} ForwardOut `{name}` has multiple authored argument occurrences",
+                                    owner.0,
+                                )));
+                            }
+                            occurrences.push(SemanticOccurrence {
+                                target: *target,
+                                kind: SemanticOccurrenceKind::ForwardOut,
+                                span: checked_span(argument.span),
+                            });
+                        }
+                        CheckedCallEntry::Input { .. } => {}
+                    }
+                }
+                for context in &call.contexts {
+                    let declaration = declaration_by_id
+                        .get(&context.declaration)
+                        .copied()
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition {} call-context occurrence references missing declaration {}",
+                                owner.0, context.declaration.0,
+                            ))
+                        })?;
+                    if !declared.insert(context.declaration) {
+                        return Err(KernelCheckedLinkError::new(format!(
+                            "kernel definition {} repeats call-context declaration occurrence {}",
+                            owner.0, context.declaration.0,
+                        )));
+                    }
+                    occurrences.push(SemanticOccurrence {
+                        target: context.declaration,
+                        kind: SemanticOccurrenceKind::Declaration,
+                        span: declaration.span,
+                    });
+                }
+                occurrences.push(SemanticOccurrence {
+                    target: call.callable,
+                    kind: SemanticOccurrenceKind::Call,
+                    span: call.span,
+                });
+                if let CheckedContextBinding::Explicit { span, .. } = call.context_binding {
+                    occurrences.push(SemanticOccurrence {
+                        target: call.callable,
+                        kind: SemanticOccurrenceKind::Pass,
+                        span,
+                    });
+                }
+            }
+            let expected_declaration_occurrences = definition
+                .declarations
+                .iter()
+                .filter(|declaration| {
+                    !matches!(
+                        declaration.origin,
+                        crate::KernelDeclarationOrigin::RecordField { .. }
+                    )
+                })
+                .count();
+            if declared.len() != expected_declaration_occurrences {
+                let missing = definition
+                    .declarations
+                    .iter()
+                    .filter_map(|declaration| {
+                        if matches!(
+                            declaration.origin,
+                            crate::KernelDeclarationOrigin::RecordField { .. }
+                        ) {
+                            return None;
+                        }
+                        let target = self
+                            .declaration(owner, KernelDeclarationReference::Local(declaration.id))
+                            .ok()?;
+                        (!declared.contains(&target)).then_some(target.0)
+                    })
+                    .collect::<Vec<_>>();
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} has declarations without exact occurrences: {missing:?}",
+                    owner.0,
+                )));
+            }
+
+            for row in checked_range(linked.expressions)? {
+                let expression = expressions.get(row).filter(|expression| {
+                    expression.id == CheckedExprId(u32::try_from(row).unwrap_or(u32::MAX))
+                });
+                let Some(expression) = expression else {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {} occurrence references missing expression row {row}",
+                        owner.0,
+                    )));
+                };
+                let target = match expression.kind {
+                    CheckedExpressionKind::Read { target, .. }
+                    | CheckedExpressionKind::Drain { target, .. } => target,
+                    _ => continue,
+                };
+                occurrences.push(SemanticOccurrence {
+                    target,
+                    kind: SemanticOccurrenceKind::Read,
+                    span: expression.span,
+                });
+            }
+            let range_end = u32::try_from(occurrences.len()).map_err(|_| {
+                KernelCheckedLinkError::new("kernel checked occurrence count exceeds u32")
+            })?;
+            ranges.push(KernelCheckedRowRange {
+                start: range_start,
+                len: range_end - range_start,
+            });
+        }
+        Ok((occurrences.into_boxed_slice(), ranges.into_boxed_slice()))
     }
 
     pub fn definitions(&self) -> &[KernelCheckedDefinitionLayout] {
@@ -2654,6 +3300,82 @@ fn exact_local_declaration_by_origin<'a>(
     Ok(declaration)
 }
 
+fn checked_range(
+    range: KernelCheckedRowRange,
+) -> Result<std::ops::Range<usize>, KernelCheckedLinkError> {
+    let start = range.start as usize;
+    let end = range
+        .start
+        .checked_add(range.len)
+        .ok_or_else(|| KernelCheckedLinkError::new("kernel checked row range overflowed"))?
+        as usize;
+    Ok(start..end)
+}
+
+fn rebase_checked_span(
+    span: &mut CheckedSpan,
+    start_line: usize,
+    start_byte: usize,
+    label: &str,
+) -> Result<(), KernelCheckedLinkError> {
+    span.line =
+        start_line
+            .checked_add(span.line.checked_sub(1).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!("{label} has no source line"))
+            })?)
+            .ok_or_else(|| KernelCheckedLinkError::new(format!("{label} line overflowed")))?;
+    span.start = start_byte
+        .checked_add(span.start)
+        .ok_or_else(|| KernelCheckedLinkError::new(format!("{label} start overflowed")))?;
+    span.end = start_byte
+        .checked_add(span.end)
+        .ok_or_else(|| KernelCheckedLinkError::new(format!("{label} end overflowed")))?;
+    Ok(())
+}
+
+fn rebase_checked_expression_spans(
+    expression: &mut CheckedExpression,
+    start_line: usize,
+    start_byte: usize,
+) -> Result<(), KernelCheckedLinkError> {
+    rebase_checked_span(
+        &mut expression.span,
+        start_line,
+        start_byte,
+        &format!("kernel checked expression row {}", expression.id.0),
+    )?;
+    let structural_fields: &mut [_] = match &mut expression.kind {
+        CheckedExpressionKind::TaggedObject { fields, .. }
+        | CheckedExpressionKind::Object { fields } => fields.as_mut_slice(),
+        _ => &mut [],
+    };
+    for (ordinal, field) in structural_fields.iter_mut().enumerate() {
+        rebase_checked_span(
+            &mut field.span,
+            start_line,
+            start_byte,
+            &format!(
+                "kernel checked expression row {} field {ordinal}",
+                expression.id.0,
+            ),
+        )?;
+    }
+    if let CheckedExpressionKind::Block { bindings, .. } = &mut expression.kind {
+        for (ordinal, binding) in bindings.iter_mut().enumerate() {
+            rebase_checked_span(
+                &mut binding.span,
+                start_line,
+                start_byte,
+                &format!(
+                    "kernel checked expression row {} BLOCK binding {ordinal}",
+                    expression.id.0,
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn checked_span(span: crate::KernelSourceSpan) -> CheckedSpan {
     CheckedSpan {
         line: span.line,
@@ -3164,6 +3886,839 @@ fn checked_match_pattern(
         },
         crate::KernelMatchPatternPayload::Invalid => return None,
     })
+}
+
+fn checked_projection_to_expression(
+    expressions: &[CheckedExpression],
+    calls: &BTreeMap<CheckedCallId, &CheckedCall>,
+    root: CheckedExprId,
+    target: CheckedExprId,
+) -> Option<Vec<String>> {
+    fn visit(
+        expressions: &[CheckedExpression],
+        calls: &BTreeMap<CheckedCallId, &CheckedCall>,
+        current: CheckedExprId,
+        target: CheckedExprId,
+        visiting: &mut BTreeSet<CheckedExprId>,
+    ) -> Option<Vec<String>> {
+        if current == target {
+            return Some(Vec::new());
+        }
+        if !visiting.insert(current) {
+            return None;
+        }
+        let expression = expressions
+            .get(current.0 as usize)
+            .filter(|expression| expression.id == current)?;
+        let direct =
+            |child, visiting: &mut BTreeSet<_>| visit(expressions, calls, child, target, visiting);
+        let result = match &expression.kind {
+            CheckedExpressionKind::TaggedObject { fields, .. }
+            | CheckedExpressionKind::Object { fields } => fields.iter().find_map(|field| {
+                let mut projection = direct(field.value, visiting)?;
+                projection.insert(0, field.name.clone());
+                Some(projection)
+            }),
+            CheckedExpressionKind::Call { call } => calls
+                .get(call)
+                .into_iter()
+                .flat_map(|call| &call.entries)
+                .find_map(|entry| match entry {
+                    CheckedCallEntry::Input { value, .. } => direct(*value, visiting),
+                    CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => None,
+                }),
+            CheckedExpressionKind::Draining { input }
+            | CheckedExpressionKind::Hold { initial: input, .. } => direct(*input, visiting),
+            CheckedExpressionKind::Flush { payload } => direct(*payload, visiting),
+            CheckedExpressionKind::When { input, arms }
+            | CheckedExpressionKind::While { input, arms } => direct(*input, visiting)
+                .or_else(|| arms.iter().find_map(|arm| direct(*arm, visiting))),
+            CheckedExpressionKind::Then { input, output } => direct(*input, visiting)
+                .or_else(|| output.and_then(|output| direct(output, visiting))),
+            CheckedExpressionKind::Infix { left, right, .. } => {
+                direct(*left, visiting).or_else(|| direct(*right, visiting))
+            }
+            CheckedExpressionKind::MatchArm { output, .. } => {
+                output.and_then(|output| direct(output, visiting))
+            }
+            CheckedExpressionKind::Block { bindings, result } => bindings
+                .iter()
+                .find_map(|binding| direct(binding.value, visiting))
+                .or_else(|| result.and_then(|result| direct(result, visiting))),
+            CheckedExpressionKind::List { items, .. }
+            | CheckedExpressionKind::Bytes { items, .. }
+            | CheckedExpressionKind::Set { items }
+            | CheckedExpressionKind::Latest { branches: items } => {
+                items.iter().find_map(|item| direct(*item, visiting))
+            }
+            CheckedExpressionKind::Map { entries } => {
+                entries.iter().find_map(|entry| direct(*entry, visiting))
+            }
+            CheckedExpressionKind::MapEntry { key, value } => {
+                direct(*key, visiting).or_else(|| direct(*value, visiting))
+            }
+            CheckedExpressionKind::TextTemplate { segments } => {
+                segments.iter().find_map(|segment| match segment {
+                    CheckedTextSegment::Static { .. } => None,
+                    CheckedTextSegment::Dynamic { value } => direct(*value, visiting),
+                })
+            }
+            CheckedExpressionKind::Read { .. }
+            | CheckedExpressionKind::Passed { .. }
+            | CheckedExpressionKind::ExternalRead { .. }
+            | CheckedExpressionKind::Drain { .. }
+            | CheckedExpressionKind::Text { .. }
+            | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::Bits { .. }
+            | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Absent
+            | CheckedExpressionKind::Tag { .. }
+            | CheckedExpressionKind::Source
+            | CheckedExpressionKind::Delimiter
+            | CheckedExpressionKind::Invalid { .. } => None,
+        };
+        visiting.remove(&current);
+        result
+    }
+
+    visit(expressions, calls, root, target, &mut BTreeSet::new())
+}
+
+fn checked_resource_projection_requirements(
+    declarations: &[CheckedDeclaration],
+    callables: &[CheckedCallableSignature],
+    calls: &[CheckedCall],
+    expressions: &[CheckedExpression],
+    sources: &[CheckedSource],
+) -> Box<[CheckedResourceProjectionRequirement]> {
+    let mut resolver =
+        CheckedSourceProvenanceResolver::new(declarations, callables, calls, expressions, sources);
+    expressions
+        .iter()
+        .filter_map(|expression| {
+            let (target, projection) = match &expression.kind {
+                CheckedExpressionKind::Read {
+                    target,
+                    projection,
+                    source: None,
+                }
+                | CheckedExpressionKind::Drain { target, projection } => (*target, projection),
+                _ => return None,
+            };
+            if projection.is_empty() {
+                return None;
+            }
+            let required_type = if checked_type_is_specific(&expression.flow_type.ty) {
+                expression.flow_type.ty.clone()
+            } else {
+                projection.last().map_or(Type::Unknown, |field| {
+                    checked_source_payload_field_type(field)
+                })
+            };
+            Some(CheckedResourceProjectionRequirement {
+                expression: expression.id,
+                target,
+                projection: projection.clone(),
+                source_origins: resolver.sources_for_declaration(target, projection),
+                required_type,
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn checked_type_is_specific(ty: &Type) -> bool {
+    match ty {
+        Type::Absent | Type::UnresolvedShape { .. } | Type::Unknown | Type::Var(_) => false,
+        Type::Object(shape) if shape.open && shape.fields.is_empty() => false,
+        Type::List(item) if matches!(item.as_ref(), Type::Object(shape) if shape.open && shape.fields.is_empty()) => {
+            false
+        }
+        _ => true,
+    }
+}
+
+fn checked_source_payload_field_type(field: &str) -> Type {
+    match field {
+        "press" | "click" | "double_click" | "blur" | "change" | "key_down" => {
+            Type::object(ObjectShape::new(BTreeMap::new(), false))
+        }
+        "bytes" => Type::Bytes(boon_checked::BytesType::Dynamic),
+        _ => Type::Text,
+    }
+}
+
+struct CheckedSourcePathIndex<'a> {
+    by_anchor: BTreeMap<DeclId, Vec<&'a CheckedSource>>,
+}
+
+impl<'a> CheckedSourcePathIndex<'a> {
+    fn new(sources: &'a [CheckedSource]) -> Self {
+        let mut by_anchor = BTreeMap::<DeclId, Vec<&CheckedSource>>::new();
+        for source in sources {
+            by_anchor
+                .entry(source.path.anchor)
+                .or_default()
+                .push(source);
+        }
+        for candidates in by_anchor.values_mut() {
+            candidates.sort_by_key(|source| std::cmp::Reverse(source.path.projection.len()));
+        }
+        Self { by_anchor }
+    }
+
+    fn exact_read(&self, target: DeclId, projection: &[String]) -> Option<CheckedSourceRead> {
+        let mut matches = self.by_anchor.get(&target)?.iter().filter_map(|source| {
+            projection
+                .strip_prefix(source.path.projection.as_slice())
+                .map(|payload| (*source, payload))
+        });
+        let (source, payload) = matches.next()?;
+        if matches.next().is_some_and(|(candidate, _)| {
+            candidate.path.projection.len() == source.path.projection.len()
+        }) {
+            return None;
+        }
+        Some(CheckedSourceRead {
+            source: source.id,
+            payload_projection: canonical_checked_source_payload_projection(payload),
+        })
+    }
+}
+
+fn canonical_checked_source_payload_projection(projection: &[String]) -> Vec<String> {
+    if projection.is_empty() {
+        return Vec::new();
+    }
+    let suffix = projection.join(".");
+    let suffix = suffix
+        .strip_prefix("event.")
+        .or_else(|| suffix.strip_prefix("events."))
+        .unwrap_or(&suffix);
+    match suffix {
+        "change.text" => vec!["text".to_owned()],
+        "change.bytes" => vec!["bytes".to_owned()],
+        "key_down.key" => vec!["key".to_owned()],
+        "press" | "click" | "double_click" | "blur" | "change" | "key_down" => {
+            vec![suffix.to_owned()]
+        }
+        field if !field.contains('.') => vec![field.to_owned()],
+        _ => projection
+            .strip_prefix(&["event".to_owned()])
+            .or_else(|| projection.strip_prefix(&["events".to_owned()]))
+            .unwrap_or(projection)
+            .to_vec(),
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CheckedSourceResolution {
+    Declaration(DeclId, Vec<String>),
+    Expression(CheckedExprId, Vec<String>),
+    ListItem(CheckedExprId, Vec<String>),
+    Output(DeclId, Vec<String>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CheckedSourceResolutionNode {
+    Declaration(DeclId),
+    Expression(CheckedExprId),
+    ListItem(CheckedExprId),
+    Output(DeclId),
+}
+
+impl CheckedSourceResolution {
+    const fn node(&self) -> CheckedSourceResolutionNode {
+        match self {
+            Self::Declaration(declaration, _) => {
+                CheckedSourceResolutionNode::Declaration(*declaration)
+            }
+            Self::Expression(expression, _) => CheckedSourceResolutionNode::Expression(*expression),
+            Self::ListItem(expression, _) => CheckedSourceResolutionNode::ListItem(*expression),
+            Self::Output(declaration, _) => CheckedSourceResolutionNode::Output(*declaration),
+        }
+    }
+}
+
+struct CheckedSourceProvenanceResolver<'a> {
+    declarations: BTreeMap<DeclId, &'a CheckedDeclaration>,
+    callables: BTreeMap<DeclId, &'a CheckedCallableSignature>,
+    calls: BTreeMap<CheckedCallId, &'a CheckedCall>,
+    expressions: BTreeMap<CheckedExprId, &'a CheckedExpression>,
+    source_paths: CheckedSourcePathIndex<'a>,
+    source_expressions: BTreeMap<CheckedExprId, Vec<CheckedSourceId>>,
+    actual_inputs_by_formal: BTreeMap<DeclId, Vec<CheckedExprId>>,
+    contextual_lists_by_output: BTreeMap<DeclId, Vec<CheckedExprId>>,
+    forwarded_outputs_by_formal: BTreeMap<DeclId, Vec<DeclId>>,
+    declaration_cache: BTreeMap<(DeclId, Vec<String>), Vec<CheckedSourceRead>>,
+}
+
+impl<'a> CheckedSourceProvenanceResolver<'a> {
+    fn new(
+        declarations: &'a [CheckedDeclaration],
+        callables: &'a [CheckedCallableSignature],
+        calls: &'a [CheckedCall],
+        expressions: &'a [CheckedExpression],
+        sources: &'a [CheckedSource],
+    ) -> Self {
+        let callable_index = callables
+            .iter()
+            .map(|callable| (callable.decl_id, callable))
+            .collect::<BTreeMap<_, _>>();
+        let mut source_expressions = BTreeMap::<CheckedExprId, Vec<CheckedSourceId>>::new();
+        for source in sources {
+            source_expressions
+                .entry(source.expression)
+                .or_default()
+                .push(source.id);
+        }
+        let mut actual_inputs_by_formal = BTreeMap::<DeclId, Vec<CheckedExprId>>::new();
+        let mut contextual_lists_by_output = BTreeMap::<DeclId, Vec<CheckedExprId>>::new();
+        let mut forwarded_outputs_by_formal = BTreeMap::<DeclId, Vec<DeclId>>::new();
+        for call in calls {
+            let mut indexed_input_formals = BTreeSet::new();
+            for entry in &call.entries {
+                match entry {
+                    CheckedCallEntry::Input { formal, value, .. } => {
+                        if indexed_input_formals.insert(*formal) {
+                            actual_inputs_by_formal
+                                .entry(*formal)
+                                .or_default()
+                                .push(*value);
+                        }
+                    }
+                    CheckedCallEntry::FreshOut { formal, output, .. }
+                    | CheckedCallEntry::ForwardOut {
+                        formal,
+                        target: output,
+                        ..
+                    } => {
+                        forwarded_outputs_by_formal
+                            .entry(*formal)
+                            .or_default()
+                            .push(*output);
+                    }
+                }
+            }
+            let Some(operation) = callable_index
+                .get(&call.callable)
+                .and_then(|callable| callable.contextual_operation)
+            else {
+                continue;
+            };
+            let (list_formal, row_formal, _) = checked_contextual_operation_formals(operation);
+            let Some(list) = checked_call_formal_input(call, list_formal) else {
+                continue;
+            };
+            for entry in &call.entries {
+                let output = match entry {
+                    CheckedCallEntry::FreshOut { formal, output, .. } if *formal == row_formal => {
+                        Some(*output)
+                    }
+                    CheckedCallEntry::ForwardOut {
+                        formal,
+                        target: output,
+                        ..
+                    } if *formal == row_formal => Some(*output),
+                    _ => None,
+                };
+                if let Some(output) = output {
+                    contextual_lists_by_output
+                        .entry(output)
+                        .or_default()
+                        .push(list);
+                }
+            }
+        }
+        Self {
+            declarations: declarations
+                .iter()
+                .map(|declaration| (declaration.id, declaration))
+                .collect(),
+            callables: callable_index,
+            calls: calls.iter().map(|call| (call.id, call)).collect(),
+            expressions: expressions
+                .iter()
+                .map(|expression| (expression.id, expression))
+                .collect(),
+            source_paths: CheckedSourcePathIndex::new(sources),
+            source_expressions,
+            actual_inputs_by_formal,
+            contextual_lists_by_output,
+            forwarded_outputs_by_formal,
+            declaration_cache: BTreeMap::new(),
+        }
+    }
+
+    fn sources_for_declaration(
+        &mut self,
+        target: DeclId,
+        projection: &[String],
+    ) -> Vec<CheckedSourceRead> {
+        let key = (target, projection.to_vec());
+        if let Some(cached) = self.declaration_cache.get(&key) {
+            return cached.clone();
+        }
+        let mut explored = BTreeSet::new();
+        let mut active = BTreeSet::new();
+        let resolved = self
+            .declaration_sources(target, projection, &mut explored, &mut active)
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.declaration_cache.insert(key, resolved.clone());
+        resolved
+    }
+
+    fn declaration_sources(
+        &self,
+        target: DeclId,
+        projection: &[String],
+        explored: &mut BTreeSet<CheckedSourceResolution>,
+        active: &mut BTreeSet<CheckedSourceResolutionNode>,
+    ) -> BTreeSet<CheckedSourceRead> {
+        let key = CheckedSourceResolution::Declaration(target, projection.to_vec());
+        let node = key.node();
+        if active.contains(&node) || !explored.insert(key) {
+            return BTreeSet::new();
+        }
+        active.insert(node);
+        let mut resolved = BTreeSet::new();
+        if let Some(source) = self.source_paths.exact_read(target, projection) {
+            resolved.insert(source);
+        }
+        let Some(declaration) = self.declarations.get(&target).copied() else {
+            active.remove(&node);
+            return resolved;
+        };
+        if declaration.kind == CheckedDeclarationKind::ValueParameter {
+            for actual in self
+                .actual_inputs_by_formal
+                .get(&target)
+                .into_iter()
+                .flatten()
+            {
+                resolved.extend(self.expression_sources(*actual, projection, explored, active));
+            }
+        }
+        if matches!(
+            declaration.kind,
+            CheckedDeclarationKind::FreshOut | CheckedDeclarationKind::OutParameter
+        ) {
+            resolved.extend(self.output_sources(target, projection, explored, active));
+        }
+        if let Some(value) = declaration.value {
+            resolved.extend(self.expression_sources(value, projection, explored, active));
+        }
+        if let Some(result) = self
+            .callables
+            .get(&target)
+            .and_then(|callable| callable.result_expression)
+        {
+            resolved.extend(self.expression_sources(result, projection, explored, active));
+        }
+        active.remove(&node);
+        resolved
+    }
+
+    fn expression_sources(
+        &self,
+        expression_id: CheckedExprId,
+        projection: &[String],
+        explored: &mut BTreeSet<CheckedSourceResolution>,
+        active: &mut BTreeSet<CheckedSourceResolutionNode>,
+    ) -> BTreeSet<CheckedSourceRead> {
+        let key = CheckedSourceResolution::Expression(expression_id, projection.to_vec());
+        let node = key.node();
+        if active.contains(&node) || !explored.insert(key) {
+            return BTreeSet::new();
+        }
+        active.insert(node);
+        let mut resolved = BTreeSet::new();
+        if let Some(sources) = self.source_expressions.get(&expression_id) {
+            resolved.extend(sources.iter().map(|source| CheckedSourceRead {
+                source: *source,
+                payload_projection: canonical_checked_source_payload_projection(projection),
+            }));
+            active.remove(&node);
+            return resolved;
+        }
+        let Some(expression) = self.expressions.get(&expression_id).copied() else {
+            active.remove(&node);
+            return resolved;
+        };
+        match &expression.kind {
+            CheckedExpressionKind::Read {
+                target,
+                projection: read_projection,
+                ..
+            }
+            | CheckedExpressionKind::Drain {
+                target,
+                projection: read_projection,
+            } => {
+                let mut combined = read_projection.clone();
+                combined.extend_from_slice(projection);
+                resolved.extend(self.declaration_sources(*target, &combined, explored, active));
+            }
+            CheckedExpressionKind::TaggedObject { fields, .. }
+            | CheckedExpressionKind::Object { fields } => {
+                if let Some((field, rest)) = projection.split_first() {
+                    for candidate in fields.iter().filter(|candidate| candidate.name == *field) {
+                        resolved.extend(self.expression_sources(
+                            candidate.value,
+                            rest,
+                            explored,
+                            active,
+                        ));
+                    }
+                }
+            }
+            CheckedExpressionKind::Call { call } => {
+                if let Some(call) = self.calls.get(call).copied()
+                    && let Some(callable) = self.callables.get(&call.callable).copied()
+                {
+                    if callable.kind == CheckedCallableKind::User {
+                        if let Some(result) = callable.result_expression {
+                            resolved.extend(
+                                self.expression_sources(result, projection, explored, active),
+                            );
+                        }
+                    } else if (matches!(
+                        callable.contextual_operation,
+                        Some(CheckedContextualOperation::Find { .. })
+                    ) || matches!(
+                        call.function.as_str(),
+                        "List/get" | "List/latest" | "List/find"
+                    )) && let Some(list) = checked_call_input(call, "list")
+                    {
+                        resolved.extend(self.list_item_sources(list, projection, explored, active));
+                    }
+                }
+            }
+            CheckedExpressionKind::Draining { input }
+            | CheckedExpressionKind::Hold { initial: input, .. } => {
+                resolved.extend(self.expression_sources(*input, projection, explored, active));
+            }
+            CheckedExpressionKind::Flush { payload } => {
+                resolved.extend(self.expression_sources(*payload, projection, explored, active));
+            }
+            CheckedExpressionKind::Latest { branches } => {
+                for branch in branches {
+                    resolved.extend(self.expression_sources(*branch, projection, explored, active));
+                }
+            }
+            CheckedExpressionKind::When { arms, .. }
+            | CheckedExpressionKind::While { arms, .. } => {
+                for arm in arms {
+                    resolved.extend(self.expression_sources(*arm, projection, explored, active));
+                }
+            }
+            CheckedExpressionKind::Then { output, .. }
+            | CheckedExpressionKind::MatchArm { output, .. } => {
+                if let Some(output) = output {
+                    resolved.extend(self.expression_sources(*output, projection, explored, active));
+                }
+            }
+            CheckedExpressionKind::Block { result, .. } => {
+                if let Some(result) = result {
+                    resolved.extend(self.expression_sources(*result, projection, explored, active));
+                }
+            }
+            CheckedExpressionKind::MapEntry { key, value } => {
+                resolved.extend(self.expression_sources(*key, &[], explored, active));
+                resolved.extend(self.expression_sources(*value, projection, explored, active));
+            }
+            CheckedExpressionKind::Map { entries } => {
+                for entry in entries {
+                    resolved.extend(self.expression_sources(*entry, projection, explored, active));
+                }
+            }
+            CheckedExpressionKind::Set { items } => {
+                for item in items {
+                    resolved.extend(self.expression_sources(*item, projection, explored, active));
+                }
+            }
+            CheckedExpressionKind::List { .. }
+            | CheckedExpressionKind::Passed { .. }
+            | CheckedExpressionKind::ExternalRead { .. }
+            | CheckedExpressionKind::Text { .. }
+            | CheckedExpressionKind::TextTemplate { .. }
+            | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::Bits { .. }
+            | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Absent
+            | CheckedExpressionKind::Tag { .. }
+            | CheckedExpressionKind::Source
+            | CheckedExpressionKind::Infix { .. }
+            | CheckedExpressionKind::Bytes { .. }
+            | CheckedExpressionKind::Delimiter
+            | CheckedExpressionKind::Invalid { .. } => {}
+        }
+        active.remove(&node);
+        resolved
+    }
+
+    fn list_item_sources(
+        &self,
+        expression_id: CheckedExprId,
+        projection: &[String],
+        explored: &mut BTreeSet<CheckedSourceResolution>,
+        active: &mut BTreeSet<CheckedSourceResolutionNode>,
+    ) -> BTreeSet<CheckedSourceRead> {
+        let key = CheckedSourceResolution::ListItem(expression_id, projection.to_vec());
+        let node = key.node();
+        if active.contains(&node) || !explored.insert(key) {
+            return BTreeSet::new();
+        }
+        active.insert(node);
+        let mut resolved = BTreeSet::new();
+        let Some(expression) = self.expressions.get(&expression_id).copied() else {
+            active.remove(&node);
+            return resolved;
+        };
+        match &expression.kind {
+            CheckedExpressionKind::List { items, .. } => {
+                for item in items {
+                    resolved.extend(self.expression_sources(*item, projection, explored, active));
+                }
+            }
+            CheckedExpressionKind::Read {
+                target,
+                projection: list_projection,
+                ..
+            } => {
+                if list_projection.is_empty()
+                    && let Some(declaration) = self.declarations.get(target).copied()
+                {
+                    if declaration.kind == CheckedDeclarationKind::ValueParameter {
+                        for actual in self
+                            .actual_inputs_by_formal
+                            .get(target)
+                            .into_iter()
+                            .flatten()
+                        {
+                            resolved.extend(
+                                self.list_item_sources(*actual, projection, explored, active),
+                            );
+                        }
+                    }
+                    if let Some(value) = declaration.value {
+                        resolved
+                            .extend(self.list_item_sources(value, projection, explored, active));
+                    }
+                }
+            }
+            CheckedExpressionKind::Call { call } => {
+                if let Some(call) = self.calls.get(call).copied()
+                    && let Some(callable) = self.callables.get(&call.callable).copied()
+                {
+                    if callable.kind == CheckedCallableKind::User {
+                        if let Some(result) = callable.result_expression {
+                            resolved.extend(
+                                self.list_item_sources(result, projection, explored, active),
+                            );
+                        }
+                    } else {
+                        match callable.contextual_operation {
+                            Some(CheckedContextualOperation::Map { body, .. }) => {
+                                if let Some(body) = checked_call_formal_input(call, body) {
+                                    resolved.extend(
+                                        self.expression_sources(body, projection, explored, active),
+                                    );
+                                }
+                            }
+                            Some(
+                                CheckedContextualOperation::Filter { list, .. }
+                                | CheckedContextualOperation::Retain { list, .. }
+                                | CheckedContextualOperation::Remove { list, .. }
+                                | CheckedContextualOperation::SortBy { list, .. }
+                                | CheckedContextualOperation::ThenBy { list, .. },
+                            ) => {
+                                if let Some(list) = checked_call_formal_input(call, list) {
+                                    resolved.extend(
+                                        self.list_item_sources(list, projection, explored, active),
+                                    );
+                                }
+                            }
+                            Some(
+                                CheckedContextualOperation::Every { .. }
+                                | CheckedContextualOperation::Any { .. }
+                                | CheckedContextualOperation::Find { .. },
+                            )
+                            | None => {
+                                if matches!(call.function.as_str(), "List/take" | "List/page")
+                                    && let Some(list) = checked_call_input(call, "list")
+                                {
+                                    resolved.extend(
+                                        self.list_item_sources(list, projection, explored, active),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            CheckedExpressionKind::Draining { input }
+            | CheckedExpressionKind::Hold { initial: input, .. } => {
+                resolved.extend(self.list_item_sources(*input, projection, explored, active));
+            }
+            CheckedExpressionKind::Latest { branches } => {
+                for branch in branches {
+                    resolved.extend(self.list_item_sources(*branch, projection, explored, active));
+                }
+            }
+            CheckedExpressionKind::When { arms, .. }
+            | CheckedExpressionKind::While { arms, .. } => {
+                for arm in arms {
+                    resolved.extend(self.list_item_sources(*arm, projection, explored, active));
+                }
+            }
+            CheckedExpressionKind::Then { output, .. }
+            | CheckedExpressionKind::MatchArm { output, .. } => {
+                if let Some(output) = output {
+                    resolved.extend(self.list_item_sources(*output, projection, explored, active));
+                }
+            }
+            CheckedExpressionKind::Block { result, .. } => {
+                if let Some(result) = result {
+                    resolved.extend(self.list_item_sources(*result, projection, explored, active));
+                }
+            }
+            CheckedExpressionKind::TaggedObject { .. }
+            | CheckedExpressionKind::Object { .. }
+            | CheckedExpressionKind::MapEntry { .. }
+            | CheckedExpressionKind::Map { .. }
+            | CheckedExpressionKind::Set { .. }
+            | CheckedExpressionKind::Passed { .. }
+            | CheckedExpressionKind::ExternalRead { .. }
+            | CheckedExpressionKind::Drain { .. }
+            | CheckedExpressionKind::Text { .. }
+            | CheckedExpressionKind::TextTemplate { .. }
+            | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::Bits { .. }
+            | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Absent
+            | CheckedExpressionKind::Flush { .. }
+            | CheckedExpressionKind::Tag { .. }
+            | CheckedExpressionKind::Source
+            | CheckedExpressionKind::Infix { .. }
+            | CheckedExpressionKind::Bytes { .. }
+            | CheckedExpressionKind::Delimiter
+            | CheckedExpressionKind::Invalid { .. } => {}
+        }
+        active.remove(&node);
+        resolved
+    }
+
+    fn output_sources(
+        &self,
+        target: DeclId,
+        projection: &[String],
+        explored: &mut BTreeSet<CheckedSourceResolution>,
+        active: &mut BTreeSet<CheckedSourceResolutionNode>,
+    ) -> BTreeSet<CheckedSourceRead> {
+        let key = CheckedSourceResolution::Output(target, projection.to_vec());
+        let node = key.node();
+        if active.contains(&node) || !explored.insert(key) {
+            return BTreeSet::new();
+        }
+        active.insert(node);
+        let mut resolved = BTreeSet::new();
+        for list in self
+            .contextual_lists_by_output
+            .get(&target)
+            .into_iter()
+            .flatten()
+        {
+            resolved.extend(self.list_item_sources(*list, projection, explored, active));
+        }
+        for output in self
+            .forwarded_outputs_by_formal
+            .get(&target)
+            .into_iter()
+            .flatten()
+        {
+            resolved.extend(self.output_sources(*output, projection, explored, active));
+        }
+        active.remove(&node);
+        resolved
+    }
+}
+
+fn checked_call_formal_input(call: &CheckedCall, formal: DeclId) -> Option<CheckedExprId> {
+    call.entries.iter().find_map(|entry| match entry {
+        CheckedCallEntry::Input {
+            formal: candidate,
+            value,
+            ..
+        } if *candidate == formal => Some(*value),
+        CheckedCallEntry::Input { .. }
+        | CheckedCallEntry::FreshOut { .. }
+        | CheckedCallEntry::ForwardOut { .. } => None,
+    })
+}
+
+fn checked_call_input(call: &CheckedCall, name: &str) -> Option<CheckedExprId> {
+    call.entries.iter().find_map(|entry| match entry {
+        CheckedCallEntry::Input {
+            name: candidate,
+            value,
+            ..
+        } if candidate == name => Some(*value),
+        CheckedCallEntry::Input { .. }
+        | CheckedCallEntry::FreshOut { .. }
+        | CheckedCallEntry::ForwardOut { .. } => None,
+    })
+}
+
+const fn checked_contextual_operation_formals(
+    operation: CheckedContextualOperation,
+) -> (DeclId, DeclId, DeclId) {
+    match operation {
+        CheckedContextualOperation::Map { list, row, body }
+        | CheckedContextualOperation::Filter {
+            list,
+            row,
+            predicate: body,
+        }
+        | CheckedContextualOperation::Retain {
+            list,
+            row,
+            predicate: body,
+        }
+        | CheckedContextualOperation::Remove {
+            list,
+            row,
+            predicate: body,
+        }
+        | CheckedContextualOperation::Every {
+            list,
+            row,
+            predicate: body,
+        }
+        | CheckedContextualOperation::Any {
+            list,
+            row,
+            predicate: body,
+        }
+        | CheckedContextualOperation::Find {
+            list,
+            row,
+            predicate: body,
+        }
+        | CheckedContextualOperation::SortBy {
+            list,
+            row,
+            key: body,
+            ..
+        }
+        | CheckedContextualOperation::ThenBy {
+            list,
+            row,
+            key: body,
+            ..
+        } => (list, row, body),
+    }
 }
 
 fn lexical_payload_path(payload: &crate::KernelExpressionSemanticPayload) -> Option<String> {
@@ -4229,7 +5784,9 @@ mod tests {
             .into_boxed_slice(),
             result: KernelExpressionId(0),
         };
-        let provider_facts = facts(&unit, &provider_key, "provider");
+        let mut provider_facts = facts(&unit, &provider_key, "provider");
+        provider_facts.expression_payloads[0] =
+            crate::KernelExpressionSemanticPayload::Number(boon_data::ExactNumber::from_u64(1));
         let mut consumer_facts = facts(&unit, &consumer_key, "consumer");
         consumer_facts.statements[0].children =
             vec![KernelStatementChildReference::Owner(KernelOwnerId(0))].into_boxed_slice();
@@ -4273,6 +5830,37 @@ mod tests {
             layout.definitions()[1].root_statement,
             CheckedStatementId(1)
         );
+        let rows = layout
+            .materialize_rows(&project, &snapshot, ProgramRole::Client)
+            .expect("one linker call must materialize the complete checked-row surface");
+        assert_eq!(rows.scopes.len(), 1);
+        assert_eq!(rows.declarations.len(), 2);
+        assert_eq!(rows.expressions.len(), 2);
+        assert_eq!(rows.statements.len(), 2);
+        assert!(rows.callables.is_empty());
+        assert!(rows.context_formals.is_empty());
+        assert!(rows.calls.is_empty());
+        assert!(rows.call_result_paths.is_empty());
+        assert!(rows.pattern_bindings.is_empty());
+        assert!(rows.resource_projection_requirements.is_empty());
+        assert_eq!(rows.occurrences.len(), 3);
+        assert_eq!(
+            rows.occurrences
+                .iter()
+                .filter(|occurrence| occurrence.kind == SemanticOccurrenceKind::Declaration)
+                .count(),
+            2,
+        );
+        assert_eq!(
+            rows.occurrences
+                .iter()
+                .filter(|occurrence| occurrence.kind == SemanticOccurrenceKind::Read)
+                .count(),
+            1,
+        );
+        assert!(rows.sources.is_empty());
+        assert!(rows.states.is_empty());
+        assert!(rows.lists.is_empty());
 
         let imported = snapshot.definitions[1].expressions[0].inputs[0].value;
         assert_eq!(

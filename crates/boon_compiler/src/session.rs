@@ -2227,8 +2227,13 @@ impl CompilerSession {
             if state.diagnostics.is_none() {
                 let (parsed, parse_work, parse_ms) = parse_project_syntax_snapshot(state)?;
                 state.diagnostics = Some(
-                    compiler_diagnostics_from_kernel(parsed, parse_work, parse_ms)
-                        .map_err(session_error)?,
+                    compiler_diagnostics_from_kernel(
+                        parsed,
+                        parse_work,
+                        parse_ms,
+                        state.source.program_role,
+                    )
+                    .map_err(session_error)?,
                 );
             }
             if cancellation.is_canceled() {

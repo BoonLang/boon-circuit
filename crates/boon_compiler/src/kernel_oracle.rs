@@ -10,9 +10,9 @@
 
 use boon_checked::{
     CheckedCall, CheckedCallableSignature, CheckedContextFormal, CheckedDeclaration,
-    CheckedExpression, CheckedExpressionKind, CheckedList, CheckedListKeyPolicy, CheckedScope,
-    CheckedSource, CheckedState, CheckedStateKind, CheckedStatement, DiagnosticSeverity, FlowMode,
-    FlowType, ObjectShape, Type, TypeDiagnostic, Variant, type_is_recursively_closed,
+    CheckedExpression, CheckedList, CheckedListKeyPolicy, CheckedScope, CheckedSource,
+    CheckedState, CheckedStateKind, CheckedStatement, DiagnosticSeverity, FlowMode, FlowType,
+    ObjectShape, Type, TypeDiagnostic, Variant, type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
     CheckDemand, KernelAbiCallContextInput, KernelAbiContextualOperation, KernelAbiInput,
@@ -500,6 +500,11 @@ pub struct KernelOwnerOracleReport {
     pub checked_callables: Box<[CheckedCallableSignature]>,
     pub checked_context_formals: Box<[CheckedContextFormal]>,
     pub checked_calls: Box<[CheckedCall]>,
+    pub checked_call_result_paths: Box<[boon_checked::CheckedCallResultPath]>,
+    pub checked_pattern_bindings: Box<[boon_checked::CheckedPatternBinding]>,
+    pub checked_resource_projection_requirements:
+        Box<[boon_checked::CheckedResourceProjectionRequirement]>,
+    pub checked_occurrences: Box<[boon_checked::SemanticOccurrence]>,
     pub checked_sources: Box<[CheckedSource]>,
     pub checked_states: Box<[CheckedState]>,
     pub checked_lists: Box<[CheckedList]>,
@@ -594,11 +599,12 @@ struct PreparedKernelProjectProjection {
 fn prepare_kernel_project_projection(
     project: &ProjectSyntaxSnapshot,
     source_payloads: &BTreeMap<String, Type>,
+    role: boon_checked::ProgramRole,
 ) -> PreparedKernelProjectProjection {
     let owner_order = project.stable_check_owner_keys().collect::<Vec<_>>();
     let input_owners = owner_order.len();
     let value_surfaces = project_value_surfaces(project);
-    let kernel_abi = project_kernel_abi(project, boon_checked::ProgramRole::Client);
+    let kernel_abi = project_kernel_abi(project, role);
     let authoritative_call_shapes = kernel_abi
         .as_ref()
         .map(project_kernel_authoritative_call_shapes_from_abi);
@@ -1087,6 +1093,18 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     project: &ProjectSyntaxSnapshot,
     source_payloads: &BTreeMap<String, Type>,
 ) -> (KernelOwnerOracleReport, KernelOwnerOracleTimings) {
+    profile_kernel_owner_oracle_with_source_payloads_for_role(
+        project,
+        source_payloads,
+        boon_checked::ProgramRole::Client,
+    )
+}
+
+fn profile_kernel_owner_oracle_with_source_payloads_for_role(
+    project: &ProjectSyntaxSnapshot,
+    source_payloads: &BTreeMap<String, Type>,
+    role: boon_checked::ProgramRole,
+) -> (KernelOwnerOracleReport, KernelOwnerOracleTimings) {
     let total_started = Instant::now();
     let PreparedKernelProjectProjection {
         owner_order,
@@ -1104,7 +1122,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         owner_projection_us,
         direct_projection_elapsed,
         dependency_pruning_us,
-    } = prepare_kernel_project_projection(project, source_payloads);
+    } = prepare_kernel_project_projection(project, source_payloads, role);
     let mut program_compile_us = 0;
     let mut graph_solve_us = 0;
     let mut interface_projection_us = 0;
@@ -1120,6 +1138,12 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
     let mut checked_callables: Box<[CheckedCallableSignature]> = Box::new([]);
     let mut checked_context_formals: Box<[CheckedContextFormal]> = Box::new([]);
     let mut checked_calls: Box<[CheckedCall]> = Box::new([]);
+    let mut checked_call_result_paths: Box<[boon_checked::CheckedCallResultPath]> = Box::new([]);
+    let mut checked_pattern_bindings: Box<[boon_checked::CheckedPatternBinding]> = Box::new([]);
+    let mut checked_resource_projection_requirements: Box<
+        [boon_checked::CheckedResourceProjectionRequirement],
+    > = Box::new([]);
+    let mut checked_occurrences: Box<[boon_checked::SemanticOccurrence]> = Box::new([]);
     let mut checked_sources: Box<[CheckedSource]> = Box::new([]);
     let mut checked_states: Box<[CheckedState]> = Box::new([]);
     let mut checked_lists: Box<[CheckedList]> = Box::new([]);
@@ -1166,52 +1190,9 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                     let layout = KernelCheckedLinkLayout::new(kernel_input, &checked)
                         .map_err(|error| error.to_string())?;
                     checked_link_references = layout.totals().resolved_references;
-                    let mut materialized_scopes = layout
-                        .materialize_scopes(&checked)
-                        .map_err(|error| error.to_string())?
-                        .into_vec();
-                    let mut materialized_declarations = layout
-                        .materialize_declarations(&checked)
-                        .map_err(|error| error.to_string())?
-                        .into_vec();
-                    let mut materialized_expressions = layout
-                        .materialize_expressions(&checked)
-                        .map_err(|error| error.to_string())?
-                        .into_vec();
-                    let mut materialized_statements = layout
-                        .materialize_statements(&checked)
-                        .map_err(|error| error.to_string())?
-                        .into_vec();
-                    let mut materialized_sources = layout
-                        .materialize_sources(&checked)
-                        .map_err(|error| error.to_string())?
-                        .into_vec();
-                    let mut materialized_states = layout
-                        .materialize_states(&checked)
-                        .map_err(|error| error.to_string())?
-                        .into_vec();
-                    let mut materialized_lists = layout
-                        .materialize_lists(&checked)
-                        .map_err(|error| error.to_string())?
-                        .into_vec();
-                    let (materialized_callables, materialized_context_formals) = layout
-                        .materialize_user_callables(&checked, boon_checked::ProgramRole::Client)
+                    let mut rows = layout
+                        .materialize_rows(kernel_input, &checked, role)
                         .map_err(|error| error.to_string())?;
-                    let mut materialized_callables = materialized_callables.into_vec();
-                    let (materialized_abi_callables, materialized_abi_declarations) = layout
-                        .materialize_abi_callables(kernel_input.abi())
-                        .map_err(|error| error.to_string())?;
-                    materialized_callables.extend(materialized_abi_callables.into_vec());
-                    materialized_declarations.extend(materialized_abi_declarations.into_vec());
-                    let mut materialized_calls = layout
-                        .materialize_calls(
-                            kernel_input,
-                            &checked,
-                            &materialized_callables,
-                            &materialized_declarations,
-                        )
-                        .map_err(|error| error.to_string())?
-                        .into_vec();
                     for definition in layout.definitions() {
                         let key = kernel_input
                             .links()
@@ -1232,288 +1213,32 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                                     key.source_unit_id(),
                                 )
                             })?;
-                        for row in definition.scopes.start
-                            ..definition
-                                .scopes
-                                .start
-                                .checked_add(definition.scopes.len)
-                                .ok_or_else(|| {
-                                    "kernel checked scope range overflowed".to_owned()
-                                })?
-                        {
-                            let scope = materialized_scopes
-                                .get_mut(row as usize)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "kernel checked scope linker references missing row {row}"
-                                    )
-                                })?;
-                            scope.span.line = source
-                                .start_line
-                                .checked_add(scope.span.line.checked_sub(1).ok_or_else(|| {
-                                    format!("kernel checked scope row {row} has no source line")
-                                })?)
-                                .ok_or_else(|| {
-                                    format!("kernel checked scope row {row} line overflowed")
-                                })?;
-                            scope.span.start = source
-                                .start_byte
-                                .checked_add(scope.span.start)
-                                .ok_or_else(|| {
-                                    format!("kernel checked scope row {row} start overflowed")
-                                })?;
-                            scope.span.end = source
-                                .start_byte
-                                .checked_add(scope.span.end)
-                                .ok_or_else(|| {
-                                    format!("kernel checked scope row {row} end overflowed")
-                                })?;
-                        }
-                        for row in definition.declarations.start
-                            ..definition
-                                .declarations
-                                .start
-                                .checked_add(definition.declarations.len)
-                                .ok_or_else(|| {
-                                    "kernel checked declaration range overflowed".to_owned()
-                                })?
-                        {
-                            let index = row.checked_sub(1).ok_or_else(|| {
-                                "kernel checked declaration row uses reserved identity zero"
-                                    .to_owned()
-                            })?;
-                            let declaration = materialized_declarations
-                                .get_mut(index as usize)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "kernel checked declaration linker references missing row {row}"
-                                    )
-                                })?;
-                            declaration.span.line = source
-                                .start_line
-                                .checked_add(declaration.span.line.checked_sub(1).ok_or_else(
-                                    || {
-                                        format!(
-                                            "kernel checked declaration row {row} has no source line"
-                                        )
-                                    },
-                                )?)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "kernel checked declaration row {row} line overflowed"
-                                    )
-                                })?;
-                            declaration.span.start = source
-                                .start_byte
-                                .checked_add(declaration.span.start)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "kernel checked declaration row {row} start overflowed"
-                                    )
-                                })?;
-                            declaration.span.end = source
-                                .start_byte
-                                .checked_add(declaration.span.end)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "kernel checked declaration row {row} end overflowed"
-                                    )
-                                })?;
-                        }
-                        for row in definition.expressions.start
-                            ..definition
-                                .expressions
-                                .start
-                                .checked_add(definition.expressions.len)
-                                .ok_or_else(|| {
-                                    "kernel checked expression range overflowed".to_owned()
-                                })?
-                        {
-                            let expression = materialized_expressions
-                                .get_mut(row as usize)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "kernel checked expression linker references missing row {row}"
-                                    )
-                                })?;
-                            relocate_direct_checked_expression_spans(
-                                expression,
-                                source.start_line,
-                                source.start_byte,
-                            )?;
-                        }
-                        for row in definition.statements.start
-                            ..definition
-                                .statements
-                                .start
-                                .checked_add(definition.statements.len)
-                                .ok_or_else(|| {
-                                    "kernel checked statement range overflowed".to_owned()
-                                })?
-                        {
-                            let statement = materialized_statements
-                                .get_mut(row as usize)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "kernel checked statement linker references missing row {row}"
-                                    )
-                                })?;
-                            statement.span.line = source
-                                .start_line
-                                .checked_add(statement.span.line.checked_sub(1).ok_or_else(
-                                    || {
-                                        format!(
-                                            "kernel checked statement row {row} has no source line"
-                                        )
-                                    },
-                                )?)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "kernel checked statement row {row} line overflowed"
-                                    )
-                                })?;
-                            statement.span.start = source
-                                .start_byte
-                                .checked_add(statement.span.start)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "kernel checked statement row {row} start overflowed"
-                                    )
-                                })?;
-                            statement.span.end = source
-                                .start_byte
-                                .checked_add(statement.span.end)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "kernel checked statement row {row} end overflowed"
-                                    )
-                                })?;
-                        }
-                        for row in definition.sources.start
-                            ..definition
-                                .sources
-                                .start
-                                .checked_add(definition.sources.len)
-                                .ok_or_else(|| {
-                                    "kernel checked SOURCE range overflowed".to_owned()
-                                })?
-                        {
-                            let resource = materialized_sources
-                                .get_mut(row as usize)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "kernel checked SOURCE linker references missing row {row}"
-                                    )
-                                })?;
-                            relocate_direct_checked_span(
-                                &mut resource.span,
-                                source.start_line,
-                                source.start_byte,
-                                &format!("kernel checked SOURCE row {row}"),
-                            )?;
-                        }
-                        for row in definition.states.start
-                            ..definition
-                                .states
-                                .start
-                                .checked_add(definition.states.len)
-                                .ok_or_else(|| {
-                                    "kernel checked state range overflowed".to_owned()
-                                })?
-                        {
-                            let resource = materialized_states
-                                .get_mut(row as usize)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "kernel checked state linker references missing row {row}"
-                                    )
-                                })?;
-                            relocate_direct_checked_span(
-                                &mut resource.span,
-                                source.start_line,
-                                source.start_byte,
-                                &format!("kernel checked state row {row}"),
-                            )?;
-                        }
-                        for row in definition.lists.start
-                            ..definition
-                                .lists
-                                .start
-                                .checked_add(definition.lists.len)
-                                .ok_or_else(|| {
-                                    "kernel checked LIST range overflowed".to_owned()
-                                })?
-                        {
-                            let resource = materialized_lists
-                                .get_mut(row as usize)
-                                .ok_or_else(|| {
-                                    format!(
-                                        "kernel checked LIST linker references missing row {row}"
-                                    )
-                                })?;
-                            relocate_direct_checked_span(
-                                &mut resource.span,
-                                source.start_line,
-                                source.start_byte,
-                                &format!("kernel checked LIST row {row}"),
-                            )?;
-                        }
-                        for row in definition.calls.start
-                            ..definition
-                                .calls
-                                .start
-                                .checked_add(definition.calls.len)
-                                .ok_or_else(|| "kernel checked call range overflowed".to_owned())?
-                        {
-                            let call = materialized_calls.get_mut(row as usize).ok_or_else(|| {
-                                format!("kernel checked call linker references missing row {row}")
-                            })?;
-                            relocate_direct_checked_span(
-                                &mut call.span,
-                                source.start_line,
-                                source.start_byte,
-                                &format!("kernel checked call row {row}"),
-                            )?;
-                            if let boon_checked::CheckedContextBinding::Explicit { span, .. } =
-                                &mut call.context_binding
-                            {
-                                relocate_direct_checked_span(
-                                    span,
-                                    source.start_line,
-                                    source.start_byte,
-                                    &format!("kernel checked call row {row} PASS"),
-                                )?;
-                            }
-                        }
-                        if let Some(callable) = materialized_callables
-                            .iter_mut()
-                            .find(|callable| callable.decl_id == definition.public_declaration)
-                        {
-                            for parameter in &mut callable.parameters {
-                                parameter.start = source
-                                    .start_byte
-                                    .checked_add(parameter.start)
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "kernel checked callable {} parameter start overflowed",
-                                            callable.name,
-                                        )
-                                    })?;
-                                parameter.end = source
-                                    .start_byte
-                                    .checked_add(parameter.end)
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "kernel checked callable {} parameter end overflowed",
-                                            callable.name,
-                                        )
-                                    })?;
-                            }
-                        }
+                        rows.rebase_definition_spans(
+                            &layout,
+                            definition.owner,
+                            source.start_line,
+                            source.start_byte,
+                        )
+                        .map_err(|error| error.to_string())?;
                     }
-                    checked_scopes = materialized_scopes.into_boxed_slice();
-                    checked_declarations = materialized_declarations.into_boxed_slice();
-                    checked_expressions = materialized_expressions.into_boxed_slice();
+                    let materialized_scopes = rows.scopes;
+                    let materialized_declarations = rows.declarations;
+                    let materialized_expressions = rows.expressions;
+                    let materialized_statements = rows.statements;
+                    let materialized_callables = rows.callables;
+                    let materialized_context_formals = rows.context_formals;
+                    let materialized_calls = rows.calls;
+                    let materialized_call_result_paths = rows.call_result_paths;
+                    let materialized_pattern_bindings = rows.pattern_bindings;
+                    let materialized_resource_projection_requirements =
+                        rows.resource_projection_requirements;
+                    let materialized_sources = rows.sources;
+                    let materialized_states = rows.states;
+                    let materialized_lists = rows.lists;
+                    let materialized_occurrences = rows.occurrences;
+                    checked_scopes = materialized_scopes;
+                    checked_declarations = materialized_declarations;
+                    checked_expressions = materialized_expressions;
                     checked_expression_keys = checked
                         .definitions
                         .iter()
@@ -1534,7 +1259,7 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                             checked_expressions.len(),
                         ));
                     }
-                    checked_statements = materialized_statements.into_boxed_slice();
+                    checked_statements = materialized_statements;
                     checked_statement_keys = checked
                         .definitions
                         .iter()
@@ -1548,12 +1273,17 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                             checked_statements.len(),
                         ));
                     }
-                    checked_sources = materialized_sources.into_boxed_slice();
-                    checked_states = materialized_states.into_boxed_slice();
-                    checked_lists = materialized_lists.into_boxed_slice();
-                    checked_callables = materialized_callables.into_boxed_slice();
+                    checked_sources = materialized_sources;
+                    checked_states = materialized_states;
+                    checked_lists = materialized_lists;
+                    checked_callables = materialized_callables;
                     checked_context_formals = materialized_context_formals;
-                    checked_calls = materialized_calls.into_boxed_slice();
+                    checked_calls = materialized_calls;
+                    checked_call_result_paths = materialized_call_result_paths;
+                    checked_pattern_bindings = materialized_pattern_bindings;
+                    checked_resource_projection_requirements =
+                        materialized_resource_projection_requirements;
+                    checked_occurrences = materialized_occurrences;
                     checked_link_layout_us = elapsed_us(checked_link_started.elapsed());
                     Ok(checked)
                 })
@@ -2261,6 +1991,10 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
         checked_callables,
         checked_context_formals,
         checked_calls,
+        checked_call_result_paths,
+        checked_pattern_bindings,
+        checked_resource_projection_requirements,
+        checked_occurrences,
         checked_sources,
         checked_states,
         checked_lists,
@@ -2305,6 +2039,7 @@ pub(crate) fn compiler_diagnostics_from_kernel(
     project: ProjectSyntaxSnapshot,
     parse_work: boon_parser::ParseWorkCounters,
     parse_ms: f64,
+    role: boon_checked::ProgramRole,
 ) -> Result<crate::CompilerDiagnostics, String> {
     let typecheck_started = Instant::now();
     let (source_payloads, source_abi_diagnostics) =
@@ -2321,7 +2056,7 @@ pub(crate) fn compiler_diagnostics_from_kernel(
         definition_keys,
         abi,
         ..
-    } = prepare_kernel_project_projection(&project, &source_payloads);
+    } = prepare_kernel_project_projection(&project, &source_payloads, role);
     if !unsupported.is_empty() {
         if std::env::var_os("BOON_KERNEL_DIAGNOSTICS_UNSUPPORTED_TRACE").is_some() {
             eprintln!(
@@ -2836,71 +2571,6 @@ fn present_kernel_call_input_diagnostic(
 
 fn elapsed_us(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
-}
-
-fn relocate_direct_checked_span(
-    span: &mut boon_checked::CheckedSpan,
-    start_line: usize,
-    start_byte: usize,
-    label: &str,
-) -> Result<(), String> {
-    span.line = start_line
-        .checked_add(
-            span.line
-                .checked_sub(1)
-                .ok_or_else(|| format!("{label} has no source line"))?,
-        )
-        .ok_or_else(|| format!("{label} line overflowed"))?;
-    span.start = start_byte
-        .checked_add(span.start)
-        .ok_or_else(|| format!("{label} start overflowed"))?;
-    span.end = start_byte
-        .checked_add(span.end)
-        .ok_or_else(|| format!("{label} end overflowed"))?;
-    Ok(())
-}
-
-fn relocate_direct_checked_expression_spans(
-    expression: &mut CheckedExpression,
-    start_line: usize,
-    start_byte: usize,
-) -> Result<(), String> {
-    relocate_direct_checked_span(
-        &mut expression.span,
-        start_line,
-        start_byte,
-        &format!("kernel checked expression row {}", expression.id.0),
-    )?;
-    let structural_spans: &mut [_] = match &mut expression.kind {
-        CheckedExpressionKind::TaggedObject { fields, .. }
-        | CheckedExpressionKind::Object { fields } => fields.as_mut_slice(),
-        _ => &mut [],
-    };
-    for (ordinal, field) in structural_spans.iter_mut().enumerate() {
-        relocate_direct_checked_span(
-            &mut field.span,
-            start_line,
-            start_byte,
-            &format!(
-                "kernel checked expression row {} field {ordinal}",
-                expression.id.0,
-            ),
-        )?;
-    }
-    if let CheckedExpressionKind::Block { bindings, .. } = &mut expression.kind {
-        for (ordinal, binding) in bindings.iter_mut().enumerate() {
-            relocate_direct_checked_span(
-                &mut binding.span,
-                start_line,
-                start_byte,
-                &format!(
-                    "kernel checked expression row {} BLOCK binding {ordinal}",
-                    expression.id.0,
-                ),
-            )?;
-        }
-    }
-    Ok(())
 }
 
 fn stable_kernel_declaration_origin(
@@ -3970,6 +3640,7 @@ fn compact_call_syntax_input(
                     },
                     name: argument.name.clone().into_boxed_str(),
                     value: dense_expression(argument.value, "argument")?,
+                    span: kernel_subspan(view, syntax.line, argument.start, argument.end),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?
@@ -17993,7 +17664,11 @@ mod tests {
         let project =
             parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
                 .expect("parse nested checked-presentation fixture");
-        let prepared = prepare_kernel_project_projection(&project, &BTreeMap::new());
+        let prepared = prepare_kernel_project_projection(
+            &project,
+            &BTreeMap::new(),
+            boon_checked::ProgramRole::Client,
+        );
         assert!(
             prepared
                 .unsupported
@@ -18749,6 +18424,7 @@ mod tests {
                 project.clone(),
                 boon_parser::ParseWorkCounters::default(),
                 parse_us as f64 / 1_000.0,
+                boon_checked::ProgramRole::Client,
             )
             .expect("compile NovyWave production diagnostics through KernelSession");
             let wall_us = elapsed_us(diagnostics_started.elapsed());
@@ -19005,6 +18681,41 @@ mod tests {
             .output
             .checked_program_fields()
             .expect("NovyWave diagnostics own checked fields");
+        assert_eq!(
+            report.checked_call_result_paths.len(),
+            fields.call_result_paths.len(),
+            "kernel must materialize every NovyWave call-result semantic path",
+        );
+        assert_eq!(
+            report.checked_pattern_bindings.len(),
+            fields.pattern_bindings.len(),
+            "kernel must materialize every NovyWave pattern binding",
+        );
+        assert_eq!(
+            report.checked_resource_projection_requirements.len(),
+            fields.resource_projection_requirements.len(),
+            "kernel must materialize every NovyWave resource projection requirement",
+        );
+        let occurrence_counts = |occurrences: &[boon_checked::SemanticOccurrence]| {
+            occurrences
+                .iter()
+                .fold(BTreeMap::new(), |mut counts, occurrence| {
+                    *counts
+                        .entry(format!("{:?}", occurrence.kind))
+                        .or_insert(0usize) += 1;
+                    counts
+                })
+        };
+        eprintln!(
+            "kernel-novywave occurrence_counts kernel={:?} current={:?}",
+            occurrence_counts(&report.checked_occurrences),
+            occurrence_counts(&fields.occurrences),
+        );
+        assert_eq!(
+            report.checked_occurrences.len(),
+            fields.occurrences.len(),
+            "kernel must materialize every NovyWave semantic occurrence",
+        );
         assert_eq!(
             report.supported.len() + report.container_owners.len() + report.unsupported.len(),
             project.stable_check_owner_keys().count(),

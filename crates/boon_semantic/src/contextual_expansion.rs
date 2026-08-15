@@ -778,8 +778,12 @@ pub(crate) fn derive_contextual_materializations(
     let mut arena = SemanticExpressionArena::default();
     let mut item_types_by_owner = BTreeMap::new();
     let mut required_ordinary_definitions = BTreeSet::new();
-    let builder_indexes =
-        SemanticExpressionBuilderIndexes::new(program, out_net, retained_ordinary_declarations);
+    let builder_indexes = SemanticExpressionBuilderIndexes::new(
+        program,
+        out_net,
+        retained_ordinary_declarations,
+        &lookup,
+    )?;
     for (id, candidate) in candidates.iter().cloned().enumerate() {
         let materialization_id = SemanticMaterializationId(id);
         let inherited_candidates = inherited_order_candidates[id]
@@ -1463,6 +1467,7 @@ fn concrete_structural_type(
 fn semantic_callable_inventory(
     program: &CheckedProgramFields,
     semantic_scope_ids: &BTreeMap<boon_checked::LexicalScopeId, SemanticScopeId>,
+    completed_context_formals: &BTreeMap<ContextFormalId, FlowType>,
 ) -> Result<(Vec<SemanticCallable>, BTreeMap<DeclId, SemanticCallableId>), ExpansionError> {
     let mut callable_ids = BTreeMap::new();
     let mut callables = Vec::with_capacity(program.callables.len());
@@ -1518,14 +1523,15 @@ fn semantic_callable_inventory(
                 .collect(),
             context_formal: callable.context_formal,
             context_parameter: callable.context_formal.and_then(|formal| {
-                completed_context_formal_flow_type(program, formal).map(|flow_type| {
-                    SemanticCallableContextParameter {
+                completed_context_formals
+                    .get(&formal)
+                    .cloned()
+                    .map(|flow_type| SemanticCallableContextParameter {
                         id: semantic_parameter_id(id, callable.parameters.len()),
                         formal,
                         name: "PASSED".to_owned(),
                         flow_type,
-                    }
-                })
+                    })
             }),
             result: callable.result.clone(),
             role: callable.role,
@@ -1576,37 +1582,54 @@ fn add_missing_context_projection(ty: &Type, fields: &[String], leaf: Type) -> T
 /// only its owner-local sparse surface. Retained semantic definitions need the
 /// union of those exact body reads. Complete only missing paths here; existing
 /// scheme leaves keep their alpha correlation with parameters/results.
-fn completed_context_formal_flow_type(
+fn completed_context_formal_flow_types(
     program: &CheckedProgramFields,
-    formal: ContextFormalId,
-) -> Option<FlowType> {
-    let lookup = CheckedProgramLookup::new(program);
-    let formal = program.context_formal(formal)?;
-    let callable = program
-        .callables
-        .iter()
-        .find(|callable| callable.decl_id == formal.callable)?;
-    let mut flow_type = formal.scheme.flow_type.clone();
-    for expression in program.expressions.iter().filter(|expression| {
-        enclosing_function_owner(program, &lookup, expression.scope_id) == Some(callable.decl_id)
-            && matches!(
-                &expression.kind,
-                CheckedExpressionKind::Passed {
-                    formal: expression_formal,
-                    ..
-                } if *expression_formal == formal.id
-            )
-    }) {
-        let CheckedExpressionKind::Passed { projection, .. } = &expression.kind else {
-            unreachable!("filtered to PASSED expressions")
+    lookup: &CheckedProgramLookup,
+) -> Result<BTreeMap<ContextFormalId, FlowType>, ExpansionError> {
+    let mut owners = BTreeMap::new();
+    let mut completed = BTreeMap::new();
+    for formal in &program.context_formals {
+        if owners.insert(formal.id, formal.callable).is_some()
+            || completed
+                .insert(formal.id, formal.scheme.flow_type.clone())
+                .is_some()
+        {
+            return Err(ExpansionError::InvalidLocalBindings(format!(
+                "checked context formal {} is defined more than once",
+                formal.id.0,
+            )));
+        }
+    }
+    for expression in &program.expressions {
+        let CheckedExpressionKind::Passed {
+            formal, projection, ..
+        } = &expression.kind
+        else {
+            continue;
         };
+        let callable = owners.get(formal).copied().ok_or_else(|| {
+            ExpansionError::InvalidLocalBindings(format!(
+                "checked PASSED expression {} references missing context formal {}",
+                expression.id.0, formal.0,
+            ))
+        })?;
+        let enclosing = enclosing_function_owner(program, lookup, expression.scope_id);
+        if enclosing != Some(callable) {
+            return Err(ExpansionError::InvalidLocalBindings(format!(
+                "checked PASSED expression {} belongs to callable {enclosing:?} instead of context owner {}",
+                expression.id.0, callable.0,
+            )));
+        }
+        let flow_type = completed
+            .get_mut(formal)
+            .expect("context-formal owner and flow indexes are built together");
         flow_type.ty = add_missing_context_projection(
             &flow_type.ty,
             projection,
             erase_runtime_type_vars(&expression.flow_type.ty),
         );
     }
-    Some(flow_type)
+    Ok(completed)
 }
 
 fn semantic_call_inventory(
@@ -1776,6 +1799,9 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
     program: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
+    let lookup = CheckedProgramLookup::new(program);
+    let completed_context_formals =
+        completed_context_formal_flow_types(program, &lookup).map_err(|error| error.to_string())?;
     let semantic_scope_ids = program
         .scopes
         .iter()
@@ -1783,7 +1809,7 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
         .map(|(index, scope)| (scope.id, SemanticScopeId(index)))
         .collect::<BTreeMap<_, _>>();
     let (expected_callables, callable_ids) =
-        semantic_callable_inventory(program, &semantic_scope_ids)
+        semantic_callable_inventory(program, &semantic_scope_ids, &completed_context_formals)
             .map_err(|error| error.to_string())?;
     let (expected_calls, _) = semantic_call_inventory(program, &semantic_scope_ids, &callable_ids)
         .map_err(|error| error.to_string())?;
@@ -1849,7 +1875,11 @@ pub(crate) fn derive_semantic_execution_graph(
             })
         })
         .collect::<Result<Vec<_>, ExpansionError>>()?;
-    let (mut callables, callable_ids) = semantic_callable_inventory(program, &semantic_scope_ids)?;
+    let (mut callables, callable_ids) = semantic_callable_inventory(
+        program,
+        &semantic_scope_ids,
+        &builder_indexes.completed_context_formals,
+    )?;
     let (calls, call_ids) = semantic_call_inventory(program, &semantic_scope_ids, &callable_ids)?;
     let call_occurrences = out_net
         .call_instances
@@ -4721,6 +4751,7 @@ pub(crate) struct SemanticExpressionBuilderIndexes {
     call_ids: BTreeMap<CheckedCallId, SemanticCallId>,
     producer_callable_ids: BTreeMap<crate::ProducerFunctionId, SemanticCallableId>,
     ordinary_callable_ids: BTreeSet<SemanticCallableId>,
+    completed_context_formals: BTreeMap<ContextFormalId, FlowType>,
     hold_owners: BTreeMap<CheckedExprId, DeclId>,
     callables_with_holds: BTreeSet<DeclId>,
 }
@@ -5165,7 +5196,8 @@ impl SemanticExpressionBuilderIndexes {
         program: &CheckedProgramFields,
         out_net: &OutNet,
         retained_ordinary_declarations: &BTreeSet<DeclId>,
-    ) -> Self {
+        lookup: &CheckedProgramLookup,
+    ) -> Result<Self, ExpansionError> {
         let callable_ids = program
             .callables
             .iter()
@@ -5193,26 +5225,27 @@ impl SemanticExpressionBuilderIndexes {
             .copied()
             .filter_map(|callable| callable_ids.get(&callable).copied())
             .collect();
-        let lookup = CheckedProgramLookup::new(program);
+        let completed_context_formals = completed_context_formal_flow_types(program, lookup)?;
         let hold_owners: BTreeMap<CheckedExprId, DeclId> = program
             .states
             .iter()
             .filter(|state| state.kind == CheckedStateKind::Hold)
             .filter_map(|state| {
                 let expression = lookup.expression(program, state.expression)?;
-                enclosing_function_owner(program, &lookup, expression.scope_id)
+                enclosing_function_owner(program, lookup, expression.scope_id)
                     .map(|owner| (state.expression, owner))
             })
             .collect();
         let callables_with_holds = hold_owners.values().copied().collect();
-        Self {
+        Ok(Self {
             callable_ids,
             call_ids,
             producer_callable_ids,
             ordinary_callable_ids,
+            completed_context_formals,
             hold_owners,
             callables_with_holds,
-        }
+        })
     }
 }
 
@@ -6155,7 +6188,11 @@ impl<'a> SemanticExpressionBuilder<'a> {
                             found: formal,
                         });
                     }
-                    let mut flow_type = completed_context_formal_flow_type(self.program, formal)
+                    let mut flow_type = self
+                        .indexes
+                        .completed_context_formals
+                        .get(&formal)
+                        .cloned()
                         .ok_or_else(|| {
                             ExpansionError::InvalidLocalBindings(format!(
                                 "ordinary callable {semantic_callable} has missing PASSED formal {}",
@@ -6912,7 +6949,11 @@ impl<'a> SemanticExpressionBuilder<'a> {
         formal: ContextFormalId,
         actual: SemanticExprId,
     ) -> Result<SemanticExprId, ExpansionError> {
-        let scheme = completed_context_formal_flow_type(self.program, formal)
+        let scheme = self
+            .indexes
+            .completed_context_formals
+            .get(&formal)
+            .cloned()
             .ok_or(ExpansionError::MissingPassedContext(origin.id))?;
         self.capture_ordinary_context_type(
             origin,
@@ -8598,7 +8639,9 @@ mod tests {
             open: true,
         });
 
-        let completed = completed_context_formal_flow_type(&program, formal)
+        let completed = completed_context_formal_flow_types(&program, &lookup)
+            .expect("completed retained context templates")
+            .remove(&formal)
             .expect("completed retained context template");
         assert!(
             project_concrete_type(

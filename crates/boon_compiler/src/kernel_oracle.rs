@@ -14,14 +14,15 @@ use boon_checked::{
 };
 use boon_compiler_kernel::{
     CheckDemand, KernelCallArgumentKind, KernelCallArgumentSource, KernelCallInputRole,
-    KernelCallShapeArgument, KernelCallShapeInput, KernelCallShapeParameter,
-    KernelCallShapeResolution, KernelCallTarget, KernelCallTypeSubstitution, KernelCallableKind,
-    KernelCheckProduct, KernelCollectionKind, KernelCompileWork, KernelDeclarationId,
-    KernelDeclarationInput, KernelDeclarationKind, KernelDeclarationOrigin,
-    KernelDeclarationReference, KernelDefinitionFactsInput, KernelDefinitionRelocations,
-    KernelDiagnosticKind, KernelDiagnosticSeverity, KernelDiagnosticSite, KernelExpressionId,
-    KernelExpressionRelocation, KernelExpressionSemanticPayload, KernelExternalExpression,
-    KernelExternalTarget, KernelHostEffectArtifact, KernelInheritedFormal, KernelLexicalAccess,
+    KernelCallPassInput, KernelCallShapeArgument, KernelCallShapeInput, KernelCallShapeParameter,
+    KernelCallShapeResolution, KernelCallSyntaxArgument, KernelCallSyntaxInput, KernelCallTarget,
+    KernelCallTypeSubstitution, KernelCallableKind, KernelCheckProduct, KernelCollectionKind,
+    KernelCompileWork, KernelDeclarationId, KernelDeclarationInput, KernelDeclarationKind,
+    KernelDeclarationOrigin, KernelDeclarationReference, KernelDefinitionFactsInput,
+    KernelDefinitionRelocations, KernelDiagnosticKind, KernelDiagnosticSeverity,
+    KernelDiagnosticSite, KernelExpressionId, KernelExpressionRelocation,
+    KernelExpressionSemanticPayload, KernelExternalExpression, KernelExternalTarget,
+    KernelHostEffectArtifact, KernelInheritedFormal, KernelLexicalAccess,
     KernelLexicalBindingInput, KernelLexicalBindingTarget, KernelLexicalBindingTargetInput,
     KernelListId, KernelListInput, KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge,
     KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelParameterEvaluationScope,
@@ -390,10 +391,27 @@ pub struct KernelOwnerOracleList {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelOwnerOracleCall {
     pub expression: StableExpressionKey,
+    pub function: Box<str>,
+    pub pipe_input: Option<KernelOwnerOracleValueReference>,
+    pub arguments: Box<[KernelOwnerOracleCallSyntaxArgument]>,
+    pub pass: Option<KernelOwnerOracleCallPass>,
     pub target: KernelOwnerOracleCallTarget,
     pub inputs: Box<[KernelOwnerOracleCallInput]>,
     pub type_substitutions: Box<[KernelCallTypeSubstitution]>,
     pub result: FlowType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleCallSyntaxArgument {
+    pub kind: KernelCallArgumentKind,
+    pub name: Box<str>,
+    pub provider: KernelOwnerOracleValueReference,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleCallPass {
+    pub provider: KernelOwnerOracleValueReference,
+    pub final_clause: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -470,11 +488,11 @@ pub struct KernelOwnerOracleReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelOwnerOracleCurrentness {
     pub owner: StableCheckOwnerKey,
-    pub basis_fingerprint_v5: [u8; 32],
+    pub basis_fingerprint_v6: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v7: [u8; 32],
+    pub artifact_fingerprint_v8: [u8; 32],
     pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v7: [u8; 32],
+    pub fingerprint_v8: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1098,11 +1116,11 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                 .zip(&artifact.currentness)
                 .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
                     owner: prepared[*prepared_index].owner.clone(),
-                    basis_fingerprint_v5: receipt.basis_fingerprint_v5,
+                    basis_fingerprint_v6: receipt.basis_fingerprint_v6,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
-                    artifact_fingerprint_v7: receipt.artifact_fingerprint_v7,
+                    artifact_fingerprint_v8: receipt.artifact_fingerprint_v8,
                     dependency_fingerprint_v1: receipt.dependency_fingerprint_v1,
-                    fingerprint_v7: receipt.fingerprint_v7,
+                    fingerprint_v8: receipt.fingerprint_v8,
                 })
                 .collect::<Vec<_>>();
             let definitions = artifact.definitions;
@@ -1143,6 +1161,32 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         owner.definition_facts.expression_payloads,
                         "kernel definition artifacts retain every exact expression semantic payload"
                     );
+                    assert_eq!(
+                        artifact.call_syntax.len(),
+                        owner.definition_facts.call_syntax.len(),
+                        "kernel definition artifacts retain every authored call surface"
+                    );
+                    for (linked, authored) in artifact
+                        .call_syntax
+                        .iter()
+                        .zip(owner.definition_facts.call_syntax.iter())
+                    {
+                        assert_eq!(linked.expression, authored.expression);
+                        assert_eq!(linked.function, authored.function);
+                        assert_eq!(linked.pipe_input.is_some(), authored.pipe_input.is_some());
+                        assert_eq!(linked.arguments.len(), authored.arguments.len());
+                        for (linked, authored) in
+                            linked.arguments.iter().zip(authored.arguments.iter())
+                        {
+                            assert_eq!(linked.ordinal, authored.ordinal);
+                            assert_eq!(linked.kind, authored.kind);
+                            assert_eq!(linked.name, authored.name);
+                        }
+                        assert_eq!(
+                            linked.pass.map(|pass| pass.final_clause),
+                            authored.pass.map(|pass| pass.final_clause),
+                        );
+                    }
                     let stable_provider = |value: KernelValueReference| match value {
                         KernelValueReference::Local(expression) => {
                             KernelOwnerOracleValueReference::Expression(
@@ -1495,10 +1539,21 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
+                    let mut call_syntax = artifact
+                        .call_syntax
+                        .into_iter()
+                        .map(|syntax| (syntax.expression, syntax))
+                        .collect::<BTreeMap<_, _>>();
                     let calls = artifact
                         .calls
                         .into_iter()
                         .map(|call| {
+                            let syntax = call_syntax.remove(&call.expression).unwrap_or_else(|| {
+                                panic!(
+                                    "kernel call expression {} has no authored call surface",
+                                    call.expression.0
+                                )
+                            });
                             let target = match call.target {
                                 KernelCallTarget::User {
                                     target,
@@ -1532,6 +1587,22 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                                 expression: owner.expressions
                                     [call.expression.0 as usize]
                                     .clone(),
+                                function: syntax.function,
+                                pipe_input: syntax.pipe_input.map(&stable_provider),
+                                arguments: syntax
+                                    .arguments
+                                    .iter()
+                                    .map(|argument| KernelOwnerOracleCallSyntaxArgument {
+                                        kind: argument.kind,
+                                        name: argument.name.clone(),
+                                        provider: stable_provider(argument.value),
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .into_boxed_slice(),
+                                pass: syntax.pass.map(|pass| KernelOwnerOracleCallPass {
+                                    provider: stable_provider(pass.value),
+                                    final_clause: pass.final_clause,
+                                }),
                                 target,
                                 inputs: call
                                     .inputs
@@ -1550,6 +1621,10 @@ pub fn profile_kernel_owner_oracle_with_source_payloads(
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
+                    assert!(
+                        call_syntax.is_empty(),
+                        "every authored call surface must link to one solved call"
+                    );
                     let effects = artifact
                         .effects
                         .into_iter()
@@ -2987,6 +3062,84 @@ fn owner_uses_passed_context(view: UnitOwnerSyntaxView<'_>) -> bool {
         AstExprKind::Identifier(name) => name == "PASSED",
         AstExprKind::Path(path) => path.first().is_some_and(|root| root == "PASSED"),
         _ => false,
+    })
+}
+
+fn compact_call_syntax_input(
+    index: usize,
+    syntax: &boon_syntax::AstExpr,
+    view: UnitOwnerSyntaxView<'_>,
+    owner: &StableCheckOwnerKey,
+    local_by_syntax: &BTreeMap<usize, usize>,
+    node_count: usize,
+    external_by_key: &mut BTreeMap<PreparedExternalExpression, usize>,
+    external_expressions: &mut Vec<PreparedExternalExpression>,
+) -> Result<KernelCallSyntaxInput, String> {
+    let mut dense_expression = |input: usize, label: &str| {
+        prepared_input_reference_index(
+            PreparedInputReference::Syntax(input),
+            view,
+            owner,
+            Some(syntax.id),
+            local_by_syntax,
+            node_count,
+            external_by_key,
+            external_expressions,
+        )
+        .map_err(|error| format!("authored call {label}: {error}"))
+        .and_then(checked_kernel_expression)
+    };
+    let (function, pipe_input, arguments, pass) = match &syntax.kind {
+        AstExprKind::Call {
+            function,
+            args,
+            pass,
+        } => (function, None, args, pass.as_ref()),
+        AstExprKind::Pipe {
+            input,
+            op,
+            args,
+            pass,
+            ..
+        } => (
+            op,
+            Some(dense_expression(
+                syntax.linked_input.unwrap_or(*input),
+                "pipe input",
+            )?),
+            args,
+            pass.as_ref(),
+        ),
+        _ => return Err("call syntax projection received a non-call expression".to_owned()),
+    };
+    Ok(KernelCallSyntaxInput {
+        expression: checked_kernel_expression(index)?,
+        function: function.clone().into_boxed_str(),
+        pipe_input,
+        arguments: arguments
+            .iter()
+            .enumerate()
+            .map(|(ordinal, argument)| {
+                Ok(KernelCallSyntaxArgument {
+                    ordinal: checked_u32(ordinal, "authored call argument ordinal")?,
+                    kind: match argument.kind {
+                        AstCallArgKind::Named => KernelCallArgumentKind::Named,
+                        AstCallArgKind::BareBinding => KernelCallArgumentKind::BareBinding,
+                    },
+                    name: argument.name.clone().into_boxed_str(),
+                    value: dense_expression(argument.value, "argument")?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .into_boxed_slice(),
+        pass: pass
+            .map(|pass| {
+                Ok::<_, String>(KernelCallPassInput {
+                    value: dense_expression(pass.value, "PASS value")?,
+                    final_clause: pass.final_clause,
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -4564,6 +4717,33 @@ fn compact_owner_view(
         .map(|expression| compact_expression_semantic_payload(&expression.kind))
         .chain(has_synthetic_result.then_some(KernelExpressionSemanticPayload::None))
         .collect::<Vec<_>>()
+        .into_boxed_slice();
+    definition_facts.call_syntax = raw_expressions
+        .iter()
+        .zip(nodes.iter())
+        .enumerate()
+        .filter_map(|(index, (expression, node))| {
+            matches!(
+                &node.kind,
+                KernelOwnerNodeKind::UserCall { .. }
+                    | KernelOwnerNodeKind::RenderConstructor { .. }
+                    | KernelOwnerNodeKind::PureBuiltin { .. }
+                    | KernelOwnerNodeKind::HostEffect { .. }
+            )
+            .then(|| {
+                compact_call_syntax_input(
+                    index,
+                    expression,
+                    view,
+                    &owner,
+                    &local_by_syntax,
+                    node_count,
+                    &mut external_by_key,
+                    &mut external_expressions,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
         .into_boxed_slice();
     let render_slots = view
         .statements()
@@ -8868,6 +9048,63 @@ mod tests {
                 ));
                 continue;
             };
+            if current.function != kernel.function.as_ref() {
+                mismatches.push(format!(
+                    "kernel owner {owner:?} call {stable:?} retains spelling `{}` but checked call spells `{}`",
+                    kernel.function, current.function,
+                ));
+            }
+            let current_pipe = current.entries.iter().any(|entry| {
+                matches!(
+                    entry,
+                    boon_checked::CheckedCallEntry::Input {
+                        from_pipe: true,
+                        ..
+                    }
+                )
+            });
+            if current_pipe != kernel.pipe_input.is_some() {
+                mismatches.push(format!(
+                    "kernel owner {owner:?} call {stable:?} pipe-input surface differs from checked"
+                ));
+            }
+            let current_argument_names = current
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    boon_checked::CheckedCallEntry::Input {
+                        name,
+                        from_pipe: false,
+                        ..
+                    }
+                    | boon_checked::CheckedCallEntry::FreshOut { name, .. }
+                    | boon_checked::CheckedCallEntry::ForwardOut { name, .. } => {
+                        Some(name.as_str())
+                    }
+                    boon_checked::CheckedCallEntry::Input {
+                        from_pipe: true, ..
+                    } => None,
+                })
+                .collect::<Vec<_>>();
+            let kernel_argument_names = kernel
+                .arguments
+                .iter()
+                .map(|argument| argument.name.as_ref())
+                .collect::<Vec<_>>();
+            if current_argument_names != kernel_argument_names {
+                mismatches.push(format!(
+                    "kernel owner {owner:?} call {stable:?} authored arguments {kernel_argument_names:?} differ from checked {current_argument_names:?}"
+                ));
+            }
+            let current_explicit_pass = matches!(
+                current.context_binding,
+                boon_checked::CheckedContextBinding::Explicit { .. }
+            );
+            if current_explicit_pass != kernel.pass.is_some() {
+                mismatches.push(format!(
+                    "kernel owner {owner:?} call {stable:?} explicit PASS surface differs from checked"
+                ));
+            }
             let target_matches = match &kernel.target {
                 KernelOwnerOracleCallTarget::User {
                     target,
@@ -13439,7 +13676,7 @@ mod tests {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v7 != [0; 32]),
+                        && receipt.fingerprint_v8 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(

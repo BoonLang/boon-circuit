@@ -524,6 +524,33 @@ pub enum KernelTextTemplateSegment {
     Dynamic(u32),
 }
 
+/// Exact authored call surface retained independently from canonical solver
+/// edges. Resolution may reorder inputs by formal ordinal and collapse many
+/// spellings into one builtin kind; the checked linker must not reverse that
+/// lossy transformation.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelCallSyntaxInput {
+    pub expression: KernelExpressionId,
+    pub function: Box<str>,
+    pub pipe_input: Option<KernelExpressionId>,
+    pub arguments: Box<[KernelCallSyntaxArgument]>,
+    pub pass: Option<KernelCallPassInput>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelCallSyntaxArgument {
+    pub ordinal: u32,
+    pub kind: KernelCallArgumentKind,
+    pub name: Box<str>,
+    pub value: KernelExpressionId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelCallPassInput {
+    pub value: KernelExpressionId,
+    pub final_clause: bool,
+}
+
 impl KernelDefinitionRelocations {
     pub fn is_empty(&self) -> bool {
         self.expressions.is_empty() && self.statements.is_empty()
@@ -538,6 +565,7 @@ impl KernelDefinitionRelocations {
 pub struct KernelDefinitionFactsInput {
     pub relocations: KernelDefinitionRelocations,
     pub expression_payloads: Box<[KernelExpressionSemanticPayload]>,
+    pub call_syntax: Box<[KernelCallSyntaxInput]>,
     pub statements: Box<[KernelStatementInput]>,
     pub declarations: Box<[KernelDeclarationInput]>,
     pub lexical_bindings: Box<[KernelLexicalBindingInput]>,
@@ -602,6 +630,7 @@ pub struct KernelOwnerProgram {
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
     relocations: KernelDefinitionRelocations,
     expression_payloads: Box<[KernelExpressionSemanticPayload]>,
+    call_syntax: Box<[KernelCallSyntaxArtifact]>,
     statements: Box<[KernelStatementArtifact]>,
     declarations: Box<[KernelDeclarationArtifact]>,
     lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
@@ -609,7 +638,7 @@ pub struct KernelOwnerProgram {
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
-    basis_fingerprint_v5: [u8; 32],
+    basis_fingerprint_v6: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -691,6 +720,7 @@ struct KernelProjectOwnerOutputs {
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
     relocations: KernelDefinitionRelocations,
     expression_payloads: Box<[KernelExpressionSemanticPayload]>,
+    call_syntax: Box<[KernelCallSyntaxArtifact]>,
     statements: Box<[KernelStatementArtifact]>,
     declarations: Box<[KernelDeclarationArtifact]>,
     lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
@@ -703,7 +733,7 @@ struct KernelProjectOwnerOutputs {
     /// requirements. That aggregate is useful to the solver, but is not a
     /// sound direct assignability contract for call diagnostics.
     syntax_discriminated_formals: Box<[u32]>,
-    basis_fingerprint_v5: [u8; 32],
+    basis_fingerprint_v6: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -802,6 +832,29 @@ pub struct KernelCallInputArtifact {
 pub enum KernelValueReference {
     Local(KernelExpressionId),
     External(KernelExternalExpression),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelCallSyntaxArtifact {
+    pub expression: KernelExpressionId,
+    pub function: Box<str>,
+    pub pipe_input: Option<KernelValueReference>,
+    pub arguments: Box<[KernelCallSyntaxArgumentArtifact]>,
+    pub pass: Option<KernelCallPassArtifact>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelCallSyntaxArgumentArtifact {
+    pub ordinal: u32,
+    pub kind: KernelCallArgumentKind,
+    pub name: Box<str>,
+    pub value: KernelValueReference,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelCallPassArtifact {
+    pub value: KernelValueReference,
+    pub final_clause: bool,
 }
 
 pub type KernelCallValueReference = KernelValueReference;
@@ -1728,6 +1781,7 @@ pub struct DefinitionArtifact {
     /// linking. Dense IDs remain definition-local and revision-local.
     pub relocations: KernelDefinitionRelocations,
     pub expression_payloads: Box<[KernelExpressionSemanticPayload]>,
+    pub call_syntax: Box<[KernelCallSyntaxArtifact]>,
     pub expressions: Box<[KernelExpressionArtifact]>,
     pub statements: Box<[KernelStatementArtifact]>,
     pub declarations: Box<[KernelDeclarationArtifact]>,
@@ -1812,7 +1866,7 @@ pub fn is_registered_kernel_host_effect(operation: &str) -> bool {
 
 impl KernelOwnerProgram {
     pub fn solve(self) -> Result<KernelDefinitionSnapshot, KernelSolveError> {
-        let basis_fingerprint_v5 = self.basis_fingerprint_v5;
+        let basis_fingerprint_v6 = self.basis_fingerprint_v6;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
             .output(self.result_output)
@@ -1871,6 +1925,7 @@ impl KernelOwnerProgram {
             formals: formal_flows,
             relocations: self.relocations,
             expression_payloads: self.expression_payloads,
+            call_syntax: self.call_syntax,
             expressions,
             statements: self.statements,
             declarations: self.declarations,
@@ -1884,7 +1939,7 @@ impl KernelOwnerProgram {
         };
         let (dependencies, currentness) = build_snapshot_receipts(
             std::slice::from_mut(&mut definition),
-            &[basis_fingerprint_v5],
+            &[basis_fingerprint_v6],
         )?;
         let [currentness] = currentness.as_ref() else {
             unreachable!("one standalone kernel definition produces one receipt")
@@ -2049,7 +2104,7 @@ impl KernelSolvedProject {
         let basis_fingerprints = self
             .owners
             .iter()
-            .map(|owner| owner.basis_fingerprint_v5)
+            .map(|owner| owner.basis_fingerprint_v6)
             .collect::<Vec<_>>();
         let mut definitions = self
             .owners
@@ -2678,6 +2733,7 @@ fn materialize_project_definition(
         formals: public_formals[owner_index].clone(),
         relocations: owner.relocations,
         expression_payloads: owner.expression_payloads,
+        call_syntax: owner.call_syntax,
         expressions,
         statements: owner.statements,
         declarations: owner.declarations,
@@ -2736,73 +2792,182 @@ fn validate_definition_linker_facts(
         }
     }
 
-    if facts.expression_payloads.is_empty() {
-        return Ok(());
+    if !facts.expression_payloads.is_empty() {
+        if facts.expression_payloads.len() != input.nodes.len() {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} has {} expression semantic payloads for {} expressions",
+                facts.expression_payloads.len(),
+                input.nodes.len(),
+            )));
+        }
+        for (index, (node, payload)) in input
+            .nodes
+            .iter()
+            .zip(facts.expression_payloads.iter())
+            .enumerate()
+        {
+            let compatible = match payload {
+                KernelExpressionSemanticPayload::None => true,
+                KernelExpressionSemanticPayload::Text(_) => {
+                    matches!(&node.kind, KernelOwnerNodeKind::Text)
+                }
+                KernelExpressionSemanticPayload::TextTemplate(segments) => {
+                    if !matches!(&node.kind, KernelOwnerNodeKind::TextTemplate) {
+                        false
+                    } else {
+                        let dynamic_input_count = node
+                            .inputs
+                            .iter()
+                            .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::TextDynamic))
+                            .count();
+                        let dynamic_ordinals = segments
+                            .iter()
+                            .filter_map(|segment| match segment {
+                                KernelTextTemplateSegment::Static(_) => None,
+                                KernelTextTemplateSegment::Dynamic(ordinal) => Some(*ordinal),
+                            })
+                            .collect::<BTreeSet<_>>();
+                        dynamic_ordinals.len() == dynamic_input_count
+                            && dynamic_ordinals
+                                .iter()
+                                .enumerate()
+                                .all(|(expected, ordinal)| {
+                                    usize::try_from(*ordinal) == Ok(expected)
+                                })
+                    }
+                }
+                KernelExpressionSemanticPayload::Number(_) => {
+                    matches!(&node.kind, KernelOwnerNodeKind::Number)
+                }
+                KernelExpressionSemanticPayload::Byte(_) => {
+                    matches!(&node.kind, KernelOwnerNodeKind::Byte)
+                }
+                KernelExpressionSemanticPayload::Bits(value) => {
+                    matches!(&node.kind, KernelOwnerNodeKind::Bits(width) if *width == value.width())
+                }
+                KernelExpressionSemanticPayload::HoldName(_) => {
+                    matches!(&node.kind, KernelOwnerNodeKind::Hold)
+                }
+                KernelExpressionSemanticPayload::Invalid(_) => matches!(
+                    &node.kind,
+                    KernelOwnerNodeKind::Unknown
+                        | KernelOwnerNodeKind::Number
+                        | KernelOwnerNodeKind::Bits(_)
+                ),
+            };
+            if !compatible {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel {label} expression {index} semantic payload {payload:?} is incompatible with node {:?}",
+                    node.kind,
+                )));
+            }
+        }
     }
-    if facts.expression_payloads.len() != input.nodes.len() {
-        return Err(KernelOwnerBuildError::new(format!(
-            "kernel {label} has {} expression semantic payloads for {} expressions",
-            facts.expression_payloads.len(),
-            input.nodes.len(),
-        )));
-    }
-    for (index, (node, payload)) in input
+
+    let call_count = input
         .nodes
         .iter()
-        .zip(facts.expression_payloads.iter())
-        .enumerate()
-    {
-        let compatible = match payload {
-            KernelExpressionSemanticPayload::None => true,
-            KernelExpressionSemanticPayload::Text(_) => {
-                matches!(&node.kind, KernelOwnerNodeKind::Text)
-            }
-            KernelExpressionSemanticPayload::TextTemplate(segments) => {
-                if !matches!(&node.kind, KernelOwnerNodeKind::TextTemplate) {
-                    false
-                } else {
-                    let dynamic_input_count = node
-                        .inputs
-                        .iter()
-                        .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::TextDynamic))
-                        .count();
-                    let dynamic_ordinals = segments
-                        .iter()
-                        .filter_map(|segment| match segment {
-                            KernelTextTemplateSegment::Static(_) => None,
-                            KernelTextTemplateSegment::Dynamic(ordinal) => Some(*ordinal),
-                        })
-                        .collect::<BTreeSet<_>>();
-                    dynamic_ordinals.len() == dynamic_input_count
-                        && dynamic_ordinals
-                            .iter()
-                            .enumerate()
-                            .all(|(expected, ordinal)| usize::try_from(*ordinal) == Ok(expected))
-                }
-            }
-            KernelExpressionSemanticPayload::Number(_) => {
-                matches!(&node.kind, KernelOwnerNodeKind::Number)
-            }
-            KernelExpressionSemanticPayload::Byte(_) => {
-                matches!(&node.kind, KernelOwnerNodeKind::Byte)
-            }
-            KernelExpressionSemanticPayload::Bits(value) => {
-                matches!(&node.kind, KernelOwnerNodeKind::Bits(width) if *width == value.width())
-            }
-            KernelExpressionSemanticPayload::HoldName(_) => {
-                matches!(&node.kind, KernelOwnerNodeKind::Hold)
-            }
-            KernelExpressionSemanticPayload::Invalid(_) => matches!(
+        .filter(|node| {
+            matches!(
                 &node.kind,
-                KernelOwnerNodeKind::Unknown
-                    | KernelOwnerNodeKind::Number
-                    | KernelOwnerNodeKind::Bits(_)
-            ),
-        };
-        if !compatible {
+                KernelOwnerNodeKind::UserCall { .. }
+                    | KernelOwnerNodeKind::RenderConstructor { .. }
+                    | KernelOwnerNodeKind::PureBuiltin { .. }
+                    | KernelOwnerNodeKind::HostEffect { .. }
+            )
+        })
+        .count();
+    if facts.call_syntax.is_empty() {
+        if !relocations.is_empty() && call_count != 0 {
             return Err(KernelOwnerBuildError::new(format!(
-                "kernel {label} expression {index} semantic payload {payload:?} is incompatible with node {:?}",
-                node.kind,
+                "kernel {label} has no authored call syntax for {call_count} call expressions"
+            )));
+        }
+        return Ok(());
+    }
+    if facts.call_syntax.len() != call_count {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel {label} has {} authored call rows for {call_count} call expressions",
+            facts.call_syntax.len(),
+        )));
+    }
+    let input_namespace_len = input
+        .nodes
+        .len()
+        .checked_add(input.external_expressions.len())
+        .ok_or_else(|| {
+            KernelOwnerBuildError::new(format!(
+                "kernel {label} call input namespace overflows usize"
+            ))
+        })?;
+    let mut previous_expression = None;
+    for call in &facts.call_syntax {
+        let expression = call.expression.0 as usize;
+        let Some(node) = input.nodes.get(expression) else {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} authored call references missing expression {expression}"
+            )));
+        };
+        if previous_expression.is_some_and(|previous| previous >= call.expression) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} authored call rows are not strictly ordered by expression"
+            )));
+        }
+        previous_expression = Some(call.expression);
+        if call.function.is_empty()
+            || !matches!(
+                &node.kind,
+                KernelOwnerNodeKind::UserCall { .. }
+                    | KernelOwnerNodeKind::RenderConstructor { .. }
+                    | KernelOwnerNodeKind::PureBuiltin { .. }
+                    | KernelOwnerNodeKind::HostEffect { .. }
+            )
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} authored call expression {expression} does not name a call node"
+            )));
+        }
+        if let KernelOwnerNodeKind::HostEffect { operation } = &node.kind
+            && operation != &call.function
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} host-effect expression {expression} spells `{}` but resolves `{operation}`",
+                call.function,
+            )));
+        }
+        let mut authored_values = BTreeMap::<KernelExpressionId, usize>::new();
+        if let Some(pipe_input) = call.pipe_input {
+            *authored_values.entry(pipe_input).or_default() += 1;
+        }
+        for (ordinal, argument) in call.arguments.iter().enumerate() {
+            if usize::try_from(argument.ordinal) != Ok(ordinal)
+                || argument.name.is_empty()
+                || argument.value.0 as usize >= input_namespace_len
+            {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel {label} call expression {expression} has an invalid authored argument at ordinal {ordinal}"
+                )));
+            }
+            *authored_values.entry(argument.value).or_default() += 1;
+        }
+        if let Some(pass) = call.pass {
+            *authored_values.entry(pass.value).or_default() += 1;
+        }
+        if authored_values
+            .keys()
+            .any(|value| value.0 as usize >= input_namespace_len)
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} call expression {expression} references a missing authored input"
+            )));
+        }
+        let mut canonical_values = BTreeMap::<KernelExpressionId, usize>::new();
+        for edge in &node.inputs {
+            *canonical_values.entry(edge.expression).or_default() += 1;
+        }
+        if authored_values != canonical_values {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} call expression {expression} authored inputs {authored_values:?} differ from canonical inputs {canonical_values:?}"
             )));
         }
     }
@@ -2814,7 +2979,7 @@ pub fn compile_owner_program_with_definition_facts(
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
     validate_definition_linker_facts(input, facts, None)?;
-    let basis_fingerprint_v5 = definition_basis_fingerprint(input, facts)?;
+    let basis_fingerprint_v6 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
@@ -2968,6 +3133,7 @@ pub fn compile_owner_program_with_definition_facts(
         expression_artifacts: collect_expression_artifacts(input)?,
         relocations: facts.relocations.clone(),
         expression_payloads: facts.expression_payloads.clone(),
+        call_syntax: collect_call_syntax_artifacts(input, facts)?,
         statements,
         declarations,
         lexical_bindings,
@@ -2975,7 +3141,7 @@ pub fn compile_owner_program_with_definition_facts(
         calls: collect_call_artifacts(input)?,
         effects: collect_host_effect_artifacts(input)?,
         diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
-        basis_fingerprint_v5,
+        basis_fingerprint_v6,
     })
 }
 
@@ -3979,6 +4145,50 @@ fn call_type_pattern_accepts(pattern: &Type, actual: &Type) -> bool {
     }
 }
 
+fn collect_call_syntax_artifacts(
+    input: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<Box<[KernelCallSyntaxArtifact]>, KernelOwnerBuildError> {
+    facts
+        .call_syntax
+        .iter()
+        .map(|call| {
+            let call_index = call.expression.0 as usize;
+            Ok(KernelCallSyntaxArtifact {
+                expression: call.expression,
+                function: call.function.clone(),
+                pipe_input: call
+                    .pipe_input
+                    .map(|value| kernel_value_reference(input, value, call_index))
+                    .transpose()?,
+                arguments: call
+                    .arguments
+                    .iter()
+                    .map(|argument| {
+                        Ok(KernelCallSyntaxArgumentArtifact {
+                            ordinal: argument.ordinal,
+                            kind: argument.kind,
+                            name: argument.name.clone(),
+                            value: kernel_value_reference(input, argument.value, call_index)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?
+                    .into_boxed_slice(),
+                pass: call
+                    .pass
+                    .map(|pass| {
+                        Ok(KernelCallPassArtifact {
+                            value: kernel_value_reference(input, pass.value, call_index)?,
+                            final_clause: pass.final_clause,
+                        })
+                    })
+                    .transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
+}
+
 fn collect_call_artifacts(
     input: &KernelOwnerProgramInput,
 ) -> Result<Box<[PendingKernelCallArtifact]>, KernelOwnerBuildError> {
@@ -4573,6 +4783,7 @@ pub fn compile_project_program_with_definition_facts(
                 expression_artifacts: collect_expression_artifacts(owner)?,
                 relocations: facts[owner_index].relocations.clone(),
                 expression_payloads: facts[owner_index].expression_payloads.clone(),
+                call_syntax: collect_call_syntax_artifacts(owner, &facts[owner_index])?,
                 statements,
                 declarations: collect_declaration_artifacts(owner, &facts[owner_index])?,
                 lexical_bindings: collect_lexical_binding_artifacts(owner, &facts[owner_index])?,
@@ -4594,7 +4805,7 @@ pub fn compile_project_program_with_definition_facts(
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice(),
                 syntax_discriminated_formals: syntax_discriminated_formals[owner_index].clone(),
-                basis_fingerprint_v5: definition_basis_fingerprint_with_buffer(
+                basis_fingerprint_v6: definition_basis_fingerprint_with_buffer(
                     owner,
                     &facts[owner_index],
                     &mut basis_fingerprint_scratch,
@@ -12014,16 +12225,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v5,
-            moved.currentness.basis_fingerprint_v5
+            solved.currentness.basis_fingerprint_v6,
+            moved.currentness.basis_fingerprint_v6
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v7,
-            moved.currentness.artifact_fingerprint_v7
+            solved.currentness.artifact_fingerprint_v8,
+            moved.currentness.artifact_fingerprint_v8
         );
         assert_ne!(
-            solved.currentness.fingerprint_v7,
-            moved.currentness.fingerprint_v7
+            solved.currentness.fingerprint_v8,
+            moved.currentness.fingerprint_v8
         );
 
         let mut missing = facts.clone();
@@ -12114,16 +12325,16 @@ mod tests {
             edited.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v5,
-            edited.currentness.basis_fingerprint_v5,
+            solved.currentness.basis_fingerprint_v6,
+            edited.currentness.basis_fingerprint_v6,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v7,
-            edited.currentness.artifact_fingerprint_v7,
+            solved.currentness.artifact_fingerprint_v8,
+            edited.currentness.artifact_fingerprint_v8,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v7,
-            edited.currentness.fingerprint_v7,
+            solved.currentness.fingerprint_v8,
+            edited.currentness.fingerprint_v8,
         );
 
         let mut missing = facts.clone();
@@ -12164,6 +12375,122 @@ mod tests {
     }
 
     #[test]
+    fn authored_call_rows_preserve_lossy_source_surface_exactly_once() {
+        let input = KernelOwnerProgramInput {
+            nodes: vec![
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Text,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Text,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                },
+                KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::PureBuiltin {
+                        kind: KernelPureBuiltinKind::TextConcat,
+                    },
+                    inputs: vec![
+                        edge(
+                            KernelOwnerEdgeRole::AbiArgument {
+                                name: "$pipe".into(),
+                            },
+                            0,
+                        ),
+                        edge(
+                            KernelOwnerEdgeRole::AbiArgument {
+                                name: "other".into(),
+                            },
+                            1,
+                        ),
+                    ]
+                    .into_boxed_slice(),
+                    mode: FlowMode::Continuous,
+                },
+            ]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(2),
+        };
+        let syntax = KernelCallSyntaxInput {
+            expression: KernelExpressionId(2),
+            function: "Text/concat".into(),
+            pipe_input: Some(KernelExpressionId(0)),
+            arguments: vec![KernelCallSyntaxArgument {
+                ordinal: 0,
+                kind: KernelCallArgumentKind::Named,
+                name: "other".into(),
+                value: KernelExpressionId(1),
+            }]
+            .into_boxed_slice(),
+            pass: None,
+        };
+        let facts = KernelDefinitionFactsInput {
+            call_syntax: vec![syntax.clone()].into_boxed_slice(),
+            ..KernelDefinitionFactsInput::default()
+        };
+        let solved = compile_owner_program_with_definition_facts(&input, &facts)
+            .unwrap()
+            .solve()
+            .unwrap();
+        let [linked] = solved.definition.call_syntax.as_ref() else {
+            panic!("one authored call surface must be linked")
+        };
+        assert_eq!(linked.expression, syntax.expression);
+        assert_eq!(linked.function, syntax.function);
+        assert_eq!(
+            linked.pipe_input,
+            Some(KernelValueReference::Local(KernelExpressionId(0)))
+        );
+        assert_eq!(
+            linked.arguments[0].value,
+            KernelValueReference::Local(KernelExpressionId(1))
+        );
+        assert_eq!(solved.definition.calls.len(), 1);
+
+        let mut renamed = facts.clone();
+        renamed.call_syntax[0].function = "Text/concat_alias".into();
+        let renamed = compile_owner_program_with_definition_facts(&input, &renamed)
+            .unwrap()
+            .solve()
+            .unwrap();
+        assert_eq!(solved.definition.result, renamed.definition.result);
+        assert_eq!(
+            solved.currentness.public_result_fingerprint_v1,
+            renamed.currentness.public_result_fingerprint_v1,
+        );
+        assert_ne!(
+            solved.currentness.basis_fingerprint_v6,
+            renamed.currentness.basis_fingerprint_v6,
+        );
+        assert_ne!(
+            solved.currentness.artifact_fingerprint_v8,
+            renamed.currentness.artifact_fingerprint_v8,
+        );
+        assert_ne!(
+            solved.currentness.fingerprint_v8,
+            renamed.currentness.fingerprint_v8,
+        );
+
+        let mut partial = facts.clone();
+        partial.call_syntax[0].arguments = Box::new([]);
+        let error = compile_owner_program_with_definition_facts(&input, &partial)
+            .err()
+            .expect("authored and canonical call inputs must agree exactly");
+        assert!(error.to_string().contains("differ from canonical inputs"));
+
+        let mut bad_ordinal = facts.clone();
+        bad_ordinal.call_syntax[0].arguments[0].ordinal = 4;
+        let error = compile_owner_program_with_definition_facts(&input, &bad_ordinal)
+            .err()
+            .expect("authored call argument ordinals must be dense");
+        assert!(error.to_string().contains("invalid authored argument"));
+    }
+
+    #[test]
     fn definition_declarations_and_lexical_bindings_are_validated_and_relocated() {
         let input = KernelOwnerProgramInput {
             nodes: vec![
@@ -12200,6 +12527,7 @@ mod tests {
         let facts = KernelDefinitionFactsInput {
             relocations: KernelDefinitionRelocations::default(),
             expression_payloads: Box::new([]),
+            call_syntax: Box::new([]),
             statements: vec![KernelStatementInput {
                 id: KernelStatementId(0),
                 kind: KernelStatementKind::Field {
@@ -12426,6 +12754,7 @@ mod tests {
         let facts = KernelDefinitionFactsInput {
             relocations: KernelDefinitionRelocations::default(),
             expression_payloads: Box::new([]),
+            call_syntax: Box::new([]),
             statements,
             declarations,
             lexical_bindings: Box::new([]),

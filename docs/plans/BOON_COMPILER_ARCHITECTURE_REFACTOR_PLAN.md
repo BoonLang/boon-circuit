@@ -3478,9 +3478,49 @@ SOURCE ABI projection. The candidate kernel portion is 709.317 ms, of which
 candidate is 3,129.621 ms. The optimized Cargo rebuild itself is deliberately
 excluded from these compiler timings.
 
-The next dependency-bottom slice is exact call/execution payload authority.
-Once those rows are complete, the dense checked linker can consume
-`DefinitionArtifact` directly rather than re-reading source-shaped owner DTOs.
+### Exact authored call-surface authority
+
+Canonical solver call edges are intentionally lossy: resolution may order
+inputs by formal ordinal, collapse different spellings into one builtin kind,
+and separate PASS from ordinary arguments. The checked linker must not try to
+reverse that transformation. `KernelCallSyntaxInput` now records the exact
+function spelling, optional pipeline input, ordered authored arguments and
+their kinds and names, and an explicit PASS value plus final-clause flag.
+`DefinitionArtifact` carries the corresponding linked call row beside the
+solved call artifact.
+
+The first full NovyWave differential found an important boundary invariant:
+an authored pipeline input is not necessarily a local expression. A structural
+child owner may publish that input through its public result. Call syntax values
+therefore use the same explicit local-or-external `KernelValueReference`
+relocation as compiled expression edges. Raw definition-local IDs would reject
+513 valid owners and lose 2,912 checked-call rows. This is a general
+cross-definition rule, not a NovyWave exception.
+
+Production definitions must provide exactly one sorted syntax row for every
+call node. Kernel validation checks function compatibility, dense argument
+ordinals, nonempty names, the complete authored input multiset, and all
+local/external reference bounds. Partial or duplicate tables fail closed;
+type-only kernel fixtures without source relocations may still omit them.
+Call-surface facts participate in definition basis, artifact, and
+exact-currentness fingerprints, advancing those domains to basis V6 and
+artifact/currentness V8.
+
+The complete kernel suite is 93/93 green, parser-backed Counter/Todo coverage
+remains deterministic, and the full debug NovyWave differential retains all
+1,821 calls across all 1,389 solved owners and eight structural containers with
+zero unsupported owners. It records 59,302 operations, 95,483 activations, and
+3,119.780 ms for the complete debug candidate, including 2,970.361 ms kernel
+work, 420.595 ms checked-image publication, and 1,048.227 ms of deliberately
+deep oracle comparison. No fresh optimized rebuild was spent on this adjacent
+metadata slice; the preceding semantic-payload release receipt remains the
+current optimized baseline.
+
+The next dependency-bottom slice is structural execution payload authority:
+retain the exact expression forms and declaration-bearing execution edges that
+canonical type equations deliberately omit. Once those rows are complete, the
+dense checked linker can consume `DefinitionArtifact` directly rather than
+re-reading source-shaped owner DTOs.
 
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not

@@ -4469,6 +4469,23 @@ definition proof fragments and the shared row/document plan-code linker; do
 not add another catalog layer or spend the next tranche on the remaining
 single-digit setup work.
 
+The clean 2026-08-16 toolchain recheck reinforces that ordering. Removing the
+workspace root target reclaimed 8.1 GiB; a fresh pinned-stable `boon_cli`
+release build then took 353.63 seconds and 1,952,228 KiB peak RSS. The fresh
+production binary compiled NovyWave verified in 2,538.197 ms in its first
+localization sample, including 972.625 ms semantic construction, 252.359 ms
+backend construction, and 0.351 ms WHERE verification, with the same source
+and MachinePlan digests above. A proof-specific trace attributes 132.571 ms to
+canonical-CBOR payload hashing, 53.984 ms to row-fingerprint hashing, and only
+1.292 ms to relocation ordering/deduplication across 31,225 execution rows.
+A safe structural Serde codec that also committed schema and sparse field names
+was implemented and measured, then rejected and deleted: it increased payload
+hashing to 258.390 ms and row hashing to 57.938 ms. Raw tuple/bincode encoding
+is not an acceptable substitute because omitted Serde fields would make sparse
+records ambiguous. The next cut therefore removes rich per-occurrence payload
+serialization through definition-owned expression proof fragments; it does
+not tune relocation sorting or switch proof codecs.
+
 Updating the architecture gate exposed two stale classifier entries from the
 definition-template checkpoint. `InvalidDefinitionTemplate` and the three
 checked definition execution-template records are now explicitly classified,

@@ -816,6 +816,10 @@ struct ExecutionImageHandoffBuilderV3<'a> {
     /// Most rows have only a few relocations, so retaining one arena removes a
     /// second allocation from every dependency-bearing row.
     relocation_digest_scratch: Vec<[u8; 32]>,
+    trace: bool,
+    trace_payload_hash_ns: u128,
+    trace_relocation_ns: u128,
+    trace_row_hash_ns: u128,
 }
 
 impl<'a> ExecutionImageHandoffBuilderV3<'a> {
@@ -833,6 +837,7 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
                 "execution V3 definition routes do not cover checked projections".to_owned(),
             );
         }
+        let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
         Ok(Self {
             checked,
             construction_image,
@@ -842,6 +847,10 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
             entity_routes: Vec::new(),
             hash_scratch: Vec::new(),
             relocation_digest_scratch: Vec::new(),
+            trace,
+            trace_payload_hash_ns: 0,
+            trace_relocation_ns: 0,
+            trace_row_hash_ns: 0,
         })
     }
 
@@ -950,7 +959,11 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
         payload: &T,
         relocations: Vec<PendingExecutionProjectionIdV3>,
     ) -> Result<(), String> {
+        let started = self.trace.then(std::time::Instant::now);
         let payload_digest = seal_execution_row_payload_v3(payload, &mut self.hash_scratch)?;
+        if let Some(started) = started {
+            self.trace_payload_hash_ns += started.elapsed().as_nanos();
+        }
         self.push_presealed(projection, domain, payload_digest, relocations)
     }
 
@@ -961,6 +974,7 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
         payload_digest: [u8; 32],
         mut relocations: Vec<PendingExecutionProjectionIdV3>,
     ) -> Result<(), String> {
+        let relocation_started = self.trace.then(std::time::Instant::now);
         let stable_key_digests = &self.projections;
         relocations
             .sort_unstable_by_key(|target| stable_key_digests[target.as_usize()].stable_key_digest);
@@ -974,6 +988,10 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
         );
         let projection_stable_key_digest =
             self.projections[projection.as_usize()].stable_key_digest;
+        if let Some(started) = relocation_started {
+            self.trace_relocation_ns += started.elapsed().as_nanos();
+        }
+        let row_hash_started = self.trace.then(std::time::Instant::now);
         let digest = boon_contract::canonical_serde_hash_v1_with_buffer(
             EXECUTION_IMAGE_ROW_DOMAIN_V3,
             &ExecutionImageRowFingerprintV3 {
@@ -985,6 +1003,9 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
             &mut self.hash_scratch,
         )
         .map_err(|error| format!("failed to hash execution V3 row: {error}"))?;
+        if let Some(started) = row_hash_started {
+            self.trace_row_hash_ns += started.elapsed().as_nanos();
+        }
         let has_relocations = !relocations.is_empty();
         let pending = &mut self.projections[projection.as_usize()];
         pending.row_digests.push(digest);
@@ -1034,6 +1055,10 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
             mut entity_routes,
             mut hash_scratch,
             relocation_digest_scratch: _,
+            trace,
+            trace_payload_hash_ns,
+            trace_relocation_ns,
+            trace_row_hash_ns,
         } = self;
         let mut canonical_projection_by_pending =
             vec![ExecutionImageProjectionIdV3(u32::MAX); projections.len()];
@@ -1157,7 +1182,7 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
             &mut hash_scratch,
         )
         .map_err(|error| format!("failed to hash execution V3 handoff: {error}"))?;
-        if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
+        if trace {
             let row_count = sealed_projections
                 .iter()
                 .map(|projection| projection.row_count as usize)
@@ -1169,6 +1194,12 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
                 row_count,
                 sealed_entity_routes.len(),
                 relocation_arena.len(),
+            );
+            eprintln!(
+                "boon_semantic execution_handoff_v3 payload_hash_ms={:.3} relocation_ms={:.3} row_hash_ms={:.3}",
+                trace_payload_hash_ns as f64 / 1_000_000.0,
+                trace_relocation_ns as f64 / 1_000_000.0,
+                trace_row_hash_ns as f64 / 1_000_000.0,
             );
         }
         Ok((

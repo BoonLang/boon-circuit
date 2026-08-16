@@ -2008,11 +2008,14 @@ fn exact_owner(
     Ok(*owner)
 }
 
-fn resolve_construction_owner(
+fn resolve_construction_owner<F>(
     route: &ConstructionDependencyOwnerV1,
     owners: &DependencyOwnerIndex,
-    context: &str,
-) -> Result<SemanticDependencyOwnerV1, CallableDependencyManifestError> {
+    context: &F,
+) -> Result<SemanticDependencyOwnerV1, CallableDependencyManifestError>
+where
+    F: Fn() -> String,
+{
     match route {
         ConstructionDependencyOwnerV1::ProgramRoot => Ok(SemanticDependencyOwnerV1::ProgramRoot),
         ConstructionDependencyOwnerV1::CheckedStatement(statement) => {
@@ -2031,7 +2034,16 @@ fn resolve_construction_owner(
                 .iter()
                 .map(|route| resolve_construction_owner(route, owners, context))
                 .collect::<Result<Vec<_>, _>>()?;
-            exact_owner(candidates, context)
+            let candidates = candidates.into_iter().collect::<BTreeSet<_>>();
+            let candidates = candidates.iter().copied().collect::<Vec<_>>();
+            let [owner] = candidates.as_slice() else {
+                return Err(CallableDependencyManifestError::new(format!(
+                    "{} resolves to {} primary callable/root owners {candidates:?}; an explicit engine identity is required",
+                    context(),
+                    candidates.len(),
+                )));
+            };
+            Ok(*owner)
         }
     }
 }
@@ -2072,6 +2084,7 @@ pub(crate) enum ConstructionDependencyOwnerV1 {
 pub enum ConstructionDependencyDomainV1 {
     #[default]
     Lowering,
+    Reactive,
     Resource,
 }
 
@@ -2100,6 +2113,46 @@ impl ConstructionDependencyRowsV1 {
         Self { domain, rows }
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+}
+
+/// Finalized reactive sections published by the construction owner before the
+/// rich graph is assembled. The dependency linker consumes only the compact
+/// publication; it must not rediscover these rows from
+/// [`SemanticReactiveGraphV1`].
+pub(crate) struct ReactiveDependencyInputsV1<'a> {
+    pub(crate) external_event_identities: &'a [CheckedExternalDeclarationIdentityV1],
+    pub(crate) producer_instances: &'a [SemanticProducerInstanceV1],
+    pub(crate) fields: &'a [SemanticFieldV1],
+    pub(crate) bindings: &'a [SemanticBindingV1],
+    pub(crate) reads: &'a [SemanticReadBindingV1],
+    pub(crate) dependency_uses: &'a [SemanticDependencyUseV1],
+    pub(crate) call_invocations: &'a [SemanticCallInvocationScheduleV1],
+    pub(crate) activations: &'a [SemanticActivationSiteV1],
+    pub(crate) pulse_batches: &'a [SemanticPulseBatchV1],
+    pub(crate) derived_values: &'a [SemanticDerivedValueV1],
+    pub(crate) trigger_arms: &'a [SemanticTriggerOwnedArmV1],
+    pub(crate) state_update_arms: &'a [SemanticStateUpdateArmV1],
+    pub(crate) list_mutations: &'a [SemanticListMutationV1],
+    pub(crate) dependencies: &'a [SemanticDependencyEdgeV1],
+    pub(crate) possible_causes: &'a [SemanticPossibleCausesV1],
+    pub(crate) host_effect_schedules: &'a [SemanticHostEffectScheduleV1],
+    pub(crate) output_values: &'a [SemanticOutputValueV1],
+    pub(crate) view_captures: &'a [SemanticViewCaptureV1],
+    pub(crate) migration_inputs: &'a [SemanticMigrationInputV1],
+}
+
+/// Move-only reactive proof publication. `component_digest` remains the exact
+/// V2 reactive component receipt while `rows` carries the V7 construction
+/// namespace and pending cross-domain references.
+pub(crate) struct ReactiveDependencyPublicationV1 {
+    rows: ConstructionDependencyRowsV1,
+    component_digest: [u8; 32],
+}
+
+impl ReactiveDependencyPublicationV1 {
     pub(crate) fn len(&self) -> usize {
         self.rows.len()
     }
@@ -2168,6 +2221,26 @@ impl ConstructionDependencyRowBuilderV1 {
             SemanticDependencyProjectionClassV4::Structural,
             payload,
         )
+    }
+
+    pub(crate) fn structural_from_payload_digest(
+        &mut self,
+        owner: ConstructionDependencyOwnerV1,
+        subject: SemanticDependencySubjectV1,
+        payload_digest: [u8; 32],
+    ) -> Result<ConstructionDependencyRowV1, CallableDependencyManifestError> {
+        let local_digest = compact_local_classification_digest_v4(
+            &subject,
+            payload_digest,
+            &mut self.hash_scratch,
+        )?;
+        Ok(ConstructionDependencyRowV1 {
+            owner,
+            subject,
+            class: SemanticDependencyProjectionClassV4::Structural,
+            local_digest,
+            references: None,
+        })
     }
 
     pub(crate) fn diagnostic<P: Serialize>(
@@ -2735,6 +2808,8 @@ struct DependencyCollector {
     compact_records: Vec<CompactDependencyRecordV4>,
     compact_references: Vec<PendingDependencyReference>,
     #[cfg(test)]
+    compact_subjects: Vec<SemanticDependencySubjectV1>,
+    #[cfg(test)]
     records: Vec<SemanticDependencyRecordV1>,
     // Entity references cannot be resolved until every subject has been
     // classified. Keep only those unresolved identities in a dense sidecar;
@@ -2782,6 +2857,8 @@ impl DependencyCollector {
             compact_records: Vec::with_capacity(record_capacity),
             compact_references: Vec::with_capacity(record_capacity),
             #[cfg(test)]
+            compact_subjects: Vec::with_capacity(coverage_capacity),
+            #[cfg(test)]
             records: Vec::new(),
             #[cfg(test)]
             unresolved_entity_references: Vec::new(),
@@ -2798,7 +2875,7 @@ impl DependencyCollector {
 
     fn ingest_construction_rows(
         &mut self,
-        rows: &ConstructionDependencyRowsV1,
+        rows: ConstructionDependencyRowsV1,
         owners: &DependencyOwnerIndex,
     ) -> Result<(), CallableDependencyManifestError> {
         #[cfg(test)]
@@ -2807,24 +2884,29 @@ impl DependencyCollector {
                 "construction-owned compact rows cannot populate the exhaustive V3 oracle",
             ));
         }
-        for row in &rows.rows {
-            let context = format!("construction dependency subject {:?}", row.subject);
-            let owner = resolve_construction_owner(&row.owner, owners, &context)?;
+        let ConstructionDependencyRowsV1 { domain, rows } = rows;
+        for row in rows {
+            let owner = resolve_construction_owner(&row.owner, owners, &|| {
+                format!("construction dependency subject {:?}", row.subject)
+            })?;
             self.claim_subject(&row.subject)?;
-            match (&row.class, &row.references) {
-                (SemanticDependencyProjectionClassV4::Dependency { .. }, Some(references)) => {
+            match (row.class, row.references) {
+                (
+                    class @ SemanticDependencyProjectionClassV4::Dependency { .. },
+                    Some(references),
+                ) => {
                     let id = SemanticDependencyRecordId(self.compact_records.len());
                     let compact_row = self.compact_rows.len();
                     self.push_compact_classification_with_origin(
                         owner,
                         &row.subject,
-                        row.class,
-                        CompactDependencyRowOriginV7::Construction(rows.domain),
+                        class,
+                        CompactDependencyRowOriginV7::Construction(domain),
                         row.local_digest,
                         Some(id),
                     );
                     let references_start = self.compact_references.len();
-                    self.compact_references.extend(references.iter().cloned());
+                    self.compact_references.extend(references);
                     let references_end = self.compact_references.len();
                     self.compact_records.push(CompactDependencyRecordV4 {
                         row: compact_row,
@@ -2837,15 +2919,15 @@ impl DependencyCollector {
                         .push(id);
                 }
                 (
-                    SemanticDependencyProjectionClassV4::Structural
-                    | SemanticDependencyProjectionClassV4::Diagnostic,
+                    class @ (SemanticDependencyProjectionClassV4::Structural
+                    | SemanticDependencyProjectionClassV4::Diagnostic),
                     None,
                 ) => {
                     self.push_compact_classification_with_origin(
                         owner,
                         &row.subject,
-                        row.class,
-                        CompactDependencyRowOriginV7::Construction(rows.domain),
+                        class,
+                        CompactDependencyRowOriginV7::Construction(domain),
                         row.local_digest,
                         None,
                     );
@@ -2885,6 +2967,8 @@ impl DependencyCollector {
             compact_records: Vec::with_capacity(record_capacity),
             compact_references: Vec::with_capacity(record_capacity),
             #[cfg(test)]
+            compact_subjects: Vec::with_capacity(coverage_capacity),
+            #[cfg(test)]
             records: retain_exhaustive
                 .then(|| Vec::with_capacity(record_capacity))
                 .unwrap_or_default(),
@@ -2911,6 +2995,7 @@ impl DependencyCollector {
             compact_rows: Vec::new(),
             compact_records: Vec::new(),
             compact_references: Vec::new(),
+            compact_subjects: Vec::new(),
             records: Vec::new(),
             unresolved_entity_references: Vec::new(),
             coverage: Vec::new(),
@@ -4055,6 +4140,8 @@ impl DependencyCollector {
         local_digest: [u8; 32],
         dependency: Option<SemanticDependencyRecordId>,
     ) {
+        #[cfg(test)]
+        self.compact_subjects.push(subject.clone());
         self.compact_rows.push(CompactDependencyRowV4 {
             projection: DenseDependencyProjectionKeyV4 {
                 owner,
@@ -4419,6 +4506,7 @@ impl DependencyCollector {
             compact_rows: _,
             compact_records: _,
             compact_references: _,
+            compact_subjects: _,
             mut records,
             unresolved_entity_references,
             coverage,
@@ -6775,10 +6863,11 @@ pub(crate) fn build_callable_dependency_manifest_v7(
     #[cfg(test)] out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV2,
-    resource_rows: &ConstructionDependencyRowsV1,
+    resource_rows: ConstructionDependencyRowsV1,
     reactive: &SemanticReactiveGraphV1,
+    reactive_publication: ReactiveDependencyPublicationV1,
     lowering: &SemanticLoweringContractV2,
-    lowering_rows: &ConstructionDependencyRowsV1,
+    lowering_rows: ConstructionDependencyRowsV1,
     view: &SemanticViewBindingGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     memory: &SemanticMemoryGraphV1,
@@ -6863,6 +6952,17 @@ pub(crate) fn build_callable_dependency_manifest_v7(
         }
         Ok::<(), CallableDependencyManifestError>(())
     })?;
+    #[cfg(test)]
+    phase!(
+        "reactive_publication_oracle",
+        validate_reactive_dependency_publication_against_oracle(
+            &reactive_publication,
+            checked,
+            execution,
+            reactive,
+            &owner_index,
+        )
+    )?;
     let presealed = phase!(
         "consume_checked_execution_prefix",
         manifest_prefix.into_index(checked_handoff, execution_handoff, &stable_owners)
@@ -6959,8 +7059,11 @@ pub(crate) fn build_callable_dependency_manifest_v7(
         collector.ingest_construction_rows(resource_rows, &owner_index)
     )?;
     let reactive_graph_digest = phase!(
-        "inventory_reactive",
-        inventory_reactive(reactive, execution, &owner_index, &mut collector)
+        "ingest_reactive_rows",
+        (|| {
+            collector.ingest_construction_rows(reactive_publication.rows, &owner_index)?;
+            Ok::<_, CallableDependencyManifestError>(reactive_publication.component_digest)
+        })()
     )?;
     phase!(
         "ingest_lowering_rows",
@@ -11378,6 +11481,1004 @@ fn resource_initializer_expressions(
         .collect()
 }
 
+fn construction_owner_with_static(
+    primary: ConstructionDependencyOwnerV1,
+    owner: Option<StaticOwnerId>,
+) -> ConstructionDependencyOwnerV1 {
+    match owner {
+        None => primary,
+        Some(owner) => ConstructionDependencyOwnerV1::Exact(vec![
+            primary,
+            ConstructionDependencyOwnerV1::StaticOwner(owner),
+        ]),
+    }
+}
+
+fn construction_exact_owner(
+    mut candidates: Vec<ConstructionDependencyOwnerV1>,
+) -> ConstructionDependencyOwnerV1 {
+    if candidates.len() == 1 {
+        candidates.pop().expect("one construction owner candidate")
+    } else {
+        ConstructionDependencyOwnerV1::Exact(candidates)
+    }
+}
+
+pub(crate) fn publish_reactive_dependencies_v1(
+    input: ReactiveDependencyInputsV1<'_>,
+) -> Result<ReactiveDependencyPublicationV1, CallableDependencyManifestError> {
+    let ReactiveDependencyInputsV1 {
+        external_event_identities,
+        producer_instances,
+        fields,
+        bindings,
+        reads,
+        dependency_uses,
+        call_invocations,
+        activations,
+        pulse_batches,
+        derived_values,
+        trigger_arms,
+        state_update_arms,
+        list_mutations,
+        dependencies,
+        possible_causes,
+        host_effect_schedules,
+        output_values,
+        view_captures,
+        migration_inputs,
+    } = input;
+    let nested_parameter_count = producer_instances
+        .iter()
+        .map(|producer| producer.parameters.len())
+        .sum::<usize>();
+    let row_capacity = 1
+        + producer_instances.len()
+        + nested_parameter_count
+        + fields.len()
+        + bindings.len()
+        + reads.len()
+        + dependency_uses.len()
+        + call_invocations.len()
+        + activations.len()
+        + pulse_batches.len()
+        + derived_values.len()
+        + trigger_arms.len()
+        + state_update_arms.len()
+        + list_mutations.len()
+        + dependencies.len()
+        + possible_causes.len()
+        + host_effect_schedules.len()
+        + output_values.len()
+        + view_captures.len()
+        + migration_inputs.len();
+    let mut builder = ConstructionDependencyRowBuilderV1::new();
+    let mut rows_out = Vec::with_capacity(row_capacity);
+
+    for producer in producer_instances {
+        let owner = ConstructionDependencyOwnerV1::StaticOwner(producer.owner);
+        let entity = SemanticDependencyEntityV1::Digest {
+            domain: SemanticDependencyEntityDomainV1::SemanticProducerInstance,
+            digest: producer.identity,
+        };
+        rows_out.push(builder.dependency(
+            owner.clone(),
+            SemanticDependencyChannelV1::ResourceBehavior,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::CoverageOrRouting,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveProducerInstance,
+                entity.clone(),
+            ),
+            SemanticDependencySemanticsV1 {
+                static_owner: Some(producer.owner),
+                call_instance: Some(producer.root_call),
+                multiplicity: match producer.mode {
+                    ProducerMaterializationMode::Current => {
+                        SemanticDependencyMultiplicityV1::PerTick
+                    }
+                    ProducerMaterializationMode::Invocation => {
+                        SemanticDependencyMultiplicityV1::PerEvent
+                    }
+                },
+                ..SemanticDependencySemanticsV1::default()
+            },
+            producer,
+            vec![
+                dependency_callable_interface(producer.callable),
+                dependency_entity(expression_entity(producer.root_expression)),
+                dependency_entity(statement_entity(producer.result_statement)),
+            ],
+        )?);
+        for (ordinal, parameter) in producer.parameters.iter().enumerate() {
+            rows_out.push(
+                builder.dependency(
+                    owner.clone(),
+                    SemanticDependencyChannelV1::ParentValueFormal,
+                    vec![SemanticDependencyRoleV1::FormulaBinder],
+                    child_subject(
+                        SemanticDependencySubjectKindV1::ReactiveProducerParameter,
+                        entity.clone(),
+                        ordinal,
+                    ),
+                    SemanticDependencySemanticsV1 {
+                        flow_type: Some(parameter.flow_type.clone()),
+                        lifetime: SemanticDependencyLifetimeV1::Call,
+                        ..SemanticDependencySemanticsV1::default()
+                    },
+                    parameter,
+                    parameter
+                        .input_expressions
+                        .iter()
+                        .copied()
+                        .map(expression_entity)
+                        .map(dependency_entity)
+                        .collect(),
+                )?,
+            );
+        }
+    }
+
+    for field in fields {
+        rows_out.push(builder.dependency(
+            construction_owner_with_static(
+                ConstructionDependencyOwnerV1::Expression(field.producer),
+                field.owner,
+            ),
+            SemanticDependencyChannelV1::ResourceWrite,
+            vec![
+                SemanticDependencyRoleV1::FixedDefinition,
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveField,
+                field_entity(field.id),
+            ),
+            SemanticDependencySemanticsV1 {
+                flow_type: Some(field.flow_type.clone()),
+                static_owner: field.owner,
+                row: field.row,
+                phase: SemanticDependencyPhaseV1::CandidateWrite,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            field,
+            vec![
+                dependency_entity(statement_entity(field.statement)),
+                dependency_entity(expression_entity(field.producer)),
+            ],
+        )?);
+    }
+
+    for binding in bindings {
+        rows_out.push(builder.dependency(
+            construction_owner_with_static(
+                ConstructionDependencyOwnerV1::Expression(binding.producer),
+                binding.owner,
+            ),
+            SemanticDependencyChannelV1::ResourceWrite,
+            vec![
+                SemanticDependencyRoleV1::FormulaBinder,
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveBinding,
+                binding_entity(binding.id),
+            ),
+            SemanticDependencySemanticsV1 {
+                flow_type: Some(binding.flow_type.clone()),
+                static_owner: binding.owner,
+                call_instance: binding.call_instance,
+                phase: SemanticDependencyPhaseV1::CandidateWrite,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            binding,
+            vec![
+                dependency_entity(statement_entity(binding.statement)),
+                dependency_entity(expression_entity(binding.producer)),
+                dependency_entity(binding_target_entity(binding.target)),
+            ],
+        )?);
+    }
+
+    for read in reads {
+        let (channel, projection, references) = reactive_read_dependency(&read.target);
+        rows_out.push(builder.dependency(
+            ConstructionDependencyOwnerV1::Expression(read.expression),
+            channel,
+            vec![
+                SemanticDependencyRoleV1::FormulaBinder,
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveRead,
+                read_entity(read.id),
+            ),
+            SemanticDependencySemanticsV1 {
+                projection,
+                phase: SemanticDependencyPhaseV1::CurrentValue,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            read,
+            references,
+        )?);
+    }
+
+    for dependency in dependency_uses {
+        let owner = construction_exact_owner(vec![
+            ConstructionDependencyOwnerV1::Binding(dependency.dependent),
+            ConstructionDependencyOwnerV1::Expression(dependency.expression),
+        ]);
+        let mut references = vec![dependency_entity(binding_entity(dependency.dependent))];
+        match &dependency.target {
+            SemanticDependencyTargetV1::ExternalRead { read } => {
+                references.push(dependency_entity(read_entity(*read)));
+            }
+            SemanticDependencyTargetV1::ExternalCall { call, expression } => {
+                references.push(dependency_entity(call_entity(*call)));
+                references.push(dependency_entity(expression_entity(*expression)));
+            }
+        }
+        if let SemanticDependencyTimingV1::After { boundaries } = &dependency.timing {
+            references.extend(
+                boundaries
+                    .iter()
+                    .copied()
+                    .map(event_cause_entity)
+                    .map(dependency_entity),
+            );
+        }
+        rows_out.push(builder.dependency(
+            owner,
+            SemanticDependencyChannelV1::ExternalValueOrCall,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::CoverageOrRouting,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveDependencyUse,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticDependencyUse,
+                    dependency.id.as_usize(),
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                multiplicity: SemanticDependencyMultiplicityV1::PerEvent,
+                lifetime: SemanticDependencyLifetimeV1::Activation,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            dependency,
+            references,
+        )?);
+    }
+
+    for schedule in call_invocations {
+        let mut references = vec![
+            dependency_entity(expression_entity(schedule.expression)),
+            dependency_entity(call_entity(schedule.call)),
+        ];
+        references.extend(
+            schedule
+                .dependent_bindings
+                .iter()
+                .copied()
+                .map(binding_entity)
+                .map(dependency_entity),
+        );
+        references.extend(schedule.invocation_arms.iter().copied().map(|arm| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticTriggerArm,
+                arm.as_usize(),
+            ))
+        }));
+        rows_out.push(builder.dependency(
+            ConstructionDependencyOwnerV1::Expression(schedule.expression),
+            SemanticDependencyChannelV1::ExternalValueOrCall,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::CoverageOrRouting,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveCallSchedule,
+                expression_entity(schedule.expression),
+            ),
+            SemanticDependencySemanticsV1 {
+                multiplicity: if schedule.current_capable {
+                    SemanticDependencyMultiplicityV1::PerTick
+                } else {
+                    SemanticDependencyMultiplicityV1::PerEvent
+                },
+                lifetime: SemanticDependencyLifetimeV1::Activation,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            schedule,
+            references,
+        )?);
+    }
+
+    for activation in activations {
+        let mut references = vec![
+            dependency_entity(expression_entity(activation.then_expression)),
+            dependency_entity(expression_entity(activation.input_expression)),
+            dependency_entity(expression_entity(activation.output_expression)),
+        ];
+        references.extend(
+            activation
+                .states
+                .iter()
+                .copied()
+                .map(state_entity)
+                .map(dependency_entity),
+        );
+        rows_out.push(builder.dependency(
+            ConstructionDependencyOwnerV1::Expression(activation.then_expression),
+            SemanticDependencyChannelV1::CoverageRouting,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::AssuranceOrActivation,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveActivation,
+                activation_entity(activation.id),
+            ),
+            SemanticDependencySemanticsV1 {
+                static_owner: activation.owner,
+                multiplicity: SemanticDependencyMultiplicityV1::PerEvent,
+                lifetime: SemanticDependencyLifetimeV1::Activation,
+                phase: SemanticDependencyPhaseV1::EventPayload,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            activation,
+            references,
+        )?);
+    }
+
+    for pulse in pulse_batches {
+        let mut references = vec![
+            dependency_entity(call_entity(pulse.call)),
+            dependency_entity(expression_entity(pulse.call_expression)),
+            dependency_entity(expression_entity(pulse.count_expression)),
+        ];
+        references.extend(
+            pulse
+                .enclosing_activation
+                .map(activation_entity)
+                .map(dependency_entity),
+        );
+        references.extend(pulse.state.map(state_entity).map(dependency_entity));
+        references.extend(
+            pulse
+                .hold_expression
+                .map(expression_entity)
+                .map(dependency_entity),
+        );
+        references.extend(
+            pulse
+                .transition_expression
+                .map(expression_entity)
+                .map(dependency_entity),
+        );
+        references.extend(
+            pulse
+                .transition_output
+                .map(expression_entity)
+                .map(dependency_entity),
+        );
+        references.extend(pulse.trigger_arms.iter().copied().map(|arm| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticTriggerArm,
+                arm.as_usize(),
+            ))
+        }));
+        references.extend(pulse.state_update_arms.iter().copied().map(|arm| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticStateUpdateArm,
+                arm.as_usize(),
+            ))
+        }));
+        references.extend(pulse.list_mutations.iter().copied().map(|mutation| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticListMutation,
+                mutation.as_usize(),
+            ))
+        }));
+        references.extend(pulse.derived_values.iter().copied().map(|derived| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticDerivedValue,
+                derived.as_usize(),
+            ))
+        }));
+        references.extend(pulse.host_effect_schedules.iter().copied().map(|effect| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticHostEffect,
+                effect.as_usize(),
+            ))
+        }));
+        references.extend(
+            pulse
+                .flush_roots
+                .iter()
+                .copied()
+                .map(expression_entity)
+                .map(dependency_entity),
+        );
+        for route in &pulse.emission_routes {
+            references.extend(route.consumer.map(expression_entity).map(dependency_entity));
+            if let SemanticPulseEmissionFilterV1::Skip {
+                call,
+                expression,
+                count_expression,
+                ..
+            } = &route.filter
+            {
+                references.push(dependency_entity(call_entity(*call)));
+                references.push(dependency_entity(expression_entity(*expression)));
+                references.push(dependency_entity(expression_entity(*count_expression)));
+            }
+        }
+        rows_out.push(builder.dependency(
+            ConstructionDependencyOwnerV1::Expression(pulse.call_expression),
+            SemanticDependencyChannelV1::RuntimeIntrinsicOrHostEffect,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::CoverageOrRouting,
+                SemanticDependencyRoleV1::AssuranceOrActivation,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactivePulseBatch,
+                pulse_batch_entity(pulse.id),
+            ),
+            SemanticDependencySemanticsV1 {
+                multiplicity: SemanticDependencyMultiplicityV1::PerEvent,
+                lifetime: SemanticDependencyLifetimeV1::Activation,
+                phase: SemanticDependencyPhaseV1::Commit,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            pulse,
+            references,
+        )?);
+    }
+
+    for derived in derived_values {
+        let mut references = vec![
+            dependency_entity(binding_entity(derived.binding)),
+            dependency_entity(field_entity(derived.field)),
+            dependency_entity(statement_entity(derived.statement)),
+            dependency_entity(expression_entity(derived.producer)),
+        ];
+        references.extend(
+            derived
+                .materialized_list
+                .map(list_entity)
+                .map(dependency_entity),
+        );
+        references.extend(
+            derived
+                .causes
+                .iter()
+                .copied()
+                .map(event_cause_entity)
+                .map(dependency_entity),
+        );
+        rows_out.push(
+            builder.dependency(
+                construction_exact_owner(vec![
+                    ConstructionDependencyOwnerV1::Binding(derived.binding),
+                    ConstructionDependencyOwnerV1::Expression(derived.producer),
+                ]),
+                SemanticDependencyChannelV1::ResourceBehavior,
+                vec![
+                    SemanticDependencyRoleV1::FixedDefinition,
+                    SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                ],
+                top_subject(
+                    SemanticDependencySubjectKindV1::ReactiveDerivedValue,
+                    indexed_entity(
+                        SemanticDependencyEntityDomainV1::SemanticDerivedValue,
+                        derived.id.as_usize(),
+                    ),
+                ),
+                SemanticDependencySemanticsV1 {
+                    row: derived
+                        .materialized_list
+                        .zip(derived.materialized_row_scope)
+                        .map(|(list, scope)| SemanticRowBinding { list, scope }),
+                    multiplicity: SemanticDependencyMultiplicityV1::PerTransition,
+                    lifetime: SemanticDependencyLifetimeV1::Snapshot,
+                    ..SemanticDependencySemanticsV1::default()
+                },
+                derived,
+                references,
+            )?,
+        );
+    }
+
+    for arm in trigger_arms {
+        rows_out.push(builder.dependency(
+            construction_owner_with_static(
+                ConstructionDependencyOwnerV1::Expression(arm.gate_expression),
+                arm.owner,
+            ),
+            SemanticDependencyChannelV1::CoverageRouting,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::CoverageOrRouting,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveTriggerArm,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticTriggerArm,
+                    arm.id.as_usize(),
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                static_owner: arm.owner,
+                row: None,
+                multiplicity: SemanticDependencyMultiplicityV1::PerEvent,
+                lifetime: SemanticDependencyLifetimeV1::Event,
+                phase: SemanticDependencyPhaseV1::EventPayload,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            arm,
+            vec![
+                dependency_entity(event_cause_entity(arm.cause)),
+                dependency_entity(expression_entity(arm.gate_expression)),
+                dependency_entity(expression_entity(arm.output_expression)),
+            ],
+        )?);
+    }
+
+    for arm in state_update_arms {
+        rows_out.push(builder.dependency(
+            ConstructionDependencyOwnerV1::State(arm.state),
+            SemanticDependencyChannelV1::ResourceWrite,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::CoverageOrRouting,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveStateUpdateArm,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticStateUpdateArm,
+                    arm.id.as_usize(),
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                multiplicity: SemanticDependencyMultiplicityV1::PerTransition,
+                lifetime: SemanticDependencyLifetimeV1::Snapshot,
+                phase: SemanticDependencyPhaseV1::CandidateWrite,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            arm,
+            vec![
+                dependency_entity(state_entity(arm.state)),
+                dependency_entity(indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticTriggerArm,
+                    arm.trigger.as_usize(),
+                )),
+            ],
+        )?);
+    }
+
+    for mutation in list_mutations {
+        let mut references = vec![
+            dependency_entity(list_entity(mutation.list)),
+            dependency_entity(expression_entity(mutation.site)),
+            dependency_entity(event_cause_entity(mutation.cause)),
+        ];
+        match &mutation.kind {
+            SemanticListMutationKindV1::Append { gate, item, .. } => {
+                references.push(dependency_entity(expression_entity(*gate)));
+                references.push(dependency_entity(expression_entity(*item)));
+            }
+            SemanticListMutationKindV1::Remove {
+                materialization,
+                gate,
+                predicate,
+                owner,
+                ..
+            } => {
+                references.push(dependency_entity(indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticMaterialization,
+                    materialization.as_usize(),
+                )));
+                references.push(dependency_entity(expression_entity(*gate)));
+                references.push(dependency_entity(expression_entity(*predicate)));
+                references.push(dependency_entity(static_owner_entity(*owner)));
+            }
+        }
+        rows_out.push(builder.dependency(
+            construction_owner_with_static(
+                ConstructionDependencyOwnerV1::Expression(mutation.site),
+                mutation.owner,
+            ),
+            SemanticDependencyChannelV1::ResourceWrite,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::CoverageOrRouting,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveListMutation,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticListMutation,
+                    mutation.id.as_usize(),
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                static_owner: mutation.owner,
+                row: mutation.row_scope.map(|scope| SemanticRowBinding {
+                    list: mutation.list,
+                    scope,
+                }),
+                multiplicity: SemanticDependencyMultiplicityV1::PerTransition,
+                lifetime: SemanticDependencyLifetimeV1::Row,
+                phase: SemanticDependencyPhaseV1::CandidateWrite,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            mutation,
+            references,
+        )?);
+    }
+
+    for edge in dependencies {
+        rows_out.push(builder.dependency(
+            ConstructionDependencyOwnerV1::State(edge.to),
+            SemanticDependencyChannelV1::ResourceRead,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::CoverageOrRouting,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveDependencyEdge,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticExternalDependency,
+                    edge.id.as_usize(),
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                multiplicity: SemanticDependencyMultiplicityV1::PerTransition,
+                lifetime: SemanticDependencyLifetimeV1::Snapshot,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            edge,
+            vec![
+                dependency_entity(event_cause_entity(edge.from)),
+                dependency_entity(state_entity(edge.to)),
+            ],
+        )?);
+    }
+
+    for causes in possible_causes {
+        rows_out.push(
+            builder.dependency(
+                ConstructionDependencyOwnerV1::State(causes.state),
+                SemanticDependencyChannelV1::AssuranceInput,
+                vec![
+                    SemanticDependencyRoleV1::CoverageOrRouting,
+                    SemanticDependencyRoleV1::AssuranceOrActivation,
+                ],
+                top_subject(
+                    SemanticDependencySubjectKindV1::ReactivePossibleCauses,
+                    state_entity(causes.state),
+                ),
+                SemanticDependencySemanticsV1::default(),
+                causes,
+                causes
+                    .causes
+                    .iter()
+                    .copied()
+                    .map(event_cause_entity)
+                    .map(dependency_entity)
+                    .collect(),
+            )?,
+        );
+    }
+
+    for effect in host_effect_schedules {
+        let mut references = vec![
+            dependency_entity(expression_entity(effect.expression)),
+            dependency_entity(call_entity(effect.call)),
+        ];
+        references.extend(effect.state_update_arms.iter().copied().map(|arm| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticStateUpdateArm,
+                arm.as_usize(),
+            ))
+        }));
+        references.extend(effect.transient_result.map(|derived| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticDerivedValue,
+                derived.as_usize(),
+            ))
+        }));
+        rows_out.push(builder.dependency(
+            construction_owner_with_static(
+                ConstructionDependencyOwnerV1::Expression(effect.expression),
+                effect.owner,
+            ),
+            SemanticDependencyChannelV1::RuntimeIntrinsicOrHostEffect,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::AssuranceOrActivation,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveHostEffect,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticHostEffect,
+                    effect.id.as_usize(),
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                static_owner: effect.owner,
+                multiplicity: SemanticDependencyMultiplicityV1::PerActivation,
+                lifetime: SemanticDependencyLifetimeV1::Activation,
+                phase: SemanticDependencyPhaseV1::EffectCompletion,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            effect,
+            references,
+        )?);
+    }
+
+    for output in output_values {
+        let mut references = vec![
+            dependency_entity(expression_entity(output.expression)),
+            dependency_entity(statement_entity(output.statement)),
+        ];
+        references.extend(output.field.map(field_entity).map(dependency_entity));
+        rows_out.push(builder.dependency(
+            construction_exact_owner(vec![
+                ConstructionDependencyOwnerV1::Expression(output.expression),
+                ConstructionDependencyOwnerV1::Statement(output.statement),
+            ]),
+            SemanticDependencyChannelV1::CoverageRouting,
+            vec![
+                SemanticDependencyRoleV1::CoverageOrRouting,
+                SemanticDependencyRoleV1::AssuranceOrActivation,
+            ],
+            child_subject(
+                SemanticDependencySubjectKindV1::ReactiveOutput,
+                SemanticDependencyEntityV1::Program,
+                output.ordinal,
+            ),
+            SemanticDependencySemanticsV1 {
+                visibility: SemanticDependencyVisibilityV1::Public,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            output,
+            references,
+        )?);
+    }
+
+    for capture in view_captures {
+        rows_out.push(builder.dependency(
+            ConstructionDependencyOwnerV1::Expression(capture.expression),
+            SemanticDependencyChannelV1::LexicalCapture,
+            vec![
+                SemanticDependencyRoleV1::FormulaBinder,
+                SemanticDependencyRoleV1::CoverageOrRouting,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveViewCapture,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticCapture,
+                    capture.id.as_usize(),
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                lifetime: SemanticDependencyLifetimeV1::Snapshot,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            capture,
+            vec![
+                dependency_entity(expression_entity(capture.expression)),
+                dependency_entity(view_capture_target_entity(capture.target)),
+            ],
+        )?);
+    }
+
+    for migration in migration_inputs {
+        let owner = construction_exact_owner(vec![
+            construction_owner_with_static(
+                ConstructionDependencyOwnerV1::Expression(migration.marker),
+                migration.owner,
+            ),
+            ConstructionDependencyOwnerV1::Expression(migration.input),
+        ]);
+        rows_out.push(builder.dependency(
+            owner,
+            SemanticDependencyChannelV1::MigrationPredecessor,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::AssuranceOrActivation,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveMigrationInput,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticMigrationInput,
+                    migration.id.as_usize(),
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                static_owner: migration.owner,
+                multiplicity: SemanticDependencyMultiplicityV1::PerActivation,
+                lifetime: SemanticDependencyLifetimeV1::Activation,
+                phase: SemanticDependencyPhaseV1::PreviousCommittedValue,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            migration,
+            vec![
+                dependency_entity(expression_entity(migration.marker)),
+                dependency_entity(expression_entity(migration.input)),
+            ],
+        )?);
+    }
+
+    if rows_out.len() + 1 != row_capacity {
+        return Err(CallableDependencyManifestError::new(format!(
+            "reactive dependency publication produced {} rows before its graph receipt; expected {}",
+            rows_out.len(),
+            row_capacity.saturating_sub(1),
+        )));
+    }
+    let unclassified_digest = dependency_payload_digest(
+        &(SEMANTIC_REACTIVE_GRAPH_SCHEMA_V1, external_event_identities),
+        &mut builder.hash_scratch,
+    )?;
+    let mut hasher = Sha256::new();
+    hasher.update(DEPENDENCY_REACTIVE_COMPONENT_RECEIPT_DOMAIN_V2);
+    dependency_proof_update_usize(&mut hasher, rows_out.len(), "reactive component row count")?;
+    for row in &rows_out {
+        hasher.update(row.local_digest);
+    }
+    hasher.update(unclassified_digest);
+    let component_digest = hasher.finalize().into();
+    rows_out.push(builder.structural_from_payload_digest(
+        ConstructionDependencyOwnerV1::ProgramRoot,
+        top_subject(
+            SemanticDependencySubjectKindV1::ReactiveGraph,
+            SemanticDependencyEntityV1::Program,
+        ),
+        component_digest,
+    )?);
+    Ok(ReactiveDependencyPublicationV1 {
+        rows: ConstructionDependencyRowsV1::from_rows(
+            ConstructionDependencyDomainV1::Reactive,
+            rows_out,
+        ),
+        component_digest,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn reactive_dependency_publication_for_test(
+    graph: &SemanticReactiveGraphV1,
+) -> Result<ReactiveDependencyPublicationV1, CallableDependencyManifestError> {
+    publish_reactive_dependencies_v1(ReactiveDependencyInputsV1 {
+        external_event_identities: &graph.external_event_identities,
+        producer_instances: &graph.producer_instances,
+        fields: &graph.fields,
+        bindings: &graph.bindings,
+        reads: &graph.reads,
+        dependency_uses: &graph.dependency_uses,
+        call_invocations: &graph.call_invocations,
+        activations: &graph.activations,
+        pulse_batches: &graph.pulse_batches,
+        derived_values: &graph.derived_values,
+        trigger_arms: &graph.trigger_arms,
+        state_update_arms: &graph.state_update_arms,
+        list_mutations: &graph.list_mutations,
+        dependencies: &graph.dependencies,
+        possible_causes: &graph.possible_causes,
+        host_effect_schedules: &graph.host_effect_schedules,
+        output_values: &graph.output_values,
+        view_captures: &graph.view_captures,
+        migration_inputs: &graph.migration_inputs,
+    })
+}
+
+#[cfg(test)]
+fn validate_reactive_dependency_publication_against_oracle(
+    publication: &ReactiveDependencyPublicationV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
+    reactive: &SemanticReactiveGraphV1,
+    owners: &DependencyOwnerIndex,
+) -> Result<(), CallableDependencyManifestError> {
+    if publication.rows.domain != ConstructionDependencyDomainV1::Reactive {
+        return Err(CallableDependencyManifestError::new(
+            "reactive dependency publication uses the wrong construction domain",
+        ));
+    }
+    let mut oracle = DependencyCollector::for_program(checked, execution, false);
+    let component_digest = inventory_reactive(reactive, execution, owners, &mut oracle)?;
+    if component_digest != publication.component_digest {
+        return Err(CallableDependencyManifestError::new(
+            "construction-published reactive component digest differs from the replay oracle",
+        ));
+    }
+    if publication.rows.rows.len() != oracle.compact_rows.len()
+        || oracle.compact_rows.len() != oracle.compact_subjects.len()
+    {
+        return Err(CallableDependencyManifestError::new(format!(
+            "construction-published reactive row count {} differs from replay oracle rows {} subjects {}",
+            publication.rows.rows.len(),
+            oracle.compact_rows.len(),
+            oracle.compact_subjects.len(),
+        )));
+    }
+
+    for (ordinal, ((published, replay), replay_subject)) in publication
+        .rows
+        .rows
+        .iter()
+        .zip(oracle.compact_rows.iter())
+        .zip(oracle.compact_subjects.iter())
+        .enumerate()
+    {
+        let published_owner = resolve_construction_owner(&published.owner, owners, &|| {
+            format!("reactive dependency publication row {ordinal}")
+        })?;
+        let published_projection = DenseDependencyProjectionKeyV4 {
+            owner: published_owner,
+            subject_kind: published.subject.kind,
+            class: published.class,
+        };
+        if published_projection != replay.projection {
+            return Err(CallableDependencyManifestError::new(format!(
+                "construction-published reactive row {ordinal} projection differs from the replay oracle",
+            )));
+        }
+        if &published.subject != replay_subject {
+            return Err(CallableDependencyManifestError::new(format!(
+                "construction-published reactive row {ordinal} subject differs from the replay oracle",
+            )));
+        }
+        if published.local_digest != replay.local_digest {
+            return Err(CallableDependencyManifestError::new(format!(
+                "construction-published reactive row {ordinal} digest differs from the replay oracle",
+            )));
+        }
+        let replay_references = replay
+            .dependency
+            .map(|id| {
+                oracle
+                    .compact_records
+                    .get(id.as_usize())
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "reactive replay row {ordinal} references missing dependency {id}",
+                        ))
+                    })
+                    .and_then(|record| {
+                        if record.row != ordinal {
+                            return Err(CallableDependencyManifestError::new(format!(
+                                "reactive replay dependency {id} belongs to row {} instead of {ordinal}",
+                                record.row,
+                            )));
+                        }
+                        oracle
+                            .compact_references
+                            .get(record.references_start..record.references_end)
+                            .ok_or_else(|| {
+                                CallableDependencyManifestError::new(format!(
+                                    "reactive replay dependency {id} has an invalid reference span",
+                                ))
+                            })
+                    })
+            })
+            .transpose()?;
+        if published.references.as_deref() != replay_references {
+            return Err(CallableDependencyManifestError::new(format!(
+                "construction-published reactive row {ordinal} references differ from the replay oracle",
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn inventory_reactive(
     reactive: &SemanticReactiveGraphV1,
     execution: &SemanticExecutionImageColumnsV1,
@@ -12229,6 +13330,7 @@ fn inventory_reactive(
     Ok(component_digest)
 }
 
+#[cfg(test)]
 fn owner_for_expression_and_static(
     owners: &DependencyOwnerIndex,
     expression: SemanticExprId,

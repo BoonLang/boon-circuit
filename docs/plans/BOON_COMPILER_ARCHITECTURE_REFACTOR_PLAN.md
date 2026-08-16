@@ -4243,6 +4243,43 @@ source digest `e8b6c437a3f112026ca4f8a58e9f9c98e04cb2e3826a29724f3dc8e72d8bda9b`
 and MachinePlan SHA-256
 `ca6a030997141a451a119165a9f9ba194071126ae257a7475d7ceafe7a1ea63a`.
 
+Reactive dependency facts now cross the same construction boundary.
+`ReactiveBuilder` publishes one move-only `ReactiveDependencyPublicationV1`
+from its finalized local sections before assembling the retained rich graph;
+Manifest V7 consumes that publication and no longer calls
+`inventory_reactive` in production. The legacy inventory remains only under
+`cfg(test)`. Every parser-backed semantic elaboration compares the direct
+publication with that independent replay row by row: resolved owner, complete
+subject, class, local digest, ordered optional reference span, component
+receipt, and final graph row must all match. The architecture gate requires
+exactly one production publisher, rejects every production replay or Manifest
+reconstruction call, and the classifier schema now explicitly owns the
+`Reactive` construction domain.
+
+This is another ownership checkpoint, not yet a speed claim. A traced release
+sample spends 17.262 ms publishing reactive facts and 17.907 ms resolving and
+ingesting them, while the preceding retrospective reactive inventory took
+29.247 ms. The roughly six-millisecond temporary transfer cost is the price of
+the still-separate symbolic row arena; simply applying that two-pass shape to
+storage would repeat the tax. The complete Manifest trace falls to about
+129.2 ms from 147.670 ms because the former inventory label disappears, but
+the construction publisher now owns the corresponding work. The next
+speed-bearing cut must let the final proof seal consume symbolic construction
+rows without rebuilding a second compact row arena, then migrate storage onto
+that consuming path.
+
+Five fresh-process stable-release observations have medians of 737.640 ms for
+diagnostics and 2,813.981 ms for verified compilation. Verified semantic
+construction is 1,138.033 ms, backend construction is 369.824 ms, peak RSS is
+359,580 KiB, and WHERE contract verification is 0.331 ms. A repeated
+empty-session batch settles at 2,829.259 ms verified, with 1,146.136 ms
+semantic, 374.825 ms backend, 384,256 KiB peak RSS, and 0.334 ms WHERE; its
+diagnostics median is 744.039 ms. These are directionally neutral against the
+preceding 735.379/2,818.544 ms fresh and 733.870/2,822.024 ms empty medians,
+with expected low-single-digit transfer cost and ordinary process variance.
+All observations retain zero diagnostics, the same source digest, and the
+same MachinePlan SHA-256 above.
+
 Updating the architecture gate exposed two stale classifier entries from the
 definition-template checkpoint. `InvalidDefinitionTemplate` and the three
 checked definition execution-template records are now explicitly classified,

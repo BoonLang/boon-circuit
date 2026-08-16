@@ -46,8 +46,8 @@ use std::sync::Arc;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x00, 0x1f, 0xb3, 0x79, 0xe6, 0x1d, 0x16, 0xc4, 0x09, 0x62, 0xcf, 0xf8, 0xb8, 0x58, 0x0c, 0x31,
-    0x5a, 0xb3, 0x91, 0x24, 0xeb, 0xd3, 0x6d, 0x81, 0x0a, 0xf1, 0xd7, 0x3d, 0x54, 0xc1, 0x8d, 0xfa,
+    0x5e, 0x6c, 0x84, 0x5b, 0x07, 0xf3, 0x58, 0x4b, 0x20, 0xea, 0xa1, 0x5e, 0xc7, 0x3f, 0x7b, 0x35,
+    0xf0, 0xe8, 0xe5, 0xc3, 0x15, 0x2e, 0x94, 0x40, 0xc1, 0x59, 0xa5, 0x39, 0x27, 0x4f, 0x6a, 0x25,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -2934,9 +2934,9 @@ fn elaborate_with_representation(
             resource_dependency_rows.len()
         );
     }
-    let reactive_graph = elaboration_phase!(
+    let reactive_build = elaboration_phase!(
         "build_semantic_reactive_graph",
-        reactive::build_semantic_reactive_graph_from_validated_inputs(
+        reactive::build_semantic_reactive_graph_with_dependency_publication_from_validated_inputs(
             &execution_graph,
             &resource_graph,
             &resolved_out_graph,
@@ -2944,6 +2944,14 @@ fn elaborate_with_representation(
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
+    let reactive_graph = reactive_build.graph;
+    let reactive_dependency_publication = reactive_build.publication;
+    if trace_elaboration {
+        eprintln!(
+            "boon_semantic construction_rows domain=reactive rows={}",
+            reactive_dependency_publication.len()
+        );
+    }
     let lowering_build = elaboration_phase!(
         "build_semantic_lowering_contract",
         lowering_contract::build_semantic_lowering_contract_with_dependency_rows(
@@ -3040,10 +3048,11 @@ fn elaborate_with_representation(
             &resolved_out_graph,
             execution_graph,
             &resource_graph,
-            &resource_dependency_rows,
+            resource_dependency_rows,
             &reactive_graph,
+            reactive_dependency_publication,
             &lowering_contract,
-            &lowering_dependency_rows,
+            lowering_dependency_rows,
             &view_binding_graph,
             &scope_storage_graph,
             &memory_graph,
@@ -8186,6 +8195,9 @@ result: mapped(value: 0)
         let resource_dependency_rows =
             resource::resource_dependency_rows_for_test(&semantic.resource_graph)
                 .expect("mutated resource graph has construction dependency rows");
+        let reactive_dependency_publication =
+            dependency_manifest::reactive_dependency_publication_for_test(&semantic.reactive_graph)
+                .expect("mutated reactive graph has construction dependency rows");
         let manifest_prefix = dependency_manifest::replay_manifest_prefix_v7_for_test(
             &semantic.checked_program,
             semantic.semantic_image.checked_handoff(),
@@ -8204,10 +8216,11 @@ result: mapped(value: 0)
             &semantic.resolved_out_graph,
             &semantic.execution_graph,
             &semantic.resource_graph,
-            &resource_dependency_rows,
+            resource_dependency_rows,
             &semantic.reactive_graph,
+            reactive_dependency_publication,
             &semantic.lowering_contract,
-            &lowering_dependency_rows,
+            lowering_dependency_rows,
             &semantic.view_binding_graph,
             &semantic.scope_storage_graph,
             &semantic.memory_graph,

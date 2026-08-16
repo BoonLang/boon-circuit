@@ -1336,6 +1336,7 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     let semantic_path = workspace.join("crates/boon_semantic/src/lib.rs");
     let lowering_path = workspace.join("crates/boon_semantic/src/core_lowering.rs");
     let semantic_image_path = workspace.join("crates/boon_semantic/src/semantic_image.rs");
+    let reactive_path = workspace.join("crates/boon_semantic/src/reactive.rs");
     let dependency_manifest_path =
         workspace.join("crates/boon_semantic/src/dependency_manifest.rs");
     for obsolete in [
@@ -1356,6 +1357,7 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     let semantic = read_text(&semantic_path)?;
     let lowering = read_text(&lowering_path)?;
     let semantic_image = read_text(&semantic_image_path)?;
+    let reactive = read_text(&reactive_path)?;
     let dependency_manifest = read_text(&dependency_manifest_path)?;
     syn::parse_file(&ir)
         .map_err(|error| format!("cannot parse `{}`: {error}", ir_path.display()))?;
@@ -1363,6 +1365,8 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         .map_err(|error| format!("cannot parse `{}`: {error}", lowering_path.display()))?;
     syn::parse_file(&semantic_image)
         .map_err(|error| format!("cannot parse `{}`: {error}", semantic_image_path.display()))?;
+    let reactive_syntax = syn::parse_file(&reactive)
+        .map_err(|error| format!("cannot parse `{}`: {error}", reactive_path.display()))?;
     let dependency_manifest_syntax = syn::parse_file(&dependency_manifest).map_err(|error| {
         format!(
             "cannot parse `{}`: {error}",
@@ -1507,6 +1511,68 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         return Err(format!(
             "production dependency-manifest code replays checked/execution projections at {:?}",
             replay_references.references,
+        ));
+    }
+    verify_required_direct_field(
+        &reactive,
+        "SemanticReactiveGraphBuildV1",
+        "publication",
+        "ReactiveDependencyPublicationV1",
+    )?;
+    for required in [
+        "build_semantic_reactive_graph_with_dependency_publication_from_validated_inputs",
+        "publish_reactive_dependencies_v1",
+    ] {
+        if !reactive.contains(required) {
+            return Err(format!(
+                "reactive construction omits dependency publication seam `{required}`"
+            ));
+        }
+    }
+    for required in [
+        "ConstructionDependencyDomainV1::Reactive",
+        "\"reactive_publication_oracle\"",
+        "validate_reactive_dependency_publication_against_oracle",
+        "construction-published reactive component digest differs from the replay oracle",
+        "construction-published reactive row {ordinal} projection differs from the replay oracle",
+        "construction-published reactive row {ordinal} references differ from the replay oracle",
+        "#[cfg(test)]\nfn inventory_reactive",
+        "\"ingest_reactive_rows\"",
+    ] {
+        if !dependency_manifest.contains(required) {
+            return Err(format!(
+                "dependency manifest omits construction-published reactive proof `{required}`"
+            ));
+        }
+    }
+    let mut reactive_replay_references =
+        ProductionIdentifierReferenceCollector::new("inventory_reactive");
+    reactive_replay_references.visit_file(&dependency_manifest_syntax);
+    if !reactive_replay_references.references.is_empty() {
+        return Err(format!(
+            "production dependency-manifest code replays the reactive graph at {:?}",
+            reactive_replay_references.references,
+        ));
+    }
+    let mut reactive_publication_references =
+        ProductionIdentifierReferenceCollector::new("publish_reactive_dependencies_v1");
+    reactive_publication_references.visit_file(&reactive_syntax);
+    if reactive_publication_references.references != ["macro"] {
+        return Err(format!(
+            "reactive construction must publish dependency rows exactly once; found {:?}",
+            reactive_publication_references.references,
+        ));
+    }
+    let mut manifest_reactive_publication_references =
+        ProductionIdentifierReferenceCollector::new("publish_reactive_dependencies_v1");
+    manifest_reactive_publication_references.visit_file(&dependency_manifest_syntax);
+    if !manifest_reactive_publication_references
+        .references
+        .is_empty()
+    {
+        return Err(format!(
+            "production dependency-manifest code reconstructs reactive publication at {:?}",
+            manifest_reactive_publication_references.references,
         ));
     }
     for forbidden in [

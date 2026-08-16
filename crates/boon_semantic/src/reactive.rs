@@ -538,6 +538,11 @@ pub struct SemanticReactiveError {
     message: String,
 }
 
+pub(crate) struct SemanticReactiveGraphBuildV1 {
+    pub(crate) graph: SemanticReactiveGraphV1,
+    pub(crate) publication: crate::dependency_manifest::ReactiveDependencyPublicationV1,
+}
+
 impl SemanticReactiveError {
     fn new(message: impl Into<String>) -> Self {
         Self {
@@ -606,6 +611,52 @@ pub(crate) fn build_semantic_reactive_graph_from_validated_inputs(
     out_net: &ResolvedOutGraph,
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
 ) -> Result<SemanticReactiveGraphV1, SemanticReactiveError> {
+    build_semantic_reactive_graph_from_validated_inputs_impl(
+        execution,
+        resources,
+        out_net,
+        external_event_identities,
+        false,
+    )
+    .map(|(graph, _)| graph)
+}
+
+pub(crate) fn build_semantic_reactive_graph_with_dependency_publication_from_validated_inputs(
+    execution: &SemanticExecutionImageColumnsV1,
+    resources: &SemanticResourceGraphV2,
+    out_net: &ResolvedOutGraph,
+    external_event_identities: &[CheckedExternalDeclarationIdentityV1],
+) -> Result<SemanticReactiveGraphBuildV1, SemanticReactiveError> {
+    let (graph, publication) = build_semantic_reactive_graph_from_validated_inputs_impl(
+        execution,
+        resources,
+        out_net,
+        external_event_identities,
+        true,
+    )?;
+    Ok(SemanticReactiveGraphBuildV1 {
+        graph,
+        publication: publication.ok_or_else(|| {
+            SemanticReactiveError::new(
+                "production reactive construction did not publish dependency rows",
+            )
+        })?,
+    })
+}
+
+fn build_semantic_reactive_graph_from_validated_inputs_impl(
+    execution: &SemanticExecutionImageColumnsV1,
+    resources: &SemanticResourceGraphV2,
+    out_net: &ResolvedOutGraph,
+    external_event_identities: &[CheckedExternalDeclarationIdentityV1],
+    publish_dependencies: bool,
+) -> Result<
+    (
+        SemanticReactiveGraphV1,
+        Option<crate::dependency_manifest::ReactiveDependencyPublicationV1>,
+    ),
+    SemanticReactiveError,
+> {
     let trace_reactive = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! reactive_phase {
         ($name:literal, $expression:expr) => {{
@@ -658,12 +709,13 @@ pub(crate) fn build_semantic_reactive_graph_from_validated_inputs(
         "index_inputs",
         ReactiveBuilder::new(execution, resources, out_net, external_event_identities)
     )?;
-    let graph = reactive_phase!("derive_graph", builder.build())?;
+    let (graph, publication) =
+        reactive_phase!("derive_graph", builder.build(publish_dependencies))?;
     reactive_phase!(
         "validate_shape",
         validate_semantic_reactive_shape(&graph, execution, resources)
     )?;
-    Ok(graph)
+    Ok((graph, publication))
 }
 
 impl SemanticReactiveGraphV1 {
@@ -1590,7 +1642,16 @@ impl<'a> ReactiveBuilder<'a> {
         Ok(result)
     }
 
-    fn build(self) -> Result<SemanticReactiveGraphV1, SemanticReactiveError> {
+    fn build(
+        self,
+        publish_dependencies: bool,
+    ) -> Result<
+        (
+            SemanticReactiveGraphV1,
+            Option<crate::dependency_manifest::ReactiveDependencyPublicationV1>,
+        ),
+        SemanticReactiveError,
+    > {
         let trace_reactive = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
         macro_rules! reactive_phase {
             ($name:literal, $expression:expr) => {{
@@ -1903,9 +1964,44 @@ impl<'a> ReactiveBuilder<'a> {
             )
         )?;
 
-        Ok(SemanticReactiveGraphV1 {
+        let external_event_identities = self
+            .external_event_identities
+            .into_iter()
+            .collect::<Vec<_>>();
+        let publication = if publish_dependencies {
+            Some(reactive_phase!(
+                "publish_dependencies",
+                crate::dependency_manifest::publish_reactive_dependencies_v1(
+                    crate::dependency_manifest::ReactiveDependencyInputsV1 {
+                        external_event_identities: &external_event_identities,
+                        producer_instances: &producer_instances,
+                        fields: &fields,
+                        bindings: &bindings,
+                        reads: &reads,
+                        dependency_uses: &dependency_uses,
+                        call_invocations: &call_invocations,
+                        activations: &activations,
+                        pulse_batches: &pulse_batches,
+                        derived_values: &derived_values,
+                        trigger_arms: &trigger_arms,
+                        state_update_arms: &state_update_arms,
+                        list_mutations: &list_mutations,
+                        dependencies: &dependencies,
+                        possible_causes: &possible_causes,
+                        host_effect_schedules: &host_effect_schedules,
+                        output_values: &output_values,
+                        view_captures: &view_captures,
+                        migration_inputs: &migration_inputs,
+                    },
+                )
+                .map_err(|error| SemanticReactiveError::new(error.to_string()))
+            )?)
+        } else {
+            None
+        };
+        let graph = SemanticReactiveGraphV1 {
             schema: SEMANTIC_REACTIVE_GRAPH_SCHEMA_V1.to_owned(),
-            external_event_identities: self.external_event_identities.into_iter().collect(),
+            external_event_identities,
             producer_instances,
             fields,
             bindings,
@@ -1924,7 +2020,8 @@ impl<'a> ReactiveBuilder<'a> {
             output_values,
             view_captures,
             migration_inputs,
-        })
+        };
+        Ok((graph, publication))
     }
 
     fn build_producer_instances(

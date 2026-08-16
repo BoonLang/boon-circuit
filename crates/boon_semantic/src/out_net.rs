@@ -10,8 +10,8 @@ use boon_checked::{
     CheckedContextBinding, CheckedDeclaration, CheckedDeclarationKind, CheckedEvaluationScope,
     CheckedExprId, CheckedExpressionKind, CheckedMatchPattern, CheckedPassedAccess,
     CheckedPatternBinding, CheckedProgramFields, CheckedScopeKind, CheckedTypeSubstitution,
-    ContextFormalId, DeclId, FlowType, LexicalScopeId, Type, TypeVar,
-    apply_checked_type_substitutions_once,
+    CheckedTypeSubstitutionFrameLookup, ContextFormalId, DeclId, FlowType, LexicalScopeId, Type,
+    TypeVar, apply_checked_type_substitution_frames, apply_checked_type_substitutions_once,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -149,7 +149,12 @@ pub struct OutCallInstance {
     /// Substitutions introduced by this checked call only. Inherited entries
     /// remain owned by `parent`; retaining their full structural types in
     /// every descendant makes deep generic call graphs quadratic in memory.
-    pub local_type_substitutions: Vec<CheckedTypeSubstitution>,
+    local_type_substitutions: Vec<CheckedTypeSubstitution>,
+    /// Local keys with values resolved once through their parent invocation.
+    /// This remains proportional to local call facts and never copies an
+    /// ancestor key set into a descendant frame.
+    #[serde(skip)]
+    resolved_type_substitutions: Vec<CheckedTypeSubstitution>,
     #[serde(skip)]
     type_substitution_count: usize,
     pub result: FlowType,
@@ -159,6 +164,12 @@ pub struct OutCallInstance {
     /// Present only when this concrete user call directly allocates runtime
     /// resources. Pure forwarding wrappers deliberately have no owner.
     pub owner: Option<StaticOwnerId>,
+}
+
+impl OutCallInstance {
+    pub fn local_type_substitutions(&self) -> &[CheckedTypeSubstitution] {
+        &self.local_type_substitutions
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -265,32 +276,45 @@ pub struct OutNet<Contract = ()> {
     producer_root_calls: BTreeSet<OutCallInstanceId>,
 }
 
+struct OutTypeSubstitutionFrames<'a>(&'a [OutCallInstance]);
+
+impl CheckedTypeSubstitutionFrameLookup for OutTypeSubstitutionFrames<'_> {
+    type Frame = OutCallInstanceId;
+
+    fn parent(&self, frame: Self::Frame) -> Option<Self::Frame> {
+        self.0
+            .get(frame.as_usize())
+            .filter(|instance| instance.id == frame)
+            .and_then(|instance| instance.parent)
+    }
+
+    fn substitutions(&self, frame: Self::Frame) -> &[CheckedTypeSubstitution] {
+        self.0
+            .get(frame.as_usize())
+            .filter(|instance| instance.id == frame)
+            .map_or(&[], |instance| instance.local_type_substitutions())
+    }
+
+    fn frame_count(&self) -> usize {
+        self.0.len()
+    }
+}
+
 fn apply_type_substitution_frames(
     call_instances: &[OutCallInstance],
-    mut frame: Option<OutCallInstanceId>,
+    frame: Option<OutCallInstanceId>,
     ty: &Type,
 ) -> Type {
-    let mut ty = ty.clone();
-    let mut remaining = call_instances.len().saturating_add(1);
-    while let Some(call) = frame {
-        if remaining == 0 {
-            break;
-        }
-        remaining -= 1;
-        let Some(instance) = call_instances
-            .get(call.as_usize())
-            .filter(|instance| instance.id == call)
-        else {
-            break;
-        };
-        // Each checked-call row is a directional edge between two independently
-        // alpha-normalized namespaces: its keys belong to this callee, while
-        // its values belong to the parent. Apply one frame at a time without
-        // reinterpreting replacement values in the frame that produced them.
-        ty = apply_checked_type_substitutions_once(&ty, &instance.local_type_substitutions);
-        frame = instance.parent;
-    }
-    ty
+    frame.map_or_else(
+        || ty.clone(),
+        |frame| {
+            apply_checked_type_substitution_frames(
+                ty,
+                frame,
+                &OutTypeSubstitutionFrames(call_instances),
+            )
+        },
+    )
 }
 
 /// Chooses the already-finalized checked occurrence when the instantiated
@@ -421,17 +445,35 @@ impl<Contract> OutNet<Contract> {
         else {
             return environment;
         };
-        for substitution in &instance.local_type_substitutions {
-            environment.insert(
-                substitution.variable,
-                apply_type_substitution_frames(
-                    &self.call_instances,
-                    instance.parent,
-                    &substitution.value,
-                ),
-            );
+        debug_assert_eq!(
+            instance.local_type_substitutions.len(),
+            instance.resolved_type_substitutions.len()
+        );
+        for substitution in &instance.resolved_type_substitutions {
+            environment.insert(substitution.variable, substitution.value.clone());
         }
         environment
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_local_type_substitution_for_test(
+        &mut self,
+        call: OutCallInstanceId,
+        substitution: CheckedTypeSubstitution,
+    ) {
+        let parent = self.call_instances[call.as_usize()].parent;
+        let resolved = CheckedTypeSubstitution {
+            variable: substitution.variable,
+            value: apply_type_substitution_frames(
+                &self.call_instances,
+                parent,
+                &substitution.value,
+            ),
+        };
+        let instance = &mut self.call_instances[call.as_usize()];
+        instance.local_type_substitutions.push(substitution);
+        instance.resolved_type_substitutions.push(resolved);
+        instance.type_substitution_count = instance.type_substitution_count.saturating_add(1);
     }
 
     pub fn type_substitution_count(&self, call: OutCallInstanceId) -> usize {
@@ -1199,6 +1241,7 @@ where
             passed: None,
             ports: Vec::new(),
             local_type_substitutions: Vec::new(),
+            resolved_type_substitutions: Vec::new(),
             type_substitution_count: 0,
             result: signature.result.clone(),
             result_is_exact_occurrence: false,
@@ -1816,6 +1859,17 @@ where
             // those values through an ancestry map aliases unrelated equal
             // ordinals from intermediate call schemes.
             let local_type_substitutions = checked_call.type_substitutions.to_vec();
+            let resolved_type_substitutions = local_type_substitutions
+                .iter()
+                .map(|substitution| CheckedTypeSubstitution {
+                    variable: substitution.variable,
+                    value: apply_type_substitution_frames(
+                        &self.call_instances,
+                        parent,
+                        &substitution.value,
+                    ),
+                })
+                .collect();
             let type_substitution_count = parent
                 .and_then(|parent| self.call_instances.get(parent.as_usize()))
                 .map_or(0, |parent| parent.type_substitution_count)
@@ -1919,6 +1973,7 @@ where
                 passed,
                 ports: Vec::new(),
                 local_type_substitutions,
+                resolved_type_substitutions,
                 type_substitution_count,
                 result,
                 result_is_exact_occurrence,

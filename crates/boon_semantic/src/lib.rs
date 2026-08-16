@@ -2837,7 +2837,7 @@ fn elaborate_with_representation(
         let local_substitution_count = resolved_out_graph
             .call_instances
             .iter()
-            .map(|call| call.local_type_substitutions.len())
+            .map(|call| call.local_type_substitutions().len())
             .sum::<usize>();
         let maximum_substitution_count = resolved_out_graph
             .call_instances
@@ -3304,7 +3304,7 @@ fn resolve_out_contracts(
             })?;
         let mut substitutions = graph.type_substitution_environment(call_id);
         let mut provisional_variables = instance
-            .local_type_substitutions
+            .local_type_substitutions()
             .iter()
             .map(|substitution| substitution.variable)
             .collect::<BTreeSet<_>>();
@@ -3648,7 +3648,7 @@ fn concrete_checked_expression_type(
                         ))
                     })?;
                 let mut provisional_variables = instance
-                    .local_type_substitutions
+                    .local_type_substitutions()
                     .iter()
                     .map(|substitution| substitution.variable)
                     .collect::<BTreeSet<_>>();
@@ -4489,14 +4489,7 @@ fn apply_out_contract_substitutions(
     ty: &boon_checked::Type,
     substitutions: &BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
 ) -> boon_checked::Type {
-    let substitutions = substitutions
-        .iter()
-        .map(|(variable, value)| boon_checked::CheckedTypeSubstitution {
-            variable: *variable,
-            value: value.clone(),
-        })
-        .collect::<Vec<_>>();
-    boon_checked::apply_checked_type_substitutions(ty, &substitutions)
+    boon_checked::apply_checked_type_environment(ty, substitutions)
 }
 
 fn project_out_contract_type(
@@ -5805,19 +5798,22 @@ result: identity(value: 1)
             field_order: vec!["element".to_owned()],
             open: false,
         });
-        let instance = &mut graph.call_instances[instance_id.as_usize()];
-        instance.result.ty = Type::object(boon_checked::ObjectShape {
-            fields: BTreeMap::from([("element".to_owned(), Type::Var(occurrence_alpha))]),
-            field_order: vec!["element".to_owned()],
-            open: false,
-        });
-        instance.result_is_exact_occurrence = false;
-        instance
-            .local_type_substitutions
-            .push(boon_checked::CheckedTypeSubstitution {
+        {
+            let instance = &mut graph.call_instances[instance_id.as_usize()];
+            instance.result.ty = Type::object(boon_checked::ObjectShape {
+                fields: BTreeMap::from([("element".to_owned(), Type::Var(occurrence_alpha))]),
+                field_order: vec!["element".to_owned()],
+                open: false,
+            });
+            instance.result_is_exact_occurrence = false;
+        }
+        graph.push_local_type_substitution_for_test(
+            instance_id,
+            boon_checked::CheckedTypeSubstitution {
                 variable: occurrence_alpha,
                 value: Type::Number,
-            });
+            },
+        );
 
         let actual = concrete_checked_expression_type(
             &checked,
@@ -6153,7 +6149,7 @@ result:
                 instance.parent,
                 instance.provenance,
                 instance.passed,
-                instance.local_type_substitutions.len(),
+                instance.local_type_substitutions().len(),
             );
             if let Some(passed) = instance.passed {
                 let value = fields
@@ -7654,7 +7650,7 @@ FUNCTION lane_row(row) {
         let retained_substitutions = out
             .call_instances
             .iter()
-            .map(|call| call.local_type_substitutions.len())
+            .map(|call| call.local_type_substitutions().len())
             .sum::<usize>();
         let logical_substitutions = out
             .call_instances
@@ -7668,7 +7664,9 @@ FUNCTION lane_row(row) {
         let inherited = out
             .call_instances
             .iter()
-            .find(|call| out.type_substitution_count(call.id) > call.local_type_substitutions.len())
+            .find(|call| {
+                out.type_substitution_count(call.id) > call.local_type_substitutions().len()
+            })
             .expect("nested generic fixture has an inherited type environment");
         let environment = out.type_substitution_environment(inherited.id);
         for variable in environment.keys() {

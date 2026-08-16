@@ -1501,6 +1501,24 @@ pub trait CheckedTypeSubstitutionLookup {
     fn replacement(&self, variable: TypeVar) -> Option<&Type>;
 }
 
+/// A parent-linked sequence of independently alpha-normalized substitution
+/// frames.
+///
+/// A replacement stored in one frame belongs to its parent frame's namespace.
+/// Walking the type tree once through this interface avoids rebuilding and
+/// cloning the complete structural type once per invocation ancestor.
+pub trait CheckedTypeSubstitutionFrameLookup {
+    type Frame: Copy + Eq;
+
+    fn parent(&self, frame: Self::Frame) -> Option<Self::Frame>;
+
+    fn substitutions(&self, frame: Self::Frame) -> &[CheckedTypeSubstitution];
+
+    /// Upper bound used to fail closed if a malformed provider exposes a
+    /// cyclic parent chain.
+    fn frame_count(&self) -> usize;
+}
+
 impl CheckedTypeSubstitutionLookup for BTreeMap<TypeVar, Type> {
     fn replacement(&self, variable: TypeVar) -> Option<&Type> {
         self.get(&variable)
@@ -1559,6 +1577,224 @@ pub fn apply_checked_type_substitution_lookup_once(
     substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
 ) -> Type {
     substitute_checked_type_from_lookup_once(ty, substitutions)
+}
+
+/// Applies a parent-linked invocation environment in one structural walk.
+///
+/// This is exactly equivalent to applying each frame with
+/// [`apply_checked_type_substitutions_once`] from child to root, but it visits
+/// unchanged object/list/union structure only once. Replacement values advance
+/// to the parent namespace before they are interpreted.
+pub fn apply_checked_type_substitution_frames<Frames>(
+    ty: &Type,
+    frame: Frames::Frame,
+    frames: &Frames,
+) -> Type
+where
+    Frames: CheckedTypeSubstitutionFrameLookup + ?Sized,
+{
+    substitute_checked_type_frames_inner(ty, Some(frame), frames, frames.frame_count()).0
+}
+
+fn substitute_checked_type_frames_inner<Frames>(
+    ty: &Type,
+    frame: Option<Frames::Frame>,
+    frames: &Frames,
+    remaining_frames: usize,
+) -> (Type, bool)
+where
+    Frames: CheckedTypeSubstitutionFrameLookup + ?Sized,
+{
+    match ty {
+        Type::Var(variable) => {
+            let mut frame = frame;
+            let mut remaining_frames = remaining_frames;
+            while let Some(current) = frame {
+                if remaining_frames == 0 {
+                    return (ty.clone(), false);
+                }
+                remaining_frames -= 1;
+                let parent = frames.parent(current);
+                if let Some(replacement) = frames
+                    .substitutions(current)
+                    .replacement(*variable)
+                    .filter(|replacement| *replacement != ty)
+                {
+                    let substituted = substitute_checked_type_frames_inner(
+                        replacement,
+                        parent,
+                        frames,
+                        remaining_frames,
+                    )
+                    .0;
+                    let changed = substituted != *ty;
+                    return (substituted, changed);
+                }
+                frame = parent;
+            }
+            (ty.clone(), false)
+        }
+        Type::List(item) => {
+            let (substituted, changed) =
+                substitute_checked_type_frames_inner(item, frame, frames, remaining_frames);
+            if changed {
+                (Type::List(Type::shared(substituted)), true)
+            } else {
+                (ty.clone(), false)
+            }
+        }
+        Type::Map { key, value } => {
+            let (key, key_changed) =
+                substitute_checked_type_frames_inner(key, frame, frames, remaining_frames);
+            let (value, value_changed) =
+                substitute_checked_type_frames_inner(value, frame, frames, remaining_frames);
+            if key_changed || value_changed {
+                (
+                    Type::Map {
+                        key: Box::new(key),
+                        value: Box::new(value),
+                    },
+                    true,
+                )
+            } else {
+                (ty.clone(), false)
+            }
+        }
+        Type::Set(item) => {
+            let (substituted, changed) =
+                substitute_checked_type_frames_inner(item, frame, frames, remaining_frames);
+            if changed {
+                (Type::Set(Type::shared(substituted)), true)
+            } else {
+                (ty.clone(), false)
+            }
+        }
+        Type::Function { args, result } => {
+            let substituted_args =
+                substitute_checked_type_frame_sequence(args, frame, frames, remaining_frames);
+            let (result_ty, result_changed) =
+                substitute_checked_type_frames_inner(&result.ty, frame, frames, remaining_frames);
+            if substituted_args.is_some() || result_changed {
+                (
+                    Type::Function {
+                        args: substituted_args.unwrap_or_else(|| args.clone()),
+                        result: Box::new(FlowType {
+                            mode: result.mode,
+                            ty: result_ty,
+                        }),
+                    },
+                    true,
+                )
+            } else {
+                (ty.clone(), false)
+            }
+        }
+        Type::Object(shape) => {
+            if let Some(shape) =
+                substitute_checked_object_shape_frames(shape, frame, frames, remaining_frames)
+            {
+                (Type::Object(shape), true)
+            } else {
+                (ty.clone(), false)
+            }
+        }
+        Type::VariantSet(variants) => {
+            let mut changed = None::<Vec<Variant>>;
+            for (index, variant) in variants.iter().enumerate() {
+                let Variant::Tagged { tag, fields } = variant else {
+                    if let Some(changed) = changed.as_mut() {
+                        changed.push(variant.clone());
+                    }
+                    continue;
+                };
+                if let Some(fields) =
+                    substitute_checked_object_shape_frames(fields, frame, frames, remaining_frames)
+                {
+                    let changed = changed.get_or_insert_with(|| variants[..index].to_vec());
+                    changed.push(Variant::Tagged {
+                        tag: tag.clone(),
+                        fields,
+                    });
+                } else if let Some(changed) = changed.as_mut() {
+                    changed.push(variant.clone());
+                }
+            }
+            if let Some(variants) = changed {
+                (Type::VariantSet(variants.into()), true)
+            } else {
+                (ty.clone(), false)
+            }
+        }
+        Type::Union(members) => {
+            if let Some(members) =
+                substitute_checked_type_frame_sequence(members, frame, frames, remaining_frames)
+            {
+                (Type::Union(members), true)
+            } else {
+                (ty.clone(), false)
+            }
+        }
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown => (ty.clone(), false),
+    }
+}
+
+fn substitute_checked_type_frame_sequence<Frames>(
+    types: &[Type],
+    frame: Option<Frames::Frame>,
+    frames: &Frames,
+    remaining_frames: usize,
+) -> Option<Vec<Type>>
+where
+    Frames: CheckedTypeSubstitutionFrameLookup + ?Sized,
+{
+    let mut changed = None::<Vec<Type>>;
+    for (index, ty) in types.iter().enumerate() {
+        let (substituted, item_changed) =
+            substitute_checked_type_frames_inner(ty, frame, frames, remaining_frames);
+        if item_changed {
+            let changed = changed.get_or_insert_with(|| types[..index].to_vec());
+            changed.push(substituted);
+        } else if let Some(changed) = changed.as_mut() {
+            changed.push(ty.clone());
+        }
+    }
+    changed
+}
+
+fn substitute_checked_object_shape_frames<Frames>(
+    shape: &SharedObjectShape,
+    frame: Option<Frames::Frame>,
+    frames: &Frames,
+    remaining_frames: usize,
+) -> Option<SharedObjectShape>
+where
+    Frames: CheckedTypeSubstitutionFrameLookup + ?Sized,
+{
+    let mut changed = None::<BTreeMap<String, Type>>;
+    for (name, ty) in &shape.fields {
+        let (substituted, field_changed) =
+            substitute_checked_type_frames_inner(ty, frame, frames, remaining_frames);
+        if field_changed {
+            changed
+                .get_or_insert_with(|| shape.fields.clone())
+                .insert(name.clone(), substituted);
+        }
+    }
+    changed.map(|fields| {
+        ObjectShape {
+            fields,
+            field_order: shape.field_order.clone(),
+            open: shape.open,
+        }
+        .into()
+    })
 }
 
 fn substitute_checked_type_from_lookup(
@@ -3278,6 +3514,77 @@ mod tests {
             apply_checked_type_substitutions_once(&ty, &cross_namespace),
             Type::Union(vec![Type::Var(TypeVar(1)), Type::Var(TypeVar(1))]),
             "equal raw ordinals across caller and callee namespaces must not be deduplicated"
+        );
+    }
+
+    #[test]
+    fn parent_linked_substitutions_match_repeated_one_layer_application() {
+        struct Frames(Vec<(Option<usize>, Vec<CheckedTypeSubstitution>)>);
+
+        impl CheckedTypeSubstitutionFrameLookup for Frames {
+            type Frame = usize;
+
+            fn parent(&self, frame: Self::Frame) -> Option<Self::Frame> {
+                self.0[frame].0
+            }
+
+            fn substitutions(&self, frame: Self::Frame) -> &[CheckedTypeSubstitution] {
+                &self.0[frame].1
+            }
+
+            fn frame_count(&self) -> usize {
+                self.0.len()
+            }
+        }
+
+        let frames = Frames(vec![
+            (
+                None,
+                vec![CheckedTypeSubstitution {
+                    variable: TypeVar(0),
+                    value: Type::Number,
+                }],
+            ),
+            (
+                Some(0),
+                vec![CheckedTypeSubstitution {
+                    variable: TypeVar(1),
+                    value: object([("value", Type::Var(TypeVar(0)))], false),
+                }],
+            ),
+            (
+                Some(1),
+                vec![
+                    CheckedTypeSubstitution {
+                        variable: TypeVar(0),
+                        value: Type::Text,
+                    },
+                    CheckedTypeSubstitution {
+                        variable: TypeVar(2),
+                        // Equal raw ordinals denote distinct variables across
+                        // these two adjacent alpha namespaces.
+                        value: Type::Var(TypeVar(2)),
+                    },
+                ],
+            ),
+        ]);
+        let ty = Type::List(Type::shared(Type::Union(vec![
+            Type::Var(TypeVar(0)),
+            Type::Var(TypeVar(1)),
+            Type::Var(TypeVar(2)),
+        ])));
+        let mut repeated = ty.clone();
+        let mut frame = Some(2);
+        while let Some(current) = frame {
+            repeated =
+                apply_checked_type_substitutions_once(&repeated, frames.substitutions(current));
+            frame = frames.parent(current);
+        }
+
+        assert_eq!(
+            apply_checked_type_substitution_frames(&ty, 2, &frames),
+            repeated,
+            "one structural walk must retain exact cross-namespace frame semantics"
         );
     }
 

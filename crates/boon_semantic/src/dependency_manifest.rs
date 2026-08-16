@@ -9023,7 +9023,7 @@ fn inventory_out(
         .iter()
         .map(|call| {
             let local_type_substitutions = call
-                .local_type_substitutions
+                .local_type_substitutions()
                 .iter()
                 .map(|substitution| {
                     Ok(CanonicalOutTypeSubstitutionV1 {

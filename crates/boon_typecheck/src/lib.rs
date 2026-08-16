@@ -1,23 +1,43 @@
 use boon_checked::*;
+mod checked_metadata;
 mod owner_abi;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 mod owner_body;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 mod owner_checked;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 mod owner_compat;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 mod owner_constraints;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 mod owner_diagnostics;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 mod owner_interface;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 mod owner_shard_builder;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 mod owner_signature_lexical;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 mod owner_syntax;
+pub use checked_metadata::*;
 pub use owner_abi::*;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 pub use owner_body::*;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 pub use owner_checked::*;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 pub use owner_compat::*;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 pub use owner_constraints::*;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 pub use owner_diagnostics::*;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 pub use owner_interface::*;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 pub use owner_shard_builder::*;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 pub use owner_signature_lexical::*;
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 pub use owner_syntax::*;
 
 use boon_contract::SourceBundleDigestV1;
@@ -60,6 +80,7 @@ enum DiagnosticAuthority {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[cfg_attr(not(any(test, feature = "legacy-owner-oracle")), allow(dead_code))]
 pub(crate) enum OwnerDiagnosticCallDisposition {
     User {
         owner: boon_syntax::StableCheckOwnerKey,
@@ -767,7 +788,6 @@ struct CheckedProgramDatabase {
     /// expression's owner-inferred flow globally.
     diagnostic_call_input_types: BTreeMap<(usize, usize), Type>,
     diagnostic_calls: BTreeMap<usize, OwnerDiagnosticCallFact>,
-    diagnostic_reads: BTreeMap<usize, OwnerEffectiveLexicalReadPlan>,
     diagnostic_expression_spans: DenseIndexTable<CheckedSpan>,
     diagnostic_statement_spans: DenseIndexTable<CheckedSpan>,
     diagnostic_authority: DiagnosticAuthority,
@@ -20783,7 +20803,6 @@ impl CheckedProgramDatabase {
             checked_statement_values: DenseIndexTable::default(),
             diagnostic_call_input_types: BTreeMap::new(),
             diagnostic_calls: BTreeMap::new(),
-            diagnostic_reads: BTreeMap::new(),
             diagnostic_expression_spans: DenseIndexTable::default(),
             diagnostic_statement_spans: DenseIndexTable::default(),
             diagnostic_authority: DiagnosticAuthority::Legacy,
@@ -23486,11 +23505,7 @@ impl CheckedProgramDatabase {
                 let _ = self.infer_record_shape(fields);
             }
             AstExprKind::Drain { path } => {
-                if self.diagnostic_authority != DiagnosticAuthority::Owner
-                    || !self.diagnostic_reads.contains_key(&expression.id)
-                {
-                    let _ = self.type_for_path(expression.id, &drain_path_parts(path));
-                }
+                let _ = self.type_for_path(expression.id, &drain_path_parts(path));
             }
             AstExprKind::ListLiteral { items, .. } => {
                 for item in items {
@@ -23781,11 +23796,7 @@ impl CheckedProgramDatabase {
                 ));
             }
             AstExprKind::Path(parts) => {
-                if self.diagnostic_authority != DiagnosticAuthority::Owner
-                    || !self.diagnostic_reads.contains_key(&expression.id)
-                {
-                    let _ = self.type_for_path(expression.id, parts);
-                }
+                let _ = self.type_for_path(expression.id, parts);
             }
             AstExprKind::Arrow { .. } => {
                 self.diagnostics.push(self.diagnostic_for_expr(
@@ -24895,15 +24906,6 @@ impl CheckedProgramDatabase {
     }
 
     fn type_for_path(&mut self, expr_id: usize, parts: &[String]) -> Type {
-        if self.diagnostic_authority == DiagnosticAuthority::Owner
-            && self.diagnostic_reads.contains_key(&expr_id)
-            && let Some(flow_type) = self.inferred_expr_types.get(&expr_id)
-        {
-            // Owner lexical planning already chose the exact local, imported,
-            // dynamic, or authoritative target. A spelling-first external or
-            // source-payload branch here would reintroduce shadowing bugs.
-            return flow_type.ty.clone();
-        }
         if let Some(producer) = external_value_role(parts) {
             let path = external_value_path(parts).expect("external path has a role and suffix");
             if !external_value_uses_store_root(parts) {
@@ -28373,6 +28375,7 @@ fn checked_match_pattern_compatibility(
     }
 }
 
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 fn checked_match_pattern_from_ast(pattern: &AstMatchPattern) -> Option<CheckedMatchPattern> {
     Some(match pattern {
         AstMatchPattern::Wildcard => CheckedMatchPattern::Wildcard,

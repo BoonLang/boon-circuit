@@ -2269,7 +2269,7 @@ pub(crate) fn compiler_diagnostics_from_kernel(
     )
     .map_err(|error| format!("cannot fingerprint kernel diagnostics: {error}"))?;
     let typecheck_ms = typecheck_started.elapsed().as_secs_f64() * 1_000.0;
-    let owner_work = boon_typecheck::OwnerBodyInferenceWork {
+    let owner_work = crate::CompilerOwnerWork {
         statements: active
             .iter()
             .map(|owner| {
@@ -2482,7 +2482,7 @@ pub(crate) fn compiler_checked_from_kernel(
 ) -> Result<crate::CheckedSourceFromSource, String> {
     let started = Instant::now();
     let checked = checked_construction_from_kernel(&project, role)?;
-    let owner_work = boon_typecheck::OwnerBodyInferenceWork {
+    let owner_work = crate::CompilerOwnerWork {
         statements: u64::try_from(checked.fields.statements.len()).unwrap_or(u64::MAX),
         expressions: u64::try_from(checked.fields.expressions.len()).unwrap_or(u64::MAX),
         local_constraints: checked.compile_work.linked_operations,

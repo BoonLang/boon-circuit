@@ -4,11 +4,13 @@ use crate::{
     checked_intrinsic_v1, host_effect_signature, host_port_table, scene_root,
     session_info_intrinsic_type, source_payload_shape_table, syntax_source_sites,
 };
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
+use boon_checked::ObjectShape;
 use boon_checked::{
     CheckedCallContextKind, CheckedCallableKind, CheckedEffectSummary,
     CheckedExternalDeclarationIdentityV1, CheckedIntrinsicV1, CheckedParameterKind,
-    CheckedParameterRequirement, ExternalTypeEnvironment, FlowType, ObjectShape,
-    OwnerAbiDeclarationKey, OwnerAbiDeclarationKind, ProgramRole, Type,
+    CheckedParameterRequirement, ExternalTypeEnvironment, FlowType, OwnerAbiDeclarationKey,
+    OwnerAbiDeclarationKind, ProgramRole, Type,
 };
 use boon_parser::ProjectSyntaxSnapshot;
 use boon_syntax::StableCheckOwnerKey;
@@ -35,6 +37,7 @@ const OWNER_CONSTRUCTION_ABI_ENVIRONMENT_DOMAIN_V3: &[u8] =
 const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V7: &[u8] =
     b"boon.owner-inference-abi-environment.v7\0";
 const OWNER_CHECKED_ABI_CALLABLE_KEY_DOMAIN_V2: &[u8] = b"boon.owner-checked-abi-callable.v2\0";
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 const OWNER_CHECKED_ABI_VALUE_KEY_DOMAIN_V1: &[u8] = b"boon.owner-checked-abi-value.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -151,6 +154,7 @@ pub enum OwnerAbiResultSpecialization {
     RenderConstructor,
 }
 
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 pub(crate) fn specialize_owner_abi_result_type(
     base: &Type,
     specialization: OwnerAbiResultSpecialization,
@@ -201,6 +205,7 @@ pub(crate) fn owner_abi_callable_declaration_key(
     })
 }
 
+#[cfg(any(test, feature = "legacy-owner-oracle"))]
 pub(crate) fn owner_abi_value_declaration_key(
     role: ProgramRole,
     contract: &OwnerAbiValueContract,

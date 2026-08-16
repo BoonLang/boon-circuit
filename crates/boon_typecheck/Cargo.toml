@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Explicit test-only oracle for the superseded owner interface/body checker.
+# Production compiler builds consume the dense kernel and must not compile
+# this stack merely for compatibility DTOs.
+legacy-owner-oracle = []
+
 [dependencies]
 boon_checked.workspace = true
 boon_compilation_db.workspace = true

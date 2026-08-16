@@ -175,7 +175,7 @@ pub struct CheckedDiagnosticsProfile {
     pub diagnostic_count: usize,
     pub parse_work: ParseWorkCounters,
     pub typecheck_work: boon_typecheck::TypeCheckWorkCounters,
-    pub owner_work: boon_typecheck::OwnerBodyInferenceWork,
+    pub owner_work: CompilerOwnerWork,
     pub parse_ms: f64,
     pub typecheck_ms: f64,
     pub total_ms: f64,
@@ -195,12 +195,33 @@ pub struct CompilerDiagnosticsProfile {
     /// Compatibility projection for benchmark consumers that still render
     /// the legacy owner-work columns. Kernel diagnostics populate this from
     /// their single dense compile/solve instead of running the owner solver.
-    pub owner_work: boon_typecheck::OwnerBodyInferenceWork,
+    pub owner_work: CompilerOwnerWork,
     pub kernel_compile_work: boon_compiler_kernel::KernelCompileWork,
     pub kernel_solve_work: boon_compiler_kernel::KernelSolveWork,
     pub parse_ms: f64,
     pub typecheck_ms: f64,
     pub total_ms: f64,
+}
+
+/// Compatibility-shaped deterministic work receipt for compiler benchmarks.
+///
+/// The dense kernel populates these columns directly. Keeping this receipt in
+/// the compiler facade prevents normal compiler builds from importing the
+/// obsolete owner-body solver merely to name its historical counter DTO.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompilerOwnerWork {
+    pub statements: u64,
+    pub expressions: u64,
+    pub local_constraints: u64,
+    pub interface_imports: u64,
+    pub interface_plan_direct_owners: u64,
+    pub interface_plan_required_owners: u64,
+    pub interface_plan_provider_sccs: u64,
+    pub interface_plan_result_transfers: u64,
+    pub interface_plan_transfer_nodes: u64,
+    pub interface_plan_transfer_edges: u64,
+    pub calls: u64,
+    pub unification_steps: u64,
 }
 
 /// Complete construction-independent diagnostics for one compiler-session
@@ -405,7 +426,7 @@ pub struct CompileProfile {
     pub cancellation_checkpoint_count: usize,
     pub parse_work: ParseWorkCounters,
     pub typecheck_work: boon_typecheck::TypeCheckWorkCounters,
-    pub owner_work: boon_typecheck::OwnerBodyInferenceWork,
+    pub owner_work: CompilerOwnerWork,
     pub parse_ms: f64,
     pub typecheck_ms: f64,
     pub semantic_ms: f64,
@@ -853,7 +874,7 @@ pub(crate) fn checked_source_from_checked_fields(
     parse_work: ParseWorkCounters,
     parse_ms: f64,
     typecheck_work: boon_typecheck::TypeCheckWorkCounters,
-    owner_work: boon_typecheck::OwnerBodyInferenceWork,
+    owner_work: CompilerOwnerWork,
     typecheck_ms: f64,
     checked_call_occurrences: Option<Box<[boon_syntax::StableOccurrenceKey]>>,
 ) -> CheckedSourceFromSource {
@@ -1114,7 +1135,7 @@ fn finish_checked_program_to_machine_plan(
     parsed_expression_count: usize,
     parse_work: ParseWorkCounters,
     typecheck_work: boon_typecheck::TypeCheckWorkCounters,
-    owner_work: boon_typecheck::OwnerBodyInferenceWork,
+    owner_work: CompilerOwnerWork,
     parse_ms: f64,
     typecheck_ms: f64,
     elapsed_before_finish_ms: f64,

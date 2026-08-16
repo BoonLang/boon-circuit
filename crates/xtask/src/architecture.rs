@@ -65,6 +65,11 @@ pub fn collect_architecture_evidence(workspace: &Path) -> GateEvidence {
     );
     push_check(
         &mut checks,
+        "legacy-owner-solver-test-only",
+        legacy_owner_solver_test_only(workspace),
+    );
+    push_check(
+        &mut checks,
         "dependency-classifier-schema-v1",
         crate::dependency_classifier::verify(workspace),
     );
@@ -612,6 +617,106 @@ fn exact_struct_definition_lines<'a>(
             || line == format!("pub struct {name} {{")
             || line.starts_with(&format!("pub(crate) struct {name} {{"))
     })
+}
+
+fn legacy_owner_solver_test_only(workspace: &Path) -> Result<String, String> {
+    const FEATURE: &str = "legacy-owner-oracle";
+    const MODULES: &[&str] = &[
+        "owner_body",
+        "owner_checked",
+        "owner_compat",
+        "owner_constraints",
+        "owner_diagnostics",
+        "owner_interface",
+        "owner_shard_builder",
+        "owner_signature_lexical",
+        "owner_syntax",
+    ];
+
+    let typecheck_manifest = parse_toml(&workspace.join("crates/boon_typecheck/Cargo.toml"))?;
+    let compiler_manifest = parse_toml(&workspace.join("crates/boon_compiler/Cargo.toml"))?;
+    let typecheck_source = read_text(&workspace.join("crates/boon_typecheck/src/lib.rs"))?;
+
+    if typecheck_manifest
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .and_then(|features| features.get(FEATURE))
+        .is_none()
+    {
+        return Err(format!(
+            "boon_typecheck does not declare the explicit `{FEATURE}` oracle feature"
+        ));
+    }
+
+    let gated_prefix = format!("#[cfg(any(test, feature = \"{FEATURE}\"))]");
+    for module in MODULES {
+        let declaration = format!("{gated_prefix}\nmod {module};");
+        let export = format!("{gated_prefix}\npub use {module}::*;");
+        if !typecheck_source.contains(&declaration) || !typecheck_source.contains(&export) {
+            return Err(format!(
+                "legacy owner module `{module}` is not gated at both declaration and export"
+            ));
+        }
+    }
+
+    let production_dependency = compiler_manifest
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .and_then(|dependencies| dependencies.get("boon_typecheck"))
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| "boon_compiler lacks its explicit boon_typecheck dependency".to_owned())?;
+    if production_dependency
+        .get("features")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|features| {
+            features
+                .iter()
+                .any(|feature| feature.as_str() == Some(FEATURE))
+        })
+    {
+        return Err("boon_compiler production enables the legacy owner solver".to_owned());
+    }
+
+    let test_feature = compiler_manifest
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .and_then(|features| features.get("test-kernel-oracle"))
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| "boon_compiler lacks its bounded kernel oracle feature".to_owned())?;
+    if !test_feature
+        .iter()
+        .any(|feature| feature.as_str() == Some("boon_typecheck/legacy-owner-oracle"))
+    {
+        return Err(
+            "the bounded kernel oracle does not explicitly enable the legacy owner solver"
+                .to_owned(),
+        );
+    }
+
+    let development_dependency = compiler_manifest
+        .get("dev-dependencies")
+        .and_then(toml::Value::as_table)
+        .and_then(|dependencies| dependencies.get("boon_typecheck"))
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| {
+            "boon_compiler tests lack their explicit owner oracle dependency".to_owned()
+        })?;
+    if !development_dependency
+        .get("features")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|features| {
+            features
+                .iter()
+                .any(|feature| feature.as_str() == Some(FEATURE))
+        })
+    {
+        return Err("boon_compiler tests do not explicitly enable the owner oracle".to_owned());
+    }
+
+    Ok(format!(
+        "{} legacy owner modules are absent from production and available only to explicit differential tests",
+        MODULES.len()
+    ))
 }
 
 fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> {

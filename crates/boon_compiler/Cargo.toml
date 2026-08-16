@@ -13,7 +13,7 @@ default = []
 test-flat-oracle = ["boon_semantic/test-flat-oracle"]
 # Enables the bounded dense-kernel differential producer. It is absent from
 # ordinary compiler binaries and cannot become a runtime fallback.
-test-kernel-oracle = []
+test-kernel-oracle = ["boon_typecheck/legacy-owner-oracle"]
 
 [dependencies]
 boon_checked.workspace = true
@@ -41,6 +41,7 @@ web-time.workspace = true
 boon_compiler_kernel.workspace = true
 boon_document.workspace = true
 boon_plan_executor.workspace = true
+boon_typecheck = { workspace = true, features = ["legacy-owner-oracle"] }
 
 [[test]]
 name = "artifact_oracle"

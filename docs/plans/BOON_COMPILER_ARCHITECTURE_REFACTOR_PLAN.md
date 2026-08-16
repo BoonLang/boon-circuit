@@ -3950,6 +3950,42 @@ model boundary, while the old checker itself becomes test-only differential
 oracle code. Deleting the files before separating that seam would merely copy
 legacy ownership into the new crate or silently remove checked metadata.
 
+The fresh post-deletion NovyWave receipts use newly built debug and optimized
+`boon_cli` producers. Debug diagnostics is 2,922.655 ms and debug verified is
+8,051.816 ms; the latter contains 4,246.995 ms checking, 2,470.414 ms semantic
+construction, and 1.058 ms WHERE verification. Optimized diagnostics is
+759.313 ms, including 602.499 ms checking and 94.693 ms parsing. Optimized
+verified is 3,537.049 ms, down 79.709 ms from the preceding 3,616.758 ms
+receipt; it contains 1,338.267 ms checking, 1,553.184 ms semantic construction,
+351.106 ms backend work, and 0.792 ms WHERE verification. WHERE is therefore
+0.022% of optimized verified time: it remains an explicit receipt, but is not
+an optimization target. The debug and optimized Rust rebuilds took 272.67 and
+261.37 seconds respectively and are excluded from all Boon timings.
+
+The following compiler-boundary cut makes the legacy owner checker physically
+absent from normal production compilation. Nine owner modules totaling 58,854
+source lines are gated behind the explicit `legacy-owner-oracle` feature;
+ordinary `boon_compiler` dependencies cannot enable that feature, while the
+bounded differential feature and compiler development dependency must enable
+it. An architecture audit enforces all three sides of that boundary. The
+historical owner-work receipt is now a compiler-facade DTO, and the remaining
+377-line checked-metadata reconstruction pass is separated from inference so
+the owner interface/body solver is not compiled merely to finalize checked
+tables. The old source remains only as the test oracle allowed by the original
+flag-day plan; it is not a production checker or fallback.
+
+This cut roughly halved a comparable optimized Rust rebuild from 261.37 seconds
+and 1,906,316 KiB peak RSS to 122.05 seconds and 1,046,408 KiB. That comparison
+is directional rather than a clean-room compiler benchmark, but it measures the
+intended source/rebuild closure. It does not improve the Boon algorithm yet:
+optimized diagnostic allocation counts are byte-for-byte unchanged, and two
+fresh optimized verified samples are 3,702.352 and 3,472.894 ms around the
+preceding 3,537.049 ms receipt. The latter sample contains 1,322.432 ms checking,
+1,514.472 ms semantic construction, 344.589 ms backend work, and 0.970 ms WHERE
+verification. Optimized diagnostics is 736.339 ms with 583.882 ms checking.
+The next runtime cut must therefore remove repeated semantic/OUT construction,
+not claim source gating or WHERE as execution speed.
+
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not
 spend a full optimized rebuild on every small edit. Keep the latest accepted

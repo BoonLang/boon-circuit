@@ -4419,7 +4419,7 @@ row coverage, payload mutation rejection, deterministic image and Manifest
 digests, and the independent V2/V7 replay oracles remain mandatory. This is a
 proof-authority replacement, not permission to omit content binding.
 
-The backend trace establishes the following large cut after that proof
+The backend trace establishes the following large cut alongside that proof
 boundary: setup is 94.7 ms, derived-value lowering 124.0 ms, state/effect
 updates 18.7 ms, document construction 82.7 ms, and finalization 23.4 ms. The
 shared plan-code linker must attack setup, derived, and document together.
@@ -4431,6 +4431,43 @@ then introduce the runtime function/call representation when the template
 actually replaces all three recursive owners. Trial arena clones in
 state-dependent materialized-field discovery are part of that deleted owner,
 not a separate micro-optimization project.
+
+The first backend table cut is now complete. `ScalarFieldCatalog` owns one
+immutable `ListRowFieldCatalog`: binding exclusions, indexed-state fields,
+constructor authorities, public value fields, sibling-value collisions, and
+authored per-list row fields are each classified once. `ValueIndex`, list-slot
+construction, materialized row copies, detached state locals, append lowering,
+and persistence all consume the same authority map. The previous helpers
+scanned every binding for every field, every field for every list, and every
+sibling field for every constructor authority. They are now `cfg(test)` replay
+oracles, compared against every constructed catalog; the architecture gate
+rejects production references to either replay.
+
+This is a large measured deletion. On the debug probe, list-slot construction
+falls from 1,663.4 ms to 0.3 ms. On the release test probe the direct catalog
+takes 0.755 ms while the independently labelled old oracle takes 108.808 ms;
+the test total deliberately retains that oracle cost. A freshly rebuilt
+non-test `boon_cli` instead records 0.731 ms for the catalog, 7.696 ms for all
+backend setup, and 281.845 ms for the complete backend in the traced sample.
+The MachinePlan hash remains
+`ca6a030997141a451a119165a9f9ba194071126ae257a7475d7ceafe7a1ea63a`.
+
+Five one-process-per-observation stable-release samples now have medians of
+738.613 ms diagnostics and 2,560.763 ms verified. The verified range is
+2,519.052--2,638.826 ms; semantic construction is 981.140 ms, backend
+construction is 258.378 ms, peak RSS is 354,972 KiB, and WHERE verification is
+0.348 ms. Relative to the preceding 2,676.083 ms verified checkpoint median,
+this is a 115.320 ms end-to-end improvement. Diagnostics do not enter the
+backend and therefore receive no expected benefit; their movement from the
+previous batch is treated as cold-process variance, not a regression hidden by
+the verified result. Every observation has zero diagnostics and the unchanged
+source digest
+`e8b6c437a3f112026ca4f8a58e9f9c98e04cb2e3826a29724f3dc8e72d8bda9b`.
+
+Backend setup is therefore no longer a large owner. Continue with normalized
+definition proof fragments and the shared row/document plan-code linker; do
+not add another catalog layer or spend the next tranche on the remaining
+single-digit setup work.
 
 Updating the architecture gate exposed two stale classifier entries from the
 definition-template checkpoint. `InvalidDefinitionTemplate` and the three

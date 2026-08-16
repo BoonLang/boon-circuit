@@ -1348,6 +1348,8 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     let storage_path = workspace.join("crates/boon_semantic/src/storage_contract.rs");
     let dependency_manifest_path =
         workspace.join("crates/boon_semantic/src/dependency_manifest.rs");
+    let machine_plan_backend_path =
+        workspace.join("crates/boon_compiler/src/machine_plan_backend.rs");
     for obsolete in [
         workspace.join("crates/boon_ir/src/semantic_mapping.rs"),
         workspace.join("crates/boon_ir/src/semantic_mapping"),
@@ -1370,6 +1372,7 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     let resource = read_text(&resource_path)?;
     let storage = read_text(&storage_path)?;
     let dependency_manifest = read_text(&dependency_manifest_path)?;
+    let machine_plan_backend = read_text(&machine_plan_backend_path)?;
     syn::parse_file(&ir)
         .map_err(|error| format!("cannot parse `{}`: {error}", ir_path.display()))?;
     syn::parse_file(&lowering)
@@ -1388,6 +1391,12 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         format!(
             "cannot parse `{}`: {error}",
             dependency_manifest_path.display()
+        )
+    })?;
+    let machine_plan_backend_syntax = syn::parse_file(&machine_plan_backend).map_err(|error| {
+        format!(
+            "cannot parse `{}`: {error}",
+            machine_plan_backend_path.display()
         )
     })?;
 
@@ -1697,6 +1706,33 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
             "production resource construction replays storage-scope epochs at {:?}",
             resource_scope_replay_references.references,
         ));
+    }
+    for required in [
+        "struct ListRowFieldCatalog",
+        "list_row_fields: ListRowFieldCatalog::new(program)?,",
+        "construction-owned row fields differ from the replay oracle",
+        "construction-owned list authority fields differ from the replay oracle",
+        "#[cfg(test)]\nfn list_row_fields_replay_oracle(",
+        "#[cfg(test)]\nfn list_authority_field_ids_replay_oracle(",
+    ] {
+        if !machine_plan_backend.contains(required) {
+            return Err(format!(
+                "machine-plan construction omits the indexed list-row ownership proof `{required}`"
+            ));
+        }
+    }
+    for replay in [
+        "list_row_fields_replay_oracle",
+        "list_authority_field_ids_replay_oracle",
+    ] {
+        let mut references = ProductionIdentifierReferenceCollector::new(replay);
+        references.visit_file(&machine_plan_backend_syntax);
+        if !references.references.is_empty() {
+            return Err(format!(
+                "production machine-plan construction replays list-row facts via `{replay}` at {:?}",
+                references.references,
+            ));
+        }
     }
     for forbidden in [
         "fn validate_totality(",

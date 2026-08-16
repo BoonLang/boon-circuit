@@ -9,6 +9,7 @@ use boon_semantic::program_core::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 fn plan_source_id(value: ir::SourceId) -> SourceId {
     SourceId(value.0)
@@ -1763,6 +1764,7 @@ fn compiled_list_storage_slot(
     program: &ErasedProgram,
     list: &ir::ListMemory,
     id: PlanStorageId,
+    row_field_catalog: &ListRowFieldCatalog,
     index: &ValueIndex,
     arena: &mut PlanRowExpressionArena,
     constants: &mut Vec<PlanConstant>,
@@ -1774,7 +1776,7 @@ fn compiled_list_storage_slot(
         id,
         list_id: plan_list_id(list.id),
         scope_id: plan_scope_id(list.row_scope_id),
-        row_fields: list_row_fields(program, list),
+        row_fields: row_field_catalog.row_fields(list)?.to_vec(),
         capacity: list.capacity,
         hidden_key_type: list.hidden_key_type.clone(),
         has_generation: list.has_generation,
@@ -2923,6 +2925,7 @@ fn durable_migration_source_list_plan(
         program,
         list,
         PlanStorageId(0),
+        &scalar_fields.list_row_fields,
         &index,
         &mut arena,
         &mut constants,
@@ -4840,16 +4843,27 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         }
         backend_phase_started = Instant::now();
     };
+    let mut setup_phase_started = Instant::now();
+    let mut trace_setup_phase = |phase: &str| {
+        if trace_backend {
+            eprintln!(
+                "boon_compiler backend setup.{phase}: {:.3}ms",
+                elapsed_ms(setup_phase_started)
+            );
+        }
+        setup_phase_started = Instant::now();
+    };
     let effects = effect_contracts(program)?;
     let mut effect_outbox = effect_outbox_schemas(&effects)?;
-    let authority_field_ids = list_authority_field_ids(program);
     let scalar_fields = ScalarFieldCatalog::new(program)?;
+    let authority_field_ids = scalar_fields.list_row_fields.authority_field_ids();
     let index = ValueIndex::new(
         program,
         &distributed.expression_refs,
         &distributed.path_refs,
         &scalar_fields,
     )?;
+    trace_setup_phase("indexes");
     let mut next_op = 0usize;
     let mut unresolved_refs = BTreeSet::new();
 
@@ -4890,6 +4904,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         synthetic.id = PlanSourceRouteId(source_routes.len());
         source_routes.push(synthetic);
     }
+    trace_setup_phase("source_routes");
 
     let mut row_expressions = PlanRowExpressionArena::new();
     let mut constants = Vec::new();
@@ -4918,6 +4933,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         .iter()
         .map(|state| migration_storage_default(program, state))
         .collect::<Vec<_>>();
+    trace_setup_phase("activations_and_migrations");
 
     let mut scalar_slots = Vec::with_capacity(program.state_cells.len());
     for state in program.state_cells.iter() {
@@ -5023,6 +5039,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
             initializer,
         });
     }
+    trace_setup_phase("scalar_slots");
 
     let mut list_indexes = Vec::new();
     let list_slot_offset = scalar_slots.len();
@@ -5035,6 +5052,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
                 program,
                 list,
                 PlanStorageId(list_slot_offset + slot_index),
+                &scalar_fields.list_row_fields,
                 &index,
                 &mut row_expressions,
                 &mut constants,
@@ -5066,6 +5084,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         })
         .collect::<Vec<_>>();
     let byte_bank_storage_count = byte_banks.len();
+    trace_setup_phase("list_slots_and_byte_banks");
 
     let source_ops = source_routes
         .iter()
@@ -5128,10 +5147,14 @@ pub(crate) fn compile_erased_program_with_distributed_context(
             )));
         }
     }
+    trace_setup_phase("operations_and_effect_schedules");
     let mut derived_ops = Vec::new();
     trace_backend_phase("setup");
     let mut materialized_row_outputs = BTreeSet::new();
     let mut split_pulse_outputs = BTreeMap::<usize, Vec<ValueRef>>::new();
+    let mut derived_expression_elapsed = std::time::Duration::ZERO;
+    let mut derived_expression_count = 0usize;
+    let mut bounded_access_elapsed = std::time::Duration::ZERO;
     for (derived_index, derived) in program.derived_values.iter().enumerate() {
         let derived_output = derived_output_ref(derived, &scalar_fields)?;
         if projection_owned_outputs.contains(&derived_output) {
@@ -5231,7 +5254,9 @@ pub(crate) fn compile_erased_program_with_distributed_context(
                 )?,
             })
         } else {
-            derived_expression_for_value(
+            let lower_started = trace_backend.then(Instant::now);
+            derived_expression_count += 1;
+            let expression = derived_expression_for_value(
                 program,
                 derived,
                 &index,
@@ -5241,12 +5266,17 @@ pub(crate) fn compile_erased_program_with_distributed_context(
                 &mut inputs,
                 &mut list_indexes,
                 &mut unresolved_refs,
-            )?
+            )?;
+            if let Some(lower_started) = lower_started {
+                derived_expression_elapsed += lower_started.elapsed();
+            }
+            expression
         };
         let mut materialization = None;
         if unresolved == 0
             && let Some(expression) = expression.as_mut()
         {
+            let bounded_started = trace_backend.then(Instant::now);
             lower_bounded_list_access(
                 program,
                 &index,
@@ -5255,6 +5285,9 @@ pub(crate) fn compile_erased_program_with_distributed_context(
                 expression,
                 &mut list_indexes,
             )?;
+            if let Some(bounded_started) = bounded_started {
+                bounded_access_elapsed += bounded_started.elapsed();
+            }
         }
         if exact_reconstructable_list_literal(
             &derived_output,
@@ -5414,6 +5447,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
                 &inner,
                 &row_expressions,
                 &list_indexes,
+                authority_field_ids,
             )?;
             row_field_copies.retain(|copy| !deferred_outputs.contains(&copy.target_field));
             let value_list_authorities =
@@ -5484,6 +5518,14 @@ pub(crate) fn compile_erased_program_with_distributed_context(
             derived.indexed,
             unresolved,
         ));
+    }
+    if trace_backend {
+        eprintln!(
+            "boon_compiler backend derived_expression_lowering count={} elapsed_ms={:.3} bounded_access_ms={:.3}",
+            derived_expression_count,
+            derived_expression_elapsed.as_secs_f64() * 1_000.0,
+            bounded_access_elapsed.as_secs_f64() * 1_000.0,
+        );
     }
     trace_backend_phase("derived_values");
     let mut update_ops = program
@@ -5797,7 +5839,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
                                 program,
                                 &target_list.name,
                                 &name,
-                                &authority_field_ids,
+                                authority_field_ids,
                             )
                             .ok_or_else(|| {
                                 PlanError::new(format!(
@@ -6464,7 +6506,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         &row_expressions,
         &list_indexes,
         &regions,
-        &authority_field_ids,
+        authority_field_ids,
         &transient_effect_result_targets,
         &transient_producer_states,
         &transient_producer_lists,
@@ -8475,6 +8517,317 @@ fn indexed_state_field_ids(program: &ErasedProgram) -> BTreeSet<FieldId> {
         .collect()
 }
 
+/// Construction-owned row-storage facts used by every list slot.
+///
+/// The previous path rebuilt these facts independently for each list.  On a
+/// wide program that meant scanning all bindings for every field, all fields
+/// for every list, and all sibling fields for every constructor authority.
+/// This catalog classifies the immutable erased storage graph once and keeps
+/// the authored field order in one dense per-list table.
+#[derive(Clone, Debug)]
+struct ListRowFieldCatalog {
+    row_fields_by_list: Vec<Vec<PlanListRowField>>,
+    authority_field_ids: Arc<BTreeMap<(String, String), FieldId>>,
+}
+
+impl ListRowFieldCatalog {
+    fn new(program: &ErasedProgram) -> Result<Self, PlanError> {
+        let trace = std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some();
+        let started = trace.then(Instant::now);
+        let indexed_state_fields = indexed_state_field_ids(program);
+        let source_binding_producers = program
+            .scope_index
+            .bindings
+            .iter()
+            .filter_map(|binding| {
+                matches!(binding.target, ir::ErasedBindingTarget::Source { .. })
+                    .then_some(binding.producer)
+            })
+            .collect::<BTreeSet<_>>();
+        let row_value_binding_keys = program
+            .scope_index
+            .bindings
+            .iter()
+            .filter_map(|binding| match binding.target {
+                ir::ErasedBindingTarget::Value {
+                    field: None,
+                    row: Some(row),
+                } => Some((row, binding.producer, binding.declaration)),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let mut state_binding_authorities = BTreeMap::new();
+        for binding in &program.scope_index.bindings {
+            let ir::ErasedBindingTarget::State {
+                field: Some(authority),
+                row: Some(row),
+                ..
+            } = binding.target
+            else {
+                continue;
+            };
+            state_binding_authorities
+                .entry((row, binding.producer, binding.declaration))
+                .or_insert_with(BTreeSet::new)
+                .insert(authority);
+        }
+
+        let mut runtime_row_storage = vec![false; program.scope_index.fields.len()];
+        for field in &program.scope_index.fields {
+            let runtime = !field.resource_only
+                && !field
+                    .producer
+                    .is_some_and(|producer| source_binding_producers.contains(&producer))
+                && !field.row.is_some_and(|row| {
+                    let Some(producer) = field.producer else {
+                        return false;
+                    };
+                    let Some(declaration) = field.declaration else {
+                        return false;
+                    };
+                    row_value_binding_keys.contains(&(row, producer, declaration))
+                        || state_binding_authorities
+                            .get(&(row, producer, declaration))
+                            .is_some_and(|authorities| {
+                                authorities.iter().any(|authority| *authority != field.id)
+                            })
+                });
+            let slot = runtime_row_storage
+                .get_mut(field.id.as_usize())
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "storage field {} is outside the dense row-field catalog",
+                        field.id
+                    ))
+                })?;
+            *slot = runtime;
+        }
+
+        let mut constructor_authority = vec![false; program.scope_index.fields.len()];
+        for field in &program.scope_index.fields {
+            let is_constructor = field.role.is_authority()
+                && !indexed_state_fields.contains(&plan_field_id(field.id))
+                && !field.parent.is_some_and(|parent| {
+                    program
+                        .scope_index
+                        .fields
+                        .get(parent.as_usize())
+                        .filter(|candidate| candidate.id == parent)
+                        .is_some_and(|parent| parent.row == field.row && parent.role.is_authority())
+                });
+            constructor_authority[field.id.as_usize()] = is_constructor;
+        }
+
+        let separate_value_paths = program
+            .scope_index
+            .fields
+            .iter()
+            .filter(|field| {
+                runtime_row_storage[field.id.as_usize()]
+                    && field.role == ir::ErasedFieldRole::Value
+                    && field.row.is_some()
+            })
+            .map(|field| {
+                (
+                    field.row.expect("filtered row storage field"),
+                    field.row_path.clone(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+
+        let mut direct_fields = BTreeMap::new();
+        for field in &program.scope_index.fields {
+            if !runtime_row_storage[field.id.as_usize()]
+                || field.row_path.as_slice() != [field.name.as_str()]
+            {
+                continue;
+            }
+            let Some(row) = field.row else {
+                continue;
+            };
+            let value_priority = match field.role {
+                ir::ErasedFieldRole::Value => 0,
+                ir::ErasedFieldRole::ValueAuthority => 1,
+                ir::ErasedFieldRole::ListAuthority => 2,
+                ir::ErasedFieldRole::Capture => 3,
+            };
+            let candidate = (
+                value_priority,
+                erased_row_field_depth(program, field),
+                plan_field_id(field.id),
+            );
+            let key = (row.list, field.name.clone());
+            match direct_fields.get(&key) {
+                Some(current) if *current <= candidate => {}
+                _ => {
+                    direct_fields.insert(key, candidate);
+                }
+            }
+        }
+
+        let mut public_value_names = BTreeMap::<ir::ListId, BTreeSet<String>>::new();
+        for memory in program.semantic_memory.iter().filter(|memory| {
+            semantic_memory_is_active(memory)
+                && matches!(
+                    memory.runtime_backing,
+                    ir::SemanticMemoryRuntimeBacking::List { .. }
+                )
+        }) {
+            let ir::SemanticMemoryRuntimeBacking::List { list_id, .. } = memory.runtime_backing
+            else {
+                unreachable!("filtered semantic list memory")
+            };
+            let DataTypePlan::List { item } =
+                semantic_data_type_plan(&memory.data_type).canonicalized()
+            else {
+                continue;
+            };
+            let names = public_value_names.entry(list_id).or_default();
+            match item.as_ref() {
+                DataTypePlan::Record { fields, .. } => names.extend(
+                    fields
+                        .iter()
+                        .filter(|field| !field.name.starts_with("@authority:"))
+                        .map(|field| field.name.clone()),
+                ),
+                _ => {
+                    names.insert("value".to_owned());
+                }
+            }
+        }
+        let public_value_fields = public_value_names
+            .into_iter()
+            .map(|(list, names)| {
+                let fields = names
+                    .into_iter()
+                    .filter_map(|name| direct_fields.get(&(list, name)).map(|value| value.2))
+                    .collect::<BTreeSet<_>>();
+                (list, fields)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let mut row_fields_by_list = vec![Vec::new(); program.lists.len()];
+        let mut authority_field_ids = BTreeMap::new();
+        for field in &program.scope_index.fields {
+            let is_constructor = constructor_authority[field.id.as_usize()];
+            if is_constructor && let Some(row) = field.row {
+                let list = program
+                    .lists
+                    .get(row.list.as_usize())
+                    .filter(|list| list.id == row.list)
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "constructor authority field {} references missing list {}",
+                            field.id, row.list
+                        ))
+                    })?;
+                let key = (list.name.clone(), field.name.clone());
+                let candidate = plan_field_id(field.id);
+                match authority_field_ids.get(&key) {
+                    Some(current) if *current <= candidate => {}
+                    _ => {
+                        authority_field_ids.insert(key, candidate);
+                    }
+                }
+            }
+            if !runtime_row_storage[field.id.as_usize()] {
+                continue;
+            }
+            let Some(row) = field.row else {
+                continue;
+            };
+            let rows = row_fields_by_list
+                .get_mut(row.list.as_usize())
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "row storage field {} references missing list {}",
+                        field.id, row.list
+                    ))
+                })?;
+            let role = if field.role == ir::ErasedFieldRole::Capture {
+                PlanListRowFieldRole::Capture
+            } else {
+                let value = if is_constructor {
+                    public_value_fields
+                        .get(&row.list)
+                        .is_some_and(|fields| fields.contains(&plan_field_id(field.id)))
+                        && !separate_value_paths.contains(&(row, field.row_path.clone()))
+                } else {
+                    field.role.is_value()
+                };
+                match (value, is_constructor) {
+                    (true, true) => PlanListRowFieldRole::ValueAuthority,
+                    (false, true) => PlanListRowFieldRole::Authority,
+                    (_, false) => PlanListRowFieldRole::Value,
+                }
+            };
+            rows.push(PlanListRowField {
+                field_id: plan_field_id(field.id),
+                name: field.name.clone(),
+                role,
+            });
+        }
+
+        let catalog = Self {
+            row_fields_by_list,
+            authority_field_ids: Arc::new(authority_field_ids),
+        };
+        if let Some(started) = started {
+            eprintln!(
+                "boon_compiler backend list_row_field_catalog lists={} fields={} elapsed_ms={:.3}",
+                program.lists.len(),
+                program.scope_index.fields.len(),
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
+        #[cfg(test)]
+        {
+            let oracle_started = trace.then(Instant::now);
+            for list in &program.lists {
+                let direct = catalog.row_fields(list)?;
+                let replay = list_row_fields_replay_oracle(program, list);
+                if direct != replay {
+                    return Err(PlanError::new(format!(
+                        "list `{}` construction-owned row fields differ from the replay oracle",
+                        list.name
+                    )));
+                }
+            }
+            if catalog.authority_field_ids.as_ref()
+                != &list_authority_field_ids_replay_oracle(program)
+            {
+                return Err(PlanError::new(
+                    "construction-owned list authority fields differ from the replay oracle",
+                ));
+            }
+            if let Some(oracle_started) = oracle_started {
+                eprintln!(
+                    "boon_compiler backend list_row_field_catalog.oracle elapsed_ms={:.3}",
+                    oracle_started.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
+        }
+        Ok(catalog)
+    }
+
+    fn row_fields(&self, list: &ir::ListMemory) -> Result<&[PlanListRowField], PlanError> {
+        self.row_fields_by_list
+            .get(list.id.as_usize())
+            .map(Vec::as_slice)
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "list {} is outside the dense row-field catalog",
+                    list.id
+                ))
+            })
+    }
+
+    fn authority_field_ids(&self) -> &BTreeMap<(String, String), FieldId> {
+        &self.authority_field_ids
+    }
+}
+
+#[cfg(test)]
 fn erased_field_is_list_constructor_authority(
     program: &ErasedProgram,
     field: &ir::ErasedFieldDef,
@@ -8493,6 +8846,7 @@ fn erased_field_is_list_constructor_authority(
     })
 }
 
+#[cfg(test)]
 fn erased_constructor_authority_has_separate_value(
     program: &ErasedProgram,
     field: &ir::ErasedFieldDef,
@@ -8506,6 +8860,7 @@ fn erased_constructor_authority_has_separate_value(
     })
 }
 
+#[cfg(test)]
 fn public_list_value_field_ids(
     program: &ErasedProgram,
     list: &ir::ListMemory,
@@ -8544,7 +8899,11 @@ fn public_list_value_field_ids(
         .collect()
 }
 
-fn list_row_fields(program: &ErasedProgram, list: &ir::ListMemory) -> Vec<PlanListRowField> {
+#[cfg(test)]
+fn list_row_fields_replay_oracle(
+    program: &ErasedProgram,
+    list: &ir::ListMemory,
+) -> Vec<PlanListRowField> {
     let indexed_state_fields = indexed_state_field_ids(program);
     let public_value_fields = public_list_value_field_ids(program, list);
     program
@@ -8585,7 +8944,10 @@ fn list_row_fields(program: &ErasedProgram, list: &ir::ListMemory) -> Vec<PlanLi
         .collect()
 }
 
-fn list_authority_field_ids(program: &ErasedProgram) -> BTreeMap<(String, String), FieldId> {
+#[cfg(test)]
+fn list_authority_field_ids_replay_oracle(
+    program: &ErasedProgram,
+) -> BTreeMap<(String, String), FieldId> {
     let indexed_fields = indexed_state_field_ids(program);
     let mut fields = BTreeMap::<(String, String), (u8, usize, FieldId)>::new();
     for field in
@@ -8977,6 +9339,11 @@ fn state_dependent_materialized_row_fields(
     list_indexes: &mut Vec<PlanListIndex>,
     include_state_independent: bool,
 ) -> Result<Vec<MaterializedRowFieldPlan>, PlanError> {
+    let trace = std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some();
+    let started = trace.then(Instant::now);
+    let mut clone_elapsed = std::time::Duration::ZERO;
+    let mut trial_lower_elapsed = std::time::Duration::ZERO;
+    let mut trial_lower_count = 0usize;
     let target_states = state_fields.values().copied().collect::<BTreeSet<_>>();
     if target_states.is_empty() && !include_state_independent {
         return Ok(Vec::new());
@@ -9069,9 +9436,13 @@ fn state_dependent_materialized_row_fields(
         }
         let mut lowered = None;
         for event_trigger in std::iter::once(None).chain(pulse_triggers.iter().cloned().map(Some)) {
+            let clone_started = trace.then(Instant::now);
             let mut trial_arena = arena.clone();
             let mut trial_constants = constants.clone();
             let mut trial_indexes = list_indexes.clone();
+            if let Some(clone_started) = clone_started {
+                clone_elapsed += clone_started.elapsed();
+            }
             let mut trial_inputs = Vec::new();
             let mut lowerer = ExecutableRowLowerer::new(
                 program,
@@ -9084,12 +9455,21 @@ fn state_dependent_materialized_row_fields(
             if let Some(trigger) = event_trigger.as_ref() {
                 lowerer = lowerer.with_event_trigger(trigger);
             }
+            let trial_lower_started = trace.then(Instant::now);
+            trial_lower_count += 1;
             match lowerer.lower(producer) {
                 Ok(_) => {
+                    if let Some(trial_lower_started) = trial_lower_started {
+                        trial_lower_elapsed += trial_lower_started.elapsed();
+                    }
                     lowered = Some((event_trigger, trial_inputs));
                     break;
                 }
-                Err(_) => {}
+                Err(_) => {
+                    if let Some(trial_lower_started) = trial_lower_started {
+                        trial_lower_elapsed += trial_lower_started.elapsed();
+                    }
+                }
             }
         }
         let Some((event_trigger, trial_inputs)) = lowered else {
@@ -9117,6 +9497,7 @@ fn state_dependent_materialized_row_fields(
         }
     }
 
+    let candidate_count = trial.len();
     let mut result = Vec::new();
     for (name, output, producer, _, event_trigger, projected) in trial {
         if !include_state_independent && !deferred.contains(&output) {
@@ -9164,6 +9545,7 @@ fn state_dependent_materialized_row_fields(
                     row_local,
                     source_list,
                     target_list,
+                    index.list_authority_field_ids(),
                 )?;
                 if arena.contextual_locals_resolve_with(candidate, owner, row_local)? {
                     expression = candidate;
@@ -9188,6 +9570,17 @@ fn state_dependent_materialized_row_fields(
             inputs,
         });
     }
+    if let Some(started) = started {
+        eprintln!(
+            "boon_compiler backend materialized_row_field_probe target_list={} candidates={} trial_lowers={} clone_ms={:.3} trial_lower_ms={:.3} total_ms={:.3}",
+            target_list.0,
+            candidate_count,
+            trial_lower_count,
+            clone_elapsed.as_secs_f64() * 1_000.0,
+            trial_lower_elapsed.as_secs_f64() * 1_000.0,
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+    }
     Ok(result)
 }
 
@@ -9199,6 +9592,7 @@ fn retarget_materialized_source_local(
     row_local: PlanLocalId,
     source_list: ListId,
     target_list: ListId,
+    authority_fields: &BTreeMap<(String, String), FieldId>,
 ) -> Result<PlanRowExpressionId, PlanError> {
     let target_list_name = program
         .lists
@@ -9211,7 +9605,6 @@ fn retarget_materialized_source_local(
                 target_list.0
             ))
         })?;
-    let authority_fields = list_authority_field_ids(program);
     rewrite_row_expression(arena, expression, |arena, _, node| {
         if let PlanRowExpressionNode::ListRowField {
             row,
@@ -11087,16 +11480,19 @@ fn materialized_list_row_field_copies(
     expression: &PlanDerivedExpression,
     arena: &PlanRowExpressionArena,
     list_indexes: &[PlanListIndex],
+    authority_fields: &BTreeMap<(String, String), FieldId>,
 ) -> Result<Vec<PlanMaterializedRowFieldCopy>, PlanError> {
     let mut source_lists = BTreeSet::new();
     collect_materialized_row_sources(expression, arena, list_indexes, &mut source_lists)?;
     if source_lists.is_empty() {
         return Ok(Vec::new());
     }
-    let target_fields = materialized_copy_target_fields_by_name(program, target_list);
+    let target_fields =
+        materialized_copy_target_fields_by_name(program, target_list, authority_fields);
     let mut copies = Vec::new();
     for source_list in source_lists {
-        let source_fields = materialized_copy_source_fields_by_name(program, source_list);
+        let source_fields =
+            materialized_copy_source_fields_by_name(program, source_list, authority_fields);
         let before = copies.len();
         for (name, target_field) in &target_fields {
             if let Some(source_field) = source_fields.get(name) {
@@ -11157,6 +11553,7 @@ fn erased_field_contains_resource(program: &ErasedProgram, field: &ir::ErasedFie
 fn materialized_copy_source_fields_by_name(
     program: &ErasedProgram,
     list_id: ListId,
+    authority_fields: &BTreeMap<(String, String), FieldId>,
 ) -> BTreeMap<String, FieldId> {
     let Some(list) = program
         .lists
@@ -11165,11 +11562,10 @@ fn materialized_copy_source_fields_by_name(
     else {
         return BTreeMap::new();
     };
-    let authority_fields = list_authority_field_ids(program);
     top_level_materialized_data_field_names(program, list_id)
         .into_iter()
         .filter_map(|name| {
-            storage_input_field_id(program, &list.name, &name, &authority_fields)
+            storage_input_field_id(program, &list.name, &name, authority_fields)
                 .map(|field| (name, field))
         })
         .collect()
@@ -11178,6 +11574,7 @@ fn materialized_copy_source_fields_by_name(
 fn materialized_copy_target_fields_by_name(
     program: &ErasedProgram,
     list_id: ListId,
+    authority_fields: &BTreeMap<(String, String), FieldId>,
 ) -> BTreeMap<String, FieldId> {
     let Some(list) = program
         .lists
@@ -11186,11 +11583,10 @@ fn materialized_copy_target_fields_by_name(
     else {
         return BTreeMap::new();
     };
-    let authority_fields = list_authority_field_ids(program);
     top_level_materialized_data_field_names(program, list_id)
         .into_iter()
         .filter_map(|name| {
-            storage_input_field_id(program, &list.name, &name, &authority_fields)
+            storage_input_field_id(program, &list.name, &name, authority_fields)
                 .map(|field| (name, field))
         })
         .collect()
@@ -12264,10 +12660,14 @@ impl<'a> ExecutableRowLowerer<'a> {
                     erased_owner.0, local.0, list_id.0
                 ))
             })?;
-        let authority_fields = list_authority_field_ids(program);
         let field_id = |field_name: &str| {
-            storage_input_field_id(program, list_name, field_name, &authority_fields).ok_or_else(
-                || {
+            storage_input_field_id(
+                program,
+                list_name,
+                field_name,
+                self.index.list_authority_field_ids(),
+            )
+            .ok_or_else(|| {
                     PlanError::new(format!(
                         "{state_label} local {}:{} member `{field_name}` from source projection `{}` and constructor projection `{}` has no exact target-row constructor field",
                         erased_owner.0,
@@ -12275,8 +12675,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                         projection.join("."),
                         constructor_projection.join("."),
                     ))
-                },
-            )
+                })
         };
         let body = self
             .program
@@ -15970,6 +16369,7 @@ fn derived_output_ref(
 struct ScalarFieldCatalog {
     by_ir: BTreeMap<ir::FieldId, FieldId>,
     plan_ids: BTreeSet<FieldId>,
+    list_row_fields: ListRowFieldCatalog,
 }
 
 impl ScalarFieldCatalog {
@@ -15988,7 +16388,11 @@ impl ScalarFieldCatalog {
                 )));
             }
         }
-        Ok(Self { by_ir, plan_ids })
+        Ok(Self {
+            by_ir,
+            plan_ids,
+            list_row_fields: ListRowFieldCatalog::new(program)?,
+        })
     }
 
     fn require(&self, field: ir::FieldId, context: &str) -> Result<FieldId, PlanError> {
@@ -16018,6 +16422,7 @@ pub(super) struct ValueIndex {
     state_data_types: BTreeMap<StateId, DataTypePlan>,
     field_value_types: BTreeMap<FieldId, PlanValueType>,
     field_data_types: BTreeMap<FieldId, DataTypePlan>,
+    list_authority_field_ids: Arc<BTreeMap<(String, String), FieldId>>,
 }
 
 pub(super) fn lower_document_runtime_expression(
@@ -16051,7 +16456,7 @@ impl ValueIndex {
         let mut state_data_types = BTreeMap::new();
         let mut field_value_types = BTreeMap::new();
         let mut field_data_types = BTreeMap::new();
-        let authority_field_ids = list_authority_field_ids(program);
+        let authority_field_ids = scalar_fields.list_row_fields.authority_field_ids();
         for source in &program.sources {
             by_path.insert(
                 source.path.clone(),
@@ -16128,7 +16533,7 @@ impl ValueIndex {
                             program,
                             &list.name,
                             &field.name,
-                            &authority_field_ids,
+                            authority_field_ids,
                         ) {
                             by_path
                                 .entry(format!("{}.{}", list.name, field.name))
@@ -16281,6 +16686,9 @@ impl ValueIndex {
             state_data_types,
             field_value_types,
             field_data_types,
+            list_authority_field_ids: Arc::clone(
+                &scalar_fields.list_row_fields.authority_field_ids,
+            ),
         })
     }
 
@@ -16293,6 +16701,10 @@ impl ValueIndex {
 
     fn resolve_storage(&self, binding: ir::ErasedBindingId) -> Option<ValueRef> {
         self.by_storage.get(&binding).cloned()
+    }
+
+    fn list_authority_field_ids(&self) -> &BTreeMap<(String, String), FieldId> {
+        &self.list_authority_field_ids
     }
 
     fn row_source(

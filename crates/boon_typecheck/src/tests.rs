@@ -125,6 +125,58 @@ fn explicit_call_occurrence_relocation_seals_the_same_checked_image() {
 }
 
 #[test]
+fn project_checked_metadata_reconstruction_uses_only_parser_and_checked_rows() {
+    let project = boon_parser::parse_project_syntax(
+        "app/RUN.bn",
+        [(
+            "app/RUN.bn".to_owned(),
+            concat!(
+                "store: [\n",
+                "    request: SOURCE\n",
+                "]\n",
+                "outputs: [\n",
+                "    response: [\n",
+                "        status: 200\n",
+                "        body: BYTES[1] { 16u41 }\n",
+                "    ]\n",
+                "]\n",
+                "host_ports: [\n",
+                "    http: [\n",
+                "        request: store.request\n",
+                "        response: outputs.response\n",
+                "    ]\n",
+                "]\n",
+            )
+            .to_owned(),
+        )],
+    )
+    .expect("checked metadata reconstruction fixture parses");
+    let output = check_project_diagnostics_program_profiled_with_external_types(
+        &project,
+        &ExternalTypeEnvironment::empty(ProgramRole::Server),
+    )
+    .0;
+    assert!(
+        !output.report.has_errors(),
+        "{:#?}",
+        output.report.diagnostics
+    );
+    let fields = output
+        .checked_program_fields()
+        .expect("valid diagnostics retain checked rows");
+    assert!(fields.lowering_metadata.host_port_table.http.is_some());
+    assert_eq!(fields.lowering_metadata.output_root_types.len(), 1);
+
+    let reconstructed = derive_project_checked_lowering_metadata(
+        &project,
+        fields,
+        &fields.lowering_metadata.diagnostics,
+    )
+    .expect("parser and checked rows reconstruct lowering metadata");
+    assert_eq!(reconstructed, fields.lowering_metadata);
+}
+
+#[test]
 fn unit_native_project_diagnostics_match_assembled_source_positions_exactly() {
     let files = vec![
         ("app/A.bn".to_owned(), "a: 1\n".to_owned()),

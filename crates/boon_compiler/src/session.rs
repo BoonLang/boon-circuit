@@ -9490,11 +9490,11 @@ mod tests {
                 owner_oracle, legacy_oracle,
                 "owner diagnostics differ from the normalized independent assembled checker for:\n{source}"
             );
-            if let Some(program) = &legacy.output.program {
+            if let Some(program) = legacy.output.checked_program_fields() {
                 assert_eq!(
                     assembly.fields().order_chains,
                     program.order_chains,
-                    "stable project order facts relocate differently from the independent checked oracle for:\n{source}"
+                    "checked-row order derivation differs from the independent checked oracle for:\n{source}"
                 );
             }
         }

@@ -6078,10 +6078,24 @@ pub fn compile_project_program_with_definition_facts(
         );
         validate_owner_input(owner_id, owner, &principals)?;
     }
+    // A call authored inside a formal-derived WHEN arm owns an exact branch
+    // occurrence even when the callee itself contains no SELECT. Seed that
+    // provenance from the caller graph before compiling nested callees; the
+    // call compiler below can additionally mark a result selected inside the
+    // callee. Starting from all-false silently downgraded branch-local calls
+    // to their generic callable scheme during semantic OUT expansion.
     let mut syntax_discriminated_call_candidates = input
         .owners
         .iter()
-        .map(|owner| vec![false; owner.nodes.len()])
+        .enumerate()
+        .map(|(owner_index, owner)| {
+            syntax_selected_call_nodes(
+                owner,
+                &principals[owner_index].static_variants,
+                &formal_dependent_expressions[owner_index],
+            )
+            .into_vec()
+        })
         .collect::<Vec<_>>();
     let mut syntax_discriminated_call_root_outputs = input
         .owners
@@ -8951,9 +8965,14 @@ impl DirectSummaryPlanCompiler<'_> {
                     }
                     self.compile_expression(owner_id, output.expression.0 as usize, actuals, active)
                 }
-                KernelOwnerNodeKind::Delimiter | KernelOwnerNodeKind::Unknown
-                    if node.inputs.is_empty() =>
-                {
+                KernelOwnerNodeKind::Delimiter if node.inputs.is_empty() => {
+                    Some(PlannedSummaryValue {
+                        value: self.push_node(KernelSummaryNode::ContextualHole),
+                        mode: fixed_mode,
+                        formal_projection_input: None,
+                    })
+                }
+                KernelOwnerNodeKind::Unknown if node.inputs.is_empty() => {
                     let unknown = self.builder.terms().unknown();
                     Some(term_value(self, unknown))
                 }
@@ -8984,6 +9003,7 @@ fn fold_constant_summary_nodes(
         let node = nodes[index].clone();
         let constant = match &node {
             KernelSummaryNode::Input(_)
+            | KernelSummaryNode::ContextualHole
             | KernelSummaryNode::Constrain { .. }
             | KernelSummaryNode::Invoke { .. } => None,
             KernelSummaryNode::Term(term) => {
@@ -9192,6 +9212,7 @@ fn canonicalize_summary_node(
     let mut node = old_nodes[index].clone();
     let is_pure = match &mut node {
         KernelSummaryNode::Input(_) | KernelSummaryNode::Term(_) => true,
+        KernelSummaryNode::ContextualHole => false,
         KernelSummaryNode::Projection { provider, .. } => {
             let (value, pure) = canonicalize_summary_value(
                 *provider,
@@ -9439,7 +9460,8 @@ fn pure_summary_node_hash(node: &KernelSummaryNode) -> u64 {
                 }
             }
         }
-        KernelSummaryNode::Constrain { .. }
+        KernelSummaryNode::ContextualHole
+        | KernelSummaryNode::Constrain { .. }
         | KernelSummaryNode::Sequence { .. }
         | KernelSummaryNode::Invoke { .. } => {
             unreachable!("effect-owning summary nodes are never hash-consed")
@@ -9482,7 +9504,7 @@ fn compact_summary_result(
                     .get_mut(*input as usize)
                     .expect("kernel summary input belongs to its compact program") = true;
             }
-            KernelSummaryNode::Term(_) => {}
+            KernelSummaryNode::Term(_) | KernelSummaryNode::ContextualHole => {}
             KernelSummaryNode::Projection { provider, .. } => pending.push(*provider),
             KernelSummaryNode::Constrain { value, .. } => pending.push(*value),
             KernelSummaryNode::Sequence {
@@ -9596,7 +9618,7 @@ fn relocate_summary_node(
         KernelSummaryNode::Input(input) => {
             *input = inputs[*input as usize].expect("reachable summary input has a relocation");
         }
-        KernelSummaryNode::Term(_) => {}
+        KernelSummaryNode::Term(_) | KernelSummaryNode::ContextualHole => {}
         KernelSummaryNode::Projection { provider, .. } => {
             *provider = relocated_summary_value(*provider, values);
         }
@@ -10639,7 +10661,7 @@ fn compile_node(
                 initial_state_surface,
             )?;
             if let Some(selected) = syntax_discriminated_result.as_deref_mut() {
-                *selected = specialization.result_syntax_selected;
+                *selected |= specialization.result_syntax_selected;
             }
             let result = checked_expression_index(
                 target_owner.result,
@@ -11213,7 +11235,13 @@ fn compile_node(
                 PublishMode::Replace,
             )?;
         }
-        KernelOwnerNodeKind::Delimiter | KernelOwnerNodeKind::Unknown => {
+        KernelOwnerNodeKind::Delimiter => {
+            // `[]` is a contextual syntax hole, not the runtime type Unknown.
+            // Its consumer supplies the concrete record/collection shape.
+            // Keeping this private variable unwritten is the same ownership
+            // rule used by FreshOut above.
+        }
+        KernelOwnerNodeKind::Unknown => {
             let unknown = builder.terms().unknown();
             builder.add_publish(output, [unknown], PublishMode::Replace);
         }
@@ -18399,6 +18427,15 @@ mod tests {
         assert_eq!(
             state_type(&artifact.definitions[1].expressions[1].flow_type.ty),
             full
+        );
+        assert!(
+            artifact.definitions[1]
+                .calls
+                .iter()
+                .find(|call| call.expression == KernelExpressionId(1))
+                .expect("wrapper has the call authored inside its selected arm")
+                .syntax_discriminated_result,
+            "a call authored inside a formal-derived WHEN arm must retain exact occurrence authority",
         );
         assert_eq!(
             state_type(&artifact.definitions[2].expressions[2].flow_type.ty),

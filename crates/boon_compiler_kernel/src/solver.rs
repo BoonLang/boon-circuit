@@ -210,6 +210,13 @@ struct SolverStateProgram {
 impl SolverStateProgram {
     fn consumers(&self, variable: TypeVariableId) -> &[ProgramConsumer] {
         let index = variable.0 as usize;
+        if index + 1 >= self.consumer_offsets.len() {
+            // Summary bytecode may allocate occurrence-local contextual holes
+            // after the static CSR index has been sealed. Those variables
+            // have no direct program consumers; dependencies on them are
+            // tracked by the dynamic binding-dependents index instead.
+            return &[];
+        }
         let start = self.consumer_offsets[index] as usize;
         let end = self.consumer_offsets[index + 1] as usize;
         &self.consumers[start..end]
@@ -379,6 +386,33 @@ impl ComponentSolver {
             static_equalities: static_equalities.into_boxed_slice(),
         };
         (solver, execution)
+    }
+
+    fn new_contextual_hole_term(&mut self) -> TypeTermId {
+        let variable = TypeVariableId(
+            u32::try_from(self.cells.len()).expect("kernel variable count exceeds u32"),
+        );
+        self.cells.push(VariableCell {
+            parent: variable,
+            rank: 0,
+            binding: None,
+            contextual_hole: true,
+            authoritative_provider: false,
+        });
+        self.syntax_selected.push(false);
+        self.syntax_selected_here.push(false);
+        self.call_syntax_selected.push(false);
+        self.binding_dependencies.push(Vec::new());
+        self.binding_dependents.push(Vec::new());
+        self.equivalence_next.push(None);
+        self.equivalence_head.push(variable);
+        self.equivalence_tail.push(variable);
+        self.schedule_seen.push(0);
+        self.resolve_active.push(0);
+        self.occurs_active.push(0);
+        self.variable_visit_seen.push(0);
+        self.work.variables = self.work.variables.saturating_add(1);
+        self.program.terms.variable(variable)
     }
 
     fn solve(mut self, execution: &SolverExecution) -> Result<ComponentArtifact, KernelSolveError> {
@@ -1342,7 +1376,12 @@ impl ComponentSolver {
         inputs: &[KernelSummaryCallInput],
     ) -> Result<(), KernelSolveError> {
         self.work.summary_call_activations = self.work.summary_call_activations.saturating_add(1);
-        let result = self.evaluate_summary_program(program, inputs)?;
+        let mut result = self.evaluate_summary_program(program, inputs)?;
+        // A contextual hole is allowed to escape shared definition bytecode,
+        // but it has no stable identity outside this call occurrence. Preserve
+        // locally constrained holes and canonicalize only still-unbound holes
+        // to the runtime Unknown surface before publication.
+        result.term = self.erase_unbound_contextual_holes(result.term);
         self.replace_binding(output, result.term, true);
         self.set_syntax_selected(output, result.syntax_selected);
         self.call_syntax_selected[output.0 as usize] = result.syntax_selected;
@@ -1472,6 +1511,11 @@ impl ComponentSolver {
             KernelSummaryNode::Input(input_index) => resolve_input(self, *input_index),
             KernelSummaryNode::Term(term) => Ok(SummaryValue {
                 term: *term,
+                parameter_derived: false,
+                syntax_selected: false,
+            }),
+            KernelSummaryNode::ContextualHole => Ok(SummaryValue {
+                term: self.new_contextual_hole_term(),
                 parameter_derived: false,
                 syntax_selected: false,
             }),
@@ -1721,6 +1765,85 @@ impl ComponentSolver {
         scratch.values[index] = evaluated;
         scratch.value_seen[index] = generation;
         Ok(evaluated)
+    }
+
+    fn erase_unbound_contextual_holes(&mut self, term: TypeTermId) -> TypeTermId {
+        let term = self.resolve_term(term);
+        match self.program.terms.term(term).clone() {
+            TypeTerm::Variable(variable) => {
+                let root = self.root(variable);
+                if self.cells[root.0 as usize].contextual_hole
+                    && self.cells[root.0 as usize].binding.is_none()
+                {
+                    self.program.terms.unknown()
+                } else {
+                    self.program.terms.variable(root)
+                }
+            }
+            TypeTerm::VariantSet(variants) => {
+                let variants = variants
+                    .into_vec()
+                    .into_iter()
+                    .map(|variant| match variant {
+                        VariantTerm::Tag(tag) => VariantTerm::Tag(tag),
+                        VariantTerm::Tagged { tag, fields } => VariantTerm::Tagged {
+                            tag,
+                            fields: self.erase_unbound_contextual_holes(fields),
+                        },
+                    })
+                    .collect::<Vec<_>>();
+                self.program.terms.variant_set_preserving_order(variants)
+            }
+            TypeTerm::Object { fields, open } => {
+                let fields = fields
+                    .into_vec()
+                    .into_iter()
+                    .map(|field| (field.name, self.erase_unbound_contextual_holes(field.ty)))
+                    .collect::<Vec<_>>();
+                self.program.terms.object(fields, open)
+            }
+            TypeTerm::List(item) => {
+                let item = self.erase_unbound_contextual_holes(item);
+                self.program.terms.list(item)
+            }
+            TypeTerm::Set(item) => {
+                let item = self.erase_unbound_contextual_holes(item);
+                self.program.terms.set(item)
+            }
+            TypeTerm::Map { key, value } => {
+                let key = self.erase_unbound_contextual_holes(key);
+                let value = self.erase_unbound_contextual_holes(value);
+                self.program.terms.map(key, value)
+            }
+            TypeTerm::Function {
+                args,
+                result_mode,
+                result,
+            } => {
+                let args = args
+                    .iter()
+                    .map(|argument| self.erase_unbound_contextual_holes(*argument))
+                    .collect::<Vec<_>>();
+                let result = self.erase_unbound_contextual_holes(result);
+                self.program.terms.function(args, result_mode, result)
+            }
+            TypeTerm::Union(members) => {
+                let members = members
+                    .iter()
+                    .map(|member| self.erase_unbound_contextual_holes(*member))
+                    .collect::<Vec<_>>();
+                self.program.terms.union(members)
+            }
+            TypeTerm::Text
+            | TypeTerm::Number
+            | TypeTerm::Bytes(_)
+            | TypeTerm::Absent
+            | TypeTerm::OpenObjectPlaceholder
+            | TypeTerm::RenderContract
+            | TypeTerm::UnresolvedShape(_)
+            | TypeTerm::Unknown
+            | TypeTerm::Bits(_) => term,
+        }
     }
 
     fn merge_record_spread(
@@ -2555,6 +2678,53 @@ mod tests {
                 ]
                 .into(),
             )
+        );
+    }
+
+    #[test]
+    fn shared_summary_contextual_holes_bind_locally_and_erase_only_when_unresolved() {
+        let mut builder = ComponentProgramBuilder::new();
+        let constrained = builder.new_authoritative_provider();
+        let unresolved = builder.new_authoritative_provider();
+        let open_object = builder.terms().open_object();
+        let constrained_summary = Arc::new(KernelSummaryProgram {
+            definition: 0,
+            nodes: vec![
+                KernelSummaryNode::ContextualHole,
+                KernelSummaryNode::Constrain {
+                    value: crate::KernelSummaryValueId(0),
+                    expected: open_object,
+                },
+            ]
+            .into_boxed_slice(),
+            result: crate::KernelSummaryValueId(1),
+        });
+        let unresolved_summary = Arc::new(KernelSummaryProgram {
+            definition: 1,
+            nodes: vec![KernelSummaryNode::ContextualHole].into_boxed_slice(),
+            result: crate::KernelSummaryValueId(0),
+        });
+        builder.add_summary_call(
+            constrained,
+            constrained_summary,
+            std::iter::empty::<KernelSummaryCallInput>(),
+        );
+        builder.add_summary_call(
+            unresolved,
+            unresolved_summary,
+            std::iter::empty::<KernelSummaryCallInput>(),
+        );
+        let constrained_output = builder.add_output(constrained, FlowMode::Continuous);
+        let unresolved_output = builder.add_output(unresolved, FlowMode::Continuous);
+
+        let artifact = solve_component(builder.finish()).expect("contextual summaries solve");
+        assert_eq!(
+            artifact.output(constrained_output).unwrap().flow_type.ty,
+            Type::object(ObjectShape::new(Default::default(), true)),
+        );
+        assert_eq!(
+            artifact.output(unresolved_output).unwrap().flow_type.ty,
+            Type::Unknown,
         );
     }
 

@@ -14,7 +14,9 @@ use crate::{
 };
 use boon_checked::*;
 use boon_parser::ProjectSyntaxSnapshot;
-use boon_syntax::{AstStatement, StableCheckOwnerKey, StableExpressionKey, StableStatementKey};
+use boon_syntax::{
+    AstStatement, AstStatementKind, StableCheckOwnerKey, StableExpressionKey, StableStatementKey,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -115,7 +117,6 @@ struct CompatibilityLayout<'a> {
     owners: BTreeMap<StableCheckOwnerKey, OwnerDenseLayout>,
     statement_by_key: BTreeMap<StableStatementKey, CheckedStatementId>,
     expression_by_key: BTreeMap<StableExpressionKey, CheckedExprId>,
-    call_by_key: BTreeMap<(StableCheckOwnerKey, StableExpressionKey), CheckedCallId>,
     owner_root_statement: BTreeMap<StableCheckOwnerKey, CheckedStatementId>,
     owner_public_declaration: BTreeMap<StableCheckOwnerKey, DeclId>,
     owner_parameter_declaration: BTreeMap<(StableCheckOwnerKey, u32), DeclId>,
@@ -315,7 +316,6 @@ impl<'a> CompatibilityLayout<'a> {
             owners: BTreeMap::new(),
             statement_by_key,
             expression_by_key,
-            call_by_key: BTreeMap::new(),
             owner_root_statement: BTreeMap::new(),
             owner_public_declaration: BTreeMap::new(),
             owner_parameter_declaration: BTreeMap::new(),
@@ -512,6 +512,7 @@ impl<'a> CompatibilityLayout<'a> {
             }
         }
         calls.sort_by(|left, right| (left.0, &left.1, left.2).cmp(&(right.0, &right.1, right.2)));
+        let mut stable_calls = BTreeSet::new();
         for (index, (_, owner, local)) in calls.into_iter().enumerate() {
             let row = &self.shards[&owner].rows().calls[local.0 as usize];
             let stable_key = row.stable_key.clone();
@@ -522,7 +523,7 @@ impl<'a> CompatibilityLayout<'a> {
             );
             let id = CheckedCallId(checked_u32(index, "call identity")?);
             dense[local.0 as usize] = id;
-            if self.call_by_key.insert((owner, stable_key), id).is_some() {
+            if !stable_calls.insert((owner, stable_key)) {
                 return Err(OwnerCompatibilityAssemblyError::new(
                     "checked owner assembly repeats one stable call identity",
                 ));
@@ -661,35 +662,6 @@ impl CompatibilityLayout<'_> {
                     "owner {owner:?} has no dense call {}",
                     call.0
                 ))
-            })
-    }
-
-    fn stable_expression(
-        &self,
-        expression: &crate::ProjectOrderExpressionFact,
-    ) -> Result<CheckedExprId, OwnerCompatibilityAssemblyError> {
-        self.expression_by_key
-            .get(&expression.expression)
-            .copied()
-            .filter(|_| self.shards.contains_key(&expression.owner))
-            .ok_or_else(|| {
-                OwnerCompatibilityAssemblyError::new(
-                    "project order fact references a missing stable expression",
-                )
-            })
-    }
-
-    fn stable_call(
-        &self,
-        call: &crate::ProjectOrderExpressionFact,
-    ) -> Result<CheckedCallId, OwnerCompatibilityAssemblyError> {
-        self.call_by_key
-            .get(&(call.owner.clone(), call.expression.clone()))
-            .copied()
-            .ok_or_else(|| {
-                OwnerCompatibilityAssemblyError::new(
-                    "project order fact references a missing stable call",
-                )
             })
     }
 
@@ -1871,21 +1843,20 @@ fn owner_named_value_type_table(
     Ok(table)
 }
 
-fn syntax_statement_by_stable_key<'a>(
-    syntax: &'a crate::TypecheckSyntaxProgram,
-    project: &ProjectSyntaxSnapshot,
-    key: &StableStatementKey,
-) -> Option<&'a AstStatement> {
+fn syntax_statement_by_checked_id(
+    syntax: &crate::TypecheckSyntaxProgram,
+    id: CheckedStatementId,
+) -> Option<&AstStatement> {
     fn find<'a>(
         statements: &'a [AstStatement],
-        project: &ProjectSyntaxSnapshot,
-        key: &StableStatementKey,
+        syntax: &crate::TypecheckSyntaxProgram,
+        id: CheckedStatementId,
     ) -> Option<&'a AstStatement> {
         for statement in statements {
-            if project.stable_statement_key(statement.id).as_ref() == Some(key) {
+            if syntax.checked_statement_id(statement.id) == id {
                 return Some(statement);
             }
-            if let Some(found) = find(&statement.children, project, key) {
+            if let Some(found) = find(&statement.children, syntax, id) {
                 return Some(found);
             }
         }
@@ -1894,30 +1865,49 @@ fn syntax_statement_by_stable_key<'a>(
 
     syntax
         .root_statement_units()
-        .find_map(|statements| find(statements, project, key))
+        .find_map(|statements| find(statements, syntax, id))
 }
 
 fn owner_output_root_types(
     syntax: &crate::TypecheckSyntaxProgram,
-    project: &ProjectSyntaxSnapshot,
-    facts: &ProjectDiagnosticFacts,
     fields: &CheckedProgramFields,
 ) -> Result<Vec<OutputRootTypeEntry>, OwnerCompatibilityAssemblyError> {
     let lookup = crate::CheckedProgramLookup::new(fields);
-    let mut entries = Vec::with_capacity(facts.output_roots().len());
-    for fact in facts.output_roots() {
-        let source =
-            syntax_statement_by_stable_key(syntax, project, &fact.statement).ok_or_else(|| {
-                OwnerCompatibilityAssemblyError::new(format!(
-                    "output root `{}` has no stable syntax statement",
-                    fact.name
-                ))
-            })?;
+    let containers = syntax
+        .statements()
+        .iter()
+        .filter(|statement| {
+            matches!(&statement.kind, AstStatementKind::Field { name } if name == "outputs")
+        })
+        .collect::<Vec<_>>();
+    let Some(container) = containers.first() else {
+        return Ok(Vec::new());
+    };
+    let mut entries = Vec::new();
+    let mut names = BTreeSet::new();
+    for source in &container.children {
+        if matches!(
+            source.kind,
+            AstStatementKind::Hold { field: Some(_), .. }
+                | AstStatementKind::Source { field: Some(_), .. }
+        ) {
+            continue;
+        }
+        let name = match &source.kind {
+            AstStatementKind::Field { name }
+            | AstStatementKind::List {
+                field: Some(name), ..
+            } => name,
+            _ => continue,
+        };
+        if !names.insert(name.clone()) {
+            continue;
+        }
         let statement_id = syntax.checked_statement_id(source.id);
         let checked_statement = lookup.unique_statement(statement_id).ok_or_else(|| {
             OwnerCompatibilityAssemblyError::new(format!(
                 "output root `{}` has no exact checked statement",
-                fact.name
+                name
             ))
         })?;
         let declaration = match checked_statement.kind {
@@ -1929,7 +1919,7 @@ fn owner_output_root_types(
             _ => {
                 return Err(OwnerCompatibilityAssemblyError::new(format!(
                     "output root `{}` has no exact checked declaration identity",
-                    fact.name
+                    name
                 )));
             }
         };
@@ -1943,14 +1933,8 @@ fn owner_output_root_types(
                 )
             })
             .unwrap_or(Type::Unknown);
-        if ty != fact.ty {
-            return Err(OwnerCompatibilityAssemblyError::new(format!(
-                "output root `{}` checked type differs from its project diagnostic fact",
-                fact.name
-            )));
-        }
         entries.push(OutputRootTypeEntry {
-            name: fact.name.clone(),
+            name: name.clone(),
             declaration,
             statement: statement_id,
             value: checked_statement.value,
@@ -1963,54 +1947,68 @@ fn owner_output_root_types(
 
 fn owner_render_slot_table(
     syntax: &crate::TypecheckSyntaxProgram,
-    project: &ProjectSyntaxSnapshot,
-    facts: &ProjectDiagnosticFacts,
     fields: &CheckedProgramFields,
 ) -> Result<RenderSlotTable, OwnerCompatibilityAssemblyError> {
-    let mut slots = Vec::with_capacity(facts.render_slots().len());
-    for fact in facts.render_slots() {
-        let source =
-            syntax_statement_by_stable_key(syntax, project, &fact.statement).ok_or_else(|| {
-                OwnerCompatibilityAssemblyError::new("render slot has no exact syntax statement")
-            })?;
-        let statement_id = syntax.checked_statement_id(source.id);
-        let statement = fields
-            .statements
-            .get(statement_id.0 as usize)
-            .filter(|statement| statement.id == statement_id)
-            .ok_or_else(|| {
-                OwnerCompatibilityAssemblyError::new("render slot checked statement is missing")
-            })?;
-        if statement.value_use != CheckedValueUse::RenderSlot {
-            return Err(OwnerCompatibilityAssemblyError::new(
-                "project render fact points to a non-render checked statement",
-            ));
-        }
+    let registry = crate::RenderContractRegistry::default();
+    let mut slots = Vec::new();
+    for statement in fields
+        .statements
+        .iter()
+        .filter(|statement| statement.value_use == CheckedValueUse::RenderSlot)
+    {
+        let source = syntax_statement_by_checked_id(syntax, statement.id).ok_or_else(|| {
+            OwnerCompatibilityAssemblyError::new("render slot has no exact syntax statement")
+        })?;
+        let slot_name = match &source.kind {
+            AstStatementKind::Field { name }
+            | AstStatementKind::Source {
+                field: Some(name), ..
+            }
+            | AstStatementKind::List {
+                field: Some(name), ..
+            } => name.clone(),
+            _ => "items".to_owned(),
+        };
         let value_expr_id = statement.value.map(|value| value.0 as usize);
         let actual_type = statement
             .value
             .and_then(|value| fields.expressions.get(value.0 as usize))
             .map(|expression| expression.flow_type.ty.clone())
             .unwrap_or_else(|| {
-                if matches!(fact.slot_name.as_str(), "items" | "children") {
+                if matches!(slot_name.as_str(), "items" | "children") {
                     Type::List(Type::shared(crate::open_object_type()))
                 } else {
                     crate::open_object_type()
                 }
             });
-        if actual_type != fact.actual_type {
-            return Err(OwnerCompatibilityAssemblyError::new(format!(
-                "render slot `{}` checked type differs from its project diagnostic fact",
-                fact.slot_name
-            )));
+        let mut diagnostics = Vec::new();
+        if let Some(value) = statement.value
+            && !registry.slot_accepts_type(&slot_name, &actual_type)
+        {
+            let expression = fields.expressions.get(value.0 as usize).ok_or_else(|| {
+                OwnerCompatibilityAssemblyError::new(
+                    "render slot references a missing checked value expression",
+                )
+            })?;
+            diagnostics.push(TypeDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                line: expression.span.line,
+                start: expression.span.start,
+                end: expression.span.end,
+                message: if crate::type_contains_absence(&actual_type) {
+                    "`SKIP` cannot be used as a render value".to_owned()
+                } else {
+                    crate::render_slot_type_error(&slot_name, &actual_type)
+                },
+            });
         }
         slots.push(RenderSlot {
             slot_statement_id: statement.id.0 as usize,
-            slot_name: fact.slot_name.clone(),
-            expected_contract: fact.expected_contract.clone(),
+            slot_name: slot_name.clone(),
+            expected_contract: registry.slot_contract(&slot_name).to_owned(),
             value_expr_id,
             actual_type,
-            diagnostics: fact.diagnostics.to_vec(),
+            diagnostics,
         });
     }
     slots.sort_by_key(|slot| slot.slot_statement_id);
@@ -2018,90 +2016,118 @@ fn owner_render_slot_table(
 }
 
 fn owner_host_port_table(
-    facts: &ProjectDiagnosticFacts,
+    syntax: &crate::TypecheckSyntaxProgram,
     fields: &CheckedProgramFields,
     outputs: &[OutputRootTypeEntry],
+    diagnostics: &[TypeDiagnostic],
 ) -> Result<HostPortTable, OwnerCompatibilityAssemblyError> {
-    let table = crate::resolve_checked_host_port_table(facts.host_ports(), fields, outputs);
-    crate::validate_checked_host_port_source_payload_types(fields, facts.host_ports()).map_err(
+    let source_paths = fields
+        .sources
+        .iter()
+        .filter_map(|source| fields.semantic_path(&source.path))
+        .collect::<BTreeSet<_>>();
+    let source_lookup = crate::SourcePayloadPathLookup::new(&source_paths);
+    let (host_ports, _) = crate::host_port_table(syntax, &source_lookup);
+    let table = crate::resolve_checked_host_port_table(&host_ports, fields, outputs);
+    crate::validate_checked_host_port_source_payload_types(fields, &host_ports).map_err(
         |error| {
             OwnerCompatibilityAssemblyError::new(format!(
-                "checked host source payload differs from project diagnostic facts: {error}"
+                "checked host source payload differs from its parser-owned host contract: {error}"
             ))
         },
     )?;
-    reconcile_owner_host_port_resolution(facts.host_port_resolution_error(), table)
-}
-
-fn reconcile_owner_host_port_resolution(
-    expected_error: Option<&str>,
-    actual: Result<HostPortTable, String>,
-) -> Result<HostPortTable, OwnerCompatibilityAssemblyError> {
-    match (expected_error, actual) {
-        (None, Ok(table)) => Ok(table),
-        (Some(expected), Err(actual)) if expected == actual => Ok(HostPortTable::default()),
-        (None, Err(actual)) => Err(OwnerCompatibilityAssemblyError::new(format!(
-            "checked host-port relocation unexpectedly failed: {actual}"
-        ))),
-        (Some(expected), Err(actual)) => Err(OwnerCompatibilityAssemblyError::new(format!(
-            "checked host-port relocation failed differently from project diagnostic facts\nexpected: {expected}\nfound: {actual}"
-        ))),
-        (Some(expected), Ok(_)) => Err(OwnerCompatibilityAssemblyError::new(format!(
-            "checked host-port rows unexpectedly became relocatable; project diagnostic facts recorded: {expected}"
-        ))),
-    }
-}
-
-fn owner_order_chains(
-    facts: &ProjectDiagnosticFacts,
-    layout: &CompatibilityLayout<'_>,
-) -> Result<Vec<CheckedCallOrderChain>, OwnerCompatibilityAssemblyError> {
-    let mut chains = Vec::with_capacity(facts.order().chains().len());
-    let mut seen = BTreeSet::new();
-    for fact in facts.order().chains() {
-        let call = layout.stable_call(&fact.call)?;
-        if !seen.insert(call) {
-            return Err(OwnerCompatibilityAssemblyError::new(
-                "project order facts repeat one checked call",
-            ));
+    match table {
+        Ok(table) => Ok(table),
+        Err(error)
+            if diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == error) =>
+        {
+            Ok(HostPortTable::default())
         }
-        let keys = fact
-            .keys
-            .iter()
-            .map(|key| {
-                Ok(CheckedOrderKey {
-                    call_path: key
-                        .call_path
-                        .iter()
-                        .map(|call| layout.stable_call(call))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    key: layout.stable_expression(&key.key)?,
-                    direction: match &key.direction {
-                        crate::ProjectOrderDirectionFact::Ascending => {
-                            CheckedOrderDirection::Ascending
-                        }
-                        crate::ProjectOrderDirectionFact::Descending => {
-                            CheckedOrderDirection::Descending
-                        }
-                        crate::ProjectOrderDirectionFact::Dynamic { expression } => {
-                            CheckedOrderDirection::Dynamic {
-                                expression: layout.stable_expression(expression)?,
-                            }
-                        }
-                    },
-                    key_type: key.key_type.clone(),
-                    pure: key.pure,
-                    total: key.total,
-                })
-            })
-            .collect::<Result<Vec<_>, OwnerCompatibilityAssemblyError>>()?;
-        chains.push(CheckedCallOrderChain {
-            call,
-            chain: CheckedOrderChain { keys },
-        });
+        Err(error) => Err(OwnerCompatibilityAssemblyError::new(format!(
+            "checked host-port relocation unexpectedly failed: {error}"
+        ))),
     }
-    chains.sort_by_key(|chain| chain.call);
-    Ok(chains)
+}
+
+/// Reconstruct every lowering table from parser-issued identities and a
+/// completed checked-row graph.
+///
+/// This pass performs no inference and consumes no owner-solver diagnostic
+/// facts. It is the shared transition seam for both compatibility assembly and
+/// the dense kernel's final checked construction.
+pub fn derive_project_checked_lowering_metadata(
+    project: &ProjectSyntaxSnapshot,
+    fields: &CheckedProgramFields,
+    diagnostics: &[TypeDiagnostic],
+) -> Result<CheckedProgramLoweringMetadata, OwnerCompatibilityAssemblyError> {
+    if fields.source_bundle_digest_v1 != project.source_bundle_digest_v1() {
+        return Err(OwnerCompatibilityAssemblyError::new(
+            "checked rows and parser snapshot have different source bundle digests",
+        ));
+    }
+    let syntax = crate::TypecheckSyntaxProgram::UnitNative(project.clone());
+    let expr_type_table = ExprTypeTable {
+        entries: fields
+            .expressions
+            .iter()
+            .map(|expression| ExprTypeEntry {
+                expr_id: expression.id.0 as usize,
+                flow_type: expression.flow_type.clone(),
+            })
+            .collect(),
+    };
+    let unknown_type_count = expr_type_table
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.flow_type.ty, Type::Unknown))
+        .count();
+    let mut unresolved = BTreeSet::new();
+    for entry in &expr_type_table.entries {
+        crate::collect_type_vars(&entry.flow_type.ty, &mut unresolved);
+    }
+    let source_payload_shape_table = crate::checked_source_payload_shape_table(fields);
+    let function_type_table = owner_function_type_table(&fields.callables);
+    let named_value_type_table = owner_named_value_type_table(&syntax, fields)
+        .map_err(OwnerCompatibilityAssemblyError::new)?;
+    let output_root_types = owner_output_root_types(&syntax, fields)?;
+    let render_slot_table = owner_render_slot_table(&syntax, fields)?;
+    let host_port_table = owner_host_port_table(&syntax, fields, &output_root_types, diagnostics)?;
+    let lookup = crate::CheckedProgramLookup::new(fields);
+    crate::validate_structural_lowering_metadata(
+        fields,
+        &lookup,
+        &source_payload_shape_table,
+        &function_type_table,
+        &named_value_type_table,
+        &output_root_types,
+        &host_port_table,
+    )
+    .map_err(OwnerCompatibilityAssemblyError::new)?;
+    Ok(CheckedProgramLoweringMetadata {
+        source_units: project
+            .source_layouts()
+            .iter()
+            .map(|unit| CheckedSourceUnitMetadata {
+                path: unit.path.clone(),
+                module: unit.module.clone(),
+                start_line: unit.start_line,
+                line_count: unit.line_count,
+            })
+            .collect(),
+        original_source_expression_count: project.expression_count(),
+        source_payload_shape_table,
+        host_port_table,
+        output_root_types,
+        expr_type_table,
+        function_type_table,
+        named_value_type_table,
+        render_slot_table,
+        checked_expression_count: fields.expressions.len(),
+        dynamic_fallback_count: unknown_type_count + unresolved.len(),
+        diagnostics: diagnostics.to_vec(),
+    })
 }
 
 fn canonicalize_owner_diagnostics(diagnostics: &mut Vec<TypeDiagnostic>) {
@@ -2852,7 +2878,9 @@ pub fn assemble_checked_owner_project<'a>(
         &mut phase_started,
         fields.sources.len(),
     );
-    fields.order_chains = owner_order_chains(project_diagnostic_facts, &layout)?;
+    let (order_chains, order_diagnostics) = crate::derive_checked_order_chains(&fields);
+    fields.order_chains = order_chains;
+    diagnostics.extend(order_diagnostics);
     trace_compat_phase(
         trace,
         "order-chains",
@@ -2860,103 +2888,12 @@ pub fn assemble_checked_owner_project<'a>(
         fields.order_chains.len(),
     );
 
-    let expr_type_table = ExprTypeTable {
-        entries: fields
-            .expressions
-            .iter()
-            .map(|expression| ExprTypeEntry {
-                expr_id: expression.id.0 as usize,
-                flow_type: expression.flow_type.clone(),
-            })
-            .collect(),
-    };
-    let unknown_type_count = expr_type_table
-        .entries
-        .iter()
-        .filter(|entry| matches!(entry.flow_type.ty, Type::Unknown))
-        .count();
-    let mut unresolved = BTreeSet::new();
-    for entry in &expr_type_table.entries {
-        crate::collect_type_vars(&entry.flow_type.ty, &mut unresolved);
-    }
-    trace_compat_phase(
-        trace,
-        "expression-type-table",
-        &mut phase_started,
-        expr_type_table.entries.len(),
-    );
-    let source_payload_shape_table = crate::checked_source_payload_shape_table(&fields);
-    let function_type_table = owner_function_type_table(&fields.callables);
-    trace_compat_phase(
-        trace,
-        "source-and-function-tables",
-        &mut phase_started,
-        source_payload_shape_table.len() + function_type_table.entries.len(),
-    );
-    let named_value_type_table = owner_named_value_type_table(&syntax, &fields)
-        .map_err(OwnerCompatibilityAssemblyError::new)?;
-    trace_compat_phase(
-        trace,
-        "named-value-table",
-        &mut phase_started,
-        named_value_type_table.entries.len(),
-    );
-    let output_root_types =
-        owner_output_root_types(&syntax, project, project_diagnostic_facts, &fields)?;
-    let render_slot_table =
-        owner_render_slot_table(&syntax, project, project_diagnostic_facts, &fields)?;
-    let host_port_table =
-        owner_host_port_table(project_diagnostic_facts, &fields, &output_root_types)?;
-    trace_compat_phase(
-        trace,
-        "output-render-host-tables",
-        &mut phase_started,
-        output_root_types.len(),
-    );
-    let lookup = crate::CheckedProgramLookup::new(&fields);
-    crate::validate_structural_lowering_metadata(
-        &fields,
-        &lookup,
-        &source_payload_shape_table,
-        &function_type_table,
-        &named_value_type_table,
-        &output_root_types,
-        &host_port_table,
-    )
-    .map_err(OwnerCompatibilityAssemblyError::new)?;
-    trace_compat_phase(
-        trace,
-        "structural-validation",
-        &mut phase_started,
-        diagnostics.len(),
-    );
     canonicalize_owner_diagnostics(&mut diagnostics);
-    fields.lowering_metadata = CheckedProgramLoweringMetadata {
-        source_units: project
-            .source_layouts()
-            .iter()
-            .map(|unit| CheckedSourceUnitMetadata {
-                path: unit.path.clone(),
-                module: unit.module.clone(),
-                start_line: unit.start_line,
-                line_count: unit.line_count,
-            })
-            .collect(),
-        original_source_expression_count: project.expression_count(),
-        source_payload_shape_table,
-        host_port_table,
-        output_root_types,
-        expr_type_table,
-        function_type_table,
-        named_value_type_table,
-        render_slot_table,
-        checked_expression_count: fields.expressions.len(),
-        dynamic_fallback_count: unknown_type_count + unresolved.len(),
-        diagnostics: diagnostics.clone(),
-    };
+    fields.lowering_metadata =
+        derive_project_checked_lowering_metadata(project, &fields, &diagnostics)?;
     trace_compat_phase(
         trace,
-        "metadata-publication",
+        "checked-metadata-finalization",
         &mut phase_started,
         diagnostics.len(),
     );
@@ -2965,27 +2902,4 @@ pub fn assemble_checked_owner_project<'a>(
         diagnostics,
         fingerprint_v1,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn host_port_resolution_reconciliation_is_exact() {
-        assert!(reconcile_owner_host_port_resolution(None, Ok(HostPortTable::default())).is_ok());
-        assert!(
-            reconcile_owner_host_port_resolution(Some("missing"), Err("missing".to_owned()))
-                .is_ok()
-        );
-        assert!(
-            reconcile_owner_host_port_resolution(Some("missing"), Err("different".to_owned()))
-                .is_err()
-        );
-        assert!(
-            reconcile_owner_host_port_resolution(Some("missing"), Ok(HostPortTable::default()))
-                .is_err()
-        );
-        assert!(reconcile_owner_host_port_resolution(None, Err("missing".to_owned())).is_err());
-    }
 }

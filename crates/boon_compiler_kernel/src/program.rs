@@ -92,6 +92,11 @@ pub struct KernelSummaryProgram {
 pub enum KernelSummaryNode {
     Input(u32),
     Term(TypeTermId),
+    /// One occurrence-local contextual hole (`[]`). The evaluator allocates a
+    /// fresh union-find variable for every summary invocation so an enclosing
+    /// constraint can choose record, list, set, map, or bytes shape without
+    /// sharing that choice across calls.
+    ContextualHole,
     /// Directional projection of a value constructed inside the immutable
     /// summary. Formal-root projections stay occurrence-local call inputs so
     /// they can retain requirement backflow; computed values need no mutable

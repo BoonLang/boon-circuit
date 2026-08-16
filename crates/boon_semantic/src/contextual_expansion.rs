@@ -1464,6 +1464,42 @@ fn concrete_structural_type(
     }
 }
 
+/// Turns the parser's context-sensitive empty `[]` marker into the runtime
+/// value kind selected by the checked occurrence type. The checked type stays
+/// authoritative: in particular, an empty Object expression must not be
+/// re-derived as a closed `{}` when its consumer selected an open object.
+fn contextual_delimiter_runtime_kind(ty: &Type) -> Option<SemanticExpressionKind> {
+    match ty {
+        Type::Object(_) => Some(SemanticExpressionKind::Object(Vec::new())),
+        Type::List(_) => Some(SemanticExpressionKind::List {
+            capacity: None,
+            items: Vec::new(),
+        }),
+        Type::Map { .. } => Some(SemanticExpressionKind::Map {
+            entries: Vec::new(),
+        }),
+        Type::Set(_) => Some(SemanticExpressionKind::Set { items: Vec::new() }),
+        Type::Bytes(bytes) => Some(SemanticExpressionKind::Bytes {
+            fixed_size: match bytes {
+                boon_checked::BytesType::Dynamic => None,
+                boon_checked::BytesType::Fixed(size) => Some(*size),
+            },
+            items: Vec::new(),
+        }),
+        Type::Text
+        | Type::Number
+        | Type::Absent
+        | Type::VariantSet(_)
+        | Type::RenderContract
+        | Type::Function { .. }
+        | Type::UnresolvedShape { .. }
+        | Type::Var(_)
+        | Type::Unknown
+        | Type::Union(_)
+        | Type::Bits { .. } => None,
+    }
+}
+
 fn semantic_callable_inventory(
     program: &CheckedProgramFields,
     semantic_scope_ids: &BTreeMap<boon_checked::LexicalScopeId, SemanticScopeId>,
@@ -7841,7 +7877,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
         &mut self,
         expression: &CheckedExpression,
         owner: Option<StaticOwnerId>,
-        kind: SemanticExpressionKind,
+        mut kind: SemanticExpressionKind,
     ) -> SemanticExprId {
         let frame = self.frame_stack.last().copied().flatten();
         let mut flow_type = match &expression.kind {
@@ -7859,7 +7895,12 @@ impl<'a> SemanticExpressionBuilder<'a> {
         if !matches!(&expression.kind, CheckedExpressionKind::Call { .. }) {
             flow_type.ty = concrete_type_in_frame(self.out_net, &flow_type.ty, frame);
         }
-        if let Some(ty) = concrete_structural_type(&self.expressions, &kind) {
+        let contextual_delimiter = matches!(kind, SemanticExpressionKind::Delimiter);
+        if contextual_delimiter
+            && let Some(runtime_kind) = contextual_delimiter_runtime_kind(&flow_type.ty)
+        {
+            kind = runtime_kind;
+        } else if let Some(ty) = concrete_structural_type(&self.expressions, &kind) {
             flow_type.ty = ty;
         }
         flow_type.ty = erase_runtime_type_vars(&flow_type.ty);
@@ -7931,6 +7972,38 @@ impl<'a> SemanticExpressionBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contextual_delimiter_materializes_the_checked_collection_kind() {
+        let open_object = Type::object(boon_checked::ObjectShape {
+            fields: BTreeMap::new(),
+            field_order: Vec::new(),
+            open: true,
+        });
+        assert!(matches!(
+            contextual_delimiter_runtime_kind(&open_object),
+            Some(SemanticExpressionKind::Object(fields)) if fields.is_empty()
+        ));
+        assert!(matches!(
+            contextual_delimiter_runtime_kind(&Type::List(Type::shared(Type::Text))),
+            Some(SemanticExpressionKind::List { capacity: None, items }) if items.is_empty()
+        ));
+        assert!(matches!(
+            contextual_delimiter_runtime_kind(&Type::Map {
+                key: Box::new(Type::Text),
+                value: Box::new(Type::Number),
+            }),
+            Some(SemanticExpressionKind::Map { entries }) if entries.is_empty()
+        ));
+        assert!(matches!(
+            contextual_delimiter_runtime_kind(&Type::Set(Type::shared(Type::Text))),
+            Some(SemanticExpressionKind::Set { items }) if items.is_empty()
+        ));
+        assert!(matches!(
+            contextual_delimiter_runtime_kind(&Type::Unknown),
+            None
+        ));
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum BodyShape {

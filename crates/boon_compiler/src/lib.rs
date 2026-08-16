@@ -268,6 +268,9 @@ pub struct CheckedSourceFromSource {
     pub syntax: CheckedSourceSyntax,
     pub output: boon_checked::CheckOutput,
     pub profile: CheckedDiagnosticsProfile,
+    /// Parser-issued call identities supplied by the dense kernel. Legacy
+    /// checked constructions derive them from parser slots during sealing.
+    checked_call_occurrences: Option<Box<[boon_syntax::StableOccurrenceKey]>>,
 }
 
 /// Produces structured parser/type diagnostics for a failed runtime compile.
@@ -682,7 +685,8 @@ pub fn compile_artifact_oracle_pair(
         &parsed,
         &external_types,
     );
-    let checked = checked_program_from_output(CheckedSyntaxRef::Assembled(&parsed), check_output)?;
+    let checked =
+        checked_program_from_output(CheckedSyntaxRef::Assembled(&parsed), check_output, None)?;
     let retained = compile_checked_artifact_oracle_plan(
         checked.clone(),
         false,
@@ -818,7 +822,30 @@ pub(crate) fn checked_source_from_owner_assembly(
     owner_work: boon_typecheck::OwnerBodyInferenceWork,
     typecheck_ms: f64,
 ) -> CheckedSourceFromSource {
-    let fields = assembly.fields().clone();
+    checked_source_from_checked_fields(
+        syntax,
+        assembly.fields().clone(),
+        assembly.diagnostics(),
+        parse_work,
+        parse_ms,
+        typecheck_work,
+        owner_work,
+        typecheck_ms,
+        None,
+    )
+}
+
+pub(crate) fn checked_source_from_checked_fields(
+    syntax: ProjectSyntaxSnapshot,
+    fields: boon_checked::CheckedProgramFields,
+    diagnostics: &[boon_checked::TypeDiagnostic],
+    parse_work: ParseWorkCounters,
+    parse_ms: f64,
+    typecheck_work: boon_typecheck::TypeCheckWorkCounters,
+    owner_work: boon_typecheck::OwnerBodyInferenceWork,
+    typecheck_ms: f64,
+    checked_call_occurrences: Option<Box<[boon_syntax::StableOccurrenceKey]>>,
+) -> CheckedSourceFromSource {
     let metadata = &fields.lowering_metadata;
     let render_slot_failure_count = metadata
         .render_slot_table
@@ -861,8 +888,7 @@ pub(crate) fn checked_source_from_owner_assembly(
             )
         })
         .collect::<std::collections::BTreeSet<_>>();
-    let report_diagnostics = assembly
-        .diagnostics()
+    let report_diagnostics = diagnostics
         .iter()
         .filter(|diagnostic| {
             !render_diagnostics.contains(&(
@@ -905,10 +931,10 @@ pub(crate) fn checked_source_from_owner_assembly(
         diagnostics: report_diagnostics,
     };
     let construction = (!report.has_errors()).then(|| {
-        // SAFETY: `assemble_checked_owner_project` accepts only complete,
-        // immutable checked-owner shards, resolves every relocation, proves
-        // exact dense coverage, reconstructs and validates the lowering
-        // tables, and binds the parser-produced project source digest.
+        // SAFETY: callers expose fields only after their checker has completed
+        // dense coverage, relocation, lowering-metadata validation, and source
+        // digest binding. This boundary deliberately grants diagnostics
+        // construction authority but not a runtime checked image.
         unsafe {
             boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(fields)
         }
@@ -946,6 +972,7 @@ pub(crate) fn checked_source_from_owner_assembly(
             typecheck_ms,
             total_ms: parse_ms + typecheck_ms,
         },
+        checked_call_occurrences,
     }
 }
 
@@ -1051,6 +1078,7 @@ fn check_syntax_source_with_ownership(
             typecheck_ms,
             total_ms: parse_ms + elapsed_ms(check_started),
         },
+        checked_call_occurrences: None,
     })
 }
 
@@ -1099,7 +1127,8 @@ fn compile_parsed_to_machine_plan(
     }
     let source_unit_count = parsed.files.len();
     let parsed_expression_count = parsed.expressions.len();
-    let checked = checked_program_from_output(CheckedSyntaxRef::Assembled(&parsed), check_output)?;
+    let checked =
+        checked_program_from_output(CheckedSyntaxRef::Assembled(&parsed), check_output, None)?;
     finish_checked_program_to_machine_plan(
         checked,
         source_unit_count,
@@ -1144,6 +1173,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         syntax,
         output,
         mut profile,
+        checked_call_occurrences,
     } = checked_source;
     let deferred_runtime_handoff = output.construction.is_some();
     let runtime_handoff_started = Instant::now();
@@ -1151,7 +1181,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         CheckedSourceSyntax::Assembled(program) => CheckedSyntaxRef::Assembled(program),
         CheckedSourceSyntax::UnitNative(program) => CheckedSyntaxRef::UnitNative(program),
     };
-    let checked = checked_program_from_output(syntax, output)?;
+    let checked = checked_program_from_output(syntax, output, checked_call_occurrences.as_deref())?;
     if deferred_runtime_handoff {
         let runtime_handoff_ms = elapsed_ms(runtime_handoff_started);
         profile.typecheck_ms += runtime_handoff_ms;
@@ -1304,6 +1334,7 @@ impl CheckedSyntaxRef<'_> {
 fn checked_program_from_output(
     syntax: CheckedSyntaxRef<'_>,
     output: boon_checked::CheckOutput,
+    checked_call_occurrences: Option<&[boon_syntax::StableOccurrenceKey]>,
 ) -> CompilerResult<boon_checked::CheckedProgram> {
     if output.report.has_errors() {
         let diagnostics = output
@@ -1346,9 +1377,23 @@ fn checked_program_from_output(
     match (output.program, output.construction) {
         (Some(program), None) => Ok(program),
         (None, Some(construction)) => match syntax {
-            CheckedSyntaxRef::Assembled(program) => {
+            CheckedSyntaxRef::Assembled(program) if checked_call_occurrences.is_none() => {
                 boon_typecheck::seal_checked_program_construction(program, construction)
                     .map_err(|error| PlanError::new(error).into())
+            }
+            CheckedSyntaxRef::Assembled(_) => Err(PlanError::new(
+                "assembled checked construction cannot consume project-native call identities",
+            )
+            .into()),
+            CheckedSyntaxRef::UnitNative(program)
+                if let Some(call_occurrences) = checked_call_occurrences =>
+            {
+                boon_typecheck::seal_project_checked_program_construction_with_call_occurrences(
+                    program,
+                    construction,
+                    call_occurrences,
+                )
+                .map_err(|error| PlanError::new(error).into())
             }
             CheckedSyntaxRef::UnitNative(program) => {
                 boon_typecheck::seal_project_checked_program_construction(program, construction)

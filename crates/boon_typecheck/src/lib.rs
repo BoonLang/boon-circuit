@@ -17456,7 +17456,13 @@ fn type_is_deferred_order_key(ty: &Type) -> bool {
     )
 }
 
-fn derive_checked_order_chains(
+/// Derive list-order metadata and diagnostics solely from completed checked
+/// rows.
+///
+/// This is the single post-checking authority used by both the legacy checker
+/// and compact checked-row producers. It performs no type inference and does
+/// not inspect parser or owner-solver facts.
+pub fn derive_checked_order_chains(
     program: &CheckedProgramFields,
 ) -> (Vec<CheckedCallOrderChain>, Vec<TypeDiagnostic>) {
     let mut order_chains = Vec::new();

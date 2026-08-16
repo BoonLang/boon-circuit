@@ -10,9 +10,10 @@
 
 use boon_checked::{
     CheckedCall, CheckedCallableSignature, CheckedContextFormal, CheckedDeclaration,
-    CheckedExpression, CheckedList, CheckedListKeyPolicy, CheckedScope, CheckedSource,
-    CheckedState, CheckedStateKind, CheckedStatement, DiagnosticSeverity, FlowMode, FlowType,
-    ObjectShape, Type, TypeDiagnostic, Variant, type_is_recursively_closed,
+    CheckedExpression, CheckedList, CheckedListKeyPolicy, CheckedProgramFields, CheckedScope,
+    CheckedSource, CheckedState, CheckedStateKind, CheckedStatement, DiagnosticSeverity,
+    ExternalTypeEnvironment, FlowMode, FlowType, LexicalScopeId, ObjectShape, Type, TypeDiagnostic,
+    Variant, type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
     CheckDemand, KernelAbiCallContextInput, KernelAbiContextualOperation, KernelAbiInput,
@@ -29,7 +30,7 @@ use boon_compiler_kernel::{
     KernelExecutionRecordFieldInput, KernelExecutionShapeInput, KernelExpressionId,
     KernelExpressionPresentation, KernelExpressionRelocation, KernelExpressionSemanticPayload,
     KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
-    KernelInheritedFormal, KernelLexicalAccess, KernelLexicalBindingInput,
+    KernelInheritedFormal, KernelInterfaceSnapshot, KernelLexicalAccess, KernelLexicalBindingInput,
     KernelLexicalBindingTarget, KernelLexicalBindingTargetInput, KernelListId, KernelListInput,
     KernelMatchPatternPayload, KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge,
     KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelParameterEvaluationScope,
@@ -2101,51 +2102,13 @@ pub(crate) fn compiler_diagnostics_from_kernel(
         ));
     }
 
-    let output_types = active
-        .iter()
-        .zip(interfaces.public_results.iter())
-        .filter_map(|(prepared_index, result)| {
-            let owner = &prepared[*prepared_index].owner;
-            let StableCheckOwnerKey::Item(key) = owner else {
-                return None;
-            };
-            let segments = key.item_route.segments();
-            let [.., container, output] = segments else {
-                return None;
-            };
-            if container.names.first().map(String::as_str) == Some("outputs")
-                && output.kind == UnitItemKind::Field
-            {
-                Some((output.names.first()?.clone(), result.ty.clone()))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    let mut diagnostics = source_abi_diagnostics.into_vec();
-    diagnostics.extend(boon_typecheck::project_host_output_abi_diagnostics(
-        &project,
-        &output_types,
-    ));
-    for diagnostic in interfaces.diagnostics.iter() {
-        diagnostics.push(present_kernel_interface_diagnostic(
-            &project, &prepared, &active, diagnostic,
-        )?);
-    }
-    diagnostics.extend(project_kernel_interface_render_slot_diagnostics(
+    let diagnostics = present_kernel_project_diagnostics(
         &project,
         &prepared,
         &active,
-        &interfaces.diagnostic_values,
-    )?);
-    diagnostics.sort_by(|left, right| {
-        left.line
-            .cmp(&right.line)
-            .then_with(|| left.start.cmp(&right.start))
-            .then_with(|| left.end.cmp(&right.end))
-            .then_with(|| left.message.cmp(&right.message))
-    });
-    diagnostics.dedup();
+        source_abi_diagnostics.as_ref(),
+        &interfaces,
+    )?;
 
     let checked_expression_count = active
         .iter()
@@ -2227,6 +2190,259 @@ pub(crate) fn compiler_diagnostics_from_kernel(
         full_document_typecheck_coverage: true,
         fingerprint_v1,
     })
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct KernelCheckedConstruction {
+    pub fields: CheckedProgramFields,
+    pub call_occurrences: Box<[StableOccurrenceKey]>,
+    pub diagnostics: Box<[TypeDiagnostic]>,
+    pub compile_work: KernelCompileWork,
+    pub solve_work: KernelSolveWork,
+    pub owner_count: usize,
+}
+
+/// Build a complete checked construction from one dense-kernel solve.
+///
+/// This is the flag-day handoff candidate. It does not call any owner syntax,
+/// constraint, interface, body, shard, or compatibility-assembly request.
+/// Parser-issued identities are used only for source relocation and the
+/// deterministic checked metadata post-pass.
+pub(crate) fn checked_construction_from_kernel(
+    project: &ProjectSyntaxSnapshot,
+    role: boon_checked::ProgramRole,
+) -> Result<KernelCheckedConstruction, String> {
+    let (source_payloads, source_abi_diagnostics) =
+        boon_typecheck::project_source_payload_abi_types_and_diagnostics(project);
+    let PreparedKernelProjectProjection {
+        owner_order,
+        prepared,
+        active,
+        container_owners,
+        unsupported,
+        project_input,
+        definition_facts,
+        definition_keys,
+        abi,
+        ..
+    } = prepare_kernel_project_projection(project, &source_payloads, role);
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "dense kernel checked construction does not cover the complete project: {unsupported:#?}"
+        ));
+    }
+    let owner_count = active.len().saturating_add(container_owners.len());
+    if owner_count != owner_order.len() {
+        return Err(format!(
+            "dense kernel checked construction covers {owner_count} of {} project owners",
+            owner_order.len()
+        ));
+    }
+
+    let input =
+        KernelProjectInput::new_with_abi(project_input, definition_facts, definition_keys, abi)
+            .map_err(|error| format!("cannot build dense kernel checked input: {error}"))?;
+    let mut session = KernelSession::new(input);
+    let diagnostics_product = session
+        .check(CheckDemand::Diagnostics)
+        .map_err(|error| format!("cannot solve dense kernel checked diagnostics: {error}"))?;
+    let compile_work = diagnostics_product.compile_work;
+    let KernelCheckProduct::Diagnostics(interfaces) = diagnostics_product.product else {
+        unreachable!("diagnostics demand returns an interface snapshot")
+    };
+    if interfaces.public_results.len() != active.len() {
+        return Err(format!(
+            "dense kernel checked construction publishes {} of {} definition interfaces",
+            interfaces.public_results.len(),
+            active.len()
+        ));
+    }
+    let mut diagnostics = present_kernel_project_diagnostics(
+        project,
+        &prepared,
+        &active,
+        source_abi_diagnostics.as_ref(),
+        &interfaces,
+    )?;
+
+    let checked_product = session
+        .check(CheckDemand::CheckedImage)
+        .map_err(|error| format!("cannot materialize dense kernel checked image: {error}"))?;
+    let KernelCheckProduct::CheckedImage(snapshot) = checked_product.product else {
+        unreachable!("checked-image demand returns a checked snapshot")
+    };
+    let solve_work = snapshot.work;
+    let layout = KernelCheckedLinkLayout::new(session.project(), &snapshot)
+        .map_err(|error| format!("cannot build dense kernel checked layout: {error}"))?;
+    let mut rows = layout
+        .materialize_rows(session.project(), &snapshot, role)
+        .map_err(|error| format!("cannot link dense kernel checked rows: {error}"))?;
+    for definition in layout.definitions() {
+        let key = session
+            .project()
+            .links()
+            .definition_key(definition.owner)
+            .ok_or_else(|| {
+                format!(
+                    "dense kernel checked layout has no stable key for definition {}",
+                    definition.owner.0
+                )
+            })?;
+        let source = project
+            .source_layouts()
+            .iter()
+            .find(|source| &source.source_unit_id == key.source_unit_id())
+            .ok_or_else(|| {
+                format!(
+                    "dense kernel checked layout has no source unit for {:?}",
+                    key.source_unit_id()
+                )
+            })?;
+        rows.rebase_definition_spans(
+            &layout,
+            definition.owner,
+            source.start_line,
+            source.start_byte,
+        )
+        .map_err(|error| format!("cannot rebase dense kernel checked rows: {error}"))?;
+    }
+
+    let call_occurrences = rows.call_occurrences;
+    let mut fields = CheckedProgramFields {
+        source_bundle_digest_v1: project.source_bundle_digest_v1(),
+        role,
+        external_types: ExternalTypeEnvironment::empty(role),
+        lowering_metadata: Default::default(),
+        root_scope: LexicalScopeId(0),
+        scopes: rows.scopes.into_vec(),
+        declarations: rows.declarations.into_vec(),
+        statements: rows.statements.into_vec(),
+        expressions: rows.expressions.into_vec(),
+        callables: rows.callables.into_vec(),
+        context_formals: rows.context_formals.into_vec(),
+        calls: rows.calls.into_vec(),
+        call_result_paths: rows.call_result_paths.into_vec(),
+        order_chains: Vec::new(),
+        pattern_bindings: rows.pattern_bindings.into_vec(),
+        resource_projection_requirements: rows.resource_projection_requirements.into_vec(),
+        sources: rows.sources.into_vec(),
+        states: rows.states.into_vec(),
+        lists: rows.lists.into_vec(),
+        occurrences: rows.occurrences.into_vec(),
+    };
+    let (order_chains, order_diagnostics) = boon_typecheck::derive_checked_order_chains(&fields);
+    fields.order_chains = order_chains;
+    diagnostics.extend(order_diagnostics);
+    diagnostics.sort_by(|left, right| {
+        left.line
+            .cmp(&right.line)
+            .then_with(|| left.start.cmp(&right.start))
+            .then_with(|| left.end.cmp(&right.end))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    diagnostics.dedup();
+    fields.lowering_metadata =
+        boon_typecheck::derive_project_checked_lowering_metadata(project, &fields, &diagnostics)
+            .map_err(|error| format!("cannot finalize dense kernel checked metadata: {error}"))?;
+    Ok(KernelCheckedConstruction {
+        fields,
+        call_occurrences,
+        diagnostics: diagnostics.into_boxed_slice(),
+        compile_work,
+        solve_work,
+        owner_count,
+    })
+}
+
+pub(crate) fn compiler_checked_from_kernel(
+    project: ProjectSyntaxSnapshot,
+    parse_work: boon_parser::ParseWorkCounters,
+    parse_ms: f64,
+    role: boon_checked::ProgramRole,
+) -> Result<crate::CheckedSourceFromSource, String> {
+    let started = Instant::now();
+    let checked = checked_construction_from_kernel(&project, role)?;
+    let owner_work = boon_typecheck::OwnerBodyInferenceWork {
+        statements: u64::try_from(checked.fields.statements.len()).unwrap_or(u64::MAX),
+        expressions: u64::try_from(checked.fields.expressions.len()).unwrap_or(u64::MAX),
+        local_constraints: checked.compile_work.linked_operations,
+        interface_imports: 0,
+        interface_plan_direct_owners: u64::try_from(checked.owner_count).unwrap_or(u64::MAX),
+        interface_plan_required_owners: u64::try_from(checked.owner_count).unwrap_or(u64::MAX),
+        interface_plan_provider_sccs: 0,
+        interface_plan_result_transfers: 0,
+        interface_plan_transfer_nodes: checked.compile_work.summary_definition_nodes,
+        interface_plan_transfer_edges: checked.compile_work.summary_invoke_nodes,
+        calls: u64::try_from(checked.fields.calls.len()).unwrap_or(u64::MAX),
+        unification_steps: checked.solve_work.activations,
+    };
+    let typecheck_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    Ok(crate::checked_source_from_checked_fields(
+        project,
+        checked.fields,
+        &checked.diagnostics,
+        parse_work,
+        parse_ms,
+        boon_typecheck::TypeCheckWorkCounters::default(),
+        owner_work,
+        typecheck_ms,
+        Some(checked.call_occurrences),
+    ))
+}
+
+fn present_kernel_project_diagnostics(
+    project: &ProjectSyntaxSnapshot,
+    prepared: &[PreparedOwner],
+    active: &[usize],
+    source_abi_diagnostics: &[TypeDiagnostic],
+    interfaces: &KernelInterfaceSnapshot,
+) -> Result<Vec<TypeDiagnostic>, String> {
+    let output_types = active
+        .iter()
+        .zip(interfaces.public_results.iter())
+        .filter_map(|(prepared_index, result)| {
+            let owner = &prepared[*prepared_index].owner;
+            let StableCheckOwnerKey::Item(key) = owner else {
+                return None;
+            };
+            let segments = key.item_route.segments();
+            let [.., container, output] = segments else {
+                return None;
+            };
+            if container.names.first().map(String::as_str) == Some("outputs")
+                && output.kind == UnitItemKind::Field
+            {
+                Some((output.names.first()?.clone(), result.ty.clone()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut diagnostics = source_abi_diagnostics.to_vec();
+    diagnostics.extend(boon_typecheck::project_host_output_abi_diagnostics(
+        project,
+        &output_types,
+    ));
+    for diagnostic in interfaces.diagnostics.iter() {
+        diagnostics.push(present_kernel_interface_diagnostic(
+            project, prepared, active, diagnostic,
+        )?);
+    }
+    diagnostics.extend(project_kernel_interface_render_slot_diagnostics(
+        project,
+        prepared,
+        active,
+        &interfaces.diagnostic_values,
+    )?);
+    diagnostics.sort_by(|left, right| {
+        left.line
+            .cmp(&right.line)
+            .then_with(|| left.start.cmp(&right.start))
+            .then_with(|| left.end.cmp(&right.end))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    diagnostics.dedup();
+    Ok(diagnostics)
 }
 
 fn present_kernel_interface_diagnostic(
@@ -16847,6 +17063,52 @@ mod tests {
     }
 
     #[test]
+    fn empty_delimiters_in_retained_calls_bind_to_the_consumer_shape() {
+        let source = concat!(
+            "FUNCTION row(label_text) {\n",
+            "    Scene/Element/label(\n",
+            "        element: []\n",
+            "        style: []\n",
+            "        label: label_text\n",
+            "    )\n",
+            "}\n",
+            "view: row(label_text: TEXT { hello })\n",
+        );
+        let (_project, _legacy, report) = direct_expression_parity_fixture(source);
+
+        let call_input = |calls: &[CheckedCall], name: &str| {
+            let call = calls
+                .iter()
+                .find(|call| call.function == "Scene/Element/label")
+                .expect("fixture label call");
+            call.entries.iter().find_map(|entry| match entry {
+                boon_checked::CheckedCallEntry::Input {
+                    name: input_name,
+                    value,
+                    ..
+                } if input_name == name => Some(*value),
+                boon_checked::CheckedCallEntry::Input { .. }
+                | boon_checked::CheckedCallEntry::FreshOut { .. }
+                | boon_checked::CheckedCallEntry::ForwardOut { .. } => None,
+            })
+        };
+        for name in ["element", "style"] {
+            let direct = call_input(&report.checked_calls, name)
+                .and_then(|value| report.checked_expressions.get(value.0 as usize))
+                .unwrap_or_else(|| panic!("kernel `{name}` input expression"));
+            assert!(matches!(direct.kind, CheckedExpressionKind::Delimiter));
+            let Type::Object(shape) = &direct.flow_type.ty else {
+                panic!(
+                    "kernel `{name}` delimiter did not bind to its Object consumer: {:?}",
+                    direct.flow_type,
+                );
+            };
+            assert!(shape.open);
+            assert!(shape.fields.is_empty());
+        }
+    }
+
+    #[test]
     fn record_spreads_compile_as_ordered_residual_overlays() {
         let source = concat!(
             "FUNCTION base() {\n",
@@ -18297,6 +18559,60 @@ mod tests {
     }
 
     #[test]
+    fn dense_kernel_builds_and_seals_a_complete_checked_construction() {
+        let source = concat!(
+            "FUNCTION double(input) {\n",
+            "    input + input\n",
+            "}\n",
+            "value: double(input: 2)\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse dense checked-construction fixture");
+        let checked = checked_construction_from_kernel(&project, boon_checked::ProgramRole::Server)
+            .expect("dense kernel builds complete checked rows");
+        assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+        assert!(checked.owner_count > 0);
+        assert!(checked.compile_work.linked_operations > 0);
+        assert!(checked.solve_work.activations > 0);
+        assert_eq!(checked.fields.expressions.len(), project.expression_count());
+        assert_eq!(checked.fields.calls.len(), 1);
+        assert_eq!(checked.call_occurrences.len(), checked.fields.calls.len());
+        assert_eq!(
+            checked.fields.lowering_metadata.checked_expression_count,
+            checked.fields.expressions.len()
+        );
+        assert_eq!(
+            checked
+                .fields
+                .lowering_metadata
+                .expr_type_table
+                .entries
+                .len(),
+            checked.fields.expressions.len()
+        );
+
+        let expected = checked.fields.clone();
+        // SAFETY: `checked_construction_from_kernel` completed dense linking,
+        // order derivation, structural metadata validation, and source-digest
+        // binding before exposing these fields.
+        let construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                checked.fields,
+            )
+        };
+        let sealed =
+            boon_typecheck::seal_project_checked_program_construction_with_call_occurrences(
+                &project,
+                construction,
+                &checked.call_occurrences,
+            )
+            .expect("dense checked construction seals through explicit parser call identities");
+        let (sealed, _) = sealed.into_parts();
+        assert_eq!(sealed, expected);
+    }
+
+    #[test]
     fn real_example_coverage_is_deterministic_and_explicit() {
         for (disk_relative, project_path) in [
             ("../../examples/counter.bn", "examples/counter.bn"),
@@ -18459,6 +18775,97 @@ mod tests {
                 (diagnostics.profile.total_ms * 1_000.0) as u64,
                 diagnostics.profile.kernel_solve_work.operations,
                 diagnostics.profile.kernel_solve_work.activations,
+            );
+        }
+        if std::env::var_os("BOON_KERNEL_PRODUCTION_CHECKED").is_some() {
+            let checked_started = Instant::now();
+            let checked =
+                checked_construction_from_kernel(&project, boon_checked::ProgramRole::Client)
+                    .expect("compile NovyWave complete checked construction through KernelSession");
+            let construction_us = elapsed_us(checked_started.elapsed());
+            assert!(
+                checked.diagnostics.is_empty(),
+                "NovyWave kernel checked diagnostics: {:#?}",
+                checked.diagnostics
+            );
+            let expression_rows = checked.fields.expressions.len();
+            let call_rows = checked.fields.calls.len();
+            let definition_rows = checked.fields.declarations.len();
+            let seal_started = Instant::now();
+            // SAFETY: the dense construction helper validates the complete
+            // linked graph and lowering metadata before returning.
+            let construction = unsafe {
+                boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                    checked.fields,
+                )
+            };
+            boon_typecheck::seal_project_checked_program_construction_with_call_occurrences(
+                &project,
+                construction,
+                &checked.call_occurrences,
+            )
+            .expect("seal NovyWave dense checked image");
+            let seal_us = elapsed_us(seal_started.elapsed());
+            eprintln!(
+                "kernel-novywave production_checked=true profile={} construction_us={} seal_us={} total_us={} owners={} declarations={} expressions={} calls={} linked_operations={} activations={}",
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                },
+                construction_us,
+                seal_us,
+                construction_us.saturating_add(seal_us),
+                checked.owner_count,
+                definition_rows,
+                expression_rows,
+                call_rows,
+                checked.compile_work.linked_operations,
+                checked.solve_work.activations,
+            );
+        }
+        if std::env::var_os("BOON_KERNEL_PRODUCTION_VERIFIED").is_some() {
+            let verified_started = Instant::now();
+            let checked = compiler_checked_from_kernel(
+                project.clone(),
+                boon_parser::ParseWorkCounters::default(),
+                parse_us as f64 / 1_000.0,
+                boon_checked::ProgramRole::Client,
+            )
+            .expect("compile NovyWave checked source through the dense kernel");
+            let compiled = crate::finish_checked_machine_plan_with_cancellation(
+                checked,
+                crate::CheckedCompileRequest::new(
+                    crate::TargetProfile::SoftwareDefault,
+                    crate::ProgramRole::Client,
+                    crate::ApplicationIdentity::compiler_default(),
+                ),
+                None,
+            )
+            .expect("lower NovyWave dense checked construction to MachinePlan");
+            let unsealed_profile = compiled.profile;
+            let sealed = compiled
+                .seal()
+                .expect("seal NovyWave dense-kernel MachinePlan");
+            let wall_us = elapsed_us(verified_started.elapsed());
+            eprintln!(
+                "kernel-novywave production_verified=true profile={} wall_us={} parse_ms={:.3} typecheck_ms={:.3} semantic_ms={:.3} where_verify_ms={:.3} ir_lower_ms={:.3} ir_verify_ms={:.3} backend_ms={:.3} plan_verify_ms={:.3} total_ms={:.3} preseal_total_ms={:.3}",
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                },
+                wall_us,
+                sealed.profile.parse_ms,
+                sealed.profile.typecheck_ms,
+                sealed.profile.semantic_ms,
+                sealed.profile.contract_verify_ms,
+                sealed.profile.ir_lower_ms,
+                sealed.profile.verify_ms,
+                sealed.profile.compile_ms,
+                sealed.profile.plan_validation_ms,
+                sealed.profile.total_ms,
+                unsealed_profile.total_ms,
             );
         }
         eprintln!(

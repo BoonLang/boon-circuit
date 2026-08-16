@@ -254,14 +254,6 @@ impl ProjectDiagnosticFacts {
     pub const fn fingerprint_v1(&self) -> [u8; 32] {
         self.fingerprint_v1
     }
-
-    pub(crate) const fn host_ports(&self) -> &HostPortSyntaxTable {
-        &self.host_ports
-    }
-
-    pub(crate) fn host_port_resolution_error(&self) -> Option<&str> {
-        self.host_port_resolution_error.as_deref()
-    }
 }
 
 /// One project diagnostic relocated into a source unit's local coordinate

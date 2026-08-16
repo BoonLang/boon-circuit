@@ -2539,6 +2539,9 @@ pub fn is_renderable_type(ty: &Type) -> bool {
     if matches!(ty, Type::RenderContract) || is_no_element_type(ty) {
         return true;
     }
+    if let Type::Union(members) = ty {
+        return !members.is_empty() && members.iter().all(is_renderable_type);
+    }
     let Type::Object(shape) = ty else {
         return false;
     };
@@ -3301,13 +3304,16 @@ mod tests {
     #[test]
     fn renderability_uses_the_shared_checked_kind_contract() {
         assert!(is_renderable_type(&Type::RenderContract));
-        assert!(is_renderable_type(&Type::VariantSet(
-            vec![tag("NoElement")].into()
-        )));
-        assert!(is_renderable_type(&object(
-            [("kind", Type::VariantSet(vec![tag("Row")].into()))],
-            false,
-        )));
+        let no_element = Type::VariantSet(vec![tag("NoElement")].into());
+        let row = object([("kind", Type::VariantSet(vec![tag("Row")].into()))], false);
+        assert!(is_renderable_type(&no_element));
+        assert!(is_renderable_type(&row));
+        assert!(is_renderable_type(&Type::Union(vec![
+            row.clone(),
+            no_element,
+        ])));
+        assert!(!is_renderable_type(&Type::Union(Vec::new())));
+        assert!(!is_renderable_type(&Type::Union(vec![row, Type::Text])));
         assert!(!is_renderable_type(&object(
             [("kind", Type::VariantSet(vec![tag("UnknownKind")].into()))],
             false,

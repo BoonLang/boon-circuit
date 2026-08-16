@@ -3609,6 +3609,34 @@ fn concrete_checked_expression_type(
                 if out_contract_type_is_resolved(&instance.result.ty) {
                     return Ok(instance.result.ty.clone());
                 }
+                let mut substitutions = active_substitutions.clone();
+                let instance_type_environment = graph.type_substitution_environment(instance_id);
+                merge_out_contract_substitutions(&mut substitutions, instance_type_environment);
+                let occurrence_result =
+                    apply_out_contract_substitutions(&instance.result.ty, &substitutions);
+                if out_contract_type_is_resolved(&occurrence_result) {
+                    // OutNet has already reconciled the callable scheme with
+                    // this checked occurrence. Its row may still mention
+                    // frame-local alphas, so close those first; recursively
+                    // reconstruct the callable body only while the occurrence
+                    // remains unresolved. This is also required for render
+                    // constructors whose public ABI intentionally exposes less
+                    // structure than their checked occurrence.
+                    return Ok(occurrence_result);
+                }
+                if instance.result_is_exact_occurrence {
+                    let runtime_occurrence =
+                        contextual_expansion::erase_runtime_type_vars(&occurrence_result);
+                    if out_contract_type_is_resolved(&runtime_occurrence) {
+                        // A syntax-discriminated occurrence is the structural
+                        // authority even when child-owned runtime correlations
+                        // have no concrete OUT binding. Semantic execution
+                        // names those residual alphas as Unknown; descending
+                        // into a deliberately smaller callable ABI would erase
+                        // fields that the occurrence already proved.
+                        return Ok(runtime_occurrence);
+                    }
+                }
                 let callable = program
                     .callables
                     .iter()
@@ -3619,9 +3647,6 @@ fn concrete_checked_expression_type(
                             scoped.expression.0, instance.provenance.callable.0
                         ))
                     })?;
-                let mut substitutions = active_substitutions.clone();
-                let instance_type_environment = graph.type_substitution_environment(instance_id);
-                merge_out_contract_substitutions(&mut substitutions, instance_type_environment);
                 let mut provisional_variables = instance
                     .local_type_substitutions
                     .iter()
@@ -5196,9 +5221,11 @@ fn out_contract_mismatch(
 
 fn out_contract_type_is_resolved(ty: &boon_checked::Type) -> bool {
     match ty {
-        boon_checked::Type::Var(_)
-        | boon_checked::Type::Unknown
-        | boon_checked::Type::UnresolvedShape { .. } => false,
+        // `Unknown` is the canonical runtime spelling of a definition-local
+        // alpha that has no cross-owner identity. It is stable data in a
+        // semantic OUT contract, unlike a live checked `Var` or an unresolved
+        // structural placeholder.
+        boon_checked::Type::Var(_) | boon_checked::Type::UnresolvedShape { .. } => false,
         boon_checked::Type::List(item) => out_contract_type_is_resolved(item),
         boon_checked::Type::Map { key, value } => {
             out_contract_type_is_resolved(key) && out_contract_type_is_resolved(value)
@@ -5225,7 +5252,8 @@ fn out_contract_type_is_resolved(ty: &boon_checked::Type) -> bool {
         | boon_checked::Type::Bytes(_)
         | boon_checked::Type::Bits { .. }
         | boon_checked::Type::Absent
-        | boon_checked::Type::RenderContract => true,
+        | boon_checked::Type::RenderContract
+        | boon_checked::Type::Unknown => true,
     }
 }
 
@@ -5736,6 +5764,142 @@ mod tests {
 
         unify_out_contract_type(&pattern, &actual, &mut substitutions)
             .expect("a structural branch union must reuse its existing frame alpha binding");
+    }
+
+    #[test]
+    fn call_occurrence_closes_its_frame_alphas_before_callable_fallback() {
+        let parsed = boon_parser::parse_source(
+            "semantic-exact-call-occurrence.bn",
+            r#"
+FUNCTION identity(value) {
+    value
+}
+
+result: identity(value: 1)
+"#,
+        )
+        .expect("exact-call fixture parses");
+        let checked = boon_typecheck::check_program(&parsed)
+            .program
+            .expect("exact-call fixture typechecks");
+        let checked_call = checked
+            .calls
+            .iter()
+            .find(|call| call.function == "identity")
+            .expect("fixture has one identity call");
+        let producer_roots = resolve_producer_roots(&checked, &[]).unwrap();
+        let mut graph = out_net::OutNet::<OutPortContractV1>::try_build_with(
+            &checked,
+            producer_roots,
+            |call, _, entry| provisional_out_port_contract(&checked, call, entry),
+            |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
+        )
+        .expect("exact-call fixture builds one OUT graph")
+        .graph;
+        let instance_id = graph
+            .call_instance_for_checked_call(checked_call.id, None)
+            .expect("identity call has one root OUT frame");
+        let occurrence_alpha = boon_checked::TypeVar(u32::MAX - 1);
+        let expected = Type::object(boon_checked::ObjectShape {
+            fields: BTreeMap::from([("element".to_owned(), Type::Number)]),
+            field_order: vec!["element".to_owned()],
+            open: false,
+        });
+        let instance = &mut graph.call_instances[instance_id.as_usize()];
+        instance.result.ty = Type::object(boon_checked::ObjectShape {
+            fields: BTreeMap::from([("element".to_owned(), Type::Var(occurrence_alpha))]),
+            field_order: vec!["element".to_owned()],
+            open: false,
+        });
+        instance.result_is_exact_occurrence = false;
+        instance
+            .local_type_substitutions
+            .push(boon_checked::CheckedTypeSubstitution {
+                variable: occurrence_alpha,
+                value: Type::Number,
+            });
+
+        let actual = concrete_checked_expression_type(
+            &checked,
+            &graph,
+            ScopedCheckedExpr {
+                expression: checked_call.expression,
+                frame: None,
+                evaluation_port: None,
+                value_frame: None,
+            },
+            &BTreeMap::new(),
+            &mut BTreeSet::new(),
+        )
+        .expect("the checked occurrence closes through its own OUT frame");
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exact_call_occurrence_preserves_shape_when_residual_alphas_are_runtime_unknown() {
+        let parsed = boon_parser::parse_source(
+            "semantic-exact-runtime-call-occurrence.bn",
+            r#"
+FUNCTION identity(value) {
+    value
+}
+
+result: identity(value: 1)
+"#,
+        )
+        .expect("exact-runtime-call fixture parses");
+        let checked = boon_typecheck::check_program(&parsed)
+            .program
+            .expect("exact-runtime-call fixture typechecks");
+        let checked_call = checked
+            .calls
+            .iter()
+            .find(|call| call.function == "identity")
+            .expect("fixture has one identity call");
+        let producer_roots = resolve_producer_roots(&checked, &[]).unwrap();
+        let mut graph = out_net::OutNet::<OutPortContractV1>::try_build_with(
+            &checked,
+            producer_roots,
+            |call, _, entry| provisional_out_port_contract(&checked, call, entry),
+            |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
+        )
+        .expect("exact-runtime-call fixture builds one OUT graph")
+        .graph;
+        let instance_id = graph
+            .call_instance_for_checked_call(checked_call.id, None)
+            .expect("identity call has one root OUT frame");
+        let occurrence_alpha = boon_checked::TypeVar(u32::MAX - 2);
+        let instance = &mut graph.call_instances[instance_id.as_usize()];
+        instance.result.ty = Type::object(boon_checked::ObjectShape {
+            fields: BTreeMap::from([("element".to_owned(), Type::Var(occurrence_alpha))]),
+            field_order: vec!["element".to_owned()],
+            open: false,
+        });
+        instance.result_is_exact_occurrence = true;
+
+        let actual = concrete_checked_expression_type(
+            &checked,
+            &graph,
+            ScopedCheckedExpr {
+                expression: checked_call.expression,
+                frame: None,
+                evaluation_port: None,
+                value_frame: None,
+            },
+            &BTreeMap::new(),
+            &mut BTreeSet::new(),
+        )
+        .expect("the exact occurrence remains the runtime structural authority");
+
+        assert_eq!(
+            actual,
+            Type::object(boon_checked::ObjectShape {
+                fields: BTreeMap::from([("element".to_owned(), Type::Unknown)]),
+                field_order: vec!["element".to_owned()],
+                open: false,
+            })
+        );
     }
 
     fn checked_branch_container_fixture() -> (

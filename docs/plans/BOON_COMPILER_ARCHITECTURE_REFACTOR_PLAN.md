@@ -3898,20 +3898,37 @@ ms total, 17,979.268 ms wall, 7,504.709 ms semantic, 824.433 ms manifest, and
 1.179 ms WHERE. Both probes cover all 1,389 definitions with zero unsupported
 owners and exact differential parity.
 
-Focused manifest tests are 20/20 green and the dependency-firewall test is
-green. The 107 compiler library tests are green, but the full package run also
-exposes three pre-existing dense-kernel integration failures in `map_set.rs`.
-They identify missing compact ABIs for Map/Set/List operations and an invalid
-cross-owner BLOCK binding ID. These fail during dense checked construction,
-before semantic elaboration, and therefore are not regressions from this cut.
-They are nevertheless flag-day parity blockers. The next largest correctness
-cut is to close this collection/block coverage family as one kernel tranche;
-only then may the dead owner-interface/body session machinery be physically
-deleted. That deletion is measured as Rust rebuild closure rather than falsely
-credited to Boon execution latency. After parity is restored, the largest
-measured runtime cuts are definition-owned semantic construction (currently
-286.302 ms for execution-graph derivation) and the remaining construction-time
-OUT graph (228.502 ms), not WHERE.
+The compact operation-parity tranche closes those blockers. `List/get`,
+`Map/get`, `Map/upsert`, `Map/remove`, `Set/add`, `Set/remove`, `Set/contains`,
+`Stream/pulses`, and `Stream/skip` now compile through typed kernel ABI
+operations. Dynamic `Field/name` reads are packed directional projections,
+and `FLUSH` owns a separate dense control-flow propagation graph instead of
+polluting ordinary value unification. Multiline HOLD updates use the
+parser-issued final checked value rather than structurally widening every
+intermediate pipeline stage into state.
+
+The same tranche removes the last local-only lexical assumption exposed by a
+pattern binding inside a child owner. An imported lexical declaration is now
+the exact `(owner, declaration)` pair; linking and currentness never recover it
+from a public declaration, path, or name. Project validation rejects a missing
+target declaration row, standalone compilation rejects every imported form,
+and dependency receipts record the exact declaration authority. Receipt
+domains advance to definition basis V14, definition artifact/currentness V16,
+and dependency imports V2.
+
+The complete kernel suite is 102/102 green, the compiler library suite is
+107/107 with two intentional large ignored probes, all 16 compiler integration
+tests pass, the pulse suite is 8/8, the collection suite is 3/3, and the parser
+suite is 78/78 plus four compile-fail doctests. The full package no longer has
+a dense-kernel parity failure. This is a correctness/coverage checkpoint; it
+does not claim a timing improvement over the preceding 3,616.758 ms optimized
+verified receipt. The next largest cut is now physical deletion of the dead
+owner-interface/body request stack in `boon_compiler::session`, currently
+visible as 39 dead-code warnings. That deletion is measured as source/rebuild
+closure rather than falsely credited to Boon execution latency. After it, the
+largest measured runtime cuts remain definition-owned semantic construction
+(currently 286.302 ms for execution-graph derivation) and the remaining
+construction-time OUT graph (228.502 ms), not WHERE.
 
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not

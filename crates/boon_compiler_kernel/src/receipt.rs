@@ -11,14 +11,14 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
-const KERNEL_DEFINITION_BASIS_DOMAIN_V13: &[u8] = b"boon.compiler-kernel.definition-basis.v13\0";
+const KERNEL_DEFINITION_BASIS_DOMAIN_V14: &[u8] = b"boon.compiler-kernel.definition-basis.v14\0";
 const KERNEL_PUBLIC_RESULT_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.public-result.v1\0";
 const KERNEL_EXPRESSION_SURFACE_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.expression-surface.v1\0";
-const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V15: &[u8] =
-    b"boon.compiler-kernel.definition-artifact.v15\0";
-const KERNEL_DEPENDENCY_IMPORTS_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.dependency-imports.v1\0";
-const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V15: &[u8] =
-    b"boon.compiler-kernel.definition-currentness.v15\0";
+const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V16: &[u8] =
+    b"boon.compiler-kernel.definition-artifact.v16\0";
+const KERNEL_DEPENDENCY_IMPORTS_DOMAIN_V2: &[u8] = b"boon.compiler-kernel.dependency-imports.v2\0";
+const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V16: &[u8] =
+    b"boon.compiler-kernel.definition-currentness.v16\0";
 
 /// Exact definition-local origin of one dependency edge.
 ///
@@ -94,6 +94,10 @@ pub enum KernelDependencySource {
 pub enum KernelDependencyTarget {
     Definition(KernelOwnerId),
     PublicDeclaration(KernelOwnerId),
+    Declaration {
+        owner: KernelOwnerId,
+        declaration: crate::KernelDeclarationId,
+    },
     PublicStatement(KernelOwnerId),
     Expression {
         owner: KernelOwnerId,
@@ -110,6 +114,7 @@ impl KernelDependencyTarget {
             | Self::PublicStatement(owner)
             | Self::Expression { owner, .. }
             | Self::Result(owner) => owner,
+            Self::Declaration { owner, .. } => owner,
         }
     }
 }
@@ -189,11 +194,11 @@ impl KernelDefinitionDependencyGraph {
 /// exact imported authority set produced it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelDefinitionCurrentnessReceipt {
-    pub basis_fingerprint_v13: [u8; 32],
+    pub basis_fingerprint_v14: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
-    pub artifact_fingerprint_v15: [u8; 32],
-    pub dependency_fingerprint_v1: [u8; 32],
-    pub fingerprint_v15: [u8; 32],
+    pub artifact_fingerprint_v16: [u8; 32],
+    pub dependency_fingerprint_v2: [u8; 32],
+    pub fingerprint_v16: [u8; 32],
 }
 
 pub(crate) fn definition_basis_fingerprint(
@@ -209,7 +214,7 @@ pub(crate) fn definition_basis_fingerprint_with_buffer(
     scratch: &mut Vec<u8>,
 ) -> Result<[u8; 32], KernelOwnerBuildError> {
     Ok(stable_fingerprint(
-        KERNEL_DEFINITION_BASIS_DOMAIN_V13,
+        KERNEL_DEFINITION_BASIS_DOMAIN_V14,
         &(input, facts),
         scratch,
     ))
@@ -253,7 +258,7 @@ pub(crate) fn build_snapshot_receipts(
             &mut hash_scratch,
         )?);
         artifact_fingerprints.push(stable_fingerprint(
-            KERNEL_DEFINITION_ARTIFACT_DOMAIN_V15,
+            KERNEL_DEFINITION_ARTIFACT_DOMAIN_V16,
             definition,
             &mut hash_scratch,
         ));
@@ -301,6 +306,9 @@ pub(crate) fn build_snapshot_receipts(
                                 expression.0, provider
                             ))
                         }),
+                    KernelDependencyTarget::Declaration { .. } => {
+                        Ok(artifact_fingerprints[provider])
+                    }
                     KernelDependencyTarget::Definition(_)
                     | KernelDependencyTarget::PublicDeclaration(_)
                     | KernelDependencyTarget::PublicStatement(_)
@@ -310,29 +318,29 @@ pub(crate) fn build_snapshot_receipts(
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let dependency_fingerprint_v1 = stable_fingerprint(
-            KERNEL_DEPENDENCY_IMPORTS_DOMAIN_V1,
+        let dependency_fingerprint_v2 = stable_fingerprint(
+            KERNEL_DEPENDENCY_IMPORTS_DOMAIN_V2,
             &(dependencies, imported_authorities),
             &mut hash_scratch,
         );
-        let basis_fingerprint_v13 = basis_fingerprints[definition_index];
+        let basis_fingerprint_v14 = basis_fingerprints[definition_index];
         let public_result_fingerprint_v1 = public_result_fingerprints[definition_index];
-        let artifact_fingerprint_v15 = artifact_fingerprints[definition_index];
-        let fingerprint_v15 = stable_fingerprint(
-            KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V15,
+        let artifact_fingerprint_v16 = artifact_fingerprints[definition_index];
+        let fingerprint_v16 = stable_fingerprint(
+            KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V16,
             &(
-                basis_fingerprint_v13,
-                artifact_fingerprint_v15,
-                dependency_fingerprint_v1,
+                basis_fingerprint_v14,
+                artifact_fingerprint_v16,
+                dependency_fingerprint_v2,
             ),
             &mut hash_scratch,
         );
         receipts.push(KernelDefinitionCurrentnessReceipt {
-            basis_fingerprint_v13,
+            basis_fingerprint_v14,
             public_result_fingerprint_v1,
-            artifact_fingerprint_v15,
-            dependency_fingerprint_v1,
-            fingerprint_v15,
+            artifact_fingerprint_v16,
+            dependency_fingerprint_v2,
+            fingerprint_v16,
         });
     }
     Ok((dependency_graph, receipts.into_boxed_slice()))
@@ -662,11 +670,20 @@ fn push_declaration_dependency(
     source: KernelDependencySource,
     reference: KernelDeclarationReference,
 ) {
-    if let KernelDeclarationReference::OwnerPublic(owner) = reference {
-        dependencies.push(KernelDefinitionDependency {
-            source,
-            target: KernelDependencyTarget::PublicDeclaration(owner),
-        });
+    match reference {
+        KernelDeclarationReference::Local(_) => {}
+        KernelDeclarationReference::OwnerPublic(owner) => {
+            dependencies.push(KernelDefinitionDependency {
+                source,
+                target: KernelDependencyTarget::PublicDeclaration(owner),
+            });
+        }
+        KernelDeclarationReference::OwnerDeclaration { owner, declaration } => {
+            dependencies.push(KernelDefinitionDependency {
+                source,
+                target: KernelDependencyTarget::Declaration { owner, declaration },
+            });
+        }
     }
 }
 
@@ -838,7 +855,7 @@ fn hash_normalized_flow_type(
     Ok(stable_fingerprint(domain, &normalized, scratch))
 }
 
-fn alpha_normalize_flow_type(
+pub(crate) fn alpha_normalize_flow_type(
     flow_type: &FlowType,
     variables: &mut BTreeMap<TypeVar, TypeVar>,
     next: &mut u32,
@@ -1156,11 +1173,11 @@ mod tests {
             "an unused implementation edit must preserve the public type identity"
         );
         assert_ne!(
-            first.currentness[0].artifact_fingerprint_v15,
-            second.currentness[0].artifact_fingerprint_v15
+            first.currentness[0].artifact_fingerprint_v16,
+            second.currentness[0].artifact_fingerprint_v16
         );
         assert_ne!(
-            first.currentness[0].fingerprint_v15, second.currentness[0].fingerprint_v15,
+            first.currentness[0].fingerprint_v16, second.currentness[0].fingerprint_v16,
             "the edited definition must not claim the old exact evaluation receipt"
         );
         assert_eq!(
@@ -1219,22 +1236,22 @@ mod tests {
             second[0].public_result_fingerprint_v1
         );
         assert_eq!(
-            first[0].artifact_fingerprint_v15,
-            second[0].artifact_fingerprint_v15
+            first[0].artifact_fingerprint_v16,
+            second[0].artifact_fingerprint_v16
         );
         assert_eq!(
-            first[0].artifact_fingerprint_v15,
+            first[0].artifact_fingerprint_v16,
             [
-                47, 46, 22, 121, 19, 117, 180, 185, 172, 77, 140, 147, 2, 240, 56, 82, 196, 133,
-                214, 95, 135, 133, 34, 182, 201, 184, 155, 220, 242, 153, 248, 38,
+                21, 19, 130, 76, 180, 103, 146, 59, 118, 186, 174, 194, 7, 164, 208, 76, 87, 149,
+                115, 211, 134, 6, 42, 188, 61, 116, 29, 214, 91, 151, 135, 112,
             ],
-            "the V15 artifact fingerprint byte contract changed"
+            "the V16 artifact fingerprint byte contract changed"
         );
         assert_ne!(
-            first[0].basis_fingerprint_v13,
-            second[0].basis_fingerprint_v13
+            first[0].basis_fingerprint_v14,
+            second[0].basis_fingerprint_v14
         );
-        assert_ne!(first[0].fingerprint_v15, second[0].fingerprint_v15);
+        assert_ne!(first[0].fingerprint_v16, second[0].fingerprint_v16);
     }
 
     #[test]
@@ -1306,12 +1323,12 @@ mod tests {
             diagnosed_currentness[1].public_result_fingerprint_v1
         );
         assert_ne!(
-            clean_currentness[1].artifact_fingerprint_v15,
-            diagnosed_currentness[1].artifact_fingerprint_v15
+            clean_currentness[1].artifact_fingerprint_v16,
+            diagnosed_currentness[1].artifact_fingerprint_v16
         );
         assert_ne!(
-            clean_currentness[1].fingerprint_v15,
-            diagnosed_currentness[1].fingerprint_v15
+            clean_currentness[1].fingerprint_v16,
+            diagnosed_currentness[1].fingerprint_v16
         );
     }
 
@@ -1359,16 +1376,16 @@ mod tests {
             second.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            first.currentness.basis_fingerprint_v13,
-            second.currentness.basis_fingerprint_v13
+            first.currentness.basis_fingerprint_v14,
+            second.currentness.basis_fingerprint_v14
         );
         assert_ne!(
-            first.currentness.artifact_fingerprint_v15,
-            second.currentness.artifact_fingerprint_v15
+            first.currentness.artifact_fingerprint_v16,
+            second.currentness.artifact_fingerprint_v16
         );
         assert_ne!(
-            first.currentness.fingerprint_v15,
-            second.currentness.fingerprint_v15
+            first.currentness.fingerprint_v16,
+            second.currentness.fingerprint_v16
         );
     }
 }

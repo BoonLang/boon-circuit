@@ -1,10 +1,13 @@
-use crate::{KernelCallableKind, KernelOwnerBuildError, KernelParameterEvaluationScope};
+use crate::{
+    KernelCallableKind, KernelOwnerBuildError, KernelParameterEvaluationScope,
+    receipt::alpha_normalize_flow_type,
+};
 use boon_checked::{
     CheckedCallContextKind, CheckedEffectSummary, CheckedExternalDeclarationIdentityV1,
     CheckedIntrinsicV1, CheckedParameterKind, CheckedParameterRequirement, FlowType, ProgramRole,
 };
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Immutable compiler/library ABI consumed by one kernel revision.
 ///
@@ -24,6 +27,25 @@ impl KernelAbiInput {
         callables: impl IntoIterator<Item = KernelCallableAbiInput>,
     ) -> Result<Self, KernelOwnerBuildError> {
         let mut callables = callables.into_iter().collect::<Vec<_>>();
+        // Every callable owns an independent generic scheme. External ABI
+        // producers may allocate TypeVar ordinals from a process-wide arena;
+        // carrying those ordinals into the checked linker both wastes the
+        // dense namespace and accidentally correlates unrelated callables.
+        // Canonicalize once at the permanent kernel boundary.
+        for callable in &mut callables {
+            let mut variables = BTreeMap::new();
+            let mut next = 0;
+            for parameter in &mut callable.parameters {
+                parameter.flow_type =
+                    alpha_normalize_flow_type(&parameter.flow_type, &mut variables, &mut next);
+            }
+            for context in &mut callable.contexts {
+                context.flow_type =
+                    alpha_normalize_flow_type(&context.flow_type, &mut variables, &mut next);
+            }
+            callable.result =
+                alpha_normalize_flow_type(&callable.result, &mut variables, &mut next);
+        }
         callables.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         let mut names = BTreeSet::new();
         for callable in &callables {

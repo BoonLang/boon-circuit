@@ -693,6 +693,26 @@ impl<'a> UnitOwnerSyntaxView<'a> {
         Some(selector)
     }
 
+    /// Return the exact authored pattern for a match-arm expression visible
+    /// through this source-unit view.
+    ///
+    /// Descendant value owners can retain reads of a binding declared by an
+    /// enclosing arm. They know the arm's syntax identity from statement
+    /// containment, but must not reconstruct or traverse the parent owner's
+    /// expression arena. This narrow parser-issued lookup supplies the
+    /// declaration shape while preserving that owner boundary.
+    pub fn match_arm_pattern_for_syntax_expression(
+        &self,
+        expression_id: usize,
+    ) -> Option<&'a AstMatchPattern> {
+        let expression = self.local_expression_id(expression_id)?;
+        let expression = self.fields.ast.expressions.get(expression.as_usize())?;
+        match &expression.kind {
+            AstExprKind::MatchArm { pattern, .. } => Some(pattern),
+            _ => None,
+        }
+    }
+
     fn local_expression_id(&self, expression_id: usize) -> Option<UnitLocalExpressionId> {
         let local = match self.namespace {
             Some(expected) => {

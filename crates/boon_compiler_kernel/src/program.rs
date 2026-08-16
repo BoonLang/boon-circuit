@@ -29,6 +29,13 @@ pub enum KernelCollectionOperationKind {
     Map,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelCollectionProjectionKind {
+    Item,
+    MapKey,
+    MapValue,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelPattern {
     Wildcard,
@@ -213,11 +220,12 @@ pub enum KernelOperation {
         fields: Box<[NameId]>,
         consumer: TypeVariableId,
     },
-    /// Directional extraction of a collection's item authority. This is the
-    /// compact residual behind contextual List callback bindings; it never
-    /// equates the collection producer with the callback occurrence.
-    CollectionItemProjection {
+    /// Directional extraction of one collection component authority. This is
+    /// the compact residual behind contextual callback bindings and Map ABI
+    /// correlations; it never equates the producer with the occurrence.
+    CollectionProjection {
         provider: TypeVariableId,
+        kind: KernelCollectionProjectionKind,
         consumer: TypeVariableId,
     },
     /// One collection authority. Item/key/value inputs are widened directly
@@ -450,7 +458,11 @@ impl ComponentProgramBuilder {
         inputs: impl IntoIterator<Item = TypeTermId>,
         mode: PublishMode,
     ) -> OperationId {
-        if mode == PublishMode::Replace {
+        // Every publication except equality-unification owns a replaceable
+        // derived root. Projections must observe that root directionally and
+        // replay after later epochs; otherwise an early consumer scaffold can
+        // flow backward into a cyclic HOLD/LATEST/union provider.
+        if mode != PublishMode::Unify {
             self.mark_authoritative(output);
         }
         self.push_operation(KernelOperation::Publish {
@@ -556,7 +568,37 @@ impl ComponentProgramBuilder {
         consumer: TypeVariableId,
     ) -> OperationId {
         self.mark_authoritative(consumer);
-        self.push_operation(KernelOperation::CollectionItemProjection { provider, consumer })
+        self.push_operation(KernelOperation::CollectionProjection {
+            provider,
+            kind: KernelCollectionProjectionKind::Item,
+            consumer,
+        })
+    }
+
+    pub fn add_map_key_projection(
+        &mut self,
+        provider: TypeVariableId,
+        consumer: TypeVariableId,
+    ) -> OperationId {
+        self.mark_authoritative(consumer);
+        self.push_operation(KernelOperation::CollectionProjection {
+            provider,
+            kind: KernelCollectionProjectionKind::MapKey,
+            consumer,
+        })
+    }
+
+    pub fn add_map_value_projection(
+        &mut self,
+        provider: TypeVariableId,
+        consumer: TypeVariableId,
+    ) -> OperationId {
+        self.mark_authoritative(consumer);
+        self.push_operation(KernelOperation::CollectionProjection {
+            provider,
+            kind: KernelCollectionProjectionKind::MapValue,
+            consumer,
+        })
     }
 
     pub fn add_collection(
@@ -876,7 +918,7 @@ pub(crate) fn operation_output(
         KernelOperation::Alias { consumer, .. }
         | KernelOperation::Projection { consumer, .. }
         | KernelOperation::PatternProjection { consumer, .. }
-        | KernelOperation::CollectionItemProjection { consumer, .. } => Some(*consumer),
+        | KernelOperation::CollectionProjection { consumer, .. } => Some(*consumer),
         KernelOperation::Unify { .. } => None,
     }?;
     Some(variables.map_or(output, |variables| variables[output.0 as usize]))
@@ -980,7 +1022,7 @@ fn link_residual_operation_terms(
                 link_residual_name(*field, source, target, name_cache);
             }
         }
-        KernelOperation::CollectionItemProjection { .. } => {}
+        KernelOperation::CollectionProjection { .. } => {}
         KernelOperation::Collection { inputs, values, .. } => {
             for input in inputs.iter().chain(values.iter()) {
                 link_residual_term(*input, source, target, variables, term_cache, name_cache);
@@ -1074,7 +1116,9 @@ fn collect_operation_variables(
             output.insert(*provider);
             output.insert(*consumer);
         }
-        KernelOperation::CollectionItemProjection { provider, consumer } => {
+        KernelOperation::CollectionProjection {
+            provider, consumer, ..
+        } => {
             output.insert(*provider);
             output.insert(*consumer);
         }

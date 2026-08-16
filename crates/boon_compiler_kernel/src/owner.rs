@@ -10,7 +10,7 @@ use crate::{
 };
 use boon_checked::{
     BytesType, CheckedListKeyPolicy, CheckedStateKind, FlowMode, FlowType, ObjectShape, Type,
-    Variant, type_is_recursively_closed,
+    Variant, canonical_union_type, type_is_recursively_closed,
 };
 use boon_data::{Bits, ExactNumber, ExactNumberParseReason, ExactRoundingRule};
 use boon_effect_schema::{
@@ -107,6 +107,18 @@ pub enum KernelPureBuiltinKind {
     ListChunk,
     TextJoin,
     FieldColor,
+    // Keep newly supported ABI families append-only. The enum participates in
+    // stable definition-basis hashing, so inserting variants among existing
+    // discriminants would invalidate unrelated definitions.
+    ListGet,
+    MapGet,
+    MapUpsert,
+    MapRemove,
+    SetAdd,
+    SetRemove,
+    SetContains,
+    StreamPulses,
+    StreamSkip,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -218,6 +230,16 @@ pub enum KernelOwnerNodeKind {
     Arrow,
     Delimiter,
     Unknown,
+    /// Abort the current causal activation with one closed tag-algebra
+    /// payload. The ordinary value surface is `Absent`; `FlushPayload` owns
+    /// the independent control channel materialized after type solving.
+    Flush,
+    /// Dynamic `Field/name` ABI projection. The field name is part of packed
+    /// bytecode; the provider remains a detached directional read and the
+    /// authored call row survives for runtime/intrinsic consumers.
+    FieldProjection {
+        field: Box<str>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -261,6 +283,7 @@ pub enum KernelOwnerEdgeRole {
     HoldUpdate,
     MatchOutput,
     ArrowOutput,
+    FlushPayload,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -564,6 +587,16 @@ pub enum KernelDeclarationReference {
     Local(KernelDeclarationId),
     /// The unique public declaration exported by another dense definition.
     OwnerPublic(KernelOwnerId),
+    /// One exact non-public declaration owned by another dense definition.
+    ///
+    /// This is required when owner partitioning places a value expression in
+    /// a child definition while its lexical pattern/callback declaration
+    /// remains in the enclosing definition. The pair is definition-local and
+    /// relocates directly; it is never a path or name lookup.
+    OwnerDeclaration {
+        owner: KernelOwnerId,
+        declaration: KernelDeclarationId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
@@ -929,7 +962,7 @@ pub struct KernelOwnerProgram {
     calls: Box<[PendingKernelCallArtifact]>,
     effects: Box<[KernelHostEffectArtifact]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
-    basis_fingerprint_v13: [u8; 32],
+    basis_fingerprint_v14: [u8; 32],
 }
 
 #[derive(Debug)]
@@ -1027,7 +1060,7 @@ struct KernelProjectOwnerOutputs {
     /// requirements. That aggregate is useful to the solver, but is not a
     /// sound direct assignability contract for call diagnostics.
     syntax_discriminated_formals: Box<[u32]>,
-    basis_fingerprint_v13: [u8; 32],
+    basis_fingerprint_v14: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -1113,6 +1146,9 @@ pub enum KernelCallTarget {
     FixedAbi,
     HostEffect {
         operation: Box<str>,
+    },
+    FieldProjection {
+        field: Box<str>,
     },
 }
 
@@ -2244,7 +2280,7 @@ pub fn is_registered_kernel_host_effect(operation: &str) -> bool {
 
 impl KernelOwnerProgram {
     pub fn solve(self) -> Result<KernelDefinitionSnapshot, KernelSolveError> {
-        let basis_fingerprint_v13 = self.basis_fingerprint_v13;
+        let basis_fingerprint_v14 = self.basis_fingerprint_v14;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
             .output(self.result_output)
@@ -2307,8 +2343,11 @@ impl KernelOwnerProgram {
             None,
             &synthetic_state_ordinals,
         );
-        let expressions =
-            materialize_expression_artifacts(self.expression_artifacts, expression_flows, &[]);
+        let expressions = materialize_expression_artifacts_with_local_flushes(
+            self.expression_artifacts,
+            expression_flows,
+            &[],
+        );
         let mut definition = DefinitionArtifact {
             result,
             formals: formal_flows,
@@ -2331,7 +2370,7 @@ impl KernelOwnerProgram {
         };
         let (dependencies, currentness) = build_snapshot_receipts(
             std::slice::from_mut(&mut definition),
-            &[basis_fingerprint_v13],
+            &[basis_fingerprint_v14],
         )?;
         let [currentness] = currentness.as_ref() else {
             unreachable!("one standalone kernel definition produces one receipt")
@@ -2494,10 +2533,12 @@ impl KernelSolvedProject {
     pub fn into_checked_snapshot(self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
         let diagnostic_values = self.interface_snapshot().diagnostic_values;
         let owner_effects = project_owner_effect_summaries(&self.owners);
+        let expression_flush_types =
+            project_expression_flush_types(&self.owners, &self.artifact, &self.public_results);
         let basis_fingerprints = self
             .owners
             .iter()
-            .map(|owner| owner.basis_fingerprint_v13)
+            .map(|owner| owner.basis_fingerprint_v14)
             .collect::<Vec<_>>();
         let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(&self.owners);
         let mut definitions = self
@@ -2506,10 +2547,17 @@ impl KernelSolvedProject {
             .into_iter()
             .enumerate()
             .zip(synthetic_state_ordinals.into_vec())
+            .zip(expression_flush_types.into_vec())
             .zip(self.call_facts.into_vec())
             .zip(self.diagnostics.into_vec())
             .map(
-                |((((owner_index, owner), synthetic_state_ordinals), call_facts), diagnostics)| {
+                |(
+                    (
+                        (((owner_index, owner), synthetic_state_ordinals), expression_flush_types),
+                        call_facts,
+                    ),
+                    diagnostics,
+                )| {
                     materialize_project_definition(
                         owner_index,
                         owner,
@@ -2519,6 +2567,7 @@ impl KernelSolvedProject {
                         call_facts,
                         diagnostics,
                         &synthetic_state_ordinals,
+                        expression_flush_types,
                         &owner_effects,
                     )
                 },
@@ -2561,14 +2610,23 @@ impl KernelSolvedProject {
         }
         let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(&self.owners);
         let owner_effects = project_owner_effect_summaries(&self.owners);
+        let expression_flush_types =
+            project_expression_flush_types(&self.owners, &self.artifact, &self.public_results);
         let mut demanded_iter = demanded.into_iter().peekable();
         let mut definitions = Vec::with_capacity(demanded_iter.len());
-        for ((((owner_index, owner), synthetic_state_ordinals), call_facts), diagnostics) in self
+        for (
+            (
+                (((owner_index, owner), synthetic_state_ordinals), expression_flush_types),
+                call_facts,
+            ),
+            diagnostics,
+        ) in self
             .owners
             .into_vec()
             .into_iter()
             .enumerate()
             .zip(synthetic_state_ordinals.into_vec())
+            .zip(expression_flush_types.into_vec())
             .zip(self.call_facts.into_vec())
             .zip(self.diagnostics.into_vec())
         {
@@ -2589,6 +2647,7 @@ impl KernelSolvedProject {
                 call_facts,
                 diagnostics,
                 &synthetic_state_ordinals,
+                expression_flush_types,
                 &owner_effects,
             );
             alpha_normalize_definition(&mut definition);
@@ -2627,6 +2686,155 @@ fn project_public_results(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
+}
+
+/// Solve the checker-private FLUSH channel over the already-quiescent value
+/// graph. This is deliberately a separate dense work queue: FLUSH is control
+/// flow, so forcing its payload into ordinary value unification would pollute
+/// both public interfaces and runtime value types.
+fn project_expression_flush_types(
+    owners: &[KernelProjectOwnerOutputs],
+    artifact: &ComponentArtifact,
+    public_results: &[FlowType],
+) -> Box<[Box<[Option<Type>]>]> {
+    let mut offsets = Vec::with_capacity(owners.len() + 1);
+    offsets.push(0usize);
+    for owner in owners {
+        offsets.push(offsets.last().copied().unwrap_or_default() + owner.expressions.len());
+    }
+    let result_expressions = owners
+        .iter()
+        .enumerate()
+        .map(|(owner_index, owner)| {
+            let local = owner
+                .expressions
+                .iter()
+                .position(|output| *output == owner.result)
+                .expect("owner result belongs to its expression outputs");
+            offsets[owner_index] + local
+        })
+        .collect::<Vec<_>>();
+    let total = offsets.last().copied().unwrap_or_default();
+    let mut bases = vec![Vec::<Type>::new(); total];
+    let mut dependencies = vec![Vec::<usize>::new(); total];
+
+    let value_index = |caller: usize, value: KernelValueReference| -> Option<usize> {
+        match value {
+            KernelValueReference::Local(expression) => ((expression.0 as usize)
+                < owners.get(caller)?.expressions.len())
+            .then_some(offsets[caller] + expression.0 as usize),
+            KernelValueReference::External(KernelExternalExpression {
+                owner,
+                target: KernelExternalTarget::Result,
+            }) => result_expressions.get(owner.0 as usize).copied(),
+            KernelValueReference::External(KernelExternalExpression {
+                owner,
+                target: KernelExternalTarget::Expression(expression),
+            }) => {
+                let owner = owner.0 as usize;
+                ((expression.0 as usize) < owners.get(owner)?.expressions.len())
+                    .then_some(offsets[owner] + expression.0 as usize)
+            }
+        }
+    };
+
+    for (owner_index, owner) in owners.iter().enumerate() {
+        for (local, expression) in owner.expression_artifacts.iter().enumerate() {
+            let index = offsets[owner_index] + local;
+            let carries_input_flush = |role: &KernelOwnerEdgeRole| match &expression.kind {
+                KernelOwnerNodeKind::Record { .. } | KernelOwnerNodeKind::Block => false,
+                KernelOwnerNodeKind::Hold => matches!(role, KernelOwnerEdgeRole::HoldUpdate),
+                _ => true,
+            };
+            for input in expression
+                .inputs
+                .iter()
+                .filter(|input| carries_input_flush(&input.role))
+            {
+                if let Some(dependency) = value_index(owner_index, input.value) {
+                    dependencies[index].push(dependency);
+                }
+            }
+            if let KernelOwnerNodeKind::UserCall { target, .. } = expression.kind
+                && let Some(result) = result_expressions.get(target.0 as usize)
+            {
+                dependencies[index].push(*result);
+            }
+            if matches!(expression.kind, KernelOwnerNodeKind::Flush) {
+                for payload in expression
+                    .inputs
+                    .iter()
+                    .filter(|input| matches!(input.role, KernelOwnerEdgeRole::FlushPayload))
+                {
+                    if let Some(payload) = project_call_value_type(
+                        owner_index,
+                        payload.value,
+                        owners,
+                        artifact,
+                        public_results,
+                    ) {
+                        bases[index].push(payload);
+                    }
+                }
+            }
+            dependencies[index].sort_unstable();
+            dependencies[index].dedup();
+        }
+    }
+
+    let solved = solve_flush_graph(bases, dependencies);
+    owners
+        .iter()
+        .enumerate()
+        .map(|(owner, _)| {
+            solved[offsets[owner]..offsets[owner + 1]]
+                .to_vec()
+                .into_boxed_slice()
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn solve_flush_graph(bases: Vec<Vec<Type>>, dependencies: Vec<Vec<usize>>) -> Vec<Option<Type>> {
+    assert_eq!(bases.len(), dependencies.len());
+    let mut consumers = vec![Vec::<usize>::new(); dependencies.len()];
+    for (consumer, providers) in dependencies.iter().enumerate() {
+        for provider in providers {
+            consumers[*provider].push(consumer);
+        }
+    }
+    for row in &mut consumers {
+        row.sort_unstable();
+        row.dedup();
+    }
+
+    let mut values = vec![None; dependencies.len()];
+    let mut queued = vec![true; dependencies.len()];
+    let mut queue = (0..dependencies.len()).collect::<VecDeque<_>>();
+    while let Some(index) = queue.pop_front() {
+        queued[index] = false;
+        let mut candidates = bases[index].clone();
+        candidates.extend(
+            dependencies[index]
+                .iter()
+                .filter_map(|provider| values[*provider].clone()),
+        );
+        let next = match canonical_union_type(candidates) {
+            Type::Absent | Type::Unknown | Type::UnresolvedShape { .. } => None,
+            ty => Some(ty),
+        };
+        if values[index] == next {
+            continue;
+        }
+        values[index] = next;
+        for consumer in &consumers[index] {
+            if !queued[*consumer] {
+                queued[*consumer] = true;
+                queue.push_back(*consumer);
+            }
+        }
+    }
+    values
 }
 
 fn project_public_formals(
@@ -2803,6 +3011,10 @@ fn project_call_facts_and_diagnostics(
         let mut owner_call_facts = Vec::with_capacity(owner.calls.len());
         let mut diagnostics = owner.diagnostics.to_vec();
         for call in owner.calls.iter() {
+            let result_output = owner
+                .expressions
+                .get(call.expression.0 as usize)
+                .and_then(|output| artifact.output(*output));
             let substitutions = if let KernelCallTarget::User { target, .. } = call.target {
                 let target_formals = public_formals
                     .get(target.0 as usize)
@@ -2838,8 +3050,12 @@ fn project_call_facts_and_diagnostics(
                 {
                     actuals.push((inherited.target_ordinal, actual.ty.clone()));
                 }
-                let substitutions =
-                    derive_kernel_call_type_substitutions(target_formals, target_result, &actuals);
+                let substitutions = derive_kernel_call_type_substitutions(
+                    target_formals,
+                    target_result,
+                    &actuals,
+                    None,
+                );
                 // Inherited context has no authored call-input site. Its
                 // requirements are propagated through the separate formal
                 // requirement channel and are intentionally not diagnosed as
@@ -2900,15 +3116,25 @@ fn project_call_facts_and_diagnostics(
             } else {
                 Box::new([])
             };
-            let result_output = owner
-                .expressions
-                .get(call.expression.0 as usize)
-                .and_then(|output| artifact.output(*output));
             let result_is_concrete = result_output
                 .is_some_and(|output| type_has_concrete_outer_shape(&output.flow_type.ty));
+            let exact_structural_constructor = matches!(
+                &call.target,
+                KernelCallTarget::RenderConstructor { .. }
+                    | KernelCallTarget::PureBuiltin {
+                        kind: KernelPureBuiltinKind::RecordConstructor,
+                    }
+            );
             owner_call_facts.push(SolvedKernelCallFacts {
                 type_substitutions: substitutions,
-                syntax_discriminated_result: (call.syntax_discriminated_candidate
+                // CheckedCall exposes one existing exact-occurrence bit to
+                // OutNet. Besides a selected user-call result, a structural
+                // constructor is intrinsically occurrence-owned: its named
+                // arguments are part of the solved record even when the
+                // immutable ABI signature intentionally retains only a
+                // kind-only base contract.
+                syntax_discriminated_result: (exact_structural_constructor
+                    || call.syntax_discriminated_candidate
                     || (matches!(&call.target, KernelCallTarget::User { .. })
                         && result_output.is_some_and(|output| {
                             output.call_syntax_selected
@@ -3246,6 +3472,7 @@ fn materialize_project_definition(
     call_facts: Box<[SolvedKernelCallFacts]>,
     diagnostics: Box<[KernelDiagnosticArtifact]>,
     synthetic_state_ordinals: &[Option<u32>],
+    expression_flush_types: Box<[Option<Type>]>,
     owner_effects: &[KernelEffectSummary],
 ) -> DefinitionArtifact {
     let result = public_results[owner_index].clone();
@@ -3274,6 +3501,7 @@ fn materialize_project_definition(
     let expressions = materialize_expression_artifacts(
         owner.expression_artifacts,
         expression_flows,
+        expression_flush_types,
         owner_effects,
     );
     DefinitionArtifact {
@@ -3447,6 +3675,7 @@ fn validate_definition_linker_facts(
             matches!(
                 &node.kind,
                 KernelOwnerNodeKind::UserCall { .. }
+                    | KernelOwnerNodeKind::FieldProjection { .. }
                     | KernelOwnerNodeKind::RenderConstructor { .. }
                     | KernelOwnerNodeKind::PureBuiltin { .. }
                     | KernelOwnerNodeKind::FixedAbiCall { .. }
@@ -3495,6 +3724,7 @@ fn validate_definition_linker_facts(
             || !matches!(
                 &node.kind,
                 KernelOwnerNodeKind::UserCall { .. }
+                    | KernelOwnerNodeKind::FieldProjection { .. }
                     | KernelOwnerNodeKind::RenderConstructor { .. }
                     | KernelOwnerNodeKind::PureBuiltin { .. }
                     | KernelOwnerNodeKind::FixedAbiCall { .. }
@@ -3510,6 +3740,14 @@ fn validate_definition_linker_facts(
         {
             return Err(KernelOwnerBuildError::new(format!(
                 "kernel {label} host-effect expression {expression} spells `{}` but resolves `{operation}`",
+                call.function,
+            )));
+        }
+        if let KernelOwnerNodeKind::FieldProjection { field } = &node.kind
+            && call.function.as_ref() != format!("Field/{field}")
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} field projection expression {expression} spells `{}` but resolves `Field/{field}`",
                 call.function,
             )));
         }
@@ -3583,12 +3821,17 @@ fn validate_presentation_declaration_reference(
                 declaration.0,
             )))
         }
-        KernelDeclarationReference::OwnerPublic(_) if !project_definition => {
+        KernelDeclarationReference::OwnerPublic(_)
+        | KernelDeclarationReference::OwnerDeclaration { .. }
+            if !project_definition =>
+        {
             Err(KernelOwnerBuildError::new(format!(
                 "kernel {label} checked presentation imports a declaration in a standalone definition"
             )))
         }
-        KernelDeclarationReference::Local(_) | KernelDeclarationReference::OwnerPublic(_) => Ok(()),
+        KernelDeclarationReference::Local(_)
+        | KernelDeclarationReference::OwnerPublic(_)
+        | KernelDeclarationReference::OwnerDeclaration { .. } => Ok(()),
     }
 }
 
@@ -3842,7 +4085,8 @@ fn validate_definition_linkage(
             }
             Some(declaration)
         }
-        KernelDeclarationReference::OwnerPublic(_) => None,
+        KernelDeclarationReference::OwnerPublic(_)
+        | KernelDeclarationReference::OwnerDeclaration { .. } => None,
     };
     if result_expression != input.result || result_expression.0 as usize >= input.nodes.len() {
         return Err(KernelOwnerBuildError::new(format!(
@@ -4167,7 +4411,7 @@ pub fn compile_owner_program_with_definition_facts(
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
     validate_definition_linker_facts(input, facts, None)?;
-    let basis_fingerprint_v13 = definition_basis_fingerprint(input, facts)?;
+    let basis_fingerprint_v14 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
@@ -4186,9 +4430,10 @@ pub fn compile_owner_program_with_definition_facts(
     if facts.lexical_bindings.iter().any(|binding| {
         matches!(
             binding.target,
-            KernelLexicalBindingTargetInput::Declaration(KernelDeclarationReference::OwnerPublic(
-                _
-            ))
+            KernelLexicalBindingTargetInput::Declaration(
+                KernelDeclarationReference::OwnerPublic(_)
+                    | KernelDeclarationReference::OwnerDeclaration { .. }
+            )
         )
     }) {
         return Err(KernelOwnerBuildError::new(
@@ -4199,18 +4444,24 @@ pub fn compile_owner_program_with_definition_facts(
         matches!(
             source.declaration,
             KernelDeclarationReference::OwnerPublic(_)
+                | KernelDeclarationReference::OwnerDeclaration { .. }
         ) || matches!(source.statement, KernelStatementReference::OwnerPublic(_))
     }) || facts.states.iter().any(|state| {
         matches!(
             state.declaration,
             KernelDeclarationReference::OwnerPublic(_)
+                | KernelDeclarationReference::OwnerDeclaration { .. }
         ) || matches!(
             state.binding_declaration,
             KernelDeclarationReference::OwnerPublic(_)
+                | KernelDeclarationReference::OwnerDeclaration { .. }
         ) || matches!(state.statement, KernelStatementReference::OwnerPublic(_))
     }) || facts.lists.iter().any(|list| {
-        matches!(list.declaration, KernelDeclarationReference::OwnerPublic(_))
-            || matches!(list.statement, KernelStatementReference::OwnerPublic(_))
+        matches!(
+            list.declaration,
+            KernelDeclarationReference::OwnerPublic(_)
+                | KernelDeclarationReference::OwnerDeclaration { .. }
+        ) || matches!(list.statement, KernelStatementReference::OwnerPublic(_))
     }) {
         return Err(KernelOwnerBuildError::new(
             "standalone owner resources cannot reference another owner",
@@ -4337,13 +4588,59 @@ pub fn compile_owner_program_with_definition_facts(
         )?,
         effects: collect_host_effect_artifacts(input)?,
         diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
-        basis_fingerprint_v13,
+        basis_fingerprint_v14,
     })
+}
+
+fn materialize_expression_artifacts_with_local_flushes(
+    pending: Box<[PendingKernelExpressionArtifact]>,
+    flows: Box<[FlowType]>,
+    owner_effects: &[KernelEffectSummary],
+) -> Box<[KernelExpressionArtifact]> {
+    assert_eq!(pending.len(), flows.len());
+    let mut bases = vec![Vec::<Type>::new(); pending.len()];
+    let mut dependencies = vec![Vec::<usize>::new(); pending.len()];
+    for (index, expression) in pending.iter().enumerate() {
+        let carries_input_flush = |role: &KernelOwnerEdgeRole| match &expression.kind {
+            KernelOwnerNodeKind::Record { .. } | KernelOwnerNodeKind::Block => false,
+            KernelOwnerNodeKind::Hold => matches!(role, KernelOwnerEdgeRole::HoldUpdate),
+            _ => true,
+        };
+        for input in expression
+            .inputs
+            .iter()
+            .filter(|input| carries_input_flush(&input.role))
+        {
+            if let KernelValueReference::Local(provider) = input.value
+                && (provider.0 as usize) < pending.len()
+            {
+                dependencies[index].push(provider.0 as usize);
+            }
+        }
+        if matches!(expression.kind, KernelOwnerNodeKind::Flush) {
+            for payload in expression
+                .inputs
+                .iter()
+                .filter(|input| matches!(input.role, KernelOwnerEdgeRole::FlushPayload))
+            {
+                if let KernelValueReference::Local(payload) = payload.value
+                    && let Some(flow) = flows.get(payload.0 as usize)
+                {
+                    bases[index].push(flow.ty.clone());
+                }
+            }
+        }
+        dependencies[index].sort_unstable();
+        dependencies[index].dedup();
+    }
+    let flush_types = solve_flush_graph(bases, dependencies).into_boxed_slice();
+    materialize_expression_artifacts(pending, flows, flush_types, owner_effects)
 }
 
 fn materialize_expression_artifacts(
     pending: Box<[PendingKernelExpressionArtifact]>,
     flows: Box<[FlowType]>,
+    flush_types: Box<[Option<Type>]>,
     owner_effects: &[KernelEffectSummary],
 ) -> Box<[KernelExpressionArtifact]> {
     assert_eq!(
@@ -4351,18 +4648,26 @@ fn materialize_expression_artifacts(
         flows.len(),
         "every solved expression must retain one compact artifact row"
     );
+    assert_eq!(
+        pending.len(),
+        flush_types.len(),
+        "every solved expression must retain one compact FLUSH-control row"
+    );
     pending
         .into_vec()
         .into_iter()
         .zip(flows)
-        .map(|(expression, flow_type)| KernelExpressionArtifact {
-            effect: direct_expression_effect(&expression.kind, owner_effects),
-            id: expression.id,
-            kind: expression.kind,
-            inputs: expression.inputs,
-            flow_type,
-            flush_type: None,
-        })
+        .zip(flush_types)
+        .map(
+            |((expression, flow_type), flush_type)| KernelExpressionArtifact {
+                effect: direct_expression_effect(&expression.kind, owner_effects),
+                id: expression.id,
+                kind: expression.kind,
+                inputs: expression.inputs,
+                flow_type,
+                flush_type,
+            },
+        )
         .collect::<Vec<_>>()
         .into_boxed_slice()
 }
@@ -4998,6 +5303,7 @@ fn allocate_synthetic_state_ordinals(
             let anchor = match state.path.anchor {
                 KernelDeclarationReference::Local(_) => owner,
                 KernelDeclarationReference::OwnerPublic(owner) => owner,
+                KernelDeclarationReference::OwnerDeclaration { owner, .. } => owner,
             };
             let next = next_by_anchor.entry(anchor).or_default();
             let ordinal = *next;
@@ -5124,7 +5430,8 @@ fn materialize_resource_artifacts(
                     .and_then(|results| results.get(owner.0 as usize))
                     .filter(|result| matches!(result.ty, Type::List(_)))
                     .unwrap_or(producer),
-                KernelDeclarationReference::Local(_) => producer,
+                KernelDeclarationReference::Local(_)
+                | KernelDeclarationReference::OwnerDeclaration { .. } => producer,
             };
             let Type::List(item_type) = &authority.ty else {
                 unreachable!("a solved LIST literal must retain a List type")
@@ -5243,7 +5550,7 @@ fn materialize_user_call_type_substitutions(
         actuals.push((inherited.target_ordinal, actual.ty.clone()));
     }
 
-    derive_kernel_call_type_substitutions(target_formals, target_result, &actuals)
+    derive_kernel_call_type_substitutions(target_formals, target_result, &actuals, None)
 }
 
 /// Derive the canonical substitution environment for one callable
@@ -5254,6 +5561,7 @@ pub fn derive_kernel_call_type_substitutions(
     target_formals: &[FlowType],
     target_result: &FlowType,
     actuals: &[(u32, Type)],
+    actual_result: Option<&Type>,
 ) -> Box<[KernelCallTypeSubstitution]> {
     let mut parameter_ids = BTreeMap::new();
     for formal in target_formals {
@@ -5267,6 +5575,22 @@ pub fn derive_kernel_call_type_substitutions(
             continue;
         };
         match_call_type_pattern(&pattern.ty, actual, &mut substitutions);
+    }
+
+    // The quiescent occurrence result is the final authority for parameters
+    // that are both consumed and produced by an immutable ABI callable.
+    // Input-only matching is deliberately first-wins so ordinary
+    // equality-constrained user calls can diagnose a later incompatible
+    // argument and retain their OUT-frame authority. Collection mutators are
+    // different: their solved ABI result widens the input collection with the
+    // new item/entry. Re-match that result in an isolated map, then override
+    // only the parameters it actually exposes. This keeps CheckedCall
+    // substitutions coherent with CheckedCall.result without teaching
+    // semantic expansion about individual builtins.
+    if let Some(actual_result) = actual_result {
+        let mut result_substitutions = BTreeMap::new();
+        match_call_type_pattern(&target_result.ty, actual_result, &mut result_substitutions);
+        substitutions.extend(result_substitutions);
     }
 
     let mut substitutions = substitutions
@@ -5682,6 +6006,12 @@ fn collect_call_artifacts(
                     },
                     true,
                 ),
+                KernelOwnerNodeKind::FieldProjection { field } => (
+                    KernelCallTarget::FieldProjection {
+                        field: field.clone(),
+                    },
+                    true,
+                ),
                 _ => return None,
             };
             Some((|| {
@@ -5984,16 +6314,44 @@ pub fn compile_project_program_with_definition_facts(
             facts.len()
         )));
     }
-    for (definition, facts) in facts.iter().enumerate() {
-        validate_definition_linker_facts(&input.owners[definition], facts, Some(definition))?;
-        if let Some(KernelDeclarationReference::OwnerPublic(owner)) =
-            facts.linkage.public_declaration
-            && owner.0 as usize >= input.owners.len()
-        {
+    let validate_project_declaration = |reference: KernelDeclarationReference,
+                                        definition: usize,
+                                        context: &str|
+     -> Result<(), KernelOwnerBuildError> {
+        let (owner, declaration) = match reference {
+            KernelDeclarationReference::Local(_) => return Ok(()),
+            KernelDeclarationReference::OwnerPublic(owner) => (owner, None),
+            KernelDeclarationReference::OwnerDeclaration { owner, declaration } => {
+                (owner, Some(declaration))
+            }
+        };
+        let Some(target_facts) = facts.get(owner.0 as usize) else {
             return Err(KernelOwnerBuildError::new(format!(
-                "kernel definition {definition} direct-linker public declaration references missing owner {}",
+                "kernel definition {definition} {context} references missing owner {}",
                 owner.0
             )));
+        };
+        if let Some(declaration) = declaration
+            && target_facts
+                .declarations
+                .get(declaration.0 as usize)
+                .is_none_or(|target| target.id != declaration)
+        {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel definition {definition} {context} references missing declaration {} in owner {}",
+                declaration.0, owner.0
+            )));
+        }
+        Ok(())
+    };
+    for (definition, facts) in facts.iter().enumerate() {
+        validate_definition_linker_facts(&input.owners[definition], facts, Some(definition))?;
+        if let Some(reference) = facts.linkage.public_declaration {
+            validate_project_declaration(
+                reference,
+                definition,
+                "direct-linker public declaration",
+            )?;
         }
         for statement in &facts.statements {
             for child in &statement.children {
@@ -6008,27 +6366,16 @@ pub fn compile_project_program_with_definition_facts(
             }
         }
         for binding in &facts.lexical_bindings {
-            if let KernelLexicalBindingTargetInput::Declaration(
-                KernelDeclarationReference::OwnerPublic(owner),
-            ) = binding.target
-                && owner.0 as usize >= input.owners.len()
-            {
-                return Err(KernelOwnerBuildError::new(format!(
-                    "kernel definition {definition} lexical binding {} references missing owner {}",
-                    binding.expression.0, owner.0
-                )));
+            if let KernelLexicalBindingTargetInput::Declaration(reference) = binding.target {
+                validate_project_declaration(
+                    reference,
+                    definition,
+                    &format!("lexical binding {}", binding.expression.0),
+                )?;
             }
         }
         let validate_resource_owner = |reference: KernelDeclarationReference, context: &str| {
-            if let KernelDeclarationReference::OwnerPublic(owner) = reference
-                && owner.0 as usize >= input.owners.len()
-            {
-                return Err(KernelOwnerBuildError::new(format!(
-                    "kernel definition {definition} {context} references missing owner {}",
-                    owner.0
-                )));
-            }
-            Ok(())
+            validate_project_declaration(reference, definition, context)
         };
         let validate_resource_statement_owner =
             |reference: KernelStatementReference, context: &str| {
@@ -6317,7 +6664,7 @@ pub fn compile_project_program_with_definition_facts(
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice(),
                 syntax_discriminated_formals: syntax_discriminated_formals[owner_index].clone(),
-                basis_fingerprint_v13: definition_basis_fingerprint_with_buffer(
+                basis_fingerprint_v14: definition_basis_fingerprint_with_buffer(
                     owner,
                     &facts[owner_index],
                     &mut basis_fingerprint_scratch,
@@ -6876,6 +7223,9 @@ fn infer_static_variants(
                     | KernelPureBuiltinKind::Boolean
                     | KernelPureBuiltinKind::BoolToggle,
             } => Some(BTreeSet::from(["False".into(), "True".into()])),
+            KernelOwnerNodeKind::PureBuiltin {
+                kind: KernelPureBuiltinKind::StreamPulses,
+            } => Some(BTreeSet::from(["Pulse".into()])),
             _ => None,
         };
     }
@@ -10809,6 +11159,28 @@ fn compile_node(
                 ModeEquation::Copy(instance.expression_modes[result]),
             );
         }
+        KernelOwnerNodeKind::FieldProjection { field } => {
+            let mut providers = node.inputs.iter().filter(|edge| {
+                matches!(
+                    &edge.role,
+                    KernelOwnerEdgeRole::AbiArgument { name }
+                        if matches!(name.as_ref(), "$pipe" | "input")
+                )
+            });
+            let provider = providers.next().ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} field projection has no provider"
+                ))
+            })?;
+            if providers.next().is_some() || node.inputs.len() != 1 {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} field projection must have exactly one provider"
+                )));
+            }
+            let provider = edge_variable(context, index, provider)?;
+            let field = builder.terms_mut().intern_name(field);
+            builder.add_projection_into(provider, [field], output);
+        }
         KernelOwnerNodeKind::RenderConstructor { kind } => {
             let mut fields = Vec::with_capacity(node.inputs.len() + 1);
             let mut direction = None;
@@ -10919,6 +11291,42 @@ fn compile_node(
                         ))
                     })
             };
+            let map_argument = || {
+                arguments
+                    .get("$pipe")
+                    .or_else(|| arguments.get("map"))
+                    .copied()
+                    .ok_or_else(|| {
+                        KernelOwnerBuildError::new(format!(
+                            "kernel owner {} node {index} map builtin omits its `$pipe`/`map` input",
+                            context.owner.0
+                        ))
+                    })
+            };
+            let set_argument = || {
+                arguments
+                    .get("$pipe")
+                    .or_else(|| arguments.get("set"))
+                    .copied()
+                    .ok_or_else(|| {
+                        KernelOwnerBuildError::new(format!(
+                            "kernel owner {} node {index} set builtin omits its `$pipe`/`set` input",
+                            context.owner.0
+                        ))
+                    })
+            };
+            let stream_argument = || {
+                arguments
+                    .get("$pipe")
+                    .or_else(|| arguments.get("stream"))
+                    .copied()
+                    .ok_or_else(|| {
+                        KernelOwnerBuildError::new(format!(
+                            "kernel owner {} node {index} stream builtin omits its `$pipe`/`stream` input",
+                            context.owner.0
+                        ))
+                    })
+            };
             if matches!(
                 kind,
                 KernelPureBuiltinKind::ListPredicate
@@ -10950,6 +11358,43 @@ fn compile_node(
                     KernelCollectionOperationKind::List,
                     [existing_item, appended_item],
                     [],
+                );
+                return Ok(());
+            }
+            if matches!(kind, KernelPureBuiltinKind::SetAdd) {
+                let set = set_argument()?;
+                let existing_item = builder.new_authoritative_provider();
+                builder.add_collection_item_projection(set, existing_item);
+                let existing_item = builder.variable_term(existing_item);
+                let added_item = builder.variable_term(argument("item")?);
+                builder.add_collection(
+                    output,
+                    KernelCollectionOperationKind::Set,
+                    [existing_item, added_item],
+                    [],
+                );
+                return Ok(());
+            }
+            if matches!(kind, KernelPureBuiltinKind::MapUpsert) {
+                let map = map_argument()?;
+                let entry = argument("entry")?;
+                let existing_key = builder.new_authoritative_provider();
+                let existing_value = builder.new_authoritative_provider();
+                builder.add_map_key_projection(map, existing_key);
+                builder.add_map_value_projection(map, existing_value);
+                let existing_key_term = builder.variable_term(existing_key);
+                let existing_value_term = builder.variable_term(existing_value);
+                let key_name = builder.terms_mut().intern_name("key");
+                let value_name = builder.terms_mut().intern_name("value");
+                let entry_key = builder.add_projection(entry, [key_name]);
+                let entry_value = builder.add_projection(entry, [value_name]);
+                let entry_key_term = builder.variable_term(entry_key);
+                let entry_value_term = builder.variable_term(entry_value);
+                builder.add_collection(
+                    output,
+                    KernelCollectionOperationKind::Map,
+                    [existing_key_term, entry_key_term],
+                    [existing_value_term, entry_value_term],
                 );
                 return Ok(());
             }
@@ -10995,13 +11440,13 @@ fn compile_node(
                 }
                 KernelPureBuiltinKind::ListFind => {
                     let item = builder.variable_term(argument("item")?);
-                    let value = builder.terms_mut().intern_name("value");
-                    let fields = builder.terms_mut().object([(value, item)], false);
-                    let found = builder.terms_mut().tagged_variant("Found", fields);
-                    let not_found = builder.terms_mut().variant_tag("NotFound");
-                    builder
-                        .terms_mut()
-                        .variant_set_preserving_order([found, not_found])
+                    found_or_not_found_type(builder, item)
+                }
+                KernelPureBuiltinKind::ListGet => {
+                    let item = builder.new_authoritative_provider();
+                    builder.add_collection_item_projection(list_argument()?, item);
+                    let item = builder.variable_term(item);
+                    found_or_not_found_type(builder, item)
                 }
                 KernelPureBuiltinKind::ListLatest => {
                     let item = builder.new_authoritative_provider();
@@ -11021,6 +11466,59 @@ fn compile_node(
                         .terms_mut()
                         .object([(label_name, label), (items_name, items)], false);
                     builder.terms_mut().list(chunk)
+                }
+                KernelPureBuiltinKind::MapGet => {
+                    let map = map_argument()?;
+                    let key = argument("key")?;
+                    let map_key = builder.new_authoritative_provider();
+                    let value = builder.new_authoritative_provider();
+                    builder.add_map_key_projection(map, map_key);
+                    builder.add_map_value_projection(map, value);
+                    let key_term = builder.variable_term(key);
+                    let map_key_term = builder.variable_term(map_key);
+                    let value_term = builder.variable_term(value);
+                    builder.add_unify(key_term, map_key_term);
+                    found_or_not_found_type(builder, value_term)
+                }
+                KernelPureBuiltinKind::MapRemove => {
+                    let map = map_argument()?;
+                    let key = argument("key")?;
+                    let map_key = builder.new_authoritative_provider();
+                    builder.add_map_key_projection(map, map_key);
+                    let key_term = builder.variable_term(key);
+                    let map_key_term = builder.variable_term(map_key);
+                    let map_term = builder.variable_term(map);
+                    builder.add_unify(key_term, map_key_term);
+                    map_term
+                }
+                KernelPureBuiltinKind::SetRemove => {
+                    let set = set_argument()?;
+                    let item = argument("item")?;
+                    let existing_item = builder.new_authoritative_provider();
+                    builder.add_collection_item_projection(set, existing_item);
+                    let item_term = builder.variable_term(item);
+                    let existing_item_term = builder.variable_term(existing_item);
+                    let set_term = builder.variable_term(set);
+                    builder.add_unify(item_term, existing_item_term);
+                    set_term
+                }
+                KernelPureBuiltinKind::SetContains => {
+                    let set = set_argument()?;
+                    let item = argument("item")?;
+                    let existing_item = builder.new_authoritative_provider();
+                    builder.add_collection_item_projection(set, existing_item);
+                    let item_term = builder.variable_term(item);
+                    let existing_item_term = builder.variable_term(existing_item);
+                    builder.add_unify(item_term, existing_item_term);
+                    boolean_type(builder)
+                }
+                KernelPureBuiltinKind::StreamPulses => {
+                    let pulse = builder.terms_mut().variant_tag("Pulse");
+                    builder.terms_mut().variant_set([pulse])
+                }
+                KernelPureBuiltinKind::StreamSkip => builder.variable_term(stream_argument()?),
+                KernelPureBuiltinKind::MapUpsert | KernelPureBuiltinKind::SetAdd => {
+                    unreachable!("handled above")
                 }
             };
             builder.add_publish(output, [result], PublishMode::Replace);
@@ -11277,6 +11775,20 @@ fn compile_node(
                 |role| matches!(role, KernelOwnerEdgeRole::ArrowOutput),
                 PublishMode::Replace,
             )?;
+        }
+        KernelOwnerNodeKind::Flush => {
+            let payloads = node
+                .inputs
+                .iter()
+                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::FlushPayload))
+                .count();
+            if payloads != 1 || node.inputs.len() != 1 {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} FLUSH must have exactly one payload; found {payloads}",
+                )));
+            }
+            let absent = builder.terms().absent();
+            builder.add_publish(output, [absent], PublishMode::Replace);
         }
         KernelOwnerNodeKind::Delimiter => {
             // `[]` is a contextual syntax hole, not the runtime type Unknown.
@@ -11604,6 +12116,9 @@ fn node_mode_equation(
         } => copy(
             |role| matches!(role, KernelOwnerEdgeRole::AbiArgument { name } if matches!(name.as_ref(), "$pipe" | "list")),
         ),
+        KernelOwnerNodeKind::FieldProjection { .. } => copy(
+            |role| matches!(role, KernelOwnerEdgeRole::AbiArgument { name } if matches!(name.as_ref(), "$pipe" | "input")),
+        ),
         KernelOwnerNodeKind::UserCall { .. } => Err(KernelOwnerBuildError::new(format!(
             "kernel owner node {node_index} user-call mode must come from its invocation"
         ))),
@@ -11626,6 +12141,7 @@ fn node_mode_equation(
         | KernelOwnerNodeKind::Then
         | KernelOwnerNodeKind::Infix { .. }
         | KernelOwnerNodeKind::Hold
+        | KernelOwnerNodeKind::Flush
         | KernelOwnerNodeKind::Delimiter
         | KernelOwnerNodeKind::Unknown => Ok(ModeEquation::Fixed(node.mode)),
     }
@@ -11678,6 +12194,19 @@ fn boolean_type(builder: &mut ComponentProgramBuilder) -> crate::TypeTermId {
     let false_tag = builder.terms_mut().variant_tag("False");
     let true_tag = builder.terms_mut().variant_tag("True");
     builder.terms_mut().variant_set([false_tag, true_tag])
+}
+
+fn found_or_not_found_type(
+    builder: &mut ComponentProgramBuilder,
+    item: crate::TypeTermId,
+) -> crate::TypeTermId {
+    let value = builder.terms_mut().intern_name("value");
+    let fields = builder.terms_mut().object([(value, item)], false);
+    let found = builder.terms_mut().tagged_variant("Found", fields);
+    let not_found = builder.terms_mut().variant_tag("NotFound");
+    builder
+        .terms_mut()
+        .variant_set_preserving_order([found, not_found])
 }
 
 fn parsed_number_type(builder: &mut ComponentProgramBuilder) -> crate::TypeTermId {
@@ -11917,6 +12446,7 @@ fn pure_builtin_argument_requirement(
         | KernelPureBuiltinKind::ListFilter
         | KernelPureBuiltinKind::ListMap
         | KernelPureBuiltinKind::ListFind
+        | KernelPureBuiltinKind::ListGet
         | KernelPureBuiltinKind::ListLatest
         | KernelPureBuiltinKind::ListAppend
         | KernelPureBuiltinKind::ListSort
@@ -11931,15 +12461,29 @@ fn pure_builtin_argument_requirement(
             Some(boolean_type(builder))
         }
         KernelPureBuiltinKind::ListChunk if name == "size" => Some(builder.terms().number()),
+        KernelPureBuiltinKind::ListGet if name == "position" => Some(builder.terms().number()),
         KernelPureBuiltinKind::ListLength
         | KernelPureBuiltinKind::ListPredicate
         | KernelPureBuiltinKind::ListFilter
         | KernelPureBuiltinKind::ListMap
         | KernelPureBuiltinKind::ListFind
+        | KernelPureBuiltinKind::ListGet
         | KernelPureBuiltinKind::ListLatest
         | KernelPureBuiltinKind::ListAppend
         | KernelPureBuiltinKind::ListSort
         | KernelPureBuiltinKind::ListChunk => None,
+        KernelPureBuiltinKind::MapGet
+        | KernelPureBuiltinKind::MapUpsert
+        | KernelPureBuiltinKind::MapRemove
+        | KernelPureBuiltinKind::SetAdd
+        | KernelPureBuiltinKind::SetRemove
+        | KernelPureBuiltinKind::SetContains => None,
+        KernelPureBuiltinKind::StreamPulses if matches!(name, "$pipe" | "count") => {
+            Some(builder.terms().number())
+        }
+        KernelPureBuiltinKind::StreamPulses => None,
+        KernelPureBuiltinKind::StreamSkip if name == "count" => Some(builder.terms().number()),
+        KernelPureBuiltinKind::StreamSkip => None,
     }
 }
 
@@ -13449,13 +13993,65 @@ fn checked_expression_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boon_checked::{ObjectShape, Type, Variant};
+    use boon_checked::{ObjectShape, Type, TypeVar, Variant};
 
     fn edge(role: KernelOwnerEdgeRole, expression: u32) -> KernelOwnerInputEdge {
         KernelOwnerInputEdge {
             role,
             expression: KernelExpressionId(expression),
         }
+    }
+
+    #[test]
+    fn solved_call_result_owns_a_widened_generic_substitution() {
+        let variable = TypeVar(0);
+        let admin = Type::VariantSet(vec![Variant::Tag("Admin".to_owned())].into());
+        let editor = Type::VariantSet(vec![Variant::Tag("Editor".to_owned())].into());
+        let widened = Type::VariantSet(
+            vec![
+                Variant::Tag("Admin".to_owned()),
+                Variant::Tag("Editor".to_owned()),
+            ]
+            .into(),
+        );
+        let formals = [
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Set(Type::shared(Type::Var(variable))),
+            },
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Var(variable),
+            },
+        ];
+        let result = FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::Set(Type::shared(Type::Var(variable))),
+        };
+        let actuals = [(0, Type::Set(Type::shared(admin.clone()))), (1, editor)];
+
+        assert_eq!(
+            derive_kernel_call_type_substitutions(&formals, &result, &actuals, None).as_ref(),
+            [KernelCallTypeSubstitution {
+                variable: KernelTypeParameterId(0),
+                value: admin,
+            }],
+            "input matching remains first-wins for argument diagnostics",
+        );
+        assert_eq!(
+            derive_kernel_call_type_substitutions(
+                &formals,
+                &result,
+                &actuals,
+                Some(&Type::Set(Type::shared(widened.clone()))),
+            )
+            .as_ref(),
+            [KernelCallTypeSubstitution {
+                variable: KernelTypeParameterId(0),
+                value: widened,
+            }],
+            "the quiescent result must own parameters exposed by the result scheme",
+        );
     }
 
     #[test]
@@ -13872,16 +14468,16 @@ mod tests {
             render_slot.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            artifact.currentness.basis_fingerprint_v13,
-            render_slot.currentness.basis_fingerprint_v13,
+            artifact.currentness.basis_fingerprint_v14,
+            render_slot.currentness.basis_fingerprint_v14,
         );
         assert_ne!(
-            artifact.currentness.artifact_fingerprint_v15,
-            render_slot.currentness.artifact_fingerprint_v15,
+            artifact.currentness.artifact_fingerprint_v16,
+            render_slot.currentness.artifact_fingerprint_v16,
         );
         assert_ne!(
-            artifact.currentness.fingerprint_v15,
-            render_slot.currentness.fingerprint_v15,
+            artifact.currentness.fingerprint_v16,
+            render_slot.currentness.fingerprint_v16,
         );
 
         let mut invalid = facts.clone();
@@ -13962,16 +14558,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v13,
-            moved.currentness.basis_fingerprint_v13
+            solved.currentness.basis_fingerprint_v14,
+            moved.currentness.basis_fingerprint_v14
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v15,
-            moved.currentness.artifact_fingerprint_v15
+            solved.currentness.artifact_fingerprint_v16,
+            moved.currentness.artifact_fingerprint_v16
         );
         assert_ne!(
-            solved.currentness.fingerprint_v15,
-            moved.currentness.fingerprint_v15
+            solved.currentness.fingerprint_v16,
+            moved.currentness.fingerprint_v16
         );
 
         let mut missing = facts.clone();
@@ -14056,16 +14652,16 @@ mod tests {
             moved.currentness.public_result_fingerprint_v1
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v13,
-            moved.currentness.basis_fingerprint_v13
+            solved.currentness.basis_fingerprint_v14,
+            moved.currentness.basis_fingerprint_v14
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v15,
-            moved.currentness.artifact_fingerprint_v15
+            solved.currentness.artifact_fingerprint_v16,
+            moved.currentness.artifact_fingerprint_v16
         );
         assert_ne!(
-            solved.currentness.fingerprint_v15,
-            moved.currentness.fingerprint_v15
+            solved.currentness.fingerprint_v16,
+            moved.currentness.fingerprint_v16
         );
 
         let mut missing = facts.clone();
@@ -14163,16 +14759,16 @@ mod tests {
             edited.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v13,
-            edited.currentness.basis_fingerprint_v13,
+            solved.currentness.basis_fingerprint_v14,
+            edited.currentness.basis_fingerprint_v14,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v15,
-            edited.currentness.artifact_fingerprint_v15,
+            solved.currentness.artifact_fingerprint_v16,
+            edited.currentness.artifact_fingerprint_v16,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v15,
-            edited.currentness.fingerprint_v15,
+            solved.currentness.fingerprint_v16,
+            edited.currentness.fingerprint_v16,
         );
 
         let mut missing = facts.clone();
@@ -14311,16 +14907,16 @@ mod tests {
             renamed.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v13,
-            renamed.currentness.basis_fingerprint_v13,
+            solved.currentness.basis_fingerprint_v14,
+            renamed.currentness.basis_fingerprint_v14,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v15,
-            renamed.currentness.artifact_fingerprint_v15,
+            solved.currentness.artifact_fingerprint_v16,
+            renamed.currentness.artifact_fingerprint_v16,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v15,
-            renamed.currentness.fingerprint_v15,
+            solved.currentness.fingerprint_v16,
+            renamed.currentness.fingerprint_v16,
         );
 
         let mut moved_occurrence = facts.clone();
@@ -14337,16 +14933,16 @@ mod tests {
             moved_occurrence.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v13,
-            moved_occurrence.currentness.basis_fingerprint_v13,
+            solved.currentness.basis_fingerprint_v14,
+            moved_occurrence.currentness.basis_fingerprint_v14,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v15,
-            moved_occurrence.currentness.artifact_fingerprint_v15,
+            solved.currentness.artifact_fingerprint_v16,
+            moved_occurrence.currentness.artifact_fingerprint_v16,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v15,
-            moved_occurrence.currentness.fingerprint_v15,
+            solved.currentness.fingerprint_v16,
+            moved_occurrence.currentness.fingerprint_v16,
         );
 
         let mut partial = facts.clone();
@@ -14551,16 +15147,16 @@ mod tests {
             different_selector.currentness.public_result_fingerprint_v1,
         );
         assert_ne!(
-            solved.currentness.basis_fingerprint_v13,
-            different_selector.currentness.basis_fingerprint_v13,
+            solved.currentness.basis_fingerprint_v14,
+            different_selector.currentness.basis_fingerprint_v14,
         );
         assert_ne!(
-            solved.currentness.artifact_fingerprint_v15,
-            different_selector.currentness.artifact_fingerprint_v15,
+            solved.currentness.artifact_fingerprint_v16,
+            different_selector.currentness.artifact_fingerprint_v16,
         );
         assert_ne!(
-            solved.currentness.fingerprint_v15,
-            different_selector.currentness.fingerprint_v15,
+            solved.currentness.fingerprint_v16,
+            different_selector.currentness.fingerprint_v16,
         );
 
         let mut partial = facts.clone();
@@ -18157,6 +18753,53 @@ mod tests {
             ))
         );
         assert!(artifact.work.activations < 16);
+    }
+
+    #[test]
+    fn project_program_rejects_a_missing_exact_cross_owner_declaration() {
+        let owner = || KernelOwnerProgramInput {
+            nodes: vec![KernelOwnerNode {
+                kind: KernelOwnerNodeKind::Number,
+                inputs: Box::new([]),
+                mode: FlowMode::Continuous,
+            }]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(0),
+        };
+        let facts = [
+            KernelDefinitionFactsInput::default(),
+            KernelDefinitionFactsInput {
+                lexical_bindings: vec![KernelLexicalBindingInput {
+                    expression: KernelExpressionId(0),
+                    target: KernelLexicalBindingTargetInput::Declaration(
+                        KernelDeclarationReference::OwnerDeclaration {
+                            owner: KernelOwnerId(0),
+                            declaration: KernelDeclarationId(0),
+                        },
+                    ),
+                    projection: Box::new([]),
+                    access: KernelLexicalAccess::Read,
+                }]
+                .into_boxed_slice(),
+                ..KernelDefinitionFactsInput::default()
+            },
+        ];
+
+        let error = compile_project_program_with_definition_facts(
+            &KernelProjectProgramInput {
+                owners: vec![owner(), owner()].into_boxed_slice(),
+            },
+            &facts,
+        )
+        .expect_err("an exact declaration import must resolve to a target row");
+        assert!(
+            error
+                .to_string()
+                .contains("references missing declaration 0 in owner 0"),
+            "unexpected validation error: {error}"
+        );
     }
 
     #[test]

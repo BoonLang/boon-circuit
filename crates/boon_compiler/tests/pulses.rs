@@ -349,11 +349,30 @@ fn canonical_fibonacci_pulses_cross_the_verified_ir_spine() {
 
 #[test]
 fn canonical_fibonacci_pulses_lower_into_a_verified_machine_plan() {
-    let compiled = compile_test_source(
+    let checked = boon_compiler::check_source(boon_compiler::CompilerCheckRequest::source_text(
         "fibonacci-pulses.bn",
         CANONICAL_FIBONACCI,
-        boon_plan::TargetProfile::SoftwareDefault,
         boon_plan::ProgramRole::Server,
+    ))
+    .expect("checked Fibonacci");
+    let fields = checked
+        .output
+        .checked_program_fields()
+        .expect("checked Fibonacci fields");
+    let [state] = fields.states.as_slice() else {
+        panic!("canonical Fibonacci must have one checked HOLD state");
+    };
+    assert!(
+        boon_checked::type_is_recursively_closed(&state.flow_type.ty),
+        "canonical Fibonacci HOLD must be closed before semantic lowering: {state:#?}"
+    );
+    let compiled = boon_compiler::finish_checked_machine_plan(
+        checked,
+        boon_compiler::CheckedCompileRequest::new(
+            boon_plan::TargetProfile::SoftwareDefault,
+            boon_plan::ProgramRole::Server,
+            boon_plan::ApplicationIdentity::compiler_default(),
+        ),
     )
     .expect("compiled Fibonacci MachinePlan");
     let plan = &compiled.plan;

@@ -2094,9 +2094,14 @@ pub(crate) fn derive_semantic_execution_graph(
                     ))
                 })?;
             refine_runtime_occurrence_type(&checked.ty, &runtime.ty).map_err(|error| {
+                let checked_expression = builder.expressions[value.as_usize()].checked_expr_id;
                 ExpansionError::InvalidLocalBindings(format!(
-                    "semantic field statement {semantic_statement} checked type {:?} is incompatible with contextual value {value} type {:?}: {error}",
-                    checked.ty, runtime.ty,
+                    "semantic field statement {semantic_statement} from checked statement {} value expression {} expands checked expression {} with type {:?}, incompatible with checked declaration type {:?}: {error}",
+                    statement.id.0,
+                    statement.value.map_or(u32::MAX, |value| value.0),
+                    checked_expression.0,
+                    runtime.ty,
+                    checked.ty,
                 ))
             })?;
             // A semantic statement is a runtime occurrence, not a checked

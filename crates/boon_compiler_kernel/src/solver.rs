@@ -1,10 +1,10 @@
 use crate::{
     ArtifactOutput, ComponentArtifact, ComponentProgram, KERNEL_SUMMARY_DEFINITION_RANKING_LEN,
-    KernelCollectionOperationKind, KernelOperation, KernelPattern, KernelRecordEntry,
-    KernelSelectArm, KernelSolveWork, KernelSummaryCallInput, KernelSummaryDefinitionWork,
-    KernelSummaryNode, KernelSummaryProgram, KernelSummaryRecordEntry, NameId, OperationId,
-    ProgramConsumer, ProgramOperationRef, PublishMode, ResidualOperationFrame, TypeTerm,
-    TypeTermId, TypeVariableId, VariantTerm,
+    KernelCollectionOperationKind, KernelCollectionProjectionKind, KernelOperation, KernelPattern,
+    KernelRecordEntry, KernelSelectArm, KernelSolveWork, KernelSummaryCallInput,
+    KernelSummaryDefinitionWork, KernelSummaryNode, KernelSummaryProgram, KernelSummaryRecordEntry,
+    NameId, OperationId, ProgramConsumer, ProgramOperationRef, PublishMode, ResidualOperationFrame,
+    TypeTerm, TypeTermId, TypeVariableId, VariantTerm,
 };
 use boon_checked::FlowType;
 use std::collections::VecDeque;
@@ -93,7 +93,7 @@ fn validate_single_writers(program: &ComponentProgram) -> Result<(), KernelSolve
             KernelOperation::Alias { consumer, .. }
             | KernelOperation::Projection { consumer, .. }
             | KernelOperation::PatternProjection { consumer, .. }
-            | KernelOperation::CollectionItemProjection { consumer, .. } => Some(*consumer),
+            | KernelOperation::CollectionProjection { consumer, .. } => Some(*consumer),
             KernelOperation::Select { output, .. }
             | KernelOperation::Record { output, .. }
             | KernelOperation::Collection { output, .. }
@@ -564,9 +564,7 @@ impl ComponentSolver {
             KernelOperation::Publish { .. } => &mut self.work.publish_activations,
             KernelOperation::Projection { .. }
             | KernelOperation::PatternProjection { .. }
-            | KernelOperation::CollectionItemProjection { .. } => {
-                &mut self.work.projection_activations
-            }
+            | KernelOperation::CollectionProjection { .. } => &mut self.work.projection_activations,
             KernelOperation::Collection { .. } => &mut self.work.publish_activations,
             KernelOperation::Select { .. } => &mut self.work.select_activations,
             KernelOperation::Record { .. } | KernelOperation::SummaryCall { .. } => {
@@ -606,9 +604,11 @@ impl ComponentSolver {
                 fields,
                 consumer,
             } => self.project_pattern(*provider, pattern, fields, *consumer),
-            KernelOperation::CollectionItemProjection { provider, consumer } => {
-                self.project_collection_item(*provider, *consumer)
-            }
+            KernelOperation::CollectionProjection {
+                provider,
+                kind,
+                consumer,
+            } => self.project_collection_component(*provider, *kind, *consumer),
             KernelOperation::Collection {
                 output,
                 kind,
@@ -683,8 +683,12 @@ impl ComponentSolver {
                     .collect::<Vec<_>>();
                 self.project_pattern(variable(*provider), pattern, &fields, variable(*consumer));
             }
-            KernelOperation::CollectionItemProjection { provider, consumer } => {
-                self.project_collection_item(variable(*provider), variable(*consumer));
+            KernelOperation::CollectionProjection {
+                provider,
+                kind,
+                consumer,
+            } => {
+                self.project_collection_component(variable(*provider), *kind, variable(*consumer));
             }
             KernelOperation::Collection {
                 output,
@@ -1218,7 +1222,12 @@ impl ComponentSolver {
         }
     }
 
-    fn project_collection_item(&mut self, provider: TypeVariableId, consumer: TypeVariableId) {
+    fn project_collection_component(
+        &mut self,
+        provider: TypeVariableId,
+        kind: KernelCollectionProjectionKind,
+        consumer: TypeVariableId,
+    ) {
         let syntax_selected = self.variable_syntax_selected(provider);
         self.set_syntax_selected(consumer, syntax_selected);
         let provider = self.root(provider);
@@ -1228,35 +1237,41 @@ impl ComponentSolver {
         if authoritative && matches!(self.program.terms.term(resolved), TypeTerm::Variable(_)) {
             return;
         }
-        let projected = self.collection_item_type(resolved);
+        let projected = self.collection_component_type(resolved, kind);
         match projected {
             Some(projected) if authoritative => {
                 self.replace_binding(consumer, projected, true);
             }
             Some(projected) => self.bind_equal(consumer, projected),
             None if authoritative => {
-                let missing = self
-                    .program
-                    .terms
-                    .unresolved_shape("authoritative provider is not a collection");
+                let missing = self.program.terms.unresolved_shape(
+                    "authoritative provider lacks the requested collection component",
+                );
                 self.replace_binding(consumer, missing, true);
             }
             None => {}
         }
     }
 
-    fn collection_item_type(&mut self, provider: TypeTermId) -> Option<TypeTermId> {
+    fn collection_component_type(
+        &mut self,
+        provider: TypeTermId,
+        kind: KernelCollectionProjectionKind,
+    ) -> Option<TypeTermId> {
         let provider = self.resolve_term_head(provider);
-        match self.program.terms.term(provider).clone() {
-            TypeTerm::List(item) | TypeTerm::Set(item) => Some(item),
-            TypeTerm::Union(members) => {
+        match (kind, self.program.terms.term(provider).clone()) {
+            (KernelCollectionProjectionKind::Item, TypeTerm::List(item))
+            | (KernelCollectionProjectionKind::Item, TypeTerm::Set(item)) => Some(item),
+            (KernelCollectionProjectionKind::MapKey, TypeTerm::Map { key, .. }) => Some(key),
+            (KernelCollectionProjectionKind::MapValue, TypeTerm::Map { value, .. }) => Some(value),
+            (_, TypeTerm::Union(members)) => {
                 let items = members
                     .iter()
-                    .filter_map(|member| self.collection_item_type(*member))
+                    .filter_map(|member| self.collection_component_type(*member, kind))
                     .collect::<Vec<_>>();
                 (!items.is_empty()).then(|| self.program.terms.union(items))
             }
-            TypeTerm::Variable(_) | TypeTerm::Unknown | TypeTerm::UnresolvedShape(_) => None,
+            (_, TypeTerm::Variable(_) | TypeTerm::Unknown | TypeTerm::UnresolvedShape(_)) => None,
             _ => None,
         }
     }
@@ -3430,6 +3445,40 @@ mod tests {
         );
         assert_eq!(artifact.work.operations, 2);
         assert!(artifact.work.activations < 10);
+    }
+
+    #[test]
+    fn cyclic_structural_publisher_does_not_absorb_projection_scaffolds() {
+        let mut builder = ComponentProgramBuilder::new();
+        let state = builder.new_variable();
+        let previous = builder.terms_mut().intern_name("previous");
+        let current = builder.terms_mut().intern_name("current");
+        let previous_read = builder.add_projection(state, [previous]);
+        let current_read = builder.add_projection(state, [current]);
+
+        let number = builder.terms().number();
+        let initial = builder
+            .terms_mut()
+            .object([(previous, number), (current, number)], false);
+        let previous_read = builder.variable_term(previous_read);
+        let current_read = builder.variable_term(current_read);
+        let update = builder
+            .terms_mut()
+            .object([(previous, current_read), (current, previous_read)], false);
+        builder.add_publish(state, [initial, update], PublishMode::StructuralWiden);
+        let output = builder.add_output(state, FlowMode::Continuous);
+
+        let artifact = solve_component(builder.finish()).unwrap();
+        assert_eq!(
+            artifact.output(output).unwrap().flow_type.ty,
+            Type::object(ObjectShape::from_ordered_fields(
+                [
+                    ("previous".to_owned(), Type::Number),
+                    ("current".to_owned(), Type::Number),
+                ],
+                false,
+            ))
+        );
     }
 
     #[test]

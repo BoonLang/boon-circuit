@@ -2282,7 +2282,8 @@ impl KernelCheckedLinkLayout {
                     KernelCallTarget::RenderConstructor { .. }
                     | KernelCallTarget::PureBuiltin { .. }
                     | KernelCallTarget::FixedAbi
-                    | KernelCallTarget::HostEffect { .. } => {
+                    | KernelCallTarget::HostEffect { .. }
+                    | KernelCallTarget::FieldProjection { .. } => {
                         self.abi_callable(&syntax.function)?.declaration
                     }
                 };
@@ -2580,7 +2581,8 @@ impl KernelCheckedLinkLayout {
                         KernelCallTarget::RenderConstructor { .. }
                         | KernelCallTarget::PureBuiltin { .. }
                         | KernelCallTarget::FixedAbi
-                        | KernelCallTarget::HostEffect { .. } => {
+                        | KernelCallTarget::HostEffect { .. }
+                        | KernelCallTarget::FieldProjection { .. } => {
                             let contract =
                                 project.abi().callable(&syntax.function).ok_or_else(|| {
                                     KernelCheckedLinkError::new(format!(
@@ -2603,10 +2605,28 @@ impl KernelCheckedLinkLayout {
                                 .iter()
                                 .map(|parameter| parameter.flow_type.clone())
                                 .collect::<Vec<_>>();
+                            let actual_result = matches!(
+                                &call.target,
+                                KernelCallTarget::PureBuiltin {
+                                    kind: crate::KernelPureBuiltinKind::ListAppend
+                                        | crate::KernelPureBuiltinKind::MapUpsert
+                                        | crate::KernelPureBuiltinKind::SetAdd,
+                                }
+                            )
+                            .then(|| {
+                                value_flow_authority(
+                                    snapshot,
+                                    owner,
+                                    KernelValueReference::Local(call.expression),
+                                )
+                                .map(|(_, result)| result)
+                            })
+                            .transpose()?;
                             let substitutions = derive_kernel_call_type_substitutions(
                                 &formals,
                                 &contract.result,
                                 &actuals,
+                                actual_result.as_ref().map(|result| &result.ty),
                             )
                             .into_vec();
                             (
@@ -2923,6 +2943,11 @@ impl KernelCheckedLinkLayout {
             KernelDeclarationReference::OwnerPublic(owner) => {
                 Ok(self.definition(owner)?.public_declaration)
             }
+            KernelDeclarationReference::OwnerDeclaration { owner, declaration } => Ok(DeclId(
+                self.definition(owner)?
+                    .declarations
+                    .resolve(declaration.0, "external declaration")?,
+            )),
         }
     }
 
@@ -3813,6 +3838,9 @@ fn checked_expression_kind(
         crate::KernelOwnerNodeKind::Arrow => CheckedExpressionKind::Invalid {
             tokens: vec!["unconsumed_arrow".to_owned()],
         },
+        crate::KernelOwnerNodeKind::Flush => CheckedExpressionKind::Flush {
+            payload: one_input(&crate::KernelOwnerEdgeRole::FlushPayload, "FLUSH payload")?,
+        },
         crate::KernelOwnerNodeKind::Delimiter => CheckedExpressionKind::Delimiter,
         crate::KernelOwnerNodeKind::Unknown => CheckedExpressionKind::Invalid {
             tokens: match payload {
@@ -3838,12 +3866,22 @@ fn checked_expression_kind(
         | crate::KernelOwnerNodeKind::PatternRead { .. }
         | crate::KernelOwnerNodeKind::CollectionItemRead
         | crate::KernelOwnerNodeKind::FreshOut => {
+            let stable = definition
+                .relocations
+                .expressions
+                .get(expression.id.0 as usize);
+            let span = definition
+                .presentation
+                .expressions
+                .get(expression.id.0 as usize)
+                .map(|presentation| presentation.span);
             return Err(KernelCheckedLinkError::new(format!(
-                "kernel definition {} read expression {} has no lexical authority",
+                "kernel definition {} read expression {} ({stable:?}, span {span:?}) has no lexical authority",
                 owner.0, expression.id.0,
             )));
         }
         crate::KernelOwnerNodeKind::UserCall { .. }
+        | crate::KernelOwnerNodeKind::FieldProjection { .. }
         | crate::KernelOwnerNodeKind::RenderConstructor { .. }
         | crate::KernelOwnerNodeKind::PureBuiltin { .. }
         | crate::KernelOwnerNodeKind::FixedAbiCall { .. }
@@ -5264,6 +5302,14 @@ fn referenced_abi_callable_names(
                     call.expression.0,
                 )));
             }
+            if let KernelCallTarget::FieldProjection { field } = &call.target
+                && function != format!("Field/{field}")
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {owner} field projection call {} names `{function}` instead of `Field/{field}`",
+                    call.expression.0,
+                )));
+            }
             names.insert(function.to_owned());
         }
     }
@@ -5599,6 +5645,18 @@ fn resolve_public_declaration(
             resolved,
             resolving,
         ),
+        KernelDeclarationReference::OwnerDeclaration { owner, declaration } => Ok(DeclId(
+            definitions
+                .get(owner.0 as usize)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel checked linker references missing public declaration owner {}",
+                        owner.0
+                    ))
+                })?
+                .declarations
+                .resolve(declaration.0, "delegated public declaration")?,
+        )),
     };
     resolving[definition] = false;
     let declaration = result?;

@@ -54,13 +54,8 @@ const EXECUTION_INVOCATION_OVERLAY_DOMAIN_V3: &[u8] = b"boon.execution-invocatio
 #[cfg(test)]
 const EXECUTION_CONSTRUCTION_ROUTES_DOMAIN_V3: &[u8] = b"boon.execution-construction-routes.v3\0";
 
-/// Construction-owned payload seals for final executable rows.
-///
-/// Core lowering creates executable expressions from semantic expressions and
-/// is the last pass allowed to mutate their payload. Retaining the exact V3
-/// payload digest here lets the execution-image linker consume that fact
-/// without serializing every final row again in a later whole-program sweep.
-/// Each vector is dense in its executable row-ID domain.
+/// Test-only payload-seal surface for the independent post-hoc handoff oracle.
+#[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ExecutionRowPayloadSealsV3 {
     pub(crate) expressions: Box<[[u8; 32]]>,
@@ -84,100 +79,6 @@ pub(crate) fn seal_execution_row_payload_v3<T: Serialize + ?Sized>(
         scratch,
     )
     .map_err(|error| format!("failed to seal execution V3 row payload: {error}"))
-}
-
-#[cfg(test)]
-pub(crate) fn validate_execution_row_payload_seal_samples_v3(
-    core: &crate::program_core::CanonicalProgramCoreV2,
-    seals: &ExecutionRowPayloadSealsV3,
-) -> Result<(), String> {
-    let mut scratch = Vec::new();
-    validate_execution_row_payload_seal_sample_v3(
-        "expression",
-        &core.executable.expressions,
-        &seals.expressions,
-        &mut scratch,
-    )?;
-    validate_execution_row_payload_seal_sample_v3(
-        "statement",
-        &core.executable.statements,
-        &seals.statements,
-        &mut scratch,
-    )?;
-    validate_execution_row_payload_seal_sample_v3(
-        "call occurrence",
-        &core.executable.call_occurrences,
-        &seals.call_occurrences,
-        &mut scratch,
-    )?;
-    validate_execution_row_payload_seal_sample_v3(
-        "source",
-        &core.executable.sources,
-        &seals.sources,
-        &mut scratch,
-    )?;
-    validate_execution_row_payload_seal_sample_v3(
-        "state",
-        &core.executable.states,
-        &seals.states,
-        &mut scratch,
-    )?;
-    validate_execution_row_payload_seal_sample_v3(
-        "root",
-        &core.executable.roots,
-        &seals.roots,
-        &mut scratch,
-    )?;
-    validate_execution_row_payload_seal_sample_v3(
-        "function",
-        &core.executable.functions,
-        &seals.functions,
-        &mut scratch,
-    )?;
-    validate_execution_row_payload_seal_sample_v3(
-        "materialization",
-        &core.materializations,
-        &seals.materializations,
-        &mut scratch,
-    )?;
-    validate_execution_row_payload_seal_sample_v3(
-        "static owner",
-        &core.scope_index.owners,
-        &seals.static_owners,
-        &mut scratch,
-    )
-}
-
-#[cfg(test)]
-fn validate_execution_row_payload_seal_sample_v3<T: Serialize>(
-    domain: &str,
-    rows: &[T],
-    seals: &[[u8; 32]],
-    scratch: &mut Vec<u8>,
-) -> Result<(), String> {
-    if rows.len() != seals.len() {
-        return Err(format!(
-            "execution V3 {domain} payload seals cover {} of {} final rows",
-            seals.len(),
-            rows.len()
-        ));
-    }
-    let mut samples = [0, rows.len() / 2, rows.len().saturating_sub(1)];
-    samples.sort_unstable();
-    let mut previous = None;
-    for index in samples {
-        if previous == Some(index) || index >= rows.len() {
-            continue;
-        }
-        previous = Some(index);
-        let actual = seal_execution_row_payload_v3(&rows[index], scratch)?;
-        if seals[index] != actual {
-            return Err(format!(
-                "execution V3 {domain} payload seal {index} differs from its final row"
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -754,30 +655,60 @@ impl SemanticImageBuilder<ExecutionFinalized> {
             .expect("executable receipts are finalized before handoff access")
     }
 
-    pub(crate) fn finalize_executable_receipts(
-        &mut self,
-        core: &crate::program_core::CanonicalProgramCoreV2,
-        payload_seals: &ExecutionRowPayloadSealsV3,
-    ) -> Result<(), String> {
-        if self.execution_handoff.is_some() {
-            return Err("execution V3 handoff was already finalized".to_owned());
-        }
+    pub(crate) fn execution_receipt_publisher(
+        &self,
+    ) -> Result<ExecutionReceiptPublisherV3<'_>, String> {
         let construction_image = self
             .execution_image_v3
             .as_ref()
             .ok_or_else(|| "finalized execution builder has no V3 construction image".to_owned())?;
-        let handoff = execution_image_handoff_v3(
+        ExecutionReceiptPublisherV3::new(&self.checked_handoff, construction_image, &self.execution)
+    }
+
+    pub(crate) fn install_execution_handoff(
+        &mut self,
+        handoff: ExecutionImageHandoffV3,
+    ) -> Result<(), String> {
+        if self.execution_handoff.replace(handoff).is_some() {
+            return Err("execution V3 handoff was already finalized".to_owned());
+        }
+        #[cfg(test)]
+        if let Some(oracle) = &self.execution_handoff_v2_oracle {
+            validate_v3_routes_against_v2_oracle(
+                self.execution_handoff
+                    .as_ref()
+                    .expect("installed execution handoff exists"),
+                oracle,
+                &self.checked_handoff,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validate_direct_execution_handoff(
+        &self,
+        core: &crate::program_core::CanonicalProgramCoreV2,
+        direct: &ExecutionImageHandoffV3,
+    ) -> Result<(), String> {
+        let construction_image = self
+            .execution_image_v3
+            .as_ref()
+            .ok_or_else(|| "finalized execution builder has no V3 construction image".to_owned())?;
+        let payload_seals = execution_row_payload_seals_v3_oracle(core)?;
+        let oracle = execution_image_handoff_v3(
             &self.checked_handoff,
             construction_image,
             &self.execution,
             core,
-            payload_seals,
+            &payload_seals,
         )?;
-        #[cfg(test)]
-        if let Some(oracle) = &self.execution_handoff_v2_oracle {
-            validate_v3_routes_against_v2_oracle(&handoff, oracle, &self.checked_handoff)?;
+        if direct != &oracle {
+            return Err(
+                "construction-published execution V3 handoff differs from the post-hoc oracle"
+                    .to_owned(),
+            );
         }
-        self.execution_handoff = Some(handoff);
         Ok(())
     }
 
@@ -799,6 +730,31 @@ impl SemanticImageBuilder<ExecutionFinalized> {
             seal_digest,
         })
     }
+}
+
+#[cfg(test)]
+fn execution_row_payload_seals_v3_oracle(
+    core: &crate::program_core::CanonicalProgramCoreV2,
+) -> Result<ExecutionRowPayloadSealsV3, String> {
+    fn seal<T: Serialize>(rows: &[T], scratch: &mut Vec<u8>) -> Result<Box<[[u8; 32]]>, String> {
+        rows.iter()
+            .map(|row| seal_execution_row_payload_v3(row, scratch))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Vec::into_boxed_slice)
+    }
+
+    let mut scratch = Vec::new();
+    Ok(ExecutionRowPayloadSealsV3 {
+        expressions: seal(&core.executable.expressions, &mut scratch)?,
+        statements: seal(&core.executable.statements, &mut scratch)?,
+        call_occurrences: seal(&core.executable.call_occurrences, &mut scratch)?,
+        sources: seal(&core.executable.sources, &mut scratch)?,
+        states: seal(&core.executable.states, &mut scratch)?,
+        roots: seal(&core.executable.roots, &mut scratch)?,
+        functions: seal(&core.executable.functions, &mut scratch)?,
+        materializations: seal(&core.materializations, &mut scratch)?,
+        static_owners: seal(&core.scope_index.owners, &mut scratch)?,
+    })
 }
 
 #[derive(Serialize)]
@@ -2393,6 +2349,7 @@ fn function_projection(
     )
 }
 
+#[cfg(test)]
 fn checked_execution_projection_v3(
     builder: &mut ExecutionImageHandoffBuilderV3<'_>,
     domain: CheckedImageRowDomainV2,
@@ -2402,6 +2359,7 @@ fn checked_execution_projection_v3(
     builder.intern(ExecutionConstructionProjectionV3::Checked { projection })
 }
 
+#[cfg(test)]
 fn projection_for_construction_route_v3(
     builder: &mut ExecutionImageHandoffBuilderV3<'_>,
     route: ExecutionConstructionProjectionV3,
@@ -2438,6 +2396,516 @@ fn function_projection_v3(
     })
 }
 
+/// Construction transaction for executable image receipts.
+///
+/// Canonical lowering owns the last mutable form of every executable row.  It
+/// publishes the row into this transaction at that point, so sealing does not
+/// need to walk the completed semantic and executable images again.  The
+/// transaction retains only dense projection routes and compact receipt
+/// accumulators; it never owns a second executable graph.
+pub(crate) struct ExecutionReceiptPublisherV3<'a> {
+    builder: ExecutionImageHandoffBuilderV3<'a>,
+    checked_projections: Vec<Option<PendingExecutionProjectionIdV3>>,
+    invocation_projections: Vec<PendingExecutionProjectionIdV3>,
+    expression_routes: Vec<PendingExecutionProjectionIdV3>,
+    statement_routes: Vec<PendingExecutionProjectionIdV3>,
+    owner_routes: Vec<PendingExecutionProjectionIdV3>,
+}
+
+impl<'a> ExecutionReceiptPublisherV3<'a> {
+    fn new(
+        checked: &'a CheckedImageHandoffV4,
+        construction_image: &'a ExecutionConstructionImageV3,
+        execution: &SemanticExecutionImageColumnsV1,
+    ) -> Result<Self, String> {
+        let mut builder = ExecutionImageHandoffBuilderV3::new(checked, construction_image)?;
+        let invocation_projections = construction_image
+            .routes
+            .invocations
+            .iter()
+            .map(|overlay| {
+                builder.intern(ExecutionConstructionProjectionV3::Invocation {
+                    occurrence: overlay.occurrence,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let checked_projections = vec![None; checked.projections.len()];
+        let mut publisher = Self {
+            builder,
+            checked_projections,
+            invocation_projections,
+            expression_routes: Vec::with_capacity(execution.expressions.len()),
+            statement_routes: Vec::with_capacity(execution.statements.len()),
+            owner_routes: Vec::with_capacity(execution.static_owners.len()),
+        };
+        for expression in &execution.expressions {
+            let route = construction_image.expression_route(expression.id)?;
+            let projection = publisher.projection_for_construction_route(route)?;
+            publisher.expression_routes.push(projection);
+        }
+        for statement in &execution.statements {
+            let route = construction_image.statement_route(statement.id)?;
+            let projection = publisher.projection_for_construction_route(route)?;
+            publisher.statement_routes.push(projection);
+        }
+        for owner in &execution.static_owners {
+            let occurrence = construction_image.owner_occurrence(owner.id)?;
+            let projection = publisher
+                .invocation_projections
+                .get(occurrence.as_usize())
+                .copied()
+                .ok_or_else(|| format!("static owner route has missing invocation {occurrence}"))?;
+            publisher.owner_routes.push(projection);
+        }
+        Ok(publisher)
+    }
+
+    fn checked_projection(
+        &mut self,
+        projection: CheckedImageProjectionIdV2,
+    ) -> Result<PendingExecutionProjectionIdV3, String> {
+        let definition = self
+            .builder
+            .construction_image
+            .definition_projection(projection)?;
+        if let Some(id) = self
+            .checked_projections
+            .get(definition.as_usize())
+            .copied()
+            .flatten()
+        {
+            return Ok(id);
+        }
+        let id = self
+            .builder
+            .intern(ExecutionConstructionProjectionV3::Checked {
+                projection: definition,
+            })?;
+        let slot = self
+            .checked_projections
+            .get_mut(definition.as_usize())
+            .ok_or_else(|| {
+                format!(
+                    "execution V3 checked projection cache has no definition {}",
+                    definition.0
+                )
+            })?;
+        *slot = Some(id);
+        Ok(id)
+    }
+
+    fn checked_execution_projection(
+        &mut self,
+        domain: CheckedImageRowDomainV2,
+        dense_index: usize,
+    ) -> Result<PendingExecutionProjectionIdV3, String> {
+        let projection = checked_projection(self.builder.checked, domain, dense_index)?;
+        self.checked_projection(projection)
+    }
+
+    fn projection_for_construction_route(
+        &mut self,
+        route: ExecutionConstructionProjectionV3,
+    ) -> Result<PendingExecutionProjectionIdV3, String> {
+        match route {
+            ExecutionConstructionProjectionV3::Checked { projection } => {
+                self.checked_projection(projection)
+            }
+            ExecutionConstructionProjectionV3::Invocation { occurrence } => self
+                .invocation_projections
+                .get(occurrence.as_usize())
+                .copied()
+                .ok_or_else(|| {
+                    format!("execution construction route has missing invocation {occurrence}")
+                }),
+            producer @ ExecutionConstructionProjectionV3::Producer { .. } => {
+                self.builder.intern(producer)
+            }
+        }
+    }
+
+    fn expression_projection(
+        &self,
+        expression: SemanticExprId,
+    ) -> Result<PendingExecutionProjectionIdV3, String> {
+        self.expression_routes
+            .get(expression.as_usize())
+            .copied()
+            .ok_or_else(|| format!("execution V3 references missing expression {expression}"))
+    }
+
+    fn statement_projection(
+        &self,
+        statement: SemanticStatementId,
+    ) -> Result<PendingExecutionProjectionIdV3, String> {
+        self.statement_routes
+            .get(statement.as_usize())
+            .copied()
+            .ok_or_else(|| format!("execution V3 references missing statement {statement}"))
+    }
+
+    pub(crate) fn publish_scopes(
+        &mut self,
+        execution: &SemanticExecutionImageColumnsV1,
+    ) -> Result<(), String> {
+        for scope in &execution.scopes {
+            let projection = self.checked_execution_projection(
+                CheckedImageRowDomainV2::Scope,
+                scope.checked_scope.0 as usize,
+            )?;
+            self.builder.push(
+                projection,
+                ExecutionImageRowDomainV3::Scope,
+                scope,
+                Vec::new(),
+            )?;
+            self.builder.route(
+                ExecutionImageRowDomainV3::Scope,
+                scope.id.as_usize(),
+                projection,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_expression<T: Serialize>(
+        &mut self,
+        execution: &SemanticExecutionImageColumnsV1,
+        semantic: &crate::SemanticExpression,
+        executable: &T,
+    ) -> Result<(), String> {
+        let projection = self.expression_projection(semantic.id)?;
+        let mut relocations = execution
+            .expression_children(&semantic.kind)
+            .ok_or_else(|| {
+                format!(
+                    "execution expression {} has a missing materialization child",
+                    semantic.id
+                )
+            })?
+            .into_iter()
+            .map(|expression| self.expression_projection(expression))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let crate::SemanticExpressionKind::Call { callable, .. } = semantic.kind {
+            let callable = execution
+                .callables
+                .get(callable.as_usize())
+                .filter(|candidate| candidate.id == callable)
+                .ok_or_else(|| {
+                    format!("expression {} has missing callable {callable}", semantic.id)
+                })?;
+            relocations.push(self.checked_execution_projection(
+                CheckedImageRowDomainV2::Callable,
+                callable.checked_callable.0 as usize,
+            )?);
+        }
+        self.builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Expression,
+            executable,
+            relocations,
+        )?;
+        self.builder.route(
+            ExecutionImageRowDomainV3::Expression,
+            semantic.id.as_usize(),
+            projection,
+        )
+    }
+
+    pub(crate) fn publish_statement<T: Serialize>(
+        &mut self,
+        execution: &SemanticExecutionImageColumnsV1,
+        semantic: &crate::SemanticStatement,
+        executable: &T,
+    ) -> Result<(), String> {
+        let projection = self.statement_projection(semantic.id)?;
+        let mut relocations = semantic
+            .value
+            .into_iter()
+            .chain(semantic.children.iter().filter_map(|child| {
+                execution
+                    .statements
+                    .get(child.as_usize())
+                    .and_then(|statement| statement.value)
+            }))
+            .map(|expression| self.expression_projection(expression))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(parent) = semantic.parent
+            && let Some(parent) = execution.statements.get(parent.as_usize())
+            && let Some(value) = parent.value
+        {
+            relocations.push(self.expression_projection(value)?);
+        }
+        self.builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Statement,
+            executable,
+            relocations,
+        )?;
+        self.builder.route(
+            ExecutionImageRowDomainV3::Statement,
+            semantic.id.as_usize(),
+            projection,
+        )
+    }
+
+    pub(crate) fn publish_callables_and_calls(
+        &mut self,
+        execution: &SemanticExecutionImageColumnsV1,
+    ) -> Result<(), String> {
+        for callable in &execution.callables {
+            let projection = self.checked_execution_projection(
+                CheckedImageRowDomainV2::Callable,
+                callable.checked_callable.0 as usize,
+            )?;
+            let relocations = callable
+                .semantic_root
+                .map(|expression| self.expression_projection(expression))
+                .transpose()?
+                .into_iter()
+                .collect();
+            self.builder.push(
+                projection,
+                ExecutionImageRowDomainV3::Callable,
+                callable,
+                relocations,
+            )?;
+            self.builder.route(
+                ExecutionImageRowDomainV3::Callable,
+                callable.id.as_usize(),
+                projection,
+            )?;
+        }
+        for call in &execution.calls {
+            let projection = self.checked_execution_projection(
+                CheckedImageRowDomainV2::Call,
+                call.checked_call.0 as usize,
+            )?;
+            let callable = execution
+                .callables
+                .get(call.callable.as_usize())
+                .filter(|candidate| candidate.id == call.callable)
+                .ok_or_else(|| format!("execution call {} has missing callable", call.id))?;
+            let relocations = vec![self.checked_execution_projection(
+                CheckedImageRowDomainV2::Callable,
+                callable.checked_callable.0 as usize,
+            )?];
+            self.builder.push(
+                projection,
+                ExecutionImageRowDomainV3::Call,
+                call,
+                relocations,
+            )?;
+            self.builder.route(
+                ExecutionImageRowDomainV3::Call,
+                call.id.as_usize(),
+                projection,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_call_occurrence<T: Serialize>(
+        &mut self,
+        execution: &SemanticExecutionImageColumnsV1,
+        semantic: &crate::SemanticCallOccurrence,
+        executable: &T,
+    ) -> Result<(), String> {
+        let projection = self
+            .invocation_projections
+            .get(semantic.id.as_usize())
+            .copied()
+            .ok_or_else(|| format!("call occurrence {} has no V3 overlay", semantic.id))?;
+        let mut relocations = semantic
+            .parent
+            .and_then(|parent| self.invocation_projections.get(parent.as_usize()).copied())
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(call) = semantic.call {
+            let call = execution
+                .calls
+                .get(call.as_usize())
+                .filter(|candidate| candidate.id == call)
+                .ok_or_else(|| format!("call occurrence {} has missing call", semantic.id))?;
+            relocations.push(self.checked_execution_projection(
+                CheckedImageRowDomainV2::Call,
+                call.checked_call.0 as usize,
+            )?);
+        }
+        self.builder.push(
+            projection,
+            ExecutionImageRowDomainV3::CallOccurrence,
+            executable,
+            relocations,
+        )?;
+        self.builder.route(
+            ExecutionImageRowDomainV3::CallOccurrence,
+            semantic.id.as_usize(),
+            projection,
+        )
+    }
+
+    pub(crate) fn publish_source<T: Serialize>(
+        &mut self,
+        semantic: &crate::SemanticSourceDef,
+        executable: &T,
+    ) -> Result<(), String> {
+        let fallback = self.expression_projection(semantic.expression)?;
+        let projection = semantic.call_instance.map_or(Ok(fallback), |occurrence| {
+            self.invocation_projections
+                .get(occurrence.as_usize())
+                .copied()
+                .ok_or_else(|| format!("source {} has missing invocation", semantic.id))
+        })?;
+        self.builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Source,
+            executable,
+            vec![fallback],
+        )?;
+        self.builder.route(
+            ExecutionImageRowDomainV3::Source,
+            semantic.id.as_usize(),
+            projection,
+        )
+    }
+
+    pub(crate) fn publish_state<T: Serialize>(
+        &mut self,
+        semantic: &crate::SemanticStateDef,
+        executable: &T,
+    ) -> Result<(), String> {
+        let fallback = self.expression_projection(semantic.expression)?;
+        let projection = semantic.call_instance.map_or(Ok(fallback), |occurrence| {
+            self.invocation_projections
+                .get(occurrence.as_usize())
+                .copied()
+                .ok_or_else(|| format!("state {} has missing invocation", semantic.id))
+        })?;
+        let mut relocations = vec![fallback, self.expression_projection(semantic.initial)?];
+        if let crate::SemanticStateLifetimeV1::ActivationLocal { then_expression } =
+            semantic.lifetime
+        {
+            relocations.push(self.expression_projection(then_expression)?);
+        }
+        self.builder.push(
+            projection,
+            ExecutionImageRowDomainV3::State,
+            executable,
+            relocations,
+        )?;
+        self.builder.route(
+            ExecutionImageRowDomainV3::State,
+            semantic.id.as_usize(),
+            projection,
+        )
+    }
+
+    pub(crate) fn publish_root<T: Serialize>(
+        &mut self,
+        semantic: &crate::SemanticRoot,
+        executable: &T,
+    ) -> Result<(), String> {
+        let projection = self.expression_projection(semantic.expression)?;
+        self.builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Root,
+            executable,
+            vec![projection],
+        )?;
+        self.builder.route(
+            ExecutionImageRowDomainV3::Root,
+            semantic.ordinal,
+            projection,
+        )
+    }
+
+    pub(crate) fn publish_function<T: Serialize>(
+        &mut self,
+        execution: &SemanticExecutionImageColumnsV1,
+        semantic: &SemanticFunction,
+        executable: &T,
+        dense_index: usize,
+    ) -> Result<(), String> {
+        let projection = function_projection_v3(&mut self.builder, execution, semantic)?;
+        let mut relocations = vec![self.expression_projection(semantic.root)?];
+        if let Some(source) = semantic.invocation_source {
+            relocations.push(self.expression_projection(source)?);
+        }
+        self.builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Function,
+            executable,
+            relocations,
+        )?;
+        self.builder
+            .route(ExecutionImageRowDomainV3::Function, dense_index, projection)
+    }
+
+    pub(crate) fn publish_materialization<T: Serialize>(
+        &mut self,
+        semantic: &crate::SemanticContextualMaterialization,
+        executable: &T,
+    ) -> Result<(), String> {
+        let projection = self
+            .owner_routes
+            .get(semantic.owner.as_usize())
+            .copied()
+            .unwrap_or(self.expression_projection(semantic.source)?);
+        let relocations = semantic
+            .expression_roots()
+            .into_iter()
+            .map(|expression| self.expression_projection(expression))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Materialization,
+            executable,
+            relocations,
+        )?;
+        self.builder.route(
+            ExecutionImageRowDomainV3::Materialization,
+            semantic.id.as_usize(),
+            projection,
+        )
+    }
+
+    pub(crate) fn publish_static_owner<T: Serialize>(
+        &mut self,
+        semantic: &crate::SemanticStaticOwner,
+        executable: &T,
+    ) -> Result<(), String> {
+        let projection = self
+            .owner_routes
+            .get(semantic.id.as_usize())
+            .copied()
+            .ok_or_else(|| format!("static owner {} has no V3 route", semantic.id))?;
+        let relocations = semantic
+            .parent
+            .and_then(|parent| self.owner_routes.get(parent.as_usize()).copied())
+            .into_iter()
+            .collect();
+        self.builder.push(
+            projection,
+            ExecutionImageRowDomainV3::StaticOwner,
+            executable,
+            relocations,
+        )?;
+        self.builder.route(
+            ExecutionImageRowDomainV3::StaticOwner,
+            semantic.id.as_usize(),
+            projection,
+        )
+    }
+
+    pub(crate) fn finish(self) -> Result<ExecutionImageHandoffV3, String> {
+        let source_bundle_digest_v1 = self.builder.checked.source_bundle_digest_v1;
+        let role = self.builder.checked.role;
+        self.builder.finish(source_bundle_digest_v1, role)
+    }
+}
+
+#[cfg(test)]
 fn execution_image_handoff_v3(
     checked: &CheckedImageHandoffV4,
     construction_image: &ExecutionConstructionImageV3,
@@ -2901,6 +3369,7 @@ fn execution_image_handoff_v3(
     builder.finish(checked.source_bundle_digest_v1, checked.role)
 }
 
+#[cfg(test)]
 fn execution_payload_seal_v3(
     seals: &[[u8; 32]],
     domain: ExecutionImageRowDomainV3,
@@ -3045,6 +3514,7 @@ fn validate_v3_routes_against_v2_oracle(
     Ok(())
 }
 
+#[cfg(test)]
 fn trace_execution_handoff_phase(enabled: bool, name: &str, started: &mut std::time::Instant) {
     if enabled {
         eprintln!(

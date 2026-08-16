@@ -46,8 +46,8 @@ use std::sync::Arc;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0xc4, 0x83, 0x2c, 0xbd, 0x7a, 0x01, 0x06, 0x65, 0x0f, 0x1c, 0x66, 0x2a, 0x28, 0x6e, 0x73, 0x1c,
-    0x48, 0x78, 0x8a, 0x68, 0x95, 0x23, 0x42, 0xbc, 0x9f, 0x4b, 0x30, 0x56, 0x50, 0xfb, 0xbf, 0x65,
+    0x00, 0x1f, 0xb3, 0x79, 0xe6, 0x1d, 0x16, 0xc4, 0x09, 0x62, 0xcf, 0xf8, 0xb8, 0x58, 0x0c, 0x31,
+    0x5a, 0xb3, 0x91, 0x24, 0xeb, 0xd3, 0x6d, 0x81, 0x0a, 0xf1, 0xd7, 0x3d, 0x54, 0xc1, 0x8d, 0xfa,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -2997,29 +2997,34 @@ fn elaborate_with_representation(
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
     let canonical_core_build = elaboration_phase!(
-        "build_canonical_program_core",
-        core_lowering::build_canonical_program_core(
-            &execution_graph,
-            &resource_graph,
-            &reactive_graph,
-            &lowering_contract,
-            &view_binding_graph,
-            &scope_storage_graph,
-            &memory_graph,
-        )
+        "build_canonical_program_core_and_execution_receipts",
+        (|| -> Result<_, String> {
+            let execution_receipts = semantic_image_builder.execution_receipt_publisher()?;
+            core_lowering::build_canonical_program_core(
+                &execution_graph,
+                &resource_graph,
+                &reactive_graph,
+                &lowering_contract,
+                &view_binding_graph,
+                &scope_storage_graph,
+                &memory_graph,
+                execution_receipts,
+            )
+        })()
     )
     .map_err(SemanticError::new)?;
     let core_lowering::CanonicalProgramCoreBuildV2 {
         core: canonical_core,
-        execution_payload_seals_v3,
+        execution_handoff,
     } = canonical_core_build;
+    #[cfg(test)]
+    semantic_image_builder
+        .validate_direct_execution_handoff(&canonical_core, &execution_handoff)
+        .map_err(SemanticError::new)?;
     let mut semantic_image_builder = semantic_image_builder;
-    elaboration_phase!(
-        "finalize_executable_receipts",
-        semantic_image_builder
-            .finalize_executable_receipts(&canonical_core, &execution_payload_seals_v3,)
-    )
-    .map_err(SemanticError::new)?;
+    semantic_image_builder
+        .install_execution_handoff(execution_handoff)
+        .map_err(SemanticError::new)?;
     let execution_graph = semantic_image_builder.execution();
     let dependency_build = elaboration_phase!(
         "build_callable_dependency_manifest",

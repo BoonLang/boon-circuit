@@ -4154,16 +4154,65 @@ construction (122.852 ms), canonical core construction (110.477 ms), and
 dependency-manifest assembly (168.278 ms) remain separate reconstruction
 owners.
 
+The first compositional-seal cut now publishes executable row receipts at the
+same canonical-lowering sites that allocate scopes, expressions, statements,
+callables, calls, occurrences, resources, roots, functions,
+materializations, and final static owners. Production no longer builds nine
+parallel payload-seal arrays and no longer performs the post-hoc
+`finalize_executable_receipts` whole-program sweep. Dense checked-projection
+IDs and invocation routes are indexed once in the construction-owned
+publisher. The previous finalizer and payload inventory survive only under
+`cfg(test)` as an independent oracle; every green semantic pipeline compares
+the complete direct `ExecutionImageHandoffV3` byte-for-byte with that oracle.
+The architecture gate requires all direct publication seams and rejects a
+production payload side table or finalizer call.
+
+This cut is an ownership milestone, not the hoped-for large speed win. In an
+honest no-rebuild debug A/B, canonical core plus executable receipts improves
+from 307.598 ms (137.149 ms core plus 170.449 ms finalization) to one 301.817 ms
+construction phase. The complete debug compile is 7,172.221 ms, semantic
+construction is 1,907.719 ms, and WHERE verification is still below one
+millisecond. Most of the former phase was necessary canonical hashing, so
+moving it into the row constructors saves only about 5.8 ms; it does, however,
+remove the second production row inventory and establishes one publication
+authority. Dependency-manifest assembly is now the adjacent 247.535 ms owner
+in the same trace. The next cut must make that Manifest consume the already
+published construction receipts and compact relocations, then delete its dense
+projection rebuild and retrospective checked/execution inventories. Merely
+caching or renaming the Manifest pass would not satisfy this cut.
+
+Fresh stable-release evidence is likewise flat rather than a claimed runtime
+win. Five one-process-per-observation NovyWave medians are 740.512 ms
+diagnostics and 2,825.732 ms verified in fresh-process mode, and 736.290 ms
+diagnostics and 2,849.982 ms verified through a new empty session. The
+preceding stable medians were 733.992, 2,815.179, 744.167, and 2,881.012 ms
+respectively, so all movement is inside roughly one percent in opposite
+directions. A second independent five-sample fresh verified batch is 2,794.653
+ms and records 0.617 ms median WHERE contract verification. Every observation
+has zero diagnostics, source digest
+`e8b6c437a3f112026ca4f8a58e9f9c98e04cb2e3826a29724f3dc8e72d8bda9b`,
+and MachinePlan SHA-256
+`ca6a030997141a451a119165a9f9ba194071126ae257a7475d7ceafe7a1ea63a`.
+The release phase trace measures the combined construction/receipt phase at
+252.122 ms versus 249.369 ms for the preceding separately measured core and
+finalizer, again a noise-level result. The official aggregate collector remains
+red before NovyWave because the TodoMVC fixture exposes the pre-existing
+unresolved concrete `List/map` OUT input; the direct NovyWave observations do
+not weaken or overwrite that failing gate.
+
 Updating the architecture gate exposed two stale classifier entries from the
 definition-template checkpoint. `InvalidDefinitionTemplate` and the three
 checked definition execution-template records are now explicitly classified,
 the embedded schema digest advances, and the complete architecture gate passes.
 
 The next biggest cut is to extend the same definition artifact with normalized
-semantic facts and relocations, starting at the largest measured construction
-owners: executable receipt finalization and dependency/resource manifest
-assembly. That tranche must delete their repeated inventories as it adds the
-replacement; it must not add another semantic DTO underneath the old passes.
+semantic facts and relocations, starting at the remaining largest measured
+construction owner: dependency/resource Manifest assembly. Executable receipt
+publication is already construction-owned. The next tranche must make the
+Manifest a thin consumer of those facts, delete its repeated dense projection
+and checked/execution inventories, and then carry the same ownership into
+resource and row-storage templates; it must not add another semantic DTO
+underneath the old passes.
 
 1. Finish `DefinitionArtifact` from the dependency bottom upward: declaration
    and lexical-binding identities first, then HOLD state, persistent LIST, and

@@ -4119,7 +4119,6 @@ fields = [
   { name = "materializations", disposition = "r-r-priv-id-pc-n", reviewed = true },
   { name = "static_owners", disposition = "r-r-priv-id-pc-n", reviewed = true },
   { name = "id_map", disposition = "r-c-priv-id-pc-n", reviewed = true },
-  { name = "payload_seals_v3", disposition = "r-c-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]

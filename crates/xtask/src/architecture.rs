@@ -1360,7 +1360,8 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     for required in [
         "pub(crate) fn build_canonical_program_core(",
         "struct CanonicalProgramCoreBuildV2",
-        "payload_seals_v3: crate::semantic_image::ExecutionRowPayloadSealsV3",
+        "execution_handoff: crate::semantic_image::ExecutionImageHandoffV3",
+        "ExecutionReceiptPublisherV3<'_>",
         "struct SemanticToExecutableMap",
         "fn validate_allocation_bijections(",
         "struct SemanticReactiveToMappedMap",
@@ -1382,11 +1383,36 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
             "semantic core construction must emit exactly one CanonicalProgramCoreV2".to_owned(),
         );
     }
-    if semantic_image.matches("builder.push_presealed(").count() != 9 {
+    if lowering.matches("receipts.publish_").count() != 11 {
         return Err(
-            "execution receipt linking must consume all nine executable row payload domains from core lowering"
+            "canonical lowering must publish all eleven executable receipt domains in its construction transaction"
                 .to_owned(),
         );
+    }
+    for forbidden in [
+        "execution_payload_seals_v3",
+        "payload_seals_v3: crate::semantic_image::ExecutionRowPayloadSealsV3",
+    ] {
+        if lowering.contains(forbidden) {
+            return Err(format!(
+                "canonical lowering retains the deleted post-hoc receipt side table `{forbidden}`"
+            ));
+        }
+    }
+    if semantic.contains("finalize_executable_receipts") {
+        return Err(
+            "semantic elaboration retains the deleted post-hoc executable receipt phase".to_owned(),
+        );
+    }
+    for required in [
+        "pub(crate) struct ExecutionReceiptPublisherV3",
+        "construction-published execution V3 handoff differs from the post-hoc oracle",
+    ] {
+        if !semantic_image.contains(required) {
+            return Err(format!(
+                "execution image omits direct construction receipt proof `{required}`"
+            ));
+        }
     }
     for forbidden in [
         "fn validate_totality(",

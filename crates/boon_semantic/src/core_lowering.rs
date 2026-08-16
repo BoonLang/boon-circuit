@@ -259,12 +259,11 @@ pub(super) struct MappedSemanticExecution {
     pub materializations: Vec<ContextualMaterialization>,
     pub static_owners: Vec<StaticOwnerDef>,
     pub id_map: SemanticToExecutableMap,
-    pub payload_seals_v3: crate::semantic_image::ExecutionRowPayloadSealsV3,
 }
 
 pub(crate) struct CanonicalProgramCoreBuildV2 {
     pub(crate) core: program_core::CanonicalProgramCoreV2,
-    pub(crate) execution_payload_seals_v3: crate::semantic_image::ExecutionRowPayloadSealsV3,
+    pub(crate) execution_handoff: crate::semantic_image::ExecutionImageHandoffV3,
 }
 
 #[derive(Clone, Debug)]
@@ -1544,11 +1543,13 @@ pub(super) fn map_semantic_execution_with_reactive(
     graph: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
+    receipts: &mut crate::semantic_image::ExecutionReceiptPublisherV3<'_>,
 ) -> Result<MappedSemanticExecution, String> {
     map_semantic_execution_with_external_events(
         graph,
         resources,
         &reactive.external_event_identities,
+        receipts,
     )
 }
 
@@ -1556,96 +1557,108 @@ fn map_semantic_execution_with_external_events(
     graph: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV2,
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
+    receipts: &mut crate::semantic_image::ExecutionReceiptPublisherV3<'_>,
 ) -> Result<MappedSemanticExecution, String> {
     let id_map = SemanticToExecutableMap::allocate_with_external_events(
         graph,
         resources,
         external_event_identities,
     )?;
-    let mut payload_scratch = Vec::new();
-    let mut expression_payload_seals_v3 = Vec::with_capacity(graph.expressions.len());
+    receipts.publish_scopes(graph)?;
     let mut expressions = Vec::with_capacity(graph.expressions.len());
-    for expression in &graph.expressions {
-        let expression = map_expression(graph, &id_map, expression)?;
-        expression_payload_seals_v3.push(crate::semantic_image::seal_execution_row_payload_v3(
-            &expression,
-            &mut payload_scratch,
-        )?);
-        expressions.push(expression);
+    for semantic in &graph.expressions {
+        let executable = map_expression(graph, &id_map, semantic)?;
+        if executable.id.as_usize() != semantic.id.as_usize() {
+            return Err(format!(
+                "execution expression {} maps to non-dense executable {}",
+                semantic.id, executable.id
+            ));
+        }
+        receipts.publish_expression(graph, semantic, &executable)?;
+        expressions.push(executable);
     }
-    let statements = graph
-        .statements
-        .iter()
-        .map(|statement| map_statement(&id_map, statement))
-        .collect::<Result<Vec<_>, _>>()?;
-    let statement_payload_seals_v3 = seal_execution_rows_v3(&statements, &mut payload_scratch)?;
-    let sources = graph
-        .sources
-        .iter()
-        .map(|source| map_source(&id_map, source))
-        .collect::<Result<Vec<_>, _>>()?;
-    let source_payload_seals_v3 = seal_execution_rows_v3(&sources, &mut payload_scratch)?;
-    let states = graph
-        .states
-        .iter()
-        .map(|state| map_state(&id_map, state))
-        .collect::<Result<Vec<_>, _>>()?;
-    let state_payload_seals_v3 = seal_execution_rows_v3(&states, &mut payload_scratch)?;
-    let roots = graph
-        .roots
-        .iter()
-        .map(|root| map_root(graph, &id_map, root))
-        .collect::<Result<Vec<_>, _>>()?;
-    let root_payload_seals_v3 = seal_execution_rows_v3(&roots, &mut payload_scratch)?;
-    let functions = graph
-        .functions
-        .iter()
-        .map(|function| map_function(graph, &id_map, function))
-        .collect::<Result<Vec<_>, _>>()?;
-    let function_payload_seals_v3 = seal_execution_rows_v3(&functions, &mut payload_scratch)?;
+    let mut statements = Vec::with_capacity(graph.statements.len());
+    for semantic in &graph.statements {
+        let executable = map_statement(&id_map, semantic)?;
+        if executable.id.as_usize() != semantic.id.as_usize() {
+            return Err(format!(
+                "execution statement {} maps to non-dense executable {}",
+                semantic.id, executable.id
+            ));
+        }
+        receipts.publish_statement(graph, semantic, &executable)?;
+        statements.push(executable);
+    }
+    receipts.publish_callables_and_calls(graph)?;
+
+    let mut call_occurrences = Vec::with_capacity(graph.call_occurrences.len());
+    for semantic in &graph.call_occurrences {
+        let executable = ExecutableCallOccurrence {
+            id: id_map.call_instance(semantic.id)?,
+            parent: semantic
+                .parent
+                .map(|parent| id_map.call_instance(parent))
+                .transpose()?,
+            checked_call: semantic
+                .call
+                .map(|call| semantic_call(graph, call).map(|call| call.checked_call))
+                .transpose()?,
+            context_ordinals: semantic.context_ordinals.clone(),
+        };
+        if executable.id != semantic.id.as_usize() {
+            return Err(format!(
+                "call occurrence {} maps to executable {}",
+                semantic.id, executable.id
+            ));
+        }
+        receipts.publish_call_occurrence(graph, semantic, &executable)?;
+        call_occurrences.push(executable);
+    }
+
+    let mut sources = Vec::with_capacity(graph.sources.len());
+    for semantic in &graph.sources {
+        let executable = map_source(&id_map, semantic)?;
+        receipts.publish_source(semantic, &executable)?;
+        sources.push(executable);
+    }
+    let mut states = Vec::with_capacity(graph.states.len());
+    for semantic in &graph.states {
+        let executable = map_state(&id_map, semantic)?;
+        receipts.publish_state(semantic, &executable)?;
+        states.push(executable);
+    }
+    let mut roots = Vec::with_capacity(graph.roots.len());
+    for semantic in &graph.roots {
+        let executable = map_root(graph, &id_map, semantic)?;
+        receipts.publish_root(semantic, &executable)?;
+        roots.push(executable);
+    }
+    let mut functions = Vec::with_capacity(graph.functions.len());
+    for (index, semantic) in graph.functions.iter().enumerate() {
+        let executable = map_function(graph, &id_map, semantic)?;
+        receipts.publish_function(graph, semantic, &executable, index)?;
+        functions.push(executable);
+    }
     let ordinary_functions = graph
         .callables
         .iter()
         .filter(|callable| callable.semantic_root.is_some())
         .map(|callable| map_ordinary_function(&id_map, callable))
         .collect::<Result<Vec<_>, _>>()?;
-    let call_occurrences = graph
-        .call_occurrences
-        .iter()
-        .map(|occurrence| {
-            Ok(ExecutableCallOccurrence {
-                id: id_map.call_instance(occurrence.id)?,
-                parent: occurrence
-                    .parent
-                    .map(|parent| id_map.call_instance(parent))
-                    .transpose()?,
-                checked_call: occurrence
-                    .call
-                    .map(|call| semantic_call(graph, call).map(|call| call.checked_call))
-                    .transpose()?,
-                context_ordinals: occurrence.context_ordinals.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let call_occurrence_payload_seals_v3 =
-        seal_execution_rows_v3(&call_occurrences, &mut payload_scratch)?;
-    let materializations = graph
-        .materializations
-        .iter()
-        .map(|materialization| {
-            let binding = resources
-                .materialization_binding(materialization.id)
-                .ok_or_else(|| {
-                    format!(
-                        "semantic materialization {} has no resource binding",
-                        materialization.id
-                    )
-                })?;
-            map_materialization(&id_map, materialization, binding)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let materialization_payload_seals_v3 =
-        seal_execution_rows_v3(&materializations, &mut payload_scratch)?;
+    let mut materializations = Vec::with_capacity(graph.materializations.len());
+    for semantic in &graph.materializations {
+        let binding = resources
+            .materialization_binding(semantic.id)
+            .ok_or_else(|| {
+                format!(
+                    "semantic materialization {} has no resource binding",
+                    semantic.id
+                )
+            })?;
+        let executable = map_materialization(&id_map, semantic, binding)?;
+        receipts.publish_materialization(semantic, &executable)?;
+        materializations.push(executable);
+    }
     let static_owners = graph
         .static_owners
         .iter()
@@ -1670,31 +1683,7 @@ fn map_semantic_execution_with_external_events(
         materializations,
         static_owners,
         id_map,
-        payload_seals_v3: crate::semantic_image::ExecutionRowPayloadSealsV3 {
-            expressions: expression_payload_seals_v3.into_boxed_slice(),
-            statements: statement_payload_seals_v3,
-            call_occurrences: call_occurrence_payload_seals_v3,
-            sources: source_payload_seals_v3,
-            states: state_payload_seals_v3,
-            roots: root_payload_seals_v3,
-            functions: function_payload_seals_v3,
-            materializations: materialization_payload_seals_v3,
-            // The final executable owner rows are constructed by storage
-            // lowering, not by this identity-only owner forest. They are
-            // sealed after that join in `finish_canonical_program_core`.
-            static_owners: Box::new([]),
-        },
     })
-}
-
-fn seal_execution_rows_v3<T: serde::Serialize>(
-    rows: &[T],
-    scratch: &mut Vec<u8>,
-) -> Result<Box<[[u8; 32]]>, String> {
-    rows.iter()
-        .map(|row| crate::semantic_image::seal_execution_row_payload_v3(row, scratch))
-        .collect::<Result<Vec<_>, _>>()
-        .map(Vec::into_boxed_slice)
 }
 
 pub(super) fn map_semantic_resources(
@@ -7229,9 +7218,14 @@ pub(crate) fn build_canonical_program_core(
     view_binding_graph: &crate::SemanticViewBindingGraphV1,
     scope_storage_graph: &SemanticScopeStorageGraphV1,
     memory_graph: &crate::SemanticMemoryGraphV1,
+    mut receipts: crate::semantic_image::ExecutionReceiptPublisherV3<'_>,
 ) -> Result<CanonicalProgramCoreBuildV2, String> {
-    let mapped =
-        map_semantic_execution_with_reactive(execution_graph, resource_graph, reactive_graph)?;
+    let mapped = map_semantic_execution_with_reactive(
+        execution_graph,
+        resource_graph,
+        reactive_graph,
+        &mut receipts,
+    )?;
     let resources = map_semantic_resources(execution_graph, resource_graph, &mapped.id_map)?;
     finish_canonical_program_core(
         execution_graph,
@@ -7243,6 +7237,7 @@ pub(crate) fn build_canonical_program_core(
         memory_graph,
         mapped,
         resources,
+        receipts,
     )
 }
 
@@ -7257,6 +7252,7 @@ fn finish_canonical_program_core(
     memory_graph: &crate::SemanticMemoryGraphV1,
     mapped: MappedSemanticExecution,
     resources: MappedSemanticResources,
+    mut receipts: crate::semantic_image::ExecutionReceiptPublisherV3<'_>,
 ) -> Result<CanonicalProgramCoreBuildV2, String> {
     let mut resources = resources;
     let reactive = map_semantic_reactive(
@@ -7337,7 +7333,6 @@ fn finish_canonical_program_core(
     let MappedSemanticExecution {
         executable,
         materializations,
-        mut payload_seals_v3,
         ..
     } = mapped;
     let MappedSemanticResources {
@@ -7425,17 +7420,25 @@ fn finish_canonical_program_core(
         view_bindings,
         named_value_interfaces,
     };
-    let mut payload_scratch = Vec::new();
-    payload_seals_v3.static_owners =
-        seal_execution_rows_v3(&core.scope_index.owners, &mut payload_scratch)?;
-    #[cfg(test)]
-    crate::semantic_image::validate_execution_row_payload_seal_samples_v3(
-        &core,
-        &payload_seals_v3,
-    )?;
+    for (semantic, executable) in execution_graph
+        .static_owners
+        .iter()
+        .zip(&core.scope_index.owners)
+    {
+        if (semantic.id, semantic.parent, semantic.child_ordinal)
+            != (executable.id, executable.parent, executable.child_ordinal)
+        {
+            return Err(format!(
+                "static owner {} disagrees with executable owner",
+                semantic.id
+            ));
+        }
+        receipts.publish_static_owner(semantic, executable)?;
+    }
+    let execution_handoff = receipts.finish()?;
     Ok(CanonicalProgramCoreBuildV2 {
         core,
-        execution_payload_seals_v3: payload_seals_v3,
+        execution_handoff,
     })
 }
 

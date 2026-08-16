@@ -45,8 +45,8 @@ use std::sync::Arc;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x5d, 0x6e, 0x99, 0xcf, 0x20, 0xa7, 0x9b, 0x22, 0xcb, 0x5d, 0xb2, 0x01, 0x50, 0x3c, 0x77, 0xa5,
-    0xe5, 0xc6, 0x3d, 0x36, 0xbd, 0x7e, 0xa0, 0xec, 0x8d, 0xb2, 0x14, 0x0c, 0x3b, 0xe8, 0x64, 0xbe,
+    0xb9, 0xe7, 0xf9, 0x01, 0xc1, 0xbc, 0x07, 0xce, 0x43, 0x00, 0x43, 0x44, 0xfb, 0x10, 0x6d, 0xbe,
+    0xa3, 0x3b, 0x8f, 0xfa, 0xad, 0xe5, 0x20, 0xd6, 0xdd, 0xcb, 0xbf, 0x38, 0x8b, 0x8b, 0x7d, 0x6a,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -3016,7 +3016,7 @@ fn elaborate_with_representation(
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
-    let canonical_core = elaboration_phase!(
+    let canonical_core_build = elaboration_phase!(
         "build_canonical_program_core",
         core_lowering::build_canonical_program_core(
             &execution_graph,
@@ -3029,10 +3029,15 @@ fn elaborate_with_representation(
         )
     )
     .map_err(SemanticError::new)?;
+    let core_lowering::CanonicalProgramCoreBuildV2 {
+        core: canonical_core,
+        execution_payload_seals_v3,
+    } = canonical_core_build;
     let mut semantic_image_builder = semantic_image_builder;
     elaboration_phase!(
         "finalize_executable_receipts",
-        semantic_image_builder.finalize_executable_receipts(&canonical_core)
+        semantic_image_builder
+            .finalize_executable_receipts(&canonical_core, &execution_payload_seals_v3,)
     )
     .map_err(SemanticError::new)?;
     let execution_graph = semantic_image_builder.execution();

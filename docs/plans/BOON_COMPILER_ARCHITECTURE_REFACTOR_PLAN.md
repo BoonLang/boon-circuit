@@ -3792,11 +3792,52 @@ diagnostics-only route materializes zero definitions and records 605.811 ms
 total (581.305 ms wall) in the adjacent optimized run, already below the
 flag-day 2-second gate but still above the final 250 ms objective.
 
-The next dependency-bottom cut is direct checked expression authority, followed
-by calls and the remaining global checked tables. That cut must consume the
-same relocated alpha ranges, semantic payloads, execution shapes, effect facts,
-and resource rows, then delete the roughly 192 ms compatibility checked-image
-publisher rather than retaining two assemblers.
+### Production dense-checker cut and consuming execution seals
+
+The remaining checked expression, call, resource, and global-row cuts are now
+complete and the public compiler route uses the dense kernel for both
+diagnostics and checked-image requests. The old owner checker is no longer a
+production fallback; it remains only behind compatibility/oracle tests pending
+its physical deletion. Checkpoint `dd2f653b` made this routing boundary exact.
+The compiler library suite is 107/107 green with two intentionally ignored
+large probes, and the ignored NovyWave production probe completes with all
+1,389 definitions, zero unsupported owners, and exact checked-row parity.
+
+Checkpoint `da06a5de` then replaced cumulative invocation substitution maps
+with parent-linked compact frames. NovyWave still has 1,957,896 logical
+inherited substitutions, but stores only 5,061 local facts. Release OUT
+construction fell from 330.013 ms to 225.547 ms (31.7%), while the complete
+verified wall sample moved from 3,797.229 ms to 3,735.203 ms. This is the first
+downstream cut that removes occurrence amplification rather than compressing
+its final DTO.
+
+The first consuming-seal slice is also complete. Core lowering now hashes final
+executable expressions, statements, call occurrences, sources, states, roots,
+functions, materializations, and static owners while it owns those rows. It
+returns the canonical core together with dense payload seals; execution-image
+linking consumes those seals and constructs only projection, relocation, and
+row envelopes. A workspace architecture check requires all nine executable
+domains to use this path. Static owners are deliberately sealed only after the
+storage join, because the earlier identity forest omits row bindings. Test
+builds sample the first, middle, and last row in every domain against the final
+core to prevent authority drift.
+
+On the fresh optimized NovyWave probe, executable receipt finalization fell
+from 237.746 ms to 147.144 ms. Core construction absorbs most of the payload
+encoding, so semantic elaboration improves more modestly from 1,811.097 ms to
+1,796.081 ms. The complete wall sample is 3,774.160 ms versus the prior
+3,735.203 ms because backend time varied upward by about 41 ms; this is not a
+whole-compiler speed claim. Diagnostics is 679.852 ms and WHERE verification is
+1.039 ms, again proving WHERE is not the current bottleneck. The optimized Rust
+rebuild took 3 minutes 15 seconds and is excluded from every Boon timing.
+
+The next largest runtime owner is the 289.353 ms dependency-manifest pass:
+88.198 ms re-inventories OUT and 82.446 ms rebuilds projection SCC receipts.
+The next vertical slice must consume definition/execution construction receipts
+directly and delete those rich-graph inventories, not merely move their hashes
+to another phase. In parallel, the now-dead owner-interface/body solver must be
+physically removed as a build-dependency cut; that deletion is measured as Rust
+rebuild closure rather than falsely credited to Boon execution latency.
 
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not

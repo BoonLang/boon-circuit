@@ -253,12 +253,18 @@ pub(super) struct SemanticToExecutableMap {
     runtime_states: BTreeMap<SemanticStateId, StateId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(super) struct MappedSemanticExecution {
     pub executable: ExecutableProgram,
     pub materializations: Vec<ContextualMaterialization>,
     pub static_owners: Vec<StaticOwnerDef>,
     pub id_map: SemanticToExecutableMap,
+    pub payload_seals_v3: crate::semantic_image::ExecutionRowPayloadSealsV3,
+}
+
+pub(crate) struct CanonicalProgramCoreBuildV2 {
+    pub(crate) core: program_core::CanonicalProgramCoreV2,
+    pub(crate) execution_payload_seals_v3: crate::semantic_image::ExecutionRowPayloadSealsV3,
 }
 
 #[derive(Clone, Debug)]
@@ -1556,36 +1562,47 @@ fn map_semantic_execution_with_external_events(
         resources,
         external_event_identities,
     )?;
-    let expressions = graph
-        .expressions
-        .iter()
-        .map(|expression| map_expression(graph, &id_map, expression))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut payload_scratch = Vec::new();
+    let mut expression_payload_seals_v3 = Vec::with_capacity(graph.expressions.len());
+    let mut expressions = Vec::with_capacity(graph.expressions.len());
+    for expression in &graph.expressions {
+        let expression = map_expression(graph, &id_map, expression)?;
+        expression_payload_seals_v3.push(crate::semantic_image::seal_execution_row_payload_v3(
+            &expression,
+            &mut payload_scratch,
+        )?);
+        expressions.push(expression);
+    }
     let statements = graph
         .statements
         .iter()
         .map(|statement| map_statement(&id_map, statement))
         .collect::<Result<Vec<_>, _>>()?;
+    let statement_payload_seals_v3 = seal_execution_rows_v3(&statements, &mut payload_scratch)?;
     let sources = graph
         .sources
         .iter()
         .map(|source| map_source(&id_map, source))
         .collect::<Result<Vec<_>, _>>()?;
+    let source_payload_seals_v3 = seal_execution_rows_v3(&sources, &mut payload_scratch)?;
     let states = graph
         .states
         .iter()
         .map(|state| map_state(&id_map, state))
         .collect::<Result<Vec<_>, _>>()?;
+    let state_payload_seals_v3 = seal_execution_rows_v3(&states, &mut payload_scratch)?;
     let roots = graph
         .roots
         .iter()
         .map(|root| map_root(graph, &id_map, root))
         .collect::<Result<Vec<_>, _>>()?;
+    let root_payload_seals_v3 = seal_execution_rows_v3(&roots, &mut payload_scratch)?;
     let functions = graph
         .functions
         .iter()
         .map(|function| map_function(graph, &id_map, function))
         .collect::<Result<Vec<_>, _>>()?;
+    let function_payload_seals_v3 = seal_execution_rows_v3(&functions, &mut payload_scratch)?;
     let ordinary_functions = graph
         .callables
         .iter()
@@ -1610,6 +1627,8 @@ fn map_semantic_execution_with_external_events(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let call_occurrence_payload_seals_v3 =
+        seal_execution_rows_v3(&call_occurrences, &mut payload_scratch)?;
     let materializations = graph
         .materializations
         .iter()
@@ -1625,6 +1644,8 @@ fn map_semantic_execution_with_external_events(
             map_materialization(&id_map, materialization, binding)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let materialization_payload_seals_v3 =
+        seal_execution_rows_v3(&materializations, &mut payload_scratch)?;
     let static_owners = graph
         .static_owners
         .iter()
@@ -1633,7 +1654,7 @@ fn map_semantic_execution_with_external_events(
             parent: owner.parent,
             child_ordinal: owner.child_ordinal,
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     Ok(MappedSemanticExecution {
         executable: ExecutableProgram {
@@ -1649,7 +1670,31 @@ fn map_semantic_execution_with_external_events(
         materializations,
         static_owners,
         id_map,
+        payload_seals_v3: crate::semantic_image::ExecutionRowPayloadSealsV3 {
+            expressions: expression_payload_seals_v3.into_boxed_slice(),
+            statements: statement_payload_seals_v3,
+            call_occurrences: call_occurrence_payload_seals_v3,
+            sources: source_payload_seals_v3,
+            states: state_payload_seals_v3,
+            roots: root_payload_seals_v3,
+            functions: function_payload_seals_v3,
+            materializations: materialization_payload_seals_v3,
+            // The final executable owner rows are constructed by storage
+            // lowering, not by this identity-only owner forest. They are
+            // sealed after that join in `finish_canonical_program_core`.
+            static_owners: Box::new([]),
+        },
     })
+}
+
+fn seal_execution_rows_v3<T: serde::Serialize>(
+    rows: &[T],
+    scratch: &mut Vec<u8>,
+) -> Result<Box<[[u8; 32]]>, String> {
+    rows.iter()
+        .map(|row| crate::semantic_image::seal_execution_row_payload_v3(row, scratch))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
 }
 
 pub(super) fn map_semantic_resources(
@@ -7184,7 +7229,7 @@ pub(crate) fn build_canonical_program_core(
     view_binding_graph: &crate::SemanticViewBindingGraphV1,
     scope_storage_graph: &SemanticScopeStorageGraphV1,
     memory_graph: &crate::SemanticMemoryGraphV1,
-) -> Result<program_core::CanonicalProgramCoreV2, String> {
+) -> Result<CanonicalProgramCoreBuildV2, String> {
     let mapped =
         map_semantic_execution_with_reactive(execution_graph, resource_graph, reactive_graph)?;
     let resources = map_semantic_resources(execution_graph, resource_graph, &mapped.id_map)?;
@@ -7212,7 +7257,7 @@ fn finish_canonical_program_core(
     memory_graph: &crate::SemanticMemoryGraphV1,
     mapped: MappedSemanticExecution,
     resources: MappedSemanticResources,
-) -> Result<program_core::CanonicalProgramCoreV2, String> {
+) -> Result<CanonicalProgramCoreBuildV2, String> {
     let mut resources = resources;
     let reactive = map_semantic_reactive(
         execution_graph,
@@ -7292,6 +7337,7 @@ fn finish_canonical_program_core(
     let MappedSemanticExecution {
         executable,
         materializations,
+        mut payload_seals_v3,
         ..
     } = mapped;
     let MappedSemanticResources {
@@ -7329,7 +7375,7 @@ fn finish_canonical_program_core(
     }
     let graph_node_count = executable.expressions.len();
 
-    Ok(program_core::CanonicalProgramCoreV2 {
+    let core = program_core::CanonicalProgramCoreV2 {
         executable,
         scope_index: program_core::ErasedScopeIndex {
             owners,
@@ -7378,6 +7424,18 @@ fn finish_canonical_program_core(
         materializations,
         view_bindings,
         named_value_interfaces,
+    };
+    let mut payload_scratch = Vec::new();
+    payload_seals_v3.static_owners =
+        seal_execution_rows_v3(&core.scope_index.owners, &mut payload_scratch)?;
+    #[cfg(test)]
+    crate::semantic_image::validate_execution_row_payload_seal_samples_v3(
+        &core,
+        &payload_seals_v3,
+    )?;
+    Ok(CanonicalProgramCoreBuildV2 {
+        core,
+        execution_payload_seals_v3: payload_seals_v3,
     })
 }
 

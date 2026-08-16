@@ -4119,6 +4119,7 @@ fields = [
   { name = "materializations", disposition = "r-r-priv-id-pc-n", reviewed = true },
   { name = "static_owners", disposition = "r-r-priv-id-pc-n", reviewed = true },
   { name = "id_map", disposition = "r-c-priv-id-pc-n", reviewed = true },
+  { name = "payload_seals_v3", disposition = "r-c-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -9160,6 +9161,7 @@ fields = [
   { name = "passed", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "ports", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "local_type_substitutions", disposition = "r-fr-priv-sp-id-pc-n", reviewed = true },
+  { name = "resolved_type_substitutions", disposition = "n-i-priv-n-n", reviewed = true },
   { name = "type_substitution_count", disposition = "n-i-priv-n-n", reviewed = true },
   { name = "result", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "result_is_exact_occurrence", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
@@ -11625,6 +11627,48 @@ name = "CheckedCallResultPath"
 fields = [
   { name = "call", disposition = "r-c-priv-sp-id-n", reviewed = true },
   { name = "path", disposition = "r-c-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedAuthoritativeCallableShapeV1"
+fields = [
+  { name = "name", disposition = "r-f-priv-sp-id-n", reviewed = true },
+  { name = "kind", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "parameters", disposition = "r-f-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedAuthoritativeEvaluationScopeV1"
+
+[[records.variants]]
+name = "Parent"
+disposition = "a-c-priv-sp-id-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Output"
+disposition = "r-rc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "parameter_ordinal", disposition = "r-rc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedAuthoritativeParameterShapeV1"
+fields = [
+  { name = "name", disposition = "r-f-priv-sp-id-n", reviewed = true },
+  { name = "kind", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "ordinal", disposition = "r-f-priv-sp-id-n", reviewed = true },
+  { name = "optional", disposition = "r-fa-priv-sp-id-n", reviewed = true },
+  { name = "evaluation_scope", disposition = "r-fc-priv-sp-id-n", reviewed = true },
 ]
 
 [[records]]

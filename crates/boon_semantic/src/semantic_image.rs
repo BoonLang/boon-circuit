@@ -4,10 +4,12 @@
 //! Before publication, the builder normalizes any checked inline-list
 //! authorities that must become concrete execution rows. Resource elaboration
 //! then receives immutable columns and owns row/list bindings separately. The
-//! builder crosses one consuming validation boundary, hashes every final row,
-//! and seals the checked and execution receipts beside the columns. Later
-//! semantic phases borrow the sealed columns; they never own or materialize a
-//! second execution graph.
+//! builder crosses one consuming validation boundary and seals the checked and
+//! execution receipts beside the columns. Final executable payloads are hashed
+//! by core lowering while each typed row is still construction-owned; this
+//! linker hashes only semantic-owned rows and receipt/relocation envelopes.
+//! Later semantic phases borrow the sealed columns; they never own or
+//! materialize a second execution graph.
 
 use crate::{
     DistributedCallOccurrenceRoot, OutCallInstanceId, ResolvedOutGraph,
@@ -51,6 +53,132 @@ const SEMANTIC_IMAGE_SEAL_DOMAIN_V3: &[u8] = b"boon.semantic-image-seal.v3\0";
 const EXECUTION_INVOCATION_OVERLAY_DOMAIN_V3: &[u8] = b"boon.execution-invocation-overlay.v3\0";
 #[cfg(test)]
 const EXECUTION_CONSTRUCTION_ROUTES_DOMAIN_V3: &[u8] = b"boon.execution-construction-routes.v3\0";
+
+/// Construction-owned payload seals for final executable rows.
+///
+/// Core lowering creates executable expressions from semantic expressions and
+/// is the last pass allowed to mutate their payload. Retaining the exact V3
+/// payload digest here lets the execution-image linker consume that fact
+/// without serializing every final row again in a later whole-program sweep.
+/// Each vector is dense in its executable row-ID domain.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ExecutionRowPayloadSealsV3 {
+    pub(crate) expressions: Box<[[u8; 32]]>,
+    pub(crate) statements: Box<[[u8; 32]]>,
+    pub(crate) call_occurrences: Box<[[u8; 32]]>,
+    pub(crate) sources: Box<[[u8; 32]]>,
+    pub(crate) states: Box<[[u8; 32]]>,
+    pub(crate) roots: Box<[[u8; 32]]>,
+    pub(crate) functions: Box<[[u8; 32]]>,
+    pub(crate) materializations: Box<[[u8; 32]]>,
+    pub(crate) static_owners: Box<[[u8; 32]]>,
+}
+
+pub(crate) fn seal_execution_row_payload_v3<T: Serialize + ?Sized>(
+    payload: &T,
+    scratch: &mut Vec<u8>,
+) -> Result<[u8; 32], String> {
+    boon_contract::canonical_serde_hash_v1_with_buffer(
+        EXECUTION_IMAGE_ROW_PAYLOAD_DOMAIN_V3,
+        payload,
+        scratch,
+    )
+    .map_err(|error| format!("failed to seal execution V3 row payload: {error}"))
+}
+
+#[cfg(test)]
+pub(crate) fn validate_execution_row_payload_seal_samples_v3(
+    core: &crate::program_core::CanonicalProgramCoreV2,
+    seals: &ExecutionRowPayloadSealsV3,
+) -> Result<(), String> {
+    let mut scratch = Vec::new();
+    validate_execution_row_payload_seal_sample_v3(
+        "expression",
+        &core.executable.expressions,
+        &seals.expressions,
+        &mut scratch,
+    )?;
+    validate_execution_row_payload_seal_sample_v3(
+        "statement",
+        &core.executable.statements,
+        &seals.statements,
+        &mut scratch,
+    )?;
+    validate_execution_row_payload_seal_sample_v3(
+        "call occurrence",
+        &core.executable.call_occurrences,
+        &seals.call_occurrences,
+        &mut scratch,
+    )?;
+    validate_execution_row_payload_seal_sample_v3(
+        "source",
+        &core.executable.sources,
+        &seals.sources,
+        &mut scratch,
+    )?;
+    validate_execution_row_payload_seal_sample_v3(
+        "state",
+        &core.executable.states,
+        &seals.states,
+        &mut scratch,
+    )?;
+    validate_execution_row_payload_seal_sample_v3(
+        "root",
+        &core.executable.roots,
+        &seals.roots,
+        &mut scratch,
+    )?;
+    validate_execution_row_payload_seal_sample_v3(
+        "function",
+        &core.executable.functions,
+        &seals.functions,
+        &mut scratch,
+    )?;
+    validate_execution_row_payload_seal_sample_v3(
+        "materialization",
+        &core.materializations,
+        &seals.materializations,
+        &mut scratch,
+    )?;
+    validate_execution_row_payload_seal_sample_v3(
+        "static owner",
+        &core.scope_index.owners,
+        &seals.static_owners,
+        &mut scratch,
+    )
+}
+
+#[cfg(test)]
+fn validate_execution_row_payload_seal_sample_v3<T: Serialize>(
+    domain: &str,
+    rows: &[T],
+    seals: &[[u8; 32]],
+    scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    if rows.len() != seals.len() {
+        return Err(format!(
+            "execution V3 {domain} payload seals cover {} of {} final rows",
+            seals.len(),
+            rows.len()
+        ));
+    }
+    let mut samples = [0, rows.len() / 2, rows.len().saturating_sub(1)];
+    samples.sort_unstable();
+    let mut previous = None;
+    for index in samples {
+        if previous == Some(index) || index >= rows.len() {
+            continue;
+        }
+        previous = Some(index);
+        let actual = seal_execution_row_payload_v3(&rows[index], scratch)?;
+        if seals[index] != actual {
+            return Err(format!(
+                "execution V3 {domain} payload seal {index} differs from its final row"
+            ));
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -629,6 +757,7 @@ impl SemanticImageBuilder<ExecutionFinalized> {
     pub(crate) fn finalize_executable_receipts(
         &mut self,
         core: &crate::program_core::CanonicalProgramCoreV2,
+        payload_seals: &ExecutionRowPayloadSealsV3,
     ) -> Result<(), String> {
         if self.execution_handoff.is_some() {
             return Err("execution V3 handoff was already finalized".to_owned());
@@ -642,6 +771,7 @@ impl SemanticImageBuilder<ExecutionFinalized> {
             construction_image,
             &self.execution,
             core,
+            payload_seals,
         )?;
         #[cfg(test)]
         if let Some(oracle) = &self.execution_handoff_v2_oracle {
@@ -862,6 +992,17 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
         projection: PendingExecutionProjectionIdV3,
         domain: ExecutionImageRowDomainV3,
         payload: &T,
+        relocations: Vec<PendingExecutionProjectionIdV3>,
+    ) -> Result<(), String> {
+        let payload_digest = seal_execution_row_payload_v3(payload, &mut self.hash_scratch)?;
+        self.push_presealed(projection, domain, payload_digest, relocations)
+    }
+
+    fn push_presealed(
+        &mut self,
+        projection: PendingExecutionProjectionIdV3,
+        domain: ExecutionImageRowDomainV3,
+        payload_digest: [u8; 32],
         mut relocations: Vec<PendingExecutionProjectionIdV3>,
     ) -> Result<(), String> {
         let stable_key_digests = &self.projections;
@@ -869,12 +1010,6 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
             .sort_unstable_by_key(|target| stable_key_digests[target.as_usize()].stable_key_digest);
         relocations.dedup_by_key(|target| stable_key_digests[target.as_usize()].stable_key_digest);
         relocations.retain(|target| *target != projection);
-        let payload_digest = boon_contract::canonical_serde_hash_v1_with_buffer(
-            EXECUTION_IMAGE_ROW_PAYLOAD_DOMAIN_V3,
-            payload,
-            &mut self.hash_scratch,
-        )
-        .map_err(|error| format!("failed to hash execution V3 row payload: {error}"))?;
         self.relocation_digest_scratch.clear();
         self.relocation_digest_scratch.extend(
             relocations
@@ -2308,6 +2443,7 @@ fn execution_image_handoff_v3(
     construction_image: &ExecutionConstructionImageV3,
     execution: &SemanticExecutionImageColumnsV1,
     core: &crate::program_core::CanonicalProgramCoreV2,
+    payload_seals: &ExecutionRowPayloadSealsV3,
 ) -> Result<ExecutionImageHandoffV3, String> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     let mut trace_started = std::time::Instant::now();
@@ -2321,6 +2457,15 @@ fn execution_image_handoff_v3(
         || executable.call_occurrences.len() != execution.call_occurrences.len()
         || core.materializations.len() != execution.materializations.len()
         || core.scope_index.owners.len() != execution.static_owners.len()
+        || payload_seals.expressions.len() != executable.expressions.len()
+        || payload_seals.statements.len() != executable.statements.len()
+        || payload_seals.call_occurrences.len() != executable.call_occurrences.len()
+        || payload_seals.sources.len() != executable.sources.len()
+        || payload_seals.states.len() != executable.states.len()
+        || payload_seals.roots.len() != executable.roots.len()
+        || payload_seals.functions.len() != executable.functions.len()
+        || payload_seals.materializations.len() != core.materializations.len()
+        || payload_seals.static_owners.len() != core.scope_index.owners.len()
     {
         return Err("execution V3 receipts do not exactly cover final executable rows".to_owned());
     }
@@ -2426,10 +2571,15 @@ fn execution_image_handoff_v3(
                 callable.checked_callable.0 as usize,
             )?);
         }
-        builder.push(
+        let payload_digest = execution_payload_seal_v3(
+            &payload_seals.expressions,
+            ExecutionImageRowDomainV3::Expression,
+            semantic.id.as_usize(),
+        )?;
+        builder.push_presealed(
             projection,
             ExecutionImageRowDomainV3::Expression,
-            executable,
+            payload_digest,
             relocations,
         )?;
         builder.route(
@@ -2465,10 +2615,15 @@ fn execution_image_handoff_v3(
         {
             relocations.push(expression_projection(value)?);
         }
-        builder.push(
+        let payload_digest = execution_payload_seal_v3(
+            &payload_seals.statements,
+            ExecutionImageRowDomainV3::Statement,
+            semantic.id.as_usize(),
+        )?;
+        builder.push_presealed(
             projection,
             ExecutionImageRowDomainV3::Statement,
-            executable,
+            payload_digest,
             relocations,
         )?;
         builder.route(
@@ -2565,10 +2720,15 @@ fn execution_image_handoff_v3(
                 call.checked_call.0 as usize,
             )?);
         }
-        builder.push(
+        let payload_digest = execution_payload_seal_v3(
+            &payload_seals.call_occurrences,
+            ExecutionImageRowDomainV3::CallOccurrence,
+            semantic.id.as_usize(),
+        )?;
+        builder.push_presealed(
             projection,
             ExecutionImageRowDomainV3::CallOccurrence,
-            executable,
+            payload_digest,
             relocations,
         )?;
         builder.route(
@@ -2579,7 +2739,7 @@ fn execution_image_handoff_v3(
     }
     trace_execution_handoff_phase(trace, "v3_occurrence_rows", &mut trace_started);
 
-    for (semantic, executable) in execution.sources.iter().zip(&executable.sources) {
+    for semantic in &execution.sources {
         let fallback = expression_projection(semantic.expression)?;
         let projection = semantic.call_instance.map_or(Ok(fallback), |occurrence| {
             invocation_projections
@@ -2587,10 +2747,15 @@ fn execution_image_handoff_v3(
                 .copied()
                 .ok_or_else(|| format!("source {} has missing invocation", semantic.id))
         })?;
-        builder.push(
+        let payload_digest = execution_payload_seal_v3(
+            &payload_seals.sources,
+            ExecutionImageRowDomainV3::Source,
+            semantic.id.as_usize(),
+        )?;
+        builder.push_presealed(
             projection,
             ExecutionImageRowDomainV3::Source,
-            executable,
+            payload_digest,
             vec![fallback],
         )?;
         builder.route(
@@ -2599,7 +2764,7 @@ fn execution_image_handoff_v3(
             projection,
         )?;
     }
-    for (semantic, executable) in execution.states.iter().zip(&executable.states) {
+    for semantic in &execution.states {
         let fallback = expression_projection(semantic.expression)?;
         let projection = semantic.call_instance.map_or(Ok(fallback), |occurrence| {
             invocation_projections
@@ -2613,10 +2778,15 @@ fn execution_image_handoff_v3(
         {
             relocations.push(expression_projection(then_expression)?);
         }
-        builder.push(
+        let payload_digest = execution_payload_seal_v3(
+            &payload_seals.states,
+            ExecutionImageRowDomainV3::State,
+            semantic.id.as_usize(),
+        )?;
+        builder.push_presealed(
             projection,
             ExecutionImageRowDomainV3::State,
-            executable,
+            payload_digest,
             relocations,
         )?;
         builder.route(
@@ -2627,12 +2797,17 @@ fn execution_image_handoff_v3(
     }
     trace_execution_handoff_phase(trace, "v3_resource_rows", &mut trace_started);
 
-    for (semantic, executable) in execution.roots.iter().zip(&executable.roots) {
+    for (index, semantic) in execution.roots.iter().enumerate() {
         let projection = expression_projection(semantic.expression)?;
-        builder.push(
+        let payload_digest = execution_payload_seal_v3(
+            &payload_seals.roots,
+            ExecutionImageRowDomainV3::Root,
+            index,
+        )?;
+        builder.push_presealed(
             projection,
             ExecutionImageRowDomainV3::Root,
-            executable,
+            payload_digest,
             vec![projection],
         )?;
         builder.route(
@@ -2641,30 +2816,26 @@ fn execution_image_handoff_v3(
             projection,
         )?;
     }
-    for (index, (semantic, executable)) in execution
-        .functions
-        .iter()
-        .zip(&executable.functions)
-        .enumerate()
-    {
+    for (index, semantic) in execution.functions.iter().enumerate() {
         let projection = function_projection_v3(&mut builder, execution, semantic)?;
         let mut relocations = vec![expression_projection(semantic.root)?];
         if let Some(source) = semantic.invocation_source {
             relocations.push(expression_projection(source)?);
         }
-        builder.push(
+        let payload_digest = execution_payload_seal_v3(
+            &payload_seals.functions,
+            ExecutionImageRowDomainV3::Function,
+            index,
+        )?;
+        builder.push_presealed(
             projection,
             ExecutionImageRowDomainV3::Function,
-            executable,
+            payload_digest,
             relocations,
         )?;
         builder.route(ExecutionImageRowDomainV3::Function, index, projection)?;
     }
-    for (semantic, executable) in execution
-        .materializations
-        .iter()
-        .zip(&core.materializations)
-    {
+    for semantic in &execution.materializations {
         let projection = owner_routes
             .get(semantic.owner.as_usize())
             .copied()
@@ -2674,10 +2845,15 @@ fn execution_image_handoff_v3(
             .into_iter()
             .map(expression_projection)
             .collect::<Result<Vec<_>, _>>()?;
-        builder.push(
+        let payload_digest = execution_payload_seal_v3(
+            &payload_seals.materializations,
+            ExecutionImageRowDomainV3::Materialization,
+            semantic.id.as_usize(),
+        )?;
+        builder.push_presealed(
             projection,
             ExecutionImageRowDomainV3::Materialization,
-            executable,
+            payload_digest,
             relocations,
         )?;
         builder.route(
@@ -2704,10 +2880,15 @@ fn execution_image_handoff_v3(
             .and_then(|parent| owner_routes.get(parent.as_usize()).copied())
             .into_iter()
             .collect();
-        builder.push(
+        let payload_digest = execution_payload_seal_v3(
+            &payload_seals.static_owners,
+            ExecutionImageRowDomainV3::StaticOwner,
+            semantic.id.as_usize(),
+        )?;
+        builder.push_presealed(
             projection,
             ExecutionImageRowDomainV3::StaticOwner,
-            executable,
+            payload_digest,
             relocations,
         )?;
         builder.route(
@@ -2718,6 +2899,16 @@ fn execution_image_handoff_v3(
     }
     trace_execution_handoff_phase(trace, "v3_final_domains", &mut trace_started);
     builder.finish(checked.source_bundle_digest_v1, checked.role)
+}
+
+fn execution_payload_seal_v3(
+    seals: &[[u8; 32]],
+    domain: ExecutionImageRowDomainV3,
+    dense_index: usize,
+) -> Result<[u8; 32], String> {
+    seals.get(dense_index).copied().ok_or_else(|| {
+        format!("execution V3 {domain:?} row {dense_index} has no construction-owned payload seal")
+    })
 }
 
 #[cfg(test)]

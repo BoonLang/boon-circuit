@@ -694,10 +694,14 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
     if typecheck
         .matches("CheckedProgram::from_typechecker_parts_unchecked(")
         .count()
-        != 1
+        != 2
+        || !typecheck
+            .contains("pub fn seal_project_checked_program_construction_with_call_occurrences(")
+        || !typecheck.contains("fn seal_checked_program_fields(")
     {
         return Err(
-            "typechecker must cross the unsafe CheckedProgram seal exactly once".to_owned(),
+            "typechecker must cross the unsafe CheckedProgram seal through exactly one legacy and one compact-kernel entrypoint"
+                .to_owned(),
         );
     }
     verify_required_direct_field(
@@ -1098,6 +1102,7 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     let ir_path = workspace.join("crates/boon_ir/src/lib.rs");
     let semantic_path = workspace.join("crates/boon_semantic/src/lib.rs");
     let lowering_path = workspace.join("crates/boon_semantic/src/core_lowering.rs");
+    let semantic_image_path = workspace.join("crates/boon_semantic/src/semantic_image.rs");
     for obsolete in [
         workspace.join("crates/boon_ir/src/semantic_mapping.rs"),
         workspace.join("crates/boon_ir/src/semantic_mapping"),
@@ -1115,10 +1120,13 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     let ir = read_text(&ir_path)?;
     let semantic = read_text(&semantic_path)?;
     let lowering = read_text(&lowering_path)?;
+    let semantic_image = read_text(&semantic_image_path)?;
     syn::parse_file(&ir)
         .map_err(|error| format!("cannot parse `{}`: {error}", ir_path.display()))?;
     syn::parse_file(&lowering)
         .map_err(|error| format!("cannot parse `{}`: {error}", lowering_path.display()))?;
+    syn::parse_file(&semantic_image)
+        .map_err(|error| format!("cannot parse `{}`: {error}", semantic_image_path.display()))?;
 
     for forbidden in [
         "mod semantic_mapping",
@@ -1181,6 +1189,8 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     }
     for required in [
         "pub(crate) fn build_canonical_program_core(",
+        "struct CanonicalProgramCoreBuildV2",
+        "payload_seals_v3: crate::semantic_image::ExecutionRowPayloadSealsV3",
         "struct SemanticToExecutableMap",
         "fn validate_allocation_bijections(",
         "struct SemanticReactiveToMappedMap",
@@ -1200,6 +1210,12 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     {
         return Err(
             "semantic core construction must emit exactly one CanonicalProgramCoreV2".to_owned(),
+        );
+    }
+    if semantic_image.matches("builder.push_presealed(").count() != 9 {
+        return Err(
+            "execution receipt linking must consume all nine executable row payload domains from core lowering"
+                .to_owned(),
         );
     }
     for forbidden in [

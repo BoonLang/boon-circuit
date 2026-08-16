@@ -1,12 +1,13 @@
 use crate::{
     ComponentArtifact, ComponentProgram, ComponentProgramBuilder, KernelCollectionOperationKind,
-    KernelPattern, KernelRecordEntry, KernelSelectArm, KernelSolveError, KernelSolveWork,
-    KernelSummaryCallInput, KernelSummaryNode, KernelSummaryProgram, KernelSummaryProjectionStep,
-    KernelSummaryRecordEntry, KernelSummarySelectArm, KernelSummaryValueId, OutputId, PublishMode,
-    TypeTerm, TypeTermId, TypeVariableId, VariantTerm,
-    alpha_normalize_callable_interface_and_diagnostics, alpha_normalize_definition,
-    build_snapshot_receipts, definition_basis_fingerprint,
-    definition_basis_fingerprint_with_buffer, solve_component,
+    KernelDefinitionFlowTermsV1, KernelPattern, KernelRecordEntry, KernelSelectArm,
+    KernelSolveError, KernelSolveWork, KernelSummaryCallInput, KernelSummaryNode,
+    KernelSummaryProgram, KernelSummaryProjectionStep, KernelSummaryRecordEntry,
+    KernelSummarySelectArm, KernelSummaryValueId, OutputId, PublishMode, TypeTerm, TypeTermId,
+    TypeVariableId, VariantTerm, alpha_normalize_callable_interface_and_diagnostics,
+    alpha_normalize_definition, build_snapshot_receipts, definition_basis_fingerprint,
+    definition_basis_fingerprint_with_buffer, materialize_definition_flow_terms_v1,
+    solve_component,
 };
 use boon_checked::{
     BytesType, CheckedListKeyPolicy, CheckedStateKind, FlowMode, FlowType, ObjectShape, Type,
@@ -2180,12 +2181,22 @@ pub struct KernelListArtifact {
 /// This is deliberately free of solver cells, operation IDs, and work
 /// counters. Later checked rows (calls, effects, state, lists, diagnostics)
 /// extend this single artifact instead of creating parallel owner products.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DefinitionArtifact {
     pub result: FlowType,
     /// Principal callable formal surfaces in dense declaration order. This is
     /// empty for non-callable definitions.
     pub formals: Box<[FlowType]>,
+    /// Canonical definition-owned flow terms retained directly from the
+    /// solved type DAG. Rich `FlowType` fields remain a compatibility
+    /// projection during the vertical cut and must materialize exactly from
+    /// this authority.
+    /// Direct solved-DAG handoff. This derived sidecar is deliberately absent
+    /// from the rich V16 artifact serialization/currentness contract while the
+    /// semantic V5 consumer is landing; its own structural digest is the only
+    /// stable identity.
+    #[serde(skip)]
+    pub(crate) flow_terms: KernelDefinitionFlowTermsV1,
     pub linkage: KernelDefinitionLinkage,
     /// Exact stable source identities retained for direct checked/semantic
     /// linking. Dense IDs remain definition-local and revision-local.
@@ -2206,6 +2217,39 @@ pub struct DefinitionArtifact {
     pub states: Box<[KernelStateArtifact]>,
     pub lists: Box<[KernelListArtifact]>,
     pub diagnostics: Box<[KernelDiagnosticArtifact]>,
+}
+
+impl DefinitionArtifact {
+    pub fn flow_terms(&self) -> &KernelDefinitionFlowTermsV1 {
+        &self.flow_terms
+    }
+}
+
+impl Hash for DefinitionArtifact {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Preserve the exact V16 rich-artifact byte contract while the solved
+        // term DAG is a derived sidecar. The semantic V5 cut gives the term
+        // digest its own explicit proof/currentness domain instead of silently
+        // changing an existing contract through `derive(Hash)`.
+        self.result.hash(state);
+        self.formals.hash(state);
+        self.linkage.hash(state);
+        self.relocations.hash(state);
+        self.presentation.hash(state);
+        self.expression_payloads.hash(state);
+        self.call_syntax.hash(state);
+        self.execution_shapes.hash(state);
+        self.expressions.hash(state);
+        self.statements.hash(state);
+        self.declarations.hash(state);
+        self.lexical_bindings.hash(state);
+        self.calls.hash(state);
+        self.effects.hash(state);
+        self.sources.hash(state);
+        self.states.hash(state);
+        self.lists.hash(state);
+        self.diagnostics.hash(state);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2308,6 +2352,44 @@ impl KernelOwnerProgram {
             .position(|output| *output == self.result_output)
             .expect("owner result belongs to its expression outputs");
         result.mode = self.expression_modes[result_index];
+        let flow_terms = materialize_definition_flow_terms_v1(
+            artifact.terms(),
+            &self
+                .formal_outputs
+                .iter()
+                .zip(self.formal_modes.iter().copied())
+                .map(|(output, mode)| {
+                    (
+                        artifact
+                            .output(*output)
+                            .expect("owner formal output belongs to its component")
+                            .term,
+                        mode,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            (
+                artifact
+                    .output(self.result_output)
+                    .expect("owner result output belongs to its component")
+                    .term,
+                self.expression_modes[result_index],
+            ),
+            &self
+                .expression_outputs
+                .iter()
+                .zip(self.expression_modes.iter().copied())
+                .map(|(output, mode)| {
+                    (
+                        artifact
+                            .output(*output)
+                            .expect("owner expression output belongs to its component")
+                            .term,
+                        mode,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )?;
         let formal_flows = self
             .formal_outputs
             .iter()
@@ -2351,6 +2433,7 @@ impl KernelOwnerProgram {
         let mut definition = DefinitionArtifact {
             result,
             formals: formal_flows,
+            flow_terms,
             linkage: self.linkage,
             relocations: self.relocations,
             presentation: self.presentation,
@@ -2572,7 +2655,7 @@ impl KernelSolvedProject {
                     )
                 },
             )
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();
         let (dependencies, currentness) =
             build_snapshot_receipts(&mut definitions, &basis_fingerprints)?;
@@ -2649,7 +2732,7 @@ impl KernelSolvedProject {
                 &synthetic_state_ordinals,
                 expression_flush_types,
                 &owner_effects,
-            );
+            )?;
             alpha_normalize_definition(&mut definition);
             definitions.push(KernelDemandedDefinitionArtifact {
                 owner: dense_owner,
@@ -3474,8 +3557,46 @@ fn materialize_project_definition(
     synthetic_state_ordinals: &[Option<u32>],
     expression_flush_types: Box<[Option<Type>]>,
     owner_effects: &[KernelEffectSummary],
-) -> DefinitionArtifact {
+) -> Result<DefinitionArtifact, KernelSolveError> {
     let result = public_results[owner_index].clone();
+    let flow_terms = materialize_definition_flow_terms_v1(
+        artifact.terms(),
+        &owner
+            .formals
+            .iter()
+            .zip(owner.formal_modes.iter().copied())
+            .map(|(output, mode)| {
+                (
+                    artifact
+                        .output(*output)
+                        .expect("project owner formal belongs to its component")
+                        .term,
+                    mode,
+                )
+            })
+            .collect::<Vec<_>>(),
+        (
+            artifact
+                .output(owner.result)
+                .expect("project owner result belongs to its component")
+                .term,
+            result.mode,
+        ),
+        &owner
+            .expressions
+            .iter()
+            .zip(owner.expression_modes.iter().copied())
+            .map(|(output, mode)| {
+                (
+                    artifact
+                        .output(*output)
+                        .expect("project owner expression belongs to its component")
+                        .term,
+                    mode,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )?;
     let expression_flows = owner
         .expressions
         .iter()
@@ -3504,9 +3625,10 @@ fn materialize_project_definition(
         expression_flush_types,
         owner_effects,
     );
-    DefinitionArtifact {
+    Ok(DefinitionArtifact {
         result,
         formals: public_formals[owner_index].clone(),
+        flow_terms,
         linkage: owner.linkage,
         relocations: owner.relocations,
         presentation: owner.presentation,
@@ -3523,7 +3645,7 @@ fn materialize_project_definition(
         states,
         lists,
         diagnostics,
-    }
+    })
 }
 
 pub fn compile_owner_program(

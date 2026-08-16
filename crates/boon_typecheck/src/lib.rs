@@ -16768,11 +16768,14 @@ fn seal_project_checked_program_construction_with_authority(
     }
     let image_handoff =
         checked_image_handoff_with_call_occurrences(&fields, call_occurrences, authority)?;
+    let runtime_flow_terms = checked_runtime_flow_term_handoff(&fields, &image_handoff, authority)?;
     // SAFETY: the compact checker supplies fields only after successful
     // construction and supplies parser-issued structural call identities in
     // exact dense call order. The source digest and handoff receipts are
     // validated above before granting runtime capability.
-    Ok(unsafe { CheckedProgram::from_typechecker_parts_unchecked(fields, image_handoff) })
+    Ok(unsafe {
+        CheckedProgram::from_typechecker_parts_unchecked(fields, image_handoff, runtime_flow_terms)
+    })
 }
 
 fn seal_checked_program_fields(
@@ -16787,11 +16790,45 @@ fn seal_checked_program_fields(
         ));
     }
     let image_handoff = checked_image_handoff(&fields, parsed)?;
+    let runtime_flow_terms = checked_runtime_flow_term_handoff(&fields, &image_handoff, None)?;
     // SAFETY: callers supply fields only from the successful typechecker
     // boundary or its opaque `CheckedProgramConstruction`. The source digest
     // is re-bound above and `checked_image_handoff` validates and seals the
     // runtime receipts.
-    Ok(unsafe { CheckedProgram::from_typechecker_parts_unchecked(fields, image_handoff) })
+    Ok(unsafe {
+        CheckedProgram::from_typechecker_parts_unchecked(fields, image_handoff, runtime_flow_terms)
+    })
+}
+
+fn checked_runtime_flow_term_handoff(
+    fields: &CheckedProgramFields,
+    image_handoff: &CheckedImageHandoffV4,
+    authority: Option<&CheckedImageKernelAuthorityV1>,
+) -> Result<boon_checked::CheckedRuntimeFlowTermHandoffV1, String> {
+    let projection = match authority {
+        Some(authority) => authority.runtime_flow_terms.clone(),
+        None => boon_checked::CheckedRuntimeFlowTermProjectionV1::derive_from_checked_expressions(
+            &fields.expressions,
+        )?,
+    };
+    if projection.expression_count() != fields.expressions.len() {
+        return Err(format!(
+            "checked runtime flow-term projection has {} expressions for {} checked rows",
+            projection.expression_count(),
+            fields.expressions.len()
+        ));
+    }
+    let handoff = projection.seal(
+        fields.source_bundle_digest_v1,
+        fields.role,
+        image_handoff.local_image_digest,
+    );
+    handoff.validate_authority(
+        image_handoff.source_bundle_digest_v1,
+        image_handoff.role,
+        image_handoff.local_image_digest,
+    )?;
+    Ok(handoff)
 }
 
 fn validate_structural_lowering_metadata(

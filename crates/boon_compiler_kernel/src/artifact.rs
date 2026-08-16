@@ -1,5 +1,6 @@
-use crate::OutputId;
+use crate::{OutputId, TypeTermArena, TypeTermId};
 use boon_checked::FlowType;
+use std::sync::Arc;
 
 pub const KERNEL_SUMMARY_DEFINITION_RANKING_LEN: usize = 16;
 
@@ -43,6 +44,10 @@ pub struct KernelSolveWork {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactOutput {
     pub id: OutputId,
+    /// Resolved solver-arena term retained until definition finalization.
+    /// This ID is meaningful only together with `ComponentArtifact::terms`;
+    /// it is never a stable receipt identity.
+    pub term: TypeTermId,
     pub flow_type: FlowType,
     /// Whether this exact runtime occurrence contains a value constructed by
     /// selecting one singleton, invocation-parameter-derived syntax branch.
@@ -58,15 +63,28 @@ pub struct ArtifactOutput {
     pub call_syntax_selected: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ComponentArtifact {
     outputs: Box<[ArtifactOutput]>,
+    // The solved project supports multiple sparse/full materializations from
+    // one quiescent graph. Share the frozen solver arena across those cheap
+    // snapshot clones; never give its mutable construction caches semantic
+    // equality or receipt authority.
+    terms: Arc<TypeTermArena>,
     pub work: KernelSolveWork,
 }
 
 impl ComponentArtifact {
-    pub(crate) fn new(outputs: Box<[ArtifactOutput]>, work: KernelSolveWork) -> Self {
-        Self { outputs, work }
+    pub(crate) fn new(
+        outputs: Box<[ArtifactOutput]>,
+        terms: TypeTermArena,
+        work: KernelSolveWork,
+    ) -> Self {
+        Self {
+            outputs,
+            terms: Arc::new(terms),
+            work,
+        }
     }
 
     pub fn outputs(&self) -> &[ArtifactOutput] {
@@ -77,5 +95,9 @@ impl ComponentArtifact {
         self.outputs
             .get(id.0 as usize)
             .filter(|output| output.id == id)
+    }
+
+    pub fn terms(&self) -> &TypeTermArena {
+        self.terms.as_ref()
     }
 }

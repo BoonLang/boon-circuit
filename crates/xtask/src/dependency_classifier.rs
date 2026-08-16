@@ -348,6 +348,27 @@ fn required_source_specs() -> Vec<SourceSpecV1> {
             additional_types: Vec::new(),
         },
         SourceSpecV1 {
+            path: "crates/boon_checked/src/type_terms.rs".to_owned(),
+            selection: SourceSelectionV1::Explicit,
+            prefixes: Vec::new(),
+            explicit_types: [
+                "ArtifactBytesTermV1",
+                "ArtifactFlowTermV1",
+                "ArtifactObjectFieldTermV1",
+                "ArtifactTypeModuleV1",
+                "ArtifactTypeTermIdV1",
+                "ArtifactTypeTermKindV1",
+                "ArtifactTypeTermV1",
+                "ArtifactVariantTermV1",
+                "CheckedRuntimeFlowTermHandoffV1",
+                "CheckedRuntimeFlowTermProjectionV1",
+            ]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
+            additional_types: Vec::new(),
+        },
+        SourceSpecV1 {
             path: "crates/boon_typecheck/src/lib.rs".to_owned(),
             selection: SourceSelectionV1::Explicit,
             prefixes: Vec::new(),

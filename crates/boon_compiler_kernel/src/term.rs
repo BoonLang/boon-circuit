@@ -89,7 +89,7 @@ fn is_value_placeholder_term(term: &TypeTerm) -> bool {
 ///
 /// Hash maps are lookup-only. Canonical output order is derived from the
 /// interned terms and source field order, never from hash-table iteration.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TypeTermArena {
     names: Vec<Box<str>>,
     name_ids: HashMap<u64, Vec<NameId>>,

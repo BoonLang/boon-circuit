@@ -7,6 +7,7 @@
 
 mod abi;
 mod artifact;
+mod artifact_terms;
 mod link;
 mod owner;
 mod program;
@@ -17,6 +18,7 @@ mod term;
 
 pub use abi::*;
 pub use artifact::*;
+pub use artifact_terms::*;
 pub use link::*;
 pub use owner::*;
 pub use program::*;

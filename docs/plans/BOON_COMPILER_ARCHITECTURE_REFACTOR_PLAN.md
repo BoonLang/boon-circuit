@@ -4534,6 +4534,48 @@ checked artifacts, semantic proof publication, and later plan-code templates
 from one authority; a semantic-only type cache would merely create another
 representation and is rejected.
 
+The first expression-only type-term slice is now complete. The kernel retains
+resolved solver term roots through definition finalization, rebases the
+reachable DAG into definition-local canonical artifact terms, and publishes a
+dense runtime-erased flow digest for every checked expression. The projection
+is sealed to the exact source bundle, role, and checked-image digest before
+semantic construction consumes it. Arena-local IDs remain revision-local;
+stable structural digests are the cross-boundary identity. Semantic image V5
+uses the definition digest directly for 13,054 expressions and recursively
+interns only the 3,258 true occurrence overrides.
+
+Two implementation defects found during this cut are fixed rather than hidden
+in the timing: object payload fields are canonicalized lexically while their
+authored `field_order` remains explicit, and the per-definition importer uses a
+sparse reachable-term map instead of zeroing a global-term-sized vector for
+each definition. The checked handoff validates its borrowed digest arena
+without copying it. Focused gates cover non-lexical two-field object parity,
+image/role binding and tamper rejection, the 105-test kernel suite, the
+340-test typechecker suite, the complete compiler suite, the V5 compact proof,
+and the ignored NovyWave semantic gate. The 16 failures in the wider semantic
+suite were reproduced unchanged at the preceding checkpoint and remain
+separate pre-existing proof/retained-occurrence work, not regressions accepted
+by this slice.
+
+One freshly rebuilt pinned-stable release localization records 60.173 ms for
+V5 execution-image construction and 77.563 ms for the complete resource-
+authority normalization envelope, versus the preceding V4 envelope of about
+95.9 ms. This is a directional 18.3 ms, roughly 19%, reduction in the owned
+slice; it is not a replacement for the five-sample checkpoint median. The same
+run completed verified NovyWave in 2,711.869 ms with 1,010.484 ms semantic,
+267.574 ms backend, 366,112 KiB peak RSS, and 0.661 ms WHERE verification.
+Cold-process variance makes its total slower than the prior 2,508.099 ms
+median, so no end-to-end speed claim is made. It produced zero diagnostics and
+the unchanged source and MachinePlan digests. The incremental release rebuild
+took 3:44.43 and 1,977,104 KiB peak RSS.
+
+This remains an expression-flow proof slice, not the final term-native
+semantic database. A later cut must publish all definition type roots in the
+same canonical alpha-normalization order used by receipts, then let semantic
+rows and plan templates relocate those term IDs directly. Do not grow a
+second rich type table or resume proof-codec micro-optimization around this
+handoff.
+
 The concurrent checker-kernel track remains the first half of the same
 definition-artifact design. Checked/execution receipt replay is already deleted;
 the work below completes the checker authority that will eventually produce the

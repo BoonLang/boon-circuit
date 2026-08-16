@@ -432,6 +432,7 @@ impl ComponentSolver {
             self.work.term_materializations = self.work.term_materializations.saturating_add(1);
             outputs.push(ArtifactOutput {
                 id: output.id,
+                term,
                 flow_type: FlowType {
                     mode: output.mode,
                     ty: self.program.terms.export_checked_type(term),
@@ -451,6 +452,7 @@ impl ComponentSolver {
         self.finish_summary_definition_ranking();
         Ok(ComponentArtifact::new(
             outputs.into_boxed_slice(),
+            self.program.terms,
             self.work,
         ))
     }

@@ -113,6 +113,13 @@ explicit_types = []
 additional_types = []
 
 [[sources]]
+path = "crates/boon_checked/src/type_terms.rs"
+selection = "explicit"
+prefixes = []
+explicit_types = ["ArtifactBytesTermV1", "ArtifactFlowTermV1", "ArtifactObjectFieldTermV1", "ArtifactTypeModuleV1", "ArtifactTypeTermIdV1", "ArtifactTypeTermKindV1", "ArtifactTypeTermV1", "ArtifactVariantTermV1", "CheckedRuntimeFlowTermHandoffV1", "CheckedRuntimeFlowTermProjectionV1"]
+additional_types = []
+
+[[sources]]
 path = "crates/boon_typecheck/src/lib.rs"
 selection = "explicit"
 prefixes = []
@@ -172,6 +179,14 @@ traversal = "semantic_atom"
 roles = ["coverage_or_routing", "assurance_or_activation"]
 visibility = "private"
 hash_targets = ["implementation_dependency", "proof_context"]
+erasure = "normalize_then_erase"
+
+[[dispositions]]
+id = "a-ca-priv-sp-id-n"
+traversal = "semantic_atom"
+roles = ["coverage_or_routing", "assurance_or_activation"]
+visibility = "private"
+hash_targets = ["semantic_program", "implementation_dependency"]
 erasure = "normalize_then_erase"
 
 [[dispositions]]
@@ -340,6 +355,14 @@ traversal = "semantic_atom"
 roles = ["resource_or_provider", "coverage_or_routing", "assurance_or_activation"]
 visibility = "private"
 hash_targets = ["implementation_dependency", "proof_context"]
+erasure = "normalize_then_erase"
+
+[[dispositions]]
+id = "a-rca-priv-sp-id-n"
+traversal = "semantic_atom"
+roles = ["resource_or_provider", "coverage_or_routing", "assurance_or_activation"]
+visibility = "private"
+hash_targets = ["semantic_program", "implementation_dependency"]
 erasure = "normalize_then_erase"
 
 [[dispositions]]
@@ -1312,15 +1335,6 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/program_core.rs"
-name = "NamedValueInterface"
-fields = [
-  { name = "canonical_path", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "flow_type", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/program_core.rs"
 name = "ErasedBinding"
 fields = [
   { name = "id", disposition = "r-c-priv-id-pc-n", reviewed = true },
@@ -1854,6 +1868,17 @@ name = "ExecutableCallContextId"
 fields = [
   { name = "call_instance", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "ordinal", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/program_core.rs"
+name = "ExecutableCallOccurrence"
+fields = [
+  { name = "id", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "parent", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+  { name = "checked_call", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+  { name = "context_ordinals", disposition = "r-fc-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -2988,6 +3013,15 @@ reviewed = true
 fields = [
   { name = "expression_root", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
   { name = "pipeline", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/program_core.rs"
+name = "NamedValueInterface"
+fields = [
+  { name = "canonical_path", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "flow_type", disposition = "r-fc-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -4609,9 +4643,126 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/dependency_manifest.rs"
+name = "CallableDependencyEntryV4"
+fields = [
+  { name = "callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "checked_callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "stable_owner", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "public_shape_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "implementation_dependency_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/dependency_manifest.rs"
 name = "CallableDependencyManifestError"
 fields = [
   { name = "message", disposition = "n-i-diag-n-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/dependency_manifest.rs"
+name = "CallableDependencyManifestV4"
+fields = [
+  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
+  { name = "checked_program_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "dependency_classifier_schema_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "component_digests", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "program_root", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "callable_entries", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "proof_digests", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "manifest_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "sealed_manifest_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/dependency_manifest.rs"
+name = "CallableDependencyManifestV7"
+fields = [
+  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
+  { name = "checked_program_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "dependency_classifier_schema_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "component_digests", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "program_root", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "callable_entries", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "proof_digests", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "manifest_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "sealed_manifest_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/dependency_manifest.rs"
+name = "CallableDependencyProofDigestsV4"
+fields = [
+  { name = "program_root_entry_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "callable_entries_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "dependency_rows_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "coverage_receipts_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projection_receipts_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "dependency_record_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "coverage_record_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projection_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projection_edge_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/dependency_manifest.rs"
+name = "CallableDependencyProofDigestsV7"
+fields = [
+  { name = "program_root_entry_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "callable_entries_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projection_receipts_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "checked_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "execution_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "construction_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "remaining_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "dependency_record_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "coverage_record_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projection_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projection_edge_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "broad_owner_dependency_target_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_semantic/src/dependency_manifest.rs"
+name = "ConstructionDependencyDomainV1"
+
+[[records.variants]]
+name = "Lowering"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Reactive"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Resource"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/dependency_manifest.rs"
+name = "ProgramRootDependencyEntryV4"
+fields = [
+  { name = "stable_owner", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "public_shape_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "implementation_dependency_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -5561,6 +5712,88 @@ fields = [
 ]
 
 [[records]]
+kind = "enum"
+source = "crates/boon_semantic/src/dependency_manifest.rs"
+name = "SemanticDependencyProjectionClassV4"
+
+[[records.variants]]
+name = "Dependency"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "channel", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Structural"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Diagnostic"
+disposition = "r-fcad-diag-pc-ob-ec-e"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "IntentionallyNonsemantic"
+disposition = "n-i-priv-n-n"
+reviewed = true
+fields = [
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/dependency_manifest.rs"
+name = "SemanticDependencyProjectionKeyV4"
+fields = [
+  { name = "owner", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "subject_kind", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "class", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_semantic/src/dependency_manifest.rs"
+name = "SemanticDependencyProjectionKeyV7"
+
+[[records.variants]]
+name = "Checked"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "stable_key_digest", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Execution"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "stable_key_digest", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "ConstructionSemantic"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "construction_domain", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "LegacySemantic"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/dependency_manifest.rs"
 name = "SemanticDependencyRecordId"
@@ -5658,6 +5891,27 @@ fields = [
   { name = "lifetime", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
   { name = "phase", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
   { name = "visibility", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_semantic/src/dependency_manifest.rs"
+name = "SemanticDependencyStableOwnerV4"
+
+[[records.variants]]
+name = "ProgramRoot"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Callable"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "identity", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -6679,6 +6933,17 @@ source = "crates/boon_semantic/src/execution.rs"
 name = "SemanticCallId"
 fields = [
   { name = "0", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/execution.rs"
+name = "SemanticCallOccurrence"
+fields = [
+  { name = "id", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "parent", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "call", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "context_ordinals", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -7988,6 +8253,398 @@ source = "crates/boon_semantic/src/execution.rs"
 name = "SemanticValueProvenance"
 fields = [
   { name = "members", disposition = "r-f-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionConstructionProjectionV3"
+
+[[records.variants]]
+name = "Checked"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Invocation"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "occurrence", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Producer"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "identity", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "definition", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageEntityRouteV2"
+fields = [
+  { name = "domain", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "dense_index", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageEntityRouteV3"
+fields = [
+  { name = "domain", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "dense_index", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageHandoffV2"
+fields = [
+  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
+  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "invocation_paths", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projections", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "relocations", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "entity_routes", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "local_image_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageHandoffV5"
+fields = [
+  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
+  { name = "role", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "invocation_overlays", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "projections", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "relocations", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "entity_routes", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "local_image_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageProjectionIdV2"
+fields = [
+  { name = "0", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageProjectionIdV3"
+fields = [
+  { name = "0", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageProjectionV2"
+fields = [
+  { name = "identity", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "stable_key_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "local_content_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "dependency_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "relocation_span", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageProjectionV3"
+fields = [
+  { name = "identity", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "stable_key_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "local_content_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "dependency_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "relocation_span", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageRelocationSpanV2"
+fields = [
+  { name = "start", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "len", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageRelocationSpanV3"
+fields = [
+  { name = "start", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "len", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageRowDomainV2"
+
+[[records.variants]]
+name = "Scope"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Expression"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "ExpressionOrigin"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Statement"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Callable"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Call"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "CallOccurrence"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Source"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "State"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Root"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Function"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Materialization"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "StaticOwner"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageRowDomainV3"
+
+[[records.variants]]
+name = "Scope"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Expression"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Statement"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Callable"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Call"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "CallOccurrence"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Source"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "State"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Root"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Function"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Materialization"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "StaticOwner"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionInvocationOverlayV3"
+fields = [
+  { name = "occurrence", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "parent", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "root", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "authored_call_site", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "definition", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "stable_path_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "stable_key_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionInvocationPathIdV2"
+fields = [
+  { name = "0", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionInvocationPathNodeV2"
+fields = [
+  { name = "parent", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "call_site", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "stable_path_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "SealedSemanticImageV5"
+fields = [
+  { name = "schema", disposition = "a-ca-priv-sp-id-pc-n", reviewed = true },
+  { name = "checked_handoff", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
+  { name = "execution_handoff", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
+  { name = "execution", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
+  { name = "seal_digest", disposition = "a-ca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "SemanticImageProjectionIdentityV2"
+
+[[records.variants]]
+name = "Checked"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Invocation"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "root", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "definition", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "call_path", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -11481,14 +12138,6 @@ fields = [
 ]
 
 [[records]]
-kind = "struct"
-source = "crates/boon_typecheck/src/lib.rs"
-name = "BuiltinSignatureRegistry"
-fields = [
-  { name = "entries", disposition = "r-c-priv-sp-id-n", reviewed = true },
-]
-
-[[records]]
 kind = "enum"
 source = "crates/boon_checked/src/lib.rs"
 name = "BytesType"
@@ -11516,6 +12165,48 @@ fields = [
   { name = "program", disposition = "r-r-priv-sp-id-n", reviewed = true },
   { name = "construction", disposition = "r-r-priv-sp-id-n", reviewed = true },
   { name = "report", disposition = "r-r-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedAuthoritativeCallableShapeV1"
+fields = [
+  { name = "name", disposition = "r-f-priv-sp-id-n", reviewed = true },
+  { name = "kind", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "parameters", disposition = "r-f-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedAuthoritativeEvaluationScopeV1"
+
+[[records.variants]]
+name = "Parent"
+disposition = "a-c-priv-sp-id-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Output"
+disposition = "r-rc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "parameter_ordinal", disposition = "r-rc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedAuthoritativeParameterShapeV1"
+fields = [
+  { name = "name", disposition = "r-f-priv-sp-id-n", reviewed = true },
+  { name = "kind", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "ordinal", disposition = "r-f-priv-sp-id-n", reviewed = true },
+  { name = "optional", disposition = "r-fa-priv-sp-id-n", reviewed = true },
+  { name = "evaluation_scope", disposition = "r-fc-priv-sp-id-n", reviewed = true },
 ]
 
 [[records]]
@@ -11635,48 +12326,6 @@ name = "CheckedCallResultPath"
 fields = [
   { name = "call", disposition = "r-c-priv-sp-id-n", reviewed = true },
   { name = "path", disposition = "r-c-priv-sp-id-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedAuthoritativeCallableShapeV1"
-fields = [
-  { name = "name", disposition = "r-f-priv-sp-id-n", reviewed = true },
-  { name = "kind", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-  { name = "parameters", disposition = "r-f-priv-sp-id-n", reviewed = true },
-]
-
-[[records]]
-kind = "enum"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedAuthoritativeEvaluationScopeV1"
-
-[[records.variants]]
-name = "Parent"
-disposition = "a-c-priv-sp-id-n"
-reviewed = true
-fields = [
-]
-
-[[records.variants]]
-name = "Output"
-disposition = "r-rc-priv-sp-id-n"
-reviewed = true
-fields = [
-  { name = "parameter_ordinal", disposition = "r-rc-priv-sp-id-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedAuthoritativeParameterShapeV1"
-fields = [
-  { name = "name", disposition = "r-f-priv-sp-id-n", reviewed = true },
-  { name = "kind", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-  { name = "ordinal", disposition = "r-f-priv-sp-id-n", reviewed = true },
-  { name = "optional", disposition = "r-fa-priv-sp-id-n", reviewed = true },
-  { name = "evaluation_scope", disposition = "r-fc-priv-sp-id-n", reviewed = true },
 ]
 
 [[records]]
@@ -11995,6 +12644,38 @@ name = "External"
 disposition = "a-c-priv-sp-id-n"
 reviewed = true
 fields = [
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedDefinitionExecutionNodeV1"
+fields = [
+  { name = "expression", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "dependencies", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "call", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "selector", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedDefinitionExecutionTemplateV1"
+fields = [
+  { name = "schema", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "callable", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "result", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "nodes", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "calls", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedDefinitionSelectorV1"
+fields = [
+  { name = "input", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "arms", disposition = "r-fc-priv-sp-id-n", reviewed = true },
 ]
 
 [[records]]
@@ -12378,6 +13059,264 @@ fields = [
 ]
 
 [[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedImageDefinitionAuthoritySealV1"
+fields = [
+  { name = "root_scope", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "definition_key_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "fingerprint", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedImageEntityRouteV2"
+fields = [
+  { name = "domain", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "dense_index", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedImageHandoffV4"
+fields = [
+  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
+  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projections", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "relocations", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "entity_routes", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "local_image_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedImageKernelAuthorityV1"
+fields = [
+  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
+  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "program_metadata_fingerprint", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "referenced_abi_fingerprint", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "definitions", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "runtime_flow_terms", disposition = "r-frc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedImageProjectionIdV2"
+fields = [
+  { name = "0", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedImageProjectionV2"
+fields = [
+  { name = "stable_key", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "stable_key_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "local_content_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "dependency_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "relocation_span", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedImageRelocationSpanV2"
+fields = [
+  { name = "start", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "len", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedImageRowDomainV2"
+
+[[records.variants]]
+name = "Header"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Scope"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Declaration"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Statement"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Expression"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Callable"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "ContextFormal"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Call"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "CallResultPath"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "OrderChain"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "PatternBinding"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "ResourceProjection"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Source"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "State"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "List"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Occurrence"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "SourceUnitMetadata"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "SourcePayloadShape"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "HostPort"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "OutputRootType"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "ExpressionType"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "FunctionType"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "NamedValueType"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "RenderSlot"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Diagnostic"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records]]
 kind = "enum"
 source = "crates/boon_checked/src/lib.rs"
 name = "CheckedIntrinsicV1"
@@ -12663,6 +13602,7 @@ name = "CheckedProgram"
 fields = [
   { name = "fields", disposition = "r-f-priv-sp-id-n", reviewed = true },
   { name = "image_handoff", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "runtime_flow_terms", disposition = "r-fc-priv-sp-id-n", reviewed = true },
 ]
 
 [[records]]
@@ -12699,38 +13639,6 @@ fields = [
   { name = "lists", disposition = "r-fr-priv-sp-id-n", reviewed = true },
   { name = "occurrences", disposition = "r-f-priv-sp-id-n", reviewed = true },
   { name = "definition_execution_templates", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedDefinitionExecutionTemplateV1"
-fields = [
-  { name = "schema", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-  { name = "callable", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-  { name = "result", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-  { name = "nodes", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-  { name = "calls", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedDefinitionExecutionNodeV1"
-fields = [
-  { name = "expression", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-  { name = "dependencies", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-  { name = "call", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-  { name = "selector", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedDefinitionSelectorV1"
-fields = [
-  { name = "input", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-  { name = "arms", disposition = "r-fc-priv-sp-id-n", reviewed = true },
 ]
 
 [[records]]
@@ -12879,6 +13787,101 @@ name = "CheckedSemanticPath"
 fields = [
   { name = "anchor", disposition = "r-c-priv-sp-id-n", reviewed = true },
   { name = "projection", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedShardCallableKindV2"
+
+[[records.variants]]
+name = "User"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Builtin"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "External"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedShardOwnerKeyV2"
+
+[[records.variants]]
+name = "ProgramTopLevel"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Callable"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "callable_kind", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "name", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "external_identity", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedShardProjectionKeyV2"
+fields = [
+  { name = "owner", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "region", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedShardRegionV2"
+
+[[records.variants]]
+name = "Interface"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Definition"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Invocation"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "authored_call_site_digest", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "identical_site_reverse_ordinal", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "TopLevelAuthority"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "canonical_path", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -13447,15 +14450,6 @@ fields = [
 
 [[records]]
 kind = "struct"
-source = "crates/boon_typecheck/src/lib.rs"
-name = "RenderContractRegistry"
-fields = [
-  { name = "active_root", disposition = "r-d-diag-so-n", reviewed = true },
-  { name = "roots", disposition = "r-d-diag-so-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
 source = "crates/boon_checked/src/lib.rs"
 name = "RenderSlot"
 fields = [
@@ -13523,15 +14517,6 @@ fields = [
 
 [[records]]
 kind = "struct"
-source = "crates/boon_typecheck/src/lib.rs"
-name = "RuntimeRootContract"
-fields = [
-  { name = "renderable_kinds", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
-  { name = "constructors", disposition = "r-c-priv-sp-id-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
 source = "crates/boon_checked/src/lib.rs"
 name = "SemanticOccurrence"
 fields = [
@@ -13585,6 +14570,30 @@ name = "Pass"
 disposition = "a-c-priv-sp-id-n"
 reviewed = true
 fields = [
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "SharedObjectShape"
+fields = [
+  { name = "0", disposition = "r-f-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "SharedType"
+fields = [
+  { name = "0", disposition = "r-f-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "SharedVariantSet"
+fields = [
+  { name = "0", disposition = "r-f-priv-sp-id-n", reviewed = true },
 ]
 
 [[records]]
@@ -13735,32 +14744,6 @@ disposition = "r-fc-priv-sp-id-n"
 reviewed = true
 fields = [
   { name = "width", disposition = "r-fc-priv-sp-id-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_typecheck/src/lib.rs"
-name = "TypeCheckProfile"
-fields = [
-  { name = "work_counters", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "checker_init_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "source_paths_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "source_payload_shape_table_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "source_payload_types_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "function_index_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "object_bindings_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "function_param_requirements_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "name_bindings_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "flow_bindings_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "render_contracts_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "refresh_static_list_bindings_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "recursive_functions_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "check_statements_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "ensure_all_expressions_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "report_counts_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "type_hint_table_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "assemble_report_ms", disposition = "n-i-diag-n-n", reviewed = true },
-  { name = "total_ms", disposition = "n-i-diag-n-n", reviewed = true },
 ]
 
 [[records]]
@@ -13945,14 +14928,6 @@ fields = [
 ]
 
 [[records]]
-kind = "struct"
-source = "crates/boon_typecheck/src/lib.rs"
-name = "TypeVarStore"
-fields = [
-  { name = "next", disposition = "n-i-priv-n-n", reviewed = true },
-]
-
-[[records]]
 kind = "enum"
 source = "crates/boon_checked/src/lib.rs"
 name = "Variant"
@@ -13985,6 +14960,315 @@ fields = [
   { name = "close", disposition = "r-frc-priv-sp-id-n", reviewed = true },
   { name = "error", disposition = "a-d-diag-so-n", reviewed = true },
   { name = "actions", disposition = "r-frc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_checked/src/type_terms.rs"
+name = "ArtifactBytesTermV1"
+
+[[records.variants]]
+name = "Dynamic"
+disposition = "a-c-priv-sp-id-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Fixed"
+disposition = "r-c-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "0", disposition = "r-c-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/type_terms.rs"
+name = "ArtifactFlowTermV1"
+fields = [
+  { name = "mode", disposition = "r-c-priv-sp-id-n", reviewed = true },
+  { name = "term", disposition = "r-c-priv-sp-id-n", reviewed = true },
+  { name = "stable_digest", disposition = "a-ca-priv-sp-id-n", reviewed = true },
+  { name = "runtime_erased", disposition = "r-c-priv-sp-id-n", reviewed = true },
+  { name = "runtime_erased_digest", disposition = "a-ca-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/type_terms.rs"
+name = "ArtifactObjectFieldTermV1"
+fields = [
+  { name = "name", disposition = "a-fc-priv-sp-id-n", reviewed = true },
+  { name = "ty", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/type_terms.rs"
+name = "ArtifactTypeModuleV1"
+fields = [
+  { name = "schema", disposition = "a-fca-priv-sp-id-n", reviewed = true },
+  { name = "terms", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "stable_digest", disposition = "a-fca-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/type_terms.rs"
+name = "ArtifactTypeTermIdV1"
+fields = [
+  { name = "0", disposition = "a-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_checked/src/type_terms.rs"
+name = "ArtifactTypeTermKindV1"
+
+[[records.variants]]
+name = "Text"
+disposition = "a-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Number"
+disposition = "a-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Bytes"
+disposition = "r-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "value", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Absent"
+disposition = "a-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "VariantSet"
+disposition = "r-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "variants", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Object"
+disposition = "r-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "fields", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "field_order", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "open", disposition = "a-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "RenderContract"
+disposition = "a-fca-priv-sp-id-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "List"
+disposition = "r-frc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "item", disposition = "r-frc-priv-sp-id-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Function"
+disposition = "r-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "args", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "result_mode", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "result", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "UnresolvedShape"
+disposition = "n-x-priv-id-x"
+reviewed = true
+fields = [
+  { name = "reason", disposition = "n-d-diag-so-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Variable"
+disposition = "r-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "ordinal", disposition = "a-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Unknown"
+disposition = "n-x-priv-id-x"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "Union"
+disposition = "r-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "members", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Map"
+disposition = "r-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "key", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "value", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Set"
+disposition = "r-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "item", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Bits"
+disposition = "r-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "width", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/type_terms.rs"
+name = "ArtifactTypeTermV1"
+fields = [
+  { name = "id", disposition = "a-fc-priv-sp-id-n", reviewed = true },
+  { name = "kind", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "stable_digest", disposition = "a-fca-priv-sp-id-n", reviewed = true },
+  { name = "contains_variable", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "runtime_erased", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_checked/src/type_terms.rs"
+name = "ArtifactVariantTermV1"
+
+[[records.variants]]
+name = "Tag"
+disposition = "r-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "0", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Tagged"
+disposition = "r-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+  { name = "tag", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "fields", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/type_terms.rs"
+name = "CheckedRuntimeFlowTermHandoffV1"
+fields = [
+  { name = "schema", disposition = "a-ca-priv-sp-id-n", reviewed = true },
+  { name = "source_bundle_digest_v1", disposition = "a-rca-priv-sp-id-n", reviewed = true },
+  { name = "role", disposition = "r-c-priv-sp-id-n", reviewed = true },
+  { name = "checked_image_digest", disposition = "a-ca-priv-sp-id-n", reviewed = true },
+  { name = "expression_runtime_flow_digests", disposition = "a-fca-priv-sp-id-n", reviewed = true },
+  { name = "projection_digest", disposition = "a-fca-priv-sp-id-n", reviewed = true },
+  { name = "stable_digest", disposition = "a-ca-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/type_terms.rs"
+name = "CheckedRuntimeFlowTermProjectionV1"
+fields = [
+  { name = "expression_runtime_flow_digests", disposition = "a-fca-priv-sp-id-n", reviewed = true },
+  { name = "stable_digest", disposition = "a-ca-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_typecheck/src/lib.rs"
+name = "BuiltinSignatureRegistry"
+fields = [
+  { name = "entries", disposition = "r-c-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_typecheck/src/lib.rs"
+name = "RenderContractRegistry"
+fields = [
+  { name = "active_root", disposition = "r-d-diag-so-n", reviewed = true },
+  { name = "roots", disposition = "r-d-diag-so-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_typecheck/src/lib.rs"
+name = "RuntimeRootContract"
+fields = [
+  { name = "renderable_kinds", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
+  { name = "constructors", disposition = "r-c-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_typecheck/src/lib.rs"
+name = "TypeCheckProfile"
+fields = [
+  { name = "work_counters", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "checker_init_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "source_paths_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "source_payload_shape_table_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "source_payload_types_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "function_index_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "object_bindings_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "function_param_requirements_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "name_bindings_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "flow_bindings_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "render_contracts_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "refresh_static_list_bindings_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "recursive_functions_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "check_statements_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "ensure_all_expressions_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "report_counts_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "type_hint_table_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "assemble_report_ms", disposition = "n-i-diag-n-n", reviewed = true },
+  { name = "total_ms", disposition = "n-i-diag-n-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_typecheck/src/lib.rs"
+name = "TypeVarStore"
+fields = [
+  { name = "next", disposition = "n-i-priv-n-n", reviewed = true },
 ]
 
 [[records]]
@@ -14486,953 +15770,4 @@ source = "crates/boon_verify/src/lib.rs"
 name = "VerifyError"
 fields = [
   { name = "message", disposition = "n-i-diag-n-e", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "SharedType"
-fields = [
-  { name = "0", disposition = "r-f-priv-sp-id-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "SharedVariantSet"
-fields = [
-  { name = "0", disposition = "r-f-priv-sp-id-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "SharedObjectShape"
-fields = [
-  { name = "0", disposition = "r-f-priv-sp-id-n", reviewed = true },
-]
-
-[[records]]
-kind = "enum"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedShardCallableKindV2"
-
-[[records.variants]]
-name = "User"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Builtin"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "External"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records]]
-kind = "enum"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedShardOwnerKeyV2"
-
-[[records.variants]]
-name = "ProgramTopLevel"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "Callable"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "callable_kind", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "name", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "external_identity", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "enum"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedShardRegionV2"
-
-[[records.variants]]
-name = "Interface"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Definition"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Invocation"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "authored_call_site_digest", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "identical_site_reverse_ordinal", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "TopLevelAuthority"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "canonical_path", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedShardProjectionKeyV2"
-fields = [
-  { name = "owner", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "region", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "enum"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedImageRowDomainV2"
-
-[[records.variants]]
-name = "Header"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Scope"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Declaration"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Statement"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Expression"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Callable"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "ContextFormal"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Call"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "CallResultPath"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "OrderChain"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "PatternBinding"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "ResourceProjection"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Source"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "State"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "List"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Occurrence"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "SourceUnitMetadata"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "SourcePayloadShape"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "HostPort"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "OutputRootType"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "ExpressionType"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "FunctionType"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "NamedValueType"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "RenderSlot"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Diagnostic"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedImageProjectionIdV2"
-fields = [
-  { name = "0", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedImageRelocationSpanV2"
-fields = [
-  { name = "start", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "len", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedImageProjectionV2"
-fields = [
-  { name = "stable_key", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "stable_key_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "local_content_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dependency_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "relocation_span", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedImageEntityRouteV2"
-fields = [
-  { name = "domain", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dense_index", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedImageDefinitionAuthoritySealV1"
-fields = [
-  { name = "root_scope", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "definition_key_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "fingerprint", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedImageKernelAuthorityV1"
-fields = [
-  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
-  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "program_metadata_fingerprint", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "referenced_abi_fingerprint", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "definitions", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_checked/src/lib.rs"
-name = "CheckedImageHandoffV4"
-fields = [
-  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
-  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "projections", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "relocations", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "entity_routes", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "local_image_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "enum"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "SemanticDependencyStableOwnerV4"
-
-[[records.variants]]
-name = "ProgramRoot"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "Callable"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "identity", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "enum"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "SemanticDependencyProjectionClassV4"
-
-[[records.variants]]
-name = "Dependency"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "channel", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "Structural"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Diagnostic"
-disposition = "r-fcad-diag-pc-ob-ec-e"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "IntentionallyNonsemantic"
-disposition = "n-i-priv-n-n"
-reviewed = true
-fields = []
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "SemanticDependencyProjectionKeyV4"
-fields = [
-  { name = "owner", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "subject_kind", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "class", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "ProgramRootDependencyEntryV4"
-fields = [
-  { name = "stable_owner", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "public_shape_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "implementation_dependency_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyEntryV4"
-fields = [
-  { name = "callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "checked_callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "stable_owner", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "public_shape_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "implementation_dependency_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyProofDigestsV4"
-fields = [
-  { name = "program_root_entry_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "callable_entries_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dependency_rows_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "coverage_receipts_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "projection_receipts_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dependency_record_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "coverage_record_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "projection_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "projection_edge_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyManifestV4"
-fields = [
-  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
-  { name = "checked_program_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dependency_classifier_schema_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "component_digests", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "program_root", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "callable_entries", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "proof_digests", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "manifest_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "sealed_manifest_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "enum"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "SemanticDependencyProjectionKeyV7"
-
-[[records.variants]]
-name = "Checked"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "stable_key_digest", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "Execution"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "stable_key_digest", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "ConstructionSemantic"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "construction_domain", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "LegacySemantic"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyProofDigestsV7"
-fields = [
-  { name = "program_root_entry_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "callable_entries_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "projection_receipts_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "checked_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "execution_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "construction_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "remaining_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dependency_record_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "coverage_record_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "projection_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "projection_edge_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "broad_owner_dependency_target_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyManifestV7"
-fields = [
-  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
-  { name = "checked_program_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dependency_classifier_schema_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "component_digests", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "program_root", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "callable_entries", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "proof_digests", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "manifest_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "sealed_manifest_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "enum"
-source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "ConstructionDependencyDomainV1"
-
-[[records.variants]]
-name = "Lowering"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Reactive"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Resource"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/execution.rs"
-name = "SemanticCallOccurrence"
-fields = [
-  { name = "id", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "parent", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "call", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "context_ordinals", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "enum"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionImageRowDomainV2"
-
-[[records.variants]]
-name = "Scope"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Expression"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "ExpressionOrigin"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Statement"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Callable"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Call"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "CallOccurrence"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Source"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "State"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Root"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Function"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Materialization"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "StaticOwner"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records]]
-kind = "enum"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionImageRowDomainV3"
-
-[[records.variants]]
-name = "Scope"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Expression"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Statement"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Callable"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Call"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "CallOccurrence"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Source"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "State"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Root"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Function"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "Materialization"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records.variants]]
-name = "StaticOwner"
-disposition = "a-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = []
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionInvocationPathIdV2"
-fields = [
-  { name = "0", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionImageProjectionIdV2"
-fields = [
-  { name = "0", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionImageRelocationSpanV2"
-fields = [
-  { name = "start", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "len", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionInvocationPathNodeV2"
-fields = [
-  { name = "parent", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "call_site", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "stable_path_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "enum"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "SemanticImageProjectionIdentityV2"
-
-[[records.variants]]
-name = "Checked"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "Invocation"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "root", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "definition", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "call_path", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionImageProjectionV2"
-fields = [
-  { name = "identity", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "stable_key_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "local_content_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dependency_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "relocation_span", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionImageEntityRouteV2"
-fields = [
-  { name = "domain", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dense_index", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionInvocationOverlayV3"
-fields = [
-  { name = "occurrence", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "parent", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "root", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "authored_call_site", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "definition", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "stable_path_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "stable_key_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "enum"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionConstructionProjectionV3"
-
-[[records.variants]]
-name = "Checked"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "Invocation"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "occurrence", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "Producer"
-disposition = "r-fca-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-  { name = "identity", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "definition", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionImageProjectionIdV3"
-fields = [
-  { name = "0", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionImageRelocationSpanV3"
-fields = [
-  { name = "start", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "len", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionImageProjectionV3"
-fields = [
-  { name = "identity", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "stable_key_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "local_content_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dependency_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "relocation_span", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionImageEntityRouteV3"
-fields = [
-  { name = "domain", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "dense_index", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionImageHandoffV4"
-fields = [
-  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
-  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "invocation_overlays", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "projections", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "relocations", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "entity_routes", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "local_image_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionImageHandoffV2"
-fields = [
-  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
-  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "invocation_paths", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "projections", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "relocations", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "entity_routes", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "local_image_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/semantic_image.rs"
-name = "SealedSemanticImageV4"
-fields = [
-  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "checked_handoff", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "execution_handoff", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "execution", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-  { name = "seal_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/program_core.rs"
-name = "ExecutableCallOccurrence"
-fields = [
-  { name = "id", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "parent", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "checked_call", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "context_ordinals", disposition = "r-fc-priv-id-pc-n", reviewed = true },
 ]

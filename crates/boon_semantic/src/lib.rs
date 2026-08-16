@@ -46,8 +46,8 @@ use std::sync::Arc;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x1d, 0x6a, 0xfa, 0xd0, 0x87, 0x1f, 0xa4, 0x2e, 0x36, 0x32, 0x46, 0x04, 0x1f, 0x2d, 0xd2, 0x16,
-    0x20, 0x7f, 0x1a, 0x88, 0x2c, 0x52, 0x29, 0x71, 0x91, 0xde, 0x7e, 0x1f, 0xbb, 0x36, 0x02, 0x2d,
+    0xaa, 0x76, 0xcb, 0x35, 0xb2, 0x6f, 0x41, 0xdf, 0xa0, 0x3f, 0x32, 0xe7, 0x31, 0xd7, 0x9d, 0x15,
+    0x30, 0xc5, 0x78, 0xe6, 0xd8, 0x1c, 0x4b, 0x0b, 0x57, 0x0c, 0x82, 0xbf, 0x6f, 0xa6, 0x51, 0x79,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -627,7 +627,7 @@ pub fn distributed_value_occurrences(
 pub struct SemanticProgram {
     source_bundle_digest_v1: SourceBundleDigestV1,
     role: boon_checked::ProgramRole,
-    semantic_image: SealedSemanticImageV4,
+    semantic_image: SealedSemanticImageV5,
     #[cfg(test)]
     checked_program: CheckedProgramFields,
     #[cfg(test)]
@@ -812,7 +812,7 @@ impl SemanticProgram {
         &self.resolved_out_graph
     }
 
-    pub const fn semantic_image(&self) -> &SealedSemanticImageV4 {
+    pub const fn semantic_image(&self) -> &SealedSemanticImageV5 {
         &self.semantic_image
     }
 
@@ -2743,7 +2743,8 @@ fn elaborate_with_representation(
         }};
     }
 
-    let (checked_program, checked_handoff) = checked_program.into_parts();
+    let (checked_program, checked_handoff, runtime_flow_terms) =
+        checked_program.into_semantic_parts();
     let source_bundle_digest_v1 = checked_program.source_bundle_digest_v1;
     let role = checked_program.role;
     if trace_elaboration {
@@ -2864,6 +2865,7 @@ fn elaborate_with_representation(
         contextual_expansion::derive_semantic_execution_graph(
             &checked_program,
             checked_handoff,
+            runtime_flow_terms,
             &resolved_out_graph,
             &materializations,
             materialization_expressions,

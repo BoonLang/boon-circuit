@@ -6,7 +6,9 @@
 //! proof-bearing [`CheckedProgram`].
 
 mod owner_shard;
+mod type_terms;
 pub use owner_shard::*;
+pub use type_terms::*;
 
 use boon_contract::SourceBundleDigestV1;
 use boon_data::{Bits, ExactNumber};
@@ -2278,6 +2280,10 @@ pub struct CheckedImageKernelAuthorityV1 {
     pub program_metadata_fingerprint: [u8; 32],
     pub referenced_abi_fingerprint: [u8; 32],
     pub definitions: Vec<CheckedImageDefinitionAuthoritySealV1>,
+    /// Move-only semantic proof sidecar. It is deliberately outside the V4
+    /// serialized checked-image/currentness contract.
+    #[serde(skip, default)]
+    pub runtime_flow_terms: CheckedRuntimeFlowTermProjectionV1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -2399,6 +2405,8 @@ pub struct CheckedProgram {
     fields: CheckedProgramFields,
     #[serde(skip)]
     image_handoff: CheckedImageHandoffV4,
+    #[serde(skip)]
+    runtime_flow_terms: CheckedRuntimeFlowTermHandoffV1,
 }
 
 /// Completed typechecker construction before a runtime handoff is requested.
@@ -3097,10 +3105,12 @@ impl CheckedProgram {
     pub unsafe fn from_typechecker_parts_unchecked(
         fields: CheckedProgramFields,
         image_handoff: CheckedImageHandoffV4,
+        runtime_flow_terms: CheckedRuntimeFlowTermHandoffV1,
     ) -> Self {
         Self {
             fields,
             image_handoff,
+            runtime_flow_terms,
         }
     }
 
@@ -3112,8 +3122,25 @@ impl CheckedProgram {
         (self.fields, self.image_handoff)
     }
 
+    /// Consume the runtime capability and its opaque canonical type-proof
+    /// sidecar. Inspection callers keep using `into_parts`; only semantic
+    /// execution owns this additional handoff.
+    pub fn into_semantic_parts(
+        self,
+    ) -> (
+        CheckedProgramFields,
+        CheckedImageHandoffV4,
+        CheckedRuntimeFlowTermHandoffV1,
+    ) {
+        (self.fields, self.image_handoff, self.runtime_flow_terms)
+    }
+
     pub fn image_handoff(&self) -> &CheckedImageHandoffV4 {
         &self.image_handoff
+    }
+
+    pub fn runtime_flow_terms(&self) -> &CheckedRuntimeFlowTermHandoffV1 {
+        &self.runtime_flow_terms
     }
 }
 

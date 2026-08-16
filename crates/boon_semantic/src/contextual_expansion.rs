@@ -1946,6 +1946,7 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
 pub(crate) fn derive_semantic_execution_graph(
     program: &CheckedProgramFields,
     checked_handoff: CheckedImageHandoffV4,
+    runtime_flow_terms: boon_checked::CheckedRuntimeFlowTermHandoffV1,
     out_net: &OutNet,
     materializations: &[SemanticContextualMaterialization],
     mut arena: SemanticExpressionArena,
@@ -2990,9 +2991,13 @@ pub(crate) fn derive_semantic_execution_graph(
             .collect(),
         checked_expression_origins: arena.checked_expression_origins,
     };
-    let builder =
-        SemanticImageBuilder::execution_pending(checked_handoff, execution_routes, execution)
-            .map_err(ExpansionError::InvalidLocalBindings)?;
+    let builder = SemanticImageBuilder::execution_pending(
+        checked_handoff,
+        runtime_flow_terms,
+        execution_routes,
+        execution,
+    )
+    .map_err(ExpansionError::InvalidLocalBindings)?;
     trace_phase("execution_builder");
     Ok(builder)
 }
@@ -8196,10 +8201,10 @@ mod tests {
             "diagnostics: {:#?}",
             checked.report.diagnostics
         );
-        let (program, checked_handoff) = checked
+        let (program, checked_handoff, runtime_flow_terms) = checked
             .program
             .expect("valid fixture has a checked program")
-            .into_parts();
+            .into_semantic_parts();
         crate::validate_contextual_bindings(&program)
             .expect("valid fixture has exact contextual bindings");
         let producer_roots =
@@ -8226,6 +8231,7 @@ mod tests {
         let builder = derive_semantic_execution_graph(
             &program,
             checked_handoff,
+            runtime_flow_terms,
             &out,
             &materializations,
             arena,

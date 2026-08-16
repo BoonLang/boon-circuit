@@ -2541,6 +2541,7 @@ pub(crate) fn checked_construction_from_kernel(
         program_metadata_fingerprint,
         referenced_abi_fingerprint,
         definitions: checked_image_definition_seals,
+        runtime_flow_terms: rows.runtime_flow_terms,
     };
     Ok(KernelCheckedConstruction {
         fields,

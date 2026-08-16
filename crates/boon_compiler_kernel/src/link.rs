@@ -15,12 +15,13 @@ use boon_checked::{
     CheckedEvaluationScope, CheckedExprId, CheckedExpression, CheckedExpressionKind, CheckedList,
     CheckedListId, CheckedMatchPattern, CheckedParameter, CheckedParameterKind,
     CheckedParameterRequirement, CheckedPassedAccess, CheckedPatternBinding, CheckedRecordField,
-    CheckedResourceBinding, CheckedResourceProjectionRequirement, CheckedScope, CheckedScopeKind,
-    CheckedSemanticPath, CheckedSource, CheckedSourceId, CheckedSourceRead, CheckedSpan,
-    CheckedState, CheckedStateId, CheckedStatement, CheckedStatementId, CheckedStatementKind,
-    CheckedTextSegment, CheckedTypeSubstitution, CheckedValueUse, ContextFormalId, DeclId,
-    FlowMode, FlowType, LexicalScopeId, ObjectShape, ProgramRole, SemanticOccurrence,
-    SemanticOccurrenceKind, Type, TypeVar, Variant,
+    CheckedResourceBinding, CheckedResourceProjectionRequirement,
+    CheckedRuntimeFlowTermProjectionV1, CheckedScope, CheckedScopeKind, CheckedSemanticPath,
+    CheckedSource, CheckedSourceId, CheckedSourceRead, CheckedSpan, CheckedState, CheckedStateId,
+    CheckedStatement, CheckedStatementId, CheckedStatementKind, CheckedTextSegment,
+    CheckedTypeSubstitution, CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType,
+    LexicalScopeId, ObjectShape, ProgramRole, SemanticOccurrence, SemanticOccurrenceKind, Type,
+    TypeVar, Variant,
 };
 use boon_syntax::StableOccurrenceKey;
 use std::collections::{BTreeMap, BTreeSet};
@@ -129,6 +130,7 @@ pub struct KernelCheckedRows {
     pub states: Box<[CheckedState]>,
     pub lists: Box<[CheckedList]>,
     pub definition_execution_templates: Box<[CheckedDefinitionExecutionTemplateV1]>,
+    pub runtime_flow_terms: CheckedRuntimeFlowTermProjectionV1,
     pub occurrences: Box<[SemanticOccurrence]>,
     occurrence_ranges: Box<[KernelCheckedRowRange]>,
 }
@@ -584,6 +586,18 @@ impl KernelCheckedLinkLayout {
         let scopes = self.materialize_scopes(snapshot)?;
         let mut declarations = self.materialize_declarations(snapshot)?.into_vec();
         let expressions = self.materialize_expressions(snapshot)?;
+        let runtime_flow_terms = self.materialize_runtime_flow_terms(snapshot)?;
+        #[cfg(test)]
+        {
+            let replay =
+                CheckedRuntimeFlowTermProjectionV1::derive_from_checked_expressions(&expressions)
+                    .map_err(KernelCheckedLinkError::new)?;
+            if runtime_flow_terms != replay {
+                return Err(KernelCheckedLinkError::new(
+                    "kernel direct runtime flow-term handoff differs from rich checked replay",
+                ));
+            }
+        }
         let statements = self.materialize_statements(snapshot)?;
         let sources = self.materialize_sources(snapshot)?;
         let states = self.materialize_states(snapshot)?;
@@ -630,9 +644,65 @@ impl KernelCheckedLinkLayout {
             states,
             lists,
             definition_execution_templates,
+            runtime_flow_terms,
             occurrences,
             occurrence_ranges,
         })
+    }
+
+    fn materialize_runtime_flow_terms(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<CheckedRuntimeFlowTermProjectionV1, KernelCheckedLinkError> {
+        self.validate_snapshot_definition_count(snapshot, "runtime flow-term handoff")?;
+        let mut digests = vec![None; self.totals.expressions as usize];
+        for (owner_index, (definition, layout)) in snapshot
+            .definitions
+            .iter()
+            .zip(self.definitions.iter())
+            .enumerate()
+        {
+            if definition.flow_terms().expressions.len() != definition.expressions.len() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {owner_index} has {} expression term roots for {} expressions",
+                    definition.flow_terms().expressions.len(),
+                    definition.expressions.len()
+                )));
+            }
+            for (local, flow) in definition.flow_terms().expressions.iter().enumerate() {
+                let local = u32::try_from(local).map_err(|_| {
+                    KernelCheckedLinkError::new(
+                        "kernel definition expression term count exceeds u32",
+                    )
+                })?;
+                let global = layout
+                    .expressions
+                    .resolve(local, "runtime flow-term expression")?
+                    as usize;
+                let slot = digests.get_mut(global).ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel runtime flow-term expression {global} exceeds its dense table"
+                    ))
+                })?;
+                if slot.replace(flow.runtime_erased_digest).is_some() {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel runtime flow-term expression {global} is published twice"
+                    )));
+                }
+            }
+        }
+        let digests = digests
+            .into_iter()
+            .enumerate()
+            .map(|(expression, digest)| {
+                digest.ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel runtime flow-term handoff omits expression {expression}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CheckedRuntimeFlowTermProjectionV1::from_runtime_flow_digests(digests))
     }
 
     /// Publish one dependency-first execution template directly from the

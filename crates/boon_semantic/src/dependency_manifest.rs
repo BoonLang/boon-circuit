@@ -1470,7 +1470,7 @@ impl DependencyOwnerIndex {
 
     fn derive_from_image_routes(
         checked_handoff: &CheckedImageHandoffV4,
-        execution_handoff: &ExecutionImageHandoffV4,
+        execution_handoff: &ExecutionImageHandoffV5,
         execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV2,
         reactive: &SemanticReactiveGraphV1,
@@ -2963,7 +2963,7 @@ struct DependencyCollector {
 impl DependencyCollector {
     fn for_presealed_images(
         checked: &CheckedImageHandoffV4,
-        execution: &ExecutionImageHandoffV4,
+        execution: &ExecutionImageHandoffV5,
     ) -> Self {
         let checked_rows = checked
             .projections
@@ -5976,7 +5976,7 @@ fn execution_projection_owner_from_overlays_v7(
 
 fn execution_projection_owner_v7(
     checked: &CheckedImageHandoffV4,
-    execution: &ExecutionImageHandoffV4,
+    execution: &ExecutionImageHandoffV5,
     projection: &ExecutionConstructionProjectionV3,
 ) -> Result<SemanticDependencyStableOwnerV4, CallableDependencyManifestError> {
     execution_projection_owner_from_overlays_v7(checked, &execution.invocation_overlays, projection)
@@ -6094,7 +6094,7 @@ impl ManifestCheckedExecutionPrefixV7 {
     fn into_index(
         self,
         checked: &CheckedImageHandoffV4,
-        execution: &ExecutionImageHandoffV4,
+        execution: &ExecutionImageHandoffV5,
         stable_owners: &BTreeMap<SemanticDependencyOwnerV1, SemanticDependencyStableOwnerV4>,
     ) -> Result<DenseManifestProjectionIndexV7, CallableDependencyManifestError> {
         if self.index.source_bundle_digest_v1 != checked.source_bundle_digest_v1
@@ -6475,7 +6475,7 @@ impl ManifestCheckedExecutionPrefixBuilderV7 {
 #[cfg(test)]
 fn build_dense_projection_index_v7(
     checked: &CheckedImageHandoffV4,
-    execution_handoff: &ExecutionImageHandoffV4,
+    execution_handoff: &ExecutionImageHandoffV5,
     execution: &SemanticExecutionImageColumnsV1,
     stable_owners: &BTreeMap<SemanticDependencyOwnerV1, SemanticDependencyStableOwnerV4>,
 ) -> Result<DenseManifestProjectionIndexV7, CallableDependencyManifestError> {
@@ -6791,7 +6791,7 @@ fn build_dense_projection_index_v7(
 pub(crate) fn replay_manifest_prefix_v7_for_test(
     checked: &CheckedProgramFields,
     checked_handoff: &CheckedImageHandoffV4,
-    execution_handoff: &ExecutionImageHandoffV4,
+    execution_handoff: &ExecutionImageHandoffV5,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<ManifestCheckedExecutionPrefixV7, CallableDependencyManifestError> {
     let mut owners = BTreeSet::from([SemanticDependencyOwnerV1::ProgramRoot]);
@@ -7165,7 +7165,7 @@ pub(crate) fn build_callable_dependency_manifest_v7(
     dependency_classifier_schema_digest: [u8; 32],
     checked: &CheckedProgramFields,
     checked_handoff: &CheckedImageHandoffV4,
-    execution_handoff: &ExecutionImageHandoffV4,
+    execution_handoff: &ExecutionImageHandoffV5,
     manifest_prefix: ManifestCheckedExecutionPrefixV7,
     producer_materializations: &[ProducerMaterializationRequest],
     #[cfg(test)] out: &ResolvedOutGraph,
@@ -8349,7 +8349,7 @@ impl CallableDependencyManifestV7 {
     pub(crate) fn validate_integrity(
         &self,
         dependency_classifier_schema_digest: [u8; 32],
-        image: &SealedSemanticImageV4,
+        image: &SealedSemanticImageV5,
         execution: &SemanticExecutionImageColumnsV1,
     ) -> Result<(), CallableDependencyManifestError> {
         if self.schema != CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V7 {

@@ -26,10 +26,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
-pub const SEMANTIC_IMAGE_SCHEMA_V4: &str = "boon.semantic-image.v4";
+pub const SEMANTIC_IMAGE_SCHEMA_V5: &str = "boon.semantic-image.v5";
 #[cfg(test)]
 pub const EXECUTION_IMAGE_HANDOFF_SCHEMA_V2: &str = "boon.execution-image-handoff.v2";
-pub const EXECUTION_IMAGE_HANDOFF_SCHEMA_V4: &str = "boon.execution-image-handoff.v4";
+pub const EXECUTION_IMAGE_HANDOFF_SCHEMA_V5: &str = "boon.execution-image-handoff.v5";
 pub const EXECUTION_CONSTRUCTION_ROUTES_SCHEMA_V3: &str = "boon.execution-construction-routes.v3";
 
 // The parent/call-site path is a stable logical identity shared by the V2
@@ -49,10 +49,10 @@ const EXECUTION_IMAGE_PROJECTION_KEY_DOMAIN_V3: &[u8] = b"boon.execution-image-p
 const EXECUTION_IMAGE_ROW_PAYLOAD_DOMAIN_V3: &[u8] = b"boon.execution-image-row-payload.v3\0";
 const EXECUTION_IMAGE_ROW_DOMAIN_V3: &[u8] = b"boon.execution-image-row.v3\0";
 const EXECUTION_IMAGE_SHARD_DOMAIN_V3: &[u8] = b"boon.execution-image-shard.v3\0";
-const EXECUTION_IMAGE_HANDOFF_DOMAIN_V4: &[u8] = b"boon.execution-image-handoff.v4\0";
-const SEMANTIC_IMAGE_SEAL_DOMAIN_V4: &[u8] = b"boon.semantic-image-seal.v4\0";
+const EXECUTION_IMAGE_HANDOFF_DOMAIN_V5: &[u8] = b"boon.execution-image-handoff.v5\0";
+const SEMANTIC_IMAGE_SEAL_DOMAIN_V5: &[u8] = b"boon.semantic-image-seal.v5\0";
 const EXECUTION_INVOCATION_OVERLAY_DOMAIN_V3: &[u8] = b"boon.execution-invocation-overlay.v3\0";
-const EXECUTION_EXPRESSION_PROOF_DOMAIN_V1: &[u8] = b"boon.execution-expression-proof.v1\0";
+const EXECUTION_EXPRESSION_PROOF_DOMAIN_V2: &[u8] = b"boon.execution-expression-proof.v2\0";
 const EXECUTION_EXPRESSION_PROOF_NESTED_DOMAIN_V1: &[u8] =
     b"boon.execution-expression-proof-nested.v1\0";
 const EXECUTION_DEFINITION_PROOF_FRAGMENT_DOMAIN_V1: &[u8] =
@@ -773,120 +773,6 @@ fn execution_proof_update_strings_v1(
     Ok(())
 }
 
-fn execution_proof_update_object_shape_v1(
-    hasher: &mut Sha256,
-    shape: &boon_checked::ObjectShape,
-) -> Result<(), String> {
-    execution_proof_update_usize_v1(hasher, shape.fields.len(), "object field count")?;
-    for (name, ty) in &shape.fields {
-        execution_proof_update_string_v1(hasher, name, "object field name")?;
-        execution_proof_update_type_v1(hasher, ty)?;
-    }
-    execution_proof_update_strings_v1(hasher, &shape.field_order, "object field order")?;
-    hasher.update([u8::from(shape.open)]);
-    Ok(())
-}
-
-fn execution_proof_update_type_v1(
-    hasher: &mut Sha256,
-    ty: &boon_checked::Type,
-) -> Result<(), String> {
-    use boon_checked::{BytesType, Type, Variant};
-
-    match ty {
-        Type::Text => hasher.update([0]),
-        Type::Number => hasher.update([1]),
-        Type::Bytes(BytesType::Dynamic) => hasher.update([2, 0]),
-        Type::Bytes(BytesType::Fixed(size)) => {
-            hasher.update([2, 1]);
-            execution_proof_update_usize_v1(hasher, *size, "fixed byte-list type size")?;
-        }
-        Type::Absent => hasher.update([3]),
-        Type::VariantSet(variants) => {
-            hasher.update([4]);
-            execution_proof_update_usize_v1(
-                hasher,
-                variants.len(),
-                "variant-set alternative count",
-            )?;
-            for variant in variants.iter() {
-                match variant {
-                    Variant::Tag(tag) => {
-                        hasher.update([0]);
-                        execution_proof_update_string_v1(hasher, tag, "variant tag")?;
-                    }
-                    Variant::Tagged { tag, fields } => {
-                        hasher.update([1]);
-                        execution_proof_update_string_v1(hasher, tag, "tagged variant tag")?;
-                        execution_proof_update_object_shape_v1(hasher, fields)?;
-                    }
-                }
-            }
-        }
-        Type::Object(shape) => {
-            hasher.update([5]);
-            execution_proof_update_object_shape_v1(hasher, shape)?;
-        }
-        Type::RenderContract => hasher.update([6]),
-        Type::List(item) => {
-            hasher.update([7]);
-            execution_proof_update_type_v1(hasher, item)?;
-        }
-        Type::Function { args, result } => {
-            hasher.update([8]);
-            execution_proof_update_usize_v1(hasher, args.len(), "function type argument count")?;
-            for argument in args {
-                execution_proof_update_type_v1(hasher, argument)?;
-            }
-            execution_proof_update_flow_type_v1(hasher, result)?;
-        }
-        Type::UnresolvedShape { reason } => {
-            hasher.update([9]);
-            execution_proof_update_string_v1(hasher, reason, "unresolved type reason")?;
-        }
-        Type::Var(variable) => {
-            hasher.update([10]);
-            hasher.update(variable.0.to_be_bytes());
-        }
-        Type::Unknown => hasher.update([11]),
-        Type::Union(variants) => {
-            hasher.update([12]);
-            execution_proof_update_usize_v1(hasher, variants.len(), "union member count")?;
-            for variant in variants {
-                execution_proof_update_type_v1(hasher, variant)?;
-            }
-        }
-        Type::Map { key, value } => {
-            hasher.update([13]);
-            execution_proof_update_type_v1(hasher, key)?;
-            execution_proof_update_type_v1(hasher, value)?;
-        }
-        Type::Set(item) => {
-            hasher.update([14]);
-            execution_proof_update_type_v1(hasher, item)?;
-        }
-        Type::Bits { width } => {
-            hasher.update([15]);
-            hasher.update(width.to_be_bytes());
-        }
-    }
-    Ok(())
-}
-
-fn execution_proof_update_flow_type_v1(
-    hasher: &mut Sha256,
-    flow_type: &boon_checked::FlowType,
-) -> Result<(), String> {
-    use boon_checked::FlowMode;
-    hasher.update([match flow_type.mode {
-        FlowMode::Continuous => 0,
-        FlowMode::TickPresent => 1,
-        FlowMode::PresentOrAbsent => 2,
-        FlowMode::Absent => 3,
-    }]);
-    execution_proof_update_type_v1(hasher, &flow_type.ty)
-}
-
 fn execution_proof_update_optional_usize_v1(
     hasher: &mut Sha256,
     value: Option<usize>,
@@ -1582,8 +1468,8 @@ fn execution_proof_update_children_v1(
     Ok(())
 }
 
-fn seal_execution_expression_proof_v1(
-    plan: &ExecutionExpressionProofPlanV1,
+fn seal_execution_expression_proof_v2(
+    plan: &ExecutionExpressionProofPlanV2,
     fragment: &DefinitionExecutionProofFragmentV1,
     semantic: &crate::SemanticExpression,
     executable: &crate::program_core::ExecutableExpression,
@@ -1609,14 +1495,16 @@ fn seal_execution_expression_proof_v1(
         }];
     let kind = execution_expression_occurrence_kind_v1(semantic, executable, children)?;
     let mut hasher = Sha256::new();
-    hasher.update(EXECUTION_EXPRESSION_PROOF_DOMAIN_V1);
+    hasher.update(EXECUTION_EXPRESSION_PROOF_DOMAIN_V2);
     hasher.update(fragment.digest);
     hasher.update(plan.checked_expression_ordinal.to_be_bytes());
-    if plan.definition_flow_type {
-        hasher.update([0]);
-    } else {
-        hasher.update([1]);
-        execution_proof_update_flow_type_v1(&mut hasher, &executable.flow_type)?;
+    hasher.update(plan.definition_runtime_flow_digest);
+    match plan.flow_override_digest {
+        Some(digest) => {
+            hasher.update([1]);
+            hasher.update(digest);
+        }
+        None => hasher.update([0]),
     }
     execution_proof_update_optional_nested_v1(
         &mut hasher,
@@ -1850,7 +1738,7 @@ pub struct ExecutionImageEntityRouteV3 {
 /// Compact executable receipt set. Invocation ancestry is owned by the V3
 /// parent-linked overlays; it is never expanded into a second path arena.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ExecutionImageHandoffV4 {
+pub struct ExecutionImageHandoffV5 {
     pub schema: String,
     pub source_bundle_digest_v1: SourceBundleDigestV1,
     pub role: ProgramRole,
@@ -1861,7 +1749,7 @@ pub struct ExecutionImageHandoffV4 {
     pub local_image_digest: [u8; 32],
 }
 
-impl ExecutionImageHandoffV4 {
+impl ExecutionImageHandoffV5 {
     pub fn projection(
         &self,
         id: ExecutionImageProjectionIdV3,
@@ -1921,11 +1809,11 @@ pub(crate) struct ExecutionConstructionRoutesV3 {
     local_digest: [u8; 32],
 }
 
-pub(crate) struct ExecutionConstructionImageV4 {
+pub(crate) struct ExecutionConstructionImageV5 {
     routes: ExecutionConstructionRoutesV3,
     expression_routes: Vec<ExecutionConstructionProjectionV3>,
     definition_proof_fragments: Vec<Option<DefinitionExecutionProofFragmentV1>>,
-    expression_proof_plans: Vec<ExecutionExpressionProofPlanV1>,
+    expression_proof_plans: Vec<ExecutionExpressionProofPlanV2>,
     statement_routes: Vec<ExecutionConstructionProjectionV3>,
 }
 
@@ -1943,10 +1831,11 @@ struct DefinitionExecutionProofFragmentV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct ExecutionExpressionProofPlanV1 {
+struct ExecutionExpressionProofPlanV2 {
     fragment: CheckedImageProjectionIdV2,
     checked_expression_ordinal: u32,
-    definition_flow_type: bool,
+    definition_runtime_flow_digest: [u8; 32],
+    flow_override_digest: Option<[u8; 32]>,
     definition_effect: bool,
     specialized_static: bool,
 }
@@ -2106,7 +1995,7 @@ impl ExecutionConstructionRoutesV3 {
     }
 }
 
-impl ExecutionConstructionImageV4 {
+impl ExecutionConstructionImageV5 {
     fn definition_projection(
         &self,
         projection: CheckedImageProjectionIdV2,
@@ -2144,7 +2033,7 @@ impl ExecutionConstructionImageV4 {
         expression: SemanticExprId,
     ) -> Result<
         (
-            &ExecutionExpressionProofPlanV1,
+            &ExecutionExpressionProofPlanV2,
             &DefinitionExecutionProofFragmentV1,
         ),
         String,
@@ -2226,20 +2115,20 @@ impl ExecutionImageHandoffV2 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SealedSemanticImageV4 {
+pub struct SealedSemanticImageV5 {
     schema: String,
     checked_handoff: CheckedImageHandoffV4,
-    execution_handoff: ExecutionImageHandoffV4,
+    execution_handoff: ExecutionImageHandoffV5,
     execution: SemanticExecutionImageColumnsV1,
     seal_digest: [u8; 32],
 }
 
-impl SealedSemanticImageV4 {
+impl SealedSemanticImageV5 {
     pub const fn checked_handoff(&self) -> &CheckedImageHandoffV4 {
         &self.checked_handoff
     }
 
-    pub const fn execution_handoff(&self) -> &ExecutionImageHandoffV4 {
+    pub const fn execution_handoff(&self) -> &ExecutionImageHandoffV5 {
         &self.execution_handoff
     }
 
@@ -2256,9 +2145,9 @@ impl SealedSemanticImageV4 {
         source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
     ) -> Result<(), String> {
-        if self.schema != SEMANTIC_IMAGE_SCHEMA_V4
+        if self.schema != SEMANTIC_IMAGE_SCHEMA_V5
             || self.checked_handoff.schema != CHECKED_IMAGE_HANDOFF_SCHEMA_V4
-            || self.execution_handoff.schema != EXECUTION_IMAGE_HANDOFF_SCHEMA_V4
+            || self.execution_handoff.schema != EXECUTION_IMAGE_HANDOFF_SCHEMA_V5
         {
             return Err("semantic image contains an unsupported schema".to_owned());
         }
@@ -2292,10 +2181,11 @@ struct PostResourceValidatedV2;
 
 pub(crate) struct SemanticImageBuilder<State> {
     checked_handoff: CheckedImageHandoffV4,
+    runtime_flow_terms: Option<boon_checked::CheckedRuntimeFlowTermHandoffV1>,
     execution_routes_v3: Option<ExecutionConstructionRoutesV3>,
-    execution_image_v4: Option<ExecutionConstructionImageV4>,
+    execution_image_v5: Option<ExecutionConstructionImageV5>,
     execution: SemanticExecutionImageColumnsV1,
-    execution_handoff: Option<ExecutionImageHandoffV4>,
+    execution_handoff: Option<ExecutionImageHandoffV5>,
     #[cfg(test)]
     execution_handoff_v2_oracle: Option<ExecutionImageHandoffV2>,
     state: PhantomData<State>,
@@ -2304,6 +2194,7 @@ pub(crate) struct SemanticImageBuilder<State> {
 impl SemanticImageBuilder<ExecutionPending> {
     pub(crate) fn execution_pending(
         checked_handoff: CheckedImageHandoffV4,
+        runtime_flow_terms: boon_checked::CheckedRuntimeFlowTermHandoffV1,
         execution_routes_v3: ExecutionConstructionRoutesV3,
         execution: SemanticExecutionImageColumnsV1,
     ) -> Result<Self, String> {
@@ -2315,8 +2206,9 @@ impl SemanticImageBuilder<ExecutionPending> {
         }
         Ok(Self {
             checked_handoff,
+            runtime_flow_terms: Some(runtime_flow_terms),
             execution_routes_v3: Some(execution_routes_v3),
-            execution_image_v4: None,
+            execution_image_v5: None,
             execution,
             execution_handoff: None,
             #[cfg(test)]
@@ -2343,8 +2235,13 @@ impl SemanticImageBuilder<ExecutionPending> {
             .execution_routes_v3
             .take()
             .ok_or_else(|| "execution V3 routes were already consumed".to_owned())?;
-        self.execution_image_v4 = Some(execution_construction_image_v4(
+        let runtime_flow_terms = self
+            .runtime_flow_terms
+            .take()
+            .ok_or_else(|| "checked runtime flow terms were already consumed".to_owned())?;
+        self.execution_image_v5 = Some(execution_construction_image_v5(
             &self.checked_handoff,
+            &runtime_flow_terms,
             checked,
             routes,
             &self.execution,
@@ -2369,20 +2266,21 @@ impl SemanticImageBuilder<ExecutionPending> {
         if self.execution_routes_v3.is_some() {
             return Err("execution V3 routes were not bound after normalization".to_owned());
         }
-        let execution_image_v4 = self
-            .execution_image_v4
-            .ok_or_else(|| "execution V4 image was not constructed".to_owned())?;
+        let execution_image_v5 = self
+            .execution_image_v5
+            .ok_or_else(|| "execution V5 image was not constructed".to_owned())?;
         #[cfg(test)]
         let execution_handoff_v2_oracle = Some(execution_image_handoff_v2_oracle(
             &self.checked_handoff,
-            &execution_image_v4,
+            &execution_image_v5,
             _out,
             &self.execution,
         )?);
         Ok(SemanticImageBuilder {
             checked_handoff: self.checked_handoff,
+            runtime_flow_terms: None,
             execution_routes_v3: None,
-            execution_image_v4: Some(execution_image_v4),
+            execution_image_v5: Some(execution_image_v5),
             execution: self.execution,
             execution_handoff: None,
             #[cfg(test)]
@@ -2401,7 +2299,7 @@ impl SemanticImageBuilder<ExecutionFinalized> {
         &self.checked_handoff
     }
 
-    pub(crate) fn execution_handoff(&self) -> &ExecutionImageHandoffV4 {
+    pub(crate) fn execution_handoff(&self) -> &ExecutionImageHandoffV5 {
         self.execution_handoff
             .as_ref()
             .expect("executable receipts are finalized before handoff access")
@@ -2409,20 +2307,20 @@ impl SemanticImageBuilder<ExecutionFinalized> {
 
     pub(crate) fn execution_receipt_publisher(
         &self,
-    ) -> Result<ExecutionReceiptPublisherV4<'_>, String> {
+    ) -> Result<ExecutionReceiptPublisherV5<'_>, String> {
         let construction_image = self
-            .execution_image_v4
+            .execution_image_v5
             .as_ref()
-            .ok_or_else(|| "finalized execution builder has no V4 construction image".to_owned())?;
-        ExecutionReceiptPublisherV4::new(&self.checked_handoff, construction_image, &self.execution)
+            .ok_or_else(|| "finalized execution builder has no V5 construction image".to_owned())?;
+        ExecutionReceiptPublisherV5::new(&self.checked_handoff, construction_image, &self.execution)
     }
 
     pub(crate) fn install_execution_handoff(
         &mut self,
-        handoff: ExecutionImageHandoffV4,
+        handoff: ExecutionImageHandoffV5,
     ) -> Result<(), String> {
         if self.execution_handoff.replace(handoff).is_some() {
-            return Err("execution V4 handoff was already finalized".to_owned());
+            return Err("execution V5 handoff was already finalized".to_owned());
         }
         #[cfg(test)]
         if let Some(oracle) = &self.execution_handoff_v2_oracle {
@@ -2441,14 +2339,14 @@ impl SemanticImageBuilder<ExecutionFinalized> {
     pub(crate) fn validate_direct_execution_handoff(
         &self,
         core: &crate::program_core::CanonicalProgramCoreV2,
-        direct: &ExecutionImageHandoffV4,
+        direct: &ExecutionImageHandoffV5,
     ) -> Result<(), String> {
         let construction_image = self
-            .execution_image_v4
+            .execution_image_v5
             .as_ref()
-            .ok_or_else(|| "finalized execution builder has no V4 construction image".to_owned())?;
+            .ok_or_else(|| "finalized execution builder has no V5 construction image".to_owned())?;
         let payload_seals = execution_row_payload_seals_v3_oracle(core)?;
-        let oracle = execution_image_handoff_v4(
+        let oracle = execution_image_handoff_v5(
             &self.checked_handoff,
             construction_image,
             &self.execution,
@@ -2457,24 +2355,24 @@ impl SemanticImageBuilder<ExecutionFinalized> {
         )?;
         if direct != &oracle {
             return Err(
-                "construction-published execution V4 handoff differs from the post-hoc oracle"
+                "construction-published execution V5 handoff differs from the post-hoc oracle"
                     .to_owned(),
             );
         }
         Ok(())
     }
 
-    pub(crate) fn seal(self) -> Result<SealedSemanticImageV4, String> {
+    pub(crate) fn seal(self) -> Result<SealedSemanticImageV5, String> {
         let execution_handoff = self
             .execution_handoff
-            .ok_or_else(|| "finalized execution builder has no V4 handoff".to_owned())?;
-        let schema = SEMANTIC_IMAGE_SCHEMA_V4.to_owned();
+            .ok_or_else(|| "finalized execution builder has no V5 handoff".to_owned())?;
+        let schema = SEMANTIC_IMAGE_SCHEMA_V5.to_owned();
         let seal_digest =
             semantic_image_seal_digest(&schema, &self.checked_handoff, &execution_handoff)?;
-        let _execution_image_v4 = self
-            .execution_image_v4
-            .ok_or_else(|| "finalized execution builder has no V3 image".to_owned())?;
-        Ok(SealedSemanticImageV4 {
+        let _execution_image_v5 = self
+            .execution_image_v5
+            .ok_or_else(|| "finalized execution builder has no V5 image".to_owned())?;
+        Ok(SealedSemanticImageV5 {
             schema,
             checked_handoff: self.checked_handoff,
             execution_handoff,
@@ -2548,9 +2446,9 @@ struct PendingExecutionProjectionV3 {
     relocations: Vec<PendingExecutionProjectionIdV3>,
 }
 
-struct ExecutionImageHandoffBuilderV4<'a> {
+struct ExecutionImageHandoffBuilderV5<'a> {
     checked: &'a CheckedImageHandoffV4,
-    construction_image: &'a ExecutionConstructionImageV4,
+    construction_image: &'a ExecutionConstructionImageV5,
     ids: BTreeMap<ExecutionConstructionProjectionV3, PendingExecutionProjectionIdV3>,
     stable_digest_ids: BTreeMap<[u8; 32], PendingExecutionProjectionIdV3>,
     projections: Vec<PendingExecutionProjectionV3>,
@@ -2573,10 +2471,10 @@ struct ExecutionImageHandoffBuilderV4<'a> {
     trace_row_hash_ns: u128,
 }
 
-impl<'a> ExecutionImageHandoffBuilderV4<'a> {
+impl<'a> ExecutionImageHandoffBuilderV5<'a> {
     fn new(
         checked: &'a CheckedImageHandoffV4,
-        construction_image: &'a ExecutionConstructionImageV4,
+        construction_image: &'a ExecutionConstructionImageV5,
     ) -> Result<Self, String> {
         if construction_image
             .routes
@@ -2792,7 +2690,7 @@ impl<'a> ExecutionImageHandoffBuilderV4<'a> {
         mut manifest_prefix: crate::dependency_manifest::ManifestCheckedExecutionPrefixBuilderV7,
     ) -> Result<
         (
-            ExecutionImageHandoffV4,
+            ExecutionImageHandoffV5,
             crate::dependency_manifest::ManifestCheckedExecutionPrefixV7,
         ),
         String,
@@ -2920,9 +2818,9 @@ impl<'a> ExecutionImageHandoffBuilderV4<'a> {
             });
         }
         let local_image_digest = boon_contract::canonical_serde_hash_v1_with_buffer(
-            EXECUTION_IMAGE_HANDOFF_DOMAIN_V4,
+            EXECUTION_IMAGE_HANDOFF_DOMAIN_V5,
             &(
-                EXECUTION_IMAGE_HANDOFF_SCHEMA_V4,
+                EXECUTION_IMAGE_HANDOFF_SCHEMA_V5,
                 source_bundle_digest_v1,
                 role,
                 &invocation_overlays,
@@ -2932,14 +2830,14 @@ impl<'a> ExecutionImageHandoffBuilderV4<'a> {
             ),
             &mut hash_scratch,
         )
-        .map_err(|error| format!("failed to hash execution V4 handoff: {error}"))?;
+        .map_err(|error| format!("failed to hash execution V5 handoff: {error}"))?;
         if trace {
             let row_count = sealed_projections
                 .iter()
                 .map(|projection| projection.row_count as usize)
                 .sum::<usize>();
             eprintln!(
-                "boon_semantic execution_handoff_v4 overlays={} projections={} rows={} entity_routes={} relocations={}",
+                "boon_semantic execution_handoff_v5 overlays={} projections={} rows={} entity_routes={} relocations={}",
                 invocation_overlays.len(),
                 sealed_projections.len(),
                 row_count,
@@ -2947,15 +2845,15 @@ impl<'a> ExecutionImageHandoffBuilderV4<'a> {
                 relocation_arena.len(),
             );
             eprintln!(
-                "boon_semantic execution_handoff_v4 payload_hash_ms={:.3} relocation_ms={:.3} row_hash_ms={:.3}",
+                "boon_semantic execution_handoff_v5 payload_hash_ms={:.3} relocation_ms={:.3} row_hash_ms={:.3}",
                 trace_payload_hash_ns as f64 / 1_000_000.0,
                 trace_relocation_ns as f64 / 1_000_000.0,
                 trace_row_hash_ns as f64 / 1_000_000.0,
             );
         }
         Ok((
-            ExecutionImageHandoffV4 {
-                schema: EXECUTION_IMAGE_HANDOFF_SCHEMA_V4.to_owned(),
+            ExecutionImageHandoffV5 {
+                schema: EXECUTION_IMAGE_HANDOFF_SCHEMA_V5.to_owned(),
                 source_bundle_digest_v1,
                 role,
                 invocation_overlays,
@@ -3024,7 +2922,7 @@ struct PendingExecutionProjectionV2 {
 #[cfg(test)]
 struct ExecutionImageHandoffBuilderV2<'a> {
     checked: &'a CheckedImageHandoffV4,
-    construction_image: &'a ExecutionConstructionImageV4,
+    construction_image: &'a ExecutionConstructionImageV5,
     path_ids: BTreeMap<
         (
             Option<ExecutionInvocationPathIdV2>,
@@ -3048,7 +2946,7 @@ struct ExecutionImageHandoffBuilderV2<'a> {
 impl<'a> ExecutionImageHandoffBuilderV2<'a> {
     fn new(
         checked: &'a CheckedImageHandoffV4,
-        construction_image: &'a ExecutionConstructionImageV4,
+        construction_image: &'a ExecutionConstructionImageV5,
     ) -> Result<Self, String> {
         if construction_image
             .routes
@@ -4070,15 +3968,16 @@ fn semantic_expression_has_explicit_static_specialization_v1(
     )
 }
 
-fn execution_expression_proof_plans_v1(
+fn execution_expression_proof_plans_v2(
     checked_handoff: &CheckedImageHandoffV4,
+    runtime_flow_terms: &boon_checked::CheckedRuntimeFlowTermHandoffV1,
     checked: &boon_checked::CheckedProgramFields,
     routes: &ExecutionConstructionRoutesV3,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<
     (
         Vec<Option<DefinitionExecutionProofFragmentV1>>,
-        Vec<ExecutionExpressionProofPlanV1>,
+        Vec<ExecutionExpressionProofPlanV2>,
     ),
     String,
 > {
@@ -4099,6 +3998,17 @@ fn execution_expression_proof_plans_v1(
     {
         return Err(
             "execution expression proof plans received mismatched checked authorities".to_owned(),
+        );
+    }
+    runtime_flow_terms.validate_authority(
+        checked_handoff.source_bundle_digest_v1,
+        checked_handoff.role,
+        checked_handoff.local_image_digest,
+    )?;
+    if runtime_flow_terms.expression_count() != checked.expressions.len() {
+        return Err(
+            "execution expression proof plans received an invalid checked type-term handoff"
+                .to_owned(),
         );
     }
 
@@ -4203,6 +4113,8 @@ fn execution_expression_proof_plans_v1(
     let mut definition_flow_types = 0usize;
     let mut definition_effects = 0usize;
     let mut definition_static = 0usize;
+    let mut runtime_checked_flow_types = vec![None; checked.expressions.len()];
+    let mut occurrence_terms = boon_checked::ArtifactTypeModuleBuilderV1::new();
     for expression in &execution.expressions {
         if expression.id.as_usize() != plans.len() {
             return Err(format!(
@@ -4228,11 +4140,41 @@ fn execution_expression_proof_plans_v1(
                     expression.id
                 )
             })?;
-        let runtime_checked_flow_type = boon_checked::FlowType {
-            mode: checked_expression.flow_type.mode,
-            ty: boon_checked::erase_runtime_type_vars(&checked_expression.flow_type.ty),
+        let definition_runtime_flow_digest = runtime_flow_terms
+            .expression_runtime_flow_digest(expression.checked_expr_id)
+            .ok_or_else(|| {
+                format!(
+                    "execution expression {} has no checked runtime flow-term digest",
+                    expression.id
+                )
+            })?;
+        let runtime_checked_flow_type = runtime_checked_flow_types
+            .get_mut(expression.checked_expr_id.0 as usize)
+            .ok_or_else(|| {
+                format!(
+                    "execution expression {} has no checked runtime flow slot",
+                    expression.id
+                )
+            })?
+            .get_or_insert_with(|| boon_checked::FlowType {
+                mode: checked_expression.flow_type.mode,
+                ty: boon_checked::erase_runtime_type_vars(&checked_expression.flow_type.ty),
+            });
+        let flow_override_digest = if expression.flow_type == *runtime_checked_flow_type {
+            None
+        } else {
+            Some(
+                occurrence_terms
+                    .intern_flow(&expression.flow_type)
+                    .map_err(|error| {
+                        format!(
+                            "execution expression {} cannot publish its occurrence flow term: {error}",
+                            expression.id
+                        )
+                    })?
+                    .runtime_erased_digest,
+            )
         };
-        let definition_flow_type = expression.flow_type == runtime_checked_flow_type;
         let definition_effect = expression.effect == checked_expression.effect;
         let definition_owns_static = definition_owns_semantic_expression_static_v1(
             &checked_expression.kind,
@@ -4260,9 +4202,9 @@ fn execution_expression_proof_plans_v1(
                 expression.id, checked_expression.kind, expression.kind
             ));
         };
-        definition_flow_types += usize::from(definition_flow_type);
+        definition_flow_types += usize::from(flow_override_digest.is_none());
         definition_effects += usize::from(definition_effect);
-        plans.push(ExecutionExpressionProofPlanV1 {
+        plans.push(ExecutionExpressionProofPlanV2 {
             fragment: expression_projection,
             checked_expression_ordinal: *checked_expression_ordinals
                 .get(expression.checked_expr_id.0 as usize)
@@ -4272,14 +4214,15 @@ fn execution_expression_proof_plans_v1(
                         expression.id
                     )
                 })?,
-            definition_flow_type,
+            definition_runtime_flow_digest,
+            flow_override_digest,
             definition_effect,
             specialized_static,
         });
     }
     if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
         eprintln!(
-            "boon_semantic execution_expression_proof_v1 plans={} definition_static={} static_overrides={} definition_flow_types={} flow_overrides={} definition_effects={} effect_overrides={}",
+            "boon_semantic execution_expression_proof_v2 plans={} definition_static={} static_overrides={} definition_flow_types={} flow_overrides={} definition_effects={} effect_overrides={}",
             plans.len(),
             definition_static,
             plans.len().saturating_sub(definition_static),
@@ -4292,12 +4235,13 @@ fn execution_expression_proof_plans_v1(
     Ok((definition_proof_fragments, plans))
 }
 
-pub(crate) fn execution_construction_image_v4(
+pub(crate) fn execution_construction_image_v5(
     checked_handoff: &CheckedImageHandoffV4,
+    runtime_flow_terms: &boon_checked::CheckedRuntimeFlowTermHandoffV1,
     checked: &boon_checked::CheckedProgramFields,
     routes: ExecutionConstructionRoutesV3,
     execution: &SemanticExecutionImageColumnsV1,
-) -> Result<ExecutionConstructionImageV4, String> {
+) -> Result<ExecutionConstructionImageV5, String> {
     let trace_started = std::env::var_os("BOON_SEMANTIC_TRACE")
         .is_some()
         .then(std::time::Instant::now);
@@ -4363,8 +4307,13 @@ pub(crate) fn execution_construction_image_v4(
         expression_routes.push(route);
     }
 
-    let (definition_proof_fragments, expression_proof_plans) =
-        execution_expression_proof_plans_v1(checked_handoff, checked, &routes, execution)?;
+    let (definition_proof_fragments, expression_proof_plans) = execution_expression_proof_plans_v2(
+        checked_handoff,
+        runtime_flow_terms,
+        checked,
+        &routes,
+        execution,
+    )?;
 
     let mut statement_routes = Vec::with_capacity(execution.statements.len());
     for statement in &execution.statements {
@@ -4392,7 +4341,7 @@ pub(crate) fn execution_construction_image_v4(
         }));
     }
 
-    let image = ExecutionConstructionImageV4 {
+    let image = ExecutionConstructionImageV5 {
         routes,
         expression_routes,
         definition_proof_fragments,
@@ -4401,7 +4350,7 @@ pub(crate) fn execution_construction_image_v4(
     };
     if let Some(started) = trace_started {
         eprintln!(
-            "boon_semantic execution_image_v4 owners={} expression_routes={} statement_routes={} elapsed_ms={:.3}",
+            "boon_semantic execution_image_v5 owners={} expression_routes={} statement_routes={} elapsed_ms={:.3}",
             image.routes.owner_occurrences.len(),
             image.expression_routes.len(),
             image.statement_routes.len(),
@@ -4676,7 +4625,7 @@ fn function_projection(
 
 #[cfg(test)]
 fn checked_execution_projection_v3(
-    builder: &mut ExecutionImageHandoffBuilderV4<'_>,
+    builder: &mut ExecutionImageHandoffBuilderV5<'_>,
     domain: CheckedImageRowDomainV2,
     dense_index: usize,
 ) -> Result<PendingExecutionProjectionIdV3, String> {
@@ -4686,14 +4635,14 @@ fn checked_execution_projection_v3(
 
 #[cfg(test)]
 fn projection_for_construction_route_v3(
-    builder: &mut ExecutionImageHandoffBuilderV4<'_>,
+    builder: &mut ExecutionImageHandoffBuilderV5<'_>,
     route: ExecutionConstructionProjectionV3,
 ) -> Result<PendingExecutionProjectionIdV3, String> {
     builder.intern(route)
 }
 
 fn function_projection_v3(
-    builder: &mut ExecutionImageHandoffBuilderV4<'_>,
+    builder: &mut ExecutionImageHandoffBuilderV5<'_>,
     execution: &SemanticExecutionImageColumnsV1,
     function: &SemanticFunction,
 ) -> Result<PendingExecutionProjectionIdV3, String> {
@@ -4728,8 +4677,8 @@ fn function_projection_v3(
 /// need to walk the completed semantic and executable images again.  The
 /// transaction retains only dense projection routes and compact receipt
 /// accumulators; it never owns a second executable graph.
-pub(crate) struct ExecutionReceiptPublisherV4<'a> {
-    builder: ExecutionImageHandoffBuilderV4<'a>,
+pub(crate) struct ExecutionReceiptPublisherV5<'a> {
+    builder: ExecutionImageHandoffBuilderV5<'a>,
     manifest_prefix: crate::dependency_manifest::ManifestCheckedExecutionPrefixBuilderV7,
     checked_projections: Vec<Option<PendingExecutionProjectionIdV3>>,
     invocation_projections: Vec<PendingExecutionProjectionIdV3>,
@@ -4739,13 +4688,13 @@ pub(crate) struct ExecutionReceiptPublisherV4<'a> {
     expression_children: Vec<ExecutionExpressionChildV1>,
 }
 
-impl<'a> ExecutionReceiptPublisherV4<'a> {
+impl<'a> ExecutionReceiptPublisherV5<'a> {
     fn new(
         checked: &'a CheckedImageHandoffV4,
-        construction_image: &'a ExecutionConstructionImageV4,
+        construction_image: &'a ExecutionConstructionImageV5,
         execution: &SemanticExecutionImageColumnsV1,
     ) -> Result<Self, String> {
-        let mut builder = ExecutionImageHandoffBuilderV4::new(checked, construction_image)?;
+        let mut builder = ExecutionImageHandoffBuilderV5::new(checked, construction_image)?;
         let manifest_prefix =
             crate::dependency_manifest::ManifestCheckedExecutionPrefixBuilderV7::new(
                 checked, execution,
@@ -4938,7 +4887,7 @@ impl<'a> ExecutionReceiptPublisherV4<'a> {
             .construction_image
             .expression_proof_authority(semantic.id)?;
         let started = self.builder.trace.then(std::time::Instant::now);
-        let payload_digest = seal_execution_expression_proof_v1(
+        let payload_digest = seal_execution_expression_proof_v2(
             plan,
             fragment,
             semantic,
@@ -5252,7 +5201,7 @@ impl<'a> ExecutionReceiptPublisherV4<'a> {
         self,
     ) -> Result<
         (
-            ExecutionImageHandoffV4,
+            ExecutionImageHandoffV5,
             crate::dependency_manifest::ManifestCheckedExecutionPrefixV7,
         ),
         String,
@@ -5265,13 +5214,13 @@ impl<'a> ExecutionReceiptPublisherV4<'a> {
 }
 
 #[cfg(test)]
-fn execution_image_handoff_v4(
+fn execution_image_handoff_v5(
     checked: &CheckedImageHandoffV4,
-    construction_image: &ExecutionConstructionImageV4,
+    construction_image: &ExecutionConstructionImageV5,
     execution: &SemanticExecutionImageColumnsV1,
     core: &crate::program_core::CanonicalProgramCoreV2,
     payload_seals: &ExecutionRowPayloadSealsV3,
-) -> Result<ExecutionImageHandoffV4, String> {
+) -> Result<ExecutionImageHandoffV5, String> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     let mut trace_started = std::time::Instant::now();
     let executable = &core.executable;
@@ -5293,10 +5242,10 @@ fn execution_image_handoff_v4(
         || payload_seals.materializations.len() != core.materializations.len()
         || payload_seals.static_owners.len() != core.scope_index.owners.len()
     {
-        return Err("execution V4 receipts do not exactly cover final executable rows".to_owned());
+        return Err("execution V5 receipts do not exactly cover final executable rows".to_owned());
     }
 
-    let mut builder = ExecutionImageHandoffBuilderV4::new(checked, construction_image)?;
+    let mut builder = ExecutionImageHandoffBuilderV5::new(checked, construction_image)?;
     let invocation_projections = construction_image
         .routes
         .invocations
@@ -5399,7 +5348,7 @@ fn execution_image_handoff_v4(
             )?);
         }
         let (plan, fragment) = construction_image.expression_proof_authority(semantic.id)?;
-        let payload_digest = seal_execution_expression_proof_v1(
+        let payload_digest = seal_execution_expression_proof_v2(
             plan,
             fragment,
             semantic,
@@ -5777,7 +5726,7 @@ fn checked_route_oracle_owner(
 
 #[cfg(test)]
 fn v3_route_oracle_owner(
-    handoff: &ExecutionImageHandoffV4,
+    handoff: &ExecutionImageHandoffV5,
     checked: &CheckedImageHandoffV4,
     projection: ExecutionImageProjectionIdV3,
 ) -> Result<ExecutionRouteOracleOwner, String> {
@@ -5862,7 +5811,7 @@ fn v3_domain_in_v2(domain: ExecutionImageRowDomainV3) -> ExecutionImageRowDomain
 
 #[cfg(test)]
 fn validate_v3_routes_against_v2_oracle(
-    handoff: &ExecutionImageHandoffV4,
+    handoff: &ExecutionImageHandoffV5,
     oracle: &ExecutionImageHandoffV2,
     checked: &CheckedImageHandoffV4,
 ) -> Result<(), String> {
@@ -5901,7 +5850,7 @@ fn trace_execution_handoff_phase(enabled: bool, name: &str, started: &mut std::t
 #[cfg(test)]
 fn execution_image_handoff_v2_oracle(
     checked: &CheckedImageHandoffV4,
-    construction_image: &ExecutionConstructionImageV4,
+    construction_image: &ExecutionConstructionImageV5,
     _out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<ExecutionImageHandoffV2, String> {
@@ -6381,10 +6330,10 @@ fn execution_image_handoff_v2_oracle(
 fn semantic_image_seal_digest(
     schema: &str,
     checked: &CheckedImageHandoffV4,
-    execution: &ExecutionImageHandoffV4,
+    execution: &ExecutionImageHandoffV5,
 ) -> Result<[u8; 32], String> {
     boon_contract::canonical_serde_hash_v1(
-        SEMANTIC_IMAGE_SEAL_DOMAIN_V4,
+        SEMANTIC_IMAGE_SEAL_DOMAIN_V5,
         &(
             schema,
             checked.local_image_digest,
@@ -6421,11 +6370,12 @@ mod compact_expression_proof_tests {
         }
     }
 
-    fn plan() -> ExecutionExpressionProofPlanV1 {
-        ExecutionExpressionProofPlanV1 {
+    fn plan() -> ExecutionExpressionProofPlanV2 {
+        ExecutionExpressionProofPlanV2 {
             fragment: CheckedImageProjectionIdV2(0),
             checked_expression_ordinal: 7,
-            definition_flow_type: false,
+            definition_runtime_flow_digest: [6; 32],
+            flow_override_digest: Some([7; 32]),
             definition_effect: true,
             specialized_static: true,
         }
@@ -6463,8 +6413,15 @@ mod compact_expression_proof_tests {
     }
 
     fn seal(semantic: &SemanticExpression, executable: &ExecutableExpression) -> [u8; 32] {
-        seal_execution_expression_proof_v1(
-            &plan(),
+        let mut plan = plan();
+        plan.flow_override_digest = Some(
+            boon_checked::ArtifactTypeModuleBuilderV1::new()
+                .intern_flow(&executable.flow_type)
+                .expect("test occurrence flow term")
+                .runtime_erased_digest,
+        );
+        seal_execution_expression_proof_v2(
+            &plan,
             &fragment(),
             semantic,
             executable,
@@ -6544,19 +6501,12 @@ mod compact_expression_proof_tests {
     }
 
     #[test]
-    fn compact_flow_proof_distinguishes_every_type_shape() {
-        fn digest(ty: Type) -> [u8; 32] {
-            let mut hasher = Sha256::new();
-            hasher.update(b"boon.test.execution-flow-proof.v1\0");
-            execution_proof_update_flow_type_v1(
-                &mut hasher,
-                &FlowType {
-                    mode: FlowMode::Continuous,
-                    ty,
-                },
-            )
-            .expect("flow proof fixture");
-            hasher.finalize().into()
+    fn compact_flow_proof_uses_canonical_runtime_term_shapes() {
+        fn digest(mode: FlowMode, ty: Type) -> [u8; 32] {
+            boon_checked::ArtifactTypeModuleBuilderV1::new()
+                .intern_flow(&FlowType { mode, ty })
+                .expect("canonical flow-term fixture")
+                .runtime_erased_digest
         }
 
         let object_shape = ObjectShape {
@@ -6600,20 +6550,18 @@ mod compact_expression_proof_tests {
             Type::Set(Type::shared(Type::Text)),
             Type::Bits { width: 17 },
         ];
-        let digests = types.into_iter().map(digest).collect::<BTreeSet<_>>();
-        assert_eq!(digests.len(), 18);
+        let digests = types
+            .into_iter()
+            .map(|ty| digest(FlowMode::Continuous, ty))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            digests.len(),
+            17,
+            "runtime proof intentionally erases Var to the same term as Unknown"
+        );
 
-        let continuous = digest(Type::Number);
-        let mut present = Sha256::new();
-        present.update(b"boon.test.execution-flow-proof.v1\0");
-        execution_proof_update_flow_type_v1(
-            &mut present,
-            &FlowType {
-                mode: FlowMode::TickPresent,
-                ty: Type::Number,
-            },
-        )
-        .expect("present flow proof fixture");
-        assert_ne!(continuous, <[u8; 32]>::from(present.finalize()));
+        let continuous = digest(FlowMode::Continuous, Type::Number);
+        let present = digest(FlowMode::TickPresent, Type::Number);
+        assert_ne!(continuous, present);
     }
 }

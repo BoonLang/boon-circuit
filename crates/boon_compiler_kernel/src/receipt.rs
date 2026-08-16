@@ -1188,19 +1188,12 @@ mod tests {
 
     #[test]
     fn semantic_artifact_fingerprints_alpha_normalize_type_variables() {
-        let definition = |variable| DefinitionArtifact {
-            result: FlowType {
+        let definition = |variable| {
+            let result = FlowType {
                 mode: FlowMode::Continuous,
                 ty: Type::Var(TypeVar(variable)),
-            },
-            formals: Box::new([]),
-            linkage: crate::KernelDefinitionLinkage::default(),
-            relocations: crate::KernelDefinitionRelocations::default(),
-            presentation: crate::KernelDefinitionPresentation::default(),
-            expression_payloads: Box::new([]),
-            call_syntax: Box::new([]),
-            execution_shapes: Box::new([]),
-            expressions: Box::new([crate::KernelExpressionArtifact {
+            };
+            let expression = crate::KernelExpressionArtifact {
                 id: KernelExpressionId(0),
                 kind: KernelOwnerNodeKind::FormalRead {
                     formal: 0,
@@ -1213,16 +1206,33 @@ mod tests {
                 },
                 flush_type: None,
                 effect: crate::KernelEffectSummary::default(),
-            }]),
-            statements: Box::new([]),
-            declarations: Box::new([]),
-            lexical_bindings: Box::new([]),
-            calls: Box::new([]),
-            effects: Box::new([]),
-            sources: Box::new([]),
-            states: Box::new([]),
-            lists: Box::new([]),
-            diagnostics: Box::new([]),
+            };
+            let flow_terms = crate::materialize_checked_definition_flow_terms_for_test_v1(
+                &[],
+                &result,
+                std::slice::from_ref(&expression.flow_type),
+            );
+            DefinitionArtifact {
+                result,
+                formals: Box::new([]),
+                flow_terms,
+                linkage: crate::KernelDefinitionLinkage::default(),
+                relocations: crate::KernelDefinitionRelocations::default(),
+                presentation: crate::KernelDefinitionPresentation::default(),
+                expression_payloads: Box::new([]),
+                call_syntax: Box::new([]),
+                execution_shapes: Box::new([]),
+                expressions: Box::new([expression]),
+                statements: Box::new([]),
+                declarations: Box::new([]),
+                lexical_bindings: Box::new([]),
+                calls: Box::new([]),
+                effects: Box::new([]),
+                sources: Box::new([]),
+                states: Box::new([]),
+                lists: Box::new([]),
+                diagnostics: Box::new([]),
+            }
         };
         let mut first_definition = [definition(7)];
         let mut second_definition = [definition(91)];

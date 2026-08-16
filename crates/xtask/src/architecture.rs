@@ -902,7 +902,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
         &semantic,
         "SemanticProgram",
         "semantic_image",
-        "SealedSemanticImageV4",
+        "SealedSemanticImageV5",
     )?;
     verify_required_direct_field(&ir, "ErasedProgram", "fields", "CanonicalProgramCoreV2")?;
     verify_required_direct_field(
@@ -1462,9 +1462,9 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     for required in [
         "pub(crate) fn build_canonical_program_core(",
         "struct CanonicalProgramCoreBuildV2",
-        "execution_handoff: crate::semantic_image::ExecutionImageHandoffV4",
+        "execution_handoff: crate::semantic_image::ExecutionImageHandoffV5",
         "manifest_prefix: crate::dependency_manifest::ManifestCheckedExecutionPrefixV7",
-        "ExecutionReceiptPublisherV4<'_>",
+        "ExecutionReceiptPublisherV5<'_>",
         "struct SemanticToExecutableMap",
         "fn validate_allocation_bijections(",
         "struct SemanticReactiveToMappedMap",
@@ -1508,19 +1508,30 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         );
     }
     for required in [
-        "pub(crate) struct ExecutionReceiptPublisherV4",
-        "pub const SEMANTIC_IMAGE_SCHEMA_V4",
-        "pub const EXECUTION_IMAGE_HANDOFF_SCHEMA_V4",
-        "fn seal_execution_expression_proof_v1(",
-        "fn execution_proof_update_type_v1(",
+        "pub(crate) struct ExecutionReceiptPublisherV5",
+        "pub const SEMANTIC_IMAGE_SCHEMA_V5",
+        "pub const EXECUTION_IMAGE_HANDOFF_SCHEMA_V5",
+        "fn seal_execution_expression_proof_v2(",
+        "ArtifactTypeModuleBuilderV1::new()",
         "fn execution_proof_update_static_override_v1(",
         "compact_expression_proof_binds_flow_static_owner_provenance_and_children",
-        "compact_flow_proof_distinguishes_every_type_shape",
-        "construction-published execution V4 handoff differs from the post-hoc oracle",
+        "compact_flow_proof_uses_canonical_runtime_term_shapes",
+        "construction-published execution V5 handoff differs from the post-hoc oracle",
     ] {
         if !semantic_image.contains(required) {
             return Err(format!(
                 "execution image omits direct construction receipt proof `{required}`"
+            ));
+        }
+    }
+    for forbidden in [
+        "fn execution_proof_update_object_shape_v1(",
+        "fn execution_proof_update_type_v1(",
+        "fn execution_proof_update_flow_type_v1(",
+    ] {
+        if semantic_image.contains(forbidden) {
+            return Err(format!(
+                "execution proof publication retains deleted recursive type replay `{forbidden}`"
             ));
         }
     }

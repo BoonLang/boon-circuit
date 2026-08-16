@@ -199,6 +199,11 @@ fn kernel_checked_image_seals_preserve_topology_and_definition_currentness() {
             program_metadata_fingerprint: [44; 32],
             referenced_abi_fingerprint: [55; 32],
             definitions,
+            runtime_flow_terms:
+                boon_checked::CheckedRuntimeFlowTermProjectionV1::derive_from_checked_expressions(
+                    &fields.expressions,
+                )
+                .expect("test runtime flow terms"),
         }
     };
 

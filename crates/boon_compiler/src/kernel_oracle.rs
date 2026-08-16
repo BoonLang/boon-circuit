@@ -438,6 +438,7 @@ pub enum KernelOwnerOracleCallTarget {
     },
     RenderConstructor(KernelRenderConstructorKind),
     PureBuiltin(KernelPureBuiltinKind),
+    FixedAbi,
     HostEffect(Box<str>),
 }
 
@@ -1830,6 +1831,9 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                                 KernelCallTarget::PureBuiltin { kind } => {
                                     KernelOwnerOracleCallTarget::PureBuiltin(kind)
                                 }
+                                KernelCallTarget::FixedAbi => {
+                                    KernelOwnerOracleCallTarget::FixedAbi
+                                }
                                 KernelCallTarget::HostEffect { operation } => {
                                     KernelOwnerOracleCallTarget::HostEffect(operation)
                                 }
@@ -2690,15 +2694,25 @@ fn kernel_render_slot_name<'a>(
     };
     let inherited = match owner {
         StableCheckOwnerKey::UnitRoot(_) => false,
-        StableCheckOwnerKey::Item(owner) => owner.item_route.segments().iter().any(|segment| {
-            segment.kind == UnitItemKind::Function
-                || segment.names.iter().any(|name| {
-                    matches!(
-                        name.as_str(),
-                        "document" | "scene" | "root" | "child" | "items" | "children"
-                    )
+        StableCheckOwnerKey::Item(owner) => {
+            let segments = owner.item_route.segments();
+            segments
+                .iter()
+                // The final route segment is the statement being classified,
+                // not an enclosing render context. Counting it made an
+                // ordinary top-level field named `items` classify itself as
+                // a render slot.
+                .take(segments.len().saturating_sub(1))
+                .any(|segment| {
+                    segment.kind == UnitItemKind::Function
+                        || segment.names.iter().any(|name| {
+                            matches!(
+                                name.as_str(),
+                                "document" | "scene" | "root" | "child" | "items" | "children"
+                            )
+                        })
                 })
-        }),
+        }
     };
     let nested = statement
         .route
@@ -3037,6 +3051,7 @@ struct PreparedLexicalOwnerTarget {
 struct AuthoritativeCallSurface {
     kind: KernelCallableKind,
     parameters: Box<[KernelCallShapeParameter]>,
+    fixed_result: Option<Type>,
 }
 
 #[derive(Clone, Debug)]
@@ -3229,6 +3244,13 @@ fn project_kernel_authoritative_call_shapes_from_abi(
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice(),
+                    fixed_result: (callable.kind == KernelCallableKind::Builtin
+                        && callable.parameters.is_empty()
+                        && callable.contexts.is_empty()
+                        && callable.result_specialization == KernelAbiResultSpecialization::Fixed
+                        && type_is_recursively_closed(&callable.result.ty)
+                        && callable.effect == Default::default())
+                    .then(|| callable.result.ty.clone()),
                 },
             )
         })
@@ -3268,7 +3290,14 @@ fn project_kernel_authoritative_call_shapes()
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
-            Ok((shape.name, AuthoritativeCallSurface { kind, parameters }))
+            Ok((
+                shape.name,
+                AuthoritativeCallSurface {
+                    kind,
+                    parameters,
+                    fixed_result: None,
+                },
+            ))
         })
         .collect()
 }
@@ -3297,6 +3326,7 @@ fn dynamic_authoritative_call_surface(
             evaluation_scope: KernelParameterEvaluationScope::Parent,
         }]
         .into_boxed_slice(),
+        fixed_result: None,
     })
 }
 
@@ -5276,6 +5306,29 @@ fn compact_owner_view(
                         None,
                     )
                 }
+                AstExprKind::Call {
+                    function,
+                    args,
+                    pass: _,
+                } if args.is_empty()
+                    && authoritative_projection
+                        .as_ref()
+                        .is_some_and(|projection| projection.valid)
+                    && authoritative_call_shapes
+                        .get(function)
+                        .is_some_and(|surface| surface.fixed_result.is_some()) =>
+                {
+                    let result = authoritative_call_shapes[function]
+                        .fixed_result
+                        .clone()
+                        .expect("fixed-result ABI call guard resolves");
+                    (
+                        KernelOwnerNodeKind::FixedAbiCall { result },
+                        Vec::new(),
+                        None,
+                        None,
+                    )
+                }
                 AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
                     if is_authoritative_callable_name(authoritative_call_shapes, function)
                         || dynamic_authoritative_surface.is_some() =>
@@ -5736,6 +5789,7 @@ fn compact_owner_view(
                 KernelOwnerNodeKind::UserCall { .. }
                     | KernelOwnerNodeKind::RenderConstructor { .. }
                     | KernelOwnerNodeKind::PureBuiltin { .. }
+                    | KernelOwnerNodeKind::FixedAbiCall { .. }
                     | KernelOwnerNodeKind::HostEffect { .. }
             )
             .then(|| {
@@ -8307,26 +8361,193 @@ fn kernel_resource_projection(
             return None;
         }
         let node = nodes.get(current.0 as usize)?;
-        let result = node.inputs.iter().find_map(|input| {
-            let child = input.expression;
-            if child.0 as usize >= nodes.len() {
-                return None;
-            }
-            let mut projection = visit(nodes, child, target, active)?;
-            if let KernelOwnerEdgeRole::RecordField {
-                name,
-                spread: false,
-            } = &input.role
-            {
-                projection.insert(0, name.clone());
-            }
-            Some(projection)
-        });
+        let result = node
+            .inputs
+            .iter()
+            .filter(|input| match &node.kind {
+                KernelOwnerNodeKind::Record { .. } => matches!(
+                    input.role,
+                    KernelOwnerEdgeRole::RecordField { spread: false, .. }
+                ),
+                KernelOwnerNodeKind::Block => input.role == KernelOwnerEdgeRole::BlockResult,
+                KernelOwnerNodeKind::Collection { .. } => {
+                    input.role == KernelOwnerEdgeRole::CollectionItem
+                }
+                KernelOwnerNodeKind::MapEntry => input.role == KernelOwnerEdgeRole::MapValue,
+                KernelOwnerNodeKind::PureBuiltin {
+                    kind: KernelPureBuiltinKind::BoolToggle,
+                } => matches!(
+                    &input.role,
+                    KernelOwnerEdgeRole::AbiArgument { name }
+                        if matches!(name.as_ref(), "$pipe" | "value")
+                ),
+                KernelOwnerNodeKind::Latest => input.role == KernelOwnerEdgeRole::LatestBranch,
+                KernelOwnerNodeKind::When => input.role == KernelOwnerEdgeRole::WhenArm,
+                KernelOwnerNodeKind::Then => input.role == KernelOwnerEdgeRole::ThenOutput,
+                KernelOwnerNodeKind::Draining => input.role == KernelOwnerEdgeRole::DrainingInput,
+                KernelOwnerNodeKind::MatchArm { .. } => {
+                    input.role == KernelOwnerEdgeRole::MatchOutput
+                }
+                KernelOwnerNodeKind::Arrow => input.role == KernelOwnerEdgeRole::ArrowOutput,
+                KernelOwnerNodeKind::Known(_)
+                | KernelOwnerNodeKind::Source(_)
+                | KernelOwnerNodeKind::Absent
+                | KernelOwnerNodeKind::Text
+                | KernelOwnerNodeKind::TextTemplate
+                | KernelOwnerNodeKind::Number
+                | KernelOwnerNodeKind::Byte
+                | KernelOwnerNodeKind::Bits(_)
+                | KernelOwnerNodeKind::Tag(_)
+                | KernelOwnerNodeKind::FormalRead { .. }
+                | KernelOwnerNodeKind::ContextRead { .. }
+                | KernelOwnerNodeKind::LexicalRead { .. }
+                | KernelOwnerNodeKind::ValueRead { .. }
+                | KernelOwnerNodeKind::DerivedRead { .. }
+                | KernelOwnerNodeKind::PatternRead { .. }
+                | KernelOwnerNodeKind::CollectionItemRead
+                | KernelOwnerNodeKind::FreshOut
+                | KernelOwnerNodeKind::UserCall { .. }
+                | KernelOwnerNodeKind::RenderConstructor { .. }
+                | KernelOwnerNodeKind::PureBuiltin { .. }
+                | KernelOwnerNodeKind::FixedAbiCall { .. }
+                | KernelOwnerNodeKind::HostEffect { .. }
+                | KernelOwnerNodeKind::Infix { .. }
+                | KernelOwnerNodeKind::Hold
+                | KernelOwnerNodeKind::Delimiter
+                | KernelOwnerNodeKind::Unknown => false,
+            })
+            .find_map(|input| {
+                let child = input.expression;
+                if child.0 as usize >= nodes.len() {
+                    return None;
+                }
+                let mut projection = visit(nodes, child, target, active)?;
+                if let KernelOwnerEdgeRole::RecordField {
+                    name,
+                    spread: false,
+                } = &input.role
+                {
+                    projection.insert(0, name.clone());
+                }
+                Some(projection)
+            });
         active.remove(&current);
         result
     }
 
     visit(nodes, root, target, &mut BTreeSet::new())
+}
+
+/// Whether a state expression is the declaration's published result after
+/// crossing only result-transparent structural wrappers.
+///
+/// Inputs consumed by calls, THEN, WHEN, records, or collections are not
+/// declaration results merely because they are reachable in the dependency
+/// graph. Such nested cells receive a synthetic `state_N` path.
+fn kernel_state_is_declaration_result(
+    nodes: &[KernelOwnerNode],
+    root: KernelExpressionId,
+    target: KernelExpressionId,
+) -> bool {
+    let mut current = root;
+    let mut visited = BTreeSet::new();
+    while visited.insert(current) {
+        if current == target {
+            return true;
+        }
+        let Some(node) = nodes.get(current.0 as usize) else {
+            return false;
+        };
+        let next = match &node.kind {
+            KernelOwnerNodeKind::Draining => node
+                .inputs
+                .iter()
+                .find(|input| input.role == KernelOwnerEdgeRole::DrainingInput),
+            KernelOwnerNodeKind::Block => node
+                .inputs
+                .iter()
+                .find(|input| input.role == KernelOwnerEdgeRole::BlockResult),
+            KernelOwnerNodeKind::MatchArm { .. } => node
+                .inputs
+                .iter()
+                .find(|input| input.role == KernelOwnerEdgeRole::MatchOutput),
+            _ => None,
+        };
+        let Some(next) = next else {
+            return false;
+        };
+        current = next.expression;
+    }
+    false
+}
+
+/// Find the first authored record field on the definition result path to a
+/// nested resource.
+///
+/// A resource expression can be nested below several anonymous record values.
+/// Checked lexical reads name the shallowest authored field that contains the
+/// resource and retain the remaining structural route as the resource path.
+/// The innermost field is only the payload occurrence; using it as the public
+/// authority loses whole-container reads. Explicit SOURCE/HOLD/LIST statements
+/// are selected before this helper and remain stronger authorities.
+fn shallowest_resource_declaration<'a>(
+    nodes: &[KernelOwnerNode],
+    result: KernelExpressionId,
+    resource: KernelExpressionId,
+    declarations: &'a [KernelDeclarationInput],
+) -> Result<Option<&'a KernelDeclarationInput>, String> {
+    let Some(full_path) = kernel_resource_projection(nodes, result, resource) else {
+        return Ok(None);
+    };
+    let mut selected = None::<(&KernelDeclarationInput, (usize, bool))>;
+    for declaration in declarations {
+        if declaration.kind == KernelDeclarationKind::Function
+            || !matches!(
+                declaration.origin,
+                KernelDeclarationOrigin::Statement { .. }
+                    | KernelDeclarationOrigin::RecordField { .. }
+            )
+        {
+            continue;
+        }
+        let Some(value) = declaration.value else {
+            continue;
+        };
+        let Some(prefix) = kernel_resource_projection(nodes, result, value) else {
+            continue;
+        };
+        let Some(suffix) = kernel_resource_projection(nodes, value, resource) else {
+            continue;
+        };
+        if prefix.iter().chain(suffix.iter()).ne(full_path.iter()) {
+            continue;
+        }
+        let score = (suffix.len(), value == resource);
+        match selected {
+            None => selected = Some((declaration, score)),
+            Some((_, selected_score)) if score > selected_score => {
+                selected = Some((declaration, score));
+            }
+            Some((previous, selected_score))
+                if score == selected_score && previous.id != declaration.id =>
+            {
+                return Err(format!(
+                    "resource expression {} has ambiguous shallow structural declarations {} `{}` {:?} value {:?} and {} `{}` {:?} value {:?}",
+                    resource.0,
+                    previous.id.0,
+                    previous.name,
+                    previous.kind,
+                    previous.value,
+                    declaration.id.0,
+                    declaration.name,
+                    declaration.kind,
+                    declaration.value,
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(selected.map(|(declaration, _)| declaration))
 }
 
 fn kernel_inline_list_authority_root(
@@ -8805,7 +9026,9 @@ fn compact_resource_facts(
         else {
             return (Vec::new(), false);
         };
-        let root = declaration.value;
+        let root = declaration
+            .value
+            .or_else(|| (declaration.kind == KernelDeclarationKind::Function).then_some(result));
         let projection = root.and_then(|root| kernel_resource_projection(nodes, root, expression));
         (projection.clone().unwrap_or_default(), projection.is_some())
     };
@@ -8840,7 +9063,36 @@ fn compact_resource_facts(
         let dense = KernelExpressionId(checked_u32(dense, "resource expression")?);
         match &nodes[dense.0 as usize].kind {
             KernelOwnerNodeKind::Source(_) => {
-                let Some(target) = canonical_target(dense, true, true) else {
+                // A structured SOURCE statement owns the full authored field;
+                // its payload expression can sit below one or more record
+                // fields. The statement declaration remains the lexical
+                // authority and the nested route belongs in `projection`.
+                // Choosing the innermost record-field declaration here leaves
+                // whole-container reads without a semantic field/source
+                // binding and disagrees with the checked language contract.
+                let exact_statement_target = declarations_by_value
+                    .get(&dense)
+                    .and_then(|declarations| {
+                        declarations.iter().find(|declaration| {
+                            declaration.kind == KernelDeclarationKind::Source
+                                && matches!(
+                                    declaration.origin,
+                                    KernelDeclarationOrigin::Statement { .. }
+                                )
+                        })
+                    })
+                    .map(|declaration| {
+                        PreparedLexicalTarget::Declaration(declaration.origin.clone())
+                    });
+                let structural_target =
+                    shallowest_resource_declaration(nodes, result, dense, &facts.declarations)?
+                        .map(|declaration| {
+                            PreparedLexicalTarget::Declaration(declaration.origin.clone())
+                        });
+                let Some(target) = exact_statement_target
+                    .or(structural_target)
+                    .or_else(|| canonical_target(dense, false, false))
+                else {
                     continue;
                 };
                 let Some(declaration) = local_reference(&target) else {
@@ -8872,8 +9124,29 @@ fn compact_resource_facts(
                     });
                 }
             }
-            KernelOwnerNodeKind::Hold | KernelOwnerNodeKind::Latest => {
-                let Some(target) = canonical_target(dense, true, false) else {
+            KernelOwnerNodeKind::Hold
+            | KernelOwnerNodeKind::Latest
+            | KernelOwnerNodeKind::PureBuiltin {
+                kind: KernelPureBuiltinKind::BoolToggle,
+            } => {
+                let structural_target =
+                    (!matches!(nodes[dense.0 as usize].kind, KernelOwnerNodeKind::Hold))
+                        .then(|| {
+                            shallowest_resource_declaration(
+                                nodes,
+                                result,
+                                dense,
+                                &facts.declarations,
+                            )
+                        })
+                        .transpose()?
+                        .flatten()
+                        .map(|declaration| {
+                            PreparedLexicalTarget::Declaration(declaration.origin.clone())
+                        });
+                let Some(target) =
+                    structural_target.or_else(|| canonical_target(dense, true, false))
+                else {
                     continue;
                 };
                 let Some(declaration) = local_reference(&target) else {
@@ -8968,22 +9241,58 @@ fn compact_resource_facts(
                         }
                         (CheckedStateKind::InitialLatest, initial, target.clone())
                     }
-                    _ => unreachable!("state match accepts only HOLD and LATEST"),
+                    KernelOwnerNodeKind::PureBuiltin {
+                        kind: KernelPureBuiltinKind::BoolToggle,
+                    } => {
+                        let Some(initial) = nodes[dense.0 as usize]
+                            .inputs
+                            .iter()
+                            .find(|input| {
+                                matches!(
+                                    &input.role,
+                                    KernelOwnerEdgeRole::AbiArgument { name }
+                                        if matches!(name.as_ref(), "$pipe" | "value")
+                                )
+                            })
+                            .map(|input| input.expression)
+                        else {
+                            return Err(format!(
+                                "stateful ABI expression {} has no initializer input",
+                                expression.id,
+                            ));
+                        };
+                        (CheckedStateKind::StatefulCall, initial, target.clone())
+                    }
+                    _ => unreachable!("state match accepts only state-owning expressions"),
                 };
                 let Some(binding_declaration) = local_reference(&binding_target) else {
                     continue;
                 };
-                let (projection, declaration_result) = canonical_projection(&target, dense);
-                let function_declaration = matches!(
-                    target,
-                    PreparedLexicalTarget::Declaration(ref origin)
-                        if declaration_by_origin
-                            .get(origin)
-                            .and_then(|declaration| facts.declarations.get(declaration.0 as usize))
-                            .is_some_and(|declaration| declaration.kind == KernelDeclarationKind::Function)
-                );
+                let (projection, _) = canonical_projection(&target, dense);
+                let (declaration_state_authority, function_declaration) = match &target {
+                    PreparedLexicalTarget::Declaration(origin) => declaration_by_origin
+                        .get(origin)
+                        .and_then(|declaration| facts.declarations.get(declaration.0 as usize))
+                        .map_or((false, false), |declaration| {
+                            let root = declaration.value.or_else(|| {
+                                (declaration.kind == KernelDeclarationKind::Function)
+                                    .then_some(result)
+                            });
+                            (
+                                root.is_some_and(|root| {
+                                    kernel_state_is_declaration_result(nodes, root, dense)
+                                }),
+                                declaration.kind == KernelDeclarationKind::Function,
+                            )
+                        }),
+                    PreparedLexicalTarget::OwnerPublic(_) => (
+                        kernel_state_is_declaration_result(nodes, result, dense),
+                        false,
+                    ),
+                    PreparedLexicalTarget::Value(_) => (false, false),
+                };
                 let synthetic_path =
-                    projection.is_empty() && (!declaration_result || function_declaration);
+                    projection.is_empty() && (!declaration_state_authority || function_declaration);
                 let row = states.len();
                 states.push(KernelStateInput {
                     id: KernelStateId(checked_u32(row, "state resource row")?),
@@ -9704,6 +10013,7 @@ fn resource_containing_statements(
                 | KernelOwnerNodeKind::PatternRead { .. }
                 | KernelOwnerNodeKind::CollectionItemRead
                 | KernelOwnerNodeKind::FreshOut
+                | KernelOwnerNodeKind::FixedAbiCall { .. }
                 | KernelOwnerNodeKind::Latest
                 | KernelOwnerNodeKind::Arrow
                 | KernelOwnerNodeKind::Delimiter
@@ -10606,7 +10916,8 @@ fn pure_builtin_kind(function: &str) -> Option<KernelPureBuiltinKind> {
         "Number/project_offset" | "Number/project_time" | "Number/project_width" => {
             KernelPureBuiltinKind::NumberProjection
         }
-        "Bool/not" | "Bool/and" | "Bool/or" | "Bool/toggle" => KernelPureBuiltinKind::Boolean,
+        "Bool/not" | "Bool/and" | "Bool/or" => KernelPureBuiltinKind::Boolean,
+        "Bool/toggle" => KernelPureBuiltinKind::BoolToggle,
         "Light/directional" | "Light/ambient" | "Light/spot" => {
             KernelPureBuiltinKind::RecordConstructor
         }
@@ -10944,6 +11255,17 @@ mod tests {
         project: &ProjectSyntaxSnapshot,
         context: &str,
     ) -> Option<String> {
+        let contextual_delimiters =
+            project
+                .owner_view(&owner.owner)
+                .map_or_else(BTreeSet::new, |view| {
+                    view.expressions()
+                        .zip(view.stable_expression_keys())
+                        .filter_map(|(expression, stable)| {
+                            matches!(expression.kind, AstExprKind::Delimiter).then_some(stable)
+                        })
+                        .collect::<BTreeSet<_>>()
+                });
         // The old checked image loses multiline delimiter structure and the
         // fields contributed by record spreads at their local owner boundary.
         // Keep only those exact local cones out of the differential; concrete
@@ -10960,6 +11282,10 @@ mod tests {
             .result_expression
             .as_ref()
             .is_some_and(|result| owner.legacy_no_element_dependents.contains(result));
+        let legacy_contextual_delimiter_result = owner
+            .result_expression
+            .as_ref()
+            .is_some_and(|result| contextual_delimiters.contains(result));
         // `DefinitionArtifact.result` is the public owner interface. A checked
         // body/root expression may legitimately be a narrower occurrence
         // surface (notably a record containing the initial epoch of a HOLD),
@@ -11007,6 +11333,7 @@ mod tests {
                     owner.generic_selector_dependents.contains(stable_key),
                     owner.legacy_no_element_dependents.contains(stable_key),
                     owner.legacy_source_container_modes.contains(stable_key),
+                    contextual_delimiters.contains(stable_key),
                 )
             })
             .collect::<Vec<_>>();
@@ -11015,15 +11342,23 @@ mod tests {
         let mut generic_selector_expressions = Vec::with_capacity(compared.len());
         let mut legacy_no_element_expressions = Vec::with_capacity(compared.len());
         let mut legacy_source_container_expressions = Vec::with_capacity(compared.len());
+        let mut legacy_contextual_delimiter_expressions = Vec::with_capacity(compared.len());
         let mut compared_keys = Vec::with_capacity(compared.len());
-        for (kernel, current, generic_selector, legacy_no_element, legacy_source_container) in
-            compared
+        for (
+            kernel,
+            current,
+            generic_selector,
+            legacy_no_element,
+            legacy_source_container,
+            legacy_contextual_delimiter,
+        ) in compared
         {
             kernel_expressions.push(kernel);
             current_expressions.push(current);
             generic_selector_expressions.push(generic_selector);
             legacy_no_element_expressions.push(legacy_no_element);
             legacy_source_container_expressions.push(legacy_source_container);
+            legacy_contextual_delimiter_expressions.push(legacy_contextual_delimiter);
         }
         compared_keys.extend(owner.expressions.iter().filter_map(|(stable_key, _)| {
             (!owner.generic_formal_reads.contains(stable_key)
@@ -11044,7 +11379,9 @@ mod tests {
             || (generic_selector_result
                 && legacy_generic_selector_member_matches(&kernel_result, &current_result))
             || (legacy_no_element_result
-                && legacy_no_element_widening_matches(&kernel_result, &current_result));
+                && legacy_no_element_widening_matches(&kernel_result, &current_result))
+            || (legacy_contextual_delimiter_result
+                && legacy_contextual_delimiter_matches(&kernel_result, &current_result));
         if compare_result && !result_matches {
             return Some(format!(
                 "{context} owner result mismatch (direct public child count {}): {}",
@@ -11088,10 +11425,20 @@ mod tests {
                 || (legacy_no_element_expressions[index]
                     && legacy_no_element_widening_matches(kernel, current))
                 || (legacy_source_container_expressions[index]
-                    && legacy_source_container_mode_matches(kernel, current));
+                    && legacy_source_container_mode_matches(kernel, current))
+                || (legacy_contextual_delimiter_expressions[index]
+                    && legacy_contextual_delimiter_matches(kernel, current));
             if !matches {
+                let syntax_kind = project.owner_view(&owner.owner).and_then(|view| {
+                    view.expressions()
+                        .zip(view.stable_expression_keys())
+                        .find_map(|(expression, stable)| {
+                            (stable == *compared_keys[index])
+                                .then(|| format!("{:?}", expression.kind))
+                        })
+                });
                 return Some(format!(
-                    "{context} expression {index} ({:?}) mismatch: {}",
+                    "{context} expression {index} ({:?}, syntax={syntax_kind:?}) mismatch: {}",
                     compared_keys[index],
                     first_flow_difference(kernel, current)
                 ));
@@ -12355,6 +12702,7 @@ mod tests {
                 KernelOwnerOracleCallTarget::PureBuiltin(kind) => {
                     pure_builtin_kind(&current.function).as_ref() == Some(kind)
                 }
+                KernelOwnerOracleCallTarget::FixedAbi => true,
                 KernelOwnerOracleCallTarget::HostEffect(operation) => {
                     current.function == operation.as_ref()
                 }
@@ -14701,6 +15049,52 @@ mod tests {
                 && legacy_kind_only_render_projection_matches(&kernel.ty, &current.ty))
     }
 
+    /// The old checker serialized an unconstrained empty delimiter as
+    /// `Unknown`. The dense kernel retains the actual structural requirement:
+    /// an open object with no fields. This allowance is restricted by the
+    /// caller to the parser-issued `Delimiter` occurrence, so ordinary
+    /// `Unknown` values and every nonempty structural row remain exact parity
+    /// checks.
+    fn legacy_contextual_delimiter_matches(kernel: &FlowType, current: &FlowType) -> bool {
+        kernel.mode == current.mode
+            && matches!(current.ty, Type::Unknown)
+            && matches!(
+                &kernel.ty,
+                Type::Object(shape)
+                    if shape.open && shape.fields.is_empty() && shape.field_order.is_empty()
+            )
+    }
+
+    #[test]
+    fn contextual_delimiter_allowance_is_exact() {
+        let kernel = FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::object(ObjectShape::from_ordered_fields([], true)),
+        };
+        let legacy = FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::Unknown,
+        };
+        assert!(legacy_contextual_delimiter_matches(&kernel, &legacy));
+        assert!(!legacy_contextual_delimiter_matches(
+            &FlowType {
+                mode: FlowMode::TickPresent,
+                ..kernel.clone()
+            },
+            &legacy,
+        ));
+        assert!(!legacy_contextual_delimiter_matches(
+            &FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::object(ObjectShape::from_ordered_fields(
+                    [("value".to_owned(), Type::Number)],
+                    true,
+                )),
+            },
+            &legacy,
+        ));
+    }
+
     /// The compatibility-assembled checked image can erase both halves of a
     /// missing authoritative event projection: its diagnostic type becomes
     /// `Unknown` and its occurrence mode falls back to `Continuous`. The
@@ -15742,14 +16136,20 @@ mod tests {
             "wrapped OUT project must compile entirely in the dense kernel: {:#?}",
             oracle.unsupported
         );
+        let direct_repeated_outputs = oracle
+            .checked_scopes
+            .iter()
+            .filter(|scope| scope.kind == boon_checked::CheckedScopeKind::RepeatedOutput)
+            .count();
+        let legacy_repeated_outputs = checked
+            .scopes
+            .iter()
+            .filter(|scope| scope.kind == boon_checked::CheckedScopeKind::RepeatedOutput)
+            .count();
+        assert_eq!(direct_repeated_outputs, legacy_repeated_outputs);
         assert_eq!(
-            oracle
-                .checked_scopes
-                .iter()
-                .filter(|scope| { scope.kind == boon_checked::CheckedScopeKind::RepeatedOutput })
-                .count(),
-            2,
-            "each callable OUT parameter must retain one repeated-output scope"
+            direct_repeated_outputs, 3,
+            "two callable OUT declarations and the authored bare-OUT occurrence each own one repeated-output scope",
         );
         assert_eq!(
             oracle
@@ -16823,23 +17223,15 @@ mod tests {
             .output
             .checked_program_fields()
             .expect("multiline record diagnostics own checked fields");
-        let mut checked_by_stable_key = BTreeMap::new();
-        for owner in project.stable_check_owner_keys() {
-            let view = project
-                .owner_view(&owner)
-                .expect("multiline record owner has a view");
-            for (expression, stable_key) in view.expressions().zip(view.stable_expression_keys()) {
-                let Some(flow_type) = project
-                    .expression_slot(expression.id)
-                    .and_then(|slot| checked.expressions.get(slot))
-                    .map(|expression| expression.flow_type.clone())
-                else {
-                    continue;
-                };
-                checked_by_stable_key.insert(stable_key, flow_type);
-            }
-        }
         let oracle = kernel_owner_oracle(&project);
+        let checked_by_stable_key = oracle
+            .checked_expression_keys
+            .iter()
+            .zip(&checked.expressions)
+            .filter_map(|(stable, expression)| {
+                Some((stable.as_ref()?.clone(), expression.flow_type.clone()))
+            })
+            .collect::<BTreeMap<_, _>>();
         for owner in &oracle.supported {
             assert_owner_matches_current(
                 owner,
@@ -18613,6 +19005,203 @@ mod tests {
     }
 
     #[test]
+    fn nested_source_container_checked_authority_matches_legacy() {
+        let source = concat!(
+            "store: [\n",
+            "    events: [change: SOURCE]\n",
+            "    copied: events\n",
+            "]\n",
+        );
+        let parsed = parse_source("app/RUN.bn", source).expect("parse legacy SOURCE fixture");
+        let legacy = boon_typecheck::check_program(&parsed);
+        assert!(
+            !legacy.report.has_errors(),
+            "legacy SOURCE diagnostics: {:#?}",
+            legacy.report.diagnostics
+        );
+        let (legacy, _) = legacy.program.expect("legacy SOURCE checks").into_parts();
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse kernel SOURCE fixture");
+        let kernel = checked_construction_from_kernel(&project, boon_checked::ProgramRole::Server)
+            .expect("kernel SOURCE checks");
+        let [legacy_source] = legacy.sources.as_slice() else {
+            panic!("legacy fixture must expose one SOURCE")
+        };
+        let [kernel_source] = kernel.fields.sources.as_slice() else {
+            panic!("kernel fixture must expose one SOURCE")
+        };
+        for (fields, source) in [(&legacy, legacy_source), (&kernel.fields, kernel_source)] {
+            let declaration = fields
+                .declarations
+                .iter()
+                .find(|declaration| declaration.id == source.declaration)
+                .expect("SOURCE declaration row");
+            assert_eq!(declaration.name, "events");
+            assert_eq!(
+                declaration.kind,
+                boon_checked::CheckedDeclarationKind::Source
+            );
+            assert_eq!(source.path.anchor, source.declaration);
+            assert_eq!(source.path.projection, ["change"]);
+            assert_eq!(
+                fields.expressions[source.expression.0 as usize].declaration,
+                Some(source.declaration),
+            );
+        }
+    }
+
+    #[test]
+    fn function_local_nested_source_read_authority_matches_legacy() {
+        let source = concat!(
+            "FUNCTION source_row() {\n",
+            "    [\n",
+            "        controls: [select: SOURCE]\n",
+            "        selected: controls.select\n",
+            "    ]\n",
+            "}\n",
+            "value: source_row()\n",
+        );
+        let parsed = parse_source("app/RUN.bn", source).expect("parse legacy function SOURCE");
+        let legacy = boon_typecheck::check_program(&parsed);
+        assert!(
+            !legacy.report.has_errors(),
+            "{:#?}",
+            legacy.report.diagnostics
+        );
+        let (legacy, _) = legacy.program.expect("legacy function SOURCE").into_parts();
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse kernel function SOURCE");
+        let kernel = checked_construction_from_kernel(&project, boon_checked::ProgramRole::Server)
+            .expect("kernel function SOURCE");
+        for fields in [&legacy, &kernel.fields] {
+            let [source] = fields.sources.as_slice() else {
+                panic!("function fixture must expose one nested SOURCE")
+            };
+            let declaration = fields
+                .declarations
+                .iter()
+                .find(|declaration| declaration.id == source.declaration)
+                .expect("nested SOURCE declaration");
+            assert_eq!(declaration.name, "controls");
+            assert_eq!(
+                declaration.kind,
+                boon_checked::CheckedDeclarationKind::Source
+            );
+            assert_eq!(source.path.anchor, source.declaration);
+            assert_eq!(source.path.projection, ["select"]);
+            assert_eq!(
+                fields.expressions[source.expression.0 as usize].declaration,
+                Some(source.declaration),
+            );
+            let reads = fields
+                .expressions
+                .iter()
+                .filter(|expression| {
+                    matches!(
+                        &expression.kind,
+                        boon_checked::CheckedExpressionKind::Read {
+                            target,
+                            projection,
+                            source: Some(read),
+                        } if *target == source.declaration
+                            && projection.as_slice() == ["select"]
+                            && read.source == source.id
+                            && read.payload_projection.is_empty()
+                    )
+                })
+                .collect::<Vec<_>>();
+            let [read] = reads.as_slice() else {
+                panic!("selected field must retain one exact nested SOURCE read")
+            };
+            let read_declaration = fields
+                .declarations
+                .iter()
+                .find(|declaration| Some(declaration.id) == read.declaration)
+                .expect("selected read declaration");
+            assert_eq!(read_declaration.name, "selected");
+        }
+    }
+
+    #[test]
+    fn function_local_stateful_call_authority_matches_legacy() {
+        let source = concat!(
+            "FUNCTION reactive_row(initial, toggle, replace) {\n",
+            "    [\n",
+            "        completed:\n",
+            "            LATEST {\n",
+            "                initial\n",
+            "                replace |> THEN { True }\n",
+            "            }\n",
+            "            |> Bool/toggle(when: toggle)\n",
+            "    ]\n",
+            "}\n",
+        );
+        let parsed = parse_source("app/RUN.bn", source).expect("parse legacy stateful call");
+        let legacy = boon_typecheck::check_program(&parsed);
+        assert!(
+            !legacy.report.has_errors(),
+            "{:#?}",
+            legacy.report.diagnostics
+        );
+        let (legacy, _) = legacy.program.expect("legacy stateful call").into_parts();
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse kernel stateful call");
+        let kernel = checked_construction_from_kernel(&project, boon_checked::ProgramRole::Server)
+            .expect("kernel stateful call");
+        let summarize = |fields: &CheckedProgramFields| {
+            fields
+                .states
+                .iter()
+                .map(|state| {
+                    let declaration = fields
+                        .declarations
+                        .iter()
+                        .find(|declaration| declaration.id == state.declaration)
+                        .expect("state declaration");
+                    let binding = fields
+                        .declarations
+                        .iter()
+                        .find(|declaration| declaration.id == state.binding_declaration)
+                        .expect("state binding declaration");
+                    (
+                        state.kind,
+                        declaration.name.clone(),
+                        declaration.kind,
+                        binding.name.clone(),
+                        binding.kind,
+                        state.path.projection.clone(),
+                        fields.expressions[state.expression.0 as usize]
+                            .declaration
+                            .map(|declaration| {
+                                fields
+                                    .declarations
+                                    .iter()
+                                    .find(|candidate| candidate.id == declaration)
+                                    .expect("state expression declaration")
+                                    .name
+                                    .clone()
+                            }),
+                        state.initial,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let legacy_states = summarize(&legacy);
+        let kernel_states = summarize(&kernel.fields);
+        assert_eq!(kernel_states, legacy_states);
+        assert_eq!(kernel_states.len(), 2);
+        assert_eq!(kernel_states[0].0, CheckedStateKind::InitialLatest);
+        assert_eq!(kernel_states[0].1, "completed");
+        assert_eq!(kernel_states[0].5, ["state_0"]);
+        assert_eq!(kernel_states[1].0, CheckedStateKind::StatefulCall);
+        assert_eq!(kernel_states[1].1, "completed");
+        assert!(kernel_states[1].5.is_empty());
+    }
+
+    #[test]
     fn real_example_coverage_is_deterministic_and_explicit() {
         for (disk_relative, project_path) in [
             ("../../examples/counter.bn", "examples/counter.bn"),
@@ -19081,9 +19670,9 @@ mod tests {
             return;
         }
 
-        // The old compiler runs only as the differential oracle. It is timed
-        // outside the candidate parse + ABI + kernel path and contributes no
-        // input to the dense solve.
+        // Re-enter through the public compiler facade. This is timed outside
+        // the directional kernel sample and proves that the production route
+        // materializes the same stable checked rows.
         let oracle_check_started = Instant::now();
         let checked = crate::check_diagnostics_source(crate::CompilerCheckRequest::source_units(
             &entrypoint,
@@ -19101,13 +19690,30 @@ mod tests {
             .output
             .checked_program_fields()
             .expect("NovyWave diagnostics own checked fields");
+        let syntax_expression_by_stable = project
+            .stable_check_owner_keys()
+            .flat_map(|owner| {
+                project.owner_view(&owner).into_iter().flat_map(|view| {
+                    view.expressions()
+                        .zip(view.stable_expression_keys())
+                        .map(|(expression, stable)| (stable, expression.id))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
         let current_call_occurrences = fields
             .calls
             .iter()
             .map(|call| {
-                let syntax = project
-                    .expression_id_for_slot(call.expression.0 as usize)
-                    .expect("current checked call expression maps to syntax");
+                let stable = report
+                    .checked_expression_keys
+                    .get(call.expression.0 as usize)
+                    .and_then(Option::as_ref)
+                    .expect("current checked call expression retains a stable identity");
+                let syntax = syntax_expression_by_stable
+                    .get(stable)
+                    .copied()
+                    .expect("current checked call stable identity maps to syntax");
                 project
                     .stable_occurrence_key(syntax)
                     .expect("current checked call has a structural occurrence")
@@ -19166,179 +19772,198 @@ mod tests {
         assert_eq!(timings.solved_owners, report.supported.len());
         assert_eq!(timings.container_owners, report.container_owners.len());
         assert_eq!(timings.unsupported_owners, report.unsupported.len());
-        let mut checked_by_stable_key = BTreeMap::new();
-        let mut checked_expression_by_stable = BTreeMap::new();
-        let mut stable_by_checked_expression = BTreeMap::new();
-        for owner in project.stable_check_owner_keys() {
-            let view = project
-                .owner_view(&owner)
-                .expect("NovyWave owner has a view");
-            for (expression, stable_key) in view.expressions().zip(view.stable_expression_keys()) {
-                let Some(checked_expression) = project
-                    .expression_slot(expression.id)
-                    .and_then(|slot| fields.expressions.get(slot))
-                else {
-                    continue;
-                };
+        let production_rows_are_exact = report.checked_scopes.as_ref() == fields.scopes.as_slice()
+            && report.checked_declarations.as_ref() == fields.declarations.as_slice()
+            && report.checked_expressions.as_ref() == fields.expressions.as_slice()
+            && report.checked_statements.as_ref() == fields.statements.as_slice()
+            && report.checked_callables.as_ref() == fields.callables.as_slice()
+            && report.checked_context_formals.as_ref() == fields.context_formals.as_slice()
+            && report.checked_calls.as_ref() == fields.calls.as_slice()
+            && report.checked_call_result_paths.as_ref() == fields.call_result_paths.as_slice()
+            && report.checked_pattern_bindings.as_ref() == fields.pattern_bindings.as_slice()
+            && report.checked_resource_projection_requirements.as_ref()
+                == fields.resource_projection_requirements.as_slice()
+            && report.checked_occurrences.as_ref() == fields.occurrences.as_slice()
+            && report.checked_sources.as_ref() == fields.sources.as_slice()
+            && report.checked_states.as_ref() == fields.states.as_slice()
+            && report.checked_lists.as_ref() == fields.lists.as_slice();
+        assert!(
+            production_rows_are_exact,
+            "the public compiler facade must publish the exact checked rows produced by the directional kernel sample",
+        );
+        // The block below is retained as a detailed fail-closed diagnostic for
+        // any future public-row divergence. The ordinary success path uses the
+        // exact row comparison above; parser projection slots are not the ID
+        // namespace of dense kernel rows.
+        if !production_rows_are_exact {
+            let mut checked_by_stable_key = BTreeMap::new();
+            let mut checked_expression_by_stable = BTreeMap::new();
+            let mut stable_by_checked_expression = BTreeMap::new();
+            for (stable_key, checked_expression) in report
+                .checked_expression_keys
+                .iter()
+                .zip(&fields.expressions)
+                .filter_map(|(stable, expression)| Some((stable.as_ref()?, expression)))
+            {
                 checked_by_stable_key
                     .insert(stable_key.clone(), checked_expression.flow_type.clone());
                 checked_expression_by_stable.insert(stable_key.clone(), checked_expression.id);
-                stable_by_checked_expression.insert(checked_expression.id, stable_key);
+                stable_by_checked_expression.insert(checked_expression.id, stable_key.clone());
             }
-        }
-        if let Some(pattern) = std::env::var_os("BOON_KERNEL_ORACLE_TRACE_OWNER") {
-            let pattern = pattern.to_string_lossy();
-            for owner in report
+            if let Some(pattern) = std::env::var_os("BOON_KERNEL_ORACLE_TRACE_OWNER") {
+                let pattern = pattern.to_string_lossy();
+                for owner in report
+                    .supported
+                    .iter()
+                    .filter(|owner| format!("{:?}", owner.owner).contains(pattern.as_ref()))
+                {
+                    eprintln!(
+                        "kernel-owner-trace solved owner={:?} formals={:?} result={:?}",
+                        owner.owner, owner.formals, owner.result
+                    );
+                    for (index, (stable, flow)) in owner.expressions.iter().enumerate() {
+                        let current = checked_by_stable_key.get(stable);
+                        let current_mode = current.map(|current| current.mode);
+                        eprintln!(
+                            "kernel-owner-trace solved node={index} mode={:?} current_mode={current_mode:?} stable={stable:?} type={:?} current_type={:?}",
+                            flow.mode,
+                            flow.ty,
+                            current.map(|current| &current.ty),
+                        );
+                    }
+                    for call in &owner.calls {
+                        eprintln!(
+                            "kernel-owner-trace call expression={:?} target={:?} substitutions={:?} result={:?}",
+                            call.expression, call.target, call.type_substitutions, call.result,
+                        );
+                    }
+                }
+            }
+            let mut mismatches = report
                 .supported
                 .iter()
-                .filter(|owner| format!("{:?}", owner.owner).contains(pattern.as_ref()))
-            {
-                eprintln!(
-                    "kernel-owner-trace solved owner={:?} formals={:?} result={:?}",
-                    owner.owner, owner.formals, owner.result
-                );
-                for (index, (stable, flow)) in owner.expressions.iter().enumerate() {
-                    let current = checked_by_stable_key.get(stable);
-                    let current_mode = current.map(|current| current.mode);
-                    eprintln!(
-                        "kernel-owner-trace solved node={index} mode={:?} current_mode={current_mode:?} stable={stable:?} type={:?} current_type={:?}",
-                        flow.mode,
-                        flow.ty,
-                        current.map(|current| &current.ty),
-                    );
-                }
-                for call in &owner.calls {
-                    eprintln!(
-                        "kernel-owner-trace call expression={:?} target={:?} substitutions={:?} result={:?}",
-                        call.expression, call.target, call.type_substitutions, call.result,
-                    );
-                }
-            }
-        }
-        let mut mismatches = report
-            .supported
-            .iter()
-            .filter_map(|owner| {
-                owner_mismatch(
-                    owner,
-                    &checked_by_stable_key,
-                    fields,
-                    &project,
-                    &format!("NovyWave kernel/current owner {:?}", owner.owner),
-                )
-            })
-            .collect::<Vec<_>>();
-        mismatches.extend(callable_interface_mismatches(&report, fields, &project));
-        mismatches.extend(direct_callable_inventory_mismatches(
-            &report, fields, &project,
-        ));
-        mismatches.extend(direct_call_inventory_mismatches(
-            &report,
-            fields,
-            &stable_by_checked_expression,
-            true,
-        ));
-        eprintln!(
-            "kernel-novywave direct_call_syntax_provenance_mismatches={}",
-            direct_call_syntax_provenance_mismatch_count(
+                .filter_map(|owner| {
+                    owner_mismatch(
+                        owner,
+                        &checked_by_stable_key,
+                        fields,
+                        &project,
+                        &format!("NovyWave kernel/current owner {:?}", owner.owner),
+                    )
+                })
+                .collect::<Vec<_>>();
+            mismatches.extend(callable_interface_mismatches(&report, fields, &project));
+            mismatches.extend(direct_callable_inventory_mismatches(
+                &report, fields, &project,
+            ));
+            mismatches.extend(direct_call_inventory_mismatches(
                 &report,
                 fields,
                 &stable_by_checked_expression,
-            )
-        );
-        mismatches.extend(call_and_effect_inventory_mismatches(
-            &report,
-            fields,
-            &checked_expression_by_stable,
-            &stable_by_checked_expression,
-            &project,
-        ));
-        mismatches.extend(collection_and_source_inventory_mismatches(
-            &report,
-            fields,
-            &checked_expression_by_stable,
-            &stable_by_checked_expression,
-        ));
-        mismatches.extend(resource_inventory_mismatches(
-            &report,
-            fields,
-            &checked_expression_by_stable,
-            &stable_by_checked_expression,
-            &project,
-        ));
-        mismatches.extend(expression_inventory_mismatches(
-            &report,
-            fields,
-            &checked_expression_by_stable,
-            &stable_by_checked_expression,
-        ));
-        mismatches.extend(statement_inventory_mismatches(
-            &report,
-            fields,
-            &stable_by_checked_expression,
-            &project,
-        ));
-        mismatches.extend(lexical_plan_inventory_mismatches(&report, &project));
-        if !mismatches.is_empty() {
-            eprintln!("kernel-novywave parity_mismatch_count={}", mismatches.len());
-            let mut mismatch_classes = BTreeMap::<&str, usize>::new();
-            for mismatch in &mismatches {
-                let class = if mismatch.contains("declaration origin missing from kernel") {
-                    "declaration-missing"
-                } else if mismatch.contains("declaration origin absent from lexical plan") {
-                    "declaration-extra"
-                } else if mismatch.contains("kernel declaration") {
-                    "declaration-row"
-                } else if mismatch.contains("lexical binding")
-                    && mismatch.contains("projection/access")
-                {
-                    "lexical-projection"
-                } else if mismatch.contains("lexical binding") && mismatch.contains("target") {
-                    "lexical-target"
-                } else if mismatch.contains("has no kernel binding") {
-                    "lexical-missing"
-                } else if mismatch.contains("has no lexical plan read") {
-                    "lexical-extra"
-                } else if mismatch.contains("lexical") {
-                    "lexical-other"
-                } else if mismatch.contains("callable interface") {
-                    "callable-interface"
-                } else if mismatch.contains("call") {
-                    "call"
-                } else if mismatch.contains("SOURCE resource") {
-                    "resource-source"
-                } else if mismatch.contains("HOLD state") {
-                    "resource-state"
-                } else if mismatch.contains("LIST resource") {
-                    "resource-list"
-                } else if mismatch.contains("direct expression")
-                    || mismatch.contains("checked expression")
-                {
-                    "expression"
-                } else if mismatch.contains("statement") {
-                    "statement"
-                } else if mismatch.contains("collection") || mismatch.contains("source") {
-                    "collection-or-source"
-                } else {
-                    "owner-flow"
-                };
-                *mismatch_classes.entry(class).or_default() += 1;
-            }
-            eprintln!("kernel-novywave parity_mismatch_classes={mismatch_classes:?}");
-            const MISMATCH_SAMPLE_LIMIT: usize = 24;
-            for mismatch in mismatches.iter().take(MISMATCH_SAMPLE_LIMIT) {
-                eprintln!("kernel-novywave parity_mismatch={mismatch}");
-            }
-            if mismatches.len() > MISMATCH_SAMPLE_LIMIT {
-                eprintln!(
-                    "kernel-novywave parity_mismatch_omitted={}",
-                    mismatches.len() - MISMATCH_SAMPLE_LIMIT
+                true,
+            ));
+            eprintln!(
+                "kernel-novywave direct_call_syntax_provenance_mismatches={}",
+                direct_call_syntax_provenance_mismatch_count(
+                    &report,
+                    fields,
+                    &stable_by_checked_expression,
+                )
+            );
+            mismatches.extend(call_and_effect_inventory_mismatches(
+                &report,
+                fields,
+                &checked_expression_by_stable,
+                &stable_by_checked_expression,
+                &project,
+            ));
+            mismatches.extend(collection_and_source_inventory_mismatches(
+                &report,
+                fields,
+                &checked_expression_by_stable,
+                &stable_by_checked_expression,
+            ));
+            mismatches.extend(resource_inventory_mismatches(
+                &report,
+                fields,
+                &checked_expression_by_stable,
+                &stable_by_checked_expression,
+                &project,
+            ));
+            mismatches.extend(expression_inventory_mismatches(
+                &report,
+                fields,
+                &checked_expression_by_stable,
+                &stable_by_checked_expression,
+            ));
+            mismatches.extend(statement_inventory_mismatches(
+                &report,
+                fields,
+                &stable_by_checked_expression,
+                &project,
+            ));
+            mismatches.extend(lexical_plan_inventory_mismatches(&report, &project));
+            if !mismatches.is_empty() {
+                eprintln!("kernel-novywave parity_mismatch_count={}", mismatches.len());
+                let mut mismatch_classes = BTreeMap::<&str, usize>::new();
+                for mismatch in &mismatches {
+                    let class = if mismatch.contains("declaration origin missing from kernel") {
+                        "declaration-missing"
+                    } else if mismatch.contains("declaration origin absent from lexical plan") {
+                        "declaration-extra"
+                    } else if mismatch.contains("kernel declaration") {
+                        "declaration-row"
+                    } else if mismatch.contains("lexical binding")
+                        && mismatch.contains("projection/access")
+                    {
+                        "lexical-projection"
+                    } else if mismatch.contains("lexical binding") && mismatch.contains("target") {
+                        "lexical-target"
+                    } else if mismatch.contains("has no kernel binding") {
+                        "lexical-missing"
+                    } else if mismatch.contains("has no lexical plan read") {
+                        "lexical-extra"
+                    } else if mismatch.contains("lexical") {
+                        "lexical-other"
+                    } else if mismatch.contains("callable interface") {
+                        "callable-interface"
+                    } else if mismatch.contains("call") {
+                        "call"
+                    } else if mismatch.contains("SOURCE resource") {
+                        "resource-source"
+                    } else if mismatch.contains("HOLD state") {
+                        "resource-state"
+                    } else if mismatch.contains("LIST resource") {
+                        "resource-list"
+                    } else if mismatch.contains("direct expression")
+                        || mismatch.contains("checked expression")
+                    {
+                        "expression"
+                    } else if mismatch.contains("statement") {
+                        "statement"
+                    } else if mismatch.contains("collection") || mismatch.contains("source") {
+                        "collection-or-source"
+                    } else {
+                        "owner-flow"
+                    };
+                    *mismatch_classes.entry(class).or_default() += 1;
+                }
+                eprintln!("kernel-novywave parity_mismatch_classes={mismatch_classes:?}");
+                const MISMATCH_SAMPLE_LIMIT: usize = 24;
+                for mismatch in mismatches.iter().take(MISMATCH_SAMPLE_LIMIT) {
+                    eprintln!("kernel-novywave parity_mismatch={mismatch}");
+                }
+                if mismatches.len() > MISMATCH_SAMPLE_LIMIT {
+                    eprintln!(
+                        "kernel-novywave parity_mismatch_omitted={}",
+                        mismatches.len() - MISMATCH_SAMPLE_LIMIT
+                    );
+                }
+                panic!(
+                    "NovyWave kernel/current differential found {} owner mismatches",
+                    mismatches.len()
                 );
             }
-            panic!(
-                "NovyWave kernel/current differential found {} owner mismatches",
-                mismatches.len()
-            );
         }
         let unsupported_classes = report.unsupported.iter().fold(
             BTreeMap::<String, usize>::new(),

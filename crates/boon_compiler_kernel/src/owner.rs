@@ -88,6 +88,10 @@ pub enum KernelPureBuiltinKind {
     NumberRound,
     NumberProjection,
     Boolean,
+    /// The stateful boolean toggle builtin shares the boolean type equation
+    /// but owns a read/write state effect. Keeping it distinct prevents the
+    /// type-oriented builtin family from erasing execution semantics.
+    BoolToggle,
     /// A pure record constructor whose result fields are its named inputs.
     /// This covers ABI constructors such as the Light family without baking
     /// library-specific record layouts into the type engine.
@@ -187,6 +191,12 @@ pub enum KernelOwnerNodeKind {
     },
     PureBuiltin {
         kind: KernelPureBuiltinKind,
+    },
+    /// A zero-input ABI call whose immutable contract publishes one closed
+    /// result type. The authored function name and executable meaning stay in
+    /// the ABI/call-syntax tables; the hot solver needs only this fixed term.
+    FixedAbiCall {
+        result: Type,
     },
     /// A host call whose type and execution policies come from the stable
     /// lower-level effect-schema registry. The operation name is the ABI key;
@@ -1100,6 +1110,7 @@ pub enum KernelCallTarget {
     PureBuiltin {
         kind: KernelPureBuiltinKind,
     },
+    FixedAbi,
     HostEffect {
         operation: Box<str>,
     },
@@ -2663,7 +2674,11 @@ fn local_expression_effect(kind: &KernelOwnerNodeKind) -> KernelEffectSummary {
             emits_source: true,
             ..KernelEffectSummary::default()
         },
-        KernelOwnerNodeKind::Hold | KernelOwnerNodeKind::Latest => KernelEffectSummary {
+        KernelOwnerNodeKind::Hold
+        | KernelOwnerNodeKind::Latest
+        | KernelOwnerNodeKind::PureBuiltin {
+            kind: KernelPureBuiltinKind::BoolToggle,
+        } => KernelEffectSummary {
             reads_state: true,
             writes_state: true,
             ..KernelEffectSummary::default()
@@ -3434,6 +3449,7 @@ fn validate_definition_linker_facts(
                 KernelOwnerNodeKind::UserCall { .. }
                     | KernelOwnerNodeKind::RenderConstructor { .. }
                     | KernelOwnerNodeKind::PureBuiltin { .. }
+                    | KernelOwnerNodeKind::FixedAbiCall { .. }
                     | KernelOwnerNodeKind::HostEffect { .. }
             )
         })
@@ -3481,6 +3497,7 @@ fn validate_definition_linker_facts(
                 KernelOwnerNodeKind::UserCall { .. }
                     | KernelOwnerNodeKind::RenderConstructor { .. }
                     | KernelOwnerNodeKind::PureBuiltin { .. }
+                    | KernelOwnerNodeKind::FixedAbiCall { .. }
                     | KernelOwnerNodeKind::HostEffect { .. }
             )
         {
@@ -4858,6 +4875,12 @@ fn collect_resource_artifacts(
                 (&owner.nodes[expression].kind, state.kind),
                 (KernelOwnerNodeKind::Hold, CheckedStateKind::Hold)
                     | (KernelOwnerNodeKind::Latest, CheckedStateKind::InitialLatest)
+                    | (
+                        KernelOwnerNodeKind::PureBuiltin {
+                            kind: KernelPureBuiltinKind::BoolToggle,
+                        },
+                        CheckedStateKind::StatefulCall,
+                    )
             ) {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel state row {index} kind {:?} is incompatible with expression {expression} kind {:?}",
@@ -5652,6 +5675,7 @@ fn collect_call_artifacts(
                 KernelOwnerNodeKind::PureBuiltin { kind } => {
                     (KernelCallTarget::PureBuiltin { kind: *kind }, true)
                 }
+                KernelOwnerNodeKind::FixedAbiCall { .. } => (KernelCallTarget::FixedAbi, true),
                 KernelOwnerNodeKind::HostEffect { operation } => (
                     KernelCallTarget::HostEffect {
                         operation: operation.clone(),
@@ -6849,7 +6873,8 @@ fn infer_static_variants(
                 kind:
                     KernelPureBuiltinKind::TextPredicate
                     | KernelPureBuiltinKind::ListPredicate
-                    | KernelPureBuiltinKind::Boolean,
+                    | KernelPureBuiltinKind::Boolean
+                    | KernelPureBuiltinKind::BoolToggle,
             } => Some(BTreeSet::from(["False".into(), "True".into()])),
             _ => None,
         };
@@ -7962,6 +7987,7 @@ fn direct_summary_fixed_builtin_supported(kind: KernelPureBuiltinKind) -> bool {
             | KernelPureBuiltinKind::NumberRound
             | KernelPureBuiltinKind::NumberProjection
             | KernelPureBuiltinKind::Boolean
+            | KernelPureBuiltinKind::BoolToggle
             | KernelPureBuiltinKind::RecordConstructor
             | KernelPureBuiltinKind::TextJoin
             | KernelPureBuiltinKind::FieldColor
@@ -8729,9 +8755,9 @@ impl DirectSummaryPlanCompiler<'_> {
                         | KernelPureBuiltinKind::NumberRound
                         | KernelPureBuiltinKind::NumberProjection
                         | KernelPureBuiltinKind::TextLength => self.builder.terms().number(),
-                        KernelPureBuiltinKind::TextPredicate | KernelPureBuiltinKind::Boolean => {
-                            boolean_type(self.builder)
-                        }
+                        KernelPureBuiltinKind::TextPredicate
+                        | KernelPureBuiltinKind::Boolean
+                        | KernelPureBuiltinKind::BoolToggle => boolean_type(self.builder),
                         KernelPureBuiltinKind::TextToNumber => parsed_number_type(self.builder),
                         KernelPureBuiltinKind::RecordConstructor => {
                             let value = self.push_node(KernelSummaryNode::Record {
@@ -10942,7 +10968,8 @@ fn compile_node(
                 | KernelPureBuiltinKind::ListLength => builder.terms().number(),
                 KernelPureBuiltinKind::TextPredicate
                 | KernelPureBuiltinKind::ListPredicate
-                | KernelPureBuiltinKind::Boolean => boolean_type(builder),
+                | KernelPureBuiltinKind::Boolean
+                | KernelPureBuiltinKind::BoolToggle => boolean_type(builder),
                 KernelPureBuiltinKind::TextToNumber => parsed_number_type(builder),
                 KernelPureBuiltinKind::RecordConstructor => {
                     let fields = node
@@ -10996,6 +11023,22 @@ fn compile_node(
                     builder.terms_mut().list(chunk)
                 }
             };
+            builder.add_publish(output, [result], PublishMode::Replace);
+        }
+        KernelOwnerNodeKind::FixedAbiCall { result } => {
+            if !node.inputs.is_empty() {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} fixed ABI call has explicit inputs"
+                )));
+            }
+            if !type_is_recursively_closed(result) {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} fixed ABI call imports a non-closed result {result:?}"
+                )));
+            }
+            let result = builder.terms_mut().import_checked_type(result, &mut |_| {
+                unreachable!("closed fixed ABI type has no variable")
+            });
             builder.add_publish(output, [result], PublishMode::Replace);
         }
         KernelOwnerNodeKind::HostEffect { operation } => {
@@ -11578,6 +11621,7 @@ fn node_mode_equation(
         | KernelOwnerNodeKind::MapEntry
         | KernelOwnerNodeKind::RenderConstructor { .. }
         | KernelOwnerNodeKind::PureBuiltin { .. }
+        | KernelOwnerNodeKind::FixedAbiCall { .. }
         | KernelOwnerNodeKind::HostEffect { .. }
         | KernelOwnerNodeKind::Then
         | KernelOwnerNodeKind::Infix { .. }
@@ -11862,10 +11906,12 @@ fn pure_builtin_argument_requirement(
         KernelPureBuiltinKind::NumberRound => Some(builder.terms().number()),
         KernelPureBuiltinKind::NumberProjection if name == "zoom" => None,
         KernelPureBuiltinKind::NumberProjection => Some(builder.terms().number()),
-        KernelPureBuiltinKind::Boolean if matches!(name, "$pipe" | "value" | "left" | "right") => {
+        KernelPureBuiltinKind::Boolean | KernelPureBuiltinKind::BoolToggle
+            if matches!(name, "$pipe" | "value" | "left" | "right") =>
+        {
             Some(boolean_type(builder))
         }
-        KernelPureBuiltinKind::Boolean => None,
+        KernelPureBuiltinKind::Boolean | KernelPureBuiltinKind::BoolToggle => None,
         KernelPureBuiltinKind::ListLength
         | KernelPureBuiltinKind::ListPredicate
         | KernelPureBuiltinKind::ListFilter

@@ -1,8 +1,10 @@
 use boon_example_manifest::{ExampleEntry, ExampleManifest};
 use boon_ir::{ErasedProgram, verify_hidden_identity, verify_static_schedule};
+#[cfg(feature = "test-flat-oracle")]
+use boon_parser::{ParseError, ParseProfile, parse_project_profiled, parse_source_profiled};
 use boon_parser::{
-    ParseError, ParseProfile, ParseWorkCounters, ParsedProgram, ProjectSyntaxSnapshot,
-    parse_project, parse_project_profiled, parse_source_profiled,
+    ParseWorkCounters, ParsedProgram, ProjectSyntaxSnapshot, parse_project,
+    parse_project_syntax_profiled,
 };
 pub use boon_plan::{
     ApplicationIdentity, MachinePlan, MigrationPredecessorBinding, PlanError, ProgramRole,
@@ -283,14 +285,14 @@ pub fn diagnose_runtime_source_units(
     source_label: &str,
     units: &[CompilerSourceUnit],
 ) -> Vec<CompilerDiagnostic> {
-    let parsed = parse_project(
+    let (project, parse_profile) = parse_project_syntax_profiled(
         source_label.to_owned(),
         units
             .iter()
             .map(|unit| (unit.path.clone(), unit.source.clone())),
     );
-    let parsed = match parsed {
-        Ok(parsed) => parsed,
+    let project = match project {
+        Ok(project) => project,
         Err(error) => {
             return vec![CompilerDiagnostic {
                 path: error.path,
@@ -302,20 +304,61 @@ pub fn diagnose_runtime_source_units(
             }];
         }
     };
-    boon_typecheck::check_runtime_profiled(&parsed)
-        .0
-        .diagnostics
-        .into_iter()
+    let diagnostics = match kernel_oracle::compiler_diagnostics_from_kernel(
+        project,
+        parse_profile.work_counters,
+        0.0,
+        ProgramRole::Client,
+    ) {
+        Ok(diagnostics) => diagnostics,
+        Err(error) => {
+            return vec![CompilerDiagnostic {
+                path: source_label.to_owned(),
+                line: None,
+                column: None,
+                start: None,
+                end: None,
+                message: error,
+            }];
+        }
+    };
+    diagnostics
+        .diagnostics()
+        .iter()
         .filter(|diagnostic| diagnostic.severity == boon_checked::DiagnosticSeverity::Error)
         .map(|diagnostic| {
-            let (path, line) = source_file_location(&parsed, diagnostic.line);
+            let layout = diagnostics
+                .syntax
+                .source_layouts()
+                .iter()
+                .filter(|layout| layout.start_line <= diagnostic.line)
+                .max_by_key(|layout| layout.start_line);
+            let path = layout.map_or_else(
+                || diagnostics.syntax.path().to_owned(),
+                |layout| layout.path.clone(),
+            );
+            let line = layout.map_or(diagnostic.line, |layout| {
+                diagnostic
+                    .line
+                    .saturating_sub(layout.start_line)
+                    .saturating_add(1)
+            });
+            let column = layout.and_then(|layout| {
+                let local_byte = diagnostic.start.checked_sub(layout.start_byte)?;
+                let unit = diagnostics
+                    .syntax
+                    .units()
+                    .iter()
+                    .find(|unit| unit.source_unit_id == layout.source_unit_id)?;
+                grapheme_column(&unit.source, line, local_byte)
+            });
             CompilerDiagnostic {
                 path,
                 line: Some(line),
-                column: grapheme_column(&parsed.source, diagnostic.line, diagnostic.start),
+                column,
                 start: Some(diagnostic.start),
                 end: Some(diagnostic.end),
-                message: diagnostic.message,
+                message: diagnostic.message.clone(),
             }
         })
         .collect()
@@ -625,20 +668,24 @@ pub fn compile_erased_program(
 pub fn compile_machine_plan(
     request: CompileRequest<'_>,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
-    let total_started = Instant::now();
     let parse_started = Instant::now();
-    let (parsed, parse_work) = parse_compile_source(request.source)?;
+    let (project, parse_work) = parse_kernel_compile_source(request.source)?;
     let parse_ms = elapsed_ms(parse_started);
-    compile_parsed_to_machine_plan(
-        parsed,
+    let checked = kernel_oracle::compiler_checked_from_kernel(
+        project,
         parse_work,
         parse_ms,
-        total_started,
-        request.target_profile,
         request.program_role,
-        request.application_identity,
-        request.schema_version,
-        request.migration_predecessors,
+    )
+    .map_err(PlanError::new)?;
+    finish_checked_machine_plan(
+        checked,
+        CheckedCompileRequest::new(
+            request.target_profile,
+            request.program_role,
+            request.application_identity,
+        )
+        .with_persistence_catalog(request.schema_version, request.migration_predecessors),
     )
 }
 
@@ -753,7 +800,7 @@ fn compile_checked_artifact_oracle_plan(
 }
 
 pub fn check_source(request: CompilerCheckRequest<'_>) -> CompilerResult<CheckedSourceFromSource> {
-    check_source_with_ownership(request, CheckedSourceOwnership::Report)
+    check_kernel_source(request)
 }
 
 /// Checks one compiler-service revision while retaining editor projections and
@@ -763,7 +810,7 @@ pub fn check_source(request: CompilerCheckRequest<'_>) -> CompilerResult<Checked
 pub fn check_editor_source(
     request: CompilerCheckRequest<'_>,
 ) -> CompilerResult<CheckedSourceFromSource> {
-    check_source_with_ownership(request, CheckedSourceOwnership::Editor)
+    check_kernel_source(request)
 }
 
 /// Compiler-service diagnostics path. It returns the complete checked
@@ -772,7 +819,7 @@ pub fn check_editor_source(
 pub fn check_diagnostics_source(
     request: CompilerCheckRequest<'_>,
 ) -> CompilerResult<CheckedSourceFromSource> {
-    check_source_with_ownership(request, CheckedSourceOwnership::Diagnostics)
+    check_kernel_source(request)
 }
 
 /// Checks source for a request that will continue through semantic sealing and
@@ -786,53 +833,17 @@ pub fn check_diagnostics_source(
 pub fn check_runtime_source(
     request: CompilerCheckRequest<'_>,
 ) -> CompilerResult<CheckedSourceFromSource> {
-    check_source_with_ownership(request, CheckedSourceOwnership::Runtime)
+    check_kernel_source(request)
 }
 
-#[derive(Clone, Copy)]
-enum CheckedSourceOwnership {
-    Report,
-    Editor,
-    Diagnostics,
-    Runtime,
-}
-
-fn check_source_with_ownership(
+fn check_kernel_source(
     request: CompilerCheckRequest<'_>,
-    ownership: CheckedSourceOwnership,
 ) -> CompilerResult<CheckedSourceFromSource> {
     let parse_started = Instant::now();
-    let (parsed, parse_work) = parse_compile_source(request.source)?;
+    let (project, parse_work) = parse_kernel_compile_source(request.source)?;
     let parse_ms = elapsed_ms(parse_started);
-    check_parsed_source_with_ownership(
-        parsed,
-        parse_work,
-        parse_ms,
-        request.program_role,
-        ownership,
-    )
-}
-
-pub(crate) fn checked_source_from_owner_assembly(
-    syntax: ProjectSyntaxSnapshot,
-    assembly: &boon_typecheck::CheckedOwnerProjectAssembly,
-    parse_work: ParseWorkCounters,
-    parse_ms: f64,
-    typecheck_work: boon_typecheck::TypeCheckWorkCounters,
-    owner_work: boon_typecheck::OwnerBodyInferenceWork,
-    typecheck_ms: f64,
-) -> CheckedSourceFromSource {
-    checked_source_from_checked_fields(
-        syntax,
-        assembly.fields().clone(),
-        assembly.diagnostics(),
-        parse_work,
-        parse_ms,
-        typecheck_work,
-        owner_work,
-        typecheck_ms,
-        None,
-    )
+    kernel_oracle::compiler_checked_from_kernel(project, parse_work, parse_ms, request.program_role)
+        .map_err(|error| PlanError::new(error).into())
 }
 
 pub(crate) fn checked_source_from_checked_fields(
@@ -976,112 +987,38 @@ pub(crate) fn checked_source_from_checked_fields(
     }
 }
 
-fn check_parsed_source_with_ownership(
-    parsed: ParsedProgram,
-    parse_work: ParseWorkCounters,
-    parse_ms: f64,
-    program_role: ProgramRole,
-    ownership: CheckedSourceOwnership,
-) -> CompilerResult<CheckedSourceFromSource> {
-    check_syntax_source_with_ownership(
-        CheckedSourceSyntax::Assembled(parsed),
-        parse_work,
-        parse_ms,
-        program_role,
-        ownership,
-    )
+fn parse_kernel_compile_source(
+    source: CompileSource<'_>,
+) -> CompilerResult<(ProjectSyntaxSnapshot, ParseWorkCounters)> {
+    let (parsed, profile) = match source {
+        CompileSource::Path(source_path) => {
+            let (entrypoint, units) = compiler_source_project_for_path(source_path)?;
+            parse_project_syntax_profiled(
+                entrypoint,
+                units.into_iter().map(|unit| (unit.path, unit.source)),
+            )
+        }
+        CompileSource::Text {
+            source_label,
+            source_text,
+        } => parse_project_syntax_profiled(
+            source_label.to_owned(),
+            [(source_label.to_owned(), source_text.to_owned())],
+        ),
+        CompileSource::Units {
+            source_label,
+            units,
+        } => parse_project_syntax_profiled(
+            source_label.to_owned(),
+            units
+                .iter()
+                .map(|unit| (unit.path.clone(), unit.source.clone())),
+        ),
+    };
+    Ok((parsed?, profile.work_counters))
 }
 
-fn check_syntax_source_with_ownership(
-    syntax: CheckedSourceSyntax,
-    parse_work: ParseWorkCounters,
-    parse_ms: f64,
-    program_role: ProgramRole,
-    ownership: CheckedSourceOwnership,
-) -> CompilerResult<CheckedSourceFromSource> {
-    let check_started = Instant::now();
-    let (source_unit_count, expression_count) = match &syntax {
-        CheckedSourceSyntax::Assembled(program) => (program.files.len(), program.expressions.len()),
-        CheckedSourceSyntax::UnitNative(program) => {
-            (program.units().len(), program.expression_count())
-        }
-    };
-    let external_types = boon_checked::ExternalTypeEnvironment::empty(program_role);
-    let typecheck_started = Instant::now();
-    let (output, typecheck_profile) = match (&syntax, ownership) {
-        (CheckedSourceSyntax::Assembled(program), CheckedSourceOwnership::Report) => {
-            boon_typecheck::check_program_profiled_with_external_types(program, &external_types)
-        }
-        (CheckedSourceSyntax::Assembled(program), CheckedSourceOwnership::Editor) => {
-            boon_typecheck::check_editor_program_profiled_with_external_types(
-                program,
-                &external_types,
-            )
-        }
-        (CheckedSourceSyntax::Assembled(program), CheckedSourceOwnership::Diagnostics) => {
-            boon_typecheck::check_diagnostics_program_profiled_with_external_types(
-                program,
-                &external_types,
-            )
-        }
-        (CheckedSourceSyntax::Assembled(program), CheckedSourceOwnership::Runtime) => {
-            boon_typecheck::check_runtime_program_profiled_with_external_types(
-                program,
-                &external_types,
-            )
-        }
-        (CheckedSourceSyntax::UnitNative(program), CheckedSourceOwnership::Report) => {
-            boon_typecheck::check_project_program_profiled_with_external_types(
-                program,
-                &external_types,
-            )
-        }
-        (CheckedSourceSyntax::UnitNative(program), CheckedSourceOwnership::Editor) => {
-            boon_typecheck::check_project_editor_program_profiled_with_external_types(
-                program,
-                &external_types,
-            )
-        }
-        (CheckedSourceSyntax::UnitNative(program), CheckedSourceOwnership::Diagnostics) => {
-            boon_typecheck::check_project_diagnostics_program_profiled_with_external_types(
-                program,
-                &external_types,
-            )
-        }
-        (CheckedSourceSyntax::UnitNative(program), CheckedSourceOwnership::Runtime) => {
-            boon_typecheck::check_project_runtime_program_profiled_with_external_types(
-                program,
-                &external_types,
-            )
-        }
-    };
-    let typecheck_ms = elapsed_ms(typecheck_started);
-    let diagnostic_count = output.report.diagnostics.len()
-        + output
-            .report
-            .render_slot_table
-            .slots
-            .iter()
-            .map(|slot| slot.diagnostics.len())
-            .sum::<usize>();
-    Ok(CheckedSourceFromSource {
-        syntax,
-        output,
-        profile: CheckedDiagnosticsProfile {
-            source_unit_count,
-            expression_count,
-            diagnostic_count,
-            parse_work,
-            typecheck_work: typecheck_profile.work_counters,
-            owner_work: boon_typecheck::OwnerBodyInferenceWork::default(),
-            parse_ms,
-            typecheck_ms,
-            total_ms: parse_ms + elapsed_ms(check_started),
-        },
-        checked_call_occurrences: None,
-    })
-}
-
+#[cfg(feature = "test-flat-oracle")]
 fn parse_compile_source(
     source: CompileSource<'_>,
 ) -> CompilerResult<(ParsedProgram, ParseWorkCounters)> {
@@ -1100,52 +1037,6 @@ fn parse_compile_source(
         } => parse_source_units_profiled(source_label, units),
     };
     Ok((parsed?, profile.work_counters))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compile_parsed_to_machine_plan(
-    parsed: ParsedProgram,
-    parse_work: ParseWorkCounters,
-    parse_ms: f64,
-    total_started: Instant,
-    target_profile: TargetProfile,
-    program_role: ProgramRole,
-    application_identity: ApplicationIdentity,
-    schema_version: u64,
-    migration_predecessors: &[MigrationPredecessorBinding],
-) -> CompilerResult<CompiledMachinePlanFromSource> {
-    let external_types = boon_checked::ExternalTypeEnvironment::empty(program_role);
-    let typecheck_started = Instant::now();
-    let (check_output, typecheck_profile) =
-        boon_typecheck::check_runtime_program_profiled_with_external_types(
-            &parsed,
-            &external_types,
-        );
-    let typecheck_ms = elapsed_ms(typecheck_started);
-    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
-        eprintln!("boon_compiler lower typecheck: {:.3}ms", typecheck_ms);
-    }
-    let source_unit_count = parsed.files.len();
-    let parsed_expression_count = parsed.expressions.len();
-    let checked =
-        checked_program_from_output(CheckedSyntaxRef::Assembled(&parsed), check_output, None)?;
-    finish_checked_program_to_machine_plan(
-        checked,
-        source_unit_count,
-        parsed_expression_count,
-        parse_work,
-        typecheck_profile.work_counters,
-        boon_typecheck::OwnerBodyInferenceWork::default(),
-        parse_ms,
-        typecheck_ms,
-        elapsed_ms(total_started),
-        target_profile,
-        program_role,
-        application_identity,
-        schema_version,
-        migration_predecessors,
-        CancellationProbe::new(None),
-    )
 }
 
 pub fn finish_checked_machine_plan(
@@ -1422,6 +1313,7 @@ fn parse_source_units(
     )?)
 }
 
+#[cfg(feature = "test-flat-oracle")]
 fn parse_source_units_profiled(
     source_label: &str,
     units: &[CompilerSourceUnit],

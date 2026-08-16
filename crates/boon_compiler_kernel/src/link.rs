@@ -1501,8 +1501,7 @@ impl KernelCheckedLinkLayout {
             )));
         }
 
-        let mut source_paths =
-            BTreeMap::<DeclId, Vec<(Vec<String>, CheckedSourceId, DeclId)>>::new();
+        let mut source_paths = BTreeMap::<DeclId, Vec<(Vec<String>, CheckedSourceId)>>::new();
         let mut declaration_metadata =
             BTreeMap::<DeclId, (KernelOwnerId, KernelScopeReference, Box<str>)>::new();
         for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
@@ -1548,11 +1547,10 @@ impl KernelCheckedLinkLayout {
                     .map(|field| field.to_string())
                     .collect::<Vec<_>>();
                 let exact_anchor = self.declaration(owner, source.path.anchor)?;
-                source_paths.entry(exact_anchor).or_default().push((
-                    source_projection.clone(),
-                    source_id,
-                    source_declaration,
-                ));
+                source_paths
+                    .entry(exact_anchor)
+                    .or_default()
+                    .push((source_projection.clone(), source_id));
 
                 // Checked lexical reads name a nested SOURCE by its exact
                 // declaration, even when the authored path starts at an
@@ -1579,11 +1577,10 @@ impl KernelCheckedLinkLayout {
                     if !seen_anchors.insert(anchor) || anchor == source_declaration {
                         break;
                     }
-                    source_paths.entry(anchor).or_default().push((
-                        alias_projection.clone(),
-                        source_id,
-                        source_declaration,
-                    ));
+                    source_paths
+                        .entry(anchor)
+                        .or_default()
+                        .push((alias_projection.clone(), source_id));
                     let Some((owner, parent_scope, name)) =
                         declaration_metadata.get(&anchor).cloned()
                     else {
@@ -1596,7 +1593,7 @@ impl KernelCheckedLinkLayout {
             }
         }
         for paths in source_paths.values_mut() {
-            paths.sort_by_key(|(path, source, _)| (std::cmp::Reverse(path.len()), *source));
+            paths.sort_by_key(|(path, source)| (std::cmp::Reverse(path.len()), *source));
         }
 
         let mut expressions = Vec::with_capacity(self.totals.expressions as usize);
@@ -2284,6 +2281,7 @@ impl KernelCheckedLinkLayout {
                     }
                     KernelCallTarget::RenderConstructor { .. }
                     | KernelCallTarget::PureBuiltin { .. }
+                    | KernelCallTarget::FixedAbi
                     | KernelCallTarget::HostEffect { .. } => {
                         self.abi_callable(&syntax.function)?.declaration
                     }
@@ -2581,6 +2579,7 @@ impl KernelCheckedLinkLayout {
                         }
                         KernelCallTarget::RenderConstructor { .. }
                         | KernelCallTarget::PureBuiltin { .. }
+                        | KernelCallTarget::FixedAbi
                         | KernelCallTarget::HostEffect { .. } => {
                             let contract =
                                 project.abi().callable(&syntax.function).ok_or_else(|| {
@@ -3495,7 +3494,7 @@ fn checked_expression_kind(
     shape: Option<&crate::KernelExecutionShapeArtifact>,
     lexical: Option<&crate::KernelLexicalBindingArtifact>,
     call: Option<u32>,
-    source_paths: &BTreeMap<DeclId, Vec<(Vec<String>, CheckedSourceId, DeclId)>>,
+    source_paths: &BTreeMap<DeclId, Vec<(Vec<String>, CheckedSourceId)>>,
 ) -> Result<CheckedExpressionKind, KernelCheckedLinkError> {
     if let Some(call) = call {
         return Ok(CheckedExpressionKind::Call {
@@ -3580,6 +3579,18 @@ fn checked_expression_kind(
     }
     if matches!(payload, crate::KernelExpressionSemanticPayload::Delimiter) {
         return Ok(CheckedExpressionKind::Delimiter);
+    }
+    if let crate::KernelExpressionSemanticPayload::Invalid(tokens) = payload
+        && matches!(
+            expression.kind,
+            crate::KernelOwnerNodeKind::Number
+                | crate::KernelOwnerNodeKind::Byte
+                | crate::KernelOwnerNodeKind::Bits(_)
+        )
+    {
+        return Ok(CheckedExpressionKind::Invalid {
+            tokens: tokens.iter().map(|token| token.to_string()).collect(),
+        });
     }
 
     let inputs = |role: &crate::KernelOwnerEdgeRole| {
@@ -3835,6 +3846,7 @@ fn checked_expression_kind(
         crate::KernelOwnerNodeKind::UserCall { .. }
         | crate::KernelOwnerNodeKind::RenderConstructor { .. }
         | crate::KernelOwnerNodeKind::PureBuiltin { .. }
+        | crate::KernelOwnerNodeKind::FixedAbiCall { .. }
         | crate::KernelOwnerNodeKind::HostEffect { .. } => {
             return Err(KernelCheckedLinkError::new(format!(
                 "kernel definition {} call expression {} has no call artifact",
@@ -4751,24 +4763,24 @@ fn lexical_payload_path(payload: &crate::KernelExpressionSemanticPayload) -> Opt
 }
 
 fn canonical_checked_source_read(
-    source_paths: &BTreeMap<DeclId, Vec<(Vec<String>, CheckedSourceId, DeclId)>>,
+    source_paths: &BTreeMap<DeclId, Vec<(Vec<String>, CheckedSourceId)>>,
     target: DeclId,
     projection: Vec<String>,
 ) -> (DeclId, Vec<String>, Option<CheckedSourceRead>) {
     let Some(candidates) = source_paths.get(&target) else {
         return (target, projection, None);
     };
-    let mut matches = candidates.iter().filter_map(|(path, source, declaration)| {
+    let mut matches = candidates.iter().filter_map(|(path, source)| {
         projection
             .strip_prefix(path.as_slice())
-            .map(|payload| (*source, *declaration, path.len(), payload))
+            .map(|payload| (*source, path.len(), payload))
     });
-    let Some((source, declaration, path_len, payload)) = matches.next() else {
+    let Some((source, path_len, payload)) = matches.next() else {
         return (target, projection, None);
     };
     if matches
         .next()
-        .is_some_and(|(_, _, candidate_len, _)| candidate_len == path_len)
+        .is_some_and(|(_, candidate_len, _)| candidate_len == path_len)
     {
         return (target, projection, None);
     }
@@ -4778,8 +4790,8 @@ fn canonical_checked_source_read(
         .unwrap_or(payload)
         .to_vec();
     (
-        declaration,
-        payload.to_vec(),
+        target,
+        projection,
         Some(CheckedSourceRead {
             source,
             payload_projection,

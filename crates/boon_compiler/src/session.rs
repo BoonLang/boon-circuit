@@ -1,7 +1,8 @@
 use crate::{
     CheckedCompileRequest, CheckedSourceFromSource, CompiledSealedMachinePlanFromSource,
-    CompilerDiagnostics, CompilerResult, CompilerSourceUnit, checked_source_from_owner_assembly,
-    finish_checked_machine_plan_with_cancellation, kernel_oracle::compiler_diagnostics_from_kernel,
+    CompilerDiagnostics, CompilerResult, CompilerSourceUnit,
+    finish_checked_machine_plan_with_cancellation,
+    kernel_oracle::{compiler_checked_from_kernel, compiler_diagnostics_from_kernel},
 };
 use boon_compilation_db::{
     RequestAbortReason, RequestEvaluationStats, RequestEvaluatorGraph, RequestFamily,
@@ -2247,17 +2248,7 @@ impl CompilerSession {
 
         if intent == CompileIntent::EditorDiagnostics {
             if state.checked.is_none() {
-                let (parsed, assembly, parse_work, owner_work, parse_ms, typecheck_ms) =
-                    parse_project_snapshot(state)?;
-                state.checked = Some(checked_source_from_owner_assembly(
-                    parsed,
-                    &assembly,
-                    parse_work,
-                    parse_ms,
-                    boon_typecheck::TypeCheckWorkCounters::default(),
-                    owner_work,
-                    typecheck_ms,
-                ));
+                state.checked = Some(compile_project_checked_with_kernel(state)?);
             }
             if cancellation.is_canceled() {
                 state.checked = None;
@@ -2274,17 +2265,7 @@ impl CompilerSession {
             .is_some_and(|(compiled_revision, _)| *compiled_revision == revision);
         if !current_artifact_available {
             if state.checked.is_none() {
-                let (parsed, assembly, parse_work, owner_work, parse_ms, typecheck_ms) =
-                    parse_project_snapshot(state)?;
-                state.checked = Some(checked_source_from_owner_assembly(
-                    parsed,
-                    &assembly,
-                    parse_work,
-                    parse_ms,
-                    boon_typecheck::TypeCheckWorkCounters::default(),
-                    owner_work,
-                    typecheck_ms,
-                ));
+                state.checked = Some(compile_project_checked_with_kernel(state)?);
             }
             if cancellation.is_canceled() {
                 state.checked = None;
@@ -2329,6 +2310,14 @@ impl CompilerSession {
             compiled: &state.compiled.as_ref().expect("compiled project").1,
         })
     }
+}
+
+fn compile_project_checked_with_kernel(
+    state: &mut ProjectState,
+) -> CompilerResult<CheckedSourceFromSource> {
+    let (project, parse_work, parse_ms) = parse_project_syntax_snapshot(state)?;
+    compiler_checked_from_kernel(project, parse_work, parse_ms, state.source.program_role)
+        .map_err(session_error)
 }
 
 fn parse_project_syntax_snapshot(
@@ -6403,6 +6392,7 @@ mod tests {
         assert_eq!(paths, BTreeSet::from(["RUN.bn", "Second.bn"]));
     }
 
+    #[cfg(feature = "test-flat-oracle")]
     #[test]
     fn source_unit_owner_diagnostics_reuse_before_project_layout_relocation() {
         let mut session = CompilerSession::new();
@@ -6498,6 +6488,7 @@ mod tests {
         assert_eq!(second_diagnostic.end, first_diagnostic.end + 1);
     }
 
+    #[cfg(feature = "test-flat-oracle")]
     #[test]
     fn source_unit_project_diagnostics_backdate_before_layout_relocation() {
         let first_source = "value: 1\n";
@@ -8166,6 +8157,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-flat-oracle")]
     #[test]
     fn project_diagnostic_facts_match_dense_project_diagnostics() {
         fn normalized_complete_diagnostics(
@@ -9632,6 +9624,33 @@ mod tests {
 
     #[test]
     fn public_diagnostics_stays_lean_and_editor_rows_are_explicitly_demanded() {
+        fn assert_legacy_owner_solver_idle(state: &ProjectState) {
+            assert_eq!(state.owner_input_requests.request_count(), 0);
+            assert_eq!(state.owner_constraint_requests.request_count(), 0);
+            assert_eq!(state.owner_interface_scc_requests.request_count(), 0);
+            assert_eq!(
+                state
+                    .owner_interface_scc_evaluation_requests
+                    .request_count(),
+                0
+            );
+            assert_eq!(state.owner_body_inference_requests.request_count(), 0);
+            assert_eq!(
+                state
+                    .owner_body_inference_evaluation_requests
+                    .request_count(),
+                0
+            );
+            assert_eq!(state.owner_construction_abi_requests.request_count(), 0);
+            assert_eq!(state.checked_owner_shard_requests.request_count(), 0);
+            assert_eq!(
+                state
+                    .checked_owner_project_assembly_requests
+                    .request_count(),
+                0
+            );
+        }
+
         let mut session = CompilerSession::new();
         let project = session.open_project(project("value: 1")).unwrap();
         let revision = session.revision(project).unwrap();
@@ -9646,14 +9665,7 @@ mod tests {
         }
         {
             let state = session.projects.get(&project).unwrap();
-            assert_eq!(state.owner_construction_abi_requests.request_count(), 0);
-            assert_eq!(state.checked_owner_shard_requests.request_count(), 0);
-            assert_eq!(
-                state
-                    .checked_owner_project_assembly_requests
-                    .request_count(),
-                0
-            );
+            assert_legacy_owner_solver_idle(state);
         }
         {
             let result = session
@@ -9663,6 +9675,7 @@ mod tests {
             assert!(output.program.is_none());
             assert!(output.construction.is_some());
         }
+        assert_legacy_owner_solver_idle(session.projects.get(&project).unwrap());
         let first_plan = session
             .request(project, revision, CompileIntent::VerifiedPreview, &token)
             .unwrap()
@@ -9680,6 +9693,7 @@ mod tests {
             .plan()
             .clone();
         assert_eq!(first_plan, second_plan);
+        assert_legacy_owner_solver_idle(session.projects.get(&project).unwrap());
     }
 
     #[test]

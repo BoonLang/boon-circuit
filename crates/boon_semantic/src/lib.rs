@@ -7442,9 +7442,13 @@ FUNCTION selectable_row(row) {
 "#,
         )
         .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("mapped source OUT fixture checks");
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            !checked.report.has_errors(),
+            "mapped source OUT diagnostics: {:#?}",
+            checked.report.diagnostics,
+        );
+        let checked = checked.program.expect("mapped source OUT fixture checks");
         let address_read = checked
             .resource_projection_requirements
             .iter()

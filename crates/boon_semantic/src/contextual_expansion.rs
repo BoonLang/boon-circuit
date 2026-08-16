@@ -296,6 +296,493 @@ struct CheckedProgramLookup {
     source_bearing_resource_projections: Vec<bool>,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CheckedSourceContainmentNode {
+    Declaration(DeclId, Vec<String>),
+    Expression(CheckedExprId, Vec<String>),
+    ListItem(CheckedExprId, Vec<String>),
+    Output(DeclId, Vec<String>),
+}
+
+/// Definition-local SOURCE containment is distinct from exact payload
+/// provenance. A read of `row.controls` may contain a nested SOURCE while it
+/// intentionally has no single `CheckedSourceRead` payload origin. Ordinary
+/// callable retention needs the aggregate fact so such values keep their
+/// occurrence-owned routing instead of becoming a shared runtime template.
+struct CheckedSourceContainmentIndex {
+    actual_inputs_by_formal: BTreeMap<DeclId, Vec<CheckedExprId>>,
+    contextual_lists_by_output: BTreeMap<DeclId, Vec<CheckedExprId>>,
+    forwarded_outputs_by_formal: BTreeMap<DeclId, Vec<DeclId>>,
+}
+
+impl CheckedSourceContainmentIndex {
+    fn new(program: &CheckedProgramFields, lookup: &CheckedProgramLookup) -> Self {
+        let mut actual_inputs_by_formal = BTreeMap::<DeclId, Vec<CheckedExprId>>::new();
+        let mut contextual_lists_by_output = BTreeMap::<DeclId, Vec<CheckedExprId>>::new();
+        let mut forwarded_outputs_by_formal = BTreeMap::<DeclId, Vec<DeclId>>::new();
+        for call in &program.calls {
+            let mut indexed_inputs = BTreeSet::new();
+            for entry in &call.entries {
+                match entry {
+                    CheckedCallEntry::Input { formal, value, .. } => {
+                        if indexed_inputs.insert(*formal) {
+                            actual_inputs_by_formal
+                                .entry(*formal)
+                                .or_default()
+                                .push(*value);
+                        }
+                    }
+                    CheckedCallEntry::FreshOut { formal, output, .. }
+                    | CheckedCallEntry::ForwardOut {
+                        formal,
+                        target: output,
+                        ..
+                    } => {
+                        forwarded_outputs_by_formal
+                            .entry(*formal)
+                            .or_default()
+                            .push(*output);
+                    }
+                }
+            }
+            let Some(operation) = lookup
+                .callable(program, call.callable)
+                .and_then(|callable| callable.contextual_operation)
+            else {
+                continue;
+            };
+            let (_, list_formal, row_formal, _, _) = contextual_operation_formals(operation);
+            let Some(list) = call.entries.iter().find_map(|entry| match entry {
+                CheckedCallEntry::Input { formal, value, .. } if *formal == list_formal => {
+                    Some(*value)
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            for entry in &call.entries {
+                let output = match entry {
+                    CheckedCallEntry::FreshOut { formal, output, .. } if *formal == row_formal => {
+                        Some(*output)
+                    }
+                    CheckedCallEntry::ForwardOut { formal, target, .. }
+                        if *formal == row_formal =>
+                    {
+                        Some(*target)
+                    }
+                    _ => None,
+                };
+                if let Some(output) = output {
+                    contextual_lists_by_output
+                        .entry(output)
+                        .or_default()
+                        .push(list);
+                }
+            }
+        }
+        Self {
+            actual_inputs_by_formal,
+            contextual_lists_by_output,
+            forwarded_outputs_by_formal,
+        }
+    }
+
+    fn projection_contains_source(
+        &self,
+        program: &CheckedProgramFields,
+        lookup: &CheckedProgramLookup,
+        target: DeclId,
+        projection: &[String],
+    ) -> bool {
+        self.declaration_contains_source(program, lookup, target, projection, &mut BTreeSet::new())
+    }
+
+    fn declaration_contains_source(
+        &self,
+        program: &CheckedProgramFields,
+        lookup: &CheckedProgramLookup,
+        target: DeclId,
+        projection: &[String],
+        active: &mut BTreeSet<CheckedSourceContainmentNode>,
+    ) -> bool {
+        let node = CheckedSourceContainmentNode::Declaration(target, projection.to_vec());
+        if !active.insert(node.clone()) {
+            return false;
+        }
+        let direct = program.sources.iter().any(|source| {
+            source.path.anchor == target
+                && projection.starts_with(source.path.projection.as_slice())
+        });
+        let result = direct
+            || lookup
+                .declaration(program, target)
+                .is_some_and(|declaration| {
+                    (declaration.kind == CheckedDeclarationKind::ValueParameter
+                        && self
+                            .actual_inputs_by_formal
+                            .get(&target)
+                            .into_iter()
+                            .flatten()
+                            .any(|actual| {
+                                self.expression_contains_source(
+                                    program, lookup, *actual, projection, active,
+                                )
+                            }))
+                        || (matches!(
+                            declaration.kind,
+                            CheckedDeclarationKind::FreshOut | CheckedDeclarationKind::OutParameter
+                        ) && self
+                            .output_contains_source(program, lookup, target, projection, active))
+                        || declaration.value.is_some_and(|value| {
+                            self.expression_contains_source(
+                                program, lookup, value, projection, active,
+                            )
+                        })
+                        || lookup
+                            .callable(program, target)
+                            .and_then(|callable| callable.result_expression)
+                            .is_some_and(|result| {
+                                self.expression_contains_source(
+                                    program, lookup, result, projection, active,
+                                )
+                            })
+                });
+        active.remove(&node);
+        result
+    }
+
+    fn expression_contains_source(
+        &self,
+        program: &CheckedProgramFields,
+        lookup: &CheckedProgramLookup,
+        expression_id: CheckedExprId,
+        projection: &[String],
+        active: &mut BTreeSet<CheckedSourceContainmentNode>,
+    ) -> bool {
+        let node = CheckedSourceContainmentNode::Expression(expression_id, projection.to_vec());
+        if !active.insert(node.clone()) {
+            return false;
+        }
+        if lookup
+            .source_for_expression(program, expression_id)
+            .is_some()
+        {
+            active.remove(&node);
+            return true;
+        }
+        let Some(expression) = lookup.expression(program, expression_id) else {
+            active.remove(&node);
+            return false;
+        };
+        let result = match &expression.kind {
+            CheckedExpressionKind::Read {
+                target,
+                projection: read_projection,
+                ..
+            }
+            | CheckedExpressionKind::Drain {
+                target,
+                projection: read_projection,
+            } => {
+                let mut combined = read_projection.clone();
+                combined.extend_from_slice(projection);
+                self.declaration_contains_source(program, lookup, *target, &combined, active)
+            }
+            CheckedExpressionKind::TaggedObject { fields, .. }
+            | CheckedExpressionKind::Object { fields } => {
+                if let Some((field, remaining)) = projection.split_first() {
+                    fields.iter().any(|candidate| {
+                        candidate.name == *field
+                            && self.expression_contains_source(
+                                program,
+                                lookup,
+                                candidate.value,
+                                remaining,
+                                active,
+                            )
+                    })
+                } else {
+                    fields.iter().any(|field| {
+                        self.expression_contains_source(program, lookup, field.value, &[], active)
+                    })
+                }
+            }
+            CheckedExpressionKind::Call { call } => lookup
+                .call(program, *call)
+                .and_then(|call| {
+                    lookup
+                        .callable(program, call.callable)
+                        .map(|callable| (call, callable))
+                })
+                .is_some_and(|(call, callable)| {
+                    if callable.kind == CheckedCallableKind::User {
+                        return callable.result_expression.is_some_and(|result| {
+                            self.expression_contains_source(
+                                program, lookup, result, projection, active,
+                            )
+                        });
+                    }
+                    if matches!(
+                        callable.contextual_operation,
+                        Some(CheckedContextualOperation::Find { .. })
+                    ) || matches!(
+                        call.function.as_str(),
+                        "List/get" | "List/latest" | "List/find"
+                    ) {
+                        return checked_call_named_input(callable, call, "list").is_some_and(
+                            |list| {
+                                self.list_item_contains_source(
+                                    program, lookup, list, projection, active,
+                                )
+                            },
+                        );
+                    }
+                    false
+                }),
+            CheckedExpressionKind::Draining { input }
+            | CheckedExpressionKind::Hold { initial: input, .. }
+            | CheckedExpressionKind::Flush { payload: input } => {
+                self.expression_contains_source(program, lookup, *input, projection, active)
+            }
+            CheckedExpressionKind::Latest { branches } => branches.iter().any(|branch| {
+                self.expression_contains_source(program, lookup, *branch, projection, active)
+            }),
+            CheckedExpressionKind::When { arms, .. }
+            | CheckedExpressionKind::While { arms, .. } => arms.iter().any(|arm| {
+                self.expression_contains_source(program, lookup, *arm, projection, active)
+            }),
+            CheckedExpressionKind::Then { output, .. }
+            | CheckedExpressionKind::MatchArm { output, .. } => output.is_some_and(|output| {
+                self.expression_contains_source(program, lookup, output, projection, active)
+            }),
+            CheckedExpressionKind::Block { result, .. } => result.is_some_and(|result| {
+                self.expression_contains_source(program, lookup, result, projection, active)
+            }),
+            CheckedExpressionKind::List { items, .. }
+            | CheckedExpressionKind::Set { items }
+            | CheckedExpressionKind::Bytes { items, .. } => {
+                projection.is_empty()
+                    && items.iter().any(|item| {
+                        self.expression_contains_source(program, lookup, *item, &[], active)
+                    })
+            }
+            CheckedExpressionKind::Map { entries } => {
+                projection.is_empty()
+                    && entries.iter().any(|entry| {
+                        self.expression_contains_source(program, lookup, *entry, &[], active)
+                    })
+            }
+            CheckedExpressionKind::MapEntry { key, value } => {
+                projection.is_empty()
+                    && (self.expression_contains_source(program, lookup, *key, &[], active)
+                        || self.expression_contains_source(program, lookup, *value, &[], active))
+            }
+            CheckedExpressionKind::Passed { .. } | CheckedExpressionKind::ExternalRead { .. } => {
+                projection.is_empty()
+            }
+            CheckedExpressionKind::TextTemplate { segments } => {
+                projection.is_empty()
+                    && segments.iter().any(|segment| match segment {
+                        CheckedTextSegment::Static { .. } => false,
+                        CheckedTextSegment::Dynamic { value } => {
+                            self.expression_contains_source(program, lookup, *value, &[], active)
+                        }
+                    })
+            }
+            CheckedExpressionKind::Text { .. }
+            | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::Bits { .. }
+            | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Absent
+            | CheckedExpressionKind::Tag { .. }
+            | CheckedExpressionKind::Source
+            | CheckedExpressionKind::Infix { .. }
+            | CheckedExpressionKind::Delimiter
+            | CheckedExpressionKind::Invalid { .. } => false,
+        };
+        active.remove(&node);
+        result
+    }
+
+    fn list_item_contains_source(
+        &self,
+        program: &CheckedProgramFields,
+        lookup: &CheckedProgramLookup,
+        expression_id: CheckedExprId,
+        projection: &[String],
+        active: &mut BTreeSet<CheckedSourceContainmentNode>,
+    ) -> bool {
+        let node = CheckedSourceContainmentNode::ListItem(expression_id, projection.to_vec());
+        if !active.insert(node.clone()) {
+            return false;
+        }
+        let result = lookup
+            .expression(program, expression_id)
+            .is_some_and(|expression| match &expression.kind {
+                CheckedExpressionKind::List { items, .. } => items.iter().any(|item| {
+                    self.expression_contains_source(program, lookup, *item, projection, active)
+                }),
+                CheckedExpressionKind::Read {
+                    target,
+                    projection: list_projection,
+                    ..
+                } if list_projection.is_empty() => lookup
+                    .declaration(program, *target)
+                    .is_some_and(|declaration| {
+                        (declaration.kind == CheckedDeclarationKind::ValueParameter
+                            && self
+                                .actual_inputs_by_formal
+                                .get(target)
+                                .into_iter()
+                                .flatten()
+                                .any(|actual| {
+                                    self.list_item_contains_source(
+                                        program, lookup, *actual, projection, active,
+                                    )
+                                }))
+                            || declaration.value.is_some_and(|value| {
+                                self.list_item_contains_source(
+                                    program, lookup, value, projection, active,
+                                )
+                            })
+                    }),
+                CheckedExpressionKind::Call { call } => lookup
+                    .call(program, *call)
+                    .and_then(|call| {
+                        lookup
+                            .callable(program, call.callable)
+                            .map(|callable| (call, callable))
+                    })
+                    .is_some_and(|(call, callable)| {
+                        if callable.kind == CheckedCallableKind::User {
+                            return callable.result_expression.is_some_and(|result| {
+                                self.list_item_contains_source(
+                                    program, lookup, result, projection, active,
+                                )
+                            });
+                        }
+                        match callable.contextual_operation {
+                            Some(CheckedContextualOperation::Map { body, .. }) => call
+                                .entries
+                                .iter()
+                                .find_map(|entry| match entry {
+                                    CheckedCallEntry::Input { formal, value, .. }
+                                        if *formal == body =>
+                                    {
+                                        Some(*value)
+                                    }
+                                    _ => None,
+                                })
+                                .is_some_and(|body| {
+                                    self.expression_contains_source(
+                                        program, lookup, body, projection, active,
+                                    )
+                                }),
+                            Some(
+                                CheckedContextualOperation::Filter { list, .. }
+                                | CheckedContextualOperation::Retain { list, .. }
+                                | CheckedContextualOperation::Remove { list, .. }
+                                | CheckedContextualOperation::SortBy { list, .. }
+                                | CheckedContextualOperation::ThenBy { list, .. },
+                            ) => call
+                                .entries
+                                .iter()
+                                .find_map(|entry| match entry {
+                                    CheckedCallEntry::Input { formal, value, .. }
+                                        if *formal == list =>
+                                    {
+                                        Some(*value)
+                                    }
+                                    _ => None,
+                                })
+                                .is_some_and(|list| {
+                                    self.list_item_contains_source(
+                                        program, lookup, list, projection, active,
+                                    )
+                                }),
+                            Some(
+                                CheckedContextualOperation::Every { .. }
+                                | CheckedContextualOperation::Any { .. }
+                                | CheckedContextualOperation::Find { .. },
+                            )
+                            | None => false,
+                        }
+                    }),
+                CheckedExpressionKind::Draining { input }
+                | CheckedExpressionKind::Hold { initial: input, .. } => {
+                    self.list_item_contains_source(program, lookup, *input, projection, active)
+                }
+                CheckedExpressionKind::Latest { branches } => branches.iter().any(|branch| {
+                    self.list_item_contains_source(program, lookup, *branch, projection, active)
+                }),
+                CheckedExpressionKind::When { arms, .. }
+                | CheckedExpressionKind::While { arms, .. } => arms.iter().any(|arm| {
+                    self.list_item_contains_source(program, lookup, *arm, projection, active)
+                }),
+                CheckedExpressionKind::Then { output, .. }
+                | CheckedExpressionKind::MatchArm { output, .. } => output.is_some_and(|output| {
+                    self.list_item_contains_source(program, lookup, output, projection, active)
+                }),
+                CheckedExpressionKind::Block { result, .. } => result.is_some_and(|result| {
+                    self.list_item_contains_source(program, lookup, result, projection, active)
+                }),
+                _ => false,
+            });
+        active.remove(&node);
+        result
+    }
+
+    fn output_contains_source(
+        &self,
+        program: &CheckedProgramFields,
+        lookup: &CheckedProgramLookup,
+        target: DeclId,
+        projection: &[String],
+        active: &mut BTreeSet<CheckedSourceContainmentNode>,
+    ) -> bool {
+        let node = CheckedSourceContainmentNode::Output(target, projection.to_vec());
+        if !active.insert(node.clone()) {
+            return false;
+        }
+        let result = self
+            .contextual_lists_by_output
+            .get(&target)
+            .into_iter()
+            .flatten()
+            .any(|list| self.list_item_contains_source(program, lookup, *list, projection, active))
+            || self
+                .forwarded_outputs_by_formal
+                .get(&target)
+                .into_iter()
+                .flatten()
+                .any(|output| {
+                    self.output_contains_source(program, lookup, *output, projection, active)
+                });
+        active.remove(&node);
+        result
+    }
+}
+
+fn checked_call_named_input(
+    callable: &boon_checked::CheckedCallableSignature,
+    call: &boon_checked::CheckedCall,
+    name: &str,
+) -> Option<CheckedExprId> {
+    let formal = callable
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == name)?
+        .decl_id;
+    call.entries.iter().find_map(|entry| match entry {
+        CheckedCallEntry::Input {
+            formal: candidate,
+            value,
+            ..
+        } if *candidate == formal => Some(*value),
+        _ => None,
+    })
+}
+
 impl CheckedProgramLookup {
     fn new(program: &CheckedProgramFields) -> Self {
         let mut expressions_by_id = Vec::new();
@@ -409,15 +896,7 @@ impl CheckedProgramLookup {
             }
         }
         let mut source_bearing_resource_projections = vec![false; program.expressions.len()];
-        for requirement in &program.resource_projection_requirements {
-            if !requirement.source_origins.is_empty()
-                && let Some(slot) =
-                    source_bearing_resource_projections.get_mut(requirement.expression.0 as usize)
-            {
-                *slot = true;
-            }
-        }
-        Self {
+        let mut lookup = Self {
             expressions_by_id,
             declarations_by_id,
             statements_by_id,
@@ -433,8 +912,25 @@ impl CheckedProgramLookup {
             source_declarations,
             state_declarations,
             function_owner_by_scope,
-            source_bearing_resource_projections,
+            source_bearing_resource_projections: Vec::new(),
+        };
+        let containment = CheckedSourceContainmentIndex::new(program, &lookup);
+        for requirement in &program.resource_projection_requirements {
+            if (!requirement.source_origins.is_empty()
+                || containment.projection_contains_source(
+                    program,
+                    &lookup,
+                    requirement.target,
+                    &requirement.projection,
+                ))
+                && let Some(slot) =
+                    source_bearing_resource_projections.get_mut(requirement.expression.0 as usize)
+            {
+                *slot = true;
+            }
         }
+        lookup.source_bearing_resource_projections = source_bearing_resource_projections;
+        lookup
     }
 
     fn expression<'a>(
@@ -1116,6 +1612,11 @@ fn concrete_type_in_frame(out_net: &OutNet, ty: &Type, frame: Option<OutCallInst
         |instance| out_net.apply_type_substitutions(instance, ty),
     );
     erase_runtime_type_vars(&ty)
+}
+
+fn runtime_flow_type(mut flow_type: FlowType) -> FlowType {
+    flow_type.ty = erase_runtime_type_vars(&flow_type.ty);
+    flow_type
 }
 
 fn runtime_flush_boundary_flow_type(mut success: FlowType, flush_type: Type) -> FlowType {
@@ -6186,7 +6687,8 @@ impl<'a> SemanticExpressionBuilder<'a> {
                                 projection,
                             },
                         );
-                        self.expressions[parameter.as_usize()].flow_type = flow_type;
+                        self.expressions[parameter.as_usize()].flow_type =
+                            runtime_flow_type(flow_type);
                         return Ok(parameter);
                     }
                 }
@@ -6302,7 +6804,8 @@ impl<'a> SemanticExpressionBuilder<'a> {
                                     projection,
                                 },
                             );
-                            self.expressions[parameter.as_usize()].flow_type = flow_type;
+                            self.expressions[parameter.as_usize()].flow_type =
+                                runtime_flow_type(flow_type);
                             return Ok(parameter);
                         }
                     }
@@ -6406,7 +6909,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                             projection,
                         },
                     );
-                    self.expressions[parameter.as_usize()].flow_type = flow_type;
+                    self.expressions[parameter.as_usize()].flow_type = runtime_flow_type(flow_type);
                     return Ok(parameter);
                 }
                 let passed = scoped
@@ -7035,7 +7538,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                                 projection: Vec::new(),
                             },
                         );
-                        self.expressions[value.as_usize()].flow_type = flow_type;
+                        self.expressions[value.as_usize()].flow_type = runtime_flow_type(flow_type);
                         Some(SemanticCallContextArgument {
                             formal,
                             checked_value: None,
@@ -7451,30 +7954,34 @@ impl<'a> SemanticExpressionBuilder<'a> {
     }
 
     fn static_selector_value(&self, expression: SemanticExprId) -> Option<StaticSelectorValue> {
-        let mut expression = expression;
-        let mut projection = Vec::<String>::new();
-        let mut visited = BTreeSet::new();
-        loop {
-            if !visited.insert((expression, projection.clone())) {
-                return None;
-            }
-            let definition = self.expressions.get(expression.as_usize())?;
-            if matches!(
-                definition.kind,
-                SemanticExpressionKind::Call { .. }
-                    | SemanticExpressionKind::MaterializationLocal { .. }
-            ) && let Some(tag) = crate::out_net::singleton_tag_for_type_projection(
-                &definition.flow_type.ty,
-                &projection,
-            ) {
-                return Some(StaticSelectorValue::Tag(tag));
-            }
+        self.static_selector_value_at(expression, Vec::new(), &mut BTreeSet::new())
+    }
+
+    fn static_selector_value_at(
+        &self,
+        expression: SemanticExprId,
+        projection: Vec<String>,
+        active: &mut BTreeSet<(SemanticExprId, Vec<String>)>,
+    ) -> Option<StaticSelectorValue> {
+        let key = (expression, projection.clone());
+        if !active.insert(key.clone()) {
+            return None;
+        }
+        let definition = self.expressions.get(expression.as_usize())?;
+        let result = if matches!(
+            definition.kind,
+            SemanticExpressionKind::Call { .. }
+                | SemanticExpressionKind::MaterializationLocal { .. }
+        ) && let Some(tag) =
+            crate::out_net::singleton_tag_for_type_projection(&definition.flow_type.ty, &projection)
+        {
+            Some(StaticSelectorValue::Tag(tag))
+        } else {
             match &definition.kind {
                 SemanticExpressionKind::Project { input, fields } => {
                     let mut combined = fields.clone();
                     combined.extend(projection);
-                    projection = combined;
-                    expression = *input;
+                    self.static_selector_value_at(*input, combined, active)
                 }
                 SemanticExpressionKind::Block { result, .. }
                 | SemanticExpressionKind::Flush { payload: result }
@@ -7482,42 +7989,79 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 | SemanticExpressionKind::Draining { input: result }
                     if projection.is_empty() =>
                 {
-                    expression = *result;
+                    self.static_selector_value_at(*result, projection, active)
                 }
                 SemanticExpressionKind::When { arms, .. }
                     if projection.is_empty() && arms.len() == 1 =>
                 {
-                    expression = arms[0].output;
+                    self.static_selector_value_at(arms[0].output, projection, active)
                 }
                 SemanticExpressionKind::Object(fields)
                 | SemanticExpressionKind::TaggedObject { fields, .. }
                     if !projection.is_empty() && fields.iter().all(|field| !field.spread) =>
                 {
-                    let field = projection.remove(0);
-                    expression = fields
+                    let (field, remaining) = projection.split_first()?;
+                    let value = fields
                         .iter()
                         .rev()
-                        .find(|candidate| candidate.name == field)?
+                        .find(|candidate| candidate.name == *field)?
                         .value;
+                    self.static_selector_value_at(value, remaining.to_vec(), active)
+                }
+                SemanticExpressionKind::FunctionParameter {
+                    parameter,
+                    projection: parameter_projection,
+                } => {
+                    let mut combined = parameter_projection.clone();
+                    combined.extend(projection);
+                    let actuals = self
+                        .expressions
+                        .iter()
+                        .filter_map(|candidate| match &candidate.kind {
+                            SemanticExpressionKind::Call {
+                                callable,
+                                instance: Some(_),
+                                parameter_bindings,
+                                ..
+                            } if *callable == parameter.callable => parameter_bindings
+                                .iter()
+                                .find(|binding| binding.ordinal == parameter.ordinal)
+                                .and_then(|binding| match binding.kind {
+                                    crate::SemanticCallParameterBindingKind::Explicit {
+                                        value,
+                                        ..
+                                    } => Some(value),
+                                    crate::SemanticCallParameterBindingKind::Omitted => None,
+                                }),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let mut values = actuals.into_iter().map(|actual| {
+                        self.static_selector_value_at(actual, combined.clone(), active)
+                    });
+                    let first = values.next().flatten();
+                    first.filter(|first| values.all(|value| value.as_ref() == Some(first)))
                 }
                 SemanticExpressionKind::Number(value) if projection.is_empty() => {
-                    return Some(StaticSelectorValue::Number(value.clone()));
+                    Some(StaticSelectorValue::Number(value.clone()))
                 }
                 SemanticExpressionKind::Text(value) if projection.is_empty() => {
-                    return Some(StaticSelectorValue::Text(value.clone()));
+                    Some(StaticSelectorValue::Text(value.clone()))
                 }
                 SemanticExpressionKind::Tag(value) if projection.is_empty() => {
-                    return Some(StaticSelectorValue::Tag(value.clone()));
+                    Some(StaticSelectorValue::Tag(value.clone()))
                 }
                 SemanticExpressionKind::TaggedObject { tag, .. } if projection.is_empty() => {
-                    return Some(StaticSelectorValue::Tag(tag.clone()));
+                    Some(StaticSelectorValue::Tag(tag.clone()))
                 }
                 SemanticExpressionKind::Bits(value) if projection.is_empty() => {
-                    return Some(StaticSelectorValue::Bits(value.clone()));
+                    Some(StaticSelectorValue::Bits(value.clone()))
                 }
-                _ => return None,
+                _ => None,
             }
-        }
+        };
+        active.remove(&key);
+        result
     }
 
     fn expand_select_arm_output(
@@ -9008,6 +9552,62 @@ FUNCTION view() {
     }
 
     #[test]
+    fn retained_function_parameter_expressions_erase_definition_local_alphas() {
+        let (checked, graph) = semantic_execution_before_resources(
+            r#"
+result: [
+    number: stringify(value: 1)
+    text: stringify(value: TEXT { two })
+]
+
+FUNCTION stringify(value) {
+    TEXT { value }
+    |> Text/concat(with: value, separator: TEXT { : })
+}
+"#,
+        );
+        let checked_callable = checked
+            .callables
+            .iter()
+            .find(|callable| callable.name == "stringify")
+            .expect("checked stringify callable");
+        let checked_parameter = &checked_callable.parameters[0];
+        assert!(
+            boon_checked::runtime_type_contains_var(&checked_parameter.flow_type.ty),
+            "the regression requires a definition-local checked alpha: {checked_parameter:?}",
+        );
+
+        let callable = graph
+            .callables
+            .iter()
+            .find(|callable| callable.name == "stringify")
+            .expect("semantic stringify callable");
+        assert!(
+            callable.semantic_root.is_some(),
+            "stringify must retain one shared ordinary body"
+        );
+        let parameter = semantic_parameter_id(callable.id, 0);
+        let inputs = graph
+            .expressions
+            .iter()
+            .filter(|expression| {
+                matches!(
+                    expression.kind,
+                    SemanticExpressionKind::FunctionParameter {
+                        parameter: candidate,
+                        ..
+                    } if candidate == parameter
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!inputs.is_empty(), "retained body must read its parameter");
+        assert!(inputs.iter().all(|expression| {
+            !boon_checked::runtime_type_contains_var(&expression.flow_type.ty)
+                && expression.flow_type.ty == Type::Unknown
+        }));
+    }
+
+    #[test]
     fn flush_boundary_flow_uses_runtime_success_authority_and_erases_checked_alphas() {
         let rejected =
             Type::VariantSet(vec![boon_checked::Variant::Tag("Rejected".to_owned())].into());
@@ -9101,7 +9701,7 @@ FUNCTION nested() {
     }
 
     #[test]
-    fn ordinary_definition_retains_uninstantiated_nested_call_and_exact_pass_capture() {
+    fn ordinary_definition_prunes_unselected_nested_call_and_keeps_exact_pass_capture() {
         let graph = semantic_graph(
             r#"
 theme: [mode: Light, ignored: SOURCE]
@@ -9137,19 +9737,20 @@ FUNCTION nested() {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let (_, nested_instance, nested_context) = calls
-            .iter()
-            .find(|(function, _, _)| function.ends_with("nested"))
-            .copied()
-            .expect("nested ordinary call remains explicit in the shared body");
-        assert_eq!(
-            nested_instance, None,
-            "an unselected nested pure call must not fabricate an OUT instance"
+        assert!(
+            calls
+                .iter()
+                .all(|(function, _, _)| !function.ends_with("nested")),
+            "the exact Primary invocation must not retain its unselected Secondary call",
         );
+        let nested = graph
+            .callables
+            .iter()
+            .find(|callable| callable.name.ends_with("nested"))
+            .expect("nested callable inventory remains checked");
         assert_eq!(
-            nested_context.and_then(|argument| argument.checked_value),
-            None,
-            "inherited PASSED is represented by the owner's hidden parameter"
+            nested.semantic_root, None,
+            "an unselected definition must not become executable work"
         );
 
         let (_, choose_instance, choose_context) = calls

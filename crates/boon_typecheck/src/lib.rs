@@ -53,8 +53,8 @@ use boon_syntax::{
     __parser_pack_syntax_node_id, __parser_unpack_syntax_node_id, AstBlockBindingDeclaration,
     AstCallArg, AstCallArgKind, AstDrainPath, AstExpr, AstExprKind, AstMatchPattern, AstParameter,
     AstParameterKind, AstPassContext, AstRecordField, AstStatement, AstStatementKind,
-    AstTextSegment, BytesSizeSyntax, ParserItem, SharedAstExpressions, StableOccurrenceKey,
-    SyntaxUnitNamespace,
+    AstTextSegment, BytesSizeSyntax, ParserItem, SharedAstExpressions, StableExpressionKey,
+    StableOccurrenceKey, SyntaxUnitNamespace,
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -2712,6 +2712,12 @@ impl CheckedProgramDatabase {
                 &sources,
             )
         );
+        checked_program_phase!("apply_resource_projection_types", {
+            apply_checked_resource_projection_types(
+                &mut expressions,
+                &resource_projection_requirements,
+            )
+        });
         checked_program_phase!("refine_source_payload_types", {
             refine_checked_source_payload_types_from_requirements(
                 &mut sources,
@@ -19888,6 +19894,43 @@ pub fn project_source_payload_abi_types_and_diagnostics(
     )
 }
 
+/// Projects the parser-owned canonical path of every SOURCE-like syntax site.
+///
+/// The dense checker projection consumes this identity alongside the payload
+/// ABI. Reconstructing paths independently inside each owner loses the global
+/// statement nesting authority and can repeat a parent field at an owner
+/// boundary, so the whole-project syntax walk remains the sole path owner.
+pub fn project_source_payload_abi_paths(
+    program: &ProjectSyntaxSnapshot,
+) -> Result<BTreeMap<StableExpressionKey, String>, String> {
+    let syntax = TypecheckSyntaxProgram::UnitNative(program.clone());
+    let mut paths = BTreeMap::new();
+    for source in syntax_source_sites(&syntax) {
+        let stable = program
+            .stable_expression_key(source.expression)
+            .ok_or_else(|| {
+                format!(
+                    "SOURCE expression {} has no parser-owned stable identity",
+                    source.expression
+                )
+            })?;
+        match paths.entry(stable) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(source.path);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &source.path => {}
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                return Err(format!(
+                    "SOURCE expression has conflicting canonical paths `{}` and `{}`",
+                    entry.get(),
+                    source.path
+                ));
+            }
+        }
+    }
+    Ok(paths)
+}
+
 /// Validates host-port source/output identity and output payload contracts
 /// from parser syntax plus already-solved public output types.
 ///
@@ -36295,6 +36338,32 @@ fn refine_checked_source_payload_types_from_requirements(
             insert_source_payload_requirement_path(&mut shape, &path, &ty);
         }
         source.payload_type = Type::object(shape);
+    }
+}
+
+/// Resource provenance can discover an exact SOURCE payload projection only
+/// after contextual list/call topology has been lowered. Publish that late
+/// authority back onto the corresponding checked read before diagnostics and
+/// semantic handoff; leaving the earlier open placeholder in the expression
+/// row made a valid mapped SOURCE path look unresolved even though its exact
+/// source and payload field were already known.
+fn apply_checked_resource_projection_types(
+    expressions: &mut [CheckedExpression],
+    requirements: &[CheckedResourceProjectionRequirement],
+) {
+    for requirement in requirements {
+        if requirement.source_origins.is_empty() || !is_specific_type(&requirement.required_type) {
+            continue;
+        }
+        let Some(expression) = expressions
+            .get_mut(requirement.expression.0 as usize)
+            .filter(|expression| expression.id == requirement.expression)
+        else {
+            continue;
+        };
+        if !is_specific_type(&expression.flow_type.ty) {
+            expression.flow_type.ty = requirement.required_type.clone();
+        }
     }
 }
 

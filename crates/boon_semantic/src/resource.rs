@@ -13,8 +13,8 @@ use crate::dependency_manifest::{
 };
 use crate::{
     OutCallInstanceId, ProducerFunctionId, ProducerMaterializationMode, ResolvedOutGraph,
-    SemanticBlockBinding, SemanticCallableId, SemanticContextualOperationKind,
-    SemanticContextualRowPredecessor, SemanticDependencyChannelV1,
+    SemanticBlockBinding, SemanticCallableId, SemanticCallableKind,
+    SemanticContextualOperationKind, SemanticContextualRowPredecessor, SemanticDependencyChannelV1,
     SemanticDependencyEntityDomainV1, SemanticDependencyEntityV1, SemanticDependencyLifetimeV1,
     SemanticDependencyMultiplicityV1, SemanticDependencyPhaseV1, SemanticDependencyRoleV1,
     SemanticDependencySemanticsV1, SemanticDependencySubjectKindV1,
@@ -1181,6 +1181,54 @@ fn synthesize_inline_checked_list_targets(
                 ));
             }
         }
+
+        // An ordinary callable owns one shared semantic body. Its resource
+        // literals still have one runtime identity per invocation, represented
+        // by the compact call overlay rather than by cloning the entire body.
+        // Project those invocation coordinates into authority candidates here;
+        // the small concrete expression/statement rows below are the resource
+        // instances, not another occurrence-specialized body expansion.
+        if origin.call_instance.is_none()
+            && let Some(checked_callable) =
+                checked_scope_function_owner(checked, origin.checked_scope)?
+            && let Some(callable) = execution
+                .callables
+                .iter()
+                .find(|callable| callable.checked_callable == checked_callable)
+            && let Some(callable_root) = callable.semantic_root
+            && expression_reaches(execution, callable_root, candidate.id)?
+        {
+            for invocation in &execution.expressions {
+                let SemanticExpressionKind::Call {
+                    callable: invoked,
+                    instance: Some(call_instance),
+                    ..
+                } = &invocation.kind
+                else {
+                    continue;
+                };
+                if *invoked != callable.id {
+                    continue;
+                }
+                let invocation_origin = execution
+                    .checked_expression_origins
+                    .get(invocation.id.as_usize())
+                    .filter(|candidate| candidate.expression == invocation.id)
+                    .ok_or_else(|| {
+                        format!(
+                            "ordinary invocation expression {} has no exact origin",
+                            invocation.id
+                        )
+                    })?;
+                candidates.push(InlineListAuthorityCandidate {
+                    expression: candidate.id,
+                    authority_statement: invocation_origin.owning_statement,
+                    existing_statement: None,
+                    call_instance: Some(*call_instance),
+                    owner: invocation.owner,
+                });
+            }
+        }
     }
     let mut occurrences = BTreeMap::<
         (Option<OutCallInstanceId>, Option<StaticOwnerId>),
@@ -1286,12 +1334,14 @@ fn synthesize_inline_checked_list_targets(
             let mut concrete = definition.clone();
             concrete.id = producer;
             concrete.value_id = SemanticValueId(producer.as_usize());
+            concrete.owner = candidate.owner;
             concrete.flow_type.ty = Type::List(Type::shared(runtime_item_type.clone()));
             let concrete_flow_type = concrete.flow_type.clone();
             execution.expressions.push(concrete);
             let mut concrete_origin = origin.clone();
             concrete_origin.expression = producer;
             concrete_origin.owning_statement = Some(statement);
+            concrete_origin.call_instance = candidate.call_instance;
             execution.checked_expression_origins.push(concrete_origin);
             let scope = execution
                 .scopes
@@ -1311,7 +1361,7 @@ fn synthesize_inline_checked_list_targets(
                 },
                 scope,
                 parent,
-                call_instance: origin.call_instance,
+                call_instance: candidate.call_instance,
                 span: checked_list.span,
                 checked_resources: vec![binding],
                 declaration: None,
@@ -4691,10 +4741,14 @@ fn discover_list_projections(
     let mut projections = Vec::new();
     let mut targets = BTreeSet::new();
     for target in lists {
-        let Some(chunk) = terminal_chunk_expression(execution, target.producer)? else {
+        let Some(chunk) = terminal_chunk_expression(
+            execution,
+            SemanticExpressionOccurrence::root(target.producer),
+        )?
+        else {
             continue;
         };
-        let value = expression(execution, chunk)?;
+        let value = expression(execution, chunk.expression)?;
         let SemanticExpressionKind::Call { arguments, .. } = &value.kind else {
             unreachable!("terminal chunk is a call");
         };
@@ -4704,18 +4758,22 @@ fn discover_list_projections(
             .collect::<Vec<_>>();
         let [list_argument] = list_arguments.as_slice() else {
             return Err(format!(
-                "List/chunk expression {chunk} must have exactly one checked `list` argument"
+                "List/chunk expression {} must have exactly one checked `list` argument",
+                chunk.expression,
             ));
         };
-        let source = semantic_list_id(
+        let source = semantic_list_id_at_occurrence(
             execution,
             materialization_bindings,
             &declaration_lists,
             &locals,
-            list_argument.value,
+            chunk.child(list_argument.value),
         )?
         .ok_or_else(|| {
-            format!("List/chunk expression {chunk} has no exact semantic list provenance")
+            format!(
+                "List/chunk expression {} has no exact semantic list provenance",
+                chunk.expression,
+            )
         })?;
         list_resource(lists, source)?;
         let size_arguments = arguments
@@ -4724,10 +4782,13 @@ fn discover_list_projections(
             .collect::<Vec<_>>();
         let [size_argument] = size_arguments.as_slice() else {
             return Err(format!(
-                "List/chunk expression {chunk} must have exactly one checked `size` argument"
+                "List/chunk expression {} must have exactly one checked `size` argument",
+                chunk.expression,
             ));
         };
-        let resolved_size = match semantic_static_data(execution, size_argument.value) {
+        let size =
+            resolve_function_parameter_occurrence(execution, chunk.child(size_argument.value))?;
+        let resolved_size = match semantic_static_data(execution, size.expression) {
             Ok(boon_data::Value::Number(value)) => value.to_usize_exact().ok(),
             Ok(_) | Err(_) => None,
         };
@@ -4741,7 +4802,7 @@ fn discover_list_projections(
             target: target.id,
             source,
             kind: SemanticListProjectionKindV1::Chunk {
-                size_expression: Some(size_argument.value),
+                size_expression: Some(size.expression),
                 resolved_size,
             },
         });
@@ -4749,27 +4810,192 @@ fn discover_list_projections(
     Ok(projections)
 }
 
+/// A shared definition expression plus the compact invocation overlays needed
+/// to interpret its `FunctionParameter` leaves. Arguments in frame `n` are
+/// expressions in frame `n - 1`; this keeps definition bodies shared while
+/// resource discovery follows one exact call occurrence.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SemanticExpressionOccurrence {
+    expression: SemanticExprId,
+    frames: Vec<SemanticInvocationFrame>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SemanticInvocationFrame {
+    call_expression: SemanticExprId,
+    callable: SemanticCallableId,
+    arguments: Vec<(usize, SemanticExprId)>,
+}
+
+impl SemanticExpressionOccurrence {
+    fn root(expression: SemanticExprId) -> Self {
+        Self {
+            expression,
+            frames: Vec::new(),
+        }
+    }
+
+    fn child(&self, expression: SemanticExprId) -> Self {
+        Self {
+            expression,
+            frames: self.frames.clone(),
+        }
+    }
+}
+
+fn enter_ordinary_call_occurrence(
+    execution: &SemanticExecutionImageColumnsV1,
+    occurrence: &SemanticExpressionOccurrence,
+) -> Result<Option<SemanticExpressionOccurrence>, String> {
+    let value = expression(execution, occurrence.expression)?;
+    let SemanticExpressionKind::Call {
+        callable,
+        callable_kind: SemanticCallableKind::User,
+        parameter_bindings,
+        ..
+    } = &value.kind
+    else {
+        return Ok(None);
+    };
+    let definition = execution
+        .callables
+        .get(callable.as_usize())
+        .filter(|candidate| candidate.id == *callable)
+        .ok_or_else(|| {
+            format!(
+                "ordinary call expression {} references missing callable {callable}",
+                occurrence.expression
+            )
+        })?;
+    let Some(root) = definition.semantic_root else {
+        return Ok(None);
+    };
+    let mut arguments = parameter_bindings
+        .iter()
+        .filter_map(|binding| match binding.kind {
+            crate::SemanticCallParameterBindingKind::Explicit { value, .. } => {
+                Some((binding.ordinal, value))
+            }
+            crate::SemanticCallParameterBindingKind::Omitted => None,
+        })
+        .collect::<Vec<_>>();
+    arguments.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+    if arguments.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(format!(
+            "ordinary call expression {} repeats a parameter ordinal",
+            occurrence.expression
+        ));
+    }
+    let mut frames = occurrence.frames.clone();
+    frames.push(SemanticInvocationFrame {
+        call_expression: occurrence.expression,
+        callable: *callable,
+        arguments,
+    });
+    Ok(Some(SemanticExpressionOccurrence {
+        expression: root,
+        frames,
+    }))
+}
+
+fn resolve_function_parameter_occurrence(
+    execution: &SemanticExecutionImageColumnsV1,
+    mut occurrence: SemanticExpressionOccurrence,
+) -> Result<SemanticExpressionOccurrence, String> {
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(occurrence.clone()) {
+            return Err(format!(
+                "semantic invocation parameter resolution contains a cycle through {}",
+                occurrence.expression
+            ));
+        }
+        let value = expression(execution, occurrence.expression)?;
+        let SemanticExpressionKind::FunctionParameter {
+            parameter,
+            projection,
+        } = &value.kind
+        else {
+            return Ok(occurrence);
+        };
+        if !projection.is_empty() {
+            return Err(format!(
+                "resource invocation parameter {:?} has unsupported projection {:?}",
+                parameter, projection
+            ));
+        }
+        let frame_index = occurrence
+            .frames
+            .iter()
+            .rposition(|frame| frame.callable == parameter.callable)
+            .ok_or_else(|| {
+                format!(
+                    "function parameter {:?} has no compact invocation frame",
+                    parameter
+                )
+            })?;
+        let actual = occurrence.frames[frame_index]
+            .arguments
+            .iter()
+            .find(|(ordinal, _)| *ordinal == parameter.ordinal)
+            .map(|(_, value)| *value)
+            .ok_or_else(|| {
+                format!(
+                    "function parameter {:?} has no exact invocation argument",
+                    parameter
+                )
+            })?;
+        occurrence.expression = actual;
+        occurrence.frames.truncate(frame_index);
+    }
+}
+
 fn terminal_chunk_expression(
     execution: &SemanticExecutionImageColumnsV1,
-    root: SemanticExprId,
-) -> Result<Option<SemanticExprId>, String> {
-    let mut colors = vec![0_u8; execution.expressions.len()];
-    let mut results = BTreeMap::<SemanticExprId, Option<SemanticExprId>>::new();
-    let mut pending = vec![(root, false)];
-    while let Some((id, exiting)) = pending.pop() {
-        let index = id.as_usize();
+    root: SemanticExpressionOccurrence,
+) -> Result<Option<SemanticExpressionOccurrence>, String> {
+    let mut colors = BTreeMap::<SemanticExpressionOccurrence, u8>::new();
+    let mut results =
+        BTreeMap::<SemanticExpressionOccurrence, Option<SemanticExpressionOccurrence>>::new();
+    let mut pending = vec![(root.clone(), false)];
+    while let Some((occurrence, exiting)) = pending.pop() {
+        let id = occurrence.expression;
         let value = expression(execution, id)?;
         if exiting {
             let result = match &value.kind {
-                SemanticExpressionKind::Call { name, .. } if name == "List/chunk" => Some(id),
+                SemanticExpressionKind::Call { name, .. } if name == "List/chunk" => {
+                    Some(occurrence.clone())
+                }
+                SemanticExpressionKind::Call { .. } => {
+                    if let Some(body) = enter_ordinary_call_occurrence(execution, &occurrence)? {
+                        results.get(&body).cloned().ok_or_else(|| {
+                            format!(
+                                "terminal chunk call body {} was not evaluated",
+                                body.expression
+                            )
+                        })?
+                    } else {
+                        None
+                    }
+                }
+                SemanticExpressionKind::FunctionParameter { .. } => {
+                    let actual =
+                        resolve_function_parameter_occurrence(execution, occurrence.clone())?;
+                    results.get(&actual).cloned().ok_or_else(|| {
+                        format!(
+                            "terminal chunk parameter actual {} was not evaluated",
+                            actual.expression
+                        )
+                    })?
+                }
                 SemanticExpressionKind::Block { result, .. } => results
-                    .get(result)
-                    .copied()
+                    .get(&occurrence.child(*result))
+                    .cloned()
                     .ok_or_else(|| format!("terminal chunk child {result} was not evaluated"))?,
                 SemanticExpressionKind::Project { input, .. }
                 | SemanticExpressionKind::Draining { input } => results
-                    .get(input)
-                    .copied()
+                    .get(&occurrence.child(*input))
+                    .cloned()
                     .ok_or_else(|| format!("terminal chunk child {input} was not evaluated"))?,
                 SemanticExpressionKind::Then {
                     output: Some(output),
@@ -4779,22 +5005,26 @@ fn terminal_chunk_expression(
                     output: Some(output),
                     ..
                 } => results
-                    .get(output)
-                    .copied()
+                    .get(&occurrence.child(*output))
+                    .cloned()
                     .ok_or_else(|| format!("terminal chunk child {output} was not evaluated"))?,
-                SemanticExpressionKind::When { arms, .. } => {
-                    exact_terminal_chunk_branches(id, arms.iter().map(|arm| arm.output), &results)?
-                }
-                SemanticExpressionKind::Latest { branches } => {
-                    exact_terminal_chunk_branches(id, branches.iter().copied(), &results)?
-                }
+                SemanticExpressionKind::When { arms, .. } => exact_terminal_chunk_branches(
+                    &occurrence,
+                    arms.iter().map(|arm| occurrence.child(arm.output)),
+                    &results,
+                )?,
+                SemanticExpressionKind::Latest { branches } => exact_terminal_chunk_branches(
+                    &occurrence,
+                    branches.iter().map(|branch| occurrence.child(*branch)),
+                    &results,
+                )?,
                 _ => None,
             };
-            results.insert(id, result);
-            colors[index] = 2;
+            results.insert(occurrence.clone(), result);
+            colors.insert(occurrence, 2);
             continue;
         }
-        match colors[index] {
+        match colors.get(&occurrence).copied().unwrap_or(0) {
             2 => continue,
             1 => {
                 return Err(format!(
@@ -4803,12 +5033,24 @@ fn terminal_chunk_expression(
             }
             _ => {}
         }
-        colors[index] = 1;
-        pending.push((id, true));
+        colors.insert(occurrence.clone(), 1);
+        pending.push((occurrence.clone(), true));
         let children = match &value.kind {
-            SemanticExpressionKind::Block { result, .. } => vec![*result],
+            SemanticExpressionKind::Call { name, .. } if name == "List/chunk" => Vec::new(),
+            SemanticExpressionKind::Call { .. } => {
+                enter_ordinary_call_occurrence(execution, &occurrence)?
+                    .into_iter()
+                    .collect()
+            }
+            SemanticExpressionKind::FunctionParameter { .. } => {
+                vec![resolve_function_parameter_occurrence(
+                    execution,
+                    occurrence.clone(),
+                )?]
+            }
+            SemanticExpressionKind::Block { result, .. } => vec![occurrence.child(*result)],
             SemanticExpressionKind::Project { input, .. }
-            | SemanticExpressionKind::Draining { input } => vec![*input],
+            | SemanticExpressionKind::Draining { input } => vec![occurrence.child(*input)],
             SemanticExpressionKind::Then {
                 output: Some(output),
                 ..
@@ -4816,41 +5058,48 @@ fn terminal_chunk_expression(
             | SemanticExpressionKind::MatchArm {
                 output: Some(output),
                 ..
-            } => vec![*output],
-            SemanticExpressionKind::When { arms, .. } => {
-                arms.iter().map(|arm| arm.output).collect()
-            }
-            SemanticExpressionKind::Latest { branches } => branches.clone(),
+            } => vec![occurrence.child(*output)],
+            SemanticExpressionKind::When { arms, .. } => arms
+                .iter()
+                .map(|arm| occurrence.child(arm.output))
+                .collect(),
+            SemanticExpressionKind::Latest { branches } => branches
+                .iter()
+                .map(|branch| occurrence.child(*branch))
+                .collect(),
             _ => Vec::new(),
         };
         for child in children.into_iter().rev() {
-            let child_index = child.as_usize();
-            expression(execution, child)?;
-            if colors[child_index] == 1 {
+            expression(execution, child.expression)?;
+            if colors.get(&child).copied() == Some(1) {
                 return Err(format!(
-                    "list projection expression {id} contains a semantic cycle through {child}"
+                    "list projection expression {id} contains a semantic cycle through {}",
+                    child.expression,
                 ));
             }
-            if colors[child_index] != 2 {
+            if colors.get(&child).copied() != Some(2) {
                 pending.push((child, false));
             }
         }
     }
     results
         .remove(&root)
-        .ok_or_else(|| format!("list projection root {root} was not evaluated"))
+        .ok_or_else(|| format!("list projection root {} was not evaluated", root.expression))
 }
 
 fn exact_terminal_chunk_branches(
-    parent: SemanticExprId,
-    branches: impl IntoIterator<Item = SemanticExprId>,
-    results: &BTreeMap<SemanticExprId, Option<SemanticExprId>>,
-) -> Result<Option<SemanticExprId>, String> {
+    parent: &SemanticExpressionOccurrence,
+    branches: impl IntoIterator<Item = SemanticExpressionOccurrence>,
+    results: &BTreeMap<SemanticExpressionOccurrence, Option<SemanticExpressionOccurrence>>,
+) -> Result<Option<SemanticExpressionOccurrence>, String> {
     let chunks = branches
         .into_iter()
         .map(|branch| {
-            results.get(&branch).copied().ok_or_else(|| {
-                format!("terminal chunk branch {branch} of {parent} was not evaluated")
+            results.get(&branch).cloned().ok_or_else(|| {
+                format!(
+                    "terminal chunk branch {} of {} was not evaluated",
+                    branch.expression, parent.expression,
+                )
             })
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
@@ -4858,9 +5107,27 @@ fn exact_terminal_chunk_branches(
         0 => Ok(None),
         1 => Ok(chunks.into_iter().next().flatten()),
         _ => Err(format!(
-            "conditional semantic list projection {parent} has inconsistent terminal chunk operations"
+            "conditional semantic list projection {} has inconsistent terminal chunk operations",
+            parent.expression,
         )),
     }
+}
+
+fn semantic_list_id_at_occurrence(
+    execution: &SemanticExecutionImageColumnsV1,
+    materialization_bindings: &[SemanticMaterializationResourceBindingV1],
+    lists_by_declaration: &BTreeMap<DeclId, SemanticListId>,
+    local_bindings: &BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
+    occurrence: SemanticExpressionOccurrence,
+) -> Result<Option<SemanticListId>, String> {
+    let occurrence = resolve_function_parameter_occurrence(execution, occurrence)?;
+    semantic_list_id(
+        execution,
+        materialization_bindings,
+        lists_by_declaration,
+        local_bindings,
+        occurrence.expression,
+    )
 }
 
 pub(super) fn semantic_list_id(
@@ -6657,11 +6924,18 @@ FUNCTION comparison_segments() {
             materialized_empty_lists, checked_empty_lists,
             "every reachable empty checked list needs an exact value authority"
         );
+        let page_result_declaration = semantic
+            .resource_graph
+            .states
+            .iter()
+            .find(|state| state.semantic_path.as_deref() == Some("store.page_result"))
+            .expect("published page_result state")
+            .declaration;
         let page_result_states = semantic
             .resource_graph
             .states
             .iter()
-            .filter(|state| state.declared_path == "store.page_result")
+            .filter(|state| state.declaration == page_result_declaration)
             .collect::<Vec<_>>();
         assert_eq!(
             page_result_states.len(),

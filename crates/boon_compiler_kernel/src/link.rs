@@ -585,19 +585,8 @@ impl KernelCheckedLinkLayout {
     ) -> Result<KernelCheckedRows, KernelCheckedLinkError> {
         let scopes = self.materialize_scopes(snapshot)?;
         let mut declarations = self.materialize_declarations(snapshot)?.into_vec();
-        let expressions = self.materialize_expressions(snapshot)?;
-        let runtime_flow_terms = self.materialize_runtime_flow_terms(snapshot)?;
-        #[cfg(test)]
-        {
-            let replay =
-                CheckedRuntimeFlowTermProjectionV1::derive_from_checked_expressions(&expressions)
-                    .map_err(KernelCheckedLinkError::new)?;
-            if runtime_flow_terms != replay {
-                return Err(KernelCheckedLinkError::new(
-                    "kernel direct runtime flow-term handoff differs from rich checked replay",
-                ));
-            }
-        }
+        let mut expressions = self.materialize_expressions(snapshot)?.into_vec();
+        let mut runtime_flow_terms = self.materialize_runtime_flow_terms(snapshot)?;
         let statements = self.materialize_statements(snapshot)?;
         let sources = self.materialize_sources(snapshot)?;
         let states = self.materialize_states(snapshot)?;
@@ -619,6 +608,28 @@ impl KernelCheckedLinkLayout {
             &expressions,
             &sources,
         );
+        let corrected_resource_projection_flows = apply_checked_resource_projection_types(
+            &mut expressions,
+            &resource_projection_requirements,
+        );
+        runtime_flow_terms
+            .apply_expression_flow_overrides(
+                corrected_resource_projection_flows
+                    .iter()
+                    .map(|expression| (*expression, &expressions[expression.0 as usize].flow_type)),
+            )
+            .map_err(KernelCheckedLinkError::new)?;
+        #[cfg(test)]
+        {
+            let replay =
+                CheckedRuntimeFlowTermProjectionV1::derive_from_checked_expressions(&expressions)
+                    .map_err(KernelCheckedLinkError::new)?;
+            if runtime_flow_terms != replay {
+                return Err(KernelCheckedLinkError::new(
+                    "kernel direct runtime flow-term handoff differs from rich checked replay",
+                ));
+            }
+        }
         let (occurrences, occurrence_ranges) =
             self.materialize_occurrences(snapshot, &declarations, &expressions, &calls)?;
         let definition_execution_templates = self.materialize_definition_execution_templates(
@@ -631,7 +642,7 @@ impl KernelCheckedLinkLayout {
         Ok(KernelCheckedRows {
             scopes,
             declarations: declarations.into_boxed_slice(),
-            expressions,
+            expressions: expressions.into_boxed_slice(),
             statements,
             callables: callables.into_boxed_slice(),
             context_formals,
@@ -4871,6 +4882,31 @@ fn checked_resource_projection_requirements(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
+}
+
+fn apply_checked_resource_projection_types(
+    expressions: &mut [CheckedExpression],
+    requirements: &[CheckedResourceProjectionRequirement],
+) -> Box<[CheckedExprId]> {
+    let mut corrected = Vec::new();
+    for requirement in requirements {
+        if requirement.source_origins.is_empty()
+            || !checked_type_is_specific(&requirement.required_type)
+        {
+            continue;
+        }
+        let Some(expression) = expressions
+            .get_mut(requirement.expression.0 as usize)
+            .filter(|expression| expression.id == requirement.expression)
+        else {
+            continue;
+        };
+        if !checked_type_is_specific(&expression.flow_type.ty) {
+            expression.flow_type.ty = requirement.required_type.clone();
+            corrected.push(expression.id);
+        }
+    }
+    corrected.into_boxed_slice()
 }
 
 fn checked_type_is_specific(ty: &Type) -> bool {

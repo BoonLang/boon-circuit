@@ -315,6 +315,47 @@ impl CheckedRuntimeFlowTermProjectionV1 {
         Ok(Self::from_runtime_flow_digests(digests))
     }
 
+    /// Replace the runtime-erased flow proofs for a sparse set of expressions.
+    ///
+    /// The dense checker normally publishes these digests directly from its
+    /// solved definition-local term modules. A few whole-project authorities
+    /// become exact only while checked rows are linked (currently exact SOURCE
+    /// payload projections). Rebuilding the complete rich type graph merely to
+    /// publish those sparse corrections would defeat the compact handoff, so
+    /// the linker re-interns only the corrected flow roots here.
+    pub fn apply_expression_flow_overrides<'a>(
+        &mut self,
+        overrides: impl IntoIterator<Item = (CheckedExprId, &'a FlowType)>,
+    ) -> Result<(), String> {
+        let mut builder = ArtifactTypeModuleBuilderV1::new();
+        let mut seen = BTreeMap::<CheckedExprId, [u8; 32]>::new();
+        for (expression, flow_type) in overrides {
+            let digest = builder.intern_flow(flow_type)?.runtime_erased_digest;
+            if let Some(previous) = seen.insert(expression, digest)
+                && previous != digest
+            {
+                return Err(format!(
+                    "checked runtime flow-term expression {} has conflicting overrides",
+                    expression.0
+                ));
+            }
+        }
+        for (expression, digest) in seen {
+            let slot = self
+                .expression_runtime_flow_digests
+                .get_mut(expression.0 as usize)
+                .ok_or_else(|| {
+                    format!(
+                        "checked runtime flow-term override references missing expression {}",
+                        expression.0
+                    )
+                })?;
+            *slot = digest;
+        }
+        self.stable_digest = runtime_flow_projection_digest(&self.expression_runtime_flow_digests);
+        Ok(())
+    }
+
     pub fn seal(
         self,
         source_bundle_digest_v1: SourceBundleDigestV1,

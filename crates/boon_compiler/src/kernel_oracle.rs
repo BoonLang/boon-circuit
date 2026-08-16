@@ -52,7 +52,7 @@ use boon_syntax::{
     AstBlockBindingDeclaration, AstCallArgKind, AstExpr, AstExprKind, AstMatchPattern,
     AstParameterKind, AstStatement, AstStatementKind, AstTextSegment, StableCheckOwnerKey,
     StableExpressionKey, StableItemRouteSegment, StableOccurrenceKey, StableStatementKey,
-    StableStatementKind, UnitItemKind, UnitLocalStatementId,
+    UnitItemKind, UnitLocalStatementId,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -617,6 +617,7 @@ fn prepare_kernel_project_projection(
         .as_ref()
         .map_err(|error| (*error).clone())
         .and_then(|authoritative| project_callable_surfaces(project, authoritative));
+    let source_paths = boon_typecheck::project_source_payload_abi_paths(project);
     let owner_projection_started = Instant::now();
     let mut direct_projection_elapsed = Duration::ZERO;
     let mut prepared = Vec::<PreparedOwner>::new();
@@ -636,6 +637,7 @@ fn prepare_kernel_project_projection(
             let compact = compact_owner_view(
                 view,
                 source_payloads,
+                source_paths.as_ref().map_err(Clone::clone)?,
                 callable_surfaces.as_ref().map_err(Clone::clone)?,
                 authoritative_call_shapes.as_ref().map_err(Clone::clone)?,
                 &value_surfaces,
@@ -4700,6 +4702,7 @@ fn local_value_surface_provider(
 fn compact_owner_view(
     view: UnitOwnerSyntaxView<'_>,
     source_payloads: &BTreeMap<String, Type>,
+    source_paths: &BTreeMap<StableExpressionKey, String>,
     callable_surfaces: &BTreeMap<String, Box<[CallableSurface]>>,
     authoritative_call_shapes: &BTreeMap<String, AuthoritativeCallSurface>,
     value_surfaces: &BTreeMap<String, Vec<ValueSurface>>,
@@ -4776,18 +4779,6 @@ fn compact_owner_view(
         }
         _ => (0, BTreeMap::<String, usize>::new()),
     };
-    let statement_roots = view
-        .statement_ids()
-        .iter()
-        .copied()
-        .zip(view.statements())
-        .filter_map(|(statement_id, statement)| {
-            Some((
-                statement.expr?,
-                view.stable_statement_key_local(statement_id)?,
-            ))
-        })
-        .collect::<Vec<_>>();
     let raw_expressions = view.expressions().collect::<Vec<_>>();
     let expressions = view.stable_expression_keys().collect::<Vec<_>>();
     if raw_expressions.len() != expressions.len() {
@@ -4854,12 +4845,6 @@ fn compact_owner_view(
     })
     .flatten();
 
-    let source_paths = direct_view_source_payload_paths(
-        &raw_expressions,
-        &expressions,
-        &local_by_syntax,
-        &statement_roots,
-    )?;
     let mut structured_records = direct_structured_statement_records(view)?;
     if let Some(container) = root_statement.expr
         && !local_by_syntax
@@ -10839,100 +10824,6 @@ fn direct_hold_update_expressions(
     Ok(updates)
 }
 
-fn direct_view_source_payload_paths(
-    expressions: &[&boon_syntax::AstExpr],
-    stable_expressions: &[StableExpressionKey],
-    local_by_syntax: &BTreeMap<usize, usize>,
-    statement_roots: &[(usize, boon_syntax::StableStatementKey)],
-) -> Result<BTreeMap<StableExpressionKey, String>, String> {
-    fn visit(
-        reference: usize,
-        expressions: &[&boon_syntax::AstExpr],
-        local_by_syntax: &BTreeMap<usize, usize>,
-        prefix: &[String],
-        projection: &mut Vec<String>,
-        active: &mut BTreeSet<usize>,
-        queries: &mut BTreeMap<usize, String>,
-    ) -> Result<(), String> {
-        let Some(index) = local_by_syntax.get(&reference).copied() else {
-            return Ok(());
-        };
-        if !active.insert(index) {
-            return Ok(());
-        }
-        let expression = expressions[index];
-        if matches!(expression.kind, AstExprKind::Source) {
-            let canonical_path = prefix
-                .iter()
-                .chain(projection.iter())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(".");
-            if !canonical_path.is_empty() {
-                match queries.entry(index) {
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(canonical_path);
-                    }
-                    std::collections::btree_map::Entry::Occupied(entry)
-                        if entry.get() == &canonical_path => {}
-                    std::collections::btree_map::Entry::Occupied(entry) => {
-                        return Err(format!(
-                            "source expression {} has conflicting stable paths `{}` and `{canonical_path}`",
-                            expression.id,
-                            entry.get()
-                        ));
-                    }
-                }
-            }
-        }
-        for (role, input) in source_ast_edges(expression)? {
-            let projection_len = projection.len();
-            if let KernelOwnerEdgeRole::RecordField {
-                name,
-                spread: false,
-            } = role
-            {
-                projection.push(name.into());
-            }
-            visit(
-                input,
-                expressions,
-                local_by_syntax,
-                prefix,
-                projection,
-                active,
-                queries,
-            )?;
-            projection.truncate(projection_len);
-        }
-        active.remove(&index);
-        Ok(())
-    }
-
-    let mut by_index = BTreeMap::new();
-    for (root, statement) in statement_roots {
-        visit(
-            *root,
-            expressions,
-            local_by_syntax,
-            &statement_source_path_prefix(statement),
-            &mut Vec::new(),
-            &mut BTreeSet::new(),
-            &mut by_index,
-        )?;
-    }
-    by_index
-        .into_iter()
-        .map(|(index, path)| {
-            stable_expressions
-                .get(index)
-                .cloned()
-                .map(|expression| (expression, path))
-                .ok_or_else(|| "source expression has no stable identity".to_owned())
-        })
-        .collect()
-}
-
 fn source_ast_edges(
     expression: &boon_syntax::AstExpr,
 ) -> Result<Vec<(KernelOwnerEdgeRole, usize)>, String> {
@@ -11411,45 +11302,6 @@ fn compact_ast_edges(
         unsupported => return Err(format!("unsupported owner node {unsupported:?}")),
     };
     Ok(edges)
-}
-
-fn statement_source_path_prefix(statement: &boon_syntax::StableStatementKey) -> Vec<String> {
-    let mut prefix = statement
-        .route
-        .owner
-        .iter()
-        .flat_map(|owner| owner.segments())
-        .filter_map(|segment| {
-            let name = segment.names.first()?;
-            Some(match segment.kind {
-                UnitItemKind::Function => format!("FUNCTION:{name}"),
-                UnitItemKind::Field
-                | UnitItemKind::Source
-                | UnitItemKind::Hold
-                | UnitItemKind::List => name.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
-    prefix.extend(
-        statement
-            .route
-            .statement_route
-            .iter()
-            .filter_map(|segment| {
-                let name = segment.names.first()?;
-                Some(match segment.kind {
-                    StableStatementKind::Function => format!("FUNCTION:{name}"),
-                    StableStatementKind::Field
-                    | StableStatementKind::Source
-                    | StableStatementKind::Hold
-                    | StableStatementKind::List => name.clone(),
-                    StableStatementKind::Block
-                    | StableStatementKind::Spread
-                    | StableStatementKind::Expression => return None,
-                })
-            }),
-    );
-    prefix
 }
 
 fn checked_kernel_expression(expression: usize) -> Result<KernelExpressionId, String> {
@@ -19106,6 +18958,60 @@ mod tests {
             "the child LIST must retain its parent field declaration authority"
         );
         assert_eq!(list.item_type, Type::Number);
+    }
+
+    #[test]
+    fn mapped_source_uses_the_parser_owned_abi_path_and_closes_its_read() {
+        let source = r#"
+store: [
+    rows:
+        LIST { [name: TEXT { one }] }
+        |> List/map(item, new: selectable_row(row: item))
+    selected_addresses:
+        rows
+        |> List/map(item, new: item.controls.select.address)
+]
+
+FUNCTION selectable_row(row) {
+    [controls: [select: SOURCE], name: row.name]
+}
+"#;
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse mapped SOURCE project");
+        let source_paths = boon_typecheck::project_source_payload_abi_paths(&project)
+            .expect("project parser-owned SOURCE paths");
+        assert_eq!(
+            source_paths
+                .values()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["FUNCTION:selectable_row.controls.select"]
+        );
+        let payloads = boon_typecheck::project_source_payload_abi_types(&project)
+            .expect("project mapped SOURCE payload ABI");
+        let report = kernel_owner_oracle_with_source_payloads(&project, &payloads);
+        assert!(
+            report
+                .unsupported
+                .iter()
+                .all(|(owner, _)| matches!(owner, StableCheckOwnerKey::UnitRoot(_))),
+            "mapped SOURCE owners must compile: {:#?}",
+            report.unsupported
+        );
+        let requirement = report
+            .checked_resource_projection_requirements
+            .iter()
+            .find(|requirement| {
+                requirement
+                    .source_origins
+                    .iter()
+                    .any(|origin| origin.payload_projection == ["address"])
+            })
+            .expect("mapped SOURCE address read has exact provenance");
+        let expression = &report.checked_expressions[requirement.expression.0 as usize];
+        assert_eq!(expression.flow_type.ty, Type::Text);
+        assert_eq!(requirement.required_type, Type::Text);
     }
 
     #[test]

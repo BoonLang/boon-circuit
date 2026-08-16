@@ -17194,7 +17194,7 @@ document: Document/new(
     }
 
     #[test]
-    fn producer_ownership_and_source_routes_separate_resources_from_scalars() {
+    fn source_bearing_forwarders_use_occurrence_routes_without_scalar_ownership() {
         let compiled = compiled_resource_rows();
         assert!(
             compiled
@@ -17202,8 +17202,8 @@ document: Document/new(
                 .executable
                 .ordinary_functions
                 .iter()
-                .any(|function| function.name == "forward_row"),
-            "resource projection forwarding must retain the shared ordinary callable body"
+                .all(|function| function.name != "forward_row"),
+            "a SOURCE-bearing forwarder needs occurrence-owned routing, not one shared ordinary callable body"
         );
         let resource = compiled
             .ir

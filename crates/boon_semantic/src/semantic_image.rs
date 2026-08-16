@@ -13,8 +13,8 @@
 
 use crate::{
     DistributedCallOccurrenceRoot, OutCallInstanceId, ResolvedOutGraph,
-    SemanticExecutionImageColumnsV1, SemanticExprId, SemanticFunction, SemanticStatementId,
-    StaticOwnerId,
+    SemanticExecutionImageColumnsV1, SemanticExprId, SemanticFunction, SemanticSourceId,
+    SemanticStatementId, StaticOwnerId,
 };
 use boon_checked::{
     CHECKED_IMAGE_HANDOFF_SCHEMA_V4, CheckedImageHandoffV4, CheckedImageProjectionIdV2,
@@ -1512,7 +1512,7 @@ fn seal_execution_expression_proof_v2(
         scratch,
         "effect override",
     )?;
-    if plan.specialized_static {
+    if !plan.static_origin.is_definition() {
         hasher.update([1]);
         execution_proof_update_static_override_v1(&mut hasher, &executable.kind, scratch)?;
     } else {
@@ -1837,7 +1837,46 @@ struct ExecutionExpressionProofPlanV2 {
     definition_runtime_flow_digest: [u8; 32],
     flow_override_digest: Option<[u8; 32]>,
     definition_effect: bool,
-    specialized_static: bool,
+    static_origin: ExecutionStaticOriginV1,
+}
+
+/// Exact construction authority for an execution expression's static shape.
+///
+/// `Definition` reuses the checked definition fragment. Every other variant
+/// names the semantic operation that is allowed to replace that authored
+/// shape at one concrete occurrence. The occurrence proof still commits the
+/// complete specialized executable kind; this enum is the fail-closed
+/// authorization that prevents a new shape rewrite from being accepted merely
+/// because it resembles an older rewrite.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+enum ExecutionStaticOriginV1 {
+    Definition,
+    ExpandedUserCall {
+        call: boon_checked::CheckedCallId,
+    },
+    ContextualBinding,
+    ContextualMaterialization,
+    StaticSelection,
+    DelimiterRuntime,
+    MatchBinding,
+    FlushBoundary,
+    OutputRootProjection {
+        ordinal: u32,
+        input: SemanticExprId,
+    },
+    ProducerInvocationSource {
+        source: SemanticSourceId,
+    },
+    ProducerInvocationResult {
+        statement: SemanticStatementId,
+        source: SemanticExprId,
+    },
+}
+
+impl ExecutionStaticOriginV1 {
+    const fn is_definition(&self) -> bool {
+        matches!(self, Self::Definition)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -3920,52 +3959,122 @@ fn definition_owns_semantic_expression_static_v1(
     }
 }
 
-fn semantic_expression_has_explicit_static_specialization_v1(
+fn semantic_expression_static_specialization_v1(
     checked: &boon_checked::CheckedExpressionKind,
     semantic: &crate::SemanticExpressionKind,
     expandable_user_call: bool,
-) -> bool {
+    output_root: Option<&crate::SemanticRoot>,
+    producer_source: Option<&crate::SemanticSourceDef>,
+    producer_result: Option<&crate::SemanticStatement>,
+) -> Result<Option<ExecutionStaticOriginV1>, String> {
     use crate::SemanticExpressionKind as Semantic;
     use boon_checked::CheckedExpressionKind as Checked;
 
     if expandable_user_call
-        && matches!(checked, Checked::Call { .. })
+        && let Checked::Call { call } = checked
         && !matches!(semantic, Semantic::Call { .. })
     {
         // Non-retained user calls are inlined by contextual expansion, so the
         // occurrence kind is the callable body's selected result rather than
         // `Call`. The compact occurrence proof below binds that final kind and
         // all of its ordered children.
-        return true;
+        return Ok(Some(ExecutionStaticOriginV1::ExpandedUserCall {
+            call: *call,
+        }));
     }
 
-    matches!(
-        (checked, semantic),
+    if let Some(root) = output_root {
+        let Semantic::Project { input, fields } = semantic else {
+            return Err(format!(
+                "semantic output root {} is not an explicit projection: {semantic:?}",
+                root.ordinal
+            ));
+        };
+        if !fields.is_empty() {
+            return Err(format!(
+                "semantic output root {} projection is not identity-preserving: {fields:?}",
+                root.ordinal
+            ));
+        }
+        return Ok(Some(ExecutionStaticOriginV1::OutputRootProjection {
+            ordinal: u32::try_from(root.ordinal)
+                .map_err(|_| "semantic output-root ordinal exceeds u32".to_owned())?,
+            input: *input,
+        }));
+    }
+
+    if let Some(source) = producer_source {
+        let Semantic::Source { binding_path } = semantic else {
+            return Err(format!(
+                "producer invocation source {} has non-SOURCE expression kind {semantic:?}",
+                source.id
+            ));
+        };
+        if binding_path != &source.binding_path {
+            return Err(format!(
+                "producer invocation source {} expression binding `{binding_path}` differs from `{}`",
+                source.id, source.binding_path
+            ));
+        }
+        return Ok(Some(ExecutionStaticOriginV1::ProducerInvocationSource {
+            source: source.id,
+        }));
+    }
+
+    if let Some(statement) = producer_result {
+        let Semantic::Then { input, output } = semantic else {
+            return Err(format!(
+                "producer invocation statement {} has non-THEN result kind {semantic:?}",
+                statement.id
+            ));
+        };
+        if output.is_none() {
+            return Err(format!(
+                "producer invocation statement {} has no result body",
+                statement.id
+            ));
+        }
+        return Ok(Some(ExecutionStaticOriginV1::ProducerInvocationResult {
+            statement: statement.id,
+            source: *input,
+        }));
+    }
+
+    Ok(match (checked, semantic) {
         (
             Checked::Passed { .. },
             Semantic::ElementState { .. }
-                | Semantic::MaterializationLocal { .. }
-                | Semantic::FunctionParameter { .. }
-                | Semantic::Project { .. }
-                | Semantic::LocalRead { .. }
-                | Semantic::CanonicalRead { .. }
-        ) | (
+            | Semantic::MaterializationLocal { .. }
+            | Semantic::FunctionParameter { .. }
+            | Semantic::Project { .. }
+            | Semantic::LocalRead { .. }
+            | Semantic::CanonicalRead { .. },
+        )
+        | (
             Checked::Read { .. },
             Semantic::CanonicalRead { .. }
-                | Semantic::LocalRead { .. }
-                | Semantic::Project { .. }
-                | Semantic::MaterializationLocal { .. }
-                | Semantic::FunctionParameter { .. }
-                | Semantic::ElementState { .. }
-        ) | (
-            Checked::Call { .. },
-            Semantic::Materialize { .. } | Semantic::Project { .. },
-        ) | (Checked::When { .. }, Semantic::When { .. })
-            | (Checked::While { .. }, Semantic::When { .. })
-            | (Checked::Delimiter, Semantic::Object(_))
-            | (Checked::MatchArm { .. }, Semantic::MatchArm { .. })
-            | (_, Semantic::FlushBoundary { .. })
-    )
+            | Semantic::LocalRead { .. }
+            | Semantic::Project { .. }
+            | Semantic::MaterializationLocal { .. }
+            | Semantic::FunctionParameter { .. }
+            | Semantic::ElementState { .. },
+        ) => Some(ExecutionStaticOriginV1::ContextualBinding),
+        (Checked::Call { .. }, Semantic::Materialize { .. } | Semantic::Project { .. }) => {
+            Some(ExecutionStaticOriginV1::ContextualMaterialization)
+        }
+        (Checked::When { .. }, Semantic::When { .. })
+        | (Checked::While { .. }, Semantic::When { .. }) => {
+            Some(ExecutionStaticOriginV1::StaticSelection)
+        }
+        (Checked::Delimiter, Semantic::Object(_)) => {
+            Some(ExecutionStaticOriginV1::DelimiterRuntime)
+        }
+        (Checked::MatchArm { .. }, Semantic::MatchArm { .. }) => {
+            Some(ExecutionStaticOriginV1::MatchBinding)
+        }
+        (_, Semantic::FlushBoundary { .. }) => Some(ExecutionStaticOriginV1::FlushBoundary),
+        _ => None,
+    })
 }
 
 fn execution_expression_proof_plans_v2(
@@ -4115,6 +4224,50 @@ fn execution_expression_proof_plans_v2(
     let mut definition_static = 0usize;
     let mut runtime_checked_flow_types = vec![None; checked.expressions.len()];
     let mut occurrence_terms = boon_checked::ArtifactTypeModuleBuilderV1::new();
+    let mut output_roots = BTreeMap::new();
+    for root in &execution.roots {
+        if output_roots.insert(root.expression, root).is_some() {
+            return Err(format!(
+                "execution expression {} owns more than one semantic output root",
+                root.expression
+            ));
+        }
+    }
+    let mut producer_sources = BTreeMap::new();
+    for source in &execution.sources {
+        if !matches!(
+            source.origin,
+            crate::SemanticSourceOrigin::ProducerInvocation { .. }
+        ) {
+            continue;
+        }
+        if producer_sources.insert(source.expression, source).is_some() {
+            return Err(format!(
+                "execution expression {} owns more than one producer invocation source",
+                source.expression
+            ));
+        }
+    }
+    let mut producer_results = BTreeMap::new();
+    for statement in &execution.statements {
+        if !matches!(
+            statement.origin,
+            crate::SemanticStatementOrigin::ProducerResult { .. }
+        ) {
+            continue;
+        }
+        let expression = statement.value.ok_or_else(|| {
+            format!(
+                "producer invocation statement {} has no semantic result expression",
+                statement.id
+            )
+        })?;
+        if producer_results.insert(expression, statement).is_some() {
+            return Err(format!(
+                "execution expression {expression} owns more than one producer invocation result"
+            ));
+        }
+    }
     for expression in &execution.expressions {
         if expression.id.as_usize() != plans.len() {
             return Err(format!(
@@ -4187,15 +4340,18 @@ fn execution_expression_proof_plans_v2(
             }
             _ => false,
         };
-        let specialized_static = if definition_owns_static {
+        let static_origin = if definition_owns_static {
             definition_static += 1;
-            false
-        } else if semantic_expression_has_explicit_static_specialization_v1(
+            ExecutionStaticOriginV1::Definition
+        } else if let Some(origin) = semantic_expression_static_specialization_v1(
             &checked_expression.kind,
             &expression.kind,
             expandable_user_call,
-        ) {
-            true
+            output_roots.get(&expression.id).copied(),
+            producer_sources.get(&expression.id).copied(),
+            producer_results.get(&expression.id).copied(),
+        )? {
+            origin
         } else {
             return Err(format!(
                 "execution expression {} has unsupported static specialization from {:?} to {:?}",
@@ -4217,7 +4373,7 @@ fn execution_expression_proof_plans_v2(
             definition_runtime_flow_digest,
             flow_override_digest,
             definition_effect,
-            specialized_static,
+            static_origin,
         });
     }
     if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
@@ -6377,7 +6533,7 @@ mod compact_expression_proof_tests {
             definition_runtime_flow_digest: [6; 32],
             flow_override_digest: Some([7; 32]),
             definition_effect: true,
-            specialized_static: true,
+            static_origin: ExecutionStaticOriginV1::ContextualBinding,
         }
     }
 

@@ -3016,6 +3016,7 @@ fn elaborate_with_representation(
     let core_lowering::CanonicalProgramCoreBuildV2 {
         core: canonical_core,
         execution_handoff,
+        manifest_prefix,
     } = canonical_core_build;
     #[cfg(test)]
     semantic_image_builder
@@ -3033,6 +3034,7 @@ fn elaborate_with_representation(
             &checked_program,
             semantic_image_builder.checked_handoff(),
             semantic_image_builder.execution_handoff(),
+            manifest_prefix,
             &producer_materializations,
             #[cfg(test)]
             &resolved_out_graph,
@@ -7880,6 +7882,14 @@ FUNCTION lane_row(row) {
             first.dependency_manifest().callable_entries,
             second.dependency_manifest().callable_entries
         );
+        assert_eq!(
+            boon_contract::canonical_serde_cbor_v1(first.dependency_manifest()).unwrap(),
+            boon_contract::canonical_serde_cbor_v1(second.dependency_manifest()).unwrap(),
+        );
+        assert_eq!(
+            first.request_graph_snapshot().as_ref(),
+            second.request_graph_snapshot().as_ref(),
+        );
         first.validate().unwrap();
     }
 
@@ -7892,7 +7902,7 @@ FUNCTION serve(value) {
     value + 0
 }
 
-seed: 0
+seed: serve(value: 0)
 "#,
         )
         .unwrap();
@@ -7915,6 +7925,60 @@ seed: 0
         let first = elaborate(checked.clone(), std::slice::from_ref(&request)).unwrap();
         let duplicate = elaborate(checked.clone(), &[request.clone(), request]).unwrap();
         assert_eq!(first.digest(), duplicate.digest());
+        let execution_handoff = first.semantic_image.execution_handoff();
+        assert!(
+            execution_handoff
+                .projections
+                .iter()
+                .any(|projection| matches!(
+                    projection.identity,
+                    ExecutionConstructionProjectionV3::Checked { .. }
+                ))
+        );
+        assert!(
+            execution_handoff
+                .projections
+                .iter()
+                .any(|projection| matches!(
+                    projection.identity,
+                    ExecutionConstructionProjectionV3::Invocation { .. }
+                ))
+        );
+        assert!(
+            execution_handoff
+                .projections
+                .iter()
+                .any(|projection| matches!(
+                    projection.identity,
+                    ExecutionConstructionProjectionV3::Producer { .. }
+                ))
+        );
+        let proof = &first.dependency_manifest().proof_digests;
+        assert_eq!(
+            proof.checked_row_count,
+            first
+                .semantic_image
+                .checked_handoff()
+                .projections
+                .iter()
+                .map(|projection| projection.row_count as usize)
+                .sum::<usize>(),
+        );
+        assert_eq!(
+            proof.execution_row_count,
+            execution_handoff
+                .projections
+                .iter()
+                .map(|projection| projection.row_count as usize)
+                .sum::<usize>(),
+        );
+        assert_eq!(
+            proof.coverage_record_count,
+            proof.checked_row_count
+                + proof.execution_row_count
+                + proof.construction_row_count
+                + proof.remaining_row_count,
+        );
         assert!(
             elaborate(
                 checked,
@@ -8122,11 +8186,19 @@ result: mapped(value: 0)
         let resource_dependency_rows =
             resource::resource_dependency_rows_for_test(&semantic.resource_graph)
                 .expect("mutated resource graph has construction dependency rows");
+        let manifest_prefix = dependency_manifest::replay_manifest_prefix_v7_for_test(
+            &semantic.checked_program,
+            semantic.semantic_image.checked_handoff(),
+            semantic.semantic_image.execution_handoff(),
+            &semantic.execution_graph,
+        )
+        .expect("mutated semantic image has a checked/execution manifest prefix");
         let dependency_build = build_callable_dependency_manifest_v7(
             DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
             &semantic.checked_program,
             semantic.semantic_image.checked_handoff(),
             semantic.semantic_image.execution_handoff(),
+            manifest_prefix,
             &semantic.producer_materializations,
             #[cfg(test)]
             &semantic.resolved_out_graph,

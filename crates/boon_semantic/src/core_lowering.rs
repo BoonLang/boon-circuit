@@ -264,6 +264,7 @@ pub(super) struct MappedSemanticExecution {
 pub(crate) struct CanonicalProgramCoreBuildV2 {
     pub(crate) core: program_core::CanonicalProgramCoreV2,
     pub(crate) execution_handoff: crate::semantic_image::ExecutionImageHandoffV3,
+    pub(crate) manifest_prefix: crate::dependency_manifest::ManifestCheckedExecutionPrefixV7,
 }
 
 #[derive(Clone, Debug)]
@@ -7435,10 +7436,11 @@ fn finish_canonical_program_core(
         }
         receipts.publish_static_owner(semantic, executable)?;
     }
-    let execution_handoff = receipts.finish()?;
+    let (execution_handoff, manifest_prefix) = receipts.finish()?;
     Ok(CanonicalProgramCoreBuildV2 {
         core,
         execution_handoff,
+        manifest_prefix,
     })
 }
 

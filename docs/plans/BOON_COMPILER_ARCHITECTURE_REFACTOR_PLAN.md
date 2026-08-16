@@ -4200,6 +4200,49 @@ red before NovyWave because the TodoMVC fixture exposes the pre-existing
 unresolved concrete `List/map` OUT input; the direct NovyWave observations do
 not weaken or overwrite that failing gate.
 
+The adjacent checked/execution request-prefix cut is also complete at the
+ownership boundary. `ExecutionReceiptPublisherV3` now owns a move-only
+`ManifestCheckedExecutionPrefixV7`: checked projection receipts and routes are
+imported when publication starts, while execution identities, receipts,
+relocations, entity routes, and the five cross-image/invocation identity-edge
+families are appended in canonical order during V3 handoff sealing. Canonical
+lowering returns the completed prefix beside `ExecutionImageHandoffV3`, and
+Manifest V7 consumes it by value. Production no longer calls
+`build_dense_projection_index_v7`; that replay survives only under `cfg(test)`.
+Every parser-backed semantic test compares the direct prefix with the replay
+oracle across paired image digests, dense identities, owners, receipts,
+normalized edges, routes, callable interfaces, and checked/execution row
+counts. The architecture gate parses production Rust and macro tokens to reject
+any restored replay call.
+
+This second ownership cut is again performance-neutral in isolation. Two fresh
+debug traces put canonical core plus prefix publication at 332.783--337.998 ms
+and Manifest at 217.614--220.718 ms, versus 301.817 ms plus 247.535 ms before
+the cut. The removed 25.9 ms Manifest import has moved into its construction
+owner, leaving the combined boundary effectively flat at about 550 ms. This is
+expected because the checked handoff is still imported once and every V7 key,
+receipt, and request edge must still be hashed. The next speed-bearing cut must
+make reactive, view, storage, and memory construction publish their compact
+dependency rows directly and make checked construction transfer a generic
+request-prefix fragment; then delete the corresponding Manifest inventories
+and finish-time row folding. A phase-name disappearance with unchanged combined
+work does not count as a performance milestone.
+
+The fresh stable-release checkpoint confirms the same conclusion. Five
+one-process-per-observation medians are 735.379 ms diagnostics and 2,818.544 ms
+verified in fresh-process mode, and 733.870 ms diagnostics and 2,822.024 ms
+verified through a new empty session. Fresh verified semantic construction is
+1,128.305 ms, backend construction is 389.351 ms, peak RSS is 357,236 KiB, and
+WHERE contract verification is 0.629 ms; the empty-session medians are
+1,134.519 ms, 388.093 ms, 381,928 KiB, and 0.665 ms respectively. A direct
+release phase trace puts canonical core plus prefix publication at 276.654 ms
+and Manifest at 147.670 ms, versus the preceding 252.122 ms plus 176.251 ms;
+their combined boundary changes from 428.373 to 424.324 ms, only about 4 ms and
+inside run-to-run variation. All observations have zero diagnostics and retain
+source digest `e8b6c437a3f112026ca4f8a58e9f9c98e04cb2e3826a29724f3dc8e72d8bda9b`
+and MachinePlan SHA-256
+`ca6a030997141a451a119165a9f9ba194071126ae257a7475d7ceafe7a1ea63a`.
+
 Updating the architecture gate exposed two stale classifier entries from the
 definition-template checkpoint. `InvalidDefinitionTemplate` and the three
 checked definition execution-template records are now explicitly classified,

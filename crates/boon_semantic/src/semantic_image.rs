@@ -1017,9 +1017,16 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
         self,
         source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
-    ) -> Result<ExecutionImageHandoffV3, String> {
+        mut manifest_prefix: crate::dependency_manifest::ManifestCheckedExecutionPrefixBuilderV7,
+    ) -> Result<
+        (
+            ExecutionImageHandoffV3,
+            crate::dependency_manifest::ManifestCheckedExecutionPrefixV7,
+        ),
+        String,
+    > {
         let Self {
-            checked: _,
+            checked,
             construction_image,
             ids: _,
             stable_digest_ids,
@@ -1040,9 +1047,22 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
             .iter()
             .map(|projection| projection.stable_key_digest)
             .collect::<Vec<_>>();
+        let invocation_overlays = construction_image.routes.invocations.clone();
+        for pending_id in stable_digest_ids.values().copied() {
+            let pending = &projections[pending_id.as_usize()];
+            manifest_prefix
+                .register_execution_identity(
+                    checked,
+                    &invocation_overlays,
+                    pending.identity,
+                    pending.stable_key_digest,
+                )
+                .map_err(|error| error.to_string())?;
+        }
         let mut sealed_projections = Vec::with_capacity(projections.len());
         let mut relocation_arena = Vec::new();
-        for pending_id in stable_digest_ids.values().copied() {
+        let mut manifest_relocation_targets = Vec::new();
+        for (canonical_index, pending_id) in stable_digest_ids.values().copied().enumerate() {
             let pending = &mut projections[pending_id.as_usize()];
             if pending.row_digests.is_empty() {
                 return Err(format!(
@@ -1061,24 +1081,36 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
             relocation_start
                 .checked_add(relocation_len)
                 .ok_or_else(|| "execution V3 relocation arena exceeds u32".to_owned())?;
-            relocation_arena.extend(
-                pending
-                    .relocations
-                    .iter()
-                    .map(|target| canonical_projection_by_pending[target.as_usize()]),
-            );
+            manifest_relocation_targets.clear();
+            for target in &pending.relocations {
+                let target = canonical_projection_by_pending[target.as_usize()];
+                manifest_relocation_targets.push(target.as_usize());
+                relocation_arena.push(target);
+            }
             let local_content_digest = boon_contract::canonical_serde_hash_v1_with_buffer(
                 EXECUTION_IMAGE_SHARD_DOMAIN_V3,
                 &(pending.stable_key_digest, &pending.row_digests),
                 &mut hash_scratch,
             )
             .map_err(|error| format!("failed to hash execution V3 shard: {error}"))?;
+            let row_count = u32::try_from(pending.row_digests.len())
+                .map_err(|_| "execution V3 shard row count exceeds u32")?;
+            manifest_prefix
+                .publish_execution_projection(
+                    &invocation_overlays,
+                    canonical_index,
+                    pending.identity,
+                    local_content_digest,
+                    row_count,
+                    pending.dependency_row_count,
+                    &manifest_relocation_targets,
+                )
+                .map_err(|error| error.to_string())?;
             sealed_projections.push(ExecutionImageProjectionV3 {
                 identity: pending.identity,
                 stable_key_digest: pending.stable_key_digest,
                 local_content_digest,
-                row_count: u32::try_from(pending.row_digests.len())
-                    .map_err(|_| "execution V3 shard row count exceeds u32")?,
+                row_count,
                 dependency_row_count: pending.dependency_row_count,
                 relocation_span: ExecutionImageRelocationSpanV3 {
                     start: relocation_start,
@@ -1099,17 +1131,18 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
         {
             return Err("execution V3 routes an entity more than once".to_owned());
         }
-        let entity_routes = entity_routes
-            .into_iter()
-            .map(
-                |(domain, dense_index, projection)| ExecutionImageEntityRouteV3 {
-                    domain,
-                    dense_index,
-                    projection: canonical_projection_by_pending[projection.as_usize()],
-                },
-            )
-            .collect::<Vec<_>>();
-        let invocation_overlays = construction_image.routes.invocations.clone();
+        let mut sealed_entity_routes = Vec::with_capacity(entity_routes.len());
+        for (domain, dense_index, projection) in entity_routes {
+            let projection = canonical_projection_by_pending[projection.as_usize()];
+            manifest_prefix
+                .route_execution_entity(domain, dense_index, projection.as_usize())
+                .map_err(|error| error.to_string())?;
+            sealed_entity_routes.push(ExecutionImageEntityRouteV3 {
+                domain,
+                dense_index,
+                projection,
+            });
+        }
         let local_image_digest = boon_contract::canonical_serde_hash_v1_with_buffer(
             EXECUTION_IMAGE_HANDOFF_DOMAIN_V3,
             &(
@@ -1119,7 +1152,7 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
                 &invocation_overlays,
                 &sealed_projections,
                 &relocation_arena,
-                &entity_routes,
+                &sealed_entity_routes,
             ),
             &mut hash_scratch,
         )
@@ -1134,20 +1167,25 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
                 invocation_overlays.len(),
                 sealed_projections.len(),
                 row_count,
-                entity_routes.len(),
+                sealed_entity_routes.len(),
                 relocation_arena.len(),
             );
         }
-        Ok(ExecutionImageHandoffV3 {
-            schema: EXECUTION_IMAGE_HANDOFF_SCHEMA_V3.to_owned(),
-            source_bundle_digest_v1,
-            role,
-            invocation_overlays,
-            projections: sealed_projections,
-            relocations: relocation_arena,
-            entity_routes,
-            local_image_digest,
-        })
+        Ok((
+            ExecutionImageHandoffV3 {
+                schema: EXECUTION_IMAGE_HANDOFF_SCHEMA_V3.to_owned(),
+                source_bundle_digest_v1,
+                role,
+                invocation_overlays,
+                projections: sealed_projections,
+                relocations: relocation_arena,
+                entity_routes: sealed_entity_routes,
+                local_image_digest,
+            },
+            manifest_prefix
+                .finish(source_bundle_digest_v1, role, local_image_digest)
+                .map_err(|error| error.to_string())?,
+        ))
     }
 }
 
@@ -2405,6 +2443,7 @@ fn function_projection_v3(
 /// accumulators; it never owns a second executable graph.
 pub(crate) struct ExecutionReceiptPublisherV3<'a> {
     builder: ExecutionImageHandoffBuilderV3<'a>,
+    manifest_prefix: crate::dependency_manifest::ManifestCheckedExecutionPrefixBuilderV7,
     checked_projections: Vec<Option<PendingExecutionProjectionIdV3>>,
     invocation_projections: Vec<PendingExecutionProjectionIdV3>,
     expression_routes: Vec<PendingExecutionProjectionIdV3>,
@@ -2419,6 +2458,11 @@ impl<'a> ExecutionReceiptPublisherV3<'a> {
         execution: &SemanticExecutionImageColumnsV1,
     ) -> Result<Self, String> {
         let mut builder = ExecutionImageHandoffBuilderV3::new(checked, construction_image)?;
+        let manifest_prefix =
+            crate::dependency_manifest::ManifestCheckedExecutionPrefixBuilderV7::new(
+                checked, execution,
+            )
+            .map_err(|error| error.to_string())?;
         let invocation_projections = construction_image
             .routes
             .invocations
@@ -2432,6 +2476,7 @@ impl<'a> ExecutionReceiptPublisherV3<'a> {
         let checked_projections = vec![None; checked.projections.len()];
         let mut publisher = Self {
             builder,
+            manifest_prefix,
             checked_projections,
             invocation_projections,
             expression_routes: Vec::with_capacity(execution.expressions.len()),
@@ -2898,10 +2943,19 @@ impl<'a> ExecutionReceiptPublisherV3<'a> {
         )
     }
 
-    pub(crate) fn finish(self) -> Result<ExecutionImageHandoffV3, String> {
+    pub(crate) fn finish(
+        self,
+    ) -> Result<
+        (
+            ExecutionImageHandoffV3,
+            crate::dependency_manifest::ManifestCheckedExecutionPrefixV7,
+        ),
+        String,
+    > {
         let source_bundle_digest_v1 = self.builder.checked.source_bundle_digest_v1;
         let role = self.builder.checked.role;
-        self.builder.finish(source_bundle_digest_v1, role)
+        self.builder
+            .finish(source_bundle_digest_v1, role, self.manifest_prefix)
     }
 }
 
@@ -3366,7 +3420,17 @@ fn execution_image_handoff_v3(
         )?;
     }
     trace_execution_handoff_phase(trace, "v3_final_domains", &mut trace_started);
-    builder.finish(checked.source_bundle_digest_v1, checked.role)
+    let manifest_prefix = crate::dependency_manifest::ManifestCheckedExecutionPrefixBuilderV7::new(
+        checked, execution,
+    )
+    .map_err(|error| error.to_string())?;
+    builder
+        .finish(
+            checked.source_bundle_digest_v1,
+            checked.role,
+            manifest_prefix,
+        )
+        .map(|(handoff, _)| handoff)
 }
 
 #[cfg(test)]

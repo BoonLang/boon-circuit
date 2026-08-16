@@ -1268,11 +1268,76 @@ fn verify_required_direct_field(
     Ok(())
 }
 
+struct ProductionIdentifierReferenceCollector<'a> {
+    identifier: &'a str,
+    references: Vec<&'static str>,
+}
+
+impl<'a> ProductionIdentifierReferenceCollector<'a> {
+    fn new(identifier: &'a str) -> Self {
+        Self {
+            identifier,
+            references: Vec::new(),
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for ProductionIdentifierReferenceCollector<'_> {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if item_attributes(item).is_some_and(cfg_is_test_only) {
+            return;
+        }
+        syn::visit::visit_item(self, item);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if impl_item_attributes(item).is_some_and(cfg_is_test_only) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, item);
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        if trait_item_attributes(item).is_some_and(cfg_is_test_only) {
+            return;
+        }
+        syn::visit::visit_trait_item(self, item);
+    }
+
+    fn visit_expr_block(&mut self, expression: &'ast syn::ExprBlock) {
+        if cfg_is_test_only(&expression.attrs) {
+            return;
+        }
+        syn::visit::visit_expr_block(self, expression);
+    }
+
+    fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
+        if expression
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident.to_string() == self.identifier)
+        {
+            self.references.push("expression");
+        }
+        syn::visit::visit_expr_path(self, expression);
+    }
+
+    fn visit_macro(&mut self, item: &'ast syn::Macro) {
+        if rust_token_text_contains_ident(&item.tokens.to_string(), self.identifier) {
+            self.references.push("macro");
+        }
+        syn::visit::visit_macro(self, item);
+    }
+}
+
 fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), String> {
     let ir_path = workspace.join("crates/boon_ir/src/lib.rs");
     let semantic_path = workspace.join("crates/boon_semantic/src/lib.rs");
     let lowering_path = workspace.join("crates/boon_semantic/src/core_lowering.rs");
     let semantic_image_path = workspace.join("crates/boon_semantic/src/semantic_image.rs");
+    let dependency_manifest_path =
+        workspace.join("crates/boon_semantic/src/dependency_manifest.rs");
     for obsolete in [
         workspace.join("crates/boon_ir/src/semantic_mapping.rs"),
         workspace.join("crates/boon_ir/src/semantic_mapping"),
@@ -1291,12 +1356,19 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     let semantic = read_text(&semantic_path)?;
     let lowering = read_text(&lowering_path)?;
     let semantic_image = read_text(&semantic_image_path)?;
+    let dependency_manifest = read_text(&dependency_manifest_path)?;
     syn::parse_file(&ir)
         .map_err(|error| format!("cannot parse `{}`: {error}", ir_path.display()))?;
     syn::parse_file(&lowering)
         .map_err(|error| format!("cannot parse `{}`: {error}", lowering_path.display()))?;
     syn::parse_file(&semantic_image)
         .map_err(|error| format!("cannot parse `{}`: {error}", semantic_image_path.display()))?;
+    let dependency_manifest_syntax = syn::parse_file(&dependency_manifest).map_err(|error| {
+        format!(
+            "cannot parse `{}`: {error}",
+            dependency_manifest_path.display()
+        )
+    })?;
 
     for forbidden in [
         "mod semantic_mapping",
@@ -1361,6 +1433,7 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         "pub(crate) fn build_canonical_program_core(",
         "struct CanonicalProgramCoreBuildV2",
         "execution_handoff: crate::semantic_image::ExecutionImageHandoffV3",
+        "manifest_prefix: crate::dependency_manifest::ManifestCheckedExecutionPrefixV7",
         "ExecutionReceiptPublisherV3<'_>",
         "struct SemanticToExecutableMap",
         "fn validate_allocation_bijections(",
@@ -1413,6 +1486,28 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
                 "execution image omits direct construction receipt proof `{required}`"
             ));
         }
+    }
+    for required in [
+        "pub(crate) struct ManifestCheckedExecutionPrefixBuilderV7",
+        "pub(crate) struct ManifestCheckedExecutionPrefixV7",
+        "construction-published checked/execution prefix differs from the replay oracle",
+        "\"consume_checked_execution_prefix\"",
+        "#[cfg(test)]\nfn build_dense_projection_index_v7",
+    ] {
+        if !dependency_manifest.contains(required) {
+            return Err(format!(
+                "dependency manifest omits construction-published prefix proof `{required}`"
+            ));
+        }
+    }
+    let mut replay_references =
+        ProductionIdentifierReferenceCollector::new("build_dense_projection_index_v7");
+    replay_references.visit_file(&dependency_manifest_syntax);
+    if !replay_references.references.is_empty() {
+        return Err(format!(
+            "production dependency-manifest code replays checked/execution projections at {:?}",
+            replay_references.references,
+        ));
     }
     for forbidden in [
         "fn validate_totality(",

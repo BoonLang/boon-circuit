@@ -2363,6 +2363,7 @@ enum DependencyProjectionNodeV7 {
     Projection(SemanticDependencyProjectionKeyV7),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DenseManifestProjectionV7 {
     stable_key_digest: [u8; 32],
     owner: SemanticDependencyStableOwnerV4,
@@ -2376,7 +2377,11 @@ struct DenseManifestProjectionV7 {
 /// dense ID. Sealing consumes this registry directly into the dense compilation
 /// graph rather than cloning the keys into receipt, owner, target, and graph
 /// maps again.
-struct DenseManifestProjectionIndexV7 {
+pub(crate) struct DenseManifestProjectionIndexV7 {
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    role: ProgramRole,
+    checked_image_digest: [u8; 32],
+    execution_image_digest: Option<[u8; 32]>,
     ids: BTreeMap<SemanticDependencyProjectionKeyV7, ProjectionId>,
     projections: Vec<DenseManifestProjectionV7>,
     graph: DenseProjectionGraphBuilder,
@@ -2386,6 +2391,8 @@ struct DenseManifestProjectionIndexV7 {
     checked_dependency_row_count: usize,
     execution_row_count: usize,
     execution_dependency_row_count: usize,
+    #[cfg(test)]
+    direct_edges: Vec<(ProjectionId, ProjectionId)>,
     /// Projection import hashes thousands of small canonical records. Reuse
     /// one encoding arena for the complete seal instead of allocating once
     /// per stable key and graph identity.
@@ -2393,8 +2400,12 @@ struct DenseManifestProjectionIndexV7 {
 }
 
 impl DenseManifestProjectionIndexV7 {
-    fn new() -> Self {
+    fn new(checked: &CheckedImageHandoffV4) -> Self {
         Self {
+            source_bundle_digest_v1: checked.source_bundle_digest_v1,
+            role: checked.role,
+            checked_image_digest: checked.local_image_digest,
+            execution_image_digest: None,
             ids: BTreeMap::new(),
             projections: Vec::new(),
             graph: DenseProjectionGraphBuilder::new(),
@@ -2404,8 +2415,33 @@ impl DenseManifestProjectionIndexV7 {
             checked_dependency_row_count: 0,
             execution_row_count: 0,
             execution_dependency_row_count: 0,
+            #[cfg(test)]
+            direct_edges: Vec::new(),
             hash_scratch: Vec::new(),
         }
+    }
+
+    fn bind_execution_image(
+        &mut self,
+        source_bundle_digest_v1: SourceBundleDigestV1,
+        role: ProgramRole,
+        local_image_digest: [u8; 32],
+    ) -> Result<(), CallableDependencyManifestError> {
+        if self.source_bundle_digest_v1 != source_bundle_digest_v1 || self.role != role {
+            return Err(CallableDependencyManifestError::new(
+                "manifest prefix execution image disagrees with checked source identity",
+            ));
+        }
+        if self
+            .execution_image_digest
+            .replace(local_image_digest)
+            .is_some()
+        {
+            return Err(CallableDependencyManifestError::new(
+                "manifest prefix execution image is bound more than once",
+            ));
+        }
+        Ok(())
     }
 
     fn register(
@@ -2508,6 +2544,8 @@ impl DenseManifestProjectionIndexV7 {
                 target.as_usize()
             )));
         }
+        #[cfg(test)]
+        self.direct_edges.push((source, target));
         self.graph
             .add_dependency(source, target)
             .map_err(|error| CallableDependencyManifestError::new(error.to_string()))
@@ -2525,6 +2563,65 @@ impl DenseManifestProjectionIndexV7 {
 
     fn local_digest(&self, id: ProjectionId) -> Option<[u8; 32]> {
         self.graph.local_digest(id)
+    }
+
+    #[cfg(test)]
+    fn first_difference(&self, oracle: &Self) -> Option<&'static str> {
+        if self.source_bundle_digest_v1 != oracle.source_bundle_digest_v1 {
+            return Some("source_bundle_digest_v1");
+        }
+        if self.role != oracle.role {
+            return Some("role");
+        }
+        if self.checked_image_digest != oracle.checked_image_digest {
+            return Some("checked_image_digest");
+        }
+        if self.execution_image_digest != oracle.execution_image_digest {
+            return Some("execution_image_digest");
+        }
+        if self.ids != oracle.ids {
+            return Some("projection_ids");
+        }
+        if self.projections != oracle.projections {
+            return Some("projections");
+        }
+        if self.entity_routes != oracle.entity_routes {
+            return Some("entity_routes");
+        }
+        if self.callable_interfaces != oracle.callable_interfaces {
+            return Some("callable_interfaces");
+        }
+        if (
+            self.checked_row_count,
+            self.checked_dependency_row_count,
+            self.execution_row_count,
+            self.execution_dependency_row_count,
+        ) != (
+            oracle.checked_row_count,
+            oracle.checked_dependency_row_count,
+            oracle.execution_row_count,
+            oracle.execution_dependency_row_count,
+        ) {
+            return Some("row_counts");
+        }
+        if self.projections.len() != oracle.projections.len()
+            || (0..self.projections.len()).any(|ordinal| {
+                let id = ProjectionId::from_usize(ordinal).expect("test projection ID fits u32");
+                self.local_digest(id) != oracle.local_digest(id)
+            })
+        {
+            return Some("local_digests");
+        }
+        let normalized_edges = |edges: &[(ProjectionId, ProjectionId)]| {
+            let mut edges = edges.to_vec();
+            edges.sort_unstable();
+            edges.dedup();
+            edges
+        };
+        if normalized_edges(&self.direct_edges) != normalized_edges(&oracle.direct_edges) {
+            return Some("dependency_edges");
+        }
+        None
     }
 
     fn finalize_canonical_order(&mut self) -> Result<(), CallableDependencyManifestError> {
@@ -5436,9 +5533,9 @@ fn stable_owner_for_checked_key_v7(
     })
 }
 
-fn execution_projection_owner_v7(
+fn execution_projection_owner_from_overlays_v7(
     checked: &CheckedImageHandoffV4,
-    execution: &ExecutionImageHandoffV3,
+    invocation_overlays: &[ExecutionInvocationOverlayV3],
     projection: &ExecutionConstructionProjectionV3,
 ) -> Result<SemanticDependencyStableOwnerV4, CallableDependencyManifestError> {
     let checked_owner = |projection: CheckedImageProjectionIdV2| {
@@ -5457,11 +5554,14 @@ fn execution_projection_owner_v7(
             stable_owner_for_checked_key_v7(checked_owner(*projection)?)
         }
         ExecutionConstructionProjectionV3::Invocation { occurrence } => {
-            let overlay = execution.invocation(*occurrence).ok_or_else(|| {
-                CallableDependencyManifestError::new(format!(
-                    "execution projection references missing invocation {occurrence}"
-                ))
-            })?;
+            let overlay = invocation_overlays
+                .get(occurrence.as_usize())
+                .filter(|overlay| overlay.occurrence == *occurrence)
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "execution projection references missing invocation {occurrence}"
+                    ))
+                })?;
             match overlay.root {
                 DistributedCallOccurrenceRoot::Program => {
                     checked_owner(overlay.definition)?;
@@ -5476,6 +5576,14 @@ fn execution_projection_owner_v7(
             stable_owner_for_checked_key_v7(checked_owner(*definition)?)
         }
     }
+}
+
+fn execution_projection_owner_v7(
+    checked: &CheckedImageHandoffV4,
+    execution: &ExecutionImageHandoffV3,
+    projection: &ExecutionConstructionProjectionV3,
+) -> Result<SemanticDependencyStableOwnerV4, CallableDependencyManifestError> {
+    execution_projection_owner_from_overlays_v7(checked, &execution.invocation_overlays, projection)
 }
 
 fn insert_presealed_entity_route_v7(
@@ -5568,6 +5676,407 @@ fn execution_dependency_entity_domain_v7(
     })
 }
 
+/// Move-only checked/execution prefix for the V7 request graph.
+///
+/// Checked rows are imported once when executable receipt publication starts.
+/// Execution identities, receipts, relocations, and routes are then appended
+/// while the V3 execution handoff is sealed.  The dependency manifest consumes
+/// the completed dense index directly; it must not replay either image.
+pub(crate) struct ManifestCheckedExecutionPrefixBuilderV7 {
+    index: DenseManifestProjectionIndexV7,
+    checked_manifest_ids: Vec<ProjectionId>,
+    execution_manifest_ids: Vec<ProjectionId>,
+    execution_identities: Vec<ExecutionConstructionProjectionV3>,
+    execution_manifest_by_identity: BTreeMap<ExecutionConstructionProjectionV3, ProjectionId>,
+}
+
+pub(crate) struct ManifestCheckedExecutionPrefixV7 {
+    index: DenseManifestProjectionIndexV7,
+}
+
+impl ManifestCheckedExecutionPrefixV7 {
+    fn into_index(
+        self,
+        checked: &CheckedImageHandoffV4,
+        execution: &ExecutionImageHandoffV3,
+        stable_owners: &BTreeMap<SemanticDependencyOwnerV1, SemanticDependencyStableOwnerV4>,
+    ) -> Result<DenseManifestProjectionIndexV7, CallableDependencyManifestError> {
+        if self.index.source_bundle_digest_v1 != checked.source_bundle_digest_v1
+            || self.index.source_bundle_digest_v1 != execution.source_bundle_digest_v1
+            || self.index.role != checked.role
+            || self.index.role != execution.role
+            || self.index.checked_image_digest != checked.local_image_digest
+            || self.index.execution_image_digest != Some(execution.local_image_digest)
+        {
+            return Err(CallableDependencyManifestError::new(
+                "checked/execution manifest prefix is paired with a different image",
+            ));
+        }
+        let live_owners = stable_owners.values().copied().collect::<BTreeSet<_>>();
+        if self
+            .index
+            .projections
+            .iter()
+            .any(|projection| !live_owners.contains(&projection.owner))
+        {
+            return Err(CallableDependencyManifestError::new(
+                "checked/execution manifest prefix references a non-live logical owner",
+            ));
+        }
+        Ok(self.index)
+    }
+}
+
+impl ManifestCheckedExecutionPrefixBuilderV7 {
+    pub(crate) fn new(
+        checked: &CheckedImageHandoffV4,
+        execution: &SemanticExecutionImageColumnsV1,
+    ) -> Result<Self, CallableDependencyManifestError> {
+        let mut index = DenseManifestProjectionIndexV7::new(checked);
+        let mut checked_manifest_ids = Vec::with_capacity(checked.projections.len());
+        for projection in &checked.projections {
+            let key = SemanticDependencyProjectionKeyV7::Checked {
+                stable_key_digest: projection.stable_key_digest,
+            };
+            let owner = stable_owner_for_checked_key_v7(&projection.stable_key.owner)?;
+            checked_manifest_ids.push(index.register(
+                key,
+                owner,
+                Some(projection.local_content_digest),
+            )?);
+            index.checked_row_count = index
+                .checked_row_count
+                .checked_add(projection.row_count as usize)
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new("checked row count overflow")
+                })?;
+            index.checked_dependency_row_count = index
+                .checked_dependency_row_count
+                .checked_add(projection.dependency_row_count as usize)
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new("checked dependency row count overflow")
+                })?;
+        }
+        for (ordinal, source) in checked_manifest_ids.iter().copied().enumerate() {
+            let checked_id = CheckedImageProjectionIdV2(u32::try_from(ordinal).map_err(|_| {
+                CallableDependencyManifestError::new("checked image index exceeds u32")
+            })?);
+            let relocations = checked.projection_relocations(checked_id).ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "checked projection {ordinal} has an invalid relocation span"
+                ))
+            })?;
+            for relocation in relocations {
+                let target = checked_manifest_ids
+                    .get(relocation.as_usize())
+                    .copied()
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "checked projection {ordinal} has missing relocation {}",
+                            relocation.0
+                        ))
+                    })?;
+                index.add_target(source, target)?;
+            }
+        }
+        for route in &checked.entity_routes {
+            if let Some(domain) = checked_dependency_entity_domain_v7(route.domain) {
+                let projection = checked_manifest_ids
+                    .get(route.projection.as_usize())
+                    .copied()
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "checked entity route references missing projection {}",
+                            route.projection.0
+                        ))
+                    })?;
+                insert_presealed_entity_route_v7(
+                    &mut index.entity_routes,
+                    SemanticDependencyEntityV1::Indexed {
+                        domain,
+                        index: u64::from(route.dense_index),
+                    },
+                    projection,
+                )?;
+            }
+        }
+        let mut root_interfaces = checked
+            .projections
+            .iter()
+            .enumerate()
+            .filter(|(_, projection)| {
+                matches!(
+                    projection.stable_key,
+                    CheckedShardProjectionKeyV2 {
+                        owner: CheckedShardOwnerKeyV2::ProgramTopLevel { role },
+                        region: CheckedShardRegionV2::Interface,
+                    } if role == checked.role
+                )
+            })
+            .map(|(ordinal, _)| checked_manifest_ids[ordinal]);
+        let root_interface = root_interfaces.next().ok_or_else(|| {
+            CallableDependencyManifestError::new(
+                "checked handoff has no program top-level interface projection",
+            )
+        })?;
+        if root_interfaces.next().is_some() {
+            return Err(CallableDependencyManifestError::new(
+                "checked handoff has multiple program top-level interface projections",
+            ));
+        }
+        insert_presealed_entity_route_v7(
+            &mut index.entity_routes,
+            SemanticDependencyEntityV1::Program,
+            root_interface,
+        )?;
+        let mut prefix = Self {
+            index,
+            checked_manifest_ids,
+            execution_manifest_ids: Vec::new(),
+            execution_identities: Vec::new(),
+            execution_manifest_by_identity: BTreeMap::new(),
+        };
+        prefix.bind_callable_interfaces(execution)?;
+        Ok(prefix)
+    }
+
+    pub(crate) fn register_execution_identity(
+        &mut self,
+        checked: &CheckedImageHandoffV4,
+        invocation_overlays: &[ExecutionInvocationOverlayV3],
+        identity: ExecutionConstructionProjectionV3,
+        stable_key_digest: [u8; 32],
+    ) -> Result<(), CallableDependencyManifestError> {
+        let key = SemanticDependencyProjectionKeyV7::Execution { stable_key_digest };
+        let owner =
+            execution_projection_owner_from_overlays_v7(checked, invocation_overlays, &identity)?;
+        let id = self.index.register(key, owner, None)?;
+        if self
+            .execution_manifest_by_identity
+            .insert(identity, id)
+            .is_some()
+        {
+            return Err(CallableDependencyManifestError::new(format!(
+                "execution image repeats projection identity {identity:?}"
+            )));
+        }
+        self.execution_manifest_ids.push(id);
+        self.execution_identities.push(identity);
+        Ok(())
+    }
+
+    pub(crate) fn publish_execution_projection(
+        &mut self,
+        invocation_overlays: &[ExecutionInvocationOverlayV3],
+        canonical_index: usize,
+        identity: ExecutionConstructionProjectionV3,
+        local_content_digest: [u8; 32],
+        row_count: u32,
+        dependency_row_count: u32,
+        relocation_targets: &[usize],
+    ) -> Result<(), CallableDependencyManifestError> {
+        let source = self
+            .execution_manifest_ids
+            .get(canonical_index)
+            .copied()
+            .ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "execution projection {canonical_index} has no manifest identity"
+                ))
+            })?;
+        let registered_identity = self
+            .execution_identities
+            .get(canonical_index)
+            .copied()
+            .ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "execution projection {canonical_index} has no registered identity"
+                ))
+            })?;
+        if registered_identity != identity {
+            return Err(CallableDependencyManifestError::new(format!(
+                "execution projection {canonical_index} changes identity from {registered_identity:?} to {identity:?}"
+            )));
+        }
+        self.index.set_receipt(source, local_content_digest)?;
+        self.index.execution_row_count = self
+            .index
+            .execution_row_count
+            .checked_add(row_count as usize)
+            .ok_or_else(|| CallableDependencyManifestError::new("execution row count overflow"))?;
+        self.index.execution_dependency_row_count = self
+            .index
+            .execution_dependency_row_count
+            .checked_add(dependency_row_count as usize)
+            .ok_or_else(|| {
+                CallableDependencyManifestError::new("execution dependency row count overflow")
+            })?;
+        for target in relocation_targets {
+            let target = self
+                .execution_manifest_ids
+                .get(*target)
+                .copied()
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "execution projection {canonical_index} has missing relocation {target}"
+                    ))
+                })?;
+            self.index.add_target(source, target)?;
+        }
+        match identity {
+            ExecutionConstructionProjectionV3::Checked { projection } => {
+                let target = self.checked_manifest_ids.get(projection.as_usize()).copied().ok_or_else(
+                    || CallableDependencyManifestError::new(format!(
+                        "execution projection {canonical_index} references missing checked projection {}",
+                        projection.0
+                    )),
+                )?;
+                self.index.add_target(source, target)?;
+            }
+            ExecutionConstructionProjectionV3::Invocation { occurrence } => {
+                let overlay = invocation_overlays
+                    .get(occurrence.as_usize())
+                    .filter(|overlay| overlay.occurrence == occurrence)
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "execution projection {canonical_index} references missing invocation {occurrence}"
+                        ))
+                    })?;
+                let definition = self
+                    .checked_manifest_ids
+                    .get(overlay.definition.as_usize())
+                    .copied()
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "execution projection {canonical_index} references missing definition {}",
+                            overlay.definition.0
+                        ))
+                    })?;
+                self.index.add_target(source, definition)?;
+                if let Some(call_site) = overlay.authored_call_site {
+                    let call_site = self
+                        .checked_manifest_ids
+                        .get(call_site.as_usize())
+                        .copied()
+                        .ok_or_else(|| {
+                            CallableDependencyManifestError::new(format!(
+                                "execution invocation {occurrence} references missing checked call site {}",
+                                call_site.0
+                            ))
+                        })?;
+                    self.index.add_target(source, call_site)?;
+                }
+                if let Some(parent) = overlay.parent {
+                    let parent = self
+                        .execution_manifest_by_identity
+                        .get(&ExecutionConstructionProjectionV3::Invocation {
+                            occurrence: parent,
+                        })
+                        .copied()
+                        .ok_or_else(|| {
+                            CallableDependencyManifestError::new(format!(
+                                "execution invocation {occurrence} references missing parent {parent}"
+                            ))
+                        })?;
+                    self.index.add_target(source, parent)?;
+                }
+            }
+            ExecutionConstructionProjectionV3::Producer { definition, .. } => {
+                let definition = self
+                    .checked_manifest_ids
+                    .get(definition.as_usize())
+                    .copied()
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "execution projection {canonical_index} references missing producer definition {}",
+                            definition.0
+                        ))
+                    })?;
+                self.index.add_target(source, definition)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn route_execution_entity(
+        &mut self,
+        domain: ExecutionImageRowDomainV3,
+        dense_index: u32,
+        canonical_projection: usize,
+    ) -> Result<(), CallableDependencyManifestError> {
+        let Some(entity_domain) = execution_dependency_entity_domain_v7(domain) else {
+            return Ok(());
+        };
+        let projection = self
+            .execution_manifest_ids
+            .get(canonical_projection)
+            .copied()
+            .ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "execution entity route references missing projection {canonical_projection}"
+                ))
+            })?;
+        insert_presealed_entity_route_v7(
+            &mut self.index.entity_routes,
+            SemanticDependencyEntityV1::Indexed {
+                domain: entity_domain,
+                index: u64::from(dense_index),
+            },
+            projection,
+        )?;
+        if entity_domain == SemanticDependencyEntityDomainV1::SemanticExpression {
+            insert_presealed_entity_route_v7(
+                &mut self.index.entity_routes,
+                SemanticDependencyEntityV1::Indexed {
+                    domain: SemanticDependencyEntityDomainV1::SemanticValue,
+                    index: u64::from(dense_index),
+                },
+                projection,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn bind_callable_interfaces(
+        &mut self,
+        execution: &SemanticExecutionImageColumnsV1,
+    ) -> Result<(), CallableDependencyManifestError> {
+        for callable in &execution.callables {
+            let entity = SemanticDependencyEntityV1::Indexed {
+                domain: SemanticDependencyEntityDomainV1::CheckedCallable,
+                index: u64::from(callable.checked_callable.0),
+            };
+            let projection = self
+                .index
+                .entity_routes
+                .get(&entity)
+                .copied()
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "semantic callable {} has no checked interface route",
+                        callable.id
+                    ))
+                })?;
+            self.index
+                .callable_interfaces
+                .insert(callable.id, projection);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(
+        mut self,
+        source_bundle_digest_v1: SourceBundleDigestV1,
+        role: ProgramRole,
+        execution_image_digest: [u8; 32],
+    ) -> Result<ManifestCheckedExecutionPrefixV7, CallableDependencyManifestError> {
+        self.index
+            .bind_execution_image(source_bundle_digest_v1, role, execution_image_digest)?;
+        Ok(ManifestCheckedExecutionPrefixV7 { index: self.index })
+    }
+}
+
+#[cfg(test)]
 fn build_dense_projection_index_v7(
     checked: &CheckedImageHandoffV4,
     execution_handoff: &ExecutionImageHandoffV3,
@@ -5582,7 +6091,7 @@ fn build_dense_projection_index_v7(
         ));
     }
     let stable_owner_set = stable_owners.values().copied().collect::<BTreeSet<_>>();
-    let mut index = DenseManifestProjectionIndexV7::new();
+    let mut index = DenseManifestProjectionIndexV7::new(checked);
 
     // The semantic image already owns stable keys and canonical dense IDs.
     // Manifest V7 imports only their digests, receipts, dense routes, and CSR
@@ -5874,7 +6383,39 @@ fn build_dense_projection_index_v7(
         })?;
         index.callable_interfaces.insert(callable.id, projection);
     }
+    index.bind_execution_image(
+        execution_handoff.source_bundle_digest_v1,
+        execution_handoff.role,
+        execution_handoff.local_image_digest,
+    )?;
     Ok(index)
+}
+
+#[cfg(test)]
+pub(crate) fn replay_manifest_prefix_v7_for_test(
+    checked: &CheckedProgramFields,
+    checked_handoff: &CheckedImageHandoffV4,
+    execution_handoff: &ExecutionImageHandoffV3,
+    execution: &SemanticExecutionImageColumnsV1,
+) -> Result<ManifestCheckedExecutionPrefixV7, CallableDependencyManifestError> {
+    let mut owners = BTreeSet::from([SemanticDependencyOwnerV1::ProgramRoot]);
+    owners.extend(
+        execution
+            .callables
+            .iter()
+            .map(|callable| SemanticDependencyOwnerV1::Callable {
+                callable: callable.id,
+            }),
+    );
+    let stable_owners = stable_dependency_owner_index_v4(checked, execution, &owners)?;
+    Ok(ManifestCheckedExecutionPrefixV7 {
+        index: build_dense_projection_index_v7(
+            checked_handoff,
+            execution_handoff,
+            execution,
+            &stable_owners,
+        )?,
+    })
 }
 
 #[cfg(test)]
@@ -6229,6 +6770,7 @@ pub(crate) fn build_callable_dependency_manifest_v7(
     checked: &CheckedProgramFields,
     checked_handoff: &CheckedImageHandoffV4,
     execution_handoff: &ExecutionImageHandoffV3,
+    manifest_prefix: ManifestCheckedExecutionPrefixV7,
     producer_materializations: &[ProducerMaterializationRequest],
     #[cfg(test)] out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
@@ -6322,14 +6864,23 @@ pub(crate) fn build_callable_dependency_manifest_v7(
         Ok::<(), CallableDependencyManifestError>(())
     })?;
     let presealed = phase!(
-        "register_checked_execution_receipts",
-        build_dense_projection_index_v7(
+        "consume_checked_execution_prefix",
+        manifest_prefix.into_index(checked_handoff, execution_handoff, &stable_owners)
+    )?;
+    #[cfg(test)]
+    {
+        let oracle = build_dense_projection_index_v7(
             checked_handoff,
             execution_handoff,
             execution,
             &stable_owners,
-        )
-    )?;
+        )?;
+        if let Some(field) = presealed.first_difference(&oracle) {
+            return Err(CallableDependencyManifestError::new(format!(
+                "construction-published checked/execution prefix differs from the replay oracle at {field}",
+            )));
+        }
+    }
     let callable_interface_digests = execution
         .callables
         .iter()

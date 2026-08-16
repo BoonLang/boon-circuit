@@ -4351,6 +4351,26 @@ The 80 ms cumulative latency gate is therefore met; eliminating the remaining
 rich resource/storage reconstruction is still mandatory for the template
 milestone.
 
+Named-value storage no longer rediscovers checked facts per lowering origin.
+One checked index resolves expression, declaration, and statement identities;
+one dependency-first statement pass publishes subtree FLUSH exposure; and one
+storage index publishes binding/resource targets, producer/statement fields,
+and exact `(parent, name)` child fields. Contract and projection construction
+consume those facts directly. The former recursive statement walk and linear
+checked/storage scans remain `cfg(test)` replay oracles, and every parser-backed
+storage test compares the indexed facts and selected targets with them exactly.
+The architecture gate rejects production references back to those scans.
+
+Ten exact-source stable-release observations now have medians of 693.112 ms
+diagnostics, 2,676.083 ms verified, 1,002.206 ms semantic construction, and
+0.464 ms WHERE verification. The verified range is
+2,640.925--2,794.868 ms. This cut saves another 73.706 ms verified and
+68.101 ms semantic versus the row-scope checkpoint; cumulatively the direct
+seal baseline improves by 177.095 and 177.182 ms respectively. A traced sample
+puts named-value storage at 5.164 ms instead of 55.057 ms and the complete
+storage builder at 49.647 ms instead of 100.798 ms. Diagnostics and WHERE remain
+statistically flat.
+
 The next speed-bearing cut therefore skips standalone storage dependency
 publication. Add one definition-owned resource and symbolic row-storage
 template beside the existing execution template, instantiate it through compact

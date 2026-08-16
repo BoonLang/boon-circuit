@@ -4015,13 +4015,35 @@ fn build_named_value_storage(
     fields: &[SemanticStorageFieldV1],
     bindings: &[SemanticStorageBindingV1],
 ) -> Result<Vec<SemanticNamedValueStorageV1>, SemanticScopeStorageError> {
+    let checked_index = NamedValueCheckedIndex::build(checked)?;
     let index = NamedValueStorageIndex::build(fields, bindings)?;
     let mut rows = Vec::new();
     let mut next_projection_id = 0;
     for named_value in &lowering.metadata.named_value_types {
         for (origin_ordinal, origin) in named_value.origins.iter().enumerate() {
+            let origin_facts = checked_index.origin_facts(origin)?;
+            #[cfg(test)]
+            {
+                let replay_flush = named_value_origin_exposes_flush_boundary(checked, origin)?;
+                let replay_structural =
+                    named_value_origin_is_structural_container(checked, origin)?;
+                if origin_facts.exposes_flush_boundary != replay_flush
+                    || origin_facts.structural_container != replay_structural
+                {
+                    return Err(SemanticScopeStorageError::new(format!(
+                        "named-value checked index differs from the independent scan replay for named value {} origin {origin_ordinal}",
+                        named_value.id,
+                    )));
+                }
+            }
             let targets = named_value_targets(
-                checked, execution, resources, reactive, bindings, &index, origin,
+                execution,
+                resources,
+                reactive,
+                bindings,
+                &index,
+                origin,
+                origin_facts,
             )?;
             #[cfg(test)]
             {
@@ -4049,6 +4071,7 @@ fn build_named_value_storage(
                 let projection = build_named_value_projection(
                     execution,
                     fields,
+                    &index,
                     &target,
                     &root_flow.ty,
                     &origin.checked.projection,
@@ -4059,8 +4082,9 @@ fn build_named_value_storage(
                     .map(|step| &step.output_type)
                     .unwrap_or(&root_flow.ty);
                 let contract_flow = named_value_origin_contract_flow(
-                    checked,
+                    &checked_index,
                     origin,
+                    origin_facts,
                     &target,
                     &root_flow,
                     projected_storage_type,
@@ -4120,6 +4144,212 @@ fn build_named_value_storage(
     Ok(rows)
 }
 
+#[derive(Clone, Copy)]
+struct NamedValueOriginFacts {
+    exposes_flush_boundary: bool,
+    structural_container: bool,
+}
+
+struct NamedValueCheckedIndex<'a> {
+    checked: &'a CheckedProgramFields,
+    expression_rows: BTreeMap<boon_checked::CheckedExprId, usize>,
+    declaration_rows: BTreeMap<DeclId, usize>,
+    statement_rows: BTreeMap<boon_checked::CheckedStatementId, usize>,
+    statement_exposes_flush: Vec<bool>,
+}
+
+impl<'a> NamedValueCheckedIndex<'a> {
+    fn build(checked: &'a CheckedProgramFields) -> Result<Self, SemanticScopeStorageError> {
+        let mut expression_rows = BTreeMap::new();
+        for (row, expression) in checked.expressions.iter().enumerate() {
+            if expression_rows.insert(expression.id, row).is_some() {
+                return Err(SemanticScopeStorageError::new(format!(
+                    "named-value checked index repeats expression {}",
+                    expression.id.0,
+                )));
+            }
+        }
+        let mut declaration_rows = BTreeMap::new();
+        for (row, declaration) in checked.declarations.iter().enumerate() {
+            if declaration_rows.insert(declaration.id, row).is_some() {
+                return Err(SemanticScopeStorageError::new(format!(
+                    "named-value checked index repeats declaration {}",
+                    declaration.id.0,
+                )));
+            }
+        }
+        let mut statement_rows = BTreeMap::new();
+        for (row, statement) in checked.statements.iter().enumerate() {
+            if statement_rows.insert(statement.id, row).is_some() {
+                return Err(SemanticScopeStorageError::new(format!(
+                    "named-value checked index repeats statement {}",
+                    statement.id.0,
+                )));
+            }
+        }
+
+        let mut state = vec![0_u8; checked.statements.len()];
+        let mut statement_exposes_flush = vec![false; checked.statements.len()];
+        for root in 0..checked.statements.len() {
+            if state[root] == 2 {
+                continue;
+            }
+            let mut pending = vec![(root, false)];
+            while let Some((row, exiting)) = pending.pop() {
+                if exiting {
+                    let statement = &checked.statements[row];
+                    let direct = statement.value.is_some_and(|value| {
+                        expression_rows
+                            .get(&value)
+                            .and_then(|row| checked.expressions.get(*row))
+                            .is_some_and(|expression| expression.flush_type.is_some())
+                    });
+                    let inherited = statement.children.iter().try_fold(
+                        false,
+                        |inherited, child| {
+                            let child = statement_rows.get(child).copied().ok_or_else(|| {
+                                SemanticScopeStorageError::new(format!(
+                                    "named-value FLUSH index references missing checked statement {}",
+                                    child.0,
+                                ))
+                            })?;
+                            Ok::<_, SemanticScopeStorageError>(
+                                inherited || statement_exposes_flush[child],
+                            )
+                        },
+                    )?;
+                    statement_exposes_flush[row] = direct || inherited;
+                    state[row] = 2;
+                    continue;
+                }
+                match state[row] {
+                    2 => continue,
+                    1 => continue,
+                    _ => state[row] = 1,
+                }
+                pending.push((row, true));
+                for child in checked.statements[row].children.iter().rev() {
+                    let child = statement_rows.get(child).copied().ok_or_else(|| {
+                        SemanticScopeStorageError::new(format!(
+                            "named-value FLUSH index references missing checked statement {}",
+                            child.0,
+                        ))
+                    })?;
+                    if state[child] != 2 {
+                        pending.push((child, false));
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            checked,
+            expression_rows,
+            declaration_rows,
+            statement_rows,
+            statement_exposes_flush,
+        })
+    }
+
+    fn expression(
+        &self,
+        id: boon_checked::CheckedExprId,
+    ) -> Result<&'a boon_checked::CheckedExpression, SemanticScopeStorageError> {
+        self.expression_rows
+            .get(&id)
+            .and_then(|row| self.checked.expressions.get(*row))
+            .filter(|expression| expression.id == id)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "named-value origin references missing checked expression {}",
+                    id.0,
+                ))
+            })
+    }
+
+    fn declaration(
+        &self,
+        id: DeclId,
+    ) -> Result<&'a boon_checked::CheckedDeclaration, SemanticScopeStorageError> {
+        self.declaration_rows
+            .get(&id)
+            .and_then(|row| self.checked.declarations.get(*row))
+            .filter(|declaration| declaration.id == id)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "named-value origin references missing checked declaration {}",
+                    id.0,
+                ))
+            })
+    }
+
+    fn statement(
+        &self,
+        id: boon_checked::CheckedStatementId,
+    ) -> Result<&'a boon_checked::CheckedStatement, SemanticScopeStorageError> {
+        self.statement_rows
+            .get(&id)
+            .and_then(|row| self.checked.statements.get(*row))
+            .filter(|statement| statement.id == id)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "named-value origin references missing checked statement {}",
+                    id.0,
+                ))
+            })
+    }
+
+    fn origin_facts(
+        &self,
+        origin: &crate::SemanticNamedValueTypeOriginV1,
+    ) -> Result<NamedValueOriginFacts, SemanticScopeStorageError> {
+        let statement_flush =
+            origin
+                .checked
+                .statement
+                .map(|statement| {
+                    let row = self.statement_rows.get(&statement).copied().ok_or_else(|| {
+                    SemanticScopeStorageError::new(format!(
+                        "named-value FLUSH boundary references missing checked statement {}",
+                        statement.0,
+                    ))
+                })?;
+                    Ok::<_, SemanticScopeStorageError>(self.statement_exposes_flush[row])
+                })
+                .transpose()?
+                .unwrap_or(false);
+        let expression = if let Some(value) = origin.checked.value {
+            Some(value)
+        } else if let Some(declaration) = origin.checked.declaration {
+            self.declaration(declaration)?.value
+        } else {
+            None
+        };
+        let expression_flush = expression
+            .map(|expression| Ok(self.expression(expression)?.flush_type.is_some()))
+            .transpose()?
+            .unwrap_or(false);
+
+        let structural_container = match (origin.checked.statement, origin.checked.value) {
+            (Some(statement), Some(value)) => {
+                let statement = self.statement(statement)?;
+                statement.value == Some(value)
+                    && !statement.children.is_empty()
+                    && matches!(
+                        &self.expression(value)?.kind,
+                        boon_checked::CheckedExpressionKind::Object { .. }
+                            | boon_checked::CheckedExpressionKind::List { .. }
+                    )
+            }
+            _ => false,
+        };
+        Ok(NamedValueOriginFacts {
+            exposes_flush_boundary: statement_flush || expression_flush,
+            structural_container,
+        })
+    }
+}
+
 struct NamedValueStorageIndex {
     binding_rows: BTreeMap<SemanticBindingId, usize>,
     targets_by_source: BTreeMap<SemanticSourceId, Vec<SemanticNamedValueStorageTargetV1>>,
@@ -4127,6 +4357,7 @@ struct NamedValueStorageIndex {
     targets_by_list: BTreeMap<SemanticListId, Vec<SemanticNamedValueStorageTargetV1>>,
     fields_by_statement: BTreeMap<SemanticStatementId, Vec<SemanticStorageFieldId>>,
     fields_by_producer: BTreeMap<SemanticExprId, Vec<SemanticStorageFieldId>>,
+    child_fields: BTreeMap<(SemanticStorageFieldId, String), Vec<SemanticStorageFieldId>>,
 }
 
 impl NamedValueStorageIndex {
@@ -4141,6 +4372,7 @@ impl NamedValueStorageIndex {
             targets_by_list: BTreeMap::new(),
             fields_by_statement: BTreeMap::new(),
             fields_by_producer: BTreeMap::new(),
+            child_fields: BTreeMap::new(),
         };
         for (row, binding) in bindings.iter().enumerate() {
             if index.binding_rows.insert(binding.binding, row).is_some() {
@@ -4174,6 +4406,13 @@ impl NamedValueStorageIndex {
             }
         }
         for field in fields {
+            if let Some(parent) = field.parent {
+                index
+                    .child_fields
+                    .entry((parent, field.name.clone()))
+                    .or_default()
+                    .push(field.id);
+            }
             if field.reactive_field.is_some()
                 && let Some(statement) = field.statement
             {
@@ -4196,13 +4435,13 @@ impl NamedValueStorageIndex {
 }
 
 fn named_value_targets(
-    checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
     bindings: &[SemanticStorageBindingV1],
     index: &NamedValueStorageIndex,
     origin: &crate::SemanticNamedValueTypeOriginV1,
+    origin_facts: NamedValueOriginFacts,
 ) -> Result<Vec<SemanticNamedValueStorageTargetV1>, SemanticScopeStorageError> {
     let mut targets = BTreeSet::new();
     for binding in &origin.bindings {
@@ -4313,7 +4552,7 @@ fn named_value_targets(
         && origin.lists.is_empty()
         && origin.value_list_authorities.is_empty()
     {
-        let reason = if named_value_origin_is_structural_container(checked, origin)? {
+        let reason = if origin_facts.structural_container {
             SemanticNamedValueDiagnosticOnlyReasonV1::NonExecutableStructuralContainer
         } else {
             SemanticNamedValueDiagnosticOnlyReasonV1::NonExecutableCheckedLeaf
@@ -4667,6 +4906,7 @@ fn named_value_target_flow_type(
 fn build_named_value_projection(
     execution: &SemanticExecutionImageColumnsV1,
     fields: &[SemanticStorageFieldV1],
+    index: &NamedValueStorageIndex,
     target: &SemanticNamedValueStorageTargetV1,
     root_type: &Type,
     selectors: &[String],
@@ -4708,12 +4948,12 @@ fn build_named_value_projection(
             })?;
         let storage_field = parent_field
             .map(|parent| {
-                let matches = fields
-                    .iter()
-                    .filter(|field| field.parent == Some(parent) && field.name == *selector)
-                    .map(|field| field.id)
-                    .collect::<Vec<_>>();
-                match matches.as_slice() {
+                let matches = index
+                    .child_fields
+                    .get(&(parent, selector.clone()))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                match matches {
                     [] => Ok(None),
                     [field] => Ok(Some(*field)),
                     _ => Err(SemanticScopeStorageError::new(format!(
@@ -4793,8 +5033,9 @@ fn named_value_storable_root_flow(
 }
 
 fn named_value_origin_contract_flow(
-    checked: &CheckedProgramFields,
+    checked: &NamedValueCheckedIndex<'_>,
     origin: &crate::SemanticNamedValueTypeOriginV1,
+    origin_facts: NamedValueOriginFacts,
     target: &SemanticNamedValueStorageTargetV1,
     root_flow: &FlowType,
     projected_storage_type: &Type,
@@ -4811,7 +5052,7 @@ fn named_value_origin_contract_flow(
         });
     }
     if matches!(target, SemanticNamedValueStorageTargetV1::State { .. })
-        && named_value_origin_exposes_flush_boundary(checked, origin)?
+        && origin_facts.exposes_flush_boundary
     {
         // The checked named value describes the public `T | E` boundary, while
         // a state target deliberately points at the separate storable `T`
@@ -4822,7 +5063,7 @@ fn named_value_origin_contract_flow(
             ty: projected_storage_type.clone(),
         });
     }
-    if storage_consumes_flush && named_value_origin_exposes_flush_boundary(checked, origin)? {
+    if storage_consumes_flush && origin_facts.exposes_flush_boundary {
         // FLUSH is a private control carrier. The public reactive expression
         // retains its ordinary closed boundary union, while a runtime storage
         // slot can contain only the successful data input. Record that exact
@@ -4839,15 +5080,13 @@ fn named_value_origin_contract_flow(
     ) {
         let checked_flow = if let Some(value) = origin.checked.value {
             checked
-                .expressions
-                .iter()
-                .find(|expression| expression.id == value)
+                .expression(value)
+                .ok()
                 .map(|expression| expression.flow_type.clone())
         } else if let Some(declaration) = origin.checked.declaration {
             checked
-                .declarations
-                .iter()
-                .find(|candidate| candidate.id == declaration)
+                .declaration(declaration)
+                .ok()
                 .map(|declaration| declaration.flow_type.clone())
         } else {
             None
@@ -4868,7 +5107,7 @@ fn named_value_origin_contract_flow(
         }
         return Ok(named_flow.clone());
     }
-    if named_value_origin_is_structural_container(checked, origin)? {
+    if origin_facts.structural_container {
         // A record/list attached to a statement with structural children is
         // the parser/typechecker anchor for an assembled container. Its child
         // statements own the exact named-value contracts, including exposed
@@ -4881,7 +5120,7 @@ fn named_value_origin_contract_flow(
             ty: projected_storage_type.clone(),
         });
     }
-    if named_value_origin_exposes_flush_boundary(checked, origin)? {
+    if origin_facts.exposes_flush_boundary {
         // The lowering table is the sealed public boundary authority. It has
         // already combined the normal result with the ordinary payload union
         // exposed by FLUSH anywhere in this named statement's subtree.
@@ -4889,35 +5128,9 @@ fn named_value_origin_contract_flow(
         return Ok(named_flow.clone());
     }
     let checked_flow = if let Some(value) = origin.checked.value {
-        Some(
-            checked
-                .expressions
-                .iter()
-                .find(|expression| expression.id == value)
-                .ok_or_else(|| {
-                    SemanticScopeStorageError::new(format!(
-                        "named-value origin references missing checked expression {}",
-                        value.0
-                    ))
-                })?
-                .flow_type
-                .clone(),
-        )
+        Some(checked.expression(value)?.flow_type.clone())
     } else if let Some(declaration) = origin.checked.declaration {
-        Some(
-            checked
-                .declarations
-                .iter()
-                .find(|candidate| candidate.id == declaration)
-                .ok_or_else(|| {
-                    SemanticScopeStorageError::new(format!(
-                        "named-value origin references missing checked declaration {}",
-                        declaration.0
-                    ))
-                })?
-                .flow_type
-                .clone(),
-        )
+        Some(checked.declaration(declaration)?.flow_type.clone())
     } else {
         None
     };
@@ -4968,6 +5181,7 @@ fn named_value_origin_contract_flow(
     })
 }
 
+#[cfg(test)]
 fn named_value_origin_exposes_flush_boundary(
     checked: &CheckedProgramFields,
     origin: &crate::SemanticNamedValueTypeOriginV1,
@@ -5046,6 +5260,7 @@ fn named_value_origin_exposes_flush_boundary(
         .is_some())
 }
 
+#[cfg(test)]
 fn named_value_origin_is_structural_container(
     checked: &CheckedProgramFields,
     origin: &crate::SemanticNamedValueTypeOriginV1,

@@ -1614,6 +1614,11 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         "struct NamedValueStorageIndex",
         "#[cfg(test)]\nfn named_value_targets_scan_replay_oracle",
         "named-value storage index differs from the independent scan replay",
+        "struct NamedValueCheckedIndex",
+        "named-value checked index differs from the independent scan replay",
+        "#[cfg(test)]\nfn named_value_origin_exposes_flush_boundary",
+        "#[cfg(test)]\nfn named_value_origin_is_structural_container",
+        "child_fields: BTreeMap<(SemanticStorageFieldId, String), Vec<SemanticStorageFieldId>>",
         "let mut consumers = vec![Vec::<SemanticExprId>::new(); execution.expressions.len()]",
         "let mut queue = execution",
     ] {
@@ -1640,6 +1645,19 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
             "production storage construction replays named-value scans at {:?}",
             named_value_replay_references.references,
         ));
+    }
+    for replay in [
+        "named_value_origin_exposes_flush_boundary",
+        "named_value_origin_is_structural_container",
+    ] {
+        let mut references = ProductionIdentifierReferenceCollector::new(replay);
+        references.visit_file(&storage_syntax);
+        if !references.references.is_empty() {
+            return Err(format!(
+                "production storage construction replays checked named-value facts via `{replay}` at {:?}",
+                references.references,
+            ));
+        }
     }
     for replay in [
         "validate_checked_list_classification",

@@ -3930,6 +3930,26 @@ largest measured runtime cuts remain definition-owned semantic construction
 (currently 286.302 ms for execution-graph derivation) and the remaining
 construction-time OUT graph (228.502 ms), not WHERE.
 
+Checkpoint `bf673709` closed compact operation parity. The next deletion cut
+then removed the entire obsolete owner-request stack from
+`boon_compiler::session`: owner ABI, symbol, callable-scope, constraint,
+interface, body, diagnostic, shard, and assembly request families; their
+evaluators and caches; and tests that exercised only that private superseded
+architecture. `session.rs` fell from 12,133 to 1,873 lines and now owns only
+the immutable parse/link request graph plus dense-kernel compiler products. It
+has zero `boon_typecheck` imports and zero old owner request symbols. The full
+compiler package remains green with 81/81 active library tests, one intentional
+large ignored probe, and all 16 integration tests. This is physical source and
+rebuild closure, not a Boon execution-time claim.
+
+The next physical deletion is the legacy owner solver in `boon_typecheck`, but
+the production kernel handoff still consumes a small set of ABI, render,
+source-payload, order-chain, and checked-lowering utilities from that crate.
+Those stable contracts must first move behind the dense kernel/lower-level
+model boundary, while the old checker itself becomes test-only differential
+oracle code. Deleting the files before separating that seam would merely copy
+legacy ownership into the new crate or silently remove checked metadata.
+
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not
 spend a full optimized rebuild on every small edit. Keep the latest accepted

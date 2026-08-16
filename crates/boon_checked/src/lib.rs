@@ -2191,6 +2191,8 @@ pub fn type_is_recursively_closed(ty: &Type) -> bool {
 /// ```
 pub const CHECKED_IMAGE_HANDOFF_SCHEMA_V4: &str = "boon.checked-image-handoff.v4";
 pub const CHECKED_IMAGE_KERNEL_AUTHORITY_SCHEMA_V1: &str = "boon.checked-image-kernel-authority.v1";
+pub const CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1: &str =
+    "boon.checked-definition-execution-template.v1";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2444,6 +2446,47 @@ pub struct CheckedProgramFields {
     pub states: Vec<CheckedState>,
     pub lists: Vec<CheckedList>,
     pub occurrences: Vec<SemanticOccurrence>,
+    /// One dependency-first executable body template per checked user
+    /// callable. The dense checker publishes this once with the definition;
+    /// semantic consumers must not rediscover callable body closure by
+    /// repeatedly walking the rich checked graph.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub definition_execution_templates: Vec<CheckedDefinitionExecutionTemplateV1>,
+}
+
+/// Definition-owned executable closure in the final checked namespace.
+///
+/// `nodes` is dependency-first and contains each reachable checked expression
+/// exactly once together with its compact dependency/control edges. Calls are
+/// a separate compact index so later invocation planning does not rescan every
+/// node merely to find call sites.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedDefinitionExecutionTemplateV1 {
+    pub schema: String,
+    pub callable: DeclId,
+    pub result: CheckedExprId,
+    pub nodes: Vec<CheckedDefinitionExecutionNodeV1>,
+    pub calls: Vec<CheckedCallId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedDefinitionExecutionNodeV1 {
+    pub expression: CheckedExprId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<CheckedExprId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<CheckedCallId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<CheckedDefinitionSelectorV1>,
+}
+
+/// The only dependency edge whose demanded successor set is occurrence-local.
+/// OUT evaluates the selector in the invocation frame and follows one arm when
+/// it is statically known; all other template edges are unconditional.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedDefinitionSelectorV1 {
+    pub input: CheckedExprId,
+    pub arms: Vec<CheckedExprId>,
 }
 
 impl CheckedProgramFields {
@@ -2527,6 +2570,413 @@ impl CheckedProgramFields {
         }
         Some(result)
     }
+}
+
+/// Derive one compact dependency-first body template for every checked user
+/// callable that has an executable result.
+///
+/// This is a checked-model operation: it follows explicit expression,
+/// declaration-value, and statement-child identities only. It performs no
+/// type inference and never opens parser or legacy owner data.
+pub fn derive_checked_definition_execution_templates_v1(
+    program: &CheckedProgramFields,
+) -> Result<Vec<CheckedDefinitionExecutionTemplateV1>, String> {
+    let mut scope_index_by_id = BTreeMap::new();
+    for (index, scope) in program.scopes.iter().enumerate() {
+        if scope_index_by_id.insert(scope.id, index).is_some() {
+            return Err(format!("checked program repeats scope {}", scope.id.0));
+        }
+    }
+    let mut declaration_index_by_id = BTreeMap::new();
+    for (index, declaration) in program.declarations.iter().enumerate() {
+        if declaration_index_by_id
+            .insert(declaration.id, index)
+            .is_some()
+        {
+            return Err(format!(
+                "checked program repeats declaration {}",
+                declaration.id.0
+            ));
+        }
+    }
+    let mut expression_index_by_id = BTreeMap::new();
+    for (index, expression) in program.expressions.iter().enumerate() {
+        if expression_index_by_id
+            .insert(expression.id, index)
+            .is_some()
+        {
+            return Err(format!(
+                "checked program repeats expression {}",
+                expression.id.0
+            ));
+        }
+    }
+    let mut statement_index_by_id = BTreeMap::new();
+    for (index, statement) in program.statements.iter().enumerate() {
+        if statement_index_by_id.insert(statement.id, index).is_some() {
+            return Err(format!(
+                "checked program repeats statement {}",
+                statement.id.0
+            ));
+        }
+    }
+    let mut call_index_by_id = BTreeMap::new();
+    for (index, call) in program.calls.iter().enumerate() {
+        if call_index_by_id.insert(call.id, index).is_some() {
+            return Err(format!("checked program repeats call {}", call.id.0));
+        }
+    }
+
+    let mut function_owner_by_scope = vec![None; program.scopes.len()];
+    for (scope_index, scope) in program.scopes.iter().enumerate() {
+        let mut current = scope.id;
+        let mut visited = BTreeSet::new();
+        let owner = loop {
+            if !visited.insert(current) {
+                return Err(format!(
+                    "checked lexical scope {} contains a parent cycle",
+                    scope.id.0
+                ));
+            }
+            let definition = program
+                .scopes
+                .get(
+                    *scope_index_by_id
+                        .get(&current)
+                        .ok_or_else(|| format!("checked program has no scope {}", current.0))?,
+                )
+                .ok_or_else(|| format!("checked program has no dense scope {}", current.0))?;
+            if definition.kind == CheckedScopeKind::Function {
+                break definition.owner;
+            }
+            let Some(parent) = definition.parent else {
+                break None;
+            };
+            current = parent;
+        };
+        function_owner_by_scope[scope_index] = owner;
+    }
+
+    let mut statements_by_value = BTreeMap::<CheckedExprId, Vec<CheckedStatementId>>::new();
+    for statement in &program.statements {
+        if let Some(value) = statement.value {
+            if !expression_index_by_id.contains_key(&value) {
+                return Err(format!(
+                    "checked statement {} references missing expression {}",
+                    statement.id.0, value.0
+                ));
+            }
+            statements_by_value
+                .entry(value)
+                .or_default()
+                .push(statement.id);
+        }
+    }
+
+    let mut templates = Vec::new();
+    for callable in program
+        .callables
+        .iter()
+        .filter(|callable| callable.kind == CheckedCallableKind::User)
+    {
+        let Some(result) = callable.result_expression else {
+            continue;
+        };
+        let mut state = vec![0_u8; program.expressions.len()];
+        let mut nodes = Vec::new();
+        let mut dependencies_by_expression = vec![None; program.expressions.len()];
+        let mut calls = Vec::new();
+        let mut pending = vec![(result, false)];
+        while let Some((expression, exiting)) = pending.pop() {
+            let index = *expression_index_by_id.get(&expression).ok_or_else(|| {
+                format!(
+                    "checked callable {} references missing expression {}",
+                    callable.decl_id.0, expression.0
+                )
+            })?;
+            let slot = &mut state[index];
+            if exiting {
+                if *slot != 2 {
+                    *slot = 2;
+                    let definition = &program.expressions[index];
+                    let dependencies =
+                        dependencies_by_expression[index].take().ok_or_else(|| {
+                            format!(
+                                "checked callable {} lost dependencies for expression {}",
+                                callable.decl_id.0, expression.0
+                            )
+                        })?;
+                    let (call, selector) = match &definition.kind {
+                        CheckedExpressionKind::Call { call } => (Some(*call), None),
+                        CheckedExpressionKind::When { input, arms } => (
+                            None,
+                            Some(CheckedDefinitionSelectorV1 {
+                                input: *input,
+                                arms: arms.clone(),
+                            }),
+                        ),
+                        _ => (None, None),
+                    };
+                    nodes.push(CheckedDefinitionExecutionNodeV1 {
+                        expression,
+                        dependencies,
+                        call,
+                        selector,
+                    });
+                }
+                continue;
+            }
+            match *slot {
+                2 => continue,
+                // Stateful and lexical graphs may contain intentional cycles.
+                // The first active occurrence owns the eventual template row.
+                1 => continue,
+                _ => *slot = 1,
+            }
+            let definition = program
+                .expressions
+                .get(index)
+                .filter(|candidate| candidate.id == expression)
+                .ok_or_else(|| {
+                    format!(
+                        "checked callable {} has no dense expression {}",
+                        callable.decl_id.0, expression.0
+                    )
+                })?;
+            let mut dependencies = checked_definition_expression_dependencies_v1(
+                program,
+                &scope_index_by_id,
+                &declaration_index_by_id,
+                &call_index_by_id,
+                &statement_index_by_id,
+                &function_owner_by_scope,
+                &statements_by_value,
+                callable.decl_id,
+                definition,
+            )?;
+            dependencies_by_expression[index] = Some(dependencies.clone());
+            if let CheckedExpressionKind::Call { call } = definition.kind {
+                calls.push(call);
+            }
+            pending.push((expression, true));
+            dependencies.reverse();
+            pending.extend(
+                dependencies
+                    .into_iter()
+                    .map(|dependency| (dependency, false)),
+            );
+        }
+        calls.sort_unstable_by_key(|call| call.0);
+        calls.dedup();
+        templates.push(CheckedDefinitionExecutionTemplateV1 {
+            schema: CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1.to_owned(),
+            callable: callable.decl_id,
+            result,
+            nodes,
+            calls,
+        });
+    }
+    templates.sort_unstable_by_key(|template| template.callable.0);
+    if templates
+        .windows(2)
+        .any(|pair| pair[0].callable == pair[1].callable)
+    {
+        return Err("checked definition templates repeat a callable identity".to_owned());
+    }
+    Ok(templates)
+}
+
+fn checked_definition_expression_dependencies_v1(
+    program: &CheckedProgramFields,
+    scope_index_by_id: &BTreeMap<LexicalScopeId, usize>,
+    declaration_index_by_id: &BTreeMap<DeclId, usize>,
+    call_index_by_id: &BTreeMap<CheckedCallId, usize>,
+    statement_index_by_id: &BTreeMap<CheckedStatementId, usize>,
+    function_owner_by_scope: &[Option<DeclId>],
+    statements_by_value: &BTreeMap<CheckedExprId, Vec<CheckedStatementId>>,
+    callable: DeclId,
+    expression: &CheckedExpression,
+) -> Result<Vec<CheckedExprId>, String> {
+    let mut dependencies = Vec::new();
+    match &expression.kind {
+        CheckedExpressionKind::Read { target, .. }
+        | CheckedExpressionKind::Drain { target, .. } => {
+            let declaration = program
+                .declarations
+                .get(*declaration_index_by_id.get(target).ok_or_else(|| {
+                    format!(
+                        "checked expression {} references missing declaration {}",
+                        expression.id.0, target.0
+                    )
+                })?)
+                .ok_or_else(|| {
+                    format!(
+                        "checked expression {} references missing declaration {}",
+                        expression.id.0, target.0
+                    )
+                })?;
+            if function_owner_by_scope
+                .get(
+                    *scope_index_by_id
+                        .get(&declaration.scope_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "checked declaration {} references missing scope {}",
+                                declaration.id.0, declaration.scope_id.0
+                            )
+                        })?,
+                )
+                .copied()
+                .flatten()
+                == Some(callable)
+                && let Some(value) = declaration.value
+            {
+                dependencies.push(value);
+            }
+        }
+        CheckedExpressionKind::TextTemplate { segments } => {
+            dependencies.extend(segments.iter().filter_map(|segment| match segment {
+                CheckedTextSegment::Static { .. } => None,
+                CheckedTextSegment::Dynamic { value } => Some(*value),
+            }));
+        }
+        CheckedExpressionKind::TaggedObject { fields, .. }
+        | CheckedExpressionKind::Object { fields } => {
+            dependencies.extend(fields.iter().map(|field| field.value));
+        }
+        CheckedExpressionKind::Flush { payload } => dependencies.push(*payload),
+        CheckedExpressionKind::Call { call } => {
+            let call = program
+                .calls
+                .get(*call_index_by_id.get(call).ok_or_else(|| {
+                    format!(
+                        "checked expression {} references missing call {}",
+                        expression.id.0, call.0
+                    )
+                })?)
+                .ok_or_else(|| {
+                    format!(
+                        "checked expression {} references missing call {}",
+                        expression.id.0, call.0
+                    )
+                })?;
+            dependencies.extend(call.entries.iter().filter_map(|entry| match entry {
+                CheckedCallEntry::Input { value, .. } => Some(*value),
+                CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => None,
+            }));
+            dependencies.extend(call.context_binding.explicit().map(|(value, _)| value));
+        }
+        CheckedExpressionKind::Draining { input } => dependencies.push(*input),
+        CheckedExpressionKind::Hold { initial, .. } => {
+            dependencies.push(*initial);
+            dependencies.extend(checked_definition_statement_child_values_v1(
+                program,
+                statement_index_by_id,
+                statements_by_value,
+                expression.id,
+            )?);
+        }
+        CheckedExpressionKind::Latest { branches } => dependencies.extend(branches),
+        CheckedExpressionKind::When { input, arms }
+        | CheckedExpressionKind::While { input, arms } => {
+            dependencies.push(*input);
+            dependencies.extend(arms);
+        }
+        CheckedExpressionKind::Then { input, output } => {
+            dependencies.push(*input);
+            dependencies.extend(*output);
+        }
+        CheckedExpressionKind::Infix { left, right, .. }
+        | CheckedExpressionKind::MapEntry {
+            key: left,
+            value: right,
+        } => {
+            dependencies.push(*left);
+            dependencies.push(*right);
+        }
+        CheckedExpressionKind::MatchArm { output, .. } => {
+            dependencies.extend(*output);
+            dependencies.extend(checked_definition_statement_child_values_v1(
+                program,
+                statement_index_by_id,
+                statements_by_value,
+                expression.id,
+            )?);
+        }
+        CheckedExpressionKind::Block { bindings, result } => {
+            dependencies.extend(bindings.iter().map(|binding| binding.value));
+            dependencies.extend(*result);
+        }
+        CheckedExpressionKind::List { items, .. }
+        | CheckedExpressionKind::Bytes { items, .. }
+        | CheckedExpressionKind::Map { entries: items }
+        | CheckedExpressionKind::Set { items } => dependencies.extend(items),
+        CheckedExpressionKind::Passed { .. }
+        | CheckedExpressionKind::ExternalRead { .. }
+        | CheckedExpressionKind::Text { .. }
+        | CheckedExpressionKind::Number { .. }
+        | CheckedExpressionKind::BytesByte { .. }
+        | CheckedExpressionKind::Absent
+        | CheckedExpressionKind::Tag { .. }
+        | CheckedExpressionKind::Source
+        | CheckedExpressionKind::Delimiter
+        | CheckedExpressionKind::Invalid { .. }
+        | CheckedExpressionKind::Bits { .. } => {}
+    }
+    dependencies.sort_unstable_by_key(|dependency| dependency.0);
+    dependencies.dedup();
+    Ok(dependencies)
+}
+
+fn checked_definition_statement_child_values_v1(
+    program: &CheckedProgramFields,
+    statement_index_by_id: &BTreeMap<CheckedStatementId, usize>,
+    statements_by_value: &BTreeMap<CheckedExprId, Vec<CheckedStatementId>>,
+    expression: CheckedExprId,
+) -> Result<Vec<CheckedExprId>, String> {
+    let Some(root) = statements_by_value
+        .get(&expression)
+        .into_iter()
+        .flatten()
+        .filter_map(|statement| {
+            statement_index_by_id
+                .get(statement)
+                .and_then(|index| program.statements.get(*index))
+        })
+        .find(|statement| statement.value == Some(expression) && !statement.children.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    let mut pending = root.children.iter().rev().copied().collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    let mut values = Vec::new();
+    while let Some(statement) = pending.pop() {
+        if !visited.insert(statement) {
+            continue;
+        }
+        let definition = program
+            .statements
+            .get(*statement_index_by_id.get(&statement).ok_or_else(|| {
+                format!(
+                    "checked template references missing statement {}",
+                    statement.0
+                )
+            })?)
+            .ok_or_else(|| {
+                format!(
+                    "checked template references missing statement {}",
+                    statement.0
+                )
+            })?;
+        match definition.value {
+            Some(value) if value == expression => {
+                pending.extend(definition.children.iter().rev().copied());
+            }
+            Some(value) => values.push(value),
+            None => pending.extend(definition.children.iter().rev().copied()),
+        }
+    }
+    Ok(values)
 }
 
 impl std::ops::Deref for CheckedProgram {

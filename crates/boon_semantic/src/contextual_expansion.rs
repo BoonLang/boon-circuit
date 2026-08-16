@@ -288,6 +288,12 @@ struct CheckedProgramLookup {
     pattern_bindings_by_declaration: Vec<Option<Option<usize>>>,
     statements_by_value: Vec<Vec<usize>>,
     element_contexts_by_declaration: Vec<Option<Option<(usize, usize)>>>,
+    source_by_expression: Vec<Option<Option<usize>>>,
+    state_by_expression: Vec<Option<Option<usize>>>,
+    source_declarations: Vec<bool>,
+    state_declarations: Vec<bool>,
+    function_owner_by_scope: Vec<Option<DeclId>>,
+    source_bearing_resource_projections: Vec<bool>,
 }
 
 impl CheckedProgramLookup {
@@ -307,6 +313,31 @@ impl CheckedProgramLookup {
         let mut scopes_by_id = Vec::new();
         for (index, scope) in program.scopes.iter().enumerate() {
             insert_dense_index(&mut scopes_by_id, scope.id.0 as usize, index);
+        }
+        let mut function_owner_by_scope = vec![None; program.scopes.len()];
+        for scope in &program.scopes {
+            let mut current = scope.id;
+            let mut remaining = program.scopes.len().saturating_add(1);
+            while remaining > 0 {
+                remaining -= 1;
+                let Some(definition) = program
+                    .scopes
+                    .get(current.0 as usize)
+                    .filter(|candidate| candidate.id == current)
+                else {
+                    break;
+                };
+                if definition.kind == boon_checked::CheckedScopeKind::Function {
+                    if let Some(slot) = function_owner_by_scope.get_mut(scope.id.0 as usize) {
+                        *slot = definition.owner;
+                    }
+                    break;
+                }
+                let Some(parent) = definition.parent else {
+                    break;
+                };
+                current = parent;
+            }
         }
         let mut calls_by_id = Vec::new();
         for (index, call) in program.calls.iter().enumerate() {
@@ -357,6 +388,35 @@ impl CheckedProgramLookup {
                 );
             }
         }
+        let mut source_by_expression = Vec::new();
+        let mut source_declarations = vec![false; program.declarations.len()];
+        for (index, source) in program.sources.iter().enumerate() {
+            insert_dense_index(
+                &mut source_by_expression,
+                source.expression.0 as usize,
+                index,
+            );
+            if let Some(slot) = source_declarations.get_mut(source.declaration.0 as usize) {
+                *slot = true;
+            }
+        }
+        let mut state_by_expression = Vec::new();
+        let mut state_declarations = vec![false; program.declarations.len()];
+        for (index, state) in program.states.iter().enumerate() {
+            insert_dense_index(&mut state_by_expression, state.expression.0 as usize, index);
+            if let Some(slot) = state_declarations.get_mut(state.declaration.0 as usize) {
+                *slot = true;
+            }
+        }
+        let mut source_bearing_resource_projections = vec![false; program.expressions.len()];
+        for requirement in &program.resource_projection_requirements {
+            if !requirement.source_origins.is_empty()
+                && let Some(slot) =
+                    source_bearing_resource_projections.get_mut(requirement.expression.0 as usize)
+            {
+                *slot = true;
+            }
+        }
         Self {
             expressions_by_id,
             declarations_by_id,
@@ -368,6 +428,12 @@ impl CheckedProgramLookup {
             pattern_bindings_by_declaration,
             statements_by_value,
             element_contexts_by_declaration,
+            source_by_expression,
+            state_by_expression,
+            source_declarations,
+            state_declarations,
+            function_owner_by_scope,
+            source_bearing_resource_projections,
         }
     }
 
@@ -505,6 +571,62 @@ impl CheckedProgramLookup {
         let call = program.calls.get(call)?;
         let context = call.contexts.get(context)?;
         (context.declaration == declaration).then_some((call, context))
+    }
+
+    fn source_for_expression<'a>(
+        &self,
+        program: &'a CheckedProgramFields,
+        expression: CheckedExprId,
+    ) -> Option<&'a boon_checked::CheckedSource> {
+        self.source_by_expression
+            .get(expression.0 as usize)
+            .copied()
+            .flatten()
+            .flatten()
+            .and_then(|index| program.sources.get(index))
+            .filter(|source| source.expression == expression)
+    }
+
+    fn state_for_expression<'a>(
+        &self,
+        program: &'a CheckedProgramFields,
+        expression: CheckedExprId,
+    ) -> Option<&'a boon_checked::CheckedState> {
+        self.state_by_expression
+            .get(expression.0 as usize)
+            .copied()
+            .flatten()
+            .flatten()
+            .and_then(|index| program.states.get(index))
+            .filter(|state| state.expression == expression)
+    }
+
+    fn declaration_is_source(&self, declaration: DeclId) -> bool {
+        self.source_declarations
+            .get(declaration.0 as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn declaration_is_state(&self, declaration: DeclId) -> bool {
+        self.state_declarations
+            .get(declaration.0 as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn function_owner(&self, scope: boon_checked::LexicalScopeId) -> Option<DeclId> {
+        self.function_owner_by_scope
+            .get(scope.0 as usize)
+            .copied()
+            .flatten()
+    }
+
+    fn has_source_bearing_resource_projection(&self, expression: CheckedExprId) -> bool {
+        self.source_bearing_resource_projections
+            .get(expression.0 as usize)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -2581,6 +2703,8 @@ pub(crate) fn derive_semantic_execution_graph(
             })
         })
         .collect::<Result<Vec<_>, ExpansionError>>()?;
+    let source_occurrences =
+        semantic_expression_occurrences_by_checked(&arena.expressions, program.expressions.len())?;
     let mut sources = Vec::new();
     let mut semantic_source_by_checked_instance = BTreeMap::new();
     for checked_source in &program.sources {
@@ -2588,10 +2712,19 @@ pub(crate) fn derive_semantic_execution_graph(
             ExpansionError::MissingSourceDeclaration(checked_source.expression),
         )?;
         let mut candidates_by_instance = BTreeMap::new();
-        for expression in arena.expressions.iter().filter(|expression| {
-            expression.checked_expr_id == checked_source.expression
-                && (matches!(expression.kind, SemanticExpressionKind::Source { .. })
-                    || expression.effect.emits_source)
+        let checked_candidates = source_occurrences
+            .get(checked_source.expression.0 as usize)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for expression in checked_candidates.iter().filter_map(|expression| {
+            arena
+                .expressions
+                .get(expression.as_usize())
+                .filter(|expression| {
+                    expression.checked_expr_id == checked_source.expression
+                        && (matches!(expression.kind, SemanticExpressionKind::Source { .. })
+                            || expression.effect.emits_source)
+                })
         }) {
             let _origin = arena
                 .checked_expression_origins
@@ -2640,6 +2773,7 @@ pub(crate) fn derive_semantic_execution_graph(
                 CheckedResourceBinding::Source {
                     source: checked_source.id,
                 },
+                checked_candidates,
             )?;
             let expression_definition = &arena.expressions[expression.as_usize()];
             let origin = &arena.checked_expression_origins[expression.as_usize()];
@@ -2701,6 +2835,8 @@ pub(crate) fn derive_semantic_execution_graph(
             owner: Some(owner),
         });
     }
+    let state_occurrences =
+        semantic_expression_occurrences_by_checked(&arena.expressions, program.expressions.len())?;
     let mut states = Vec::new();
     let mut semantic_state_by_checked_instance = BTreeMap::new();
     for checked_state in &program.states {
@@ -2708,12 +2844,22 @@ pub(crate) fn derive_semantic_execution_graph(
             ExpansionError::MissingStateDeclaration(checked_state.expression),
         )?;
         let mut candidates_by_instance = BTreeMap::new();
-        for expression in arena.expressions.iter().filter(|expression| {
-            expression.checked_expr_id == checked_state.expression
-                && (matches!(
-                    expression.kind,
-                    SemanticExpressionKind::Hold { .. } | SemanticExpressionKind::Latest { .. }
-                ) || expression.effect.writes_state)
+        let checked_candidates = state_occurrences
+            .get(checked_state.expression.0 as usize)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for expression in checked_candidates.iter().filter_map(|expression| {
+            arena
+                .expressions
+                .get(expression.as_usize())
+                .filter(|expression| {
+                    expression.checked_expr_id == checked_state.expression
+                        && (matches!(
+                            expression.kind,
+                            SemanticExpressionKind::Hold { .. }
+                                | SemanticExpressionKind::Latest { .. }
+                        ) || expression.effect.writes_state)
+                })
         }) {
             let _origin = arena
                 .checked_expression_origins
@@ -2761,6 +2907,7 @@ pub(crate) fn derive_semantic_execution_graph(
                 CheckedResourceBinding::State {
                     state: checked_state.id,
                 },
+                checked_candidates,
             )?;
             let expression_definition = &arena.expressions[expression.as_usize()];
             let origin = &arena.checked_expression_origins[expression.as_usize()];
@@ -2824,6 +2971,30 @@ pub(crate) fn derive_semantic_execution_graph(
     };
     SemanticImageBuilder::execution_pending(checked_handoff, execution_routes, execution)
         .map_err(ExpansionError::InvalidLocalBindings)
+}
+
+fn semantic_expression_occurrences_by_checked(
+    expressions: &[SemanticExpression],
+    checked_expression_count: usize,
+) -> Result<Vec<Vec<SemanticExprId>>, ExpansionError> {
+    let mut occurrences = vec![Vec::new(); checked_expression_count];
+    for (index, expression) in expressions.iter().enumerate() {
+        if expression.id.as_usize() != index {
+            return Err(ExpansionError::InvalidLocalBindings(format!(
+                "semantic expression {} is not dense at row {index} while indexing checked occurrences",
+                expression.id,
+            )));
+        }
+        let checked = expression.checked_expr_id.0 as usize;
+        let Some(rows) = occurrences.get_mut(checked) else {
+            return Err(ExpansionError::InvalidLocalBindings(format!(
+                "semantic expression {} references checked expression {} outside 0..{checked_expression_count}",
+                expression.id, expression.checked_expr_id.0,
+            )));
+        };
+        rows.push(expression.id);
+    }
+    Ok(occurrences)
 }
 
 struct ExactResourceInstanceContext<'a> {
@@ -3332,6 +3503,7 @@ fn ensure_resource_definition_statement(
     checked_statement: boon_checked::CheckedStatementId,
     declaration: DeclId,
     checked_binding: CheckedResourceBinding,
+    checked_occurrences: &[SemanticExprId],
 ) -> Result<(SemanticExprId, SemanticStatementId), ExpansionError> {
     let origin = arena
         .checked_expression_origins
@@ -3376,12 +3548,14 @@ fn ensure_resource_definition_statement(
                 expression.as_usize() as u32,
             )))?;
         let selected_owner = arena.expressions[expression.as_usize()].owner;
-        let owned_candidates = arena
-            .expressions
+        let owned_candidates = checked_occurrences
             .iter()
-            .zip(&arena.checked_expression_origins)
-            .filter(|(candidate, candidate_origin)| {
-                candidate.checked_expr_id == checked_expression
+            .filter_map(|candidate| {
+                let candidate = arena.expressions.get(candidate.as_usize())?;
+                let candidate_origin = arena
+                    .checked_expression_origins
+                    .get(candidate.id.as_usize())?;
+                (candidate.checked_expr_id == checked_expression
                     && candidate.owner == selected_owner
                     && candidate_origin.expression == candidate.id
                     && candidate_origin.owning_statement == Some(suggested_statement)
@@ -3395,9 +3569,9 @@ fn ensure_resource_definition_statement(
                         }
                         CheckedResourceBinding::ListAuthority { .. }
                         | CheckedResourceBinding::ListAlias { .. } => false,
-                    }
+                    })
+                .then_some(candidate.id)
             })
-            .map(|(candidate, _)| candidate.id)
             .collect::<Vec<_>>();
         let statement_value_candidate = statements
             .get(suggested_statement.as_usize())
@@ -4789,19 +4963,11 @@ fn ordinary_template_boundary_type_inner(ty: &Type) -> bool {
 }
 
 fn enclosing_function_owner(
-    program: &CheckedProgramFields,
+    _program: &CheckedProgramFields,
     lookup: &CheckedProgramLookup,
-    mut scope: boon_checked::LexicalScopeId,
+    scope: boon_checked::LexicalScopeId,
 ) -> Option<DeclId> {
-    let mut visited = BTreeSet::new();
-    while visited.insert(scope) {
-        let definition = lookup.scope(program, scope)?;
-        if definition.kind == boon_checked::CheckedScopeKind::Function {
-            return definition.owner;
-        }
-        scope = definition.parent?;
-    }
-    None
+    lookup.function_owner(scope)
 }
 
 fn ordinary_callable_base_candidate(
@@ -4862,25 +5028,38 @@ fn ordinary_callable_body_dependencies(
     program: &CheckedProgramFields,
     lookup: &CheckedProgramLookup,
     callable: &boon_checked::CheckedCallableSignature,
+    template: &boon_checked::CheckedDefinitionExecutionTemplateV1,
     candidates: &BTreeSet<DeclId>,
 ) -> Option<BTreeSet<DeclId>> {
     let Some(root) = callable.result_expression else {
         return None;
     };
-    let mut pending = vec![root];
-    let mut visited = BTreeSet::new();
+    if template.schema != boon_checked::CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1
+        || template.callable != callable.decl_id
+        || template.result != root
+        || template.nodes.last().map(|node| node.expression) != Some(root)
+    {
+        return None;
+    }
+    let expression_ids = template
+        .nodes
+        .iter()
+        .map(|node| node.expression)
+        .collect::<BTreeSet<_>>();
+    if expression_ids.len() != template.nodes.len()
+        || template.nodes.iter().any(|node| {
+            node.dependencies
+                .iter()
+                .any(|dependency| !expression_ids.contains(dependency))
+        })
+    {
+        return None;
+    }
     let mut dependencies = BTreeSet::new();
-    while let Some(expression_id) = pending.pop() {
-        if !visited.insert(expression_id) {
-            continue;
-        }
-        if program
-            .resource_projection_requirements
-            .iter()
-            .any(|requirement| {
-                requirement.expression == expression_id && !requirement.source_origins.is_empty()
-            })
-        {
+    let mut calls = BTreeSet::new();
+    for node in &template.nodes {
+        let expression_id = node.expression;
+        if lookup.has_source_bearing_resource_projection(expression_id) {
             return None;
         }
         let Some(expression) = lookup.expression(program, expression_id) else {
@@ -4914,8 +5093,9 @@ fn ordinary_callable_body_dependencies(
                                 .parameters
                                 .iter()
                                 .any(|parameter| parameter.decl_id == *target)
+                            && !expression_ids.contains(&value)
                         {
-                            pending.push(value);
+                            return None;
                         }
                     }
                     None if canonical_declaration_path(program, lookup, *target).is_some() => {
@@ -4928,6 +5108,10 @@ fn ordinary_callable_body_dependencies(
                 }
             }
             CheckedExpressionKind::Call { call } => {
+                if node.call != Some(*call) || node.selector.is_some() {
+                    return None;
+                }
+                calls.insert(*call);
                 let Some(call) = lookup.call(program, *call) else {
                     return None;
                 };
@@ -4967,50 +5151,32 @@ fn ordinary_callable_body_dependencies(
                     | CheckedCallableKind::Builtin
                     | CheckedCallableKind::External => return None,
                 }
-                pending.extend(call.entries.iter().filter_map(|entry| match entry {
-                    CheckedCallEntry::Input { value, .. } => Some(*value),
-                    CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => None,
-                }));
+                if call.entries.iter().any(|entry| match entry {
+                    CheckedCallEntry::Input { value, .. } => !expression_ids.contains(value),
+                    CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => {
+                        false
+                    }
+                }) || call
+                    .context_binding
+                    .explicit()
+                    .is_some_and(|(value, _)| !expression_ids.contains(&value))
+                {
+                    return None;
+                }
             }
-            CheckedExpressionKind::TextTemplate { segments } => {
-                pending.extend(segments.iter().filter_map(|segment| match segment {
-                    CheckedTextSegment::Dynamic { value } => Some(*value),
-                    CheckedTextSegment::Static { .. } => None,
-                }))
-            }
-            CheckedExpressionKind::TaggedObject { fields, .. }
-            | CheckedExpressionKind::Object { fields } => {
-                pending.extend(fields.iter().map(|field| field.value));
-            }
-            CheckedExpressionKind::Flush { payload } => pending.push(*payload),
-            CheckedExpressionKind::When { input, arms } => {
-                pending.push(*input);
-                pending.extend(arms.iter().copied());
-            }
-            CheckedExpressionKind::Infix { left, right, .. }
-            | CheckedExpressionKind::MapEntry {
-                key: left,
-                value: right,
-            } => {
-                pending.push(*left);
-                pending.push(*right);
-            }
-            CheckedExpressionKind::MatchArm { output, .. } => {
-                pending.extend(*output);
-                pending.extend(ordinary_statement_child_values(
-                    program,
-                    lookup,
-                    expression_id,
-                ));
-            }
-            CheckedExpressionKind::Block { bindings, result } => {
-                pending.extend(bindings.iter().map(|binding| binding.value));
-                pending.extend(*result);
-            }
-            CheckedExpressionKind::List { items, .. }
-            | CheckedExpressionKind::Bytes { items, .. }
-            | CheckedExpressionKind::Map { entries: items }
-            | CheckedExpressionKind::Set { items } => pending.extend(items.iter().copied()),
+            CheckedExpressionKind::TextTemplate { .. }
+            | CheckedExpressionKind::TaggedObject { .. }
+            | CheckedExpressionKind::Object { .. }
+            | CheckedExpressionKind::Flush { .. }
+            | CheckedExpressionKind::When { .. }
+            | CheckedExpressionKind::Infix { .. }
+            | CheckedExpressionKind::MapEntry { .. }
+            | CheckedExpressionKind::MatchArm { .. }
+            | CheckedExpressionKind::Block { .. }
+            | CheckedExpressionKind::List { .. }
+            | CheckedExpressionKind::Bytes { .. }
+            | CheckedExpressionKind::Map { .. }
+            | CheckedExpressionKind::Set { .. } => {}
             CheckedExpressionKind::Passed {
                 formal,
                 access: CheckedPassedAccess::Read,
@@ -5034,49 +5200,21 @@ fn ordinary_callable_body_dependencies(
             | CheckedExpressionKind::Then { .. }
             | CheckedExpressionKind::Invalid { .. } => return None,
         }
+        match (&expression.kind, &node.selector) {
+            (CheckedExpressionKind::When { input, arms }, Some(selector))
+                if selector.input == *input && selector.arms == *arms && node.call.is_none() => {}
+            (CheckedExpressionKind::Call { call }, None) if node.call == Some(*call) => {}
+            (CheckedExpressionKind::When { .. }, _) | (_, Some(_)) => return None,
+            _ if node.call.is_some() => return None,
+            _ => {}
+        }
+    }
+    if calls != template.calls.iter().copied().collect::<BTreeSet<_>>()
+        || calls.len() != template.calls.len()
+    {
+        return None;
     }
     Some(dependencies)
-}
-
-/// Return expression values represented by the statement tree beneath a
-/// structural expression. In list-shaped `WHEN` arms the checked expression's
-/// direct output is a delimiter; the actual field/spread values live in the
-/// arm statement's children and are part of the callable body just as much as
-/// an ordinary object expression's fields are.
-fn ordinary_statement_child_values(
-    program: &CheckedProgramFields,
-    lookup: &CheckedProgramLookup,
-    parent_expression: CheckedExprId,
-) -> Vec<CheckedExprId> {
-    let Some(statement) = lookup
-        .statement_indices_for_value(parent_expression)
-        .iter()
-        .filter_map(|index| program.statements.get(*index))
-        .find(|statement| {
-            statement.value == Some(parent_expression) && !statement.children.is_empty()
-        })
-    else {
-        return Vec::new();
-    };
-    let mut pending = statement.children.iter().rev().copied().collect::<Vec<_>>();
-    let mut visited = BTreeSet::new();
-    let mut values = Vec::new();
-    while let Some(statement) = pending.pop() {
-        if !visited.insert(statement) {
-            continue;
-        }
-        let Some(statement) = lookup.statement(program, statement) else {
-            continue;
-        };
-        match statement.value {
-            Some(value) if value == parent_expression => {
-                pending.extend(statement.children.iter().rev().copied());
-            }
-            Some(value) => values.push(value),
-            None => pending.extend(statement.children.iter().rev().copied()),
-        }
-    }
-    values
 }
 
 pub(crate) fn ordinary_callable_declarations(program: &CheckedProgramFields) -> BTreeSet<DeclId> {
@@ -5089,6 +5227,11 @@ pub(crate) fn ordinary_callable_declarations(program: &CheckedProgramFields) -> 
         .filter(|callable| ordinary_callable_base_candidate(program, callable))
         .map(|callable| callable.decl_id)
         .collect::<BTreeSet<_>>();
+    let templates = program
+        .definition_execution_templates
+        .iter()
+        .map(|template| (template.callable, template))
+        .collect::<BTreeMap<_, _>>();
     let mut dependents = BTreeMap::<DeclId, BTreeSet<DeclId>>::new();
     let mut pending_rejections = Vec::new();
     for callable in program
@@ -5096,7 +5239,17 @@ pub(crate) fn ordinary_callable_declarations(program: &CheckedProgramFields) -> 
         .iter()
         .filter(|callable| base_candidates.contains(&callable.decl_id))
     {
-        match ordinary_callable_body_dependencies(program, &lookup, callable, &base_candidates) {
+        let Some(template) = templates.get(&callable.decl_id).copied() else {
+            pending_rejections.push(callable.decl_id);
+            continue;
+        };
+        match ordinary_callable_body_dependencies(
+            program,
+            &lookup,
+            callable,
+            template,
+            &base_candidates,
+        ) {
             Some(dependencies) => {
                 for dependency in dependencies {
                     dependents
@@ -5481,12 +5634,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
         expression: CheckedExprId,
         owner: Option<StaticOwnerId>,
     ) -> Option<SemanticValueProvenance> {
-        if let Some(source) = self
-            .program
-            .sources
-            .iter()
-            .find(|source| source.expression == expression)
-        {
+        if let Some(source) = self.lookup.source_for_expression(self.program, expression) {
             return Some(SemanticValueProvenance {
                 members: vec![SemanticValueMember {
                     path: Vec::new(),
@@ -5497,10 +5645,8 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 }],
             });
         }
-        self.program
-            .states
-            .iter()
-            .find(|state| state.expression == expression)
+        self.lookup
+            .state_for_expression(self.program, expression)
             .map(|state| SemanticValueProvenance {
                 members: vec![SemanticValueMember {
                     path: Vec::new(),
@@ -6129,15 +6275,13 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 }
                 if declaration.kind == boon_checked::CheckedDeclarationKind::Field
                     && declaration_is_function_local(self.program, declaration.scope_id)
-                    && !self.program.states.iter().any(|state| {
-                        state.declaration == declaration.id
-                            || declaration.value == Some(state.expression)
+                    && !self.lookup.declaration_is_state(declaration.id)
+                    && !declaration.value.is_some_and(|value| {
+                        self.lookup
+                            .state_for_expression(self.program, value)
+                            .is_some()
                     })
-                    && !self
-                        .program
-                        .sources
-                        .iter()
-                        .any(|source| source.declaration == declaration.id)
+                    && !self.lookup.declaration_is_source(declaration.id)
                     && declaration.value.is_some()
                 {
                     let expanded = self.expand_in_frame(
@@ -7803,16 +7947,12 @@ impl<'a> SemanticExpressionBuilder<'a> {
         _owner: Option<StaticOwnerId>,
     ) -> Option<String> {
         let local = self
-            .program
-            .sources
-            .iter()
-            .find(|source| source.expression == expression)
+            .lookup
+            .source_for_expression(self.program, expression)
             .and_then(|source| self.program.semantic_path(&source.path))
             .or_else(|| {
-                self.program
-                    .states
-                    .iter()
-                    .find(|state| state.expression == expression)
+                self.lookup
+                    .state_for_expression(self.program, expression)
                     .and_then(|state| self.program.semantic_path(&state.path))
             });
         let prefix = frame.and_then(|frame| self.concrete_call_result_path(frame));
@@ -7874,15 +8014,13 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     || expression.effect.emits_source
                     || expression.effect.invokes_host)
                     && (self
-                        .program
-                        .sources
-                        .iter()
-                        .any(|source| source.expression == expression.id)
+                        .lookup
+                        .source_for_expression(self.program, expression.id)
+                        .is_some()
                         || self
-                            .program
-                            .states
-                            .iter()
-                            .any(|state| state.expression == expression.id)) =>
+                            .lookup
+                            .state_for_expression(self.program, expression.id)
+                            .is_some()) =>
             {
                 self.concrete_resource_binding_path(expression.id, frame, owner)
             }
@@ -8107,6 +8245,44 @@ mod tests {
             resource_binding_path: None,
             kind,
         }
+    }
+
+    #[test]
+    fn semantic_occurrence_index_groups_checked_expressions_without_cross_scans() {
+        let mut expressions = vec![
+            provenance_test_expression(
+                0,
+                SemanticExpressionKind::Text("first".to_owned()),
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                1,
+                SemanticExpressionKind::Text("second".to_owned()),
+                runtime_value_provenance(),
+            ),
+            provenance_test_expression(
+                2,
+                SemanticExpressionKind::Text("third".to_owned()),
+                runtime_value_provenance(),
+            ),
+        ];
+        expressions[1].checked_expr_id = CheckedExprId(0);
+        expressions[2].checked_expr_id = CheckedExprId(1);
+        assert_eq!(
+            semantic_expression_occurrences_by_checked(&expressions, 2).unwrap(),
+            vec![
+                vec![SemanticExprId(0), SemanticExprId(1)],
+                vec![SemanticExprId(2)]
+            ],
+        );
+
+        expressions[2].id = SemanticExprId(7);
+        assert!(
+            semantic_expression_occurrences_by_checked(&expressions, 2)
+                .unwrap_err()
+                .to_string()
+                .contains("not dense")
+        );
     }
 
     #[test]
@@ -8859,8 +9035,13 @@ FUNCTION nested() {
             .iter()
             .find(|callable| callable.name.ends_with("nested"))
             .expect("nested callable");
+        let template = program
+            .definition_execution_templates
+            .iter()
+            .find(|template| template.callable == wrapper.decl_id)
+            .expect("wrapper definition template");
         let dependencies =
-            ordinary_callable_body_dependencies(&program, &lookup, wrapper, &candidates)
+            ordinary_callable_body_dependencies(&program, &lookup, wrapper, template, &candidates)
                 .expect("pure structural wrapper is an ordinary candidate");
         assert_eq!(
             dependencies,

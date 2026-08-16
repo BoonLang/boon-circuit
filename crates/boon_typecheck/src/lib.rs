@@ -2739,12 +2739,18 @@ impl CheckedProgramDatabase {
             states,
             lists,
             occurrences: std::mem::take(&mut self.occurrences),
+            definition_execution_templates: Vec::new(),
         };
         let (order_chains, order_diagnostics) = checked_program_phase!(
             "derive_order_chains",
             derive_checked_order_chains(&checked_fields)
         );
         checked_fields.order_chains = order_chains;
+        checked_fields.definition_execution_templates = checked_program_phase!(
+            "definition_execution_templates",
+            boon_checked::derive_checked_definition_execution_templates_v1(&checked_fields)
+                .expect("checked program publishes valid definition execution templates")
+        );
         self.diagnostics.extend(order_diagnostics);
         let checked = checked_program_phase!("assemble_checked_fields", checked_fields);
         let inference_dependencies = Arc::try_unwrap(

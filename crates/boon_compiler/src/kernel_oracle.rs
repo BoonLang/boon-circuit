@@ -2504,6 +2504,7 @@ pub(crate) fn checked_construction_from_kernel(
         states: rows.states.into_vec(),
         lists: rows.lists.into_vec(),
         occurrences: rows.occurrences.into_vec(),
+        definition_execution_templates: rows.definition_execution_templates.into_vec(),
     };
     let (order_chains, order_diagnostics) = boon_typecheck::derive_checked_order_chains(&fields);
     fields.order_chains = order_chains;
@@ -19343,6 +19344,12 @@ mod tests {
                 .len(),
             checked.fields.expressions.len()
         );
+        assert_eq!(
+            checked.fields.definition_execution_templates,
+            boon_checked::derive_checked_definition_execution_templates_v1(&checked.fields)
+                .expect("rich checked rows derive the same definition template"),
+            "the kernel artifact-owned template must exactly match the compatibility derivation",
+        );
 
         let expected = checked.fields.clone();
         // SAFETY: `checked_construction_from_kernel` completed dense linking,
@@ -20050,6 +20057,108 @@ mod tests {
             .output
             .checked_program_fields()
             .expect("NovyWave diagnostics own checked fields");
+        let derived_definition_templates =
+            boon_checked::derive_checked_definition_execution_templates_v1(fields)
+                .expect("derive NovyWave definition templates from rich checked rows");
+        if fields.definition_execution_templates != derived_definition_templates {
+            let mismatch = fields
+                .definition_execution_templates
+                .iter()
+                .zip(&derived_definition_templates)
+                .find_map(|(direct, derived)| {
+                    if direct.callable != derived.callable {
+                        return Some(format!(
+                            "callable order differs: direct={} derived={}",
+                            direct.callable.0, derived.callable.0,
+                        ));
+                    }
+                    if direct.result != derived.result {
+                        return Some(format!(
+                            "callable {} result differs: direct={} derived={}",
+                            direct.callable.0, direct.result.0, derived.result.0,
+                        ));
+                    }
+                    if direct.calls != derived.calls {
+                        return Some(format!(
+                            "callable {} calls differ: direct={:?} derived={:?}",
+                            direct.callable.0, direct.calls, derived.calls,
+                        ));
+                    }
+                    direct
+                        .nodes
+                        .iter()
+                        .zip(&derived.nodes)
+                        .enumerate()
+                        .find_map(|(index, (direct_node, derived_node))| {
+                            (direct_node != derived_node).then(|| {
+                                let window_start = index.saturating_sub(2);
+                                let window_end = (index + 3)
+                                    .min(direct.nodes.len())
+                                    .min(derived.nodes.len());
+                                format!(
+                                    "callable {} node {index} differs: direct={direct_node:?} derived={derived_node:?}; direct_kind={:?}; derived_kind={:?}; direct_window={:?}; derived_window={:?}",
+                                    direct.callable.0,
+                                    fields
+                                        .expressions
+                                        .get(direct_node.expression.0 as usize)
+                                        .map(|expression| &expression.kind),
+                                    fields
+                                        .expressions
+                                        .get(derived_node.expression.0 as usize)
+                                        .map(|expression| &expression.kind),
+                                    direct
+                                        .nodes
+                                        .get(window_start..window_end)
+                                        .unwrap_or_default()
+                                        .iter()
+                                        .map(|node| (node.expression, &node.dependencies))
+                                        .collect::<Vec<_>>(),
+                                    derived
+                                        .nodes
+                                        .get(window_start..window_end)
+                                        .unwrap_or_default()
+                                        .iter()
+                                        .map(|node| (node.expression, &node.dependencies))
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                        })
+                        .or_else(|| {
+                            (direct.nodes.len() != derived.nodes.len()).then(|| {
+                                format!(
+                                    "callable {} node count differs: direct={} derived={}",
+                                    direct.callable.0,
+                                    direct.nodes.len(),
+                                    derived.nodes.len(),
+                                )
+                            })
+                        })
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "template count differs: direct={} derived={}",
+                        fields.definition_execution_templates.len(),
+                        derived_definition_templates.len(),
+                    )
+                });
+            panic!(
+                "kernel-owned NovyWave definition templates differ from the independent checked-row derivation: {mismatch}"
+            );
+        }
+        eprintln!(
+            "kernel-novywave definition_templates={} template_nodes={} template_calls={}",
+            fields.definition_execution_templates.len(),
+            fields
+                .definition_execution_templates
+                .iter()
+                .map(|template| template.nodes.len())
+                .sum::<usize>(),
+            fields
+                .definition_execution_templates
+                .iter()
+                .map(|template| template.calls.len())
+                .sum::<usize>(),
+        );
         let syntax_expression_by_stable = project
             .stable_check_owner_keys()
             .flat_map(|owner| {

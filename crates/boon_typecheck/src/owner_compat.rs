@@ -2507,6 +2507,7 @@ pub fn assemble_checked_owner_project<'a>(
         states,
         lists,
         occurrences,
+        definition_execution_templates: Vec::new(),
     };
     fields.resource_projection_requirements = crate::checked_resource_projection_requirements(
         &fields.declarations,
@@ -2534,6 +2535,9 @@ pub fn assemble_checked_owner_project<'a>(
     );
     let (order_chains, order_diagnostics) = crate::derive_checked_order_chains(&fields);
     fields.order_chains = order_chains;
+    fields.definition_execution_templates =
+        boon_checked::derive_checked_definition_execution_templates_v1(&fields)
+            .map_err(OwnerCompatibilityAssemblyError::new)?;
     diagnostics.extend(order_diagnostics);
     trace_compat_phase(
         trace,

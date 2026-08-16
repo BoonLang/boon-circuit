@@ -6,10 +6,12 @@ use crate::{
     KernelValueReference, derive_kernel_call_type_substitutions,
 };
 use boon_checked::{
-    CheckedBlockBinding, CheckedCall, CheckedCallEntry, CheckedCallId, CheckedCallResultPath,
-    CheckedCallableContext, CheckedCallableKind, CheckedCallableSignature, CheckedContextBinding,
-    CheckedContextFormal, CheckedContextScheme, CheckedContextTypeSubstitution,
-    CheckedContextualOperation, CheckedDeclaration, CheckedDeclarationKind, CheckedEffectSummary,
+    CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1, CheckedBlockBinding, CheckedCall,
+    CheckedCallEntry, CheckedCallId, CheckedCallResultPath, CheckedCallableContext,
+    CheckedCallableKind, CheckedCallableSignature, CheckedContextBinding, CheckedContextFormal,
+    CheckedContextScheme, CheckedContextTypeSubstitution, CheckedContextualOperation,
+    CheckedDeclaration, CheckedDeclarationKind, CheckedDefinitionExecutionNodeV1,
+    CheckedDefinitionExecutionTemplateV1, CheckedDefinitionSelectorV1, CheckedEffectSummary,
     CheckedEvaluationScope, CheckedExprId, CheckedExpression, CheckedExpressionKind, CheckedList,
     CheckedListId, CheckedMatchPattern, CheckedParameter, CheckedParameterKind,
     CheckedParameterRequirement, CheckedPassedAccess, CheckedPatternBinding, CheckedRecordField,
@@ -126,6 +128,7 @@ pub struct KernelCheckedRows {
     pub sources: Box<[CheckedSource]>,
     pub states: Box<[CheckedState]>,
     pub lists: Box<[CheckedList]>,
+    pub definition_execution_templates: Box<[CheckedDefinitionExecutionTemplateV1]>,
     pub occurrences: Box<[SemanticOccurrence]>,
     occurrence_ranges: Box<[KernelCheckedRowRange]>,
 }
@@ -604,6 +607,13 @@ impl KernelCheckedLinkLayout {
         );
         let (occurrences, occurrence_ranges) =
             self.materialize_occurrences(snapshot, &declarations, &expressions, &calls)?;
+        let definition_execution_templates = self.materialize_definition_execution_templates(
+            snapshot,
+            &scopes,
+            &declarations,
+            &statements,
+            &calls,
+        )?;
         Ok(KernelCheckedRows {
             scopes,
             declarations: declarations.into_boxed_slice(),
@@ -619,9 +629,262 @@ impl KernelCheckedLinkLayout {
             sources,
             states,
             lists,
+            definition_execution_templates,
             occurrences,
             occurrence_ranges,
         })
+    }
+
+    /// Publish one dependency-first execution template directly from the
+    /// definition artifacts and this layout's final checked relocations.
+    ///
+    /// This is intentionally part of the same linker pass that creates the
+    /// final checked authority rows. Compact expression/shape artifacts supply
+    /// the graph, while already-linked declarations, statements, and calls
+    /// supply the few execution identities whose semantics live at those row
+    /// boundaries. No downstream pass reconstructs a whole-program graph from
+    /// the completed rich checked image.
+    pub fn materialize_definition_execution_templates(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        linked_scopes: &[CheckedScope],
+        linked_declarations: &[CheckedDeclaration],
+        linked_statements: &[CheckedStatement],
+        linked_calls: &[CheckedCall],
+    ) -> Result<Box<[CheckedDefinitionExecutionTemplateV1]>, KernelCheckedLinkError> {
+        self.validate_snapshot_definition_count(snapshot, "definition execution template")?;
+
+        let mut call_by_expression = BTreeMap::new();
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = checked_owner_id(owner_index, "definition execution template call")?;
+            for (ordinal, call) in definition.calls.iter().enumerate() {
+                let ordinal = u32::try_from(ordinal).map_err(|_| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel definition {} call count exceeds u32",
+                        owner.0
+                    ))
+                })?;
+                if call_by_expression
+                    .insert((owner, call.expression), ordinal)
+                    .is_some()
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {} repeats a call for expression {}",
+                        owner.0, call.expression.0
+                    )));
+                }
+            }
+        }
+        let linked_call_by_id = linked_calls
+            .iter()
+            .map(|call| (call.id, call))
+            .collect::<BTreeMap<_, _>>();
+        if linked_call_by_id.len() != linked_calls.len() {
+            return Err(KernelCheckedLinkError::new(
+                "kernel definition templates received duplicate linked call IDs",
+            ));
+        }
+        let read_provider_callables = definition_template_read_provider_callables(
+            snapshot,
+            self,
+            linked_scopes,
+            linked_declarations,
+        )?;
+        let mut call_dependencies = BTreeMap::<
+            (KernelOwnerId, crate::KernelExpressionId),
+            Vec<(KernelOwnerId, crate::KernelExpressionId)>,
+        >::new();
+        for (key @ (owner, _), ordinal) in &call_by_expression {
+            let call_id = self.call(*owner, *ordinal)?;
+            let call = linked_call_by_id.get(&call_id).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel definition template references missing linked call {}",
+                    call_id.0,
+                ))
+            })?;
+            let consumed = call
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    CheckedCallEntry::Input { value, .. } => Some(*value),
+                    CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => None,
+                })
+                .chain(call.context_binding.explicit().map(|(value, _)| value))
+                .collect::<BTreeSet<_>>();
+            let artifact = snapshot.definitions[owner.0 as usize]
+                .calls
+                .get(*ordinal as usize)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel definition {} template references missing call ordinal {}",
+                        owner.0, ordinal,
+                    ))
+                })?;
+            let mut dependencies = Vec::new();
+            let mut matched = BTreeSet::new();
+            for input in &artifact.inputs {
+                let dependency = definition_template_value(snapshot, *owner, input.value)?;
+                let linked =
+                    self.expression(dependency.0, KernelValueReference::Local(dependency.1))?;
+                if consumed.contains(&linked) {
+                    matched.insert(linked);
+                    dependencies.push(dependency);
+                }
+            }
+            if matched != consumed {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} template call {} cannot match consumed values {:?} to compact inputs {:?}",
+                    owner.0, call_id.0, consumed, matched,
+                )));
+            }
+            call_dependencies.insert(*key, dependencies);
+        }
+        let statement_child_dependencies =
+            definition_template_statement_child_dependencies(snapshot, self, linked_statements)?;
+
+        let mut templates = Vec::new();
+        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let owner = checked_owner_id(owner_index, "definition execution template")?;
+            let Some(root_statement) = definition.linkage.root_statement else {
+                continue;
+            };
+            let Some(statement) = definition
+                .statements
+                .get(root_statement.0 as usize)
+                .filter(|statement| statement.id == root_statement)
+            else {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} template references missing root statement {}",
+                    owner.0, root_statement.0
+                )));
+            };
+            if !matches!(statement.kind, crate::KernelStatementKind::Function { .. }) {
+                continue;
+            }
+            let result = definition.linkage.result_expression.ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel callable definition {} has no result expression",
+                    owner.0
+                ))
+            })?;
+            let root = (owner, result);
+            let callable = self.definition(owner)?.public_declaration;
+            let mut state = BTreeMap::<(KernelOwnerId, crate::KernelExpressionId), u8>::new();
+            let mut dependencies = BTreeMap::<
+                (KernelOwnerId, crate::KernelExpressionId),
+                Vec<(KernelOwnerId, crate::KernelExpressionId)>,
+            >::new();
+            let mut nodes = Vec::new();
+            let mut calls = Vec::new();
+            let mut pending = vec![(root, false)];
+            while let Some((key @ (node_owner, expression_id), exiting)) = pending.pop() {
+                let node_definition =
+                    snapshot
+                        .definitions
+                        .get(node_owner.0 as usize)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition template references missing owner {}",
+                                node_owner.0
+                            ))
+                        })?;
+                let expression = node_definition
+                    .expressions
+                    .get(expression_id.0 as usize)
+                    .filter(|expression| expression.id == expression_id)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition template references missing expression {}:{}",
+                            node_owner.0, expression_id.0
+                        ))
+                    })?;
+                if exiting {
+                    if state.get(&key).copied() == Some(2) {
+                        continue;
+                    }
+                    state.insert(key, 2);
+                    let local_dependencies = dependencies.remove(&key).ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition template lost dependencies for expression {}:{}",
+                            node_owner.0, expression_id.0
+                        ))
+                    })?;
+                    let checked_dependencies = local_dependencies
+                        .iter()
+                        .map(|(dependency_owner, dependency)| {
+                            self.expression(
+                                *dependency_owner,
+                                KernelValueReference::Local(*dependency),
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let call = call_by_expression
+                        .get(&key)
+                        .copied()
+                        .map(|ordinal| self.call(node_owner, ordinal))
+                        .transpose()?;
+                    if let Some(call) = call {
+                        calls.push(call);
+                    }
+                    let selector =
+                        definition_template_selector(snapshot, node_owner, expression, self)?;
+                    nodes.push(CheckedDefinitionExecutionNodeV1 {
+                        expression: self
+                            .expression(node_owner, KernelValueReference::Local(expression_id))?,
+                        dependencies: checked_dependencies,
+                        call,
+                        selector,
+                    });
+                    continue;
+                }
+                match state.get(&key).copied().unwrap_or(0) {
+                    2 | 1 => continue,
+                    _ => {
+                        state.insert(key, 1);
+                    }
+                }
+                let mut relocated_dependencies = definition_template_dependencies(
+                    snapshot,
+                    &statement_child_dependencies,
+                    &call_dependencies,
+                    &read_provider_callables,
+                    callable,
+                    node_owner,
+                    expression,
+                )?
+                .into_iter()
+                .map(|dependency @ (dependency_owner, expression)| {
+                    self.expression(dependency_owner, KernelValueReference::Local(expression))
+                        .map(|relocated| (relocated, dependency))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+                relocated_dependencies.sort_unstable_by_key(|(relocated, _)| relocated.0);
+                relocated_dependencies.dedup_by_key(|(relocated, _)| *relocated);
+                let node_dependencies = relocated_dependencies
+                    .into_iter()
+                    .map(|(_, dependency)| dependency)
+                    .collect::<Vec<_>>();
+                dependencies.insert(key, node_dependencies.clone());
+                pending.push((key, true));
+                pending.extend(
+                    node_dependencies
+                        .into_iter()
+                        .rev()
+                        .map(|dependency| (dependency, false)),
+                );
+            }
+            calls.sort_unstable_by_key(|call| call.0);
+            calls.dedup();
+            templates.push(CheckedDefinitionExecutionTemplateV1 {
+                schema: CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1.to_owned(),
+                callable,
+                result: self.expression(owner, KernelValueReference::Local(result))?,
+                nodes,
+                calls,
+            });
+        }
+        templates.sort_unstable_by_key(|template| template.callable.0);
+        Ok(templates.into_boxed_slice())
     }
 
     /// Link pattern-binding declaration authority directly from the exact
@@ -3266,6 +3529,452 @@ fn checked_owner_id(index: usize, label: &str) -> Result<KernelOwnerId, KernelCh
             "kernel checked {label} materializer definition count exceeds u32",
         ))
     })?))
+}
+
+fn definition_template_value(
+    snapshot: &KernelCheckedSnapshot,
+    owner: KernelOwnerId,
+    value: KernelValueReference,
+) -> Result<(KernelOwnerId, crate::KernelExpressionId), KernelCheckedLinkError> {
+    match value {
+        KernelValueReference::Local(expression) => Ok((owner, expression)),
+        KernelValueReference::External(external) => match external.target {
+            KernelExternalTarget::Expression(expression) => Ok((external.owner, expression)),
+            KernelExternalTarget::Result => {
+                let definition = snapshot
+                    .definitions
+                    .get(external.owner.0 as usize)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition template references missing external owner {}",
+                            external.owner.0,
+                        ))
+                    })?;
+                let expression = definition.linkage.result_expression.ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel definition template references owner {} without a result expression",
+                        external.owner.0,
+                    ))
+                })?;
+                Ok((external.owner, expression))
+            }
+        },
+    }
+}
+
+fn definition_template_dependencies(
+    snapshot: &KernelCheckedSnapshot,
+    statement_child_dependencies: &BTreeMap<
+        (KernelOwnerId, crate::KernelExpressionId),
+        Vec<(KernelOwnerId, crate::KernelExpressionId)>,
+    >,
+    call_dependencies: &BTreeMap<
+        (KernelOwnerId, crate::KernelExpressionId),
+        Vec<(KernelOwnerId, crate::KernelExpressionId)>,
+    >,
+    read_provider_callables: &BTreeMap<(KernelOwnerId, crate::KernelExpressionId), Option<DeclId>>,
+    callable: DeclId,
+    owner: KernelOwnerId,
+    expression: &crate::KernelExpressionArtifact,
+) -> Result<Vec<(KernelOwnerId, crate::KernelExpressionId)>, KernelCheckedLinkError> {
+    let definition = snapshot.definitions.get(owner.0 as usize).ok_or_else(|| {
+        KernelCheckedLinkError::new(format!(
+            "kernel definition template references missing owner {}",
+            owner.0,
+        ))
+    })?;
+    let payload = definition
+        .expression_payloads
+        .get(expression.id.0 as usize)
+        .ok_or_else(|| {
+            KernelCheckedLinkError::new(format!(
+                "kernel definition {} template expression {} has no semantic payload",
+                owner.0, expression.id.0,
+            ))
+        })?;
+    // A non-empty authored delimiter is structurally interpreted as a record
+    // by the type engine, but remains a delimiter in the checked expression
+    // graph. Its field values are owned by child statements, not expression
+    // dependencies. Preserve that checked execution boundary here.
+    if matches!(payload, crate::KernelExpressionSemanticPayload::Delimiter) {
+        return Ok(Vec::new());
+    }
+    if let Some(dependencies) = call_dependencies.get(&(owner, expression.id)) {
+        return Ok(dependencies.clone());
+    }
+    let mut dependencies = Vec::new();
+    for input in &expression.inputs {
+        if matches!(
+            input.role,
+            crate::KernelOwnerEdgeRole::CallOutArgument { .. }
+                | crate::KernelOwnerEdgeRole::HoldUpdate
+        ) {
+            continue;
+        }
+        if matches!(input.role, crate::KernelOwnerEdgeRole::ReadProvider) {
+            let read_callable = read_provider_callables
+                .get(&(owner, expression.id))
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel definition {} template read {} has no lexical callable authority",
+                        owner.0, expression.id.0,
+                    ))
+                })?;
+            if *read_callable != Some(callable) {
+                continue;
+            }
+        }
+        dependencies.push(definition_template_value(snapshot, owner, input.value)?);
+    }
+    if matches!(
+        expression.kind,
+        crate::KernelOwnerNodeKind::Hold | crate::KernelOwnerNodeKind::MatchArm { .. }
+    ) {
+        dependencies.extend(
+            statement_child_dependencies
+                .get(&(owner, expression.id))
+                .into_iter()
+                .flatten()
+                .copied(),
+        );
+    }
+    if matches!(expression.kind, crate::KernelOwnerNodeKind::Block) {
+        let mut shapes = definition.execution_shapes.iter().filter(|shape| {
+            matches!(
+                shape,
+                crate::KernelExecutionShapeArtifact::Block {
+                    expression: candidate,
+                    ..
+                } if *candidate == expression.id
+            )
+        });
+        let Some(crate::KernelExecutionShapeArtifact::Block {
+            bindings, result, ..
+        }) = shapes.next()
+        else {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel definition {} BLOCK expression {} has no execution shape",
+                owner.0, expression.id.0,
+            )));
+        };
+        if shapes.next().is_some() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel definition {} repeats a BLOCK shape for expression {}",
+                owner.0, expression.id.0,
+            )));
+        }
+        dependencies.extend(
+            bindings
+                .iter()
+                .map(|binding| definition_template_value(snapshot, owner, binding.value))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        if let Some(result) = result {
+            dependencies.push(definition_template_value(snapshot, owner, *result)?);
+        }
+    }
+    Ok(dependencies)
+}
+
+fn definition_template_read_provider_callables(
+    snapshot: &KernelCheckedSnapshot,
+    layout: &KernelCheckedLinkLayout,
+    linked_scopes: &[CheckedScope],
+    linked_declarations: &[CheckedDeclaration],
+) -> Result<
+    BTreeMap<(KernelOwnerId, crate::KernelExpressionId), Option<DeclId>>,
+    KernelCheckedLinkError,
+> {
+    let scopes = linked_scopes
+        .iter()
+        .map(|scope| (scope.id, scope))
+        .collect::<BTreeMap<_, _>>();
+    if scopes.len() != linked_scopes.len() {
+        return Err(KernelCheckedLinkError::new(
+            "kernel definition templates received duplicate linked scope IDs",
+        ));
+    }
+    let declarations = linked_declarations
+        .iter()
+        .map(|declaration| (declaration.id, declaration))
+        .collect::<BTreeMap<_, _>>();
+    if declarations.len() != linked_declarations.len() {
+        return Err(KernelCheckedLinkError::new(
+            "kernel definition templates received duplicate linked declaration IDs",
+        ));
+    }
+    let mut callable_by_scope = BTreeMap::new();
+    for scope in linked_scopes {
+        let mut current = scope.id;
+        let mut visited = BTreeSet::new();
+        let callable = loop {
+            if !visited.insert(current) {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition template scope {} contains a parent cycle",
+                    scope.id.0,
+                )));
+            }
+            let definition = scopes.get(&current).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel definition template references missing linked scope {}",
+                    current.0,
+                ))
+            })?;
+            if definition.kind == CheckedScopeKind::Function {
+                break definition.owner;
+            }
+            let Some(parent) = definition.parent else {
+                break None;
+            };
+            current = parent;
+        };
+        callable_by_scope.insert(scope.id, callable);
+    }
+
+    let mut result = BTreeMap::new();
+    for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+        let owner = checked_owner_id(owner_index, "definition template lexical read")?;
+        for binding in &definition.lexical_bindings {
+            if !definition
+                .expressions
+                .get(binding.expression.0 as usize)
+                .filter(|expression| expression.id == binding.expression)
+                .is_some_and(|expression| {
+                    expression
+                        .inputs
+                        .iter()
+                        .any(|input| matches!(input.role, crate::KernelOwnerEdgeRole::ReadProvider))
+                })
+            {
+                continue;
+            }
+            let callable = match binding.target {
+                KernelLexicalBindingTarget::Declaration(reference) => {
+                    let declaration = layout.declaration(owner, reference)?;
+                    let declaration = declarations.get(&declaration).ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {} template read {} targets missing declaration {}",
+                            owner.0, binding.expression.0, declaration.0,
+                        ))
+                    })?;
+                    if declaration.value.is_none() {
+                        None
+                    } else {
+                        callable_by_scope
+                            .get(&declaration.scope_id)
+                            .copied()
+                            .ok_or_else(|| {
+                                KernelCheckedLinkError::new(format!(
+                                    "kernel definition template declaration {} references missing scope {}",
+                                    declaration.id.0, declaration.scope_id.0,
+                                ))
+                            })?
+                    }
+                }
+                KernelLexicalBindingTarget::ContextFormal { .. }
+                | KernelLexicalBindingTarget::Value { .. }
+                | KernelLexicalBindingTarget::RuntimeContext => None,
+            };
+            if result
+                .insert((owner, binding.expression), callable)
+                .is_some()
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} repeats lexical callable authority for expression {}",
+                    owner.0, binding.expression.0,
+                )));
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn definition_template_statement_child_dependencies(
+    snapshot: &KernelCheckedSnapshot,
+    layout: &KernelCheckedLinkLayout,
+    linked_statements: &[CheckedStatement],
+) -> Result<
+    BTreeMap<
+        (KernelOwnerId, crate::KernelExpressionId),
+        Vec<(KernelOwnerId, crate::KernelExpressionId)>,
+    >,
+    KernelCheckedLinkError,
+> {
+    let mut expression_keys = BTreeMap::new();
+    for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+        let owner = checked_owner_id(owner_index, "definition template expression reverse map")?;
+        for expression in &definition.expressions {
+            let linked = layout.expression(owner, KernelValueReference::Local(expression.id))?;
+            if expression_keys
+                .insert(linked, (owner, expression.id))
+                .is_some()
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition templates repeat linked expression {}",
+                    linked.0,
+                )));
+            }
+        }
+    }
+    let statements = linked_statements
+        .iter()
+        .map(|statement| (statement.id, statement))
+        .collect::<BTreeMap<_, _>>();
+    if statements.len() != linked_statements.len() {
+        return Err(KernelCheckedLinkError::new(
+            "kernel definition templates received duplicate linked statement IDs",
+        ));
+    }
+    let mut statements_by_value = BTreeMap::<CheckedExprId, Vec<CheckedStatementId>>::new();
+    for statement in linked_statements {
+        if let Some(value) = statement.value {
+            statements_by_value
+                .entry(value)
+                .or_default()
+                .push(statement.id);
+        }
+    }
+
+    let mut result = BTreeMap::new();
+    for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+        let owner = checked_owner_id(owner_index, "definition template statement dependency")?;
+        for expression in definition.expressions.iter().filter(|expression| {
+            matches!(
+                expression.kind,
+                crate::KernelOwnerNodeKind::Hold | crate::KernelOwnerNodeKind::MatchArm { .. }
+            )
+        }) {
+            let linked = layout.expression(owner, KernelValueReference::Local(expression.id))?;
+            let values = linked_definition_template_statement_child_values(
+                &statements,
+                &statements_by_value,
+                linked,
+            )?;
+            let dependencies = values
+                .into_iter()
+                .map(|value| {
+                    expression_keys.get(&value).copied().ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition template statement dependency references missing expression {}",
+                            value.0,
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            result.insert((owner, expression.id), dependencies);
+        }
+    }
+    Ok(result)
+}
+
+fn linked_definition_template_statement_child_values(
+    statements: &BTreeMap<CheckedStatementId, &CheckedStatement>,
+    statements_by_value: &BTreeMap<CheckedExprId, Vec<CheckedStatementId>>,
+    expression: CheckedExprId,
+) -> Result<Vec<CheckedExprId>, KernelCheckedLinkError> {
+    let Some(root) = statements_by_value
+        .get(&expression)
+        .into_iter()
+        .flatten()
+        .filter_map(|statement| statements.get(statement).copied())
+        .find(|statement| statement.value == Some(expression) && !statement.children.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    let mut pending = root.children.iter().rev().copied().collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    let mut values = Vec::new();
+    while let Some(statement) = pending.pop() {
+        if !visited.insert(statement) {
+            continue;
+        }
+        let definition = statements.get(&statement).copied().ok_or_else(|| {
+            KernelCheckedLinkError::new(format!(
+                "kernel definition template references missing linked statement {}",
+                statement.0,
+            ))
+        })?;
+        match definition.value {
+            Some(value) if value == expression => {
+                pending.extend(definition.children.iter().rev().copied());
+            }
+            Some(value) => values.push(value),
+            None => pending.extend(definition.children.iter().rev().copied()),
+        }
+    }
+    Ok(values)
+}
+
+fn definition_template_selector(
+    snapshot: &KernelCheckedSnapshot,
+    owner: KernelOwnerId,
+    expression: &crate::KernelExpressionArtifact,
+    layout: &KernelCheckedLinkLayout,
+) -> Result<Option<CheckedDefinitionSelectorV1>, KernelCheckedLinkError> {
+    let definition = snapshot.definitions.get(owner.0 as usize).ok_or_else(|| {
+        KernelCheckedLinkError::new(format!(
+            "kernel definition template references missing owner {}",
+            owner.0,
+        ))
+    })?;
+    let mut matching_shapes = definition.execution_shapes.iter().filter(|shape| {
+        matches!(
+            shape,
+            crate::KernelExecutionShapeArtifact::Conditional {
+                expression: candidate,
+                ..
+            } if *candidate == expression.id
+        )
+    });
+    let Some(shape) = matching_shapes.next() else {
+        return Ok(None);
+    };
+    if matching_shapes.next().is_some() {
+        return Err(KernelCheckedLinkError::new(format!(
+            "kernel definition {} repeats a conditional shape for expression {}",
+            owner.0, expression.id.0,
+        )));
+    }
+    let crate::KernelExecutionShapeArtifact::Conditional { kind, .. } = shape else {
+        unreachable!()
+    };
+    if *kind == crate::KernelConditionalKind::While {
+        return Ok(None);
+    }
+
+    let mut selector_inputs = expression
+        .inputs
+        .iter()
+        .filter(|input| matches!(input.role, crate::KernelOwnerEdgeRole::WhenInput));
+    let selector = selector_inputs.next().ok_or_else(|| {
+        KernelCheckedLinkError::new(format!(
+            "kernel definition {} WHEN expression {} has no selector input",
+            owner.0, expression.id.0,
+        ))
+    })?;
+    if selector_inputs.next().is_some() {
+        return Err(KernelCheckedLinkError::new(format!(
+            "kernel definition {} WHEN expression {} has multiple selector inputs",
+            owner.0, expression.id.0,
+        )));
+    }
+    let (selector_owner, selector_expression) =
+        definition_template_value(snapshot, owner, selector.value)?;
+    let input = layout.expression(
+        selector_owner,
+        KernelValueReference::Local(selector_expression),
+    )?;
+    let arms = expression
+        .inputs
+        .iter()
+        .filter(|input| matches!(input.role, crate::KernelOwnerEdgeRole::WhenArm))
+        .map(|arm| {
+            let (arm_owner, arm_expression) =
+                definition_template_value(snapshot, owner, arm.value)?;
+            layout.expression(arm_owner, KernelValueReference::Local(arm_expression))
+        })
+        .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?;
+    Ok(Some(CheckedDefinitionSelectorV1 { input, arms }))
 }
 
 fn expression_presentation(

@@ -681,6 +681,10 @@ pub enum OutNetDiagnostic {
         call: OutCallInstanceId,
         callable: DeclId,
     },
+    InvalidDefinitionTemplate {
+        callable: DeclId,
+        reason: String,
+    },
 }
 
 impl fmt::Display for OutNetDiagnostic {
@@ -749,6 +753,11 @@ impl fmt::Display for OutNetDiagnostic {
             Self::RecursiveContextualCall { call, callable } => write!(
                 formatter,
                 "OUT call instance {call} recursively expands callable declaration {}",
+                callable.0
+            ),
+            Self::InvalidDefinitionTemplate { callable, reason } => write!(
+                formatter,
+                "OUT definition template for callable {} is invalid: {reason}",
                 callable.0
             ),
         }
@@ -1083,6 +1092,15 @@ struct OutNetBuilder<'program, Contract, MakeContract, IsProducer> {
     pattern_binding_by_declaration: BTreeMap<DeclId, &'program CheckedPatternBinding>,
     statements_with_children_by_value: BTreeMap<CheckedExprId, usize>,
     function_owner_by_scope: Vec<Option<DeclId>>,
+    definition_node_by_expression: Vec<
+        Option<
+            Option<(
+                DeclId,
+                &'program boon_checked::CheckedDefinitionExecutionNodeV1,
+            )>,
+        >,
+    >,
+    definition_call_indices_by_callable: BTreeMap<DeclId, Vec<usize>>,
     root_expressions: Vec<CheckedExprId>,
     resource_owning_callables: BTreeSet<DeclId>,
     producer_root_specs: Vec<ProducerRootSpec>,
@@ -1172,6 +1190,117 @@ where
         }
         let resource_owning_callables =
             resource_owning_callables(program, &signature_by_id, &function_owner_by_scope);
+        let mut diagnostics = alias_cycle_diagnostics(program);
+        let mut definition_template_by_callable = BTreeMap::new();
+        let mut definition_node_by_expression = Vec::new();
+        let mut definition_call_indices_by_callable = BTreeMap::new();
+        for template in &program.definition_execution_templates {
+            if definition_template_by_callable
+                .insert(template.callable, template)
+                .is_some()
+            {
+                diagnostics.push(OutNetDiagnostic::InvalidDefinitionTemplate {
+                    callable: template.callable,
+                    reason: "duplicate callable template".to_owned(),
+                });
+                continue;
+            }
+            if template.schema != boon_checked::CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1
+                || template.nodes.last().map(|node| node.expression) != Some(template.result)
+                || signature_by_id
+                    .get(&template.callable)
+                    .is_none_or(|callable| {
+                        callable.kind != CheckedCallableKind::User
+                            || callable.result_expression != Some(template.result)
+                    })
+            {
+                diagnostics.push(OutNetDiagnostic::InvalidDefinitionTemplate {
+                    callable: template.callable,
+                    reason: "schema or result root mismatch".to_owned(),
+                });
+            }
+            let node_expressions = template
+                .nodes
+                .iter()
+                .map(|node| node.expression)
+                .collect::<BTreeSet<_>>();
+            let node_calls = template
+                .nodes
+                .iter()
+                .filter_map(|node| node.call)
+                .collect::<BTreeSet<_>>();
+            if node_expressions.len() != template.nodes.len()
+                || template.nodes.iter().any(|node| {
+                    node.dependencies
+                        .iter()
+                        .any(|dependency| !node_expressions.contains(dependency))
+                        || node.selector.as_ref().is_some_and(|selector| {
+                            !node_expressions.contains(&selector.input)
+                                || selector
+                                    .arms
+                                    .iter()
+                                    .any(|arm| !node_expressions.contains(arm))
+                        })
+                })
+                || node_calls != template.calls.iter().copied().collect::<BTreeSet<_>>()
+                || node_calls.len() != template.calls.len()
+            {
+                diagnostics.push(OutNetDiagnostic::InvalidDefinitionTemplate {
+                    callable: template.callable,
+                    reason: "node, dependency, selector, or call inventory mismatch".to_owned(),
+                });
+            }
+            for node in &template.nodes {
+                let index = node.expression.0 as usize;
+                if definition_node_by_expression.len() <= index {
+                    definition_node_by_expression.resize(index.saturating_add(1), None);
+                }
+                let slot = &mut definition_node_by_expression[index];
+                match slot {
+                    None => *slot = Some(Some((template.callable, node))),
+                    Some(_) => {
+                        *slot = Some(None);
+                        diagnostics.push(OutNetDiagnostic::InvalidDefinitionTemplate {
+                            callable: template.callable,
+                            reason: format!("duplicate expression {}", node.expression.0),
+                        });
+                    }
+                }
+            }
+            let mut call_indices = Vec::with_capacity(template.calls.len());
+            for call in &template.calls {
+                match call_index_by_id.get(call).copied() {
+                    Some(index)
+                        if program.calls[index].owner_callable == Some(template.callable) =>
+                    {
+                        call_indices.push(index)
+                    }
+                    None => diagnostics.push(OutNetDiagnostic::InvalidDefinitionTemplate {
+                        callable: template.callable,
+                        reason: format!("missing call {}", call.0),
+                    }),
+                    Some(_) => diagnostics.push(OutNetDiagnostic::InvalidDefinitionTemplate {
+                        callable: template.callable,
+                        reason: format!("call {} belongs to another definition", call.0),
+                    }),
+                }
+            }
+            call_indices.sort_by_key(|index| {
+                let call = &program.calls[*index];
+                (call.expression, call.id, call.callable, *index)
+            });
+            definition_call_indices_by_callable.insert(template.callable, call_indices);
+        }
+        for callable in program.callables.iter().filter(|callable| {
+            callable.kind == CheckedCallableKind::User && callable.result_expression.is_some()
+        }) {
+            if !definition_template_by_callable.contains_key(&callable.decl_id) {
+                diagnostics.push(OutNetDiagnostic::InvalidDefinitionTemplate {
+                    callable: callable.decl_id,
+                    reason: "missing user definition template".to_owned(),
+                });
+            }
+        }
         let retained_definitions = intent.retained_definitions();
         let retained_overlay_definitions =
             retained_overlay_definitions(program, retained_definitions, &signature_by_id);
@@ -1185,6 +1314,8 @@ where
             pattern_binding_by_declaration,
             statements_with_children_by_value,
             function_owner_by_scope,
+            definition_node_by_expression,
+            definition_call_indices_by_callable,
             root_expressions,
             resource_owning_callables,
             producer_root_specs,
@@ -1208,7 +1339,7 @@ where
             ports: Vec::new(),
             producer_ports: BTreeSet::new(),
             union_find: UnionFind::default(),
-            diagnostics: alias_cycle_diagnostics(program),
+            diagnostics,
         }
     }
 
@@ -1276,21 +1407,29 @@ where
         owner_callable: Option<DeclId>,
         frame: Option<OutCallInstanceId>,
     ) -> Vec<usize> {
-        let all_calls = self
-            .calls_by_owner
-            .get(&owner_callable)
-            .cloned()
-            .unwrap_or_default();
-        self.expanded_frames += 1;
-        self.lexical_call_sites_considered += all_calls.len();
-        if owner_callable.is_some_and(|owner| {
+        let conservative = owner_callable.is_some_and(|owner| {
             self.resource_owning_callables.contains(&owner)
                 || self.signature_by_id.get(&owner).is_some_and(|callable| {
                     callable.effect.writes_state
                         || callable.effect.emits_source
                         || callable.effect.invokes_host
                 })
-        }) {
+        });
+        let all_calls = match owner_callable {
+            Some(owner) if !conservative => self
+                .definition_call_indices_by_callable
+                .get(&owner)
+                .cloned()
+                .unwrap_or_default(),
+            _ => self
+                .calls_by_owner
+                .get(&owner_callable)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        self.expanded_frames += 1;
+        self.lexical_call_sites_considered += all_calls.len();
+        if conservative {
             // Stateful/effectful callable bodies can contain update expressions
             // rooted by statement scheduling rather than their result value.
             // Keep their complete lexical call inventory until that scheduling
@@ -1314,6 +1453,40 @@ where
         let mut reachable = BTreeSet::new();
         while let Some(expression) = pending.pop() {
             if !visited.insert(expression) {
+                continue;
+            }
+            if let Some(owner) = owner_callable
+                && let Some(node) = self
+                    .definition_node_by_expression
+                    .get(expression.0 as usize)
+                    .copied()
+                    .flatten()
+                    .flatten()
+                    .and_then(|(node_owner, node)| (node_owner == owner).then_some(node))
+            {
+                if let Some(call) = node.call
+                    && let Some(index) = self.call_index_by_id.get(&call).copied()
+                {
+                    reachable.insert(index);
+                }
+                if let Some(selector) = &node.selector {
+                    pending.push(selector.input);
+                    let selected = self
+                        .static_checked_selector_value(
+                            selector.input,
+                            frame,
+                            Vec::new(),
+                            &mut BTreeSet::new(),
+                        )
+                        .and_then(|value| self.selected_checked_arm(&value, &selector.arms));
+                    if let Some(selected) = selected {
+                        pending.push(selected);
+                    } else {
+                        pending.extend(selector.arms.iter().copied());
+                    }
+                } else {
+                    pending.extend(node.dependencies.iter().copied());
+                }
                 continue;
             }
             let Some(expression) = self

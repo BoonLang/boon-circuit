@@ -4067,6 +4067,53 @@ boundary; `boon_semantic` must not depend upward on
 `boon_compiler_kernel`. Once parity holds, delete the corresponding ordinary-
 body scans and retained overlay reconstruction in the same tranche.
 
+The definition-owned execution-template cut is now complete. Each user
+definition with an executable result publishes one dependency-first template
+while the kernel checked linker owns compact expression/shape artifacts and
+the final declaration, statement, and call relocations. `boon_semantic`
+consumes that table directly for ordinary-definition dependency discovery and
+OUT reachability; the independent rich-row derivation remains only as a
+differential oracle. The production linker does not rebuild a completed
+whole-program checked graph. BLOCK bindings come from compact execution
+shapes, calls consume only linked input/context entries (never OUT slots),
+local declaration reads follow exact same-callable value authority, and HOLD
+and match-arm child roots come from directly linked statement rows. Authored
+multiline delimiters remain statement-owned execution boundaries even though
+their type equations are structural records. None of these rules recognizes a
+UI library tag or product-specific source shape.
+
+The full NovyWave oracle proves exact template parity across all 1,389 kernel
+definitions with zero unsupported owners. It publishes 504 executable
+definition templates containing 9,374 dependency-first nodes and 1,463 unique
+call references. The direct checked image contains 15,575 expression rows,
+5,541 statement rows, 4,862 declaration rows, 1,821 call rows, 6,999 definition
+dependency edges, and 3,053 reverse-consumer edges. The compiler package is
+green with 81 active library tests, one
+intentional large ignored probe, and all 16 integration tests. Focused
+ordinary and retained semantic tests are green; one historical static-dispatch
+size-budget failure remains byte-artifact-confirmed pre-existing debt. The
+kernel dependency firewall contains no production dependency on
+`boon_typecheck`, `boon_semantic`, `boon_ir`, `boon_plan`, or `boon_compiler`.
+
+The accepted fresh debug verified probe is 15,533.144 ms total: 4,870.127 ms
+checking, 5,928.827 ms semantic construction, 4,408.590 ms backend work, and
+0.849 ms WHERE verification. The fresh optimized probe is 2,972.667 ms total
+(2,921.295 ms wall): 1,120.470 ms checking, 1,214.561 ms semantic
+construction, 401.189 ms backend work, and 0.618 ms WHERE verification. The
+optimized Rust rebuild took 2 minutes 41 seconds and is excluded from Boon
+latency; rebuild plus probe peaked at 1,271,804 KiB RSS. This cut is an
+ownership prerequisite rather than a speed claim: compared with the prior
+2,868.009 ms optimized sample it is slightly slower, because the direct table
+has not yet deleted the downstream semantic reconstruction owners it enables.
+WHERE is 0.021% of verified time and is explicitly measured, but is not an
+optimization target.
+
+The next biggest cut is to extend the same definition artifact with normalized
+semantic facts and relocations, starting at the largest measured construction
+owners: executable receipt finalization and dependency/resource manifest
+assembly. That tranche must delete their repeated inventories as it adds the
+replacement; it must not add another semantic DTO underneath the old passes.
+
 1. Finish `DefinitionArtifact` from the dependency bottom upward: declaration
    and lexical-binding identities first, then HOLD state, persistent LIST, and
    SOURCE resource rows. Reuse the existing dense expression and statement

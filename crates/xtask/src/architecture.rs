@@ -902,7 +902,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
         &semantic,
         "SemanticProgram",
         "semantic_image",
-        "SealedSemanticImageV3",
+        "SealedSemanticImageV4",
     )?;
     verify_required_direct_field(&ir, "ErasedProgram", "fields", "CanonicalProgramCoreV2")?;
     verify_required_direct_field(
@@ -1462,9 +1462,9 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     for required in [
         "pub(crate) fn build_canonical_program_core(",
         "struct CanonicalProgramCoreBuildV2",
-        "execution_handoff: crate::semantic_image::ExecutionImageHandoffV3",
+        "execution_handoff: crate::semantic_image::ExecutionImageHandoffV4",
         "manifest_prefix: crate::dependency_manifest::ManifestCheckedExecutionPrefixV7",
-        "ExecutionReceiptPublisherV3<'_>",
+        "ExecutionReceiptPublisherV4<'_>",
         "struct SemanticToExecutableMap",
         "fn validate_allocation_bijections(",
         "struct SemanticReactiveToMappedMap",
@@ -1508,8 +1508,15 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         );
     }
     for required in [
-        "pub(crate) struct ExecutionReceiptPublisherV3",
-        "construction-published execution V3 handoff differs from the post-hoc oracle",
+        "pub(crate) struct ExecutionReceiptPublisherV4",
+        "pub const SEMANTIC_IMAGE_SCHEMA_V4",
+        "pub const EXECUTION_IMAGE_HANDOFF_SCHEMA_V4",
+        "fn seal_execution_expression_proof_v1(",
+        "fn execution_proof_update_type_v1(",
+        "fn execution_proof_update_static_override_v1(",
+        "compact_expression_proof_binds_flow_static_owner_provenance_and_children",
+        "compact_flow_proof_distinguishes_every_type_shape",
+        "construction-published execution V4 handoff differs from the post-hoc oracle",
     ] {
         if !semantic_image.contains(required) {
             return Err(format!(

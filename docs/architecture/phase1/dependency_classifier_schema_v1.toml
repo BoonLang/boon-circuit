@@ -15387,7 +15387,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/semantic_image.rs"
-name = "ExecutionImageHandoffV3"
+name = "ExecutionImageHandoffV4"
 fields = [
   { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
@@ -15417,7 +15417,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/semantic_image.rs"
-name = "SealedSemanticImageV3"
+name = "SealedSemanticImageV4"
 fields = [
   { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "checked_handoff", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },

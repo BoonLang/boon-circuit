@@ -22,13 +22,14 @@ use boon_checked::{
 };
 use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
-pub const SEMANTIC_IMAGE_SCHEMA_V3: &str = "boon.semantic-image.v3";
+pub const SEMANTIC_IMAGE_SCHEMA_V4: &str = "boon.semantic-image.v4";
 #[cfg(test)]
 pub const EXECUTION_IMAGE_HANDOFF_SCHEMA_V2: &str = "boon.execution-image-handoff.v2";
-pub const EXECUTION_IMAGE_HANDOFF_SCHEMA_V3: &str = "boon.execution-image-handoff.v3";
+pub const EXECUTION_IMAGE_HANDOFF_SCHEMA_V4: &str = "boon.execution-image-handoff.v4";
 pub const EXECUTION_CONSTRUCTION_ROUTES_SCHEMA_V3: &str = "boon.execution-construction-routes.v3";
 
 // The parent/call-site path is a stable logical identity shared by the V2
@@ -48,9 +49,14 @@ const EXECUTION_IMAGE_PROJECTION_KEY_DOMAIN_V3: &[u8] = b"boon.execution-image-p
 const EXECUTION_IMAGE_ROW_PAYLOAD_DOMAIN_V3: &[u8] = b"boon.execution-image-row-payload.v3\0";
 const EXECUTION_IMAGE_ROW_DOMAIN_V3: &[u8] = b"boon.execution-image-row.v3\0";
 const EXECUTION_IMAGE_SHARD_DOMAIN_V3: &[u8] = b"boon.execution-image-shard.v3\0";
-const EXECUTION_IMAGE_HANDOFF_DOMAIN_V3: &[u8] = b"boon.execution-image-handoff.v3\0";
-const SEMANTIC_IMAGE_SEAL_DOMAIN_V3: &[u8] = b"boon.semantic-image-seal.v3\0";
+const EXECUTION_IMAGE_HANDOFF_DOMAIN_V4: &[u8] = b"boon.execution-image-handoff.v4\0";
+const SEMANTIC_IMAGE_SEAL_DOMAIN_V4: &[u8] = b"boon.semantic-image-seal.v4\0";
 const EXECUTION_INVOCATION_OVERLAY_DOMAIN_V3: &[u8] = b"boon.execution-invocation-overlay.v3\0";
+const EXECUTION_EXPRESSION_PROOF_DOMAIN_V1: &[u8] = b"boon.execution-expression-proof.v1\0";
+const EXECUTION_EXPRESSION_PROOF_NESTED_DOMAIN_V1: &[u8] =
+    b"boon.execution-expression-proof-nested.v1\0";
+const EXECUTION_DEFINITION_PROOF_FRAGMENT_DOMAIN_V1: &[u8] =
+    b"boon.execution-definition-proof-fragment.v1\0";
 #[cfg(test)]
 const EXECUTION_CONSTRUCTION_ROUTES_DOMAIN_V3: &[u8] = b"boon.execution-construction-routes.v3\0";
 
@@ -58,7 +64,6 @@ const EXECUTION_CONSTRUCTION_ROUTES_DOMAIN_V3: &[u8] = b"boon.execution-construc
 #[cfg(test)]
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ExecutionRowPayloadSealsV3 {
-    pub(crate) expressions: Box<[[u8; 32]]>,
     pub(crate) statements: Box<[[u8; 32]]>,
     pub(crate) call_occurrences: Box<[[u8; 32]]>,
     pub(crate) sources: Box<[[u8; 32]]>,
@@ -79,6 +84,1573 @@ pub(crate) fn seal_execution_row_payload_v3<T: Serialize + ?Sized>(
         scratch,
     )
     .map_err(|error| format!("failed to seal execution V3 row payload: {error}"))
+}
+
+fn push_execution_expression_child_v1(
+    children: &mut Vec<ExecutionExpressionChildV1>,
+    role: ExecutionExpressionChildRoleV1,
+    ordinal: usize,
+    target: crate::program_core::ExecutableExprId,
+) -> Result<(), String> {
+    children.push(ExecutionExpressionChildV1 {
+        role,
+        ordinal: u32::try_from(ordinal)
+            .map_err(|_| "execution expression child ordinal exceeds u32".to_owned())?,
+        target,
+    });
+    Ok(())
+}
+
+fn execution_record_fields_match_v1(
+    semantic: &[crate::SemanticRecordField],
+    executable: &[crate::program_core::ExecutableRecordField],
+    children: &mut Vec<ExecutionExpressionChildV1>,
+) -> Result<bool, String> {
+    if semantic.len() != executable.len() {
+        return Ok(false);
+    }
+    for (ordinal, (semantic, executable)) in semantic.iter().zip(executable).enumerate() {
+        if semantic.declaration != executable.declaration
+            || semantic.name != executable.name
+            || semantic.spread != executable.spread
+        {
+            return Ok(false);
+        }
+        push_execution_expression_child_v1(
+            children,
+            ExecutionExpressionChildRoleV1::RecordField,
+            ordinal,
+            executable.value,
+        )?;
+    }
+    Ok(true)
+}
+
+fn execution_text_segments_match_v1(
+    semantic: &[crate::SemanticTextSegment],
+    executable: &[crate::program_core::ExecutableTextSegment],
+    children: &mut Vec<ExecutionExpressionChildV1>,
+) -> Result<bool, String> {
+    if semantic.len() != executable.len() {
+        return Ok(false);
+    }
+    for (ordinal, (semantic, executable)) in semantic.iter().zip(executable).enumerate() {
+        match (semantic, executable) {
+            (
+                crate::SemanticTextSegment::Static { value: semantic },
+                crate::program_core::ExecutableTextSegment::Static { value: executable },
+            ) if semantic == executable => {}
+            (
+                crate::SemanticTextSegment::Dynamic { .. },
+                crate::program_core::ExecutableTextSegment::Dynamic { value },
+            ) => push_execution_expression_child_v1(
+                children,
+                ExecutionExpressionChildRoleV1::TextSegment,
+                ordinal,
+                *value,
+            )?,
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+fn execution_select_arms_match_v1(
+    semantic: &[crate::SemanticSelectArm],
+    executable: &[crate::program_core::ExecutableSelectArm],
+    children: &mut Vec<ExecutionExpressionChildV1>,
+) -> Result<bool, String> {
+    if semantic.len() != executable.len() {
+        return Ok(false);
+    }
+    for (ordinal, (semantic, executable)) in semantic.iter().zip(executable).enumerate() {
+        if semantic.pattern != executable.pattern
+            || semantic.bindings.len() != executable.bindings.len()
+            || !semantic
+                .bindings
+                .iter()
+                .zip(&executable.bindings)
+                .all(|(semantic, executable)| {
+                    semantic.name == executable.name && semantic.projection == executable.projection
+                })
+        {
+            return Ok(false);
+        }
+        push_execution_expression_child_v1(
+            children,
+            ExecutionExpressionChildRoleV1::WhenArm,
+            ordinal,
+            executable.output,
+        )?;
+    }
+    Ok(true)
+}
+
+fn execution_call_arguments_match_v1(
+    semantic: &[crate::SemanticCallArgument],
+    context_argument: Option<&crate::SemanticCallContextArgument>,
+    executable: &[crate::program_core::ExecutableCallArgument],
+) -> bool {
+    let expected_len = semantic.len() + usize::from(context_argument.is_some());
+    if executable.len() != expected_len {
+        return false;
+    }
+    if !semantic
+        .iter()
+        .zip(executable)
+        .all(|(semantic, executable)| {
+            semantic.ordinal == executable.ordinal
+                && semantic.name == executable.name
+                && semantic.from_pipe == executable.from_pipe
+                && semantic.value.as_usize() == executable.value.as_usize()
+        })
+    {
+        return false;
+    }
+    match (context_argument, executable.get(semantic.len())) {
+        (None, None) => true,
+        (Some(context), Some(executable)) => {
+            executable.name == "PASSED"
+                && !executable.from_pipe
+                && context.value.as_usize() == executable.value.as_usize()
+        }
+        _ => false,
+    }
+}
+
+fn execution_call_contexts_match_v1(
+    semantic: &[crate::SemanticCallContextId],
+    executable: &[crate::program_core::ExecutableCallContextId],
+) -> bool {
+    semantic.len() == executable.len()
+        && semantic
+            .iter()
+            .zip(executable)
+            .all(|(semantic, executable)| {
+                semantic.call_instance.as_usize() == executable.call_instance
+                    && semantic.ordinal == executable.ordinal
+            })
+}
+
+fn execution_expression_occurrence_kind_v1<'a>(
+    semantic: &crate::SemanticExpression,
+    executable: &'a crate::program_core::ExecutableExpression,
+    children: &mut Vec<ExecutionExpressionChildV1>,
+) -> Result<ExecutionExpressionOccurrenceKindV1<'a>, String> {
+    use crate::SemanticExpressionKind as Semantic;
+    use crate::program_core::ExecutableExpressionKind as Executable;
+
+    children.clear();
+    let mismatch = || {
+        format!(
+            "execution expression {} kind differs from its semantic proof authority",
+            semantic.id
+        )
+    };
+    Ok(match (&semantic.kind, &executable.kind) {
+        (
+            Semantic::CanonicalRead {
+                target, projection, ..
+            },
+            Executable::CanonicalRead {
+                target: executable_target,
+                path,
+                projection: executable_projection,
+                source,
+            },
+        ) if target == executable_target && projection == executable_projection => {
+            ExecutionExpressionOccurrenceKindV1::CanonicalRead {
+                target: *executable_target,
+                path,
+                projection: executable_projection,
+                source: source.as_ref(),
+            }
+        }
+        (
+            Semantic::LocalRead {
+                declaration,
+                projection,
+                ..
+            },
+            Executable::LocalRead {
+                binding,
+                declaration: executable_declaration,
+                projection: executable_projection,
+            },
+        ) if declaration == executable_declaration && projection == executable_projection => {
+            ExecutionExpressionOccurrenceKindV1::LocalRead {
+                binding: *binding,
+                declaration: *executable_declaration,
+                projection: executable_projection,
+            }
+        }
+        (
+            Semantic::ExternalRead { canonical_path, .. },
+            Executable::ExternalRead {
+                canonical_path: executable_path,
+            },
+        ) if canonical_path == executable_path => {
+            ExecutionExpressionOccurrenceKindV1::ExternalRead {
+                canonical_path: executable_path,
+            }
+        }
+        (
+            Semantic::ElementState { .. },
+            Executable::ElementState {
+                context,
+                projection,
+            },
+        ) => ExecutionExpressionOccurrenceKindV1::ElementState {
+            context: *context,
+            projection,
+        },
+        (
+            Semantic::Drain {
+                target, projection, ..
+            },
+            Executable::Drain {
+                target: executable_target,
+                path,
+                projection: executable_projection,
+            },
+        ) if target == executable_target && projection == executable_projection => {
+            ExecutionExpressionOccurrenceKindV1::Drain { path }
+        }
+        (Semantic::Text(semantic), Executable::Text { value }) if semantic == value => {
+            ExecutionExpressionOccurrenceKindV1::Text
+        }
+        (
+            Semantic::TextTemplate { segments },
+            Executable::TextTemplate {
+                segments: executable_segments,
+            },
+        ) if execution_text_segments_match_v1(segments, executable_segments, children)? => {
+            ExecutionExpressionOccurrenceKindV1::TextTemplate
+        }
+        (Semantic::Number(semantic), Executable::Number { value }) if semantic == value => {
+            ExecutionExpressionOccurrenceKindV1::Number
+        }
+        (Semantic::Bits(semantic), Executable::Bits { value }) if semantic == value => {
+            ExecutionExpressionOccurrenceKindV1::Bits
+        }
+        (Semantic::BytesByte(semantic), Executable::BytesByte { value }) if semantic == value => {
+            ExecutionExpressionOccurrenceKindV1::BytesByte
+        }
+        (Semantic::Absent, Executable::Absent) => ExecutionExpressionOccurrenceKindV1::Absent,
+        (Semantic::Flush { .. }, Executable::Flush { payload }) => {
+            push_execution_expression_child_v1(
+                children,
+                ExecutionExpressionChildRoleV1::FlushPayload,
+                0,
+                *payload,
+            )?;
+            ExecutionExpressionOccurrenceKindV1::Flush
+        }
+        (Semantic::FlushBoundary { .. }, Executable::FlushBoundary { input }) => {
+            push_execution_expression_child_v1(
+                children,
+                ExecutionExpressionChildRoleV1::FlushBoundaryInput,
+                0,
+                *input,
+            )?;
+            ExecutionExpressionOccurrenceKindV1::FlushBoundary
+        }
+        (Semantic::Tag(semantic), Executable::Tag { value }) if semantic == value => {
+            ExecutionExpressionOccurrenceKindV1::Tag
+        }
+        (
+            Semantic::TaggedObject {
+                tag,
+                fields: semantic_fields,
+            },
+            Executable::TaggedObject {
+                tag: executable_tag,
+                fields,
+            },
+        ) if tag == executable_tag
+            && execution_record_fields_match_v1(semantic_fields, fields, children)? =>
+        {
+            ExecutionExpressionOccurrenceKindV1::TaggedObject
+        }
+        (Semantic::Source { .. }, Executable::Source { binding_path }) => {
+            ExecutionExpressionOccurrenceKindV1::Source { binding_path }
+        }
+        (
+            Semantic::Call {
+                callable_kind,
+                name: semantic_name,
+                intrinsic: semantic_intrinsic,
+                arguments: semantic_arguments,
+                contexts: semantic_contexts,
+                ..
+            },
+            Executable::Call {
+                checked_call,
+                callable_kind: executable_callable_kind,
+                name,
+                intrinsic,
+                instance,
+                arguments,
+                contexts,
+                context_ordinals,
+            },
+        ) if semantic_name == name
+            && semantic_intrinsic == intrinsic
+            && matches!(
+                (*callable_kind, *executable_callable_kind),
+                (
+                    crate::SemanticCallableKind::Builtin,
+                    crate::program_core::ExecutableCallableKind::Builtin
+                ) | (
+                    crate::SemanticCallableKind::External,
+                    crate::program_core::ExecutableCallableKind::External
+                )
+            )
+            && execution_call_arguments_match_v1(semantic_arguments, None, arguments)
+            && execution_call_contexts_match_v1(semantic_contexts, contexts) =>
+        {
+            for (ordinal, argument) in arguments.iter().enumerate() {
+                push_execution_expression_child_v1(
+                    children,
+                    ExecutionExpressionChildRoleV1::CallArgument,
+                    ordinal,
+                    argument.value,
+                )?;
+            }
+            ExecutionExpressionOccurrenceKindV1::Call {
+                checked_call: *checked_call,
+                instance: *instance,
+                contexts,
+                context_ordinals,
+            }
+        }
+        (
+            Semantic::Call {
+                callable_kind: crate::SemanticCallableKind::User,
+                name: semantic_name,
+                arguments: semantic_arguments,
+                context_argument,
+                ..
+            },
+            Executable::UserCall {
+                checked_call,
+                function,
+                name,
+                instance,
+                arguments,
+                type_substitutions,
+            },
+        ) if semantic_name == name
+            && execution_call_arguments_match_v1(
+                semantic_arguments,
+                context_argument.as_ref(),
+                arguments,
+            ) =>
+        {
+            for (ordinal, argument) in arguments.iter().enumerate() {
+                push_execution_expression_child_v1(
+                    children,
+                    ExecutionExpressionChildRoleV1::CallArgument,
+                    ordinal,
+                    argument.value,
+                )?;
+            }
+            ExecutionExpressionOccurrenceKindV1::UserCall {
+                checked_call: *checked_call,
+                function: *function,
+                instance: *instance,
+                type_substitutions,
+            }
+        }
+        (Semantic::Materialize { .. }, Executable::Materialize { materialization }) => {
+            ExecutionExpressionOccurrenceKindV1::Materialize {
+                materialization: *materialization,
+            }
+        }
+        (Semantic::Draining { .. }, Executable::Draining { input }) => {
+            push_execution_expression_child_v1(
+                children,
+                ExecutionExpressionChildRoleV1::DrainingInput,
+                0,
+                *input,
+            )?;
+            ExecutionExpressionOccurrenceKindV1::Draining
+        }
+        (
+            Semantic::Hold {
+                name: semantic_name,
+                ..
+            },
+            Executable::Hold {
+                initial,
+                name,
+                binding_path,
+                updates,
+            },
+        ) if semantic_name == name => {
+            push_execution_expression_child_v1(
+                children,
+                ExecutionExpressionChildRoleV1::HoldInitial,
+                0,
+                *initial,
+            )?;
+            for (ordinal, update) in updates.iter().copied().enumerate() {
+                push_execution_expression_child_v1(
+                    children,
+                    ExecutionExpressionChildRoleV1::HoldUpdate,
+                    ordinal,
+                    update,
+                )?;
+            }
+            ExecutionExpressionOccurrenceKindV1::Hold { binding_path }
+        }
+        (Semantic::Latest { .. }, Executable::Latest { branches }) => {
+            for (ordinal, branch) in branches.iter().copied().enumerate() {
+                push_execution_expression_child_v1(
+                    children,
+                    ExecutionExpressionChildRoleV1::LatestBranch,
+                    ordinal,
+                    branch,
+                )?;
+            }
+            ExecutionExpressionOccurrenceKindV1::Latest
+        }
+        (
+            Semantic::When { arms, .. },
+            Executable::When {
+                input,
+                arms: executable_arms,
+            },
+        ) if execution_select_arms_match_v1(arms, executable_arms, children)? => {
+            children.insert(
+                0,
+                ExecutionExpressionChildV1 {
+                    role: ExecutionExpressionChildRoleV1::WhenInput,
+                    ordinal: 0,
+                    target: *input,
+                },
+            );
+            ExecutionExpressionOccurrenceKindV1::When {
+                arms: executable_arms,
+            }
+        }
+        (Semantic::Then { .. }, Executable::Then { input, output }) => {
+            push_execution_expression_child_v1(
+                children,
+                ExecutionExpressionChildRoleV1::ThenInput,
+                0,
+                *input,
+            )?;
+            if let Some(output) = output {
+                push_execution_expression_child_v1(
+                    children,
+                    ExecutionExpressionChildRoleV1::ThenOutput,
+                    0,
+                    *output,
+                )?;
+            }
+            ExecutionExpressionOccurrenceKindV1::Then
+        }
+        (
+            Semantic::Infix {
+                op: semantic_op, ..
+            },
+            Executable::Infix { left, op, right },
+        ) if semantic_op == op => {
+            push_execution_expression_child_v1(
+                children,
+                ExecutionExpressionChildRoleV1::InfixLeft,
+                0,
+                *left,
+            )?;
+            push_execution_expression_child_v1(
+                children,
+                ExecutionExpressionChildRoleV1::InfixRight,
+                0,
+                *right,
+            )?;
+            ExecutionExpressionOccurrenceKindV1::Infix
+        }
+        (
+            Semantic::MatchArm {
+                pattern: semantic_pattern,
+                ..
+            },
+            Executable::MatchArm { pattern, output },
+        ) if semantic_pattern == pattern => {
+            if let Some(output) = output {
+                push_execution_expression_child_v1(
+                    children,
+                    ExecutionExpressionChildRoleV1::MatchArmOutput,
+                    0,
+                    *output,
+                )?;
+            }
+            ExecutionExpressionOccurrenceKindV1::MatchArm
+        }
+        (Semantic::Object(semantic_fields), Executable::Object { fields })
+            if execution_record_fields_match_v1(semantic_fields, fields, children)? =>
+        {
+            ExecutionExpressionOccurrenceKindV1::Object
+        }
+        (
+            Semantic::Block {
+                bindings: semantic_bindings,
+                ..
+            },
+            Executable::Block { bindings, result },
+        ) if semantic_bindings.len() == bindings.len()
+            && semantic_bindings
+                .iter()
+                .zip(bindings)
+                .all(|(semantic, executable)| semantic.declaration == executable.declaration) =>
+        {
+            for (ordinal, binding) in bindings.iter().enumerate() {
+                push_execution_expression_child_v1(
+                    children,
+                    ExecutionExpressionChildRoleV1::BlockBinding,
+                    ordinal,
+                    binding.value,
+                )?;
+            }
+            push_execution_expression_child_v1(
+                children,
+                ExecutionExpressionChildRoleV1::BlockResult,
+                0,
+                *result,
+            )?;
+            ExecutionExpressionOccurrenceKindV1::Block { bindings }
+        }
+        (
+            Semantic::List {
+                capacity: semantic_capacity,
+                ..
+            },
+            Executable::List { capacity, items },
+        ) if semantic_capacity == capacity => {
+            for (ordinal, item) in items.iter().copied().enumerate() {
+                push_execution_expression_child_v1(
+                    children,
+                    ExecutionExpressionChildRoleV1::ListItem,
+                    ordinal,
+                    item,
+                )?;
+            }
+            ExecutionExpressionOccurrenceKindV1::List
+        }
+        (
+            Semantic::Bytes {
+                fixed_size: semantic_size,
+                ..
+            },
+            Executable::Bytes { fixed_size, items },
+        ) if semantic_size == fixed_size => {
+            for (ordinal, item) in items.iter().copied().enumerate() {
+                push_execution_expression_child_v1(
+                    children,
+                    ExecutionExpressionChildRoleV1::BytesItem,
+                    ordinal,
+                    item,
+                )?;
+            }
+            ExecutionExpressionOccurrenceKindV1::Bytes
+        }
+        (Semantic::Delimiter, Executable::Delimiter) => {
+            ExecutionExpressionOccurrenceKindV1::Delimiter
+        }
+        (Semantic::Project { .. }, Executable::Project { input, fields }) => {
+            push_execution_expression_child_v1(
+                children,
+                ExecutionExpressionChildRoleV1::ProjectInput,
+                0,
+                *input,
+            )?;
+            ExecutionExpressionOccurrenceKindV1::Project { fields }
+        }
+        (
+            Semantic::Project { .. } | Semantic::MaterializationLocal { .. },
+            Executable::MaterializationLocal {
+                owner,
+                local,
+                projection,
+                constructor_projection,
+            },
+        ) => ExecutionExpressionOccurrenceKindV1::MaterializationLocal {
+            owner: *owner,
+            local: *local,
+            projection,
+            constructor_projection,
+        },
+        (
+            Semantic::Project { .. } | Semantic::FunctionParameter { .. },
+            Executable::FunctionParameter {
+                parameter,
+                projection,
+            },
+        ) => ExecutionExpressionOccurrenceKindV1::FunctionParameter {
+            parameter: *parameter,
+            projection,
+        },
+        (Semantic::MapEntry { .. }, Executable::MapEntry { key, value }) => {
+            push_execution_expression_child_v1(
+                children,
+                ExecutionExpressionChildRoleV1::MapEntryKey,
+                0,
+                *key,
+            )?;
+            push_execution_expression_child_v1(
+                children,
+                ExecutionExpressionChildRoleV1::MapEntryValue,
+                0,
+                *value,
+            )?;
+            ExecutionExpressionOccurrenceKindV1::MapEntry
+        }
+        (Semantic::Map { .. }, Executable::Map { entries }) => {
+            for (ordinal, entry) in entries.iter().copied().enumerate() {
+                push_execution_expression_child_v1(
+                    children,
+                    ExecutionExpressionChildRoleV1::MapEntry,
+                    ordinal,
+                    entry,
+                )?;
+            }
+            ExecutionExpressionOccurrenceKindV1::Map
+        }
+        (Semantic::Set { .. }, Executable::Set { items }) => {
+            for (ordinal, item) in items.iter().copied().enumerate() {
+                push_execution_expression_child_v1(
+                    children,
+                    ExecutionExpressionChildRoleV1::SetItem,
+                    ordinal,
+                    item,
+                )?;
+            }
+            ExecutionExpressionOccurrenceKindV1::Set
+        }
+        _ => return Err(mismatch()),
+    })
+}
+
+fn execution_proof_update_usize_v1(
+    hasher: &mut Sha256,
+    value: usize,
+    label: &str,
+) -> Result<(), String> {
+    let value = u64::try_from(value)
+        .map_err(|_| format!("{label} exceeds the execution proof u64 domain"))?;
+    hasher.update(value.to_be_bytes());
+    Ok(())
+}
+
+fn execution_proof_update_bytes_v1(
+    hasher: &mut Sha256,
+    value: &[u8],
+    label: &str,
+) -> Result<(), String> {
+    execution_proof_update_usize_v1(hasher, value.len(), label)?;
+    hasher.update(value);
+    Ok(())
+}
+
+fn execution_proof_update_string_v1(
+    hasher: &mut Sha256,
+    value: &str,
+    label: &str,
+) -> Result<(), String> {
+    execution_proof_update_bytes_v1(hasher, value.as_bytes(), label)
+}
+
+fn execution_proof_update_strings_v1(
+    hasher: &mut Sha256,
+    values: &[String],
+    label: &str,
+) -> Result<(), String> {
+    execution_proof_update_usize_v1(hasher, values.len(), label)?;
+    for value in values {
+        execution_proof_update_string_v1(hasher, value, label)?;
+    }
+    Ok(())
+}
+
+fn execution_proof_update_object_shape_v1(
+    hasher: &mut Sha256,
+    shape: &boon_checked::ObjectShape,
+) -> Result<(), String> {
+    execution_proof_update_usize_v1(hasher, shape.fields.len(), "object field count")?;
+    for (name, ty) in &shape.fields {
+        execution_proof_update_string_v1(hasher, name, "object field name")?;
+        execution_proof_update_type_v1(hasher, ty)?;
+    }
+    execution_proof_update_strings_v1(hasher, &shape.field_order, "object field order")?;
+    hasher.update([u8::from(shape.open)]);
+    Ok(())
+}
+
+fn execution_proof_update_type_v1(
+    hasher: &mut Sha256,
+    ty: &boon_checked::Type,
+) -> Result<(), String> {
+    use boon_checked::{BytesType, Type, Variant};
+
+    match ty {
+        Type::Text => hasher.update([0]),
+        Type::Number => hasher.update([1]),
+        Type::Bytes(BytesType::Dynamic) => hasher.update([2, 0]),
+        Type::Bytes(BytesType::Fixed(size)) => {
+            hasher.update([2, 1]);
+            execution_proof_update_usize_v1(hasher, *size, "fixed byte-list type size")?;
+        }
+        Type::Absent => hasher.update([3]),
+        Type::VariantSet(variants) => {
+            hasher.update([4]);
+            execution_proof_update_usize_v1(
+                hasher,
+                variants.len(),
+                "variant-set alternative count",
+            )?;
+            for variant in variants.iter() {
+                match variant {
+                    Variant::Tag(tag) => {
+                        hasher.update([0]);
+                        execution_proof_update_string_v1(hasher, tag, "variant tag")?;
+                    }
+                    Variant::Tagged { tag, fields } => {
+                        hasher.update([1]);
+                        execution_proof_update_string_v1(hasher, tag, "tagged variant tag")?;
+                        execution_proof_update_object_shape_v1(hasher, fields)?;
+                    }
+                }
+            }
+        }
+        Type::Object(shape) => {
+            hasher.update([5]);
+            execution_proof_update_object_shape_v1(hasher, shape)?;
+        }
+        Type::RenderContract => hasher.update([6]),
+        Type::List(item) => {
+            hasher.update([7]);
+            execution_proof_update_type_v1(hasher, item)?;
+        }
+        Type::Function { args, result } => {
+            hasher.update([8]);
+            execution_proof_update_usize_v1(hasher, args.len(), "function type argument count")?;
+            for argument in args {
+                execution_proof_update_type_v1(hasher, argument)?;
+            }
+            execution_proof_update_flow_type_v1(hasher, result)?;
+        }
+        Type::UnresolvedShape { reason } => {
+            hasher.update([9]);
+            execution_proof_update_string_v1(hasher, reason, "unresolved type reason")?;
+        }
+        Type::Var(variable) => {
+            hasher.update([10]);
+            hasher.update(variable.0.to_be_bytes());
+        }
+        Type::Unknown => hasher.update([11]),
+        Type::Union(variants) => {
+            hasher.update([12]);
+            execution_proof_update_usize_v1(hasher, variants.len(), "union member count")?;
+            for variant in variants {
+                execution_proof_update_type_v1(hasher, variant)?;
+            }
+        }
+        Type::Map { key, value } => {
+            hasher.update([13]);
+            execution_proof_update_type_v1(hasher, key)?;
+            execution_proof_update_type_v1(hasher, value)?;
+        }
+        Type::Set(item) => {
+            hasher.update([14]);
+            execution_proof_update_type_v1(hasher, item)?;
+        }
+        Type::Bits { width } => {
+            hasher.update([15]);
+            hasher.update(width.to_be_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn execution_proof_update_flow_type_v1(
+    hasher: &mut Sha256,
+    flow_type: &boon_checked::FlowType,
+) -> Result<(), String> {
+    use boon_checked::FlowMode;
+    hasher.update([match flow_type.mode {
+        FlowMode::Continuous => 0,
+        FlowMode::TickPresent => 1,
+        FlowMode::PresentOrAbsent => 2,
+        FlowMode::Absent => 3,
+    }]);
+    execution_proof_update_type_v1(hasher, &flow_type.ty)
+}
+
+fn execution_proof_update_optional_usize_v1(
+    hasher: &mut Sha256,
+    value: Option<usize>,
+    label: &str,
+) -> Result<(), String> {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            execution_proof_update_usize_v1(hasher, value, label)
+        }
+        None => {
+            hasher.update([0]);
+            Ok(())
+        }
+    }
+}
+
+fn execution_proof_update_nested_v1<T: Serialize + ?Sized>(
+    hasher: &mut Sha256,
+    value: &T,
+    scratch: &mut Vec<u8>,
+    label: &str,
+) -> Result<(), String> {
+    let digest = boon_contract::canonical_serde_hash_v1_with_buffer(
+        EXECUTION_EXPRESSION_PROOF_NESTED_DOMAIN_V1,
+        value,
+        scratch,
+    )
+    .map_err(|error| format!("failed to seal execution proof {label}: {error}"))?;
+    hasher.update(digest);
+    Ok(())
+}
+
+fn execution_proof_update_optional_nested_v1<T: Serialize + ?Sized>(
+    hasher: &mut Sha256,
+    value: Option<&T>,
+    scratch: &mut Vec<u8>,
+    label: &str,
+) -> Result<(), String> {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            execution_proof_update_nested_v1(hasher, value, scratch, label)
+        }
+        None => {
+            hasher.update([0]);
+            Ok(())
+        }
+    }
+}
+
+fn execution_proof_update_record_fields_v1(
+    hasher: &mut Sha256,
+    fields: &[crate::program_core::ExecutableRecordField],
+) -> Result<(), String> {
+    execution_proof_update_usize_v1(hasher, fields.len(), "record field count")?;
+    for field in fields {
+        match field.declaration {
+            Some(declaration) => {
+                hasher.update([1]);
+                hasher.update(declaration.0.to_be_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        execution_proof_update_string_v1(hasher, &field.name, "record field name")?;
+        hasher.update([u8::from(field.spread)]);
+    }
+    Ok(())
+}
+
+fn execution_proof_update_select_arms_v1(
+    hasher: &mut Sha256,
+    arms: &[crate::program_core::ExecutableSelectArm],
+    scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    execution_proof_update_usize_v1(hasher, arms.len(), "select arm count")?;
+    for arm in arms {
+        execution_proof_update_nested_v1(hasher, &arm.pattern, scratch, "select arm pattern")?;
+        execution_proof_update_usize_v1(hasher, arm.bindings.len(), "select arm binding count")?;
+        for binding in &arm.bindings {
+            execution_proof_update_string_v1(hasher, &binding.name, "select arm binding name")?;
+            execution_proof_update_strings_v1(
+                hasher,
+                &binding.projection,
+                "select arm binding projection",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn execution_proof_update_call_arguments_v1(
+    hasher: &mut Sha256,
+    arguments: &[crate::program_core::ExecutableCallArgument],
+) -> Result<(), String> {
+    execution_proof_update_usize_v1(hasher, arguments.len(), "call argument count")?;
+    for argument in arguments {
+        execution_proof_update_usize_v1(hasher, argument.ordinal, "call argument ordinal")?;
+        execution_proof_update_string_v1(hasher, &argument.name, "call argument name")?;
+        hasher.update([u8::from(argument.from_pipe)]);
+    }
+    Ok(())
+}
+
+fn execution_proof_update_intrinsic_v1(
+    hasher: &mut Sha256,
+    intrinsic: Option<boon_checked::CheckedIntrinsicV1>,
+) {
+    use boon_checked::CheckedIntrinsicV1;
+    match intrinsic {
+        None => hasher.update([0]),
+        Some(CheckedIntrinsicV1::StreamPulses) => hasher.update([1]),
+        Some(CheckedIntrinsicV1::StreamSkip) => hasher.update([2]),
+    }
+}
+
+/// Commits only final static facts; child identities are committed separately
+/// in their exact typed order, avoiding recursive executable-row encoding.
+fn execution_proof_update_static_override_v1(
+    hasher: &mut Sha256,
+    kind: &crate::program_core::ExecutableExpressionKind,
+    scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    use crate::program_core::ExecutableExpressionKind as Kind;
+
+    match kind {
+        Kind::CanonicalRead {
+            target,
+            path,
+            projection,
+            source,
+        } => {
+            hasher.update([0]);
+            hasher.update(target.0.to_be_bytes());
+            execution_proof_update_string_v1(hasher, path, "specialized read path")?;
+            execution_proof_update_strings_v1(hasher, projection, "specialized read projection")?;
+            match source {
+                Some(source) => {
+                    hasher.update([1]);
+                    hasher.update(source.source.0.to_be_bytes());
+                    execution_proof_update_strings_v1(
+                        hasher,
+                        &source.payload_projection,
+                        "specialized source projection",
+                    )?;
+                }
+                None => hasher.update([0]),
+            }
+        }
+        Kind::LocalRead {
+            binding,
+            declaration,
+            projection,
+        } => {
+            hasher.update([1]);
+            execution_proof_update_usize_v1(
+                hasher,
+                binding.as_usize(),
+                "specialized local binding",
+            )?;
+            hasher.update(declaration.0.to_be_bytes());
+            execution_proof_update_strings_v1(hasher, projection, "specialized local projection")?;
+        }
+        Kind::ExternalRead { canonical_path } => {
+            hasher.update([2]);
+            execution_proof_update_string_v1(hasher, canonical_path, "specialized external path")?;
+        }
+        Kind::ElementState {
+            context,
+            projection,
+        } => {
+            hasher.update([3]);
+            execution_proof_update_usize_v1(
+                hasher,
+                context.call_instance,
+                "specialized element context instance",
+            )?;
+            execution_proof_update_usize_v1(
+                hasher,
+                context.ordinal,
+                "specialized element context ordinal",
+            )?;
+            execution_proof_update_strings_v1(
+                hasher,
+                projection,
+                "specialized element projection",
+            )?;
+        }
+        Kind::Drain {
+            target,
+            path,
+            projection,
+        } => {
+            hasher.update([4]);
+            hasher.update(target.0.to_be_bytes());
+            execution_proof_update_string_v1(hasher, path, "specialized drain path")?;
+            execution_proof_update_strings_v1(hasher, projection, "specialized drain projection")?;
+        }
+        Kind::Text { value } => {
+            hasher.update([5]);
+            execution_proof_update_string_v1(hasher, value, "specialized text")?;
+        }
+        Kind::TextTemplate { segments } => {
+            hasher.update([6]);
+            execution_proof_update_usize_v1(
+                hasher,
+                segments.len(),
+                "specialized text segment count",
+            )?;
+            for segment in segments {
+                match segment {
+                    crate::program_core::ExecutableTextSegment::Static { value } => {
+                        hasher.update([0]);
+                        execution_proof_update_string_v1(
+                            hasher,
+                            value,
+                            "specialized static text segment",
+                        )?;
+                    }
+                    crate::program_core::ExecutableTextSegment::Dynamic { .. } => {
+                        hasher.update([1]);
+                    }
+                }
+            }
+        }
+        Kind::Number { value } => {
+            hasher.update([7]);
+            execution_proof_update_nested_v1(hasher, value, scratch, "specialized Number")?;
+        }
+        Kind::BytesByte { value } => hasher.update([8, *value]),
+        Kind::Absent => hasher.update([9]),
+        Kind::Flush { .. } => hasher.update([10]),
+        Kind::FlushBoundary { .. } => hasher.update([11]),
+        Kind::Tag { value } => {
+            hasher.update([12]);
+            execution_proof_update_string_v1(hasher, value, "specialized tag")?;
+        }
+        Kind::TaggedObject { tag, fields } => {
+            hasher.update([13]);
+            execution_proof_update_string_v1(hasher, tag, "specialized tagged-object tag")?;
+            execution_proof_update_record_fields_v1(hasher, fields)?;
+        }
+        Kind::Source { binding_path } => {
+            hasher.update([14]);
+            execution_proof_update_string_v1(
+                hasher,
+                binding_path,
+                "specialized source binding path",
+            )?;
+        }
+        Kind::Call {
+            checked_call,
+            callable_kind,
+            name,
+            intrinsic,
+            instance,
+            arguments,
+            contexts,
+            context_ordinals,
+        } => {
+            hasher.update([15]);
+            hasher.update(checked_call.0.to_be_bytes());
+            hasher.update([match callable_kind {
+                crate::program_core::ExecutableCallableKind::Builtin => 0,
+                crate::program_core::ExecutableCallableKind::External => 1,
+            }]);
+            execution_proof_update_string_v1(hasher, name, "specialized call name")?;
+            execution_proof_update_intrinsic_v1(hasher, *intrinsic);
+            execution_proof_update_optional_usize_v1(
+                hasher,
+                *instance,
+                "specialized call instance",
+            )?;
+            execution_proof_update_call_arguments_v1(hasher, arguments)?;
+            execution_proof_update_usize_v1(
+                hasher,
+                contexts.len(),
+                "specialized call context count",
+            )?;
+            for context in contexts {
+                execution_proof_update_usize_v1(
+                    hasher,
+                    context.call_instance,
+                    "specialized call context instance",
+                )?;
+                execution_proof_update_usize_v1(
+                    hasher,
+                    context.ordinal,
+                    "specialized call context ordinal",
+                )?;
+            }
+            execution_proof_update_usize_v1(
+                hasher,
+                context_ordinals.len(),
+                "specialized checked context count",
+            )?;
+            for ordinal in context_ordinals {
+                execution_proof_update_usize_v1(
+                    hasher,
+                    *ordinal,
+                    "specialized checked context ordinal",
+                )?;
+            }
+        }
+        Kind::UserCall {
+            checked_call,
+            function,
+            name,
+            instance,
+            arguments,
+            type_substitutions,
+        } => {
+            hasher.update([16]);
+            hasher.update(checked_call.0.to_be_bytes());
+            execution_proof_update_usize_v1(
+                hasher,
+                function.as_usize(),
+                "specialized user function",
+            )?;
+            execution_proof_update_string_v1(hasher, name, "specialized user-call name")?;
+            execution_proof_update_optional_usize_v1(
+                hasher,
+                *instance,
+                "specialized user-call instance",
+            )?;
+            execution_proof_update_call_arguments_v1(hasher, arguments)?;
+            execution_proof_update_nested_v1(
+                hasher,
+                type_substitutions,
+                scratch,
+                "specialized user-call substitutions",
+            )?;
+        }
+        Kind::Materialize { materialization } => {
+            hasher.update([17]);
+            execution_proof_update_usize_v1(
+                hasher,
+                *materialization,
+                "specialized materialization",
+            )?;
+        }
+        Kind::Draining { .. } => hasher.update([18]),
+        Kind::Hold {
+            name, binding_path, ..
+        } => {
+            hasher.update([19]);
+            execution_proof_update_string_v1(hasher, name, "specialized HOLD name")?;
+            execution_proof_update_string_v1(
+                hasher,
+                binding_path,
+                "specialized HOLD binding path",
+            )?;
+        }
+        Kind::Latest { .. } => hasher.update([20]),
+        Kind::When { arms, .. } => {
+            hasher.update([21]);
+            execution_proof_update_select_arms_v1(hasher, arms, scratch)?;
+        }
+        Kind::Then { .. } => hasher.update([22]),
+        Kind::Infix { op, .. } => {
+            hasher.update([23]);
+            execution_proof_update_string_v1(hasher, op, "specialized infix operator")?;
+        }
+        Kind::MatchArm { pattern, .. } => {
+            hasher.update([24]);
+            execution_proof_update_nested_v1(
+                hasher,
+                pattern,
+                scratch,
+                "specialized match pattern",
+            )?;
+        }
+        Kind::Object { fields } => {
+            hasher.update([25]);
+            execution_proof_update_record_fields_v1(hasher, fields)?;
+        }
+        Kind::Block { bindings, .. } => {
+            hasher.update([26]);
+            execution_proof_update_usize_v1(
+                hasher,
+                bindings.len(),
+                "specialized block binding count",
+            )?;
+            for binding in bindings {
+                execution_proof_update_usize_v1(
+                    hasher,
+                    binding.id.as_usize(),
+                    "specialized block binding",
+                )?;
+                hasher.update(binding.declaration.0.to_be_bytes());
+            }
+        }
+        Kind::List { capacity, .. } => {
+            hasher.update([27]);
+            execution_proof_update_optional_usize_v1(
+                hasher,
+                *capacity,
+                "specialized list capacity",
+            )?;
+        }
+        Kind::Bytes { fixed_size, .. } => {
+            hasher.update([28]);
+            execution_proof_update_optional_usize_v1(
+                hasher,
+                *fixed_size,
+                "specialized byte-list size",
+            )?;
+        }
+        Kind::Delimiter => hasher.update([29]),
+        Kind::Project { fields, .. } => {
+            hasher.update([30]);
+            execution_proof_update_strings_v1(hasher, fields, "specialized project fields")?;
+        }
+        Kind::MaterializationLocal {
+            owner,
+            local,
+            projection,
+            constructor_projection,
+        } => {
+            hasher.update([31]);
+            execution_proof_update_usize_v1(
+                hasher,
+                owner.as_usize(),
+                "specialized materialization owner",
+            )?;
+            hasher.update(local.0.to_be_bytes());
+            execution_proof_update_strings_v1(
+                hasher,
+                projection,
+                "specialized materialization projection",
+            )?;
+            execution_proof_update_strings_v1(
+                hasher,
+                constructor_projection,
+                "specialized constructor projection",
+            )?;
+        }
+        Kind::FunctionParameter {
+            parameter,
+            projection,
+        } => {
+            hasher.update([32]);
+            execution_proof_update_usize_v1(
+                hasher,
+                parameter.function.as_usize(),
+                "specialized parameter function",
+            )?;
+            execution_proof_update_usize_v1(
+                hasher,
+                parameter.ordinal,
+                "specialized parameter ordinal",
+            )?;
+            execution_proof_update_strings_v1(
+                hasher,
+                projection,
+                "specialized parameter projection",
+            )?;
+        }
+        Kind::MapEntry { .. } => hasher.update([33]),
+        Kind::Map { .. } => hasher.update([34]),
+        Kind::Set { .. } => hasher.update([35]),
+        Kind::Bits { value } => {
+            hasher.update([36]);
+            execution_proof_update_nested_v1(hasher, value, scratch, "specialized BITS")?;
+        }
+    }
+    Ok(())
+}
+
+fn execution_proof_update_occurrence_kind_v1(
+    hasher: &mut Sha256,
+    kind: &ExecutionExpressionOccurrenceKindV1<'_>,
+    scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    use ExecutionExpressionOccurrenceKindV1 as Kind;
+
+    match kind {
+        Kind::CanonicalRead {
+            target,
+            path,
+            projection,
+            source,
+        } => {
+            hasher.update([0]);
+            hasher.update(target.0.to_be_bytes());
+            execution_proof_update_string_v1(hasher, path, "canonical read path")?;
+            execution_proof_update_strings_v1(hasher, projection, "canonical read projection")?;
+            match source {
+                Some(source) => {
+                    hasher.update([1]);
+                    hasher.update(source.source.0.to_be_bytes());
+                    execution_proof_update_strings_v1(
+                        hasher,
+                        &source.payload_projection,
+                        "canonical source payload projection",
+                    )?;
+                }
+                None => hasher.update([0]),
+            }
+        }
+        Kind::LocalRead {
+            binding,
+            declaration,
+            projection,
+        } => {
+            hasher.update([1]);
+            execution_proof_update_usize_v1(hasher, binding.as_usize(), "local read binding")?;
+            hasher.update(declaration.0.to_be_bytes());
+            execution_proof_update_strings_v1(hasher, projection, "local read projection")?;
+        }
+        Kind::ExternalRead { canonical_path } => {
+            hasher.update([2]);
+            execution_proof_update_string_v1(
+                hasher,
+                canonical_path,
+                "external read canonical path",
+            )?;
+        }
+        Kind::ElementState {
+            context,
+            projection,
+        } => {
+            hasher.update([3]);
+            execution_proof_update_usize_v1(
+                hasher,
+                context.call_instance,
+                "element-state call instance",
+            )?;
+            execution_proof_update_usize_v1(
+                hasher,
+                context.ordinal,
+                "element-state context ordinal",
+            )?;
+            execution_proof_update_strings_v1(hasher, projection, "element-state projection")?;
+        }
+        Kind::Drain { path } => {
+            hasher.update([4]);
+            execution_proof_update_string_v1(hasher, path, "drain path")?;
+        }
+        Kind::Text => hasher.update([5]),
+        Kind::TextTemplate => hasher.update([6]),
+        Kind::Number => hasher.update([7]),
+        Kind::Bits => hasher.update([8]),
+        Kind::BytesByte => hasher.update([9]),
+        Kind::Absent => hasher.update([10]),
+        Kind::Flush => hasher.update([11]),
+        Kind::FlushBoundary => hasher.update([12]),
+        Kind::Tag => hasher.update([13]),
+        Kind::TaggedObject => hasher.update([14]),
+        Kind::Source { binding_path } => {
+            hasher.update([15]);
+            execution_proof_update_string_v1(hasher, binding_path, "source binding path")?;
+        }
+        Kind::Call {
+            checked_call,
+            instance,
+            contexts,
+            context_ordinals,
+        } => {
+            hasher.update([16]);
+            hasher.update(checked_call.0.to_be_bytes());
+            execution_proof_update_optional_usize_v1(hasher, *instance, "call instance")?;
+            execution_proof_update_usize_v1(hasher, contexts.len(), "call context count")?;
+            for context in *contexts {
+                execution_proof_update_usize_v1(
+                    hasher,
+                    context.call_instance,
+                    "call context instance",
+                )?;
+                execution_proof_update_usize_v1(hasher, context.ordinal, "call context ordinal")?;
+            }
+            execution_proof_update_usize_v1(
+                hasher,
+                context_ordinals.len(),
+                "checked context ordinal count",
+            )?;
+            for ordinal in *context_ordinals {
+                execution_proof_update_usize_v1(hasher, *ordinal, "checked context ordinal")?;
+            }
+        }
+        Kind::UserCall {
+            checked_call,
+            function,
+            instance,
+            type_substitutions,
+        } => {
+            hasher.update([17]);
+            hasher.update(checked_call.0.to_be_bytes());
+            execution_proof_update_usize_v1(hasher, function.as_usize(), "user-call function")?;
+            execution_proof_update_optional_usize_v1(hasher, *instance, "user-call instance")?;
+            execution_proof_update_nested_v1(
+                hasher,
+                *type_substitutions,
+                scratch,
+                "user-call substitutions",
+            )?;
+        }
+        Kind::Materialize { materialization } => {
+            hasher.update([18]);
+            execution_proof_update_usize_v1(hasher, *materialization, "materialization")?;
+        }
+        Kind::Draining => hasher.update([19]),
+        Kind::Hold { binding_path } => {
+            hasher.update([20]);
+            execution_proof_update_string_v1(hasher, binding_path, "HOLD binding path")?;
+        }
+        Kind::Latest => hasher.update([21]),
+        Kind::When { arms } => {
+            hasher.update([22]);
+            execution_proof_update_select_arms_v1(hasher, arms, scratch)?;
+        }
+        Kind::Then => hasher.update([23]),
+        Kind::Infix => hasher.update([24]),
+        Kind::MatchArm => hasher.update([25]),
+        Kind::Object => hasher.update([26]),
+        Kind::Block { bindings } => {
+            hasher.update([27]);
+            execution_proof_update_usize_v1(hasher, bindings.len(), "block binding count")?;
+            for binding in *bindings {
+                execution_proof_update_usize_v1(hasher, binding.id.as_usize(), "block binding")?;
+                hasher.update(binding.declaration.0.to_be_bytes());
+            }
+        }
+        Kind::List => hasher.update([28]),
+        Kind::Bytes => hasher.update([29]),
+        Kind::Delimiter => hasher.update([30]),
+        Kind::Project { fields } => {
+            hasher.update([31]);
+            execution_proof_update_strings_v1(hasher, fields, "project fields")?;
+        }
+        Kind::MaterializationLocal {
+            owner,
+            local,
+            projection,
+            constructor_projection,
+        } => {
+            hasher.update([32]);
+            execution_proof_update_usize_v1(
+                hasher,
+                owner.as_usize(),
+                "materialization-local owner",
+            )?;
+            hasher.update(local.0.to_be_bytes());
+            execution_proof_update_strings_v1(
+                hasher,
+                projection,
+                "materialization-local projection",
+            )?;
+            execution_proof_update_strings_v1(
+                hasher,
+                constructor_projection,
+                "materialization-local constructor projection",
+            )?;
+        }
+        Kind::FunctionParameter {
+            parameter,
+            projection,
+        } => {
+            hasher.update([33]);
+            execution_proof_update_usize_v1(
+                hasher,
+                parameter.function.as_usize(),
+                "function parameter function",
+            )?;
+            execution_proof_update_usize_v1(
+                hasher,
+                parameter.ordinal,
+                "function parameter ordinal",
+            )?;
+            execution_proof_update_strings_v1(hasher, projection, "function parameter projection")?;
+        }
+        Kind::MapEntry => hasher.update([34]),
+        Kind::Map => hasher.update([35]),
+        Kind::Set => hasher.update([36]),
+    }
+    Ok(())
+}
+
+fn execution_proof_update_children_v1(
+    hasher: &mut Sha256,
+    children: &[ExecutionExpressionChildV1],
+) -> Result<(), String> {
+    execution_proof_update_usize_v1(hasher, children.len(), "expression child count")?;
+    for child in children {
+        hasher.update([child.role as u8]);
+        hasher.update(child.ordinal.to_be_bytes());
+        execution_proof_update_usize_v1(
+            hasher,
+            child.target.as_usize(),
+            "expression child target",
+        )?;
+    }
+    Ok(())
+}
+
+fn seal_execution_expression_proof_v1(
+    plan: &ExecutionExpressionProofPlanV1,
+    fragment: &DefinitionExecutionProofFragmentV1,
+    semantic: &crate::SemanticExpression,
+    executable: &crate::program_core::ExecutableExpression,
+    children: &mut Vec<ExecutionExpressionChildV1>,
+    scratch: &mut Vec<u8>,
+) -> Result<[u8; 32], String> {
+    if executable.id.as_usize() != semantic.id.as_usize()
+        || executable.checked_expr_id != semantic.checked_expr_id
+        || executable.flow_type != semantic.flow_type
+        || executable.effect != semantic.effect
+        || executable.owner != semantic.owner
+        || executable.resource_binding_path != semantic.resource_binding_path
+    {
+        return Err(format!(
+            "execution expression {} differs from its compact proof authority",
+            semantic.id
+        ));
+    }
+    let runtime_only_provenance = executable.provenance.members.as_slice()
+        == [crate::program_core::ExecutableValueMember {
+            path: Vec::new(),
+            origin: crate::program_core::ExecutableValueOrigin::Runtime,
+        }];
+    let kind = execution_expression_occurrence_kind_v1(semantic, executable, children)?;
+    let mut hasher = Sha256::new();
+    hasher.update(EXECUTION_EXPRESSION_PROOF_DOMAIN_V1);
+    hasher.update(fragment.digest);
+    hasher.update(plan.checked_expression_ordinal.to_be_bytes());
+    if plan.definition_flow_type {
+        hasher.update([0]);
+    } else {
+        hasher.update([1]);
+        execution_proof_update_flow_type_v1(&mut hasher, &executable.flow_type)?;
+    }
+    execution_proof_update_optional_nested_v1(
+        &mut hasher,
+        (!plan.definition_effect).then_some(&executable.effect),
+        scratch,
+        "effect override",
+    )?;
+    if plan.specialized_static {
+        hasher.update([1]);
+        execution_proof_update_static_override_v1(&mut hasher, &executable.kind, scratch)?;
+    } else {
+        hasher.update([0]);
+    }
+    execution_proof_update_optional_usize_v1(
+        &mut hasher,
+        executable.owner.map(StaticOwnerId::as_usize),
+        "expression owner",
+    )?;
+    execution_proof_update_optional_nested_v1(
+        &mut hasher,
+        (!runtime_only_provenance).then_some(&executable.provenance),
+        scratch,
+        "value provenance",
+    )?;
+    match executable.resource_binding_path.as_deref() {
+        Some(path) => {
+            hasher.update([1]);
+            execution_proof_update_string_v1(&mut hasher, path, "resource binding path")?;
+        }
+        None => hasher.update([0]),
+    }
+    execution_proof_update_occurrence_kind_v1(&mut hasher, &kind, scratch)?;
+    execution_proof_update_children_v1(&mut hasher, children)?;
+    Ok(hasher.finalize().into())
 }
 
 #[cfg(test)]
@@ -278,7 +1850,7 @@ pub struct ExecutionImageEntityRouteV3 {
 /// Compact executable receipt set. Invocation ancestry is owned by the V3
 /// parent-linked overlays; it is never expanded into a second path arena.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ExecutionImageHandoffV3 {
+pub struct ExecutionImageHandoffV4 {
     pub schema: String,
     pub source_bundle_digest_v1: SourceBundleDigestV1,
     pub role: ProgramRole,
@@ -289,7 +1861,7 @@ pub struct ExecutionImageHandoffV3 {
     pub local_image_digest: [u8; 32],
 }
 
-impl ExecutionImageHandoffV3 {
+impl ExecutionImageHandoffV4 {
     pub fn projection(
         &self,
         id: ExecutionImageProjectionIdV3,
@@ -349,10 +1921,160 @@ pub(crate) struct ExecutionConstructionRoutesV3 {
     local_digest: [u8; 32],
 }
 
-pub(crate) struct ExecutionConstructionImageV3 {
+pub(crate) struct ExecutionConstructionImageV4 {
     routes: ExecutionConstructionRoutesV3,
     expression_routes: Vec<ExecutionConstructionProjectionV3>,
+    definition_proof_fragments: Vec<Option<DefinitionExecutionProofFragmentV1>>,
+    expression_proof_plans: Vec<ExecutionExpressionProofPlanV1>,
     statement_routes: Vec<ExecutionConstructionProjectionV3>,
+}
+
+/// Definition-owned checked receipt reused by every concrete expression
+/// occurrence. The checked fragment commits the normalized definition rows;
+/// the dense local ordinal selects the authored expression without replaying
+/// its recursive type and syntax payload in the execution image.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct DefinitionExecutionProofFragmentV1 {
+    definition_stable_key_digest: [u8; 32],
+    definition_local_content_digest: [u8; 32],
+    expression_stable_key_digest: [u8; 32],
+    expression_local_content_digest: [u8; 32],
+    digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ExecutionExpressionProofPlanV1 {
+    fragment: CheckedImageProjectionIdV2,
+    checked_expression_ordinal: u32,
+    definition_flow_type: bool,
+    definition_effect: bool,
+    specialized_static: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+enum ExecutionExpressionChildRoleV1 {
+    TextSegment,
+    FlushPayload,
+    FlushBoundaryInput,
+    RecordField,
+    CallArgument,
+    DrainingInput,
+    HoldInitial,
+    HoldUpdate,
+    LatestBranch,
+    WhenInput,
+    WhenArm,
+    ThenInput,
+    ThenOutput,
+    InfixLeft,
+    InfixRight,
+    MatchArmOutput,
+    BlockBinding,
+    BlockResult,
+    ListItem,
+    BytesItem,
+    ProjectInput,
+    MapEntryKey,
+    MapEntryValue,
+    MapEntry,
+    SetItem,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct ExecutionExpressionChildV1 {
+    role: ExecutionExpressionChildRoleV1,
+    ordinal: u32,
+    target: crate::program_core::ExecutableExprId,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ExecutionExpressionOccurrenceKindV1<'a> {
+    CanonicalRead {
+        target: boon_checked::DeclId,
+        path: &'a str,
+        projection: &'a [String],
+        source: Option<&'a boon_checked::CheckedSourceRead>,
+    },
+    LocalRead {
+        binding: crate::program_core::ExecutableLocalBindingId,
+        declaration: boon_checked::DeclId,
+        projection: &'a [String],
+    },
+    ExternalRead {
+        canonical_path: &'a str,
+    },
+    ElementState {
+        context: crate::program_core::ExecutableCallContextId,
+        projection: &'a [String],
+    },
+    Drain {
+        path: &'a str,
+    },
+    Text,
+    TextTemplate,
+    Number,
+    Bits,
+    BytesByte,
+    Absent,
+    Flush,
+    FlushBoundary,
+    Tag,
+    TaggedObject,
+    Source {
+        binding_path: &'a str,
+    },
+    Call {
+        checked_call: boon_checked::CheckedCallId,
+        instance: Option<usize>,
+        contexts: &'a [crate::program_core::ExecutableCallContextId],
+        context_ordinals: &'a [usize],
+    },
+    UserCall {
+        checked_call: boon_checked::CheckedCallId,
+        function: crate::program_core::FunctionId,
+        instance: Option<usize>,
+        type_substitutions: &'a [boon_checked::CheckedTypeSubstitution],
+    },
+    Materialize {
+        materialization: usize,
+    },
+    Draining,
+    Hold {
+        binding_path: &'a str,
+    },
+    Latest,
+    When {
+        arms: &'a [crate::program_core::ExecutableSelectArm],
+    },
+    Then,
+    Infix,
+    MatchArm,
+    Object,
+    Block {
+        bindings: &'a [crate::program_core::ExecutableBlockBinding],
+    },
+    List,
+    Bytes,
+    Delimiter,
+    Project {
+        fields: &'a [String],
+    },
+    MaterializationLocal {
+        owner: StaticOwnerId,
+        local: crate::program_core::MaterializationLocalId,
+        projection: &'a [String],
+        constructor_projection: &'a [String],
+    },
+    FunctionParameter {
+        parameter: crate::program_core::ExecutableParameterId,
+        projection: &'a [String],
+    },
+    MapEntry,
+    Map,
+    Set,
 }
 
 impl ExecutionConstructionRoutesV3 {
@@ -384,7 +2106,7 @@ impl ExecutionConstructionRoutesV3 {
     }
 }
 
-impl ExecutionConstructionImageV3 {
+impl ExecutionConstructionImageV4 {
     fn definition_projection(
         &self,
         projection: CheckedImageProjectionIdV2,
@@ -415,6 +2137,35 @@ impl ExecutionConstructionImageV3 {
             .get(expression.as_usize())
             .copied()
             .ok_or_else(|| format!("execution construction image has no expression {expression}"))
+    }
+
+    fn expression_proof_authority(
+        &self,
+        expression: SemanticExprId,
+    ) -> Result<
+        (
+            &ExecutionExpressionProofPlanV1,
+            &DefinitionExecutionProofFragmentV1,
+        ),
+        String,
+    > {
+        let plan = self
+            .expression_proof_plans
+            .get(expression.as_usize())
+            .ok_or_else(|| {
+                format!("execution construction image has no expression proof plan {expression}")
+            })?;
+        let fragment = self
+            .definition_proof_fragments
+            .get(plan.fragment.as_usize())
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                format!(
+                    "execution expression {expression} has missing shared proof fragment {}",
+                    plan.fragment.0
+                )
+            })?;
+        Ok((plan, fragment))
     }
 
     fn statement_route(
@@ -475,20 +2226,20 @@ impl ExecutionImageHandoffV2 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SealedSemanticImageV3 {
+pub struct SealedSemanticImageV4 {
     schema: String,
     checked_handoff: CheckedImageHandoffV4,
-    execution_handoff: ExecutionImageHandoffV3,
+    execution_handoff: ExecutionImageHandoffV4,
     execution: SemanticExecutionImageColumnsV1,
     seal_digest: [u8; 32],
 }
 
-impl SealedSemanticImageV3 {
+impl SealedSemanticImageV4 {
     pub const fn checked_handoff(&self) -> &CheckedImageHandoffV4 {
         &self.checked_handoff
     }
 
-    pub const fn execution_handoff(&self) -> &ExecutionImageHandoffV3 {
+    pub const fn execution_handoff(&self) -> &ExecutionImageHandoffV4 {
         &self.execution_handoff
     }
 
@@ -505,9 +2256,9 @@ impl SealedSemanticImageV3 {
         source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
     ) -> Result<(), String> {
-        if self.schema != SEMANTIC_IMAGE_SCHEMA_V3
+        if self.schema != SEMANTIC_IMAGE_SCHEMA_V4
             || self.checked_handoff.schema != CHECKED_IMAGE_HANDOFF_SCHEMA_V4
-            || self.execution_handoff.schema != EXECUTION_IMAGE_HANDOFF_SCHEMA_V3
+            || self.execution_handoff.schema != EXECUTION_IMAGE_HANDOFF_SCHEMA_V4
         {
             return Err("semantic image contains an unsupported schema".to_owned());
         }
@@ -542,9 +2293,9 @@ struct PostResourceValidatedV2;
 pub(crate) struct SemanticImageBuilder<State> {
     checked_handoff: CheckedImageHandoffV4,
     execution_routes_v3: Option<ExecutionConstructionRoutesV3>,
-    execution_image_v3: Option<ExecutionConstructionImageV3>,
+    execution_image_v4: Option<ExecutionConstructionImageV4>,
     execution: SemanticExecutionImageColumnsV1,
-    execution_handoff: Option<ExecutionImageHandoffV3>,
+    execution_handoff: Option<ExecutionImageHandoffV4>,
     #[cfg(test)]
     execution_handoff_v2_oracle: Option<ExecutionImageHandoffV2>,
     state: PhantomData<State>,
@@ -565,7 +2316,7 @@ impl SemanticImageBuilder<ExecutionPending> {
         Ok(Self {
             checked_handoff,
             execution_routes_v3: Some(execution_routes_v3),
-            execution_image_v3: None,
+            execution_image_v4: None,
             execution,
             execution_handoff: None,
             #[cfg(test)]
@@ -592,8 +2343,9 @@ impl SemanticImageBuilder<ExecutionPending> {
             .execution_routes_v3
             .take()
             .ok_or_else(|| "execution V3 routes were already consumed".to_owned())?;
-        self.execution_image_v3 = Some(execution_construction_image_v3(
+        self.execution_image_v4 = Some(execution_construction_image_v4(
             &self.checked_handoff,
+            checked,
             routes,
             &self.execution,
         )?);
@@ -617,20 +2369,20 @@ impl SemanticImageBuilder<ExecutionPending> {
         if self.execution_routes_v3.is_some() {
             return Err("execution V3 routes were not bound after normalization".to_owned());
         }
-        let execution_image_v3 = self
-            .execution_image_v3
-            .ok_or_else(|| "execution V3 image was not constructed".to_owned())?;
+        let execution_image_v4 = self
+            .execution_image_v4
+            .ok_or_else(|| "execution V4 image was not constructed".to_owned())?;
         #[cfg(test)]
         let execution_handoff_v2_oracle = Some(execution_image_handoff_v2_oracle(
             &self.checked_handoff,
-            &execution_image_v3,
+            &execution_image_v4,
             _out,
             &self.execution,
         )?);
         Ok(SemanticImageBuilder {
             checked_handoff: self.checked_handoff,
             execution_routes_v3: None,
-            execution_image_v3: Some(execution_image_v3),
+            execution_image_v4: Some(execution_image_v4),
             execution: self.execution,
             execution_handoff: None,
             #[cfg(test)]
@@ -649,7 +2401,7 @@ impl SemanticImageBuilder<ExecutionFinalized> {
         &self.checked_handoff
     }
 
-    pub(crate) fn execution_handoff(&self) -> &ExecutionImageHandoffV3 {
+    pub(crate) fn execution_handoff(&self) -> &ExecutionImageHandoffV4 {
         self.execution_handoff
             .as_ref()
             .expect("executable receipts are finalized before handoff access")
@@ -657,20 +2409,20 @@ impl SemanticImageBuilder<ExecutionFinalized> {
 
     pub(crate) fn execution_receipt_publisher(
         &self,
-    ) -> Result<ExecutionReceiptPublisherV3<'_>, String> {
+    ) -> Result<ExecutionReceiptPublisherV4<'_>, String> {
         let construction_image = self
-            .execution_image_v3
+            .execution_image_v4
             .as_ref()
-            .ok_or_else(|| "finalized execution builder has no V3 construction image".to_owned())?;
-        ExecutionReceiptPublisherV3::new(&self.checked_handoff, construction_image, &self.execution)
+            .ok_or_else(|| "finalized execution builder has no V4 construction image".to_owned())?;
+        ExecutionReceiptPublisherV4::new(&self.checked_handoff, construction_image, &self.execution)
     }
 
     pub(crate) fn install_execution_handoff(
         &mut self,
-        handoff: ExecutionImageHandoffV3,
+        handoff: ExecutionImageHandoffV4,
     ) -> Result<(), String> {
         if self.execution_handoff.replace(handoff).is_some() {
-            return Err("execution V3 handoff was already finalized".to_owned());
+            return Err("execution V4 handoff was already finalized".to_owned());
         }
         #[cfg(test)]
         if let Some(oracle) = &self.execution_handoff_v2_oracle {
@@ -689,14 +2441,14 @@ impl SemanticImageBuilder<ExecutionFinalized> {
     pub(crate) fn validate_direct_execution_handoff(
         &self,
         core: &crate::program_core::CanonicalProgramCoreV2,
-        direct: &ExecutionImageHandoffV3,
+        direct: &ExecutionImageHandoffV4,
     ) -> Result<(), String> {
         let construction_image = self
-            .execution_image_v3
+            .execution_image_v4
             .as_ref()
-            .ok_or_else(|| "finalized execution builder has no V3 construction image".to_owned())?;
+            .ok_or_else(|| "finalized execution builder has no V4 construction image".to_owned())?;
         let payload_seals = execution_row_payload_seals_v3_oracle(core)?;
-        let oracle = execution_image_handoff_v3(
+        let oracle = execution_image_handoff_v4(
             &self.checked_handoff,
             construction_image,
             &self.execution,
@@ -705,24 +2457,24 @@ impl SemanticImageBuilder<ExecutionFinalized> {
         )?;
         if direct != &oracle {
             return Err(
-                "construction-published execution V3 handoff differs from the post-hoc oracle"
+                "construction-published execution V4 handoff differs from the post-hoc oracle"
                     .to_owned(),
             );
         }
         Ok(())
     }
 
-    pub(crate) fn seal(self) -> Result<SealedSemanticImageV3, String> {
+    pub(crate) fn seal(self) -> Result<SealedSemanticImageV4, String> {
         let execution_handoff = self
             .execution_handoff
-            .ok_or_else(|| "finalized execution builder has no V3 handoff".to_owned())?;
-        let schema = SEMANTIC_IMAGE_SCHEMA_V3.to_owned();
+            .ok_or_else(|| "finalized execution builder has no V4 handoff".to_owned())?;
+        let schema = SEMANTIC_IMAGE_SCHEMA_V4.to_owned();
         let seal_digest =
             semantic_image_seal_digest(&schema, &self.checked_handoff, &execution_handoff)?;
-        let _execution_image_v3 = self
-            .execution_image_v3
+        let _execution_image_v4 = self
+            .execution_image_v4
             .ok_or_else(|| "finalized execution builder has no V3 image".to_owned())?;
-        Ok(SealedSemanticImageV3 {
+        Ok(SealedSemanticImageV4 {
             schema,
             checked_handoff: self.checked_handoff,
             execution_handoff,
@@ -745,7 +2497,6 @@ fn execution_row_payload_seals_v3_oracle(
 
     let mut scratch = Vec::new();
     Ok(ExecutionRowPayloadSealsV3 {
-        expressions: seal(&core.executable.expressions, &mut scratch)?,
         statements: seal(&core.executable.statements, &mut scratch)?,
         call_occurrences: seal(&core.executable.call_occurrences, &mut scratch)?,
         sources: seal(&core.executable.sources, &mut scratch)?,
@@ -797,9 +2548,9 @@ struct PendingExecutionProjectionV3 {
     relocations: Vec<PendingExecutionProjectionIdV3>,
 }
 
-struct ExecutionImageHandoffBuilderV3<'a> {
+struct ExecutionImageHandoffBuilderV4<'a> {
     checked: &'a CheckedImageHandoffV4,
-    construction_image: &'a ExecutionConstructionImageV3,
+    construction_image: &'a ExecutionConstructionImageV4,
     ids: BTreeMap<ExecutionConstructionProjectionV3, PendingExecutionProjectionIdV3>,
     stable_digest_ids: BTreeMap<[u8; 32], PendingExecutionProjectionIdV3>,
     projections: Vec<PendingExecutionProjectionV3>,
@@ -822,10 +2573,10 @@ struct ExecutionImageHandoffBuilderV3<'a> {
     trace_row_hash_ns: u128,
 }
 
-impl<'a> ExecutionImageHandoffBuilderV3<'a> {
+impl<'a> ExecutionImageHandoffBuilderV4<'a> {
     fn new(
         checked: &'a CheckedImageHandoffV4,
-        construction_image: &'a ExecutionConstructionImageV3,
+        construction_image: &'a ExecutionConstructionImageV4,
     ) -> Result<Self, String> {
         if construction_image
             .routes
@@ -1041,7 +2792,7 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
         mut manifest_prefix: crate::dependency_manifest::ManifestCheckedExecutionPrefixBuilderV7,
     ) -> Result<
         (
-            ExecutionImageHandoffV3,
+            ExecutionImageHandoffV4,
             crate::dependency_manifest::ManifestCheckedExecutionPrefixV7,
         ),
         String,
@@ -1169,9 +2920,9 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
             });
         }
         let local_image_digest = boon_contract::canonical_serde_hash_v1_with_buffer(
-            EXECUTION_IMAGE_HANDOFF_DOMAIN_V3,
+            EXECUTION_IMAGE_HANDOFF_DOMAIN_V4,
             &(
-                EXECUTION_IMAGE_HANDOFF_SCHEMA_V3,
+                EXECUTION_IMAGE_HANDOFF_SCHEMA_V4,
                 source_bundle_digest_v1,
                 role,
                 &invocation_overlays,
@@ -1181,14 +2932,14 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
             ),
             &mut hash_scratch,
         )
-        .map_err(|error| format!("failed to hash execution V3 handoff: {error}"))?;
+        .map_err(|error| format!("failed to hash execution V4 handoff: {error}"))?;
         if trace {
             let row_count = sealed_projections
                 .iter()
                 .map(|projection| projection.row_count as usize)
                 .sum::<usize>();
             eprintln!(
-                "boon_semantic execution_handoff_v3 overlays={} projections={} rows={} entity_routes={} relocations={}",
+                "boon_semantic execution_handoff_v4 overlays={} projections={} rows={} entity_routes={} relocations={}",
                 invocation_overlays.len(),
                 sealed_projections.len(),
                 row_count,
@@ -1196,15 +2947,15 @@ impl<'a> ExecutionImageHandoffBuilderV3<'a> {
                 relocation_arena.len(),
             );
             eprintln!(
-                "boon_semantic execution_handoff_v3 payload_hash_ms={:.3} relocation_ms={:.3} row_hash_ms={:.3}",
+                "boon_semantic execution_handoff_v4 payload_hash_ms={:.3} relocation_ms={:.3} row_hash_ms={:.3}",
                 trace_payload_hash_ns as f64 / 1_000_000.0,
                 trace_relocation_ns as f64 / 1_000_000.0,
                 trace_row_hash_ns as f64 / 1_000_000.0,
             );
         }
         Ok((
-            ExecutionImageHandoffV3 {
-                schema: EXECUTION_IMAGE_HANDOFF_SCHEMA_V3.to_owned(),
+            ExecutionImageHandoffV4 {
+                schema: EXECUTION_IMAGE_HANDOFF_SCHEMA_V4.to_owned(),
                 source_bundle_digest_v1,
                 role,
                 invocation_overlays,
@@ -1273,7 +3024,7 @@ struct PendingExecutionProjectionV2 {
 #[cfg(test)]
 struct ExecutionImageHandoffBuilderV2<'a> {
     checked: &'a CheckedImageHandoffV4,
-    construction_image: &'a ExecutionConstructionImageV3,
+    construction_image: &'a ExecutionConstructionImageV4,
     path_ids: BTreeMap<
         (
             Option<ExecutionInvocationPathIdV2>,
@@ -1297,7 +3048,7 @@ struct ExecutionImageHandoffBuilderV2<'a> {
 impl<'a> ExecutionImageHandoffBuilderV2<'a> {
     fn new(
         checked: &'a CheckedImageHandoffV4,
-        construction_image: &'a ExecutionConstructionImageV3,
+        construction_image: &'a ExecutionConstructionImageV4,
     ) -> Result<Self, String> {
         if construction_image
             .routes
@@ -2042,11 +3793,511 @@ fn static_owner_occurrences_v3(out: &ResolvedOutGraph) -> Result<Vec<OutCallInst
         .collect()
 }
 
-pub(crate) fn execution_construction_image_v3(
-    checked: &CheckedImageHandoffV4,
+fn definition_text_segments_match_v1(
+    checked: &[boon_checked::CheckedTextSegment],
+    semantic: &[crate::SemanticTextSegment],
+) -> bool {
+    checked.len() == semantic.len()
+        && checked
+            .iter()
+            .zip(semantic)
+            .all(|(checked, semantic)| match (checked, semantic) {
+                (
+                    boon_checked::CheckedTextSegment::Static { value: checked },
+                    crate::SemanticTextSegment::Static { value: semantic },
+                ) => checked == semantic,
+                (
+                    boon_checked::CheckedTextSegment::Dynamic { .. },
+                    crate::SemanticTextSegment::Dynamic { .. },
+                ) => true,
+                _ => false,
+            })
+}
+
+fn definition_record_fields_match_v1(
+    checked: &[boon_checked::CheckedRecordField],
+    semantic: &[crate::SemanticRecordField],
+) -> bool {
+    checked.len() == semantic.len()
+        && checked.iter().zip(semantic).all(|(checked, semantic)| {
+            checked.declaration == semantic.declaration
+                && checked.name == semantic.name
+                && checked.spread == semantic.spread
+        })
+}
+
+fn definition_block_bindings_match_v1(
+    checked: &[boon_checked::CheckedBlockBinding],
+    semantic: &[crate::SemanticBlockBinding],
+) -> bool {
+    checked.len() == semantic.len()
+        && checked
+            .iter()
+            .zip(semantic)
+            .all(|(checked, semantic)| checked.declaration == semantic.declaration)
+}
+
+fn definition_owns_semantic_expression_static_v1(
+    checked: &boon_checked::CheckedExpressionKind,
+    semantic: &crate::SemanticExpressionKind,
+    execution: &SemanticExecutionImageColumnsV1,
+) -> bool {
+    use crate::SemanticExpressionKind as Semantic;
+    use boon_checked::CheckedExpressionKind as Checked;
+
+    match (checked, semantic) {
+        (
+            Checked::Read {
+                target: checked_target,
+                projection: checked_projection,
+                source: checked_source,
+            },
+            Semantic::CanonicalRead {
+                target,
+                projection,
+                source,
+                ..
+            },
+        ) => {
+            checked_target == target
+                && checked_projection == projection
+                && match (checked_source, source) {
+                    (None, None) => true,
+                    (Some(checked), Some(semantic)) => {
+                        checked.payload_projection == semantic.payload_projection
+                    }
+                    _ => false,
+                }
+        }
+        (
+            Checked::Read {
+                target, projection, ..
+            },
+            Semantic::LocalRead {
+                declaration,
+                projection: semantic_projection,
+                ..
+            },
+        ) => target == declaration && projection == semantic_projection,
+        (
+            Checked::ExternalRead {
+                canonical_path,
+                external_identity,
+            },
+            Semantic::ExternalRead {
+                canonical_path: semantic_path,
+                external_identity: semantic_identity,
+            },
+        ) => canonical_path == semantic_path && external_identity == semantic_identity,
+        (
+            Checked::Drain { target, projection },
+            Semantic::Drain {
+                target: semantic_target,
+                projection: semantic_projection,
+                ..
+            },
+        ) => target == semantic_target && projection == semantic_projection,
+        (Checked::Text { value }, Semantic::Text(semantic)) => value == semantic,
+        (
+            Checked::TextTemplate { segments },
+            Semantic::TextTemplate {
+                segments: semantic_segments,
+            },
+        ) => definition_text_segments_match_v1(segments, semantic_segments),
+        (Checked::Number { value }, Semantic::Number(semantic)) => value == semantic,
+        (Checked::Bits { value }, Semantic::Bits(semantic)) => value == semantic,
+        (Checked::BytesByte { value }, Semantic::BytesByte(semantic)) => value == semantic,
+        (Checked::Absent, Semantic::Absent) => true,
+        (Checked::Flush { .. }, Semantic::Flush { .. }) => true,
+        (Checked::Tag { name }, Semantic::Tag(semantic)) => name == semantic,
+        (
+            Checked::TaggedObject {
+                tag,
+                fields: checked_fields,
+            },
+            Semantic::TaggedObject {
+                tag: semantic_tag,
+                fields: semantic_fields,
+            },
+        ) => {
+            tag == semantic_tag
+                && definition_record_fields_match_v1(checked_fields, semantic_fields)
+        }
+        (Checked::Source, Semantic::Source { .. }) => true,
+        (
+            Checked::Call { call },
+            Semantic::Call {
+                call: semantic_call,
+                ..
+            },
+        ) => execution
+            .calls
+            .get(semantic_call.as_usize())
+            .is_some_and(|candidate| {
+                candidate.id == *semantic_call && candidate.checked_call == *call
+            }),
+        (Checked::Draining { .. }, Semantic::Draining { .. }) => true,
+        (
+            Checked::Hold { name, .. },
+            Semantic::Hold {
+                name: semantic_name,
+                ..
+            },
+        ) => name == semantic_name,
+        (Checked::Latest { branches }, Semantic::Latest { branches: semantic }) => {
+            branches.len() == semantic.len()
+        }
+        (
+            Checked::When { arms, .. },
+            Semantic::When {
+                select_kind: crate::SemanticSelectKind::When,
+                arms: semantic_arms,
+                ..
+            },
+        )
+        | (
+            Checked::While { arms, .. },
+            Semantic::When {
+                select_kind: crate::SemanticSelectKind::While,
+                arms: semantic_arms,
+                ..
+            },
+        ) => arms.len() == semantic_arms.len(),
+        (
+            Checked::Then { output, .. },
+            Semantic::Then {
+                output: semantic_output,
+                ..
+            },
+        ) => output.is_some() == semantic_output.is_some(),
+        (Checked::Infix { op, .. }, Semantic::Infix { op: semantic, .. }) => op == semantic,
+        (
+            Checked::MatchArm {
+                pattern,
+                bindings,
+                output,
+            },
+            Semantic::MatchArm {
+                pattern: semantic_pattern,
+                output: semantic_output,
+            },
+        ) => {
+            pattern == semantic_pattern
+                && bindings.is_empty()
+                && output.is_some() == semantic_output.is_some()
+        }
+        (
+            Checked::Block { bindings, result },
+            Semantic::Block {
+                bindings: semantic_bindings,
+                ..
+            },
+        ) => result.is_some() && definition_block_bindings_match_v1(bindings, semantic_bindings),
+        (Checked::Object { fields }, Semantic::Object(semantic)) => {
+            definition_record_fields_match_v1(fields, semantic)
+        }
+        (
+            Checked::List { capacity, items },
+            Semantic::List {
+                capacity: semantic_capacity,
+                items: semantic_items,
+            },
+        ) => capacity == semantic_capacity && items.len() == semantic_items.len(),
+        (
+            Checked::Bytes { fixed_size, items },
+            Semantic::Bytes {
+                fixed_size: semantic_fixed_size,
+                items: semantic_items,
+            },
+        ) => fixed_size == semantic_fixed_size && items.len() == semantic_items.len(),
+        (Checked::Delimiter, Semantic::Delimiter) => true,
+        (Checked::MapEntry { .. }, Semantic::MapEntry { .. }) => true,
+        (Checked::Map { entries }, Semantic::Map { entries: semantic }) => {
+            entries.len() == semantic.len()
+        }
+        (Checked::Set { items }, Semantic::Set { items: semantic }) => {
+            items.len() == semantic.len()
+        }
+        _ => false,
+    }
+}
+
+fn semantic_expression_has_explicit_static_specialization_v1(
+    checked: &boon_checked::CheckedExpressionKind,
+    semantic: &crate::SemanticExpressionKind,
+    expandable_user_call: bool,
+) -> bool {
+    use crate::SemanticExpressionKind as Semantic;
+    use boon_checked::CheckedExpressionKind as Checked;
+
+    if expandable_user_call
+        && matches!(checked, Checked::Call { .. })
+        && !matches!(semantic, Semantic::Call { .. })
+    {
+        // Non-retained user calls are inlined by contextual expansion, so the
+        // occurrence kind is the callable body's selected result rather than
+        // `Call`. The compact occurrence proof below binds that final kind and
+        // all of its ordered children.
+        return true;
+    }
+
+    matches!(
+        (checked, semantic),
+        (
+            Checked::Passed { .. },
+            Semantic::ElementState { .. }
+                | Semantic::MaterializationLocal { .. }
+                | Semantic::FunctionParameter { .. }
+                | Semantic::Project { .. }
+                | Semantic::LocalRead { .. }
+                | Semantic::CanonicalRead { .. }
+        ) | (
+            Checked::Read { .. },
+            Semantic::CanonicalRead { .. }
+                | Semantic::LocalRead { .. }
+                | Semantic::Project { .. }
+                | Semantic::MaterializationLocal { .. }
+                | Semantic::FunctionParameter { .. }
+                | Semantic::ElementState { .. }
+        ) | (
+            Checked::Call { .. },
+            Semantic::Materialize { .. } | Semantic::Project { .. },
+        ) | (Checked::When { .. }, Semantic::When { .. })
+            | (Checked::While { .. }, Semantic::When { .. })
+            | (Checked::Delimiter, Semantic::Object(_))
+            | (Checked::MatchArm { .. }, Semantic::MatchArm { .. })
+            | (_, Semantic::FlushBoundary { .. })
+    )
+}
+
+fn execution_expression_proof_plans_v1(
+    checked_handoff: &CheckedImageHandoffV4,
+    checked: &boon_checked::CheckedProgramFields,
+    routes: &ExecutionConstructionRoutesV3,
+    execution: &SemanticExecutionImageColumnsV1,
+) -> Result<
+    (
+        Vec<Option<DefinitionExecutionProofFragmentV1>>,
+        Vec<ExecutionExpressionProofPlanV1>,
+    ),
+    String,
+> {
+    let user_callables = checked
+        .callables
+        .iter()
+        .filter_map(|callable| {
+            (callable.kind == boon_checked::CheckedCallableKind::User).then_some(callable.decl_id)
+        })
+        .collect::<BTreeSet<_>>();
+    let expandable_user_calls = checked
+        .calls
+        .iter()
+        .filter_map(|call| user_callables.contains(&call.callable).then_some(call.id))
+        .collect::<BTreeSet<_>>();
+    if checked_handoff.source_bundle_digest_v1 != checked.source_bundle_digest_v1
+        || checked_handoff.role != checked.role
+    {
+        return Err(
+            "execution expression proof plans received mismatched checked authorities".to_owned(),
+        );
+    }
+
+    let mut checked_expression_projections = vec![None; checked.expressions.len()];
+    for route in &checked_handoff.entity_routes {
+        if route.domain != CheckedImageRowDomainV2::Expression {
+            continue;
+        }
+        let slot = checked_expression_projections
+            .get_mut(route.dense_index as usize)
+            .ok_or_else(|| {
+                format!(
+                    "checked expression route {} exceeds the checked expression table",
+                    route.dense_index
+                )
+            })?;
+        if slot.replace(route.projection).is_some() {
+            return Err(format!(
+                "checked expression route {} is defined more than once",
+                route.dense_index
+            ));
+        }
+    }
+
+    let mut next_ordinal_by_projection = vec![0u32; checked_handoff.projections.len()];
+    let mut checked_expression_ordinals = Vec::with_capacity(checked.expressions.len());
+    let mut definition_proof_fragments = vec![None; checked_handoff.projections.len()];
+    let mut hash_scratch = Vec::new();
+    for (index, expression) in checked.expressions.iter().enumerate() {
+        if expression.id.0 as usize != index {
+            return Err(format!(
+                "checked expression {} is noncanonical while planning execution proofs",
+                expression.id.0
+            ));
+        }
+        let projection = checked_expression_projections[index].ok_or_else(|| {
+            format!(
+                "checked expression {} has no exact image projection",
+                expression.id.0
+            )
+        })?;
+        let ordinal = next_ordinal_by_projection
+            .get_mut(projection.as_usize())
+            .ok_or_else(|| {
+                format!(
+                    "checked expression {} references missing proof projection {}",
+                    expression.id.0, projection.0
+                )
+            })?;
+        checked_expression_ordinals.push(*ordinal);
+        *ordinal = ordinal.checked_add(1).ok_or_else(|| {
+            format!(
+                "checked expression proof ordinal overflow in projection {}",
+                projection.0
+            )
+        })?;
+        if definition_proof_fragments[projection.as_usize()].is_none() {
+            let definition_projection = routes.definition_projection(projection)?;
+            let expression_fragment = checked_handoff.projection(projection).ok_or_else(|| {
+                format!("checked expression fragment {} is missing", projection.0)
+            })?;
+            let definition_fragment = checked_handoff
+                .projection(definition_projection)
+                .ok_or_else(|| {
+                    format!(
+                        "checked definition fragment {} is missing",
+                        definition_projection.0
+                    )
+                })?;
+            let definition_stable_key_digest = definition_fragment.stable_key_digest;
+            let definition_local_content_digest = definition_fragment.local_content_digest;
+            let expression_stable_key_digest = expression_fragment.stable_key_digest;
+            let expression_local_content_digest = expression_fragment.local_content_digest;
+            let digest = boon_contract::canonical_serde_hash_v1_with_buffer(
+                EXECUTION_DEFINITION_PROOF_FRAGMENT_DOMAIN_V1,
+                &(
+                    definition_stable_key_digest,
+                    definition_local_content_digest,
+                    expression_stable_key_digest,
+                    expression_local_content_digest,
+                ),
+                &mut hash_scratch,
+            )
+            .map_err(|error| {
+                format!(
+                    "failed to seal checked expression proof fragment {}: {error}",
+                    projection.0
+                )
+            })?;
+            definition_proof_fragments[projection.as_usize()] =
+                Some(DefinitionExecutionProofFragmentV1 {
+                    definition_stable_key_digest,
+                    definition_local_content_digest,
+                    expression_stable_key_digest,
+                    expression_local_content_digest,
+                    digest,
+                });
+        }
+    }
+
+    let mut plans = Vec::with_capacity(execution.expressions.len());
+    let mut definition_flow_types = 0usize;
+    let mut definition_effects = 0usize;
+    let mut definition_static = 0usize;
+    for expression in &execution.expressions {
+        if expression.id.as_usize() != plans.len() {
+            return Err(format!(
+                "execution expression {} is noncanonical while planning expression proofs",
+                expression.id
+            ));
+        }
+        let checked_expression = checked
+            .expressions
+            .get(expression.checked_expr_id.0 as usize)
+            .filter(|candidate| candidate.id == expression.checked_expr_id)
+            .ok_or_else(|| {
+                format!(
+                    "execution expression {} references missing checked expression {}",
+                    expression.id, expression.checked_expr_id.0
+                )
+            })?;
+        let expression_projection = checked_expression_projections
+            [expression.checked_expr_id.0 as usize]
+            .ok_or_else(|| {
+                format!(
+                    "execution expression {} has no checked proof projection",
+                    expression.id
+                )
+            })?;
+        let runtime_checked_flow_type = boon_checked::FlowType {
+            mode: checked_expression.flow_type.mode,
+            ty: boon_checked::erase_runtime_type_vars(&checked_expression.flow_type.ty),
+        };
+        let definition_flow_type = expression.flow_type == runtime_checked_flow_type;
+        let definition_effect = expression.effect == checked_expression.effect;
+        let definition_owns_static = definition_owns_semantic_expression_static_v1(
+            &checked_expression.kind,
+            &expression.kind,
+            execution,
+        );
+        let expandable_user_call = match &checked_expression.kind {
+            boon_checked::CheckedExpressionKind::Call { call } => {
+                expandable_user_calls.contains(call)
+            }
+            _ => false,
+        };
+        let specialized_static = if definition_owns_static {
+            definition_static += 1;
+            false
+        } else if semantic_expression_has_explicit_static_specialization_v1(
+            &checked_expression.kind,
+            &expression.kind,
+            expandable_user_call,
+        ) {
+            true
+        } else {
+            return Err(format!(
+                "execution expression {} has unsupported static specialization from {:?} to {:?}",
+                expression.id, checked_expression.kind, expression.kind
+            ));
+        };
+        definition_flow_types += usize::from(definition_flow_type);
+        definition_effects += usize::from(definition_effect);
+        plans.push(ExecutionExpressionProofPlanV1 {
+            fragment: expression_projection,
+            checked_expression_ordinal: *checked_expression_ordinals
+                .get(expression.checked_expr_id.0 as usize)
+                .ok_or_else(|| {
+                    format!(
+                        "execution expression {} has no checked local proof ordinal",
+                        expression.id
+                    )
+                })?,
+            definition_flow_type,
+            definition_effect,
+            specialized_static,
+        });
+    }
+    if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
+        eprintln!(
+            "boon_semantic execution_expression_proof_v1 plans={} definition_static={} static_overrides={} definition_flow_types={} flow_overrides={} definition_effects={} effect_overrides={}",
+            plans.len(),
+            definition_static,
+            plans.len().saturating_sub(definition_static),
+            definition_flow_types,
+            plans.len().saturating_sub(definition_flow_types),
+            definition_effects,
+            plans.len().saturating_sub(definition_effects),
+        );
+    }
+    Ok((definition_proof_fragments, plans))
+}
+
+pub(crate) fn execution_construction_image_v4(
+    checked_handoff: &CheckedImageHandoffV4,
+    checked: &boon_checked::CheckedProgramFields,
     routes: ExecutionConstructionRoutesV3,
     execution: &SemanticExecutionImageColumnsV1,
-) -> Result<ExecutionConstructionImageV3, String> {
+) -> Result<ExecutionConstructionImageV4, String> {
     let trace_started = std::env::var_os("BOON_SEMANTIC_TRACE")
         .is_some()
         .then(std::time::Instant::now);
@@ -2064,7 +4315,7 @@ pub(crate) fn execution_construction_image_v3(
             .filter(|origin| origin.expression == expression.id)
             .ok_or_else(|| format!("execution expression {} has no exact origin", expression.id))?;
         let checked_projection = checked_projection(
-            checked,
+            checked_handoff,
             CheckedImageRowDomainV2::Expression,
             expression.checked_expr_id.0 as usize,
         )?;
@@ -2112,6 +4363,9 @@ pub(crate) fn execution_construction_image_v3(
         expression_routes.push(route);
     }
 
+    let (definition_proof_fragments, expression_proof_plans) =
+        execution_expression_proof_plans_v1(checked_handoff, checked, &routes, execution)?;
+
     let mut statement_routes = Vec::with_capacity(execution.statements.len());
     for statement in &execution.statements {
         if statement.id.as_usize() != statement_routes.len() {
@@ -2128,7 +4382,7 @@ pub(crate) fn execution_construction_image_v3(
         };
         let fallback = ExecutionConstructionProjectionV3::Checked {
             projection: checked_projection(
-                checked,
+                checked_handoff,
                 CheckedImageRowDomainV2::Statement,
                 checked_statement.0 as usize,
             )?,
@@ -2138,14 +4392,16 @@ pub(crate) fn execution_construction_image_v3(
         }));
     }
 
-    let image = ExecutionConstructionImageV3 {
+    let image = ExecutionConstructionImageV4 {
         routes,
         expression_routes,
+        definition_proof_fragments,
+        expression_proof_plans,
         statement_routes,
     };
     if let Some(started) = trace_started {
         eprintln!(
-            "boon_semantic execution_image_v3 owners={} expression_routes={} statement_routes={} elapsed_ms={:.3}",
+            "boon_semantic execution_image_v4 owners={} expression_routes={} statement_routes={} elapsed_ms={:.3}",
             image.routes.owner_occurrences.len(),
             image.expression_routes.len(),
             image.statement_routes.len(),
@@ -2420,7 +4676,7 @@ fn function_projection(
 
 #[cfg(test)]
 fn checked_execution_projection_v3(
-    builder: &mut ExecutionImageHandoffBuilderV3<'_>,
+    builder: &mut ExecutionImageHandoffBuilderV4<'_>,
     domain: CheckedImageRowDomainV2,
     dense_index: usize,
 ) -> Result<PendingExecutionProjectionIdV3, String> {
@@ -2430,14 +4686,14 @@ fn checked_execution_projection_v3(
 
 #[cfg(test)]
 fn projection_for_construction_route_v3(
-    builder: &mut ExecutionImageHandoffBuilderV3<'_>,
+    builder: &mut ExecutionImageHandoffBuilderV4<'_>,
     route: ExecutionConstructionProjectionV3,
 ) -> Result<PendingExecutionProjectionIdV3, String> {
     builder.intern(route)
 }
 
 fn function_projection_v3(
-    builder: &mut ExecutionImageHandoffBuilderV3<'_>,
+    builder: &mut ExecutionImageHandoffBuilderV4<'_>,
     execution: &SemanticExecutionImageColumnsV1,
     function: &SemanticFunction,
 ) -> Result<PendingExecutionProjectionIdV3, String> {
@@ -2472,23 +4728,24 @@ fn function_projection_v3(
 /// need to walk the completed semantic and executable images again.  The
 /// transaction retains only dense projection routes and compact receipt
 /// accumulators; it never owns a second executable graph.
-pub(crate) struct ExecutionReceiptPublisherV3<'a> {
-    builder: ExecutionImageHandoffBuilderV3<'a>,
+pub(crate) struct ExecutionReceiptPublisherV4<'a> {
+    builder: ExecutionImageHandoffBuilderV4<'a>,
     manifest_prefix: crate::dependency_manifest::ManifestCheckedExecutionPrefixBuilderV7,
     checked_projections: Vec<Option<PendingExecutionProjectionIdV3>>,
     invocation_projections: Vec<PendingExecutionProjectionIdV3>,
     expression_routes: Vec<PendingExecutionProjectionIdV3>,
     statement_routes: Vec<PendingExecutionProjectionIdV3>,
     owner_routes: Vec<PendingExecutionProjectionIdV3>,
+    expression_children: Vec<ExecutionExpressionChildV1>,
 }
 
-impl<'a> ExecutionReceiptPublisherV3<'a> {
+impl<'a> ExecutionReceiptPublisherV4<'a> {
     fn new(
         checked: &'a CheckedImageHandoffV4,
-        construction_image: &'a ExecutionConstructionImageV3,
+        construction_image: &'a ExecutionConstructionImageV4,
         execution: &SemanticExecutionImageColumnsV1,
     ) -> Result<Self, String> {
-        let mut builder = ExecutionImageHandoffBuilderV3::new(checked, construction_image)?;
+        let mut builder = ExecutionImageHandoffBuilderV4::new(checked, construction_image)?;
         let manifest_prefix =
             crate::dependency_manifest::ManifestCheckedExecutionPrefixBuilderV7::new(
                 checked, execution,
@@ -2513,6 +4770,7 @@ impl<'a> ExecutionReceiptPublisherV3<'a> {
             expression_routes: Vec::with_capacity(execution.expressions.len()),
             statement_routes: Vec::with_capacity(execution.statements.len()),
             owner_routes: Vec::with_capacity(execution.static_owners.len()),
+            expression_children: Vec::new(),
         };
         for expression in &execution.expressions {
             let route = construction_image.expression_route(expression.id)?;
@@ -2644,11 +4902,11 @@ impl<'a> ExecutionReceiptPublisherV3<'a> {
         Ok(())
     }
 
-    pub(crate) fn publish_expression<T: Serialize>(
+    pub(crate) fn publish_expression(
         &mut self,
         execution: &SemanticExecutionImageColumnsV1,
         semantic: &crate::SemanticExpression,
-        executable: &T,
+        executable: &crate::program_core::ExecutableExpression,
     ) -> Result<(), String> {
         let projection = self.expression_projection(semantic.id)?;
         let mut relocations = execution
@@ -2675,10 +4933,26 @@ impl<'a> ExecutionReceiptPublisherV3<'a> {
                 callable.checked_callable.0 as usize,
             )?);
         }
-        self.builder.push(
+        let (plan, fragment) = self
+            .builder
+            .construction_image
+            .expression_proof_authority(semantic.id)?;
+        let started = self.builder.trace.then(std::time::Instant::now);
+        let payload_digest = seal_execution_expression_proof_v1(
+            plan,
+            fragment,
+            semantic,
+            executable,
+            &mut self.expression_children,
+            &mut self.builder.hash_scratch,
+        )?;
+        if let Some(started) = started {
+            self.builder.trace_payload_hash_ns += started.elapsed().as_nanos();
+        }
+        self.builder.push_presealed(
             projection,
             ExecutionImageRowDomainV3::Expression,
-            executable,
+            payload_digest,
             relocations,
         )?;
         self.builder.route(
@@ -2978,7 +5252,7 @@ impl<'a> ExecutionReceiptPublisherV3<'a> {
         self,
     ) -> Result<
         (
-            ExecutionImageHandoffV3,
+            ExecutionImageHandoffV4,
             crate::dependency_manifest::ManifestCheckedExecutionPrefixV7,
         ),
         String,
@@ -2991,13 +5265,13 @@ impl<'a> ExecutionReceiptPublisherV3<'a> {
 }
 
 #[cfg(test)]
-fn execution_image_handoff_v3(
+fn execution_image_handoff_v4(
     checked: &CheckedImageHandoffV4,
-    construction_image: &ExecutionConstructionImageV3,
+    construction_image: &ExecutionConstructionImageV4,
     execution: &SemanticExecutionImageColumnsV1,
     core: &crate::program_core::CanonicalProgramCoreV2,
     payload_seals: &ExecutionRowPayloadSealsV3,
-) -> Result<ExecutionImageHandoffV3, String> {
+) -> Result<ExecutionImageHandoffV4, String> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     let mut trace_started = std::time::Instant::now();
     let executable = &core.executable;
@@ -3010,7 +5284,6 @@ fn execution_image_handoff_v3(
         || executable.call_occurrences.len() != execution.call_occurrences.len()
         || core.materializations.len() != execution.materializations.len()
         || core.scope_index.owners.len() != execution.static_owners.len()
-        || payload_seals.expressions.len() != executable.expressions.len()
         || payload_seals.statements.len() != executable.statements.len()
         || payload_seals.call_occurrences.len() != executable.call_occurrences.len()
         || payload_seals.sources.len() != executable.sources.len()
@@ -3020,10 +5293,10 @@ fn execution_image_handoff_v3(
         || payload_seals.materializations.len() != core.materializations.len()
         || payload_seals.static_owners.len() != core.scope_index.owners.len()
     {
-        return Err("execution V3 receipts do not exactly cover final executable rows".to_owned());
+        return Err("execution V4 receipts do not exactly cover final executable rows".to_owned());
     }
 
-    let mut builder = ExecutionImageHandoffBuilderV3::new(checked, construction_image)?;
+    let mut builder = ExecutionImageHandoffBuilderV4::new(checked, construction_image)?;
     let invocation_projections = construction_image
         .routes
         .invocations
@@ -3091,6 +5364,7 @@ fn execution_image_handoff_v3(
     }
     trace_execution_handoff_phase(trace, "v3_scope_rows", &mut trace_started);
 
+    let mut expression_children = Vec::new();
     for (semantic, executable) in execution.expressions.iter().zip(&executable.expressions) {
         if executable.id.as_usize() != semantic.id.as_usize() {
             return Err(format!(
@@ -3124,10 +5398,14 @@ fn execution_image_handoff_v3(
                 callable.checked_callable.0 as usize,
             )?);
         }
-        let payload_digest = execution_payload_seal_v3(
-            &payload_seals.expressions,
-            ExecutionImageRowDomainV3::Expression,
-            semantic.id.as_usize(),
+        let (plan, fragment) = construction_image.expression_proof_authority(semantic.id)?;
+        let payload_digest = seal_execution_expression_proof_v1(
+            plan,
+            fragment,
+            semantic,
+            executable,
+            &mut expression_children,
+            &mut builder.hash_scratch,
         )?;
         builder.push_presealed(
             projection,
@@ -3499,7 +5777,7 @@ fn checked_route_oracle_owner(
 
 #[cfg(test)]
 fn v3_route_oracle_owner(
-    handoff: &ExecutionImageHandoffV3,
+    handoff: &ExecutionImageHandoffV4,
     checked: &CheckedImageHandoffV4,
     projection: ExecutionImageProjectionIdV3,
 ) -> Result<ExecutionRouteOracleOwner, String> {
@@ -3584,7 +5862,7 @@ fn v3_domain_in_v2(domain: ExecutionImageRowDomainV3) -> ExecutionImageRowDomain
 
 #[cfg(test)]
 fn validate_v3_routes_against_v2_oracle(
-    handoff: &ExecutionImageHandoffV3,
+    handoff: &ExecutionImageHandoffV4,
     oracle: &ExecutionImageHandoffV2,
     checked: &CheckedImageHandoffV4,
 ) -> Result<(), String> {
@@ -3623,7 +5901,7 @@ fn trace_execution_handoff_phase(enabled: bool, name: &str, started: &mut std::t
 #[cfg(test)]
 fn execution_image_handoff_v2_oracle(
     checked: &CheckedImageHandoffV4,
-    construction_image: &ExecutionConstructionImageV3,
+    construction_image: &ExecutionConstructionImageV4,
     _out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<ExecutionImageHandoffV2, String> {
@@ -4103,10 +6381,10 @@ fn execution_image_handoff_v2_oracle(
 fn semantic_image_seal_digest(
     schema: &str,
     checked: &CheckedImageHandoffV4,
-    execution: &ExecutionImageHandoffV3,
+    execution: &ExecutionImageHandoffV4,
 ) -> Result<[u8; 32], String> {
     boon_contract::canonical_serde_hash_v1(
-        SEMANTIC_IMAGE_SEAL_DOMAIN_V3,
+        SEMANTIC_IMAGE_SEAL_DOMAIN_V4,
         &(
             schema,
             checked.local_image_digest,
@@ -4114,4 +6392,228 @@ fn semantic_image_seal_digest(
         ),
     )
     .map_err(|error| format!("failed to hash semantic image seal: {error}"))
+}
+
+#[cfg(test)]
+mod compact_expression_proof_tests {
+    use super::*;
+    use crate::program_core::{
+        ExecutableExprId, ExecutableExpression, ExecutableExpressionKind, ExecutableValueMember,
+        ExecutableValueOrigin, ExecutableValueProvenance,
+    };
+    use crate::{
+        SemanticExprId, SemanticExpression, SemanticExpressionKind, SemanticValueId,
+        SemanticValueProvenance,
+    };
+    use boon_checked::{
+        BytesType, CheckedEffectSummary, CheckedExprId, FlowMode, FlowType, ObjectShape, Type,
+        TypeVar, Variant,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn fragment() -> DefinitionExecutionProofFragmentV1 {
+        DefinitionExecutionProofFragmentV1 {
+            definition_stable_key_digest: [1; 32],
+            definition_local_content_digest: [2; 32],
+            expression_stable_key_digest: [3; 32],
+            expression_local_content_digest: [4; 32],
+            digest: [5; 32],
+        }
+    }
+
+    fn plan() -> ExecutionExpressionProofPlanV1 {
+        ExecutionExpressionProofPlanV1 {
+            fragment: CheckedImageProjectionIdV2(0),
+            checked_expression_ordinal: 7,
+            definition_flow_type: false,
+            definition_effect: true,
+            specialized_static: true,
+        }
+    }
+
+    fn number_expression(value: &str) -> (SemanticExpression, ExecutableExpression) {
+        let value: boon_data::ExactNumber = value.parse().expect("exact Number fixture");
+        let flow_type = FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::Number,
+        };
+        (
+            SemanticExpression {
+                id: SemanticExprId(0),
+                value_id: SemanticValueId(0),
+                checked_expr_id: CheckedExprId(0),
+                flow_type: flow_type.clone(),
+                effect: CheckedEffectSummary::default(),
+                owner: None,
+                provenance: SemanticValueProvenance::default(),
+                resource_binding_path: None,
+                kind: SemanticExpressionKind::Number(value.clone()),
+            },
+            ExecutableExpression {
+                id: ExecutableExprId(0),
+                checked_expr_id: CheckedExprId(0),
+                flow_type,
+                effect: CheckedEffectSummary::default(),
+                owner: None,
+                provenance: ExecutableValueProvenance::default(),
+                resource_binding_path: None,
+                kind: ExecutableExpressionKind::Number { value },
+            },
+        )
+    }
+
+    fn seal(semantic: &SemanticExpression, executable: &ExecutableExpression) -> [u8; 32] {
+        seal_execution_expression_proof_v1(
+            &plan(),
+            &fragment(),
+            semantic,
+            executable,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .expect("compact expression proof")
+    }
+
+    #[test]
+    fn compact_expression_proof_binds_flow_static_owner_provenance_and_children() {
+        let (semantic, executable) = number_expression("1");
+        let baseline = seal(&semantic, &executable);
+
+        let (semantic_two, executable_two) = number_expression("2");
+        assert_ne!(baseline, seal(&semantic_two, &executable_two));
+
+        let mut semantic_text = semantic.clone();
+        semantic_text.flow_type.ty = Type::Text;
+        let mut executable_text = executable.clone();
+        executable_text.flow_type.ty = Type::Text;
+        assert_ne!(baseline, seal(&semantic_text, &executable_text));
+
+        let mut semantic_owner = semantic.clone();
+        semantic_owner.owner = Some(StaticOwnerId(1));
+        let mut executable_owner = executable.clone();
+        executable_owner.owner = Some(StaticOwnerId(1));
+        assert_ne!(baseline, seal(&semantic_owner, &executable_owner));
+
+        let mut executable_provenance = executable.clone();
+        executable_provenance.provenance = ExecutableValueProvenance {
+            members: vec![ExecutableValueMember {
+                path: vec!["nested".to_owned()],
+                origin: ExecutableValueOrigin::Runtime,
+            }],
+        };
+        assert_ne!(baseline, seal(&semantic, &executable_provenance));
+
+        let list_flow = FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::List(Type::shared(Type::Number)),
+        };
+        let semantic_list = SemanticExpression {
+            id: SemanticExprId(0),
+            value_id: SemanticValueId(0),
+            checked_expr_id: CheckedExprId(0),
+            flow_type: list_flow.clone(),
+            effect: CheckedEffectSummary::default(),
+            owner: None,
+            provenance: SemanticValueProvenance::default(),
+            resource_binding_path: None,
+            kind: SemanticExpressionKind::List {
+                capacity: Some(2),
+                items: vec![SemanticExprId(1), SemanticExprId(2)],
+            },
+        };
+        let executable_list = ExecutableExpression {
+            id: ExecutableExprId(0),
+            checked_expr_id: CheckedExprId(0),
+            flow_type: list_flow,
+            effect: CheckedEffectSummary::default(),
+            owner: None,
+            provenance: ExecutableValueProvenance::default(),
+            resource_binding_path: None,
+            kind: ExecutableExpressionKind::List {
+                capacity: Some(2),
+                items: vec![ExecutableExprId(1), ExecutableExprId(2)],
+            },
+        };
+        let ordered = seal(&semantic_list, &executable_list);
+        let mut reversed = executable_list;
+        reversed.kind = ExecutableExpressionKind::List {
+            capacity: Some(2),
+            items: vec![ExecutableExprId(2), ExecutableExprId(1)],
+        };
+        assert_ne!(ordered, seal(&semantic_list, &reversed));
+    }
+
+    #[test]
+    fn compact_flow_proof_distinguishes_every_type_shape() {
+        fn digest(ty: Type) -> [u8; 32] {
+            let mut hasher = Sha256::new();
+            hasher.update(b"boon.test.execution-flow-proof.v1\0");
+            execution_proof_update_flow_type_v1(
+                &mut hasher,
+                &FlowType {
+                    mode: FlowMode::Continuous,
+                    ty,
+                },
+            )
+            .expect("flow proof fixture");
+            hasher.finalize().into()
+        }
+
+        let object_shape = ObjectShape {
+            fields: BTreeMap::from([("value".to_owned(), Type::Number)]),
+            field_order: vec!["value".to_owned()],
+            open: false,
+        };
+        let tagged_shape = ObjectShape {
+            fields: BTreeMap::from([("text".to_owned(), Type::Text)]),
+            field_order: vec!["text".to_owned()],
+            open: false,
+        };
+        let types = vec![
+            Type::Text,
+            Type::Number,
+            Type::Bytes(BytesType::Dynamic),
+            Type::Bytes(BytesType::Fixed(4)),
+            Type::Absent,
+            Type::VariantSet(vec![Variant::Tag("Ready".to_owned())].into()),
+            Type::VariantSet(vec![Variant::tagged("Ready".to_owned(), tagged_shape)].into()),
+            Type::object(object_shape),
+            Type::RenderContract,
+            Type::List(Type::shared(Type::Number)),
+            Type::Function {
+                args: vec![Type::Number],
+                result: Box::new(FlowType {
+                    mode: FlowMode::TickPresent,
+                    ty: Type::Text,
+                }),
+            },
+            Type::UnresolvedShape {
+                reason: "fixture".to_owned(),
+            },
+            Type::Var(TypeVar(9)),
+            Type::Unknown,
+            Type::Union(vec![Type::Number, Type::Text]),
+            Type::Map {
+                key: Box::new(Type::Text),
+                value: Box::new(Type::Number),
+            },
+            Type::Set(Type::shared(Type::Text)),
+            Type::Bits { width: 17 },
+        ];
+        let digests = types.into_iter().map(digest).collect::<BTreeSet<_>>();
+        assert_eq!(digests.len(), 18);
+
+        let continuous = digest(Type::Number);
+        let mut present = Sha256::new();
+        present.update(b"boon.test.execution-flow-proof.v1\0");
+        execution_proof_update_flow_type_v1(
+            &mut present,
+            &FlowType {
+                mode: FlowMode::TickPresent,
+                ty: Type::Number,
+            },
+        )
+        .expect("present flow proof fixture");
+        assert_ne!(continuous, <[u8; 32]>::from(present.finalize()));
+    }
 }

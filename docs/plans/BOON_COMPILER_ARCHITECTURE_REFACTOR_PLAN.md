@@ -4491,6 +4491,49 @@ definition-template checkpoint. `InvalidDefinitionTemplate` and the three
 checked definition execution-template records are now explicitly classified,
 the embedded schema digest advances, and the complete architecture gate passes.
 
+The first definition-backed expression-proof cut is now complete. Semantic
+image V4 reuses each checked definition projection's stable-key and local-
+content digests, and publishes a compact per-expression proof plan containing
+the checked local ordinal, definition flow/effect/static facts, ordered typed
+child relocations, and explicit occurrence overrides. The V4 encoder is a
+fixed-schema hash writer rather than a generic rich-record serializer; mutation
+tests prove that flow types, static owner, provenance, ordered children, and
+every runtime `Type` shape remain content-bound. The classifier schema digest
+advances with the V4 ownership boundary, and the architecture gate requires
+both the direct publisher and its independent post-hoc oracle.
+
+NovyWave contains 16,312 executable expressions. Of those, 12,298 reuse their
+definition static fact and 4,014 carry an occurrence override; 13,054 reuse
+their definition flow type and 3,258 carry an occurrence override. The final
+stable-release trace records 17.704 ms constructing the execution image and
+78.224 ms publishing expression proofs, versus roughly 115 ms for the previous
+rich expression-proof envelope. The requested sub-40 ms expression target was
+not reached: recursively encoding large `FlowType` trees remains the dominant
+owner. A trial whole-flow digest cache merely moved work into construction and
+was rejected.
+
+Five independent fresh-process stable-release observations after the V4 cut
+have a 2,508.099 ms verified median, 2,500.598--2,568.134 ms range,
+948.489 ms semantic median, 250.100 ms backend median, 355,368 KiB median peak
+RSS, and 0.408 ms median WHERE verification. All five produce zero diagnostics,
+the unchanged source digest
+`e8b6c437a3f112026ca4f8a58e9f9c98e04cb2e3826a29724f3dc8e72d8bda9b`,
+and the unchanged MachinePlan digest
+`ca6a030997141a451a119165a9f9ba194071126ae257a7475d7ceafe7a1ea63a`.
+Relative to the preceding 2,560.763 ms checkpoint median this is a 52.664 ms
+end-to-end improvement, but only about 18--20 ms is directly localized to the
+expression-proof representation; the rest remains within cold-process phase
+variance.
+
+Stop proof-codec micro-optimization here. The next speed-bearing vertical cut
+is the original kernel design's hash-consed immutable type-term arena:
+`DefinitionArtifact` must own canonical `TypeTermId`s and their stable digests,
+and semantic invocation frames must relocate dense term IDs instead of walking
+recursive `Type` values per occurrence. That cut should serve type solving,
+checked artifacts, semantic proof publication, and later plan-code templates
+from one authority; a semantic-only type cache would merely create another
+representation and is rejected.
+
 The concurrent checker-kernel track remains the first half of the same
 definition-artifact design. Checked/execution receipt replay is already deleted;
 the work below completes the checker authority that will eventually produce the

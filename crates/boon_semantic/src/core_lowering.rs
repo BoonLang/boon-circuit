@@ -277,7 +277,7 @@ pub(super) struct MappedSemanticExecution {
 
 pub(crate) struct CanonicalProgramCoreBuildV2 {
     pub(crate) core: program_core::CanonicalProgramCoreV2,
-    pub(crate) execution_handoff: crate::semantic_image::ExecutionImageHandoffV3,
+    pub(crate) execution_handoff: crate::semantic_image::ExecutionImageHandoffV4,
     pub(crate) manifest_prefix: crate::dependency_manifest::ManifestCheckedExecutionPrefixV7,
 }
 
@@ -1558,7 +1558,7 @@ pub(super) fn map_semantic_execution_with_reactive(
     graph: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV2,
     reactive: &SemanticReactiveGraphV1,
-    receipts: &mut crate::semantic_image::ExecutionReceiptPublisherV3<'_>,
+    receipts: &mut crate::semantic_image::ExecutionReceiptPublisherV4<'_>,
 ) -> Result<MappedSemanticExecution, String> {
     map_semantic_execution_with_external_events(
         graph,
@@ -1572,7 +1572,7 @@ fn map_semantic_execution_with_external_events(
     graph: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV2,
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
-    receipts: &mut crate::semantic_image::ExecutionReceiptPublisherV3<'_>,
+    receipts: &mut crate::semantic_image::ExecutionReceiptPublisherV4<'_>,
 ) -> Result<MappedSemanticExecution, String> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     let id_map = core_lowering_phase!(
@@ -7272,7 +7272,7 @@ pub(crate) fn build_canonical_program_core(
     view_binding_graph: &crate::SemanticViewBindingGraphV1,
     scope_storage_graph: &SemanticScopeStorageGraphV1,
     memory_graph: &crate::SemanticMemoryGraphV1,
-    mut receipts: crate::semantic_image::ExecutionReceiptPublisherV3<'_>,
+    mut receipts: crate::semantic_image::ExecutionReceiptPublisherV4<'_>,
 ) -> Result<CanonicalProgramCoreBuildV2, String> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     let mapped = core_lowering_phase!(
@@ -7315,7 +7315,7 @@ fn finish_canonical_program_core(
     memory_graph: &crate::SemanticMemoryGraphV1,
     mapped: MappedSemanticExecution,
     resources: MappedSemanticResources,
-    mut receipts: crate::semantic_image::ExecutionReceiptPublisherV3<'_>,
+    mut receipts: crate::semantic_image::ExecutionReceiptPublisherV4<'_>,
 ) -> Result<CanonicalProgramCoreBuildV2, String> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     let mut resources = resources;

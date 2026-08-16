@@ -46,8 +46,8 @@ use std::sync::Arc;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x5e, 0x6c, 0x84, 0x5b, 0x07, 0xf3, 0x58, 0x4b, 0x20, 0xea, 0xa1, 0x5e, 0xc7, 0x3f, 0x7b, 0x35,
-    0xf0, 0xe8, 0xe5, 0xc3, 0x15, 0x2e, 0x94, 0x40, 0xc1, 0x59, 0xa5, 0x39, 0x27, 0x4f, 0x6a, 0x25,
+    0x1d, 0x6a, 0xfa, 0xd0, 0x87, 0x1f, 0xa4, 0x2e, 0x36, 0x32, 0x46, 0x04, 0x1f, 0x2d, 0xd2, 0x16,
+    0x20, 0x7f, 0x1a, 0x88, 0x2c, 0x52, 0x29, 0x71, 0x91, 0xde, 0x7e, 0x1f, 0xbb, 0x36, 0x02, 0x2d,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -627,7 +627,7 @@ pub fn distributed_value_occurrences(
 pub struct SemanticProgram {
     source_bundle_digest_v1: SourceBundleDigestV1,
     role: boon_checked::ProgramRole,
-    semantic_image: SealedSemanticImageV3,
+    semantic_image: SealedSemanticImageV4,
     #[cfg(test)]
     checked_program: CheckedProgramFields,
     #[cfg(test)]
@@ -812,7 +812,7 @@ impl SemanticProgram {
         &self.resolved_out_graph
     }
 
-    pub const fn semantic_image(&self) -> &SealedSemanticImageV3 {
+    pub const fn semantic_image(&self) -> &SealedSemanticImageV4 {
         &self.semantic_image
     }
 

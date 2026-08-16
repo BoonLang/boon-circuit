@@ -1,10 +1,11 @@
 use crate::{
-    ArtifactOutput, ComponentArtifact, ComponentProgram, KERNEL_SUMMARY_DEFINITION_RANKING_LEN,
-    KernelCollectionOperationKind, KernelCollectionProjectionKind, KernelOperation, KernelPattern,
-    KernelRecordEntry, KernelSelectArm, KernelSolveWork, KernelSummaryCallInput,
-    KernelSummaryDefinitionWork, KernelSummaryNode, KernelSummaryProgram, KernelSummaryRecordEntry,
-    NameId, OperationId, ProgramConsumer, ProgramOperationRef, PublishMode, ResidualOperationFrame,
-    TypeTerm, TypeTermId, TypeVariableId, VariantTerm,
+    ArtifactOutput, ComponentArtifact, ComponentOutputSnapshot, ComponentProgram,
+    KERNEL_SUMMARY_DEFINITION_RANKING_LEN, KernelCollectionOperationKind,
+    KernelCollectionProjectionKind, KernelOperation, KernelPattern, KernelRecordEntry,
+    KernelSelectArm, KernelSolveWork, KernelSummaryCallInput, KernelSummaryDefinitionWork,
+    KernelSummaryNode, KernelSummaryProgram, KernelSummaryRecordEntry, NameId, OperationId,
+    ProgramConsumer, ProgramOperationRef, PublishMode, ResidualOperationFrame, TypeTerm,
+    TypeTermId, TypeVariableId, VariantTerm,
 };
 use boon_checked::FlowType;
 use std::collections::VecDeque;
@@ -78,8 +79,126 @@ struct SummaryValue {
 /// Evaluate one compact component to quiescence.
 pub fn solve_component(program: ComponentProgram) -> Result<ComponentArtifact, KernelSolveError> {
     validate_single_writers(&program)?;
-    let (solver, execution) = ComponentSolver::new(program);
-    solver.solve(&execution)
+    ComponentSolveSession::new_validated(program).solve_all()
+}
+
+/// Revision-local staged solver for one immutable equation component.
+///
+/// Interface demand enables the complete bidirectional constraint closure of
+/// its output cells. A later checked-image demand enables only the remaining
+/// work items in the same union-find/type arena, so diagnostics never force a
+/// second compile or discard already-converged interface work.
+pub(crate) struct ComponentSolveSession {
+    solver: ComponentSolver,
+    execution: SolverExecution,
+}
+
+impl ComponentSolveSession {
+    pub(crate) fn new(program: ComponentProgram) -> Result<Self, KernelSolveError> {
+        validate_single_writers(&program)?;
+        Ok(Self::new_validated(program))
+    }
+
+    fn new_validated(program: ComponentProgram) -> Self {
+        let (solver, execution) = ComponentSolver::new(program);
+        Self { solver, execution }
+    }
+
+    pub(crate) fn solve_outputs(
+        &mut self,
+        demanded: &[crate::OutputId],
+    ) -> Result<ComponentOutputSnapshot, KernelSolveError> {
+        let enabled = self.demanded_work_items(demanded)?;
+        self.solver.enable(&self.execution, &enabled)?;
+        self.solver.mark_outputs_available(demanded)?;
+        Ok(self.solver.snapshot())
+    }
+
+    pub(crate) fn solve_all(mut self) -> Result<ComponentArtifact, KernelSolveError> {
+        let enabled = vec![true; self.execution.work_items.len()];
+        self.solver.enable(&self.execution, &enabled)?;
+        self.solver.mark_all_outputs_available();
+        self.solver.finish()
+    }
+
+    fn demanded_work_items(
+        &self,
+        demanded: &[crate::OutputId],
+    ) -> Result<Vec<bool>, KernelSolveError> {
+        let variable_count = self.solver.cells.len();
+        let mut writer_by_variable = vec![None::<OperationId>; variable_count];
+        for operation in 0..self.execution.work_items.len() {
+            let operation =
+                OperationId(u32::try_from(operation).expect("kernel work-item count exceeds u32"));
+            for output in self.execution.operation_outputs(operation) {
+                let slot = &mut writer_by_variable[output.0 as usize];
+                if slot.is_none() {
+                    *slot = Some(operation);
+                }
+            }
+        }
+
+        let mut variables = Vec::new();
+        let mut variable_seen = vec![false; variable_count];
+        for output in demanded {
+            let spec = self
+                .solver
+                .program
+                .outputs
+                .get(output.0 as usize)
+                .filter(|spec| spec.id == *output)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel output demand references missing output {}",
+                        output.0
+                    ))
+                })?;
+            let index = spec.variable.0 as usize;
+            if !variable_seen[index] {
+                variable_seen[index] = true;
+                variables.push(spec.variable);
+            }
+        }
+
+        let mut enabled = vec![false; self.execution.work_items.len()];
+        while let Some(variable) = variables.pop() {
+            let visit_operation =
+                |operation: OperationId,
+                 enabled: &mut [bool],
+                 variable_seen: &mut [bool],
+                 variables: &mut Vec<TypeVariableId>| {
+                    let index = operation.0 as usize;
+                    if enabled[index] {
+                        return;
+                    }
+                    enabled[index] = true;
+                    for dependency in self
+                        .execution
+                        .operation_dependencies(operation)
+                        .iter()
+                        .chain(self.execution.operation_outputs(operation))
+                    {
+                        let dependency_index = dependency.0 as usize;
+                        if !variable_seen[dependency_index] {
+                            variable_seen[dependency_index] = true;
+                            variables.push(*dependency);
+                        }
+                    }
+                };
+            if let Some(writer) = writer_by_variable[variable.0 as usize] {
+                visit_operation(writer, &mut enabled, &mut variable_seen, &mut variables);
+            }
+            for consumer in self.solver.program.consumers(variable) {
+                visit_operation(
+                    consumer.operation,
+                    &mut enabled,
+                    &mut variable_seen,
+                    &mut variables,
+                );
+            }
+        }
+        Ok(enabled)
+    }
 }
 
 fn validate_single_writers(program: &ComponentProgram) -> Result<(), KernelSolveError> {
@@ -159,6 +278,7 @@ struct ComponentSolver {
     call_syntax_selected: Vec<bool>,
     pending: VecDeque<OperationId>,
     queued: Vec<bool>,
+    enabled: Vec<bool>,
     replayable: Vec<bool>,
     self_replayable: Vec<bool>,
     active_operation: Option<OperationId>,
@@ -191,7 +311,29 @@ struct SolverExecution {
     operations: Box<[std::sync::Arc<KernelOperation>]>,
     residual_frames: Box<[ResidualOperationFrame]>,
     work_items: Box<[ProgramOperationRef]>,
-    static_equalities: Box<[StaticEqualityRef]>,
+    initial_order: Box<[OperationId]>,
+    static_equalities: Box<[(OperationId, StaticEqualityRef)]>,
+    dependency_offsets: Box<[u32]>,
+    dependencies: Box<[TypeVariableId]>,
+    output_offsets: Box<[u32]>,
+    operation_outputs: Box<[TypeVariableId]>,
+    instruction_counts: Box<[u64]>,
+}
+
+impl SolverExecution {
+    fn operation_dependencies(&self, operation: OperationId) -> &[TypeVariableId] {
+        let index = operation.0 as usize;
+        let start = self.dependency_offsets[index] as usize;
+        let end = self.dependency_offsets[index + 1] as usize;
+        &self.dependencies[start..end]
+    }
+
+    fn operation_outputs(&self, operation: OperationId) -> &[TypeVariableId] {
+        let index = operation.0 as usize;
+        let start = self.output_offsets[index] as usize;
+        let end = self.output_offsets[index + 1] as usize;
+        &self.operation_outputs[start..end]
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -205,6 +347,7 @@ struct SolverStateProgram {
     consumer_offsets: Box<[u32]>,
     consumers: Box<[ProgramConsumer]>,
     outputs: Box<[crate::ProgramOutput]>,
+    available_outputs: Vec<bool>,
 }
 
 impl SolverStateProgram {
@@ -231,11 +374,13 @@ impl ComponentSolver {
             operations,
             residual_frames,
             work_items,
-            instruction_count,
+            instruction_count: _,
             initial_order,
             acyclic_initial_operations,
-            dependency_offsets: _,
-            dependencies: _,
+            dependency_offsets,
+            dependencies,
+            output_offsets,
+            operation_outputs,
             consumer_offsets,
             consumers,
             outputs,
@@ -266,14 +411,15 @@ impl ComponentSolver {
         // with publishers used to invalidate already-evaluated consumers and
         // made an almost entirely acyclic NovyWave graph execute nearly twice.
         let mut static_equalities = Vec::new();
-        let mut pending = VecDeque::with_capacity(scheduled_work_items);
-        let mut queued = vec![false; scheduled_work_items];
+        let pending = VecDeque::with_capacity(scheduled_work_items);
+        let queued = vec![false; scheduled_work_items];
         let mut replayable = vec![true; scheduled_work_items];
         let mut self_replayable = vec![false; scheduled_work_items];
+        let mut instruction_counts = vec![0_u64; scheduled_work_items];
         let acyclic_initial_operations = usize::try_from(acyclic_initial_operations)
             .unwrap_or(scheduled_work_items)
             .min(scheduled_work_items);
-        for (position, operation) in initial_order.into_iter().enumerate() {
+        for (position, operation) in initial_order.iter().copied().enumerate() {
             self_replayable[operation.0 as usize] = position >= acyclic_initial_operations
                 && !matches!(
                     work_items[operation.0 as usize],
@@ -281,9 +427,10 @@ impl ComponentSolver {
                 );
             let has_directional = match work_items[operation.0 as usize] {
                 ProgramOperationRef::Direct(direct) => {
+                    instruction_counts[operation.0 as usize] = 1;
                     let operation_kind = operations[direct as usize].as_ref();
                     if matches!(operation_kind, KernelOperation::Unify { .. }) {
-                        static_equalities.push(StaticEqualityRef::Direct(direct));
+                        static_equalities.push((operation, StaticEqualityRef::Direct(direct)));
                         false
                     } else {
                         true
@@ -291,16 +438,21 @@ impl ComponentSolver {
                 }
                 ProgramOperationRef::ResidualFrame { frame } => {
                     let frame_value = &residual_frames[frame as usize];
+                    instruction_counts[operation.0 as usize] =
+                        frame_value.module.operation_count() as u64;
                     let mut has_directional = false;
                     for (residual, operation_kind) in
                         frame_value.module.operations.iter().enumerate()
                     {
                         if matches!(operation_kind.as_ref(), KernelOperation::Unify { .. }) {
-                            static_equalities.push(StaticEqualityRef::Residual {
-                                frame,
-                                operation: u32::try_from(residual)
-                                    .expect("kernel residual operation count exceeds u32"),
-                            });
+                            static_equalities.push((
+                                operation,
+                                StaticEqualityRef::Residual {
+                                    frame,
+                                    operation: u32::try_from(residual)
+                                        .expect("kernel residual operation count exceeds u32"),
+                                },
+                            ));
                         } else {
                             has_directional = true;
                         }
@@ -311,14 +463,18 @@ impl ComponentSolver {
                     frame,
                     operation: residual,
                 } => {
+                    instruction_counts[operation.0 as usize] = 1;
                     let operation_kind = residual_frames[frame as usize].module.operations
                         [residual as usize]
                         .as_ref();
                     if matches!(operation_kind, KernelOperation::Unify { .. }) {
-                        static_equalities.push(StaticEqualityRef::Residual {
-                            frame,
-                            operation: residual,
-                        });
+                        static_equalities.push((
+                            operation,
+                            StaticEqualityRef::Residual {
+                                frame,
+                                operation: residual,
+                            },
+                        ));
                         false
                     } else {
                         true
@@ -327,9 +483,6 @@ impl ComponentSolver {
             };
             if !has_directional {
                 replayable[operation.0 as usize] = false;
-            } else {
-                queued[operation.0 as usize] = true;
-                pending.push_back(operation);
             }
         }
         let mut terms = terms;
@@ -337,14 +490,13 @@ impl ComponentSolver {
         let solver = Self {
             work: KernelSolveWork {
                 variables: cells.len() as u64,
-                scheduled_work_items: scheduled_work_items as u64,
-                operations: instruction_count,
                 ..KernelSolveWork::default()
             },
             program: SolverStateProgram {
                 terms,
                 consumer_offsets,
                 consumers,
+                available_outputs: vec![false; outputs.len()],
                 outputs,
             },
             cells,
@@ -353,6 +505,7 @@ impl ComponentSolver {
             call_syntax_selected: vec![false; variable_count],
             pending,
             queued,
+            enabled: vec![false; scheduled_work_items],
             replayable,
             self_replayable,
             active_operation: None,
@@ -383,7 +536,13 @@ impl ComponentSolver {
             operations,
             residual_frames,
             work_items,
+            initial_order,
             static_equalities: static_equalities.into_boxed_slice(),
+            dependency_offsets,
+            dependencies,
+            output_offsets,
+            operation_outputs,
+            instruction_counts: instruction_counts.into_boxed_slice(),
         };
         (solver, execution)
     }
@@ -415,22 +574,114 @@ impl ComponentSolver {
         self.program.terms.variable(variable)
     }
 
-    fn solve(mut self, execution: &SolverExecution) -> Result<ComponentArtifact, KernelSolveError> {
-        for operation in execution.static_equalities.iter().copied() {
-            self.activate_static_equality(execution, operation)?;
+    fn enable(
+        &mut self,
+        execution: &SolverExecution,
+        requested: &[bool],
+    ) -> Result<(), KernelSolveError> {
+        if requested.len() != self.enabled.len() {
+            return Err(KernelSolveError::new(format!(
+                "kernel solve demand has {} work items for a {}-item component",
+                requested.len(),
+                self.enabled.len()
+            )));
+        }
+        let mut newly_enabled = vec![false; requested.len()];
+        for (index, requested) in requested.iter().copied().enumerate() {
+            if !requested || self.enabled[index] {
+                continue;
+            }
+            self.enabled[index] = true;
+            newly_enabled[index] = true;
+            self.work.scheduled_work_items = self.work.scheduled_work_items.saturating_add(1);
+            self.work.operations = self
+                .work
+                .operations
+                .saturating_add(execution.instruction_counts[index]);
+        }
+        // Install every newly reachable equality before any newly reachable
+        // directional provider. This preserves the one-shot namespace
+        // scaffold used by a full solve while allowing later body demand to
+        // extend an already-converged interface graph.
+        for (operation, equality) in execution.static_equalities.iter().copied() {
+            if newly_enabled[operation.0 as usize] {
+                self.activate_static_equality(execution, equality)?;
+            }
+        }
+        for operation in execution.initial_order.iter().copied() {
+            let index = operation.0 as usize;
+            if newly_enabled[index] && self.replayable[index] && !self.queued[index] {
+                self.queued[index] = true;
+                self.pending.push_back(operation);
+            }
         }
         while let Some(operation) = self.pending.pop_front() {
             self.queued[operation.0 as usize] = false;
             self.activate(execution, operation)?;
         }
+        Ok(())
+    }
 
+    fn mark_outputs_available(
+        &mut self,
+        demanded: &[crate::OutputId],
+    ) -> Result<(), KernelSolveError> {
+        for output in demanded {
+            let available = self
+                .program
+                .available_outputs
+                .get_mut(output.0 as usize)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel output demand references missing output {}",
+                        output.0
+                    ))
+                })?;
+            if self.program.outputs[output.0 as usize].id != *output {
+                return Err(KernelSolveError::new(format!(
+                    "kernel output demand references noncanonical output {}",
+                    output.0
+                )));
+            }
+            *available = true;
+        }
+        Ok(())
+    }
+
+    fn mark_all_outputs_available(&mut self) {
+        self.program.available_outputs.fill(true);
+    }
+
+    fn snapshot(&mut self) -> ComponentOutputSnapshot {
+        let outputs = self.materialize_outputs();
+        self.update_term_work();
+        self.finish_summary_definition_ranking();
+        ComponentOutputSnapshot::new(outputs, self.work)
+    }
+
+    fn finish(mut self) -> Result<ComponentArtifact, KernelSolveError> {
+        let outputs = self.materialize_outputs();
+        self.update_term_work();
+        self.finish_summary_definition_ranking();
+        Ok(ComponentArtifact::new(
+            outputs,
+            self.program.terms,
+            self.work,
+        ))
+    }
+
+    fn materialize_outputs(&mut self) -> Box<[Option<ArtifactOutput>]> {
         let output_specs = self.program.outputs.clone();
         let mut outputs = Vec::with_capacity(output_specs.len());
-        for output in output_specs.iter() {
+        for (index, output) in output_specs.iter().enumerate() {
+            if !self.program.available_outputs[index] {
+                outputs.push(None);
+                continue;
+            }
             let variable = self.program.terms.variable(output.variable);
             let term = self.resolve_term(variable);
             self.work.term_materializations = self.work.term_materializations.saturating_add(1);
-            outputs.push(ArtifactOutput {
+            outputs.push(Some(ArtifactOutput {
                 id: output.id,
                 term,
                 flow_type: FlowType {
@@ -440,8 +691,12 @@ impl ComponentSolver {
                 syntax_selected: self.variable_syntax_selected(output.variable),
                 syntax_selected_here: self.syntax_selected_here[output.variable.0 as usize],
                 call_syntax_selected: self.call_syntax_selected[output.variable.0 as usize],
-            });
+            }));
         }
+        outputs.into_boxed_slice()
+    }
+
+    fn update_term_work(&mut self) {
         let term_work = self.program.terms.work();
         self.work.term_intern_requests = term_work.intern_requests;
         self.work.term_intern_hits = term_work.intern_hits;
@@ -449,15 +704,11 @@ impl ComponentSolver {
         self.work.term_intern_hits_by_kind = term_work.intern_hits_by_kind;
         self.work.structural_widen_requests = term_work.structural_widen_requests;
         self.work.structural_widen_hits = term_work.structural_widen_hits;
-        self.finish_summary_definition_ranking();
-        Ok(ComponentArtifact::new(
-            outputs.into_boxed_slice(),
-            self.program.terms,
-            self.work,
-        ))
     }
 
     fn finish_summary_definition_ranking(&mut self) {
+        self.work.summary_definition_ranking =
+            [KernelSummaryDefinitionWork::default(); KERNEL_SUMMARY_DEFINITION_RANKING_LEN];
         for definition in 0..self.summary_node_evaluations.len() {
             let node_evaluations = self.summary_node_evaluations[definition];
             if node_evaluations == 0 {
@@ -2477,7 +2728,7 @@ impl ComponentSolver {
                     if self.active_operation == Some(operation) && !self.self_replayable[index] {
                         continue;
                     }
-                    if self.replayable[index] && !self.queued[index] {
+                    if self.enabled[index] && self.replayable[index] && !self.queued[index] {
                         self.queued[index] = true;
                         self.pending.push_back(operation);
                     }
@@ -2646,6 +2897,43 @@ mod tests {
     use crate::{ComponentProgramBuilder, KernelSummarySelectArm, PublishMode};
     use boon_checked::{FlowMode, ObjectShape, Type, Variant};
     use std::{collections::BTreeSet, sync::Arc};
+
+    #[test]
+    fn staged_output_demand_extends_one_solver_without_running_disconnected_work() {
+        let mut builder = ComponentProgramBuilder::new();
+        let text_value = builder.new_authoritative_provider();
+        let number_value = builder.new_authoritative_provider();
+        let text = builder.terms().text();
+        let number = builder.terms().number();
+        builder.add_publish(text_value, [text], PublishMode::Replace);
+        builder.add_publish(number_value, [number], PublishMode::Replace);
+        let text_output = builder.add_output(text_value, FlowMode::Continuous);
+        let number_output = builder.add_output(number_value, FlowMode::Continuous);
+
+        let mut session = ComponentSolveSession::new(builder.finish()).unwrap();
+        let interface = session.solve_outputs(&[text_output]).unwrap();
+        assert_eq!(interface.available_output_count(), 1);
+        assert_eq!(
+            interface.output(text_output).unwrap().flow_type.ty,
+            Type::Text
+        );
+        assert!(interface.output(number_output).is_none());
+        assert_eq!(interface.work.scheduled_work_items, 1);
+        assert_eq!(interface.work.activations, 1);
+
+        let complete = session.solve_all().unwrap();
+        assert_eq!(complete.available_output_count(), 2);
+        assert_eq!(
+            complete.output(text_output).unwrap().flow_type.ty,
+            Type::Text
+        );
+        assert_eq!(
+            complete.output(number_output).unwrap().flow_type.ty,
+            Type::Number
+        );
+        assert_eq!(complete.work.scheduled_work_items, 2);
+        assert_eq!(complete.work.activations, 2);
+    }
 
     #[test]
     fn coarse_residual_orders_a_late_provider_through_an_explicit_alias() {

@@ -279,7 +279,7 @@ pub struct ProgramOutput {
     pub mode: FlowMode,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ComponentProgram {
     pub(crate) terms: TypeTermArena,
     pub(crate) variables: Box<[VariableSpec]>,
@@ -291,6 +291,12 @@ pub struct ComponentProgram {
     pub(crate) acyclic_initial_operations: u64,
     pub(crate) dependency_offsets: Box<[u32]>,
     pub(crate) dependencies: Box<[TypeVariableId]>,
+    /// Dense variables written by each scheduled work item. A coarse acyclic
+    /// residual frame may write many variables while still occupying one
+    /// scheduler slot, so this cannot be reconstructed from the operation
+    /// enum alone after linking.
+    pub(crate) output_offsets: Box<[u32]>,
+    pub(crate) operation_outputs: Box<[TypeVariableId]>,
     pub(crate) consumer_offsets: Box<[u32]>,
     pub(crate) consumers: Box<[ProgramConsumer]>,
     pub(crate) outputs: Box<[ProgramOutput]>,
@@ -873,6 +879,16 @@ impl ComponentProgramBuilder {
             &dependency_offsets,
             &forward_dependencies,
         );
+        let mut output_offsets = Vec::with_capacity(operation_outputs.len() + 1);
+        let mut flat_operation_outputs = Vec::new();
+        output_offsets.push(0);
+        for outputs in &operation_outputs {
+            flat_operation_outputs.extend(outputs.iter().copied());
+            output_offsets.push(
+                u32::try_from(flat_operation_outputs.len())
+                    .expect("kernel operation-output edge count exceeds u32"),
+            );
+        }
         ComponentProgram {
             terms: self.terms,
             variables: self.variables.into_boxed_slice(),
@@ -889,6 +905,8 @@ impl ComponentProgramBuilder {
             acyclic_initial_operations,
             dependency_offsets: dependency_offsets.into_boxed_slice(),
             dependencies: forward_dependencies.into_boxed_slice(),
+            output_offsets: output_offsets.into_boxed_slice(),
+            operation_outputs: flat_operation_outputs.into_boxed_slice(),
             consumer_offsets: offsets.into_boxed_slice(),
             consumers: consumers.into_boxed_slice(),
             outputs: self.outputs.into_boxed_slice(),

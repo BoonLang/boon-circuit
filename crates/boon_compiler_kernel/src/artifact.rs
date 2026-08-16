@@ -65,7 +65,7 @@ pub struct ArtifactOutput {
 
 #[derive(Clone, Debug)]
 pub struct ComponentArtifact {
-    outputs: Box<[ArtifactOutput]>,
+    outputs: Box<[Option<ArtifactOutput>]>,
     // The solved project supports multiple sparse/full materializations from
     // one quiescent graph. Share the frozen solver arena across those cheap
     // snapshot clones; never give its mutable construction caches semantic
@@ -74,9 +74,51 @@ pub struct ComponentArtifact {
     pub work: KernelSolveWork,
 }
 
+/// Lean output-only view used by diagnostics before checked definition terms
+/// are demanded. It intentionally owns no clone of the solved type arena.
+#[derive(Clone, Debug)]
+pub(crate) struct ComponentOutputSnapshot {
+    outputs: Box<[Option<ArtifactOutput>]>,
+    pub work: KernelSolveWork,
+}
+
+pub(crate) trait ComponentOutputs {
+    fn output(&self, id: OutputId) -> Option<&ArtifactOutput>;
+    fn work(&self) -> KernelSolveWork;
+}
+
+impl ComponentOutputSnapshot {
+    pub(crate) fn new(outputs: Box<[Option<ArtifactOutput>]>, work: KernelSolveWork) -> Self {
+        Self { outputs, work }
+    }
+}
+
+impl ComponentOutputs for ComponentOutputSnapshot {
+    fn output(&self, id: OutputId) -> Option<&ArtifactOutput> {
+        self.outputs
+            .get(id.0 as usize)
+            .and_then(Option::as_ref)
+            .filter(|output| output.id == id)
+    }
+
+    fn work(&self) -> KernelSolveWork {
+        self.work
+    }
+}
+
+impl ComponentOutputs for ComponentArtifact {
+    fn output(&self, id: OutputId) -> Option<&ArtifactOutput> {
+        Self::output(self, id)
+    }
+
+    fn work(&self) -> KernelSolveWork {
+        self.work
+    }
+}
+
 impl ComponentArtifact {
     pub(crate) fn new(
-        outputs: Box<[ArtifactOutput]>,
+        outputs: Box<[Option<ArtifactOutput>]>,
         terms: TypeTermArena,
         work: KernelSolveWork,
     ) -> Self {
@@ -87,14 +129,23 @@ impl ComponentArtifact {
         }
     }
 
-    pub fn outputs(&self) -> &[ArtifactOutput] {
-        &self.outputs
+    pub fn outputs(&self) -> impl Iterator<Item = &ArtifactOutput> {
+        self.outputs.iter().filter_map(Option::as_ref)
     }
 
     pub fn output(&self, id: OutputId) -> Option<&ArtifactOutput> {
+        let index = id.0 as usize;
         self.outputs
-            .get(id.0 as usize)
+            .get(index)
+            .and_then(Option::as_ref)
             .filter(|output| output.id == id)
+    }
+
+    pub fn available_output_count(&self) -> usize {
+        self.outputs
+            .iter()
+            .filter(|output| output.is_some())
+            .count()
     }
 
     pub fn terms(&self) -> &TypeTermArena {

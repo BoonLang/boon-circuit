@@ -1,7 +1,8 @@
+use crate::solver::ComponentSolveSession;
 use crate::{
-    ComponentArtifact, ComponentProgram, ComponentProgramBuilder, KernelCollectionOperationKind,
-    KernelDefinitionFlowTermsV1, KernelPattern, KernelRecordEntry, KernelSelectArm,
-    KernelSolveError, KernelSolveWork, KernelSummaryCallInput, KernelSummaryNode,
+    ComponentArtifact, ComponentOutputs, ComponentProgram, ComponentProgramBuilder,
+    KernelCollectionOperationKind, KernelDefinitionFlowTermsV1, KernelPattern, KernelRecordEntry,
+    KernelSelectArm, KernelSolveError, KernelSolveWork, KernelSummaryCallInput, KernelSummaryNode,
     KernelSummaryProgram, KernelSummaryProjectionStep, KernelSummaryRecordEntry,
     KernelSummarySelectArm, KernelSummaryValueId, OutputId, PublishMode, TypeTerm, TypeTermId,
     TypeVariableId, VariantTerm, alpha_normalize_callable_interface_and_diagnostics,
@@ -969,6 +970,15 @@ pub struct KernelOwnerProgram {
 #[derive(Debug)]
 pub struct KernelProjectProgram {
     component: ComponentProgram,
+    owners: Box<[KernelProjectOwnerOutputs]>,
+    compile_work: KernelCompileWork,
+}
+
+/// One compiled project whose interface constraint cone may be solved before
+/// the remaining definition bodies. Both demands extend the same dense solver
+/// state and immutable equation program.
+pub(crate) struct KernelProjectSolveSession {
+    component: ComponentSolveSession,
     owners: Box<[KernelProjectOwnerOutputs]>,
     compile_work: KernelCompileWork,
 }
@@ -2481,7 +2491,7 @@ impl KernelProjectProgram {
     /// expression/resource projection, alpha-normalization of definition
     /// artifacts, dependency indexing, or currentness hashing.
     pub fn solve_interfaces(self) -> Result<KernelInterfaceSnapshot, KernelSolveError> {
-        Ok(self.solve_graph()?.interface_snapshot())
+        self.into_solve_session()?.solve_interfaces()
     }
 
     /// Materialize only the explicitly demanded definition artifacts.
@@ -2501,6 +2511,7 @@ impl KernelProjectProgram {
             &artifact,
             &public_results,
             &public_formals,
+            true,
         );
         KernelSolvedProject {
             artifact,
@@ -2517,22 +2528,14 @@ impl KernelProjectProgram {
     /// product. `KernelSession` retains this quiescent graph across multiple
     /// demands in the same revision.
     pub fn solve_graph(self) -> Result<KernelSolvedProject, KernelSolveError> {
-        let artifact = solve_component(self.component)?;
-        let public_results = project_public_results(&self.owners, &artifact);
-        let public_formals = project_public_formals(&self.owners, &artifact);
-        let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
-            &self.owners,
-            &artifact,
-            &public_results,
-            &public_formals,
-        );
-        Ok(KernelSolvedProject {
-            artifact,
+        self.into_solve_session()?.finish_graph()
+    }
+
+    pub(crate) fn into_solve_session(self) -> Result<KernelProjectSolveSession, KernelSolveError> {
+        Ok(KernelProjectSolveSession {
+            component: ComponentSolveSession::new(self.component)?,
             owners: self.owners,
-            public_results,
-            public_formals,
-            call_facts,
-            diagnostics,
+            compile_work: self.compile_work,
         })
     }
 
@@ -2545,68 +2548,63 @@ impl KernelProjectProgram {
     }
 }
 
+impl KernelProjectSolveSession {
+    pub(crate) const fn compile_work(&self) -> KernelCompileWork {
+        self.compile_work
+    }
+
+    pub(crate) fn solve_interfaces(&mut self) -> Result<KernelInterfaceSnapshot, KernelSolveError> {
+        let demand = interface_output_demand(&self.owners);
+        let artifact = self.component.solve_outputs(&demand)?;
+        let public_results = project_public_results(&self.owners, &artifact);
+        let public_formals = project_public_formals(&self.owners, &artifact);
+        let (_, diagnostics) = project_call_facts_and_diagnostics(
+            &self.owners,
+            &artifact,
+            &public_results,
+            &public_formals,
+            false,
+        );
+        Ok(project_interface_snapshot(
+            &self.owners,
+            &artifact,
+            &public_results,
+            &public_formals,
+            &diagnostics,
+        ))
+    }
+
+    pub(crate) fn finish_graph(self) -> Result<KernelSolvedProject, KernelSolveError> {
+        let artifact = self.component.solve_all()?;
+        let public_results = project_public_results(&self.owners, &artifact);
+        let public_formals = project_public_formals(&self.owners, &artifact);
+        let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
+            &self.owners,
+            &artifact,
+            &public_results,
+            &public_formals,
+            true,
+        );
+        Ok(KernelSolvedProject {
+            artifact,
+            owners: self.owners,
+            public_results,
+            public_formals,
+            call_facts,
+            diagnostics,
+        })
+    }
+}
+
 impl KernelSolvedProject {
     pub fn interface_snapshot(&self) -> KernelInterfaceSnapshot {
-        let mut public_results = Vec::with_capacity(self.public_results.len());
-        let mut callable_formals = Vec::with_capacity(self.public_formals.len());
-        let mut diagnostics = Vec::new();
-        let mut diagnostic_values = Vec::new();
-        for (owner, (formals, result)) in self
-            .public_formals
-            .iter()
-            .zip(&self.public_results)
-            .enumerate()
-        {
-            let owner_value_types = self.owners[owner]
-                .diagnostic_values
-                .iter()
-                .map(|value| {
-                    project_call_value_type(
-                        owner,
-                        *value,
-                        &self.owners,
-                        &self.artifact,
-                        &self.public_results,
-                    )
-                    .expect("validated diagnostic value has a solved provider")
-                })
-                .collect::<Vec<_>>();
-            let (formals, result, owner_diagnostics, owner_value_types) =
-                alpha_normalize_callable_interface_and_diagnostics(
-                    formals,
-                    result,
-                    &self.diagnostics[owner],
-                    &owner_value_types,
-                );
-            callable_formals.push(formals);
-            public_results.push(result);
-            diagnostics.extend(owner_diagnostics);
-            diagnostic_values.extend(
-                self.owners[owner]
-                    .diagnostic_values
-                    .iter()
-                    .copied()
-                    .zip(owner_value_types)
-                    .enumerate()
-                    .map(|(ordinal, (value, ty))| KernelDiagnosticValueArtifact {
-                        owner: KernelOwnerId(
-                            u32::try_from(owner)
-                                .expect("kernel diagnostic owner count exceeds u32"),
-                        ),
-                        ordinal: u32::try_from(ordinal)
-                            .expect("kernel diagnostic value count exceeds u32"),
-                        value,
-                        ty,
-                    }),
-            );
-        }
-        KernelInterfaceSnapshot {
-            public_results: public_results.into_boxed_slice(),
-            callable_formals: callable_formals.into_boxed_slice(),
-            diagnostics: diagnostics.into_boxed_slice(),
-            diagnostic_values: diagnostic_values.into_boxed_slice(),
-            work: self.artifact.work,
-        }
+        project_interface_snapshot(
+            &self.owners,
+            &self.artifact,
+            &self.public_results,
+            &self.public_formals,
+            &self.diagnostics,
+        )
     }
 
     pub fn checked_snapshot(&self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
@@ -2747,9 +2745,9 @@ impl KernelSolvedProject {
     }
 }
 
-fn project_public_results(
+fn project_public_results<A: ComponentOutputs + ?Sized>(
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &ComponentArtifact,
+    artifact: &A,
 ) -> Box<[FlowType]> {
     owners
         .iter()
@@ -2920,9 +2918,9 @@ fn solve_flush_graph(bases: Vec<Vec<Type>>, dependencies: Vec<Vec<usize>>) -> Ve
     values
 }
 
-fn project_public_formals(
+fn project_public_formals<A: ComponentOutputs + ?Sized>(
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &ComponentArtifact,
+    artifact: &A,
 ) -> Box<[Box<[FlowType]>]> {
     owners
         .iter()
@@ -3066,20 +3064,119 @@ fn direct_expression_effect(
     }
 }
 
+fn interface_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputId]> {
+    fn insert_value(
+        outputs: &mut BTreeSet<OutputId>,
+        owners: &[KernelProjectOwnerOutputs],
+        caller: usize,
+        value: KernelValueReference,
+    ) {
+        let output = match value {
+            KernelValueReference::Local(expression) => owners
+                .get(caller)
+                .and_then(|owner| owner.expressions.get(expression.0 as usize)),
+            KernelValueReference::External(KernelExternalExpression {
+                owner,
+                target: KernelExternalTarget::Result,
+            }) => owners.get(owner.0 as usize).map(|owner| &owner.result),
+            KernelValueReference::External(KernelExternalExpression {
+                owner,
+                target: KernelExternalTarget::Expression(expression),
+            }) => owners
+                .get(owner.0 as usize)
+                .and_then(|owner| owner.expressions.get(expression.0 as usize)),
+        };
+        if let Some(output) = output {
+            outputs.insert(*output);
+        }
+    }
+
+    let mut outputs = BTreeSet::new();
+    for (owner_index, owner) in owners.iter().enumerate() {
+        outputs.insert(owner.result);
+        outputs.extend(owner.formals.iter().copied());
+        for call in owner.calls.iter() {
+            for input in call.inputs.iter() {
+                insert_value(&mut outputs, owners, owner_index, input.value);
+            }
+        }
+        for value in owner.diagnostic_values.iter().copied() {
+            insert_value(&mut outputs, owners, owner_index, value);
+        }
+    }
+    outputs.into_iter().collect::<Vec<_>>().into_boxed_slice()
+}
+
+fn project_interface_snapshot<A: ComponentOutputs + ?Sized>(
+    owners: &[KernelProjectOwnerOutputs],
+    artifact: &A,
+    solved_results: &[FlowType],
+    solved_formals: &[Box<[FlowType]>],
+    solved_diagnostics: &[Box<[KernelDiagnosticArtifact]>],
+) -> KernelInterfaceSnapshot {
+    let mut public_results = Vec::with_capacity(solved_results.len());
+    let mut callable_formals = Vec::with_capacity(solved_formals.len());
+    let mut diagnostics = Vec::new();
+    let mut diagnostic_values = Vec::new();
+    for (owner, (formals, result)) in solved_formals.iter().zip(solved_results).enumerate() {
+        let owner_value_types = owners[owner]
+            .diagnostic_values
+            .iter()
+            .map(|value| {
+                project_call_value_type(owner, *value, owners, artifact, solved_results)
+                    .expect("validated diagnostic value has a solved provider")
+            })
+            .collect::<Vec<_>>();
+        let (formals, result, owner_diagnostics, owner_value_types) =
+            alpha_normalize_callable_interface_and_diagnostics(
+                formals,
+                result,
+                &solved_diagnostics[owner],
+                &owner_value_types,
+            );
+        callable_formals.push(formals);
+        public_results.push(result);
+        diagnostics.extend(owner_diagnostics);
+        diagnostic_values.extend(
+            owners[owner]
+                .diagnostic_values
+                .iter()
+                .copied()
+                .zip(owner_value_types)
+                .enumerate()
+                .map(|(ordinal, (value, ty))| KernelDiagnosticValueArtifact {
+                    owner: KernelOwnerId(
+                        u32::try_from(owner).expect("kernel diagnostic owner count exceeds u32"),
+                    ),
+                    ordinal: u32::try_from(ordinal)
+                        .expect("kernel diagnostic value count exceeds u32"),
+                    value,
+                    ty,
+                }),
+        );
+    }
+    KernelInterfaceSnapshot {
+        public_results: public_results.into_boxed_slice(),
+        callable_formals: callable_formals.into_boxed_slice(),
+        diagnostics: diagnostics.into_boxed_slice(),
+        diagnostic_values: diagnostic_values.into_boxed_slice(),
+        work: artifact.work(),
+    }
+}
+
 /// Project reusable call facts and user-facing type failures directly from the
 /// quiescent graph.
 ///
-/// Call substitutions are derived exactly once and retained for later checked
-/// artifact materialization. This deliberately consumes only solved output
-/// cells, compact call edges, and public callable interfaces. It does not
-/// construct checked expression, statement, resource, dependency, or
-/// currentness rows, which is the central cost invariant of
-/// `CheckDemand::Diagnostics`.
-fn project_call_facts_and_diagnostics(
+/// Derive user-facing call diagnostics from compact call edges and public
+/// interfaces. Complete checked demand additionally retains substitutions and
+/// exact call-result syntax receipts; diagnostics demand deliberately neither
+/// computes nor roots those checked-only facts.
+fn project_call_facts_and_diagnostics<A: ComponentOutputs + ?Sized>(
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &ComponentArtifact,
+    artifact: &A,
     public_results: &[FlowType],
     public_formals: &[Box<[FlowType]>],
+    retain_call_facts: bool,
 ) -> (
     Box<[Box<[SolvedKernelCallFacts]>]>,
     Box<[Box<[KernelDiagnosticArtifact]>]>,
@@ -3094,10 +3191,6 @@ fn project_call_facts_and_diagnostics(
         let mut owner_call_facts = Vec::with_capacity(owner.calls.len());
         let mut diagnostics = owner.diagnostics.to_vec();
         for call in owner.calls.iter() {
-            let result_output = owner
-                .expressions
-                .get(call.expression.0 as usize)
-                .and_then(|output| artifact.output(*output));
             let substitutions = if let KernelCallTarget::User { target, .. } = call.target {
                 let target_formals = public_formals
                     .get(target.0 as usize)
@@ -3199,6 +3292,13 @@ fn project_call_facts_and_diagnostics(
             } else {
                 Box::new([])
             };
+            if !retain_call_facts {
+                continue;
+            }
+            let result_output = owner
+                .expressions
+                .get(call.expression.0 as usize)
+                .and_then(|output| artifact.output(*output));
             let result_is_concrete = result_output
                 .is_some_and(|output| type_has_concrete_outer_shape(&output.flow_type.ty));
             let exact_structural_constructor = matches!(
@@ -3239,11 +3339,11 @@ fn project_call_facts_and_diagnostics(
     )
 }
 
-fn project_call_value_type(
+fn project_call_value_type<A: ComponentOutputs + ?Sized>(
     caller: usize,
     value: KernelValueReference,
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &ComponentArtifact,
+    artifact: &A,
     public_results: &[FlowType],
 ) -> Option<Type> {
     match value {

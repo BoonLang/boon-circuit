@@ -2374,10 +2374,20 @@ pub(crate) fn checked_construction_from_kernel(
         KernelProjectInput::new_with_abi(project_input, definition_facts, definition_keys, abi)
             .map_err(|error| format!("cannot build dense kernel checked input: {error}"))?;
     let mut session = KernelSession::new(input);
+    // A complete checked request owns every definition body. Solve that
+    // demand first, then project diagnostics from the stronger cached image;
+    // otherwise a verified compilation would intentionally stop at the
+    // interface cone only to extend the same graph immediately afterward.
+    let checked_product = session
+        .check(CheckDemand::CheckedImage)
+        .map_err(|error| format!("cannot materialize dense kernel checked image: {error}"))?;
+    let compile_work = checked_product.compile_work;
+    let KernelCheckProduct::CheckedImage(snapshot) = checked_product.product else {
+        unreachable!("checked-image demand returns a checked snapshot")
+    };
     let diagnostics_product = session
         .check(CheckDemand::Diagnostics)
         .map_err(|error| format!("cannot solve dense kernel checked diagnostics: {error}"))?;
-    let compile_work = diagnostics_product.compile_work;
     let KernelCheckProduct::Diagnostics(interfaces) = diagnostics_product.product else {
         unreachable!("diagnostics demand returns an interface snapshot")
     };
@@ -2395,13 +2405,6 @@ pub(crate) fn checked_construction_from_kernel(
         source_abi_diagnostics.as_ref(),
         &interfaces,
     )?;
-
-    let checked_product = session
-        .check(CheckDemand::CheckedImage)
-        .map_err(|error| format!("cannot materialize dense kernel checked image: {error}"))?;
-    let KernelCheckProduct::CheckedImage(snapshot) = checked_product.product else {
-        unreachable!("checked-image demand returns a checked snapshot")
-    };
     let solve_work = snapshot.work;
     let layout = KernelCheckedLinkLayout::new(session.project(), &snapshot)
         .map_err(|error| format!("cannot build dense kernel checked layout: {error}"))?;

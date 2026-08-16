@@ -1,3 +1,4 @@
+use crate::owner::KernelProjectSolveSession;
 use crate::{
     KernelAbiInput, KernelCheckedSnapshot, KernelCompileWork, KernelDefinitionFactsInput,
     KernelDemandedDefinitionSnapshot, KernelInterfaceSnapshot, KernelOwnerBuildError,
@@ -324,6 +325,7 @@ struct CachedSolvedProject {
 pub struct KernelSession {
     revision: KernelRevisionId,
     project: Arc<KernelProjectInput>,
+    prepared: Option<KernelProjectSolveSession>,
     solved: Option<CachedSolvedProject>,
     checks: BTreeMap<CheckDemand, CachedKernelCheck>,
 }
@@ -333,6 +335,7 @@ impl KernelSession {
         Self {
             revision: KernelRevisionId(1),
             project: Arc::new(project),
+            prepared: None,
             solved: None,
             checks: BTreeMap::new(),
         }
@@ -354,6 +357,7 @@ impl KernelSession {
                 .expect("kernel session revision counter exhausted"),
         );
         self.project = Arc::new(project);
+        self.prepared = None;
         self.solved = None;
         self.checks.clear();
         self.revision
@@ -380,36 +384,44 @@ impl KernelSession {
             });
         }
 
-        let reused_solve = self.solved.is_some();
-        if !reused_solve {
-            let program = self.project.compile()?;
-            let compile_work = program.compile_work();
-            self.solved = Some(CachedSolvedProject {
-                project: program.solve_graph()?,
-                compile_work,
-            });
-        }
-        let compile_work = self
-            .solved
-            .as_ref()
-            .expect("kernel session installed its solved graph")
-            .compile_work;
-        let product = match &demand {
-            CheckDemand::Diagnostics => KernelCheckProduct::Diagnostics(Arc::new(
-                self.solved
-                    .as_ref()
-                    .expect("kernel diagnostics own a solved graph")
-                    .project
-                    .interface_snapshot(),
-            )),
-            CheckDemand::CheckedImage => KernelCheckProduct::CheckedImage(Arc::new(
-                self.solved
+        let reused_solve = self.prepared.is_some() || self.solved.is_some();
+        let (product, compile_work) = match &demand {
+            CheckDemand::Diagnostics => {
+                if let Some(solved) = self.solved.as_ref() {
+                    (
+                        KernelCheckProduct::Diagnostics(Arc::new(
+                            solved.project.interface_snapshot(),
+                        )),
+                        solved.compile_work,
+                    )
+                } else {
+                    self.ensure_prepared()?;
+                    let prepared = self
+                        .prepared
+                        .as_mut()
+                        .expect("kernel diagnostics own a prepared graph");
+                    let compile_work = prepared.compile_work();
+                    (
+                        KernelCheckProduct::Diagnostics(Arc::new(prepared.solve_interfaces()?)),
+                        compile_work,
+                    )
+                }
+            }
+            CheckDemand::CheckedImage => {
+                self.ensure_solved()?;
+                let solved = self
+                    .solved
                     .take()
-                    .expect("kernel checked image owns a solved graph")
-                    .project
-                    .into_checked_snapshot()?,
-            )),
+                    .expect("kernel checked image owns a solved graph");
+                (
+                    KernelCheckProduct::CheckedImage(Arc::new(
+                        solved.project.into_checked_snapshot()?,
+                    )),
+                    solved.compile_work,
+                )
+            }
             CheckDemand::Definitions(definitions) => {
+                self.ensure_solved()?;
                 let dense = definitions
                     .iter()
                     .map(|definition| {
@@ -426,9 +438,17 @@ impl KernelSession {
                     .expect("kernel definition demand owns a solved graph")
                     .project
                     .demanded_definitions(&dense)?;
-                KernelCheckProduct::Definitions(Arc::new(
-                    self.attach_stable_definition_keys(demanded)?,
-                ))
+                let compile_work = self
+                    .solved
+                    .as_ref()
+                    .expect("kernel definition demand retains its solved graph")
+                    .compile_work;
+                (
+                    KernelCheckProduct::Definitions(Arc::new(
+                        self.attach_stable_definition_keys(demanded)?,
+                    )),
+                    compile_work,
+                )
             }
         };
         let cached = CachedKernelCheck {
@@ -442,6 +462,30 @@ impl KernelSession {
             compile_work,
             reused: reused_solve,
         })
+    }
+
+    fn ensure_prepared(&mut self) -> Result<(), KernelCheckError> {
+        if self.prepared.is_none() && self.solved.is_none() {
+            self.prepared = Some(self.project.compile()?.into_solve_session()?);
+        }
+        Ok(())
+    }
+
+    fn ensure_solved(&mut self) -> Result<(), KernelCheckError> {
+        if self.solved.is_some() {
+            return Ok(());
+        }
+        self.ensure_prepared()?;
+        let prepared = self
+            .prepared
+            .take()
+            .expect("kernel full solve owns a prepared graph");
+        let compile_work = prepared.compile_work();
+        self.solved = Some(CachedSolvedProject {
+            project: prepared.finish_graph()?,
+            compile_work,
+        });
+        Ok(())
     }
 
     fn validate_demand(&self, demand: &CheckDemand) -> Result<(), KernelCheckError> {
@@ -774,12 +818,18 @@ mod tests {
         assert_eq!(result.product.materialized_definition_count(), 0);
         assert_eq!(result.product.sealed_definition_count(), 0);
         assert!(!result.reused);
-        assert!(session.solved.is_some());
+        assert!(
+            session.prepared.is_some() && session.solved.is_none(),
+            "diagnostics must retain a staged equation graph without forcing every body"
+        );
 
         let checked = session
             .check(CheckDemand::CheckedImage)
-            .expect("checked image reuses the quiescent diagnostics graph");
-        assert!(checked.reused, "the shared type graph must not solve twice");
+            .expect("checked image extends the quiescent diagnostics graph");
+        assert!(
+            checked.reused,
+            "the shared type graph must not compile twice"
+        );
         assert!(
             session.solved.is_none(),
             "a complete checked image must replace the pre-publication graph"

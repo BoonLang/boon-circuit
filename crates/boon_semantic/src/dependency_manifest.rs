@@ -43,6 +43,10 @@ const CHECKED_PROGRAM_DIGEST_DOMAIN: &[u8] = b"boon.checked-program.v1\0";
 const DEPENDENCY_COMPONENT_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-components.v1\0";
 const DEPENDENCY_RECORD_PAYLOAD_DOMAIN: &[u8] = b"boon.callable-dependency-record-payload.v1\0";
 const DEPENDENCY_OUT_TYPE_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-out-type.v1\0";
+const DEPENDENCY_OUT_COMPONENT_RECEIPT_DOMAIN_V2: &[u8] =
+    b"boon.callable-dependency-out-component-receipts.v2\0";
+const DEPENDENCY_REACTIVE_COMPONENT_RECEIPT_DOMAIN_V2: &[u8] =
+    b"boon.callable-dependency-reactive-component-receipts.v2\0";
 const DEPENDENCY_FLOW_TYPE_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-flow-type.v1\0";
 #[cfg(test)]
 const DEPENDENCY_RECORD_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-record.v1\0";
@@ -4131,6 +4135,33 @@ impl DependencyCollector {
         Ok(())
     }
 
+    fn structural_from_payload_digest(
+        &mut self,
+        owner: SemanticDependencyOwnerV1,
+        subject: SemanticDependencySubjectV1,
+        payload_digest: [u8; 32],
+    ) -> Result<(), CallableDependencyManifestError> {
+        self.claim_subject(&subject)?;
+        let local_digest = self.compact_local_classification_digest(&subject, payload_digest)?;
+        self.push_compact_classification(
+            owner,
+            &subject,
+            SemanticDependencyProjectionClassV4::Structural,
+            local_digest,
+            None,
+        );
+        #[cfg(test)]
+        if self.retain_exhaustive {
+            self.coverage.push(SemanticDependencyCoverageV1 {
+                id: SemanticDependencyCoverageId(self.coverage.len()),
+                subject,
+                primary_owner: owner,
+                disposition: SemanticDependencyCoverageDispositionV1::Structural { payload_digest },
+            });
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn checked_program_structural(
         &mut self,
@@ -4172,6 +4203,7 @@ impl DependencyCollector {
         Ok(CheckedProgramDigestV1(checked_program_digest))
     }
 
+    #[cfg(test)]
     fn structural_with_component_digest(
         &mut self,
         owner: SemanticDependencyOwnerV1,
@@ -4770,6 +4802,25 @@ impl DependencyCollector {
         stable_owners: &BTreeMap<SemanticDependencyOwnerV1, SemanticDependencyStableOwnerV4>,
         mut presealed: DenseManifestProjectionIndexV7,
     ) -> Result<ValidatedCompactDependencyCollectionV7, CallableDependencyManifestError> {
+        let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+        let mut phase_started = trace.then(std::time::Instant::now);
+        macro_rules! trace_checkpoint {
+            ($name:literal) => {
+                if trace {
+                    let now = std::time::Instant::now();
+                    if let Some(started) = phase_started.replace(now) {
+                        eprintln!(
+                            concat!(
+                                "boon_semantic dependency_manifest_v7 finish.",
+                                $name,
+                                ":done elapsed_ms={:.3}"
+                            ),
+                            started.elapsed().as_secs_f64() * 1_000.0,
+                        );
+                    }
+                }
+            };
+        }
         if self.subjects.len() != self.compact_rows.len() {
             return Err(CallableDependencyManifestError::new(
                 "remaining semantic subjects and coverage rows are not aligned",
@@ -4942,6 +4993,7 @@ impl DependencyCollector {
                 targets: Vec::new(),
             });
         }
+        trace_checkpoint!("resolve_rows");
 
         presealed.finalize_canonical_order()?;
         let canonical_ranks = presealed
@@ -5002,12 +5054,14 @@ impl DependencyCollector {
             )?;
             presealed.set_receipt(id, receipt)?;
         }
+        trace_checkpoint!("fold_rows");
         presealed.finalize_canonical_order()?;
         let receipt_members = presealed.receipt_members()?;
         let projection_receipts_digest = compact_digest_sequence_v4(
             DEPENDENCY_PROJECTION_RECEIPT_SET_DOMAIN_V7,
             &receipt_members,
         )?;
+        trace_checkpoint!("receipt_set");
         let checked_row_count = presealed.checked_row_count;
         let checked_dependency_row_count = presealed.checked_dependency_row_count;
         let execution_row_count = presealed.execution_row_count;
@@ -5015,6 +5069,7 @@ impl DependencyCollector {
         let projection_count = presealed.projections.len();
         let stable_owner_set = stable_owners.values().copied().collect::<BTreeSet<_>>();
         let sealed_graph = presealed.seal_request_graph(&stable_owner_set)?;
+        trace_checkpoint!("seal_request_graph");
         let graph_stats = sealed_graph.snapshot.graph().stats();
         let implementation_digests = stable_owners
             .iter()
@@ -5032,6 +5087,7 @@ impl DependencyCollector {
                 Ok((*dense, digest))
             })
             .collect::<Result<BTreeMap<_, _>, CallableDependencyManifestError>>()?;
+        trace_checkpoint!("owner_digests");
         let construction_row_count = self
             .compact_rows
             .iter()
@@ -5074,6 +5130,7 @@ impl DependencyCollector {
             .ok_or_else(|| {
                 CallableDependencyManifestError::new("V7 coverage record count overflow")
             })?;
+        trace_checkpoint!("final_counts");
         Ok(ValidatedCompactDependencyCollectionV7 {
             implementation_digests,
             request_graph: sealed_graph.snapshot,
@@ -8954,15 +9011,16 @@ struct CanonicalOutTypeSubstitutionV1 {
 /// contextual frame made equivalent inherited environments quadratic in the
 /// number of frames without adding dependency evidence.
 #[derive(Serialize)]
-struct CanonicalOutCallHeaderV1 {
+struct CanonicalOutCallHeaderV1<'a> {
     id: OutCallInstanceId,
     parent: Option<OutCallInstanceId>,
     provenance: OutCallProvenance,
     parent_output: Option<DeclId>,
-    ports: Vec<OutPortId>,
+    ports: &'a [OutPortId],
     local_type_substitutions: Vec<CanonicalOutTypeSubstitutionV1>,
     result_mode: FlowMode,
     result_type_digest: [u8; 32],
+    result_is_exact_occurrence: bool,
     owner: Option<StaticOwnerId>,
 }
 
@@ -8982,9 +9040,16 @@ enum CanonicalOutInputValueV1 {
     },
 }
 
+/// One normalized invocation-frame receipt.
+///
+/// Input and PASSED rows used to be emitted as separate proof leaves even
+/// though no dependency references either identity independently. Keeping the
+/// complete frame in one payload preserves every fact while making the call
+/// the sole invalidation unit, matching the compact invocation overlay used by
+/// the execution image.
 #[derive(Serialize)]
-struct CanonicalOutCallComponentV1 {
-    header: CanonicalOutCallHeaderV1,
+struct CanonicalOutCallFrameV2<'a> {
+    header: CanonicalOutCallHeaderV1<'a>,
     inputs: Vec<CanonicalOutInputBindingV1>,
     passed: Option<PassedBinding>,
 }
@@ -9015,100 +9080,71 @@ fn inventory_out(
     collector: &mut DependencyCollector,
 ) -> Result<[u8; 32], CallableDependencyManifestError> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
-    let component_started = trace.then(std::time::Instant::now);
+    let rows_start = collector.compact_rows.len();
     let mut type_digests = HashMap::<&Type, [u8; 32]>::new();
     let mut type_digest_scratch = Vec::new();
-    let canonical_calls = out
-        .call_instances
-        .iter()
-        .map(|call| {
-            let local_type_substitutions = call
-                .local_type_substitutions()
-                .iter()
-                .map(|substitution| {
-                    Ok(CanonicalOutTypeSubstitutionV1 {
-                        variable: substitution.variable,
-                        value_digest: dependency_out_type_digest(
-                            &substitution.value,
-                            &mut type_digests,
-                            &mut type_digest_scratch,
-                        )?,
-                    })
-                })
-                .collect::<Result<Vec<_>, CallableDependencyManifestError>>()?;
-            let inputs = call
-                .inputs
-                .iter()
-                .map(|input| {
-                    let value = match &input.value {
-                        OutInputValue::Checked(value) => CanonicalOutInputValueV1::Checked(*value),
-                        OutInputValue::ProducerParameter {
-                            parameter,
-                            flow_type,
-                        } => CanonicalOutInputValueV1::ProducerParameter {
-                            parameter: *parameter,
-                            flow_mode: flow_type.mode,
-                            flow_type_digest: dependency_out_type_digest(
-                                &flow_type.ty,
-                                &mut type_digests,
-                                &mut type_digest_scratch,
-                            )?,
-                        },
-                    };
-                    Ok(CanonicalOutInputBindingV1 {
-                        formal: input.formal,
-                        value,
-                    })
-                })
-                .collect::<Result<Vec<_>, CallableDependencyManifestError>>()?;
-            Ok(CanonicalOutCallComponentV1 {
-                header: CanonicalOutCallHeaderV1 {
-                    id: call.id,
-                    parent: call.parent,
-                    provenance: call.provenance,
-                    parent_output: call.parent_output,
-                    ports: call.ports.clone(),
-                    local_type_substitutions,
-                    result_mode: call.result.mode,
-                    result_type_digest: dependency_out_type_digest(
-                        &call.result.ty,
+    let calls_started = trace.then(std::time::Instant::now);
+    for call in &out.call_instances {
+        let local_type_substitutions = call
+            .local_type_substitutions()
+            .iter()
+            .map(|substitution| {
+                Ok(CanonicalOutTypeSubstitutionV1 {
+                    variable: substitution.variable,
+                    value_digest: dependency_out_type_digest(
+                        &substitution.value,
                         &mut type_digests,
                         &mut type_digest_scratch,
                     )?,
-                    owner: call.owner,
-                },
-                inputs,
-                passed: call.passed,
+                })
             })
-        })
-        .collect::<Result<Vec<_>, CallableDependencyManifestError>>()?;
-    // OutNet's private lookup maps and parent-output node indexes are derived
-    // acceleration structures. The canonical payload commits the dense graph,
-    // every exact type through its domain-separated digest, and producer roots
-    // without serializing repeated inherited type trees per contextual frame.
-    let canonical_out_payload = (
-        &canonical_calls,
-        &out.ports,
-        &out.nets,
-        &out.static_owners,
-        out.producer_roots(),
-    );
-    let component_digest = collector.structural_with_component_digest(
-        SemanticDependencyOwnerV1::ProgramRoot,
-        top_subject(
-            SemanticDependencySubjectKindV1::ResolvedOutGraph,
-            SemanticDependencyEntityV1::Program,
-        ),
-        &canonical_out_payload,
-    )?;
-    if let Some(started) = component_started {
-        eprintln!(
-            "boon_semantic dependency_manifest inventory_out.component:done elapsed_ms={:.3}",
-            started.elapsed().as_secs_f64() * 1_000.0
-        );
-    }
-    let calls_started = trace.then(std::time::Instant::now);
-    for (call, canonical_call) in out.call_instances.iter().zip(&canonical_calls) {
+            .collect::<Result<Vec<_>, CallableDependencyManifestError>>()?;
+        let result_type_digest = dependency_out_type_digest(
+            &call.result.ty,
+            &mut type_digests,
+            &mut type_digest_scratch,
+        )?;
+        let inputs = call
+            .inputs
+            .iter()
+            .map(|input| {
+                let value = match &input.value {
+                    OutInputValue::Checked(value) => CanonicalOutInputValueV1::Checked(*value),
+                    OutInputValue::ProducerParameter {
+                        parameter,
+                        flow_type,
+                    } => CanonicalOutInputValueV1::ProducerParameter {
+                        parameter: *parameter,
+                        flow_mode: flow_type.mode,
+                        flow_type_digest: dependency_out_type_digest(
+                            &flow_type.ty,
+                            &mut type_digests,
+                            &mut type_digest_scratch,
+                        )?,
+                    },
+                };
+                Ok(CanonicalOutInputBindingV1 {
+                    formal: input.formal,
+                    value,
+                })
+            })
+            .collect::<Result<Vec<_>, CallableDependencyManifestError>>()?;
+        let frame = CanonicalOutCallFrameV2 {
+            header: CanonicalOutCallHeaderV1 {
+                id: call.id,
+                parent: call.parent,
+                provenance: call.provenance,
+                parent_output: call.parent_output,
+                ports: &call.ports,
+                local_type_substitutions,
+                result_mode: call.result.mode,
+                result_type_digest,
+                result_is_exact_occurrence: call.result_is_exact_occurrence,
+                owner: call.owner,
+            },
+            inputs,
+            passed: call.passed,
+        };
         let owner = owners.out_call(call.id)?;
         let entity = SemanticDependencyEntityV1::indexed(
             SemanticDependencyEntityDomainV1::OutCallInstance,
@@ -9149,53 +9185,11 @@ fn inventory_out(
                     lifetime: SemanticDependencyLifetimeV1::Call,
                     ..SemanticDependencySemanticsV1::default()
                 },
-                payload: &canonical_call.header,
+                payload: &frame,
                 references: call_references,
             },
-            Some(canonical_call.header.result_type_digest),
+            Some(result_type_digest),
         )?;
-        for (ordinal, input) in canonical_call.inputs.iter().enumerate() {
-            collect_dependency!(
-                collector,
-                owner,
-                SemanticDependencyChannelV1::ParentValueFormal,
-                vec![
-                    SemanticDependencyRoleV1::FixedDefinition,
-                    SemanticDependencyRoleV1::CoverageOrRouting,
-                ],
-                child_subject(
-                    SemanticDependencySubjectKindV1::OutInputBinding,
-                    entity.clone(),
-                    ordinal,
-                ),
-                SemanticDependencySemanticsV1 {
-                    call_instance: Some(call.id),
-                    lifetime: SemanticDependencyLifetimeV1::Call,
-                    ..SemanticDependencySemanticsV1::default()
-                },
-                input,
-                Vec::new(),
-            )?;
-        }
-        if let Some(passed) = &call.passed {
-            collect_dependency!(
-                collector,
-                owner,
-                SemanticDependencyChannelV1::PassedContextFormal,
-                vec![
-                    SemanticDependencyRoleV1::FormulaBinder,
-                    SemanticDependencyRoleV1::CoverageOrRouting,
-                ],
-                child_subject(SemanticDependencySubjectKindV1::OutPassedBinding, entity, 0),
-                SemanticDependencySemanticsV1 {
-                    call_instance: Some(call.id),
-                    lifetime: SemanticDependencyLifetimeV1::Call,
-                    ..SemanticDependencySemanticsV1::default()
-                },
-                passed,
-                Vec::new(),
-            )?;
-        }
     }
     if let Some(started) = calls_started {
         eprintln!(
@@ -9311,6 +9305,43 @@ fn inventory_out(
     if let Some(started) = owners_started {
         eprintln!(
             "boon_semantic dependency_manifest inventory_out.owners:done elapsed_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+    }
+
+    // The dependency rows above already seal every canonical OUT call, input,
+    // PASSED binding, port contract, net, structural producer, and owner. The
+    // old component receipt serialized that same completed graph a second
+    // time, including all call rows, solely to obtain another digest. Fold the
+    // construction-owned row receipts instead. Producer roots are the only
+    // canonical OUT payload not represented by an individual row, so commit
+    // them once beside the ordered row sequence. Private lookup maps and
+    // parent-output union nodes remain derived acceleration structures.
+    let component_started = trace.then(std::time::Instant::now);
+    let rows = collector.compact_rows.get(rows_start..).ok_or_else(|| {
+        CallableDependencyManifestError::new("OUT dependency row span is invalid")
+    })?;
+    let producer_roots_digest =
+        dependency_payload_digest(&out.producer_roots(), &mut collector.hash_scratch)?;
+    let mut hasher = Sha256::new();
+    hasher.update(DEPENDENCY_OUT_COMPONENT_RECEIPT_DOMAIN_V2);
+    dependency_proof_update_usize(&mut hasher, rows.len(), "OUT component row count")?;
+    for row in rows {
+        hasher.update(row.local_digest);
+    }
+    hasher.update(producer_roots_digest);
+    let component_digest = hasher.finalize().into();
+    collector.structural_from_payload_digest(
+        SemanticDependencyOwnerV1::ProgramRoot,
+        top_subject(
+            SemanticDependencySubjectKindV1::ResolvedOutGraph,
+            SemanticDependencyEntityV1::Program,
+        ),
+        component_digest,
+    )?;
+    if let Some(started) = component_started {
+        eprintln!(
+            "boon_semantic dependency_manifest inventory_out.component_receipts:done elapsed_ms={:.3}",
             started.elapsed().as_secs_f64() * 1_000.0
         );
     }
@@ -10784,14 +10815,7 @@ fn inventory_reactive(
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
 ) -> Result<[u8; 32], CallableDependencyManifestError> {
-    let component_digest = collector.structural_with_component_digest(
-        SemanticDependencyOwnerV1::ProgramRoot,
-        top_subject(
-            SemanticDependencySubjectKindV1::ReactiveGraph,
-            SemanticDependencyEntityV1::Program,
-        ),
-        reactive,
-    )?;
+    let rows_start = collector.compact_rows.len();
 
     for producer in &reactive.producer_instances {
         let owner = owners.static_owner(producer.owner)?;
@@ -11607,6 +11631,32 @@ fn inventory_reactive(
         )?;
     }
     let _ = execution;
+    let rows = collector.compact_rows.get(rows_start..).ok_or_else(|| {
+        CallableDependencyManifestError::new("reactive dependency row span is invalid")
+    })?;
+    let unclassified_digest = dependency_payload_digest(
+        &(
+            reactive.schema.as_str(),
+            &reactive.external_event_identities,
+        ),
+        &mut collector.hash_scratch,
+    )?;
+    let mut hasher = Sha256::new();
+    hasher.update(DEPENDENCY_REACTIVE_COMPONENT_RECEIPT_DOMAIN_V2);
+    dependency_proof_update_usize(&mut hasher, rows.len(), "reactive component row count")?;
+    for row in rows {
+        hasher.update(row.local_digest);
+    }
+    hasher.update(unclassified_digest);
+    let component_digest = hasher.finalize().into();
+    collector.structural_from_payload_digest(
+        SemanticDependencyOwnerV1::ProgramRoot,
+        top_subject(
+            SemanticDependencySubjectKindV1::ReactiveGraph,
+            SemanticDependencyEntityV1::Program,
+        ),
+        component_digest,
+    )?;
     Ok(component_digest)
 }
 
@@ -12085,13 +12135,13 @@ fn inventory_view(
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
 ) -> Result<(), CallableDependencyManifestError> {
-    collector.structural(
+    collector.structural_from_payload_digest(
         SemanticDependencyOwnerV1::ProgramRoot,
         top_subject(
             SemanticDependencySubjectKindV1::ViewBindingGraph,
             SemanticDependencyEntityV1::Program,
         ),
-        view,
+        *view.digest.as_bytes(),
     )?;
 
     for root in &view.roots {
@@ -12445,13 +12495,13 @@ fn inventory_storage(
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
 ) -> Result<(), CallableDependencyManifestError> {
-    collector.structural(
+    collector.structural_from_payload_digest(
         SemanticDependencyOwnerV1::ProgramRoot,
         top_subject(
             SemanticDependencySubjectKindV1::StorageGraph,
             SemanticDependencyEntityV1::Program,
         ),
-        storage,
+        *storage.digest.as_bytes(),
     )?;
 
     for storage_owner in &storage.owners {
@@ -13080,13 +13130,13 @@ fn inventory_memory(
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
 ) -> Result<(), CallableDependencyManifestError> {
-    collector.structural(
+    collector.structural_from_payload_digest(
         SemanticDependencyOwnerV1::ProgramRoot,
         top_subject(
             SemanticDependencySubjectKindV1::MemoryGraph,
             SemanticDependencyEntityV1::Program,
         ),
-        memory,
+        *memory.digest.as_bytes(),
     )?;
 
     for region in &memory.memories {

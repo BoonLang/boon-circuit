@@ -1488,6 +1488,29 @@ This closes the production V2 mirror, not the persistent-compiler phase:
 Manifest still imports compact checked/execution receipts into its own graph,
 and all cold products are still discarded after the request.
 
+The first follow-on Manifest deletion slice now removes several remaining
+whole-graph reserializations without moving them behind another facade. OUT
+invocation inputs and PASSED bindings are committed once as one compact call
+frame, and the OUT and reactive component receipts fold the already-emitted
+ordered row receipts plus only the component facts that have no row owner.
+View, storage, and memory structural coverage consume their construction-owned
+graph digests instead of serializing those graphs again. The V7 wire shape is
+unchanged; new digest domains make the changed receipt algorithms fail closed.
+
+On a fresh optimized NovyWave run, production Manifest work falls from the
+pre-slice 289.353 ms to 239.946 ms, and a warm repeat records 233.495 ms.
+Remaining Manifest rows fall from 33,413 to 24,221 while checked, execution,
+and construction row counts remain unchanged. The warm repeat completes in
+3,794.617 ms (3,760.219 ms wall), versus the 3,807.238 ms directional baseline;
+the local deletion is therefore measurable, but whole-pipeline variance still
+dominates the end-to-end delta. The same repeat records 1.020 ms in WHERE
+verification, confirming that WHERE is not a current optimization target.
+All 19 dependency-manifest tests, all 107 active `boon_compiler` library tests,
+and the architecture gate pass. This is an intermediate deletion checkpoint:
+Manifest still re-registers 61,844 checked and 31,225 execution receipts in a
+new projection index, and its 7,980-node request graph is still sealed after
+the executable image already owns the relevant construction routes.
+
 ### Sixth Whole-System Audit: One Persistent Definition-to-Runnable Graph
 
 The construction-route work is a prerequisite, but it is not the final

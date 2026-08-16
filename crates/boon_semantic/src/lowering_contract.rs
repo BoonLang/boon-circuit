@@ -587,8 +587,9 @@ pub(crate) fn build_semantic_lowering_contract_with_dependency_rows(
     rows.append(&mut metadata_dependency_rows);
     rows.append(&mut output_dependency_rows);
     rows.append(&mut host_port_dependency_rows);
-    let dependency_rows =
-        ConstructionDependencyRowsV1::from_rows(ConstructionDependencyDomainV1::Lowering, rows);
+    let dependency_rows = dependency_builder
+        .finish(ConstructionDependencyDomainV1::Lowering, rows)
+        .map_err(|error| SemanticLoweringContractError::new(error.to_string()))?;
     Ok(SemanticLoweringContractBuildV2 {
         contract,
         dependency_rows,
@@ -605,10 +606,7 @@ pub(crate) fn lowering_dependency_rows(
     append_lowering_metadata_dependency_rows(&mut builder, &mut rows, &lowering.metadata)?;
     append_lowering_output_dependency_rows(&mut builder, &mut rows, &lowering.output_contracts)?;
     append_lowering_host_port_dependency_rows(&mut builder, &mut rows, &lowering.host_ports)?;
-    Ok(ConstructionDependencyRowsV1::from_rows(
-        ConstructionDependencyDomainV1::Lowering,
-        rows,
-    ))
+    builder.finish(ConstructionDependencyDomainV1::Lowering, rows)
 }
 
 fn lowering_contract_dependency_row(

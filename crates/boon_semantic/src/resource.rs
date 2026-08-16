@@ -5974,10 +5974,7 @@ fn resource_dependency_rows(
         )?);
     }
 
-    Ok(ConstructionDependencyRowsV1::from_rows(
-        ConstructionDependencyDomainV1::Resource,
-        rows,
-    ))
+    builder.finish(ConstructionDependencyDomainV1::Resource, rows)
 }
 
 #[cfg(test)]

@@ -2088,33 +2088,106 @@ pub enum ConstructionDependencyDomainV1 {
     Resource,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConstructionDependencyReferenceSpanV1 {
+    start: u32,
+    end: u32,
+}
+
+impl ConstructionDependencyReferenceSpanV1 {
+    fn checked_range(
+        self,
+        reference_count: usize,
+    ) -> Result<std::ops::Range<usize>, CallableDependencyManifestError> {
+        let start = usize::try_from(self.start).map_err(|_| {
+            CallableDependencyManifestError::new(
+                "construction dependency reference span start exceeds usize",
+            )
+        })?;
+        let end = usize::try_from(self.end).map_err(|_| {
+            CallableDependencyManifestError::new(
+                "construction dependency reference span end exceeds usize",
+            )
+        })?;
+        if start > end || end > reference_count {
+            return Err(CallableDependencyManifestError::new(format!(
+                "construction dependency reference span {start}..{end} exceeds arena length {reference_count}",
+            )));
+        }
+        Ok(start..end)
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ConstructionDependencyRowV1 {
     owner: ConstructionDependencyOwnerV1,
     subject: SemanticDependencySubjectV1,
     class: SemanticDependencyProjectionClassV4,
     local_digest: [u8; 32],
-    /// `Some`, including an empty vector, distinguishes a dependency record
+    /// `Some`, including an empty span, distinguishes a dependency record
     /// from structural or diagnostic coverage.
-    references: Option<Vec<PendingDependencyReference>>,
+    references: Option<ConstructionDependencyReferenceSpanV1>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ConstructionDependencyRowsV1 {
     domain: ConstructionDependencyDomainV1,
     rows: Vec<ConstructionDependencyRowV1>,
+    reference_arena: Vec<PendingDependencyReference>,
 }
 
 impl ConstructionDependencyRowsV1 {
-    pub(crate) fn from_rows(
+    fn from_rows(
         domain: ConstructionDependencyDomainV1,
         rows: Vec<ConstructionDependencyRowV1>,
-    ) -> Self {
-        Self { domain, rows }
+        reference_arena: Vec<PendingDependencyReference>,
+    ) -> Result<Self, CallableDependencyManifestError> {
+        for row in &rows {
+            if let Some(span) = row.references {
+                let _ = span.checked_range(reference_arena.len())?;
+            }
+        }
+        Ok(Self {
+            domain,
+            rows,
+            reference_arena,
+        })
     }
 
     pub(crate) fn len(&self) -> usize {
         self.rows.len()
+    }
+
+    #[cfg(test)]
+    fn domain(&self) -> ConstructionDependencyDomainV1 {
+        self.domain
+    }
+
+    #[cfg(test)]
+    fn rows(&self) -> &[ConstructionDependencyRowV1] {
+        &self.rows
+    }
+
+    #[cfg(test)]
+    fn references_at(
+        &self,
+        ordinal: usize,
+    ) -> Result<Option<&[PendingDependencyReference]>, CallableDependencyManifestError> {
+        let row = self.rows.get(ordinal).ok_or_else(|| {
+            CallableDependencyManifestError::new(format!(
+                "construction dependency row {ordinal} is unavailable",
+            ))
+        })?;
+        row.references
+            .map(|span| {
+                let range = span.checked_range(self.reference_arena.len())?;
+                self.reference_arena.get(range).ok_or_else(|| {
+                    CallableDependencyManifestError::new(
+                        "construction dependency reference span is unavailable",
+                    )
+                })
+            })
+            .transpose()
     }
 }
 
@@ -2158,12 +2231,14 @@ impl ReactiveDependencyPublicationV1 {
     }
 }
 
-/// Shared construction-time row hasher. It owns reusable encoding storage and
-/// the flow-type digest table so a domain builder does not allocate or hash the
-/// same recursive type afresh for every occurrence.
+/// Shared construction-time row builder. It owns reusable encoding storage,
+/// the flow-type digest table, and one flat pending-reference arena for every
+/// row emitted by the domain builder.
 pub(crate) struct ConstructionDependencyRowBuilderV1 {
     hash_scratch: Vec<u8>,
     flow_type_digests: HashMap<FlowType, [u8; 32]>,
+    reference_arena: Vec<PendingDependencyReference>,
+    row_count: usize,
 }
 
 impl ConstructionDependencyRowBuilderV1 {
@@ -2171,7 +2246,24 @@ impl ConstructionDependencyRowBuilderV1 {
         Self {
             hash_scratch: Vec::new(),
             flow_type_digests: HashMap::new(),
+            reference_arena: Vec::new(),
+            row_count: 0,
         }
+    }
+
+    pub(crate) fn finish(
+        self,
+        domain: ConstructionDependencyDomainV1,
+        rows: Vec<ConstructionDependencyRowV1>,
+    ) -> Result<ConstructionDependencyRowsV1, CallableDependencyManifestError> {
+        if rows.len() != self.row_count {
+            return Err(CallableDependencyManifestError::new(format!(
+                "construction dependency builder emitted {} rows but finalized {}",
+                self.row_count,
+                rows.len(),
+            )));
+        }
+        ConstructionDependencyRowsV1::from_rows(domain, rows, self.reference_arena)
     }
 
     pub(crate) fn dependency<P: Serialize>(
@@ -2200,12 +2292,35 @@ impl ConstructionDependencyRowBuilderV1 {
             payload_digest,
             &mut self.hash_scratch,
         )?;
+        let references_start = u32::try_from(self.reference_arena.len()).map_err(|_| {
+            CallableDependencyManifestError::new(
+                "construction dependency reference arena exceeds u32 spans",
+            )
+        })?;
+        let references_end = self
+            .reference_arena
+            .len()
+            .checked_add(references.len())
+            .and_then(|end| u32::try_from(end).ok())
+            .ok_or_else(|| {
+                CallableDependencyManifestError::new(
+                    "construction dependency reference arena exceeds u32 spans",
+                )
+            })?;
+        let next_row_count = self.row_count.checked_add(1).ok_or_else(|| {
+            CallableDependencyManifestError::new("construction dependency row count overflow")
+        })?;
+        self.reference_arena.extend(references);
+        self.row_count = next_row_count;
         Ok(ConstructionDependencyRowV1 {
             owner,
             subject,
             class: SemanticDependencyProjectionClassV4::Dependency { channel },
             local_digest,
-            references: Some(references),
+            references: Some(ConstructionDependencyReferenceSpanV1 {
+                start: references_start,
+                end: references_end,
+            }),
         })
     }
 
@@ -2234,6 +2349,9 @@ impl ConstructionDependencyRowBuilderV1 {
             payload_digest,
             &mut self.hash_scratch,
         )?;
+        self.row_count = self.row_count.checked_add(1).ok_or_else(|| {
+            CallableDependencyManifestError::new("construction dependency row count overflow")
+        })?;
         Ok(ConstructionDependencyRowV1 {
             owner,
             subject,
@@ -2270,6 +2388,9 @@ impl ConstructionDependencyRowBuilderV1 {
             payload_digest,
             &mut self.hash_scratch,
         )?;
+        self.row_count = self.row_count.checked_add(1).ok_or_else(|| {
+            CallableDependencyManifestError::new("construction dependency row count overflow")
+        })?;
         Ok(ConstructionDependencyRowV1 {
             owner,
             subject,
@@ -2373,16 +2494,9 @@ struct DenseDependencyProjectionKeyV4 {
     class: SemanticDependencyProjectionClassV4,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CompactDependencyRowOriginV7 {
-    Legacy,
-    Construction(ConstructionDependencyDomainV1),
-}
-
 #[derive(Clone, Debug)]
 struct CompactDependencyRowV4 {
     projection: DenseDependencyProjectionKeyV4,
-    origin: CompactDependencyRowOriginV7,
     local_digest: [u8; 32],
     dependency: Option<SemanticDependencyRecordId>,
 }
@@ -2392,6 +2506,18 @@ struct CompactDependencyRecordV4 {
     row: usize,
     references_start: usize,
     references_end: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingDependencySegmentV7 {
+    Legacy { start: usize, end: usize },
+    Construction { batch: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PendingDependencyRecordHandleV7 {
+    Legacy(SemanticDependencyRecordId),
+    Construction { batch: usize, row: usize },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -2714,23 +2840,24 @@ impl DenseManifestProjectionIndexV7 {
         Ok(())
     }
 
-    fn receipt_members(&self) -> Result<Vec<[u8; 32]>, CallableDependencyManifestError> {
+    fn projection_receipts_digest(&self) -> Result<[u8; 32], CallableDependencyManifestError> {
+        let mut hasher = Sha256::new();
+        hasher.update(DEPENDENCY_PROJECTION_RECEIPT_SET_DOMAIN_V7);
+        dependency_proof_update_usize(&mut hasher, self.ids.len(), "V7 projection receipt count")?;
         let mut hash_scratch = Vec::new();
-        self.ids
-            .iter()
-            .map(|(key, id)| {
-                let receipt = self.local_digest(*id).ok_or_else(|| {
-                    CallableDependencyManifestError::new(format!(
-                        "V7 projection {key:?} has no local receipt"
-                    ))
-                })?;
-                canonical_dependency_hash_with_buffer(
-                    DEPENDENCY_PROJECTION_RECEIPT_MEMBER_DOMAIN_V7,
-                    &(key, receipt),
-                    &mut hash_scratch,
-                )
-            })
-            .collect()
+        for (key, id) in &self.ids {
+            let receipt = self.local_digest(*id).ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "V7 projection {key:?} has no local receipt"
+                ))
+            })?;
+            hasher.update(canonical_dependency_hash_with_buffer(
+                DEPENDENCY_PROJECTION_RECEIPT_MEMBER_DOMAIN_V7,
+                &(key, receipt),
+                &mut hash_scratch,
+            )?);
+        }
+        Ok(hasher.finalize().into())
     }
 
     fn seal_request_graph(
@@ -2807,6 +2934,9 @@ struct DependencyCollector {
     compact_rows: Vec<CompactDependencyRowV4>,
     compact_records: Vec<CompactDependencyRecordV4>,
     compact_references: Vec<PendingDependencyReference>,
+    construction_batches: Vec<ConstructionDependencyRowsV1>,
+    pending_segments: Vec<PendingDependencySegmentV7>,
+    legacy_segment_start: usize,
     #[cfg(test)]
     compact_subjects: Vec<SemanticDependencySubjectV1>,
     #[cfg(test)]
@@ -2856,6 +2986,9 @@ impl DependencyCollector {
             compact_rows: Vec::with_capacity(coverage_capacity),
             compact_records: Vec::with_capacity(record_capacity),
             compact_references: Vec::with_capacity(record_capacity),
+            construction_batches: Vec::with_capacity(3),
+            pending_segments: Vec::with_capacity(5),
+            legacy_segment_start: 0,
             #[cfg(test)]
             compact_subjects: Vec::with_capacity(coverage_capacity),
             #[cfg(test)]
@@ -2873,10 +3006,9 @@ impl DependencyCollector {
         }
     }
 
-    fn ingest_construction_rows(
+    fn consume_construction_rows(
         &mut self,
         rows: ConstructionDependencyRowsV1,
-        owners: &DependencyOwnerIndex,
     ) -> Result<(), CallableDependencyManifestError> {
         #[cfg(test)]
         if self.retain_exhaustive {
@@ -2884,63 +3016,34 @@ impl DependencyCollector {
                 "construction-owned compact rows cannot populate the exhaustive V3 oracle",
             ));
         }
-        let ConstructionDependencyRowsV1 { domain, rows } = rows;
-        for row in rows {
-            let owner = resolve_construction_owner(&row.owner, owners, &|| {
-                format!("construction dependency subject {:?}", row.subject)
-            })?;
-            self.claim_subject(&row.subject)?;
-            match (row.class, row.references) {
-                (
-                    class @ SemanticDependencyProjectionClassV4::Dependency { .. },
-                    Some(references),
-                ) => {
-                    let id = SemanticDependencyRecordId(self.compact_records.len());
-                    let compact_row = self.compact_rows.len();
-                    self.push_compact_classification_with_origin(
-                        owner,
-                        &row.subject,
-                        class,
-                        CompactDependencyRowOriginV7::Construction(domain),
-                        row.local_digest,
-                        Some(id),
-                    );
-                    let references_start = self.compact_references.len();
-                    self.compact_references.extend(references);
-                    let references_end = self.compact_references.len();
-                    self.compact_records.push(CompactDependencyRecordV4 {
-                        row: compact_row,
-                        references_start,
-                        references_end,
-                    });
-                    self.dependencies_by_entity
-                        .entry(row.subject.identity.clone())
-                        .or_default()
-                        .push(id);
-                }
-                (
-                    class @ (SemanticDependencyProjectionClassV4::Structural
-                    | SemanticDependencyProjectionClassV4::Diagnostic),
-                    None,
-                ) => {
-                    self.push_compact_classification_with_origin(
-                        owner,
-                        &row.subject,
-                        class,
-                        CompactDependencyRowOriginV7::Construction(domain),
-                        row.local_digest,
-                        None,
-                    );
-                }
-                _ => {
-                    return Err(CallableDependencyManifestError::new(format!(
-                        "construction dependency subject {:?} has mismatched class/references",
-                        row.subject
-                    )));
-                }
-            }
+        if self
+            .construction_batches
+            .iter()
+            .any(|batch| batch.domain == rows.domain)
+        {
+            return Err(CallableDependencyManifestError::new(format!(
+                "construction dependency domain {:?} is consumed more than once",
+                rows.domain,
+            )));
         }
+        self.close_legacy_segment();
+        let batch = self.construction_batches.len();
+        self.construction_batches.push(rows);
+        self.pending_segments
+            .push(PendingDependencySegmentV7::Construction { batch });
         Ok(())
+    }
+
+    fn close_legacy_segment(&mut self) {
+        let end = self.compact_rows.len();
+        if self.legacy_segment_start != end {
+            self.pending_segments
+                .push(PendingDependencySegmentV7::Legacy {
+                    start: self.legacy_segment_start,
+                    end,
+                });
+            self.legacy_segment_start = end;
+        }
     }
 
     #[cfg(test)]
@@ -2966,6 +3069,9 @@ impl DependencyCollector {
             compact_rows: Vec::with_capacity(coverage_capacity),
             compact_records: Vec::with_capacity(record_capacity),
             compact_references: Vec::with_capacity(record_capacity),
+            construction_batches: Vec::new(),
+            pending_segments: Vec::new(),
+            legacy_segment_start: 0,
             #[cfg(test)]
             compact_subjects: Vec::with_capacity(coverage_capacity),
             #[cfg(test)]
@@ -2995,6 +3101,9 @@ impl DependencyCollector {
             compact_rows: Vec::new(),
             compact_records: Vec::new(),
             compact_references: Vec::new(),
+            construction_batches: Vec::new(),
+            pending_segments: Vec::new(),
+            legacy_segment_start: 0,
             compact_subjects: Vec::new(),
             records: Vec::new(),
             unresolved_entity_references: Vec::new(),
@@ -4121,25 +4230,6 @@ impl DependencyCollector {
         local_digest: [u8; 32],
         dependency: Option<SemanticDependencyRecordId>,
     ) {
-        self.push_compact_classification_with_origin(
-            owner,
-            subject,
-            class,
-            CompactDependencyRowOriginV7::Legacy,
-            local_digest,
-            dependency,
-        );
-    }
-
-    fn push_compact_classification_with_origin(
-        &mut self,
-        owner: SemanticDependencyOwnerV1,
-        subject: &SemanticDependencySubjectV1,
-        class: SemanticDependencyProjectionClassV4,
-        origin: CompactDependencyRowOriginV7,
-        local_digest: [u8; 32],
-        dependency: Option<SemanticDependencyRecordId>,
-    ) {
         #[cfg(test)]
         self.compact_subjects.push(subject.clone());
         self.compact_rows.push(CompactDependencyRowV4 {
@@ -4148,7 +4238,6 @@ impl DependencyCollector {
                 subject_kind: subject.kind,
                 class,
             },
-            origin,
             local_digest,
             dependency,
         });
@@ -4506,6 +4595,9 @@ impl DependencyCollector {
             compact_rows: _,
             compact_records: _,
             compact_references: _,
+            construction_batches: _,
+            pending_segments: _,
+            legacy_segment_start: _,
             compact_subjects: _,
             mut records,
             unresolved_entity_references,
@@ -4993,6 +5085,7 @@ impl DependencyCollector {
         mut self,
         owners: &BTreeSet<SemanticDependencyOwnerV1>,
         stable_owners: &BTreeMap<SemanticDependencyOwnerV1, SemanticDependencyStableOwnerV4>,
+        owner_index: &DependencyOwnerIndex,
         mut presealed: DenseManifestProjectionIndexV7,
     ) -> Result<ValidatedCompactDependencyCollectionV7, CallableDependencyManifestError> {
         let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
@@ -5016,7 +5109,7 @@ impl DependencyCollector {
         }
         if self.subjects.len() != self.compact_rows.len() {
             return Err(CallableDependencyManifestError::new(
-                "remaining semantic subjects and coverage rows are not aligned",
+                "legacy semantic subjects and coverage rows are not aligned",
             ));
         }
         if self.compact_records.len() != self.dependencies_by_entity.values().flatten().count() {
@@ -5038,33 +5131,6 @@ impl DependencyCollector {
             ids.dedup();
         }
 
-        let stable_projection = |row: &CompactDependencyRowV4| {
-            let dense = row.projection;
-            let owner = stable_owners.get(&dense.owner).copied().ok_or_else(|| {
-                CallableDependencyManifestError::new(format!(
-                    "remaining semantic projection references missing owner {:?}",
-                    dense.owner
-                ))
-            })?;
-            let projection = SemanticDependencyProjectionKeyV4 {
-                owner,
-                subject_kind: dense.subject_kind,
-                class: dense.class,
-            };
-            let key = match row.origin {
-                CompactDependencyRowOriginV7::Legacy => {
-                    SemanticDependencyProjectionKeyV7::LegacySemantic { projection }
-                }
-                CompactDependencyRowOriginV7::Construction(construction_domain) => {
-                    SemanticDependencyProjectionKeyV7::ConstructionSemantic {
-                        construction_domain,
-                        projection,
-                    }
-                }
-            };
-            Ok((key, owner))
-        };
-
         for (index, record) in self.compact_records.iter().copied().enumerate() {
             let record_id = SemanticDependencyRecordId(index);
             let row = self.compact_rows.get(record.row).ok_or_else(|| {
@@ -5080,19 +5146,185 @@ impl DependencyCollector {
             }
         }
 
-        // Register each remaining projection exactly once before resolving
-        // forward entity references. The former path allocated one pending
-        // row object (and usually one target Vec) for every semantic row, then
-        // walked that second graph-shaped arena only to fold it back into the
-        // dense request graph below.
-        let row_projections = self
-            .compact_rows
+        self.close_legacy_segment();
+        let pending_segments = std::mem::take(&mut self.pending_segments);
+        let construction_batches = std::mem::take(&mut self.construction_batches);
+        let mut legacy_row_projections = Vec::with_capacity(self.compact_rows.len());
+        let mut construction_row_projections = construction_batches
             .iter()
-            .map(|row| {
-                let (projection_key, owner) = stable_projection(row)?;
-                presealed.ensure_legacy(projection_key, owner)
-            })
-            .collect::<Result<Vec<_>, CallableDependencyManifestError>>()?;
+            .map(|batch| Vec::with_capacity(batch.rows.len()))
+            .collect::<Vec<_>>();
+        let mut construction_dependency_head_by_entity =
+            HashMap::<SemanticDependencyEntityV1, PendingDependencyRecordHandleV7>::new();
+        let mut construction_next_dependency = construction_batches
+            .iter()
+            .map(|batch| Vec::with_capacity(batch.rows.len()))
+            .collect::<Vec<_>>();
+        let mut construction_record_count = 0usize;
+        let construction_row_count =
+            construction_batches
+                .iter()
+                .try_fold(0usize, |count, batch| {
+                    count.checked_add(batch.rows.len()).ok_or_else(|| {
+                        CallableDependencyManifestError::new(
+                            "V7 construction dependency row count overflow",
+                        )
+                    })
+                })?;
+        let mut next_legacy_row = 0usize;
+        let mut next_construction_batch = 0usize;
+
+        // Register rows in their historical producer/resource/reactive/
+        // lowering/view/storage/memory order. Construction batches retain
+        // symbolic owners and one flat reference arena; resolving them here
+        // fuses the former per-row ingest/rebase pass with the linker pass that
+        // every row already requires.
+        for segment in &pending_segments {
+            match *segment {
+                PendingDependencySegmentV7::Legacy { start, end } => {
+                    if start != next_legacy_row || start > end || end > self.compact_rows.len() {
+                        return Err(CallableDependencyManifestError::new(format!(
+                            "V7 legacy dependency segment {start}..{end} is not contiguous at {next_legacy_row}",
+                        )));
+                    }
+                    for (row_index, row) in self.compact_rows[start..end].iter().enumerate() {
+                        let row_index = start + row_index;
+                        let dense = row.projection;
+                        let stable_owner =
+                            stable_owners.get(&dense.owner).copied().ok_or_else(|| {
+                                CallableDependencyManifestError::new(format!(
+                                    "remaining semantic projection references missing owner {:?}",
+                                    dense.owner,
+                                ))
+                            })?;
+                        let projection = SemanticDependencyProjectionKeyV4 {
+                            owner: stable_owner,
+                            subject_kind: dense.subject_kind,
+                            class: dense.class,
+                        };
+                        let projection = presealed.ensure_legacy(
+                            SemanticDependencyProjectionKeyV7::LegacySemantic { projection },
+                            stable_owner,
+                        )?;
+                        if row_index != legacy_row_projections.len() {
+                            return Err(CallableDependencyManifestError::new(
+                                "V7 legacy projection relocation order diverged from row order",
+                            ));
+                        }
+                        legacy_row_projections.push(projection);
+                    }
+                    next_legacy_row = end;
+                }
+                PendingDependencySegmentV7::Construction { batch } => {
+                    if batch != next_construction_batch {
+                        return Err(CallableDependencyManifestError::new(format!(
+                            "V7 construction dependency batch {batch} is out of order at {next_construction_batch}",
+                        )));
+                    }
+                    let construction = construction_batches.get(batch).ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "V7 construction dependency segment references missing batch {batch}",
+                        ))
+                    })?;
+                    for (row_index, row) in construction.rows.iter().enumerate() {
+                        let dense_owner =
+                            resolve_construction_owner(&row.owner, owner_index, &|| {
+                                format!("construction dependency subject {:?}", row.subject)
+                            })?;
+                        let stable_owner = stable_owners.get(&dense_owner).copied().ok_or_else(|| {
+                            CallableDependencyManifestError::new(format!(
+                                "construction dependency subject {:?} references missing owner {dense_owner:?}",
+                                row.subject,
+                            ))
+                        })?;
+                        let projection = SemanticDependencyProjectionKeyV4 {
+                            owner: stable_owner,
+                            subject_kind: row.subject.kind,
+                            class: row.class,
+                        };
+                        let projection = presealed.ensure_legacy(
+                            SemanticDependencyProjectionKeyV7::ConstructionSemantic {
+                                construction_domain: construction.domain,
+                                projection,
+                            },
+                            stable_owner,
+                        )?;
+                        construction_row_projections[batch].push(projection);
+                        if !self.subjects.insert(row.subject.clone()) {
+                            return Err(CallableDependencyManifestError::new(format!(
+                                "dependency coverage subject {:?} is classified more than once",
+                                row.subject,
+                            )));
+                        }
+                        match (row.class, row.references) {
+                            (
+                                SemanticDependencyProjectionClassV4::Dependency { .. },
+                                Some(span),
+                            ) => {
+                                let _ = span.checked_range(construction.reference_arena.len())?;
+                                let handle = PendingDependencyRecordHandleV7::Construction {
+                                    batch,
+                                    row: row_index,
+                                };
+                                let previous = construction_dependency_head_by_entity
+                                    .insert(row.subject.identity.clone(), handle);
+                                construction_next_dependency[batch].push(previous);
+                                construction_record_count =
+                                    construction_record_count.checked_add(1).ok_or_else(|| {
+                                        CallableDependencyManifestError::new(
+                                            "V7 construction dependency record count overflow",
+                                        )
+                                    })?;
+                            }
+                            (
+                                SemanticDependencyProjectionClassV4::Structural
+                                | SemanticDependencyProjectionClassV4::Diagnostic,
+                                None,
+                            ) => construction_next_dependency[batch].push(None),
+                            _ => {
+                                return Err(CallableDependencyManifestError::new(format!(
+                                    "construction dependency subject {:?} has mismatched class/references",
+                                    row.subject,
+                                )));
+                            }
+                        }
+                    }
+                    next_construction_batch += 1;
+                }
+            }
+        }
+        if next_legacy_row != self.compact_rows.len()
+            || next_construction_batch != construction_batches.len()
+        {
+            return Err(CallableDependencyManifestError::new(
+                "V7 dependency segments do not cover every legacy and construction row",
+            ));
+        }
+        if self.subjects.len()
+            != self
+                .compact_rows
+                .len()
+                .checked_add(construction_row_count)
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new(
+                        "V7 total dependency coverage count overflow",
+                    )
+                })?
+        {
+            return Err(CallableDependencyManifestError::new(
+                "V7 semantic subjects and coverage rows are not aligned",
+            ));
+        }
+        if construction_next_dependency
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>()
+            != construction_row_count
+        {
+            return Err(CallableDependencyManifestError::new(
+                "V7 construction dependency links and rows are not aligned",
+            ));
+        }
         trace_checkpoint!("resolve_rows");
 
         presealed.finalize_canonical_order()?;
@@ -5106,36 +5338,54 @@ impl DependencyCollector {
             .iter()
             .map(|projection| projection.stable_key_digest)
             .collect::<Vec<_>>();
-        let mut legacy_rows = (0..presealed.projections.len())
+        let mut projection_rows = (0..presealed.projections.len())
             .map(|_| Vec::new())
             .collect::<Vec<Vec<[u8; 32]>>>();
         let mut targets = Vec::new();
         let mut target_digests = Vec::new();
-        for (row_index, (row, projection)) in self
-            .compact_rows
-            .iter()
-            .zip(row_projections.iter().copied())
-            .enumerate()
-        {
-            targets.clear();
-            if let Some(record_id) = row.dependency {
+
+        let projection_for_record = |handle: PendingDependencyRecordHandleV7| match handle {
+            PendingDependencyRecordHandleV7::Legacy(record_id) => {
                 let record = self
                     .compact_records
                     .get(record_id.as_usize())
-                    .filter(|record| record.row == row_index)
                     .ok_or_else(|| {
                         CallableDependencyManifestError::new(format!(
-                            "remaining coverage row {row_index} references missing dependency {record_id}"
+                            "V7 dependency handle references missing legacy record {record_id}",
                         ))
                     })?;
-                let references = self
-                    .compact_references
-                    .get(record.references_start..record.references_end)
+                legacy_row_projections
+                    .get(record.row)
+                    .copied()
                     .ok_or_else(|| {
                         CallableDependencyManifestError::new(format!(
-                            "remaining dependency {record_id} has an invalid reference span"
+                            "legacy dependency {record_id} references missing row {}",
+                            record.row,
                         ))
-                    })?;
+                    })
+            }
+            PendingDependencyRecordHandleV7::Construction { batch, row } => {
+                construction_row_projections
+                    .get(batch)
+                    .and_then(|rows| rows.get(row))
+                    .copied()
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "construction dependency {batch}:{row} has no projection relocation",
+                        ))
+                    })
+            }
+        };
+
+        let mut fold_row = |projection: ProjectionId,
+                            local_digest: [u8; 32],
+                            record: Option<(
+            PendingDependencyRecordHandleV7,
+            &[PendingDependencyReference],
+        )>|
+         -> Result<(), CallableDependencyManifestError> {
+            targets.clear();
+            if let Some((record_handle, references)) = record {
                 for reference in references {
                     match reference {
                         PendingDependencyReference::CallableInterface(callable) => {
@@ -5146,43 +5396,52 @@ impl DependencyCollector {
                                     .copied()
                                     .ok_or_else(|| {
                                         CallableDependencyManifestError::new(format!(
-                                            "dependency {record_id} references missing callable interface {callable}"
+                                            "dependency {record_handle:?} references missing callable interface {callable}"
                                         ))
                                     })?,
                             );
                         }
                         PendingDependencyReference::Entity(entity) => {
-                            if let Some(dependencies) = self.dependencies_by_entity.get(entity) {
-                                for dependency in dependencies.iter().copied() {
-                                    if dependency == record_id {
-                                        continue;
+                            let legacy_dependencies = self.dependencies_by_entity.get(entity);
+                            let construction_dependency =
+                                construction_dependency_head_by_entity.get(entity).copied();
+                            if legacy_dependencies.is_some() || construction_dependency.is_some() {
+                                if let Some(dependencies) = legacy_dependencies {
+                                    for dependency in dependencies.iter().copied() {
+                                        let dependency =
+                                            PendingDependencyRecordHandleV7::Legacy(dependency);
+                                        if dependency != record_handle {
+                                            targets.push(projection_for_record(dependency)?);
+                                        }
                                     }
-                                    let target_record = self
-                                        .compact_records
-                                        .get(dependency.as_usize())
-                                        .ok_or_else(|| {
-                                            CallableDependencyManifestError::new(format!(
-                                                "dependency {record_id} references missing dependency {dependency}"
-                                            ))
-                                        })?;
-                                    targets.push(
-                                        row_projections
-                                            .get(target_record.row)
+                                }
+                                let mut dependency = construction_dependency;
+                                while let Some(current) = dependency {
+                                    if current != record_handle {
+                                        targets.push(projection_for_record(current)?);
+                                    }
+                                    dependency = match current {
+                                        PendingDependencyRecordHandleV7::Construction {
+                                            batch,
+                                            row,
+                                        } => construction_next_dependency
+                                            .get(batch)
+                                            .and_then(|rows| rows.get(row))
                                             .copied()
-                                            .ok_or_else(|| {
-                                                CallableDependencyManifestError::new(format!(
-                                                    "dependency {dependency} references missing row {}",
-                                                    target_record.row
-                                                ))
-                                            })?,
-                                    );
+                                            .flatten(),
+                                        PendingDependencyRecordHandleV7::Legacy(_) => {
+                                            return Err(CallableDependencyManifestError::new(
+                                                "construction dependency chain contains a legacy record",
+                                            ));
+                                        }
+                                    };
                                 }
                             } else {
                                 targets.push(
                                     presealed.entity_routes.get(entity).copied().ok_or_else(
                                         || {
                                             CallableDependencyManifestError::new(format!(
-                                                "dependency {record_id} references unsealed entity {entity:?}"
+                                                "dependency {record_handle:?} references unsealed entity {entity:?}"
                                             ))
                                         },
                                     )?,
@@ -5192,7 +5451,7 @@ impl DependencyCollector {
                         #[cfg(test)]
                         PendingDependencyReference::Owner(owner) => {
                             return Err(CallableDependencyManifestError::new(format!(
-                                "V7 production dependency {record_id} uses forbidden broad owner target {owner:?}"
+                                "V7 production dependency {record_handle:?} uses forbidden broad owner target {owner:?}"
                             )));
                         }
                     }
@@ -5208,15 +5467,77 @@ impl DependencyCollector {
             );
             let digest = compact_projection_row_digest_from_key_digests_v7(
                 stable_key_digests[projection.as_usize()],
-                row.local_digest,
+                local_digest,
                 &target_digests,
             )?;
-            legacy_rows[projection.as_usize()].push(digest);
+            projection_rows[projection.as_usize()].push(digest);
             for target in targets.iter().copied() {
                 presealed.add_target(projection, target)?;
             }
+            Ok(())
+        };
+
+        for segment in &pending_segments {
+            match *segment {
+                PendingDependencySegmentV7::Legacy { start, end } => {
+                    for row_index in start..end {
+                        let row = &self.compact_rows[row_index];
+                        let projection = legacy_row_projections[row_index];
+                        let record = if let Some(record_id) = row.dependency {
+                            let record = self
+                                .compact_records
+                                .get(record_id.as_usize())
+                                .filter(|record| record.row == row_index)
+                                .ok_or_else(|| {
+                                    CallableDependencyManifestError::new(format!(
+                                        "remaining coverage row {row_index} references missing dependency {record_id}",
+                                    ))
+                                })?;
+                            let references = self
+                                .compact_references
+                                .get(record.references_start..record.references_end)
+                                .ok_or_else(|| {
+                                    CallableDependencyManifestError::new(format!(
+                                        "remaining dependency {record_id} has an invalid reference span",
+                                    ))
+                                })?;
+                            Some((
+                                PendingDependencyRecordHandleV7::Legacy(record_id),
+                                references,
+                            ))
+                        } else {
+                            None
+                        };
+                        fold_row(projection, row.local_digest, record)?;
+                    }
+                }
+                PendingDependencySegmentV7::Construction { batch } => {
+                    let construction = &construction_batches[batch];
+                    for (row_index, row) in construction.rows.iter().enumerate() {
+                        let projection = construction_row_projections[batch][row_index];
+                        let record = if let Some(span) = row.references {
+                            let range = span.checked_range(construction.reference_arena.len())?;
+                            let references = construction.reference_arena.get(range).ok_or_else(|| {
+                                CallableDependencyManifestError::new(format!(
+                                    "construction dependency {batch}:{row_index} has an invalid reference span",
+                                ))
+                            })?;
+                            Some((
+                                PendingDependencyRecordHandleV7::Construction {
+                                    batch,
+                                    row: row_index,
+                                },
+                                references,
+                            ))
+                        } else {
+                            None
+                        };
+                        fold_row(projection, row.local_digest, record)?;
+                    }
+                }
+            }
         }
-        for (ordinal, rows) in legacy_rows.into_iter().enumerate() {
+        for (ordinal, rows) in projection_rows.into_iter().enumerate() {
             if rows.is_empty() {
                 continue;
             }
@@ -5227,21 +5548,19 @@ impl DependencyCollector {
             })?;
             if presealed.local_digest(id).is_some() {
                 return Err(CallableDependencyManifestError::new(format!(
-                    "V7 dense projection {ordinal} mixes image and legacy rows"
+                    "V7 dense projection {ordinal} mixes image and semantic rows"
                 )));
             }
-            let receipt = compact_projection_receipt_digest_from_key_digest_v7(
-                stable_key_digests[ordinal],
-                &rows,
+            presealed.set_receipt(
+                id,
+                compact_projection_receipt_digest_from_key_digest_v7(
+                    stable_key_digests[ordinal],
+                    &rows,
+                )?,
             )?;
-            presealed.set_receipt(id, receipt)?;
         }
         trace_checkpoint!("fold_rows");
-        let receipt_members = presealed.receipt_members()?;
-        let projection_receipts_digest = compact_digest_sequence_v4(
-            DEPENDENCY_PROJECTION_RECEIPT_SET_DOMAIN_V7,
-            &receipt_members,
-        )?;
+        let projection_receipts_digest = presealed.projection_receipts_digest()?;
         trace_checkpoint!("receipt_set");
         let checked_row_count = presealed.checked_row_count;
         let checked_dependency_row_count = presealed.checked_dependency_row_count;
@@ -5269,20 +5588,7 @@ impl DependencyCollector {
             })
             .collect::<Result<BTreeMap<_, _>, CallableDependencyManifestError>>()?;
         trace_checkpoint!("owner_digests");
-        let construction_row_count = self
-            .compact_rows
-            .iter()
-            .filter(|row| matches!(row.origin, CompactDependencyRowOriginV7::Construction(_)))
-            .count();
-        let remaining_row_count = self
-            .compact_rows
-            .len()
-            .checked_sub(construction_row_count)
-            .ok_or_else(|| {
-                CallableDependencyManifestError::new(
-                    "V7 construction row count exceeds compact coverage",
-                )
-            })?;
+        let remaining_row_count = self.compact_rows.len();
         if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
             eprintln!(
                 "boon_semantic dependency_manifest_v7 projection_graph:counts nodes={} edges={} components={} cyclic_components={} maximum_component_nodes={} component_edges={} checked_rows={} execution_rows={} construction_rows={} remaining_rows={}",
@@ -5300,6 +5606,7 @@ impl DependencyCollector {
         }
         let dependency_record_count = checked_dependency_row_count
             .checked_add(execution_dependency_row_count)
+            .and_then(|count| count.checked_add(construction_record_count))
             .and_then(|count| count.checked_add(self.compact_records.len()))
             .ok_or_else(|| {
                 CallableDependencyManifestError::new("V7 dependency record count overflow")
@@ -5475,6 +5782,7 @@ fn compact_local_classification_digest_v4(
     Ok(hasher.finalize().into())
 }
 
+#[cfg(test)]
 fn compact_digest_sequence_v4(
     domain: &[u8],
     digests: &[[u8; 32]],
@@ -7055,19 +7363,19 @@ pub(crate) fn build_callable_dependency_manifest_v7(
         )
     )?;
     phase!(
-        "ingest_resource_rows",
-        collector.ingest_construction_rows(resource_rows, &owner_index)
+        "consume_resource_rows",
+        collector.consume_construction_rows(resource_rows)
     )?;
     let reactive_graph_digest = phase!(
-        "ingest_reactive_rows",
+        "consume_reactive_rows",
         (|| {
-            collector.ingest_construction_rows(reactive_publication.rows, &owner_index)?;
+            collector.consume_construction_rows(reactive_publication.rows)?;
             Ok::<_, CallableDependencyManifestError>(reactive_publication.component_digest)
         })()
     )?;
     phase!(
-        "ingest_lowering_rows",
-        collector.ingest_construction_rows(lowering_rows, &owner_index)
+        "consume_lowering_rows",
+        collector.consume_construction_rows(lowering_rows)
     )?;
     phase!(
         "inventory_view",
@@ -7090,7 +7398,7 @@ pub(crate) fn build_callable_dependency_manifest_v7(
     )?;
     let compact = phase!(
         "finish_projection_receipts",
-        collector.finish_compact_v7(&owners, &stable_owners, presealed)
+        collector.finish_compact_v7(&owners, &stable_owners, &owner_index, presealed)
     )?;
 
     let component_digests = CallableDependencyComponentDigestsV1 {
@@ -12342,11 +12650,9 @@ pub(crate) fn publish_reactive_dependencies_v1(
         ),
         component_digest,
     )?);
+    let rows = builder.finish(ConstructionDependencyDomainV1::Reactive, rows_out)?;
     Ok(ReactiveDependencyPublicationV1 {
-        rows: ConstructionDependencyRowsV1::from_rows(
-            ConstructionDependencyDomainV1::Reactive,
-            rows_out,
-        ),
+        rows,
         component_digest,
     })
 }
@@ -12386,7 +12692,7 @@ fn validate_reactive_dependency_publication_against_oracle(
     reactive: &SemanticReactiveGraphV1,
     owners: &DependencyOwnerIndex,
 ) -> Result<(), CallableDependencyManifestError> {
-    if publication.rows.domain != ConstructionDependencyDomainV1::Reactive {
+    if publication.rows.domain() != ConstructionDependencyDomainV1::Reactive {
         return Err(CallableDependencyManifestError::new(
             "reactive dependency publication uses the wrong construction domain",
         ));
@@ -12398,12 +12704,12 @@ fn validate_reactive_dependency_publication_against_oracle(
             "construction-published reactive component digest differs from the replay oracle",
         ));
     }
-    if publication.rows.rows.len() != oracle.compact_rows.len()
+    if publication.rows.rows().len() != oracle.compact_rows.len()
         || oracle.compact_rows.len() != oracle.compact_subjects.len()
     {
         return Err(CallableDependencyManifestError::new(format!(
             "construction-published reactive row count {} differs from replay oracle rows {} subjects {}",
-            publication.rows.rows.len(),
+            publication.rows.rows().len(),
             oracle.compact_rows.len(),
             oracle.compact_subjects.len(),
         )));
@@ -12411,7 +12717,7 @@ fn validate_reactive_dependency_publication_against_oracle(
 
     for (ordinal, ((published, replay), replay_subject)) in publication
         .rows
-        .rows
+        .rows()
         .iter()
         .zip(oracle.compact_rows.iter())
         .zip(oracle.compact_subjects.iter())
@@ -12469,7 +12775,7 @@ fn validate_reactive_dependency_publication_against_oracle(
                     })
             })
             .transpose()?;
-        if published.references.as_deref() != replay_references {
+        if publication.rows.references_at(ordinal)? != replay_references {
             return Err(CallableDependencyManifestError::new(format!(
                 "construction-published reactive row {ordinal} references differ from the replay oracle",
             )));
@@ -15031,6 +15337,92 @@ FUNCTION add(value) {
             ProgramRole::Session,
         );
         elaborate(checked, &[]).expect("dependency manifest fixture elaborates")
+    }
+
+    #[test]
+    fn construction_dependency_rows_use_one_checked_reference_arena() {
+        let mut builder = ConstructionDependencyRowBuilderV1::new();
+        let mut rows = Vec::new();
+        rows.push(
+            builder
+                .dependency(
+                    ConstructionDependencyOwnerV1::ProgramRoot,
+                    SemanticDependencyChannelV1::CoverageRouting,
+                    vec![SemanticDependencyRoleV1::CoverageOrRouting],
+                    top_subject(
+                        SemanticDependencySubjectKindV1::ReactiveGraph,
+                        SemanticDependencyEntityV1::Program,
+                    ),
+                    SemanticDependencySemanticsV1::default(),
+                    &1u8,
+                    Vec::new(),
+                )
+                .expect("empty dependency row builds"),
+        );
+        rows.push(
+            builder
+                .dependency(
+                    ConstructionDependencyOwnerV1::ProgramRoot,
+                    SemanticDependencyChannelV1::CoverageRouting,
+                    vec![SemanticDependencyRoleV1::CoverageOrRouting],
+                    top_subject(
+                        SemanticDependencySubjectKindV1::ReactiveOutput,
+                        indexed_entity(SemanticDependencyEntityDomainV1::Diagnostic, 1),
+                    ),
+                    SemanticDependencySemanticsV1::default(),
+                    &2u8,
+                    vec![
+                        dependency_entity(SemanticDependencyEntityV1::Program),
+                        dependency_callable_interface(SemanticCallableId(0)),
+                    ],
+                )
+                .expect("referencing dependency row builds"),
+        );
+        rows.push(
+            builder
+                .structural(
+                    ConstructionDependencyOwnerV1::ProgramRoot,
+                    top_subject(
+                        SemanticDependencySubjectKindV1::ReactiveProducerInstance,
+                        indexed_entity(SemanticDependencyEntityDomainV1::Diagnostic, 2),
+                    ),
+                    &3u8,
+                )
+                .expect("structural row builds"),
+        );
+        let batch = builder
+            .finish(ConstructionDependencyDomainV1::Reactive, rows)
+            .expect("flat construction dependency rows seal");
+
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch.references_at(0).unwrap(), Some(&[][..]));
+        assert_eq!(
+            batch.references_at(1).unwrap().unwrap(),
+            &[
+                dependency_entity(SemanticDependencyEntityV1::Program),
+                dependency_callable_interface(SemanticCallableId(0)),
+            ]
+        );
+        assert_eq!(batch.references_at(2).unwrap(), None);
+
+        let malformed = ConstructionDependencyRowsV1::from_rows(
+            ConstructionDependencyDomainV1::Reactive,
+            vec![ConstructionDependencyRowV1 {
+                owner: ConstructionDependencyOwnerV1::ProgramRoot,
+                subject: top_subject(
+                    SemanticDependencySubjectKindV1::ReactiveGraph,
+                    SemanticDependencyEntityV1::Program,
+                ),
+                class: SemanticDependencyProjectionClassV4::Dependency {
+                    channel: SemanticDependencyChannelV1::CoverageRouting,
+                },
+                local_digest: [0; 32],
+                references: Some(ConstructionDependencyReferenceSpanV1 { start: 0, end: 1 }),
+            }],
+            Vec::new(),
+        )
+        .expect_err("out-of-bounds construction reference span must fail closed");
+        assert!(malformed.to_string().contains("exceeds arena length 0"));
     }
 
     fn proof_manifest(program: &SemanticProgram) -> CallableDependencyProofManifestV3 {

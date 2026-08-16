@@ -4280,19 +4280,49 @@ with expected low-single-digit transfer cost and ordinary process variance.
 All observations retain zero diagnostics, the same source digest, and the
 same MachinePlan SHA-256 above.
 
+The construction-row handoff is now a move-only flat CSR batch rather than a
+second compact-row reconstruction. Resource, reactive, and lowering publishers
+place pending references in one checked `u32` span arena; Manifest consumption
+only records the ordered batch. Its unavoidable final linker pass resolves
+symbolic owners, classifies subjects, folds row receipts, and builds request
+edges directly across legacy and construction segments without copying or
+rebasing rows or references. The architecture gate rejects the deleted ingest
+adapter and construction-origin mirror. A focused malformed-span oracle and
+the full semantic/compiler suites preserve the existing behavior baseline.
+
+This seal is deliberately recorded as an ownership/layout prerequisite, not a
+latency win. Five fresh stable-release verified observations have a median of
+2,853.177 ms, including 1,179.388 ms semantic construction and 0.432 ms WHERE
+verification; the paired diagnostics median is 694.254 ms. A traced run puts
+Manifest at about 129.886 ms, effectively unchanged from the preceding
+129.2 ms trace even though the explicit construction ingest labels disappear.
+Keeping one live SHA-256 state per projection was also tested and rejected: its
+cache behavior made the row fold slower, so the implementation retains compact
+per-projection row-digest groups. Phase deletion without a combined wall-time
+reduction is not scored as progress.
+
+The next speed-bearing cut therefore skips standalone storage dependency
+publication. Add one definition-owned resource and symbolic row-storage
+template beside the existing execution template, instantiate it through compact
+occurrence overlays, and link late reactive/materialization facts once. In the
+same tranche delete production resource reconstruction, storage reconstruction,
+`inventory_storage`, and their storage-owner replay, while publishing Resource
+and Storage proof batches from that linker. The measured 119.758 ms resource
+and 122.852 ms storage builders make this a plausible 100--170 ms NovyWave cut;
+accept it only with exact resource/storage graph and MachinePlan parity and at
+least an 80 ms stable-release median improvement. Merely relocating the roughly
+10--30 ms storage inventory is not this exit.
+
 Updating the architecture gate exposed two stale classifier entries from the
 definition-template checkpoint. `InvalidDefinitionTemplate` and the three
 checked definition execution-template records are now explicitly classified,
 the embedded schema digest advances, and the complete architecture gate passes.
 
-The next biggest cut is to extend the same definition artifact with normalized
-semantic facts and relocations, starting at the remaining largest measured
-construction owner: dependency/resource Manifest assembly. Executable receipt
-publication is already construction-owned. The next tranche must make the
-Manifest a thin consumer of those facts, delete its repeated dense projection
-and checked/execution inventories, and then carry the same ownership into
-resource and row-storage templates; it must not add another semantic DTO
-underneath the old passes.
+The concurrent checker-kernel track remains the first half of the same
+definition-artifact design. Checked/execution receipt replay is already deleted;
+the work below completes the checker authority that will eventually produce the
+resource/storage templates directly. It must not add another semantic DTO
+underneath the old passes or delay the measured resource/storage deletion above.
 
 1. Finish `DefinitionArtifact` from the dependency bottom upward: declaration
    and lexical-binding identities first, then HOLD state, persistent LIST, and

@@ -1537,7 +1537,11 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         "construction-published reactive row {ordinal} projection differs from the replay oracle",
         "construction-published reactive row {ordinal} references differ from the replay oracle",
         "#[cfg(test)]\nfn inventory_reactive",
-        "\"ingest_reactive_rows\"",
+        "\"consume_reactive_rows\"",
+        "reference_arena: Vec<PendingDependencyReference>",
+        "enum PendingDependencySegmentV7",
+        "fn consume_construction_rows(",
+        "fn projection_receipts_digest(",
     ] {
         if !dependency_manifest.contains(required) {
             return Err(format!(
@@ -1574,6 +1578,18 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
             "production dependency-manifest code reconstructs reactive publication at {:?}",
             manifest_reactive_publication_references.references,
         ));
+    }
+    for forbidden in [
+        "CompactDependencyRowOriginV7::Construction",
+        "fn ingest_construction_rows(",
+        "\"ingest_reactive_rows\"",
+        "fn receipt_members(",
+    ] {
+        if dependency_manifest.contains(forbidden) {
+            return Err(format!(
+                "dependency manifest retains deleted construction-row replay `{forbidden}`"
+            ));
+        }
     }
     for forbidden in [
         "fn validate_totality(",

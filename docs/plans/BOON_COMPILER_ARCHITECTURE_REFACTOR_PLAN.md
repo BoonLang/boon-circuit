@@ -4301,6 +4301,35 @@ cache behavior made the row fold slower, so the implementation retains compact
 per-projection row-digest groups. Phase deletion without a combined wall-time
 reduction is not scored as progress.
 
+The first resource/storage simplification tranche is now speed-bearing even
+before the definition template replaces the remaining builders. Production no
+longer replays checked list classification on a cloned 16k-expression
+execution image or reconstructs checked SOURCE/HOLD provenance after the
+resource graph has already validated itself. Those whole-program rebuilds
+survive only as `cfg(test)` parity oracles. Storage row provenance now uses one
+exact reverse-consumer index and a deterministic queue-to-exhaustion fixed
+point instead of cloning the complete expression map and rescanning every
+expression by epochs. Named-value storage builds one binding/resource/
+statement/producer index instead of rescanning every storage binding and field
+for every lowering origin. Every parser-backed storage test compares both new
+algorithms with the independent old epoch/scan implementations, and the
+architecture gate rejects production references back to all four replay paths.
+
+Ten exact-source fresh-process stable-release observations have medians of
+690.969 ms for diagnostics and 2,794.221 ms for verified compilation. Verified
+semantic construction is 1,100.061 ms and WHERE contract verification is
+0.468 ms. Against the direct-seal checkpoint this saves 58.956 ms verified and
+79.327 ms inside semantic construction; diagnostics improve by 3.285 ms, while
+WHERE remains sub-millisecond and statistically flat. The observed verified
+range is 2,763.421--2,928.508 ms, so the faster preliminary five-sample batch is
+not used as the checkpoint median. A traced sample reduces
+resource construction from roughly 126.7 ms with the production replay to
+74.692 ms, and records storage at 108.828 ms: row provenance is 9.604 ms and
+the still-dominant named-value join is 62.768 ms. This is a real pass deletion
+and directional speed win, but it does not yet satisfy the 80 ms verified
+latency floor or the structural exit: the rich resource and storage builders
+still exist.
+
 The next speed-bearing cut therefore skips standalone storage dependency
 publication. Add one definition-owned resource and symbolic row-storage
 template beside the existing execution template, instantiate it through compact
@@ -4308,9 +4337,13 @@ occurrence overlays, and link late reactive/materialization facts once. In the
 same tranche delete production resource reconstruction, storage reconstruction,
 `inventory_storage`, and their storage-owner replay, while publishing Resource
 and Storage proof batches from that linker. The measured 119.758 ms resource
-and 122.852 ms storage builders make this a plausible 100--170 ms NovyWave cut;
-accept it only with exact resource/storage graph and MachinePlan parity and at
-least an 80 ms stable-release median improvement. Merely relocating the roughly
+and 122.852 ms original storage builders identified the correct ownership
+boundary; after the preliminary deletions the remaining directly observed
+ceiling is about 74.7 + 108.8 ms. Accept the complete template cut only with
+exact resource/storage graph and MachinePlan parity, no production rich-graph
+reconstruction, and a cumulative improvement of at least 80 ms from the direct
+seal checkpoint. The current exact-source median is about 59 ms faster, so both
+the latency and ownership gates remain open. Merely relocating the roughly
 10--30 ms storage inventory is not this exit.
 
 Updating the architecture gate exposed two stale classifier entries from the

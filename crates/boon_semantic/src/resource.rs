@@ -475,12 +475,17 @@ pub(crate) fn build_semantic_resource_graph(
     let trace_resources = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! resource_phase {
         ($name:literal, $expression:expr) => {{
-            if trace_resources {
-                eprintln!(concat!("boon_semantic resource phase ", $name, ":start"));
-            }
+            let started = trace_resources.then(std::time::Instant::now);
             let result = $expression;
-            if trace_resources {
-                eprintln!(concat!("boon_semantic resource phase ", $name, ":done"));
+            if let Some(started) = started {
+                eprintln!(
+                    concat!(
+                        "boon_semantic resource phase ",
+                        $name,
+                        ":done elapsed_ms={:.3}"
+                    ),
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                );
             }
             result
         }};
@@ -553,14 +558,24 @@ pub(crate) fn build_semantic_resource_graph(
     };
     graph.digest = resource_phase!("resource_graph_digest", resource_graph_digest(&graph))?;
     resource_phase!("validate", graph.validate(execution, out_net))?;
-    resource_phase!(
-        "validate_checked_list_classification",
-        validate_checked_list_classification(checked, execution, &graph)
-    )?;
-    resource_phase!(
-        "validate_checked_resource_provenance",
-        validate_checked_resource_provenance(checked, execution, &graph)
-    )?;
+    // Checked/list and source/state reconstruction are independent replay
+    // oracles, not production authorities. Production has just built and
+    // structurally validated the graph from the same final inputs; rebuilding
+    // the lists on a cloned execution arena and rebuilding every checked
+    // resource here was a second semantic pass. Parser-backed tests retain
+    // both exact replays below and `SemanticProgram::validate` runs them again
+    // after the complete program is assembled.
+    #[cfg(test)]
+    {
+        resource_phase!(
+            "validate_checked_list_classification",
+            validate_checked_list_classification(checked, execution, &graph)
+        )?;
+        resource_phase!(
+            "validate_checked_resource_provenance",
+            validate_checked_resource_provenance(checked, execution, &graph)
+        )?;
+    }
     let dependency_rows = resource_dependency_rows(&graph).map_err(|error| error.to_string())?;
     Ok(SemanticResourceGraphBuildV2 {
         graph,
@@ -5192,6 +5207,7 @@ fn validate_dense_resource_ids(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn validate_checked_list_classification(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
@@ -5214,6 +5230,7 @@ pub(crate) fn validate_checked_list_classification(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn validate_checked_resource_provenance(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,

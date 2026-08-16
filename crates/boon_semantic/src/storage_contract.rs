@@ -26,7 +26,7 @@ use boon_checked::{
 };
 use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 pub const SEMANTIC_SCOPE_STORAGE_GRAPH_SCHEMA_V1: &str = "boon.semantic-scope-storage-graph.v1";
@@ -502,21 +502,79 @@ pub(crate) fn build_semantic_scope_storage_graph_from_validated_inputs(
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV2,
 ) -> Result<SemanticScopeStorageGraphV1, SemanticScopeStorageError> {
-    let owners = build_owners(execution, resources)?;
-    let mut fields = build_storage_fields(checked, execution, resources, reactive)?;
-    let mut locals = build_storage_locals(execution, resources, &fields)?;
-    resolve_local_forwarding(execution, resources, &mut locals)?;
-    let captures = discover_detached_captures(execution, resources, reactive, &owners, &locals)?;
-    append_capture_fields(&captures, &mut fields, &mut locals)?;
-    classify_resource_only_fields(execution, resources, &locals, &mut fields)?;
-    let bindings = build_storage_bindings(execution, resources, reactive, &fields, &owners)?;
-    let sources = build_storage_sources(resources, reactive, &owners)?;
-    let row_values = build_row_values(execution, resources, &locals)?;
-    let row_source_projections = build_row_source_projections(execution, resources, &locals)?;
-    let external_references = build_external_references(execution, reactive)?;
-    let producer_result_fields = build_producer_result_fields(reactive, &fields, &bindings)?;
-    let named_values = build_named_value_storage(
-        checked, execution, resources, reactive, lowering, &fields, &bindings,
+    let trace_storage = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+    macro_rules! storage_phase {
+        ($name:literal, $expression:expr) => {{
+            let started = trace_storage.then(std::time::Instant::now);
+            let result = $expression;
+            if let Some(started) = started {
+                eprintln!(
+                    concat!(
+                        "boon_semantic storage phase ",
+                        $name,
+                        ":done elapsed_ms={:.3}"
+                    ),
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
+            result
+        }};
+    }
+
+    let owners = storage_phase!("owners", build_owners(execution, resources))?;
+    let mut fields = storage_phase!(
+        "fields",
+        build_storage_fields(checked, execution, resources, reactive)
+    )?;
+    let mut locals = storage_phase!(
+        "locals",
+        build_storage_locals(execution, resources, &fields)
+    )?;
+    storage_phase!(
+        "local_forwarding",
+        resolve_local_forwarding(execution, resources, &mut locals)
+    )?;
+    let captures = storage_phase!(
+        "detached_captures",
+        discover_detached_captures(execution, resources, reactive, &owners, &locals)
+    )?;
+    storage_phase!(
+        "capture_fields",
+        append_capture_fields(&captures, &mut fields, &mut locals)
+    )?;
+    storage_phase!(
+        "resource_only",
+        classify_resource_only_fields(execution, resources, &locals, &mut fields)
+    )?;
+    let bindings = storage_phase!(
+        "bindings",
+        build_storage_bindings(execution, resources, reactive, &fields, &owners)
+    )?;
+    let sources = storage_phase!(
+        "sources",
+        build_storage_sources(resources, reactive, &owners)
+    )?;
+    let row_values = storage_phase!(
+        "row_values",
+        build_row_values(execution, resources, &locals)
+    )?;
+    let row_source_projections = storage_phase!(
+        "row_source_projections",
+        build_row_source_projections(execution, resources, &locals)
+    )?;
+    let external_references = storage_phase!(
+        "external_references",
+        build_external_references(execution, reactive)
+    )?;
+    let producer_result_fields = storage_phase!(
+        "producer_result_fields",
+        build_producer_result_fields(reactive, &fields, &bindings)
+    )?;
+    let named_values = storage_phase!(
+        "named_values",
+        build_named_value_storage(
+            checked, execution, resources, reactive, lowering, &fields, &bindings,
+        )
     )?;
 
     let mut graph = SemanticScopeStorageGraphV1 {
@@ -534,8 +592,11 @@ pub(crate) fn build_semantic_scope_storage_graph_from_validated_inputs(
         named_values,
         digest: SemanticScopeStorageGraphDigestV1([0; 32]),
     };
-    validate_storage_shape(&graph, checked, execution, resources, reactive, lowering)?;
-    graph.digest = scope_storage_digest(&graph)?;
+    storage_phase!(
+        "validate",
+        validate_storage_shape(&graph, checked, execution, resources, reactive, lowering)
+    )?;
+    graph.digest = storage_phase!("digest", scope_storage_digest(&graph))?;
     Ok(graph)
 }
 
@@ -3295,18 +3356,287 @@ fn build_row_values(
             })
             .collect::<BTreeSet<_>>()
     };
+    #[cfg(test)]
+    let replay_seed = by_expression.clone();
+    // Row provenance is a finite monotone dataflow problem. The former
+    // implementation cloned the complete map and rescanned every semantic
+    // expression once per epoch. Build exact reverse consumers once and stop
+    // when the deterministic queue is exhausted; cycles are harmless because
+    // each activation can only insert a previously unseen `(path, row)` fact.
+    let mut consumers = vec![Vec::<SemanticExprId>::new(); execution.expressions.len()];
+    let mut dependency_edges = 0usize;
+    for expression in &execution.expressions {
+        let mut dependencies = Vec::new();
+        match &expression.kind {
+            SemanticExpressionKind::Flush { payload: input }
+            | SemanticExpressionKind::FlushBoundary { input }
+            | SemanticExpressionKind::Draining { input }
+            | SemanticExpressionKind::Block { result: input, .. }
+            | SemanticExpressionKind::Project { input, .. } => dependencies.push(*input),
+            SemanticExpressionKind::Then {
+                output: Some(output),
+                ..
+            }
+            | SemanticExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            } => dependencies.push(*output),
+            SemanticExpressionKind::When { arms, .. } => {
+                dependencies.extend(arms.iter().map(|arm| arm.output));
+            }
+            SemanticExpressionKind::Latest { branches } => {
+                dependencies.extend(branches.iter().copied());
+            }
+            SemanticExpressionKind::CanonicalRead { target, .. } => {
+                dependencies.extend(
+                    declaration_values
+                        .get(target)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                );
+            }
+            SemanticExpressionKind::LocalRead { binding, .. } => {
+                dependencies.extend(local_bindings.get(binding).map(|(_, value)| *value));
+            }
+            SemanticExpressionKind::Object(fields)
+            | SemanticExpressionKind::TaggedObject { fields, .. } => {
+                dependencies.extend(fields.iter().map(|field| field.value));
+            }
+            SemanticExpressionKind::ExternalRead { .. }
+            | SemanticExpressionKind::ElementState { .. }
+            | SemanticExpressionKind::Drain { .. }
+            | SemanticExpressionKind::Text(_)
+            | SemanticExpressionKind::TextTemplate { .. }
+            | SemanticExpressionKind::Number(_)
+            | SemanticExpressionKind::BytesByte(_)
+            | SemanticExpressionKind::Absent
+            | SemanticExpressionKind::Tag(_)
+            | SemanticExpressionKind::Source { .. }
+            | SemanticExpressionKind::Call { .. }
+            | SemanticExpressionKind::Materialize { .. }
+            | SemanticExpressionKind::Hold { .. }
+            | SemanticExpressionKind::Then { output: None, .. }
+            | SemanticExpressionKind::Infix { .. }
+            | SemanticExpressionKind::MatchArm { output: None, .. }
+            | SemanticExpressionKind::List { .. }
+            | SemanticExpressionKind::Bytes { .. }
+            | SemanticExpressionKind::Delimiter
+            | SemanticExpressionKind::MaterializationLocal { .. }
+            | SemanticExpressionKind::FunctionParameter { .. }
+            | SemanticExpressionKind::MapEntry { .. }
+            | SemanticExpressionKind::Map { .. }
+            | SemanticExpressionKind::Set { .. }
+            | SemanticExpressionKind::Bits(_) => {}
+        }
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        for dependency in dependencies {
+            let consumers = consumers.get_mut(dependency.as_usize()).ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "row-value expression {} depends on missing expression {dependency}",
+                    expression.id,
+                ))
+            })?;
+            consumers.push(expression.id);
+            dependency_edges = dependency_edges.checked_add(1).ok_or_else(|| {
+                SemanticScopeStorageError::new("row-value dependency edge count overflow")
+            })?;
+        }
+    }
+    for rows in &mut consumers {
+        rows.sort_unstable();
+        rows.dedup();
+    }
+
+    let mut queue = execution
+        .expressions
+        .iter()
+        .map(|expression| expression.id)
+        .collect::<VecDeque<_>>();
+    let mut queued = vec![true; execution.expressions.len()];
+    let mut activations = 0usize;
+    while let Some(expression_id) = queue.pop_front() {
+        let expression_index = expression_id.as_usize();
+        let expression = execution
+            .expressions
+            .get(expression_index)
+            .filter(|expression| expression.id == expression_id)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "row-value work queue references missing expression {expression_id}",
+                ))
+            })?;
+        queued[expression_index] = false;
+        activations = activations
+            .checked_add(1)
+            .ok_or_else(|| SemanticScopeStorageError::new("row-value activation count overflow"))?;
+        let rows = |id: SemanticExprId| by_expression.get(&id).cloned().unwrap_or_default();
+        let mut derived = BTreeSet::new();
+        match &expression.kind {
+            SemanticExpressionKind::Flush { payload: input }
+            | SemanticExpressionKind::FlushBoundary { input }
+            | SemanticExpressionKind::Draining { input }
+            | SemanticExpressionKind::Block { result: input, .. } => {
+                derived.extend(rows(*input));
+            }
+            SemanticExpressionKind::Then {
+                output: Some(output),
+                ..
+            }
+            | SemanticExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            } => {
+                derived.extend(rows(*output));
+            }
+            SemanticExpressionKind::When { arms, .. } => {
+                for arm in arms {
+                    derived.extend(rows(arm.output));
+                }
+            }
+            SemanticExpressionKind::Latest { branches } => {
+                for branch in branches {
+                    derived.extend(rows(*branch));
+                }
+            }
+            SemanticExpressionKind::Project { input, fields } => {
+                derived.extend(project(&rows(*input), fields));
+            }
+            SemanticExpressionKind::CanonicalRead {
+                target, projection, ..
+            } => {
+                for target in declaration_values.get(target).into_iter().flatten() {
+                    derived.extend(project(&rows(*target), projection));
+                }
+            }
+            SemanticExpressionKind::LocalRead {
+                binding,
+                projection,
+                ..
+            } => {
+                if let Some((_, target)) = local_bindings.get(binding) {
+                    derived.extend(project(&rows(*target), projection));
+                }
+            }
+            SemanticExpressionKind::Object(fields)
+            | SemanticExpressionKind::TaggedObject { fields, .. } => {
+                for field in fields {
+                    for (path, row) in rows(field.value) {
+                        let path = if field.spread {
+                            path
+                        } else {
+                            std::iter::once(field.name.clone()).chain(path).collect()
+                        };
+                        derived.insert((path, row));
+                    }
+                }
+            }
+            SemanticExpressionKind::ExternalRead { .. }
+            | SemanticExpressionKind::ElementState { .. }
+            | SemanticExpressionKind::Drain { .. }
+            | SemanticExpressionKind::Text(_)
+            | SemanticExpressionKind::TextTemplate { .. }
+            | SemanticExpressionKind::Number(_)
+            | SemanticExpressionKind::BytesByte(_)
+            | SemanticExpressionKind::Absent
+            | SemanticExpressionKind::Tag(_)
+            | SemanticExpressionKind::Source { .. }
+            | SemanticExpressionKind::Call { .. }
+            | SemanticExpressionKind::Materialize { .. }
+            | SemanticExpressionKind::Hold { .. }
+            | SemanticExpressionKind::Then { output: None, .. }
+            | SemanticExpressionKind::Infix { .. }
+            | SemanticExpressionKind::MatchArm { output: None, .. }
+            | SemanticExpressionKind::List { .. }
+            | SemanticExpressionKind::Bytes { .. }
+            | SemanticExpressionKind::Delimiter
+            | SemanticExpressionKind::MaterializationLocal { .. }
+            | SemanticExpressionKind::FunctionParameter { .. }
+            | SemanticExpressionKind::MapEntry { .. }
+            | SemanticExpressionKind::Map { .. }
+            | SemanticExpressionKind::Set { .. }
+            | SemanticExpressionKind::Bits(_) => {}
+        }
+        let target = by_expression.entry(expression.id).or_default();
+        let before = target.len();
+        target.extend(derived);
+        if target.len() != before {
+            for consumer in &consumers[expression_index] {
+                let consumer_index = consumer.as_usize();
+                if !queued[consumer_index] {
+                    queue.push_back(*consumer);
+                    queued[consumer_index] = true;
+                }
+            }
+        }
+    }
+    if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
+        eprintln!(
+            "boon_semantic storage row_values:work expressions={} edges={} activations={} facts={}",
+            execution.expressions.len(),
+            dependency_edges,
+            activations,
+            by_expression.values().map(BTreeSet::len).sum::<usize>(),
+        );
+    }
+    #[cfg(test)]
+    {
+        let replay = build_row_values_epoch_replay_oracle(
+            execution,
+            &declaration_values,
+            &local_bindings,
+            replay_seed,
+        )?;
+        if replay != by_expression {
+            return Err(SemanticScopeStorageError::new(
+                "row-value worklist differs from the independent epoch replay oracle",
+            ));
+        }
+    }
+    Ok(by_expression
+        .into_iter()
+        .flat_map(|(expression, rows)| {
+            rows.into_iter()
+                .map(move |(projection, row)| SemanticStorageRowValueV1 {
+                    expression,
+                    projection,
+                    row,
+                })
+        })
+        .collect())
+}
+
+#[cfg(test)]
+fn build_row_values_epoch_replay_oracle(
+    execution: &SemanticExecutionImageColumnsV1,
+    declaration_values: &BTreeMap<DeclId, BTreeSet<SemanticExprId>>,
+    local_bindings: &BTreeMap<crate::SemanticLocalBindingId, (DeclId, SemanticExprId)>,
+    mut by_expression: BTreeMap<SemanticExprId, BTreeSet<(Vec<String>, SemanticRowBinding)>>,
+) -> Result<
+    BTreeMap<SemanticExprId, BTreeSet<(Vec<String>, SemanticRowBinding)>>,
+    SemanticScopeStorageError,
+> {
+    let project = |rows: &BTreeSet<(Vec<String>, SemanticRowBinding)>, projection: &[String]| {
+        rows.iter()
+            .filter_map(|(path, row)| {
+                path.strip_prefix(projection)
+                    .map(|remaining| (remaining.to_vec(), *row))
+            })
+            .collect::<BTreeSet<_>>()
+    };
     let mut remaining = execution.expressions.len().saturating_add(1);
     loop {
         if remaining == 0 {
             return Err(SemanticScopeStorageError::new(
-                "semantic row-value provenance did not converge",
+                "semantic row-value replay oracle did not converge",
             ));
         }
         remaining -= 1;
         let snapshot = by_expression.clone();
+        let rows = |id: SemanticExprId| snapshot.get(&id).cloned().unwrap_or_default();
         let mut changed = false;
         for expression in &execution.expressions {
-            let rows = |id: SemanticExprId| snapshot.get(&id).cloned().unwrap_or_default();
             let mut derived = BTreeSet::new();
             match &expression.kind {
                 SemanticExpressionKind::Flush { payload: input }
@@ -3399,20 +3729,9 @@ fn build_row_values(
             changed |= target.len() != before;
         }
         if !changed {
-            break;
+            return Ok(by_expression);
         }
     }
-    Ok(by_expression
-        .into_iter()
-        .flat_map(|(expression, rows)| {
-            rows.into_iter()
-                .map(move |(projection, row)| SemanticStorageRowValueV1 {
-                    expression,
-                    projection,
-                    row,
-                })
-        })
-        .collect())
 }
 
 fn build_row_source_projections(
@@ -3696,13 +4015,26 @@ fn build_named_value_storage(
     fields: &[SemanticStorageFieldV1],
     bindings: &[SemanticStorageBindingV1],
 ) -> Result<Vec<SemanticNamedValueStorageV1>, SemanticScopeStorageError> {
+    let index = NamedValueStorageIndex::build(fields, bindings)?;
     let mut rows = Vec::new();
     let mut next_projection_id = 0;
     for named_value in &lowering.metadata.named_value_types {
         for (origin_ordinal, origin) in named_value.origins.iter().enumerate() {
             let targets = named_value_targets(
-                checked, execution, resources, reactive, fields, bindings, origin,
+                checked, execution, resources, reactive, bindings, &index, origin,
             )?;
+            #[cfg(test)]
+            {
+                let replay = named_value_targets_scan_replay_oracle(
+                    checked, execution, resources, reactive, fields, bindings, origin,
+                )?;
+                if targets != replay {
+                    return Err(SemanticScopeStorageError::new(format!(
+                        "named-value storage index differs from the independent scan replay for named value {} origin {origin_ordinal}",
+                        named_value.id,
+                    )));
+                }
+            }
             if targets.is_empty() {
                 return Err(SemanticScopeStorageError::new(format!(
                     "named value {} origin {origin_ordinal} has no exact semantic storage target",
@@ -3788,7 +4120,254 @@ fn build_named_value_storage(
     Ok(rows)
 }
 
+struct NamedValueStorageIndex {
+    binding_rows: BTreeMap<SemanticBindingId, usize>,
+    targets_by_source: BTreeMap<SemanticSourceId, Vec<SemanticNamedValueStorageTargetV1>>,
+    targets_by_state: BTreeMap<SemanticStateId, Vec<SemanticNamedValueStorageTargetV1>>,
+    targets_by_list: BTreeMap<SemanticListId, Vec<SemanticNamedValueStorageTargetV1>>,
+    fields_by_statement: BTreeMap<SemanticStatementId, Vec<SemanticStorageFieldId>>,
+    fields_by_producer: BTreeMap<SemanticExprId, Vec<SemanticStorageFieldId>>,
+}
+
+impl NamedValueStorageIndex {
+    fn build(
+        fields: &[SemanticStorageFieldV1],
+        bindings: &[SemanticStorageBindingV1],
+    ) -> Result<Self, SemanticScopeStorageError> {
+        let mut index = Self {
+            binding_rows: BTreeMap::new(),
+            targets_by_source: BTreeMap::new(),
+            targets_by_state: BTreeMap::new(),
+            targets_by_list: BTreeMap::new(),
+            fields_by_statement: BTreeMap::new(),
+            fields_by_producer: BTreeMap::new(),
+        };
+        for (row, binding) in bindings.iter().enumerate() {
+            if index.binding_rows.insert(binding.binding, row).is_some() {
+                return Err(SemanticScopeStorageError::new(format!(
+                    "named-value storage index repeats binding {}",
+                    binding.binding,
+                )));
+            }
+            let target = named_value_target_from_binding(binding);
+            match target {
+                SemanticNamedValueStorageTargetV1::Source { source, .. } => {
+                    index
+                        .targets_by_source
+                        .entry(source)
+                        .or_default()
+                        .push(target);
+                }
+                SemanticNamedValueStorageTargetV1::State { state, .. } => {
+                    index
+                        .targets_by_state
+                        .entry(state)
+                        .or_default()
+                        .push(target);
+                }
+                SemanticNamedValueStorageTargetV1::List { list, .. } => {
+                    index.targets_by_list.entry(list).or_default().push(target);
+                }
+                SemanticNamedValueStorageTargetV1::Field { .. }
+                | SemanticNamedValueStorageTargetV1::Value { .. }
+                | SemanticNamedValueStorageTargetV1::DiagnosticOnly { .. } => {}
+            }
+        }
+        for field in fields {
+            if field.reactive_field.is_some()
+                && let Some(statement) = field.statement
+            {
+                index
+                    .fields_by_statement
+                    .entry(statement)
+                    .or_default()
+                    .push(field.id);
+            }
+            if let Some(producer) = field.producer {
+                index
+                    .fields_by_producer
+                    .entry(producer)
+                    .or_default()
+                    .push(field.id);
+            }
+        }
+        Ok(index)
+    }
+}
+
 fn named_value_targets(
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
+    resources: &SemanticResourceGraphV2,
+    reactive: &SemanticReactiveGraphV1,
+    bindings: &[SemanticStorageBindingV1],
+    index: &NamedValueStorageIndex,
+    origin: &crate::SemanticNamedValueTypeOriginV1,
+) -> Result<Vec<SemanticNamedValueStorageTargetV1>, SemanticScopeStorageError> {
+    let mut targets = BTreeSet::new();
+    for binding in &origin.bindings {
+        let storage = index
+            .binding_rows
+            .get(binding)
+            .and_then(|row| bindings.get(*row))
+            .filter(|candidate| candidate.binding == *binding)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "named-value origin references missing storage binding {binding}"
+                ))
+            })?;
+        targets.insert(named_value_target_from_binding(storage));
+    }
+
+    if targets.is_empty() {
+        for source in &origin.sources {
+            let matches = index
+                .targets_by_source
+                .get(source)
+                .cloned()
+                .unwrap_or_default();
+            if matches.is_empty() {
+                return Err(SemanticScopeStorageError::new(format!(
+                    "named-value source {source} has no exact storage binding"
+                )));
+            }
+            targets.extend(matches);
+        }
+        for state in &origin.states {
+            let matches = index
+                .targets_by_state
+                .get(state)
+                .cloned()
+                .unwrap_or_default();
+            if matches.is_empty() {
+                return Err(SemanticScopeStorageError::new(format!(
+                    "named-value state {state} has no exact storage binding"
+                )));
+            }
+            targets.extend(matches);
+        }
+        for list in &origin.lists {
+            let matches = index.targets_by_list.get(list).cloned().unwrap_or_default();
+            if matches.is_empty() {
+                return Err(SemanticScopeStorageError::new(format!(
+                    "named-value list {list} has no exact storage binding"
+                )));
+            }
+            targets.extend(matches);
+        }
+    }
+
+    if targets.is_empty() {
+        for field in origin
+            .statements
+            .iter()
+            .filter_map(|statement| index.fields_by_statement.get(statement))
+            .flatten()
+            .chain(
+                origin
+                    .expressions
+                    .iter()
+                    .filter_map(|expression| index.fields_by_producer.get(expression))
+                    .flatten(),
+            )
+        {
+            targets.insert(SemanticNamedValueStorageTargetV1::Field {
+                binding: None,
+                field: *field,
+            });
+        }
+    }
+
+    if targets.is_empty() {
+        for expression in &origin.expressions {
+            let semantic = require_expression(execution, *expression)?;
+            let matching_fields = index
+                .fields_by_producer
+                .get(expression)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let field = match matching_fields {
+                [] => None,
+                [field] => Some(*field),
+                _ => {
+                    return Err(SemanticScopeStorageError::new(format!(
+                        "named-value expression {expression} resolves to {} storage fields without an exact binding",
+                        matching_fields.len()
+                    )));
+                }
+            };
+            targets.insert(SemanticNamedValueStorageTargetV1::Value {
+                expression: *expression,
+                value: semantic.value_id,
+                field,
+            });
+        }
+    }
+
+    if targets.is_empty()
+        && !origin.statements.is_empty()
+        && origin.expressions.is_empty()
+        && origin.bindings.is_empty()
+        && origin.sources.is_empty()
+        && origin.states.is_empty()
+        && origin.lists.is_empty()
+        && origin.value_list_authorities.is_empty()
+    {
+        let reason = if named_value_origin_is_structural_container(checked, origin)? {
+            SemanticNamedValueDiagnosticOnlyReasonV1::NonExecutableStructuralContainer
+        } else {
+            SemanticNamedValueDiagnosticOnlyReasonV1::NonExecutableCheckedLeaf
+        };
+        targets.insert(SemanticNamedValueStorageTargetV1::DiagnosticOnly { reason });
+    }
+
+    // Exact resource identities above are validated even when an executable
+    // binding was already present; this prevents stale lowering metadata from
+    // silently selecting a different resource instance.
+    for source in &origin.sources {
+        require_source(resources, *source)?;
+    }
+    for state in &origin.states {
+        require_state(resources, *state)?;
+    }
+    for list in &origin.lists {
+        resources
+            .lists
+            .get(list.as_usize())
+            .filter(|candidate| candidate.id == *list)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "named-value origin references missing list {list}"
+                ))
+            })?;
+    }
+    for authority in &origin.value_list_authorities {
+        resources
+            .value_list_authorities
+            .get(authority.as_usize())
+            .filter(|candidate| candidate.id == *authority)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "named-value origin references missing value-list authority {authority}"
+                ))
+            })?;
+    }
+    for binding in &origin.bindings {
+        reactive
+            .bindings
+            .get(binding.as_usize())
+            .filter(|candidate| candidate.id == *binding)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "named-value origin references missing reactive binding {binding}"
+                ))
+            })?;
+    }
+    Ok(targets.into_iter().collect())
+}
+
+#[cfg(test)]
+fn named_value_targets_scan_replay_oracle(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV2,
@@ -3944,9 +4523,6 @@ fn named_value_targets(
         targets.insert(SemanticNamedValueStorageTargetV1::DiagnosticOnly { reason });
     }
 
-    // Exact resource identities above are validated even when an executable
-    // binding was already present; this prevents stale lowering metadata from
-    // silently selecting a different resource instance.
     for source in &origin.sources {
         require_source(resources, *source)?;
     }

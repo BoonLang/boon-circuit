@@ -1311,6 +1311,13 @@ impl<'ast> Visit<'ast> for ProductionIdentifierReferenceCollector<'_> {
         syn::visit::visit_expr_block(self, expression);
     }
 
+    fn visit_expr_macro(&mut self, expression: &'ast syn::ExprMacro) {
+        if cfg_is_test_only(&expression.attrs) {
+            return;
+        }
+        syn::visit::visit_expr_macro(self, expression);
+    }
+
     fn visit_expr_path(&mut self, expression: &'ast syn::ExprPath) {
         if expression
             .path
@@ -1337,6 +1344,8 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     let lowering_path = workspace.join("crates/boon_semantic/src/core_lowering.rs");
     let semantic_image_path = workspace.join("crates/boon_semantic/src/semantic_image.rs");
     let reactive_path = workspace.join("crates/boon_semantic/src/reactive.rs");
+    let resource_path = workspace.join("crates/boon_semantic/src/resource.rs");
+    let storage_path = workspace.join("crates/boon_semantic/src/storage_contract.rs");
     let dependency_manifest_path =
         workspace.join("crates/boon_semantic/src/dependency_manifest.rs");
     for obsolete in [
@@ -1358,6 +1367,8 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     let lowering = read_text(&lowering_path)?;
     let semantic_image = read_text(&semantic_image_path)?;
     let reactive = read_text(&reactive_path)?;
+    let resource = read_text(&resource_path)?;
+    let storage = read_text(&storage_path)?;
     let dependency_manifest = read_text(&dependency_manifest_path)?;
     syn::parse_file(&ir)
         .map_err(|error| format!("cannot parse `{}`: {error}", ir_path.display()))?;
@@ -1367,6 +1378,12 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         .map_err(|error| format!("cannot parse `{}`: {error}", semantic_image_path.display()))?;
     let reactive_syntax = syn::parse_file(&reactive)
         .map_err(|error| format!("cannot parse `{}`: {error}", reactive_path.display()))?;
+    let semantic_syntax = syn::parse_file(&semantic)
+        .map_err(|error| format!("cannot parse `{}`: {error}", semantic_path.display()))?;
+    let resource_syntax = syn::parse_file(&resource)
+        .map_err(|error| format!("cannot parse `{}`: {error}", resource_path.display()))?;
+    let storage_syntax = syn::parse_file(&storage)
+        .map_err(|error| format!("cannot parse `{}`: {error}", storage_path.display()))?;
     let dependency_manifest_syntax = syn::parse_file(&dependency_manifest).map_err(|error| {
         format!(
             "cannot parse `{}`: {error}",
@@ -1589,6 +1606,57 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
             return Err(format!(
                 "dependency manifest retains deleted construction-row replay `{forbidden}`"
             ));
+        }
+    }
+    for required in [
+        "#[cfg(test)]\nfn build_row_values_epoch_replay_oracle",
+        "row-value worklist differs from the independent epoch replay oracle",
+        "struct NamedValueStorageIndex",
+        "#[cfg(test)]\nfn named_value_targets_scan_replay_oracle",
+        "named-value storage index differs from the independent scan replay",
+        "let mut consumers = vec![Vec::<SemanticExprId>::new(); execution.expressions.len()]",
+        "let mut queue = execution",
+    ] {
+        if !storage.contains(required) {
+            return Err(format!(
+                "semantic storage omits direct indexed convergence proof `{required}`"
+            ));
+        }
+    }
+    let mut row_value_replay_references =
+        ProductionIdentifierReferenceCollector::new("build_row_values_epoch_replay_oracle");
+    row_value_replay_references.visit_file(&storage_syntax);
+    if !row_value_replay_references.references.is_empty() {
+        return Err(format!(
+            "production storage construction replays row-value epochs at {:?}",
+            row_value_replay_references.references,
+        ));
+    }
+    let mut named_value_replay_references =
+        ProductionIdentifierReferenceCollector::new("named_value_targets_scan_replay_oracle");
+    named_value_replay_references.visit_file(&storage_syntax);
+    if !named_value_replay_references.references.is_empty() {
+        return Err(format!(
+            "production storage construction replays named-value scans at {:?}",
+            named_value_replay_references.references,
+        ));
+    }
+    for replay in [
+        "validate_checked_list_classification",
+        "validate_checked_resource_provenance",
+    ] {
+        for (owner, syntax) in [
+            ("resource construction", &resource_syntax),
+            ("semantic validation", &semantic_syntax),
+        ] {
+            let mut references = ProductionIdentifierReferenceCollector::new(replay);
+            references.visit_file(syntax);
+            if !references.references.is_empty() {
+                return Err(format!(
+                    "production {owner} retains checked resource replay `{replay}` at {:?}",
+                    references.references,
+                ));
+            }
         }
     }
     for forbidden in [

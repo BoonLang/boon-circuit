@@ -4330,6 +4330,27 @@ and directional speed win, but it does not yet satisfy the 80 ms verified
 latency floor or the structural exit: the rich resource and storage builders
 still exist.
 
+The materialization row-scope solver now follows the same direct convergence
+rule. It discovers exact reverse consumers while evaluating the semantic
+projection equations, then propagates only newly inserted row-scope facts until
+the queue is empty. The previous production algorithm cloned all 16,312 scope
+sets and rescanned every semantic expression by epochs under an arbitrary
+insertion budget. It remains only as a `cfg(test)` replay oracle. On NovyWave
+the direct solver discovers 8,400 dependency edges, performs 16,399 activations
+for 16,312 expressions, and publishes 763 facts; the architecture gate forbids
+a production call back to the epoch implementation.
+
+Ten exact-source stable-release observations now have medians of 696.773 ms
+diagnostics, 2,749.789 ms verified, 1,070.307 ms semantic construction, and
+0.495 ms WHERE verification. The verified range is
+2,703.299--2,883.541 ms. Relative to the direct-seal checkpoint this is a
+103.388 ms verified and 109.081 ms semantic improvement. A traced sample puts
+the resource phase at 29.526 ms and materialization row binding at 6.515 ms,
+down from 74.692 and 51.461 ms respectively after the first simplification.
+The 80 ms cumulative latency gate is therefore met; eliminating the remaining
+rich resource/storage reconstruction is still mandatory for the template
+milestone.
+
 The next speed-bearing cut therefore skips standalone storage dependency
 publication. Add one definition-owned resource and symbolic row-storage
 template beside the existing execution template, instantiate it through compact
@@ -4342,9 +4363,9 @@ boundary; after the preliminary deletions the remaining directly observed
 ceiling is about 74.7 + 108.8 ms. Accept the complete template cut only with
 exact resource/storage graph and MachinePlan parity, no production rich-graph
 reconstruction, and a cumulative improvement of at least 80 ms from the direct
-seal checkpoint. The current exact-source median is about 59 ms faster, so both
-the latency and ownership gates remain open. Merely relocating the roughly
-10--30 ms storage inventory is not this exit.
+seal checkpoint. The current exact-source median is about 103 ms faster, so the
+latency gate is closed while the ownership/deletion gate remains open. Merely
+relocating the roughly 10--30 ms storage inventory is not this exit.
 
 Updating the architecture gate exposed two stale classifier entries from the
 definition-template checkpoint. `InvalidDefinitionTemplate` and the three

@@ -30,7 +30,8 @@ use boon_checked::{
     FlowType, Type,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 pub const SEMANTIC_RESOURCE_GRAPH_SCHEMA_V2: &str = "boon.semantic-resource-graph.v2";
@@ -2846,10 +2847,20 @@ fn statement_value_for_expression(
     Ok(Some(preferred.value))
 }
 
-fn semantic_storage_scopes(
+struct SemanticStorageScopeInputs {
+    statement_values: BTreeMap<DeclId, Vec<StatementValueOccurrence>>,
+    scopes_by_declaration: BTreeMap<DeclId, SemanticRowScopeId>,
+    scopes_by_path: BTreeMap<String, SemanticRowScopeId>,
+    declarations_by_scope: BTreeMap<SemanticRowScopeId, Vec<DeclId>>,
+    materializations_by_local:
+        BTreeMap<(StaticOwnerId, crate::SemanticMaterializationLocalId), SemanticMaterializationId>,
+    local_values: BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
+}
+
+fn semantic_storage_scope_inputs(
     execution: &SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
-) -> Result<Vec<BTreeSet<SemanticRowScopeId>>, String> {
+) -> Result<SemanticStorageScopeInputs, String> {
     let mut scopes_by_declaration = BTreeMap::new();
     let mut scopes_by_path = BTreeMap::new();
     let mut declarations_by_scope = BTreeMap::<SemanticRowScopeId, Vec<DeclId>>::new();
@@ -2876,9 +2887,6 @@ fn semantic_storage_scopes(
             .push(list.declaration);
     }
 
-    let statement_values = statement_value_occurrences(execution)?;
-    let local_values = semantic_local_values(execution)?;
-
     let mut materializations_by_local = BTreeMap::new();
     for materialization in &execution.materializations {
         let key = (materialization.owner, materialization.row_local);
@@ -2892,6 +2900,106 @@ fn semantic_storage_scopes(
         }
     }
 
+    Ok(SemanticStorageScopeInputs {
+        statement_values: statement_value_occurrences(execution)?,
+        scopes_by_declaration,
+        scopes_by_path,
+        declarations_by_scope,
+        materializations_by_local,
+        local_values: semantic_local_values(execution)?,
+    })
+}
+
+fn semantic_storage_scopes(
+    execution: &SemanticExecutionImageColumnsV1,
+    lists: &[SemanticListResourceV1],
+) -> Result<Vec<BTreeSet<SemanticRowScopeId>>, String> {
+    let inputs = semantic_storage_scope_inputs(execution, lists)?;
+    let mut scopes = vec![BTreeSet::new(); execution.expressions.len()];
+    let mut consumers = vec![BTreeSet::<SemanticExprId>::new(); execution.expressions.len()];
+    let mut queue = execution
+        .expressions
+        .iter()
+        .map(|expression| expression.id)
+        .collect::<VecDeque<_>>();
+    let mut queued = vec![true; execution.expressions.len()];
+    let mut activations = 0usize;
+    let mut dependency_edges = 0usize;
+    while let Some(expression_id) = queue.pop_front() {
+        let expression_index = expression_id.as_usize();
+        execution
+            .expressions
+            .get(expression_index)
+            .filter(|expression| expression.id == expression_id)
+            .ok_or_else(|| format!("missing semantic expression {expression_id}"))?;
+        queued[expression_index] = false;
+        activations = activations
+            .checked_add(1)
+            .ok_or_else(|| "semantic storage-scope activation count overflowed".to_owned())?;
+        let dependencies = RefCell::new(BTreeSet::new());
+        let resolved = semantic_expression_storage_scopes(
+            execution,
+            expression_id,
+            &scopes,
+            &inputs,
+            &dependencies,
+        )?;
+        for dependency in dependencies.into_inner() {
+            let dependency_index = dependency.as_usize();
+            let dependency_consumers = consumers.get_mut(dependency_index).ok_or_else(|| {
+                format!(
+                    "storage-scope expression {expression_id} depends on missing expression {dependency}"
+                )
+            })?;
+            if dependency_consumers.insert(expression_id) {
+                dependency_edges = dependency_edges
+                    .checked_add(1)
+                    .ok_or_else(|| "semantic storage-scope edge count overflowed".to_owned())?;
+            }
+        }
+        let current = scopes
+            .get_mut(expression_index)
+            .ok_or_else(|| format!("missing semantic expression {expression_id}"))?;
+        let before = current.len();
+        current.extend(resolved);
+        if current.len() != before {
+            for consumer in &consumers[expression_index] {
+                let consumer_index = consumer.as_usize();
+                if !queued[consumer_index] {
+                    queue.push_back(*consumer);
+                    queued[consumer_index] = true;
+                }
+            }
+        }
+    }
+    if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
+        eprintln!(
+            "boon_semantic resource storage_scopes:work expressions={} edges={} activations={} facts={}",
+            execution.expressions.len(),
+            dependency_edges,
+            activations,
+            scopes.iter().map(BTreeSet::len).sum::<usize>(),
+        );
+    }
+    #[cfg(test)]
+    {
+        let replay = semantic_storage_scopes_epoch_replay_oracle(execution, lists, &inputs)?;
+        if replay != scopes {
+            return Err(
+                "semantic storage-scope worklist differs from the independent epoch replay oracle"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(scopes)
+}
+
+#[cfg(test)]
+fn semantic_storage_scopes_epoch_replay_oracle(
+    execution: &SemanticExecutionImageColumnsV1,
+    lists: &[SemanticListResourceV1],
+    inputs: &SemanticStorageScopeInputs,
+) -> Result<Vec<BTreeSet<SemanticRowScopeId>>, String> {
     let mut scopes = vec![BTreeSet::new(); execution.expressions.len()];
     let maximum_insertions = execution
         .expressions
@@ -2906,12 +3014,8 @@ fn semantic_storage_scopes(
                 execution,
                 expression.id,
                 &snapshot,
-                &statement_values,
-                &scopes_by_declaration,
-                &scopes_by_path,
-                &declarations_by_scope,
-                &materializations_by_local,
-                &local_values,
+                inputs,
+                &RefCell::new(BTreeSet::new()),
             )?;
             let current = scopes
                 .get_mut(expression.id.as_usize())
@@ -2920,7 +3024,7 @@ fn semantic_storage_scopes(
                 if current.insert(scope) {
                     if remaining_insertions == 0 {
                         return Err(
-                            "semantic storage-scope resolution exceeded its bounded fixed-point budget"
+                            "semantic storage-scope replay exceeded its bounded fixed-point budget"
                                 .to_owned(),
                         );
                     }
@@ -2930,10 +3034,9 @@ fn semantic_storage_scopes(
             }
         }
         if !changed {
-            break;
+            return Ok(scopes);
         }
     }
-    Ok(scopes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2941,18 +3044,12 @@ fn semantic_expression_storage_scopes(
     execution: &SemanticExecutionImageColumnsV1,
     id: SemanticExprId,
     scopes: &[BTreeSet<SemanticRowScopeId>],
-    statement_values: &BTreeMap<DeclId, Vec<StatementValueOccurrence>>,
-    scopes_by_declaration: &BTreeMap<DeclId, SemanticRowScopeId>,
-    scopes_by_path: &BTreeMap<String, SemanticRowScopeId>,
-    declarations_by_scope: &BTreeMap<SemanticRowScopeId, Vec<DeclId>>,
-    materializations_by_local: &BTreeMap<
-        (StaticOwnerId, crate::SemanticMaterializationLocalId),
-        SemanticMaterializationId,
-    >,
-    local_values: &BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
+    inputs: &SemanticStorageScopeInputs,
+    dependencies: &RefCell<BTreeSet<SemanticExprId>>,
 ) -> Result<BTreeSet<SemanticRowScopeId>, String> {
     let value = expression(execution, id)?;
     let child_scopes = |child: SemanticExprId| -> Result<BTreeSet<SemanticRowScopeId>, String> {
+        dependencies.borrow_mut().insert(child);
         scopes
             .get(child.as_usize())
             .filter(|_| {
@@ -2969,14 +3066,14 @@ fn semantic_expression_storage_scopes(
                              projection: &[String]|
      -> Result<BTreeSet<SemanticRowScopeId>, String> {
         let projected_path = semantic_canonical_read_path(path, projection);
-        if let Some(scope) = scopes_by_path.get(&projected_path) {
+        if let Some(scope) = inputs.scopes_by_path.get(&projected_path) {
             return Ok(BTreeSet::from([*scope]));
         }
-        if let Some(scope) = scopes_by_declaration.get(&target) {
+        if let Some(scope) = inputs.scopes_by_declaration.get(&target) {
             return Ok(BTreeSet::from([*scope]));
         }
         let Some(producer) =
-            statement_value_for_expression(execution, statement_values, target, id)?
+            statement_value_for_expression(execution, &inputs.statement_values, target, id)?
         else {
             return Ok(BTreeSet::new());
         };
@@ -2985,12 +3082,8 @@ fn semantic_expression_storage_scopes(
             producer,
             projection.to_vec(),
             scopes,
-            statement_values,
-            scopes_by_declaration,
-            scopes_by_path,
-            declarations_by_scope,
-            materializations_by_local,
-            local_values,
+            inputs,
+            dependencies,
         )
     };
     let resolve_chunk_items =
@@ -3004,7 +3097,8 @@ fn semantic_expression_storage_scopes(
             let Some(chunk_scope) = chunk_scopes.into_iter().next() else {
                 return Ok(BTreeSet::new());
             };
-            let declarations = declarations_by_scope
+            let declarations = inputs
+                .declarations_by_scope
                 .get(&chunk_scope)
                 .cloned()
                 .unwrap_or_default();
@@ -3017,8 +3111,12 @@ fn semantic_expression_storage_scopes(
                     ))
                 };
             };
-            let Some(producer) =
-                statement_value_for_expression(execution, statement_values, *declaration, id)?
+            let Some(producer) = statement_value_for_expression(
+                execution,
+                &inputs.statement_values,
+                *declaration,
+                id,
+            )?
             else {
                 return Ok(BTreeSet::new());
             };
@@ -3078,7 +3176,8 @@ fn semantic_expression_storage_scopes(
             projection,
             ..
         } => {
-            let materialization = materializations_by_local
+            let materialization = inputs
+                .materializations_by_local
                 .get(&(*owner, *local))
                 .copied()
                 .ok_or_else(|| {
@@ -3119,23 +3218,16 @@ fn semantic_expression_storage_scopes(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn semantic_projected_storage_scopes(
     execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
     projection: Vec<String>,
     scopes: &[BTreeSet<SemanticRowScopeId>],
-    statement_values: &BTreeMap<DeclId, Vec<StatementValueOccurrence>>,
-    scopes_by_declaration: &BTreeMap<DeclId, SemanticRowScopeId>,
-    scopes_by_path: &BTreeMap<String, SemanticRowScopeId>,
-    declarations_by_scope: &BTreeMap<SemanticRowScopeId, Vec<DeclId>>,
-    materializations_by_local: &BTreeMap<
-        (StaticOwnerId, crate::SemanticMaterializationLocalId),
-        SemanticMaterializationId,
-    >,
-    local_values: &BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
+    inputs: &SemanticStorageScopeInputs,
+    dependencies: &RefCell<BTreeSet<SemanticExprId>>,
 ) -> Result<BTreeSet<SemanticRowScopeId>, String> {
     let child_scopes = |child: SemanticExprId| -> Result<BTreeSet<SemanticRowScopeId>, String> {
+        dependencies.borrow_mut().insert(child);
         scopes
             .get(child.as_usize())
             .filter(|_| {
@@ -3176,13 +3268,16 @@ fn semantic_projected_storage_scopes(
                 let mut combined = read_projection.clone();
                 combined.extend(projection);
                 let projected_path = semantic_canonical_read_path(path, &combined);
-                if let Some(scope) = scopes_by_path.get(&projected_path) {
+                if let Some(scope) = inputs.scopes_by_path.get(&projected_path) {
                     resolved.insert(*scope);
-                } else if let Some(scope) = scopes_by_declaration.get(target) {
+                } else if let Some(scope) = inputs.scopes_by_declaration.get(target) {
                     resolved.insert(*scope);
-                } else if let Some(producer) =
-                    statement_value_for_expression(execution, statement_values, *target, id)?
-                {
+                } else if let Some(producer) = statement_value_for_expression(
+                    execution,
+                    &inputs.statement_values,
+                    *target,
+                    id,
+                )? {
                     pending.push((producer, combined));
                 }
             }
@@ -3191,7 +3286,8 @@ fn semantic_projected_storage_scopes(
                 declaration,
                 projection: read_projection,
             } => {
-                let (local_declaration, producer) = local_values
+                let (local_declaration, producer) = inputs
+                    .local_values
                     .get(binding)
                     .ok_or_else(|| format!("projected storage scope misses local {binding}"))?;
                 if local_declaration != declaration {
@@ -3290,7 +3386,8 @@ fn semantic_projected_storage_scopes(
                 projection: local_projection,
                 ..
             } => {
-                let materialization = materializations_by_local
+                let materialization = inputs
+                    .materializations_by_local
                     .get(&(*owner, *local))
                     .copied()
                     .ok_or_else(|| {
@@ -3316,8 +3413,8 @@ fn semantic_projected_storage_scopes(
                         id,
                         child_scopes(source)?,
                         scopes,
-                        statement_values,
-                        declarations_by_scope,
+                        inputs,
+                        dependencies,
                     )?);
                 }
             }
@@ -3354,8 +3451,8 @@ fn semantic_chunk_item_storage_scopes(
     consumer: SemanticExprId,
     chunk_scopes: BTreeSet<SemanticRowScopeId>,
     scopes: &[BTreeSet<SemanticRowScopeId>],
-    statement_values: &BTreeMap<DeclId, Vec<StatementValueOccurrence>>,
-    declarations_by_scope: &BTreeMap<SemanticRowScopeId, Vec<DeclId>>,
+    inputs: &SemanticStorageScopeInputs,
+    dependencies: &RefCell<BTreeSet<SemanticExprId>>,
 ) -> Result<BTreeSet<SemanticRowScopeId>, String> {
     if chunk_scopes.len() > 1 {
         return Err(format!(
@@ -3365,7 +3462,8 @@ fn semantic_chunk_item_storage_scopes(
     let Some(chunk_scope) = chunk_scopes.into_iter().next() else {
         return Ok(BTreeSet::new());
     };
-    let declarations = declarations_by_scope
+    let declarations = inputs
+        .declarations_by_scope
         .get(&chunk_scope)
         .cloned()
         .unwrap_or_default();
@@ -3378,8 +3476,12 @@ fn semantic_chunk_item_storage_scopes(
             ))
         };
     };
-    let Some(producer) =
-        statement_value_for_expression(execution, statement_values, *declaration, consumer)?
+    let Some(producer) = statement_value_for_expression(
+        execution,
+        &inputs.statement_values,
+        *declaration,
+        consumer,
+    )?
     else {
         return Ok(BTreeSet::new());
     };
@@ -3395,6 +3497,7 @@ fn semantic_chunk_item_storage_scopes(
     let source = call_argument(arguments, "list").ok_or_else(|| {
         format!("typed List/chunk producer {producer} has no canonical `list` argument")
     })?;
+    dependencies.borrow_mut().insert(source);
     scopes
         .get(source.as_usize())
         .filter(|_| {

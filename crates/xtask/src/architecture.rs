@@ -1659,6 +1659,27 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
             }
         }
     }
+    for required in [
+        "#[cfg(test)]\nfn semantic_storage_scopes_epoch_replay_oracle",
+        "semantic storage-scope worklist differs from the independent epoch replay oracle",
+        "boon_semantic resource storage_scopes:work",
+        "let mut consumers = vec![BTreeSet::<SemanticExprId>::new(); execution.expressions.len()]",
+    ] {
+        if !resource.contains(required) {
+            return Err(format!(
+                "semantic resource construction omits direct row-scope convergence proof `{required}`"
+            ));
+        }
+    }
+    let mut resource_scope_replay_references =
+        ProductionIdentifierReferenceCollector::new("semantic_storage_scopes_epoch_replay_oracle");
+    resource_scope_replay_references.visit_file(&resource_syntax);
+    if !resource_scope_replay_references.references.is_empty() {
+        return Err(format!(
+            "production resource construction replays storage-scope epochs at {:?}",
+            resource_scope_replay_references.references,
+        ));
+    }
     for forbidden in [
         "fn validate_totality(",
         "fn validate_callable_and_call_inventory(",

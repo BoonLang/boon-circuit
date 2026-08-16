@@ -4829,6 +4829,17 @@ pub(crate) fn compile_erased_program_with_distributed_context(
     distributed: &DistributedMachineContext,
 ) -> Result<MachinePlan, PlanError> {
     let backend_started = Instant::now();
+    let trace_backend = std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some();
+    let mut backend_phase_started = Instant::now();
+    let mut trace_backend_phase = |phase: &str| {
+        if trace_backend {
+            eprintln!(
+                "boon_compiler backend {phase}: {:.3}ms",
+                elapsed_ms(backend_phase_started)
+            );
+        }
+        backend_phase_started = Instant::now();
+    };
     let effects = effect_contracts(program)?;
     let mut effect_outbox = effect_outbox_schemas(&effects)?;
     let authority_field_ids = list_authority_field_ids(program);
@@ -5118,6 +5129,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         }
     }
     let mut derived_ops = Vec::new();
+    trace_backend_phase("setup");
     let mut materialized_row_outputs = BTreeSet::new();
     let mut split_pulse_outputs = BTreeMap::<usize, Vec<ValueRef>>::new();
     for (derived_index, derived) in program.derived_values.iter().enumerate() {
@@ -5473,6 +5485,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
             unresolved,
         ));
     }
+    trace_backend_phase("derived_values");
     let mut update_ops = program
         .state_update_arms
         .iter()
@@ -5711,6 +5724,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
             )));
         }
     }
+    trace_backend_phase("state_and_effect_updates");
     let list_mutation_ops = program
         .list_mutations
         .iter()
@@ -5888,6 +5902,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         })
         .collect::<Result<Vec<_>, PlanError>>()?;
 
+    trace_backend_phase("list_mutations");
     let list_projection_ops = program
         .list_projections
         .iter()
@@ -5951,6 +5966,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         })
         .collect::<Vec<_>>();
 
+    trace_backend_phase("list_projections");
     let dependency_ops = program
         .dependencies
         .iter()
@@ -5974,6 +5990,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         })
         .collect::<Vec<_>>();
 
+    trace_backend_phase("dependencies");
     let mut regions = vec![
         region(0, RegionKind::SourceRouting, source_ops),
         region(1, RegionKind::DerivedEvaluation, derived_ops),
@@ -5992,6 +6009,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         operation.synchronize_expression_inputs(&row_expressions)?;
     }
     let root_computation_fields = root_computation_fields(&regions);
+    trace_backend_phase("region_link");
     let document_started = Instant::now();
     if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
         eprintln!(

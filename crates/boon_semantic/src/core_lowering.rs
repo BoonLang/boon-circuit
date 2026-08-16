@@ -51,6 +51,20 @@ use program_core::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+macro_rules! core_lowering_phase {
+    ($trace:expr, $name:literal, $body:expr) => {{
+        let started = $trace.then(std::time::Instant::now);
+        let output = $body;
+        if let Some(started) = started {
+            eprintln!(
+                concat!("boon_semantic canonical_core ", $name, " elapsed_ms={:.3}"),
+                started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
+        output
+    }};
+}
+
 type ExecutableCallInstanceMap = BTreeMap<OutCallInstanceId, usize>;
 type ExecutableCallContextMap = BTreeMap<SemanticCallContextId, ExecutableCallContextId>;
 type AllocatedCallIdentities = (ExecutableCallInstanceMap, ExecutableCallContextMap);
@@ -1560,106 +1574,145 @@ fn map_semantic_execution_with_external_events(
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
     receipts: &mut crate::semantic_image::ExecutionReceiptPublisherV3<'_>,
 ) -> Result<MappedSemanticExecution, String> {
-    let id_map = SemanticToExecutableMap::allocate_with_external_events(
-        graph,
-        resources,
-        external_event_identities,
+    let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+    let id_map = core_lowering_phase!(
+        trace,
+        "execution.allocate",
+        SemanticToExecutableMap::allocate_with_external_events(
+            graph,
+            resources,
+            external_event_identities,
+        )
     )?;
-    receipts.publish_scopes(graph)?;
-    let mut expressions = Vec::with_capacity(graph.expressions.len());
-    for semantic in &graph.expressions {
-        let executable = map_expression(graph, &id_map, semantic)?;
-        if executable.id.as_usize() != semantic.id.as_usize() {
-            return Err(format!(
-                "execution expression {} maps to non-dense executable {}",
-                semantic.id, executable.id
-            ));
+    core_lowering_phase!(trace, "execution.scopes", receipts.publish_scopes(graph))?;
+    let expressions = core_lowering_phase!(trace, "execution.map_expressions", {
+        let mut expressions = Vec::with_capacity(graph.expressions.len());
+        for semantic in &graph.expressions {
+            let executable = map_expression(graph, &id_map, semantic)?;
+            if executable.id.as_usize() != semantic.id.as_usize() {
+                return Err(format!(
+                    "execution expression {} maps to non-dense executable {}",
+                    semantic.id, executable.id
+                ));
+            }
+            expressions.push(executable);
         }
-        receipts.publish_expression(graph, semantic, &executable)?;
-        expressions.push(executable);
-    }
-    let mut statements = Vec::with_capacity(graph.statements.len());
-    for semantic in &graph.statements {
-        let executable = map_statement(&id_map, semantic)?;
-        if executable.id.as_usize() != semantic.id.as_usize() {
-            return Err(format!(
-                "execution statement {} maps to non-dense executable {}",
-                semantic.id, executable.id
-            ));
+        Ok::<_, String>(expressions)
+    })?;
+    core_lowering_phase!(trace, "execution.publish_expressions", {
+        for (semantic, executable) in graph.expressions.iter().zip(&expressions) {
+            receipts.publish_expression(graph, semantic, executable)?;
         }
-        receipts.publish_statement(graph, semantic, &executable)?;
-        statements.push(executable);
-    }
-    receipts.publish_callables_and_calls(graph)?;
+        Ok::<_, String>(())
+    })?;
+    let statements = core_lowering_phase!(trace, "execution.map_statements", {
+        let mut statements = Vec::with_capacity(graph.statements.len());
+        for semantic in &graph.statements {
+            let executable = map_statement(&id_map, semantic)?;
+            if executable.id.as_usize() != semantic.id.as_usize() {
+                return Err(format!(
+                    "execution statement {} maps to non-dense executable {}",
+                    semantic.id, executable.id
+                ));
+            }
+            statements.push(executable);
+        }
+        Ok::<_, String>(statements)
+    })?;
+    core_lowering_phase!(trace, "execution.publish_statements", {
+        for (semantic, executable) in graph.statements.iter().zip(&statements) {
+            receipts.publish_statement(graph, semantic, executable)?;
+        }
+        Ok::<_, String>(())
+    })?;
+    core_lowering_phase!(
+        trace,
+        "execution.callables_calls",
+        receipts.publish_callables_and_calls(graph)
+    )?;
 
-    let mut call_occurrences = Vec::with_capacity(graph.call_occurrences.len());
-    for semantic in &graph.call_occurrences {
-        let executable = ExecutableCallOccurrence {
-            id: id_map.call_instance(semantic.id)?,
-            parent: semantic
-                .parent
-                .map(|parent| id_map.call_instance(parent))
-                .transpose()?,
-            checked_call: semantic
-                .call
-                .map(|call| semantic_call(graph, call).map(|call| call.checked_call))
-                .transpose()?,
-            context_ordinals: semantic.context_ordinals.clone(),
-        };
-        if executable.id != semantic.id.as_usize() {
-            return Err(format!(
-                "call occurrence {} maps to executable {}",
-                semantic.id, executable.id
-            ));
+    let call_occurrences = core_lowering_phase!(trace, "execution.call_occurrences", {
+        let mut call_occurrences = Vec::with_capacity(graph.call_occurrences.len());
+        for semantic in &graph.call_occurrences {
+            let executable = ExecutableCallOccurrence {
+                id: id_map.call_instance(semantic.id)?,
+                parent: semantic
+                    .parent
+                    .map(|parent| id_map.call_instance(parent))
+                    .transpose()?,
+                checked_call: semantic
+                    .call
+                    .map(|call| semantic_call(graph, call).map(|call| call.checked_call))
+                    .transpose()?,
+                context_ordinals: semantic.context_ordinals.clone(),
+            };
+            if executable.id != semantic.id.as_usize() {
+                return Err(format!(
+                    "call occurrence {} maps to executable {}",
+                    semantic.id, executable.id
+                ));
+            }
+            receipts.publish_call_occurrence(graph, semantic, &executable)?;
+            call_occurrences.push(executable);
         }
-        receipts.publish_call_occurrence(graph, semantic, &executable)?;
-        call_occurrences.push(executable);
-    }
+        Ok::<_, String>(call_occurrences)
+    })?;
 
-    let mut sources = Vec::with_capacity(graph.sources.len());
-    for semantic in &graph.sources {
-        let executable = map_source(&id_map, semantic)?;
-        receipts.publish_source(semantic, &executable)?;
-        sources.push(executable);
-    }
-    let mut states = Vec::with_capacity(graph.states.len());
-    for semantic in &graph.states {
-        let executable = map_state(&id_map, semantic)?;
-        receipts.publish_state(semantic, &executable)?;
-        states.push(executable);
-    }
-    let mut roots = Vec::with_capacity(graph.roots.len());
-    for semantic in &graph.roots {
-        let executable = map_root(graph, &id_map, semantic)?;
-        receipts.publish_root(semantic, &executable)?;
-        roots.push(executable);
-    }
-    let mut functions = Vec::with_capacity(graph.functions.len());
-    for (index, semantic) in graph.functions.iter().enumerate() {
-        let executable = map_function(graph, &id_map, semantic)?;
-        receipts.publish_function(graph, semantic, &executable, index)?;
-        functions.push(executable);
-    }
-    let ordinary_functions = graph
-        .callables
-        .iter()
-        .filter(|callable| callable.semantic_root.is_some())
-        .map(|callable| map_ordinary_function(&id_map, callable))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut materializations = Vec::with_capacity(graph.materializations.len());
-    for semantic in &graph.materializations {
-        let binding = resources
-            .materialization_binding(semantic.id)
-            .ok_or_else(|| {
-                format!(
-                    "semantic materialization {} has no resource binding",
-                    semantic.id
-                )
-            })?;
-        let executable = map_materialization(&id_map, semantic, binding)?;
-        receipts.publish_materialization(semantic, &executable)?;
-        materializations.push(executable);
-    }
+    let (sources, states, roots, functions, ordinary_functions, materializations) =
+        core_lowering_phase!(trace, "execution.remaining", {
+            let mut sources = Vec::with_capacity(graph.sources.len());
+            for semantic in &graph.sources {
+                let executable = map_source(&id_map, semantic)?;
+                receipts.publish_source(semantic, &executable)?;
+                sources.push(executable);
+            }
+            let mut states = Vec::with_capacity(graph.states.len());
+            for semantic in &graph.states {
+                let executable = map_state(&id_map, semantic)?;
+                receipts.publish_state(semantic, &executable)?;
+                states.push(executable);
+            }
+            let mut roots = Vec::with_capacity(graph.roots.len());
+            for semantic in &graph.roots {
+                let executable = map_root(graph, &id_map, semantic)?;
+                receipts.publish_root(semantic, &executable)?;
+                roots.push(executable);
+            }
+            let mut functions = Vec::with_capacity(graph.functions.len());
+            for (index, semantic) in graph.functions.iter().enumerate() {
+                let executable = map_function(graph, &id_map, semantic)?;
+                receipts.publish_function(graph, semantic, &executable, index)?;
+                functions.push(executable);
+            }
+            let ordinary_functions = graph
+                .callables
+                .iter()
+                .filter(|callable| callable.semantic_root.is_some())
+                .map(|callable| map_ordinary_function(&id_map, callable))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut materializations = Vec::with_capacity(graph.materializations.len());
+            for semantic in &graph.materializations {
+                let binding = resources
+                    .materialization_binding(semantic.id)
+                    .ok_or_else(|| {
+                        format!(
+                            "semantic materialization {} has no resource binding",
+                            semantic.id
+                        )
+                    })?;
+                let executable = map_materialization(&id_map, semantic, binding)?;
+                receipts.publish_materialization(semantic, &executable)?;
+                materializations.push(executable);
+            }
+            Ok::<_, String>((
+                sources,
+                states,
+                roots,
+                functions,
+                ordinary_functions,
+                materializations,
+            ))
+        })?;
     let static_owners = graph
         .static_owners
         .iter()
@@ -7221,13 +7274,22 @@ pub(crate) fn build_canonical_program_core(
     memory_graph: &crate::SemanticMemoryGraphV1,
     mut receipts: crate::semantic_image::ExecutionReceiptPublisherV3<'_>,
 ) -> Result<CanonicalProgramCoreBuildV2, String> {
-    let mapped = map_semantic_execution_with_reactive(
-        execution_graph,
-        resource_graph,
-        reactive_graph,
-        &mut receipts,
+    let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+    let mapped = core_lowering_phase!(
+        trace,
+        "execution",
+        map_semantic_execution_with_reactive(
+            execution_graph,
+            resource_graph,
+            reactive_graph,
+            &mut receipts,
+        )
     )?;
-    let resources = map_semantic_resources(execution_graph, resource_graph, &mapped.id_map)?;
+    let resources = core_lowering_phase!(
+        trace,
+        "resources",
+        map_semantic_resources(execution_graph, resource_graph, &mapped.id_map)
+    )?;
     finish_canonical_program_core(
         execution_graph,
         resource_graph,
@@ -7255,24 +7317,37 @@ fn finish_canonical_program_core(
     resources: MappedSemanticResources,
     mut receipts: crate::semantic_image::ExecutionReceiptPublisherV3<'_>,
 ) -> Result<CanonicalProgramCoreBuildV2, String> {
+    let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     let mut resources = resources;
-    let reactive = map_semantic_reactive(
-        execution_graph,
-        resource_graph,
-        reactive_graph,
-        &mapped.id_map,
-        &resources,
+    let reactive = core_lowering_phase!(
+        trace,
+        "reactive",
+        map_semantic_reactive(
+            execution_graph,
+            resource_graph,
+            reactive_graph,
+            &mapped.id_map,
+            &resources,
+        )
     )?;
-    let storage = map_semantic_storage_join(
-        execution_graph,
-        resource_graph,
-        reactive_graph,
-        scope_storage_graph,
-        &mapped.id_map,
-        &resources,
-        &reactive,
+    let storage = core_lowering_phase!(
+        trace,
+        "storage",
+        map_semantic_storage_join(
+            execution_graph,
+            resource_graph,
+            reactive_graph,
+            scope_storage_graph,
+            &mapped.id_map,
+            &resources,
+            &reactive,
+        )
     )?;
-    bind_list_initializer_inputs(&mut resources.lists, &storage)?;
+    core_lowering_phase!(
+        trace,
+        "list_initializer_inputs",
+        bind_list_initializer_inputs(&mut resources.lists, &storage)
+    )?;
     if mapped.static_owners.len() != storage.owners.len()
         || mapped
             .static_owners
@@ -7288,36 +7363,76 @@ fn finish_canonical_program_core(
                 .to_owned(),
         );
     }
-    let (mapped_role_references, external_value_references, external_call_references) =
-        map_distributed_references(execution_graph, &mapped, &storage)?;
-    let reads = finalize_storage_reads(&storage, &resources, &external_value_references)?;
-    let dependency_uses = finalize_storage_dependency_uses(&storage, &external_call_references)?;
-    let output_values = map_output_values(lowering_contract, &mapped.id_map, &storage.id_map)?;
-    let host_ports = map_host_ports(lowering_contract);
-    let view_bindings = map_view_bindings(
-        view_binding_graph,
-        &mapped.id_map,
-        &storage.id_map,
-        &storage,
+    let linked = core_lowering_phase!(
+        trace,
+        "link",
+        (|| -> Result<_, String> {
+            let (mapped_role_references, external_value_references, external_call_references) =
+                map_distributed_references(execution_graph, &mapped, &storage)?;
+            let reads = finalize_storage_reads(&storage, &resources, &external_value_references)?;
+            let dependency_uses =
+                finalize_storage_dependency_uses(&storage, &external_call_references)?;
+            let output_values =
+                map_output_values(lowering_contract, &mapped.id_map, &storage.id_map)?;
+            let host_ports = map_host_ports(lowering_contract);
+            let view_bindings = map_view_bindings(
+                view_binding_graph,
+                &mapped.id_map,
+                &storage.id_map,
+                &storage,
+            )?;
+            let (semantic_memory, migration_edges) = map_semantic_memory(
+                execution_graph,
+                reactive_graph,
+                memory_graph,
+                &mapped.id_map,
+                &storage.id_map,
+            )?;
+            let transient_collections =
+                map_transient_collections(lowering_contract, memory_graph, &mapped.id_map)?;
+            let named_value_interfaces = map_named_value_interfaces(&lowering_contract.metadata);
+            let debug_source_units = map_debug_source_units(&lowering_contract.metadata)?;
+            let debug_fields = map_semantic_field_entries(
+                &storage.fields,
+                &storage.derived_values,
+                &resources.state_cells,
+            );
+            let activations = map_activation_sites(reactive_graph, &mapped.id_map)?;
+            let pulse_batches = map_pulse_batches(reactive_graph, &mapped.id_map, &storage)?;
+            Ok((
+                mapped_role_references,
+                reads,
+                dependency_uses,
+                output_values,
+                host_ports,
+                view_bindings,
+                semantic_memory,
+                migration_edges,
+                transient_collections,
+                named_value_interfaces,
+                debug_source_units,
+                debug_fields,
+                activations,
+                pulse_batches,
+            ))
+        })()
     )?;
-    let (semantic_memory, migration_edges) = map_semantic_memory(
-        execution_graph,
-        reactive_graph,
-        memory_graph,
-        &mapped.id_map,
-        &storage.id_map,
-    )?;
-    let transient_collections =
-        map_transient_collections(lowering_contract, memory_graph, &mapped.id_map)?;
-    let named_value_interfaces = map_named_value_interfaces(&lowering_contract.metadata);
-    let debug_source_units = map_debug_source_units(&lowering_contract.metadata)?;
-    let debug_fields = map_semantic_field_entries(
-        &storage.fields,
-        &storage.derived_values,
-        &resources.state_cells,
-    );
-    let activations = map_activation_sites(reactive_graph, &mapped.id_map)?;
-    let pulse_batches = map_pulse_batches(reactive_graph, &mapped.id_map, &storage)?;
+    let (
+        mapped_role_references,
+        reads,
+        dependency_uses,
+        output_values,
+        host_ports,
+        view_bindings,
+        semantic_memory,
+        migration_edges,
+        transient_collections,
+        named_value_interfaces,
+        debug_source_units,
+        debug_fields,
+        activations,
+        pulse_batches,
+    ) = linked;
     let external_storage_sources = mapped
         .id_map
         .external_event_source_paths
@@ -7371,72 +7486,82 @@ fn finish_canonical_program_core(
     }
     let graph_node_count = executable.expressions.len();
 
-    let core = program_core::CanonicalProgramCoreV2 {
-        executable,
-        scope_index: program_core::ErasedScopeIndex {
-            owners,
-            locals,
-            fields,
-            bindings,
-            sources: storage_sources,
-            reads,
-            row_values,
-            row_source_projections,
-            dependencies: dependency_uses,
-        },
-        expression_count: lowering_contract.metadata.original_source_expression_count,
-        distributed_references: mapped_role_references,
-        producer_function_instances,
-        debug_source_units,
-        debug_fields,
-        graph_node_count,
-        sources,
-        host_ports,
-        state_cells,
-        activations,
-        pulse_batches,
-        lists,
-        semantic_memory,
-        migration_edges,
-        transient_collections,
-        output_values,
-        derived_values,
-        dependencies,
-        state_update_arms: finalized_state_transitions,
-        host_effect_schedules: host_effect_schedules
-            .into_iter()
-            .map(|schedule| program_core::HostEffectSchedule {
-                id: schedule.id,
-                expression: schedule.expression,
-                checked_expression: schedule.checked_expression,
-                owner: schedule.owner,
-                operation: schedule.operation,
-                state_update_arms: schedule.state_update_arms,
-                transient_result: schedule.transient_result,
-            })
-            .collect(),
-        list_mutations,
-        list_projections,
-        materializations,
-        view_bindings,
-        named_value_interfaces,
-    };
-    for (semantic, executable) in execution_graph
-        .static_owners
-        .iter()
-        .zip(&core.scope_index.owners)
-    {
-        if (semantic.id, semantic.parent, semantic.child_ordinal)
-            != (executable.id, executable.parent, executable.child_ordinal)
-        {
-            return Err(format!(
-                "static owner {} disagrees with executable owner",
-                semantic.id
-            ));
+    let core = core_lowering_phase!(
+        trace,
+        "assemble",
+        program_core::CanonicalProgramCoreV2 {
+            executable,
+            scope_index: program_core::ErasedScopeIndex {
+                owners,
+                locals,
+                fields,
+                bindings,
+                sources: storage_sources,
+                reads,
+                row_values,
+                row_source_projections,
+                dependencies: dependency_uses,
+            },
+            expression_count: lowering_contract.metadata.original_source_expression_count,
+            distributed_references: mapped_role_references,
+            producer_function_instances,
+            debug_source_units,
+            debug_fields,
+            graph_node_count,
+            sources,
+            host_ports,
+            state_cells,
+            activations,
+            pulse_batches,
+            lists,
+            semantic_memory,
+            migration_edges,
+            transient_collections,
+            output_values,
+            derived_values,
+            dependencies,
+            state_update_arms: finalized_state_transitions,
+            host_effect_schedules: host_effect_schedules
+                .into_iter()
+                .map(|schedule| program_core::HostEffectSchedule {
+                    id: schedule.id,
+                    expression: schedule.expression,
+                    checked_expression: schedule.checked_expression,
+                    owner: schedule.owner,
+                    operation: schedule.operation,
+                    state_update_arms: schedule.state_update_arms,
+                    transient_result: schedule.transient_result,
+                })
+                .collect(),
+            list_mutations,
+            list_projections,
+            materializations,
+            view_bindings,
+            named_value_interfaces,
         }
-        receipts.publish_static_owner(semantic, executable)?;
-    }
-    let (execution_handoff, manifest_prefix) = receipts.finish()?;
+    );
+    let (execution_handoff, manifest_prefix) = core_lowering_phase!(
+        trace,
+        "receipts",
+        (|| -> Result<_, String> {
+            for (semantic, executable) in execution_graph
+                .static_owners
+                .iter()
+                .zip(&core.scope_index.owners)
+            {
+                if (semantic.id, semantic.parent, semantic.child_ordinal)
+                    != (executable.id, executable.parent, executable.child_ordinal)
+                {
+                    return Err(format!(
+                        "static owner {} disagrees with executable owner",
+                        semantic.id
+                    ));
+                }
+                receipts.publish_static_owner(semantic, executable)?;
+            }
+            receipts.finish()
+        })()
+    )?;
     Ok(CanonicalProgramCoreBuildV2 {
         core,
         execution_handoff,

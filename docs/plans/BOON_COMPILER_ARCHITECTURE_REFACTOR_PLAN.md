@@ -4387,6 +4387,51 @@ seal checkpoint. The current exact-source median is about 103 ms faster, so the
 latency gate is closed while the ownership/deletion gate remains open. Merely
 relocating the roughly 10--30 ms storage inventory is not this exit.
 
+Fresh row-level instrumentation after checkpoint `6dbdfc36` changes the
+immediate ordering again. The preliminary resource/storage deletions did more
+than their old phase names suggested: in the current stable-release trace,
+canonical-core resource, reactive, storage, list-initializer, and link mapping
+now total only about 7.6 ms. Mapping all 16k executable expressions and 4k
+statements costs about 14.4 ms. The expensive canonical-core work is publishing
+the proof rows: scopes 12.3 ms, expressions 108.2 ms, statements 11.4 ms,
+callables/calls 42.1 ms, and call occurrences 11.1 ms, followed by 48.8 ms in
+the receipt seal. Canonical execution is 205.1 ms and the complete canonical
+core is 279.0 ms. A corresponding debug trace makes the same ownership split
+more obvious: expression mapping is 41.1 ms while expression publication is
+567.7 ms; canonical execution is 1,061.2 ms and receipt sealing is 303.2 ms.
+
+The optimized probe is compiled as a Rust test, so its separately reported
+52.1 ms `finalize_execution_image` phase also runs the `cfg(test)` V2 parity
+oracle. That work is required for compiler-test evidence but is not a
+production compiler owner and must not be counted as a release-product speed
+opportunity. The traced production path records 2,638.0 ms verified,
+991.5 ms semantic construction, 346.5 ms backend construction, and 0.623 ms
+WHERE verification. These are one-sample localization measurements, not new
+checkpoint medians.
+
+Therefore the definition-owned resource/storage template remains part of the
+one-sealed-image architecture, but it is no longer the next latency cut. The
+next cut must replace rich per-occurrence canonical-CBOR execution proof
+publication with definition-owned normalized proof fragments plus compact
+invocation/owner relocations, and make the final receipt seal fold those
+fragments without serializing the same rich executable payload again. Exact
+row coverage, payload mutation rejection, deterministic image and Manifest
+digests, and the independent V2/V7 replay oracles remain mandatory. This is a
+proof-authority replacement, not permission to omit content binding.
+
+The backend trace establishes the following large cut after that proof
+boundary: setup is 94.7 ms, derived-value lowering 124.0 ms, state/effect
+updates 18.7 ms, document construction 82.7 ms, and finalization 23.4 ms. The
+shared plan-code linker must attack setup, derived, and document together.
+Adding a `PlanRowExpressionNode` call variant prematurely would force a flag-day
+schema, verifier, executor, distributed-normalization, and visitor migration
+without yet deleting recursive lowering. First give ordinary definitions one
+construction-owned symbolic row-code template and one exact occurrence frame;
+then introduce the runtime function/call representation when the template
+actually replaces all three recursive owners. Trial arena clones in
+state-dependent materialized-field discovery are part of that deleted owner,
+not a separate micro-optimization project.
+
 Updating the architecture gate exposed two stale classifier entries from the
 definition-template checkpoint. `InvalidDefinitionTemplate` and the three
 checked definition execution-template records are now explicitly classified,

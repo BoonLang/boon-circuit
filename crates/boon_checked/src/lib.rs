@@ -2056,7 +2056,8 @@ pub fn type_is_recursively_closed(ty: &Type) -> bool {
 ///     CheckedProgram { fields }
 /// }
 /// ```
-pub const CHECKED_IMAGE_HANDOFF_SCHEMA_V3: &str = "boon.checked-image-handoff.v3";
+pub const CHECKED_IMAGE_HANDOFF_SCHEMA_V4: &str = "boon.checked-image-handoff.v4";
+pub const CHECKED_IMAGE_KERNEL_AUTHORITY_SCHEMA_V1: &str = "boon.checked-image-kernel-authority.v1";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2110,6 +2111,38 @@ pub enum CheckedShardRegionV2 {
 pub struct CheckedShardProjectionKeyV2 {
     pub owner: CheckedShardOwnerKeyV2,
     pub region: CheckedShardRegionV2,
+}
+
+/// One definition-owned seal supplied by the dense checker to checked-image
+/// publication.
+///
+/// `root_scope` is already relocated into the final checked namespace. The
+/// handoff builder uses it only to group immutable definition receipts under
+/// the same stable checked owner used by semantic construction; it never
+/// rescans or hashes the definition's rich checked rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedImageDefinitionAuthoritySealV1 {
+    pub root_scope: LexicalScopeId,
+    pub definition_key_digest: [u8; 32],
+    pub fingerprint: [u8; 32],
+}
+
+/// Construction-owned authority for the compact checked-image seal path.
+///
+/// The definition fingerprints cover exact normalized kernel artifacts and
+/// their imported authorities. The program metadata and referenced ABI seals
+/// remain separate so a change outside one user definition does not
+/// invalidate every callable projection. This authority is optional: the
+/// historical checker oracle can still prove a V4 handoff from canonical
+/// rich-row payloads.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedImageKernelAuthorityV1 {
+    pub schema: String,
+    pub source_bundle_digest_v1: SourceBundleDigestV1,
+    pub role: ProgramRole,
+    pub program_metadata_fingerprint: [u8; 32],
+    pub referenced_abi_fingerprint: [u8; 32],
+    pub definitions: Vec<CheckedImageDefinitionAuthoritySealV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -2186,7 +2219,7 @@ pub struct CheckedImageEntityRouteV2 {
 /// Consuming typechecker handoff. Semantic elaboration imports these receipts
 /// directly; it must not rescan the rich checked DTO to rediscover them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CheckedImageHandoffV3 {
+pub struct CheckedImageHandoffV4 {
     pub schema: String,
     pub source_bundle_digest_v1: SourceBundleDigestV1,
     pub role: ProgramRole,
@@ -2196,7 +2229,7 @@ pub struct CheckedImageHandoffV3 {
     pub local_image_digest: [u8; 32],
 }
 
-impl CheckedImageHandoffV3 {
+impl CheckedImageHandoffV4 {
     pub fn projection(&self, id: CheckedImageProjectionIdV2) -> Option<&CheckedImageProjectionV2> {
         self.projections.get(id.as_usize())
     }
@@ -2230,7 +2263,7 @@ pub struct CheckedProgram {
     #[serde(flatten)]
     fields: CheckedProgramFields,
     #[serde(skip)]
-    image_handoff: CheckedImageHandoffV3,
+    image_handoff: CheckedImageHandoffV4,
 }
 
 /// Completed typechecker construction before a runtime handoff is requested.
@@ -2480,7 +2513,7 @@ impl CheckedProgram {
     /// must never synthesize an empty or sentinel digest.
     pub unsafe fn from_typechecker_parts_unchecked(
         fields: CheckedProgramFields,
-        image_handoff: CheckedImageHandoffV3,
+        image_handoff: CheckedImageHandoffV4,
     ) -> Self {
         Self {
             fields,
@@ -2492,11 +2525,11 @@ impl CheckedProgram {
     ///
     /// This does not create another proof-bearing product; resealing modified
     /// fields still requires the unsafe typechecker invariant boundary.
-    pub fn into_parts(self) -> (CheckedProgramFields, CheckedImageHandoffV3) {
+    pub fn into_parts(self) -> (CheckedProgramFields, CheckedImageHandoffV4) {
         (self.fields, self.image_handoff)
     }
 
-    pub fn image_handoff(&self) -> &CheckedImageHandoffV3 {
+    pub fn image_handoff(&self) -> &CheckedImageHandoffV4 {
         &self.image_handoff
     }
 }

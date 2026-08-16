@@ -125,6 +125,153 @@ fn explicit_call_occurrence_relocation_seals_the_same_checked_image() {
 }
 
 #[test]
+fn kernel_checked_image_seals_preserve_topology_and_definition_currentness() {
+    let project = boon_parser::parse_project_syntax(
+        "app/RUN.bn",
+        [(
+            "app/RUN.bn".to_owned(),
+            concat!(
+                "FUNCTION double(input) {\n",
+                "    input + input\n",
+                "}\n",
+                "FUNCTION triple(input) {\n",
+                "    input + input + input\n",
+                "}\n",
+                "left: double(input: 2)\n",
+                "right: triple(input: 3)\n",
+            )
+            .to_owned(),
+        )],
+    )
+    .expect("kernel checked-image fixture parses");
+    let output = check_project_diagnostics_program_profiled_with_external_types(
+        &project,
+        &ExternalTypeEnvironment::default(),
+    )
+    .0;
+    assert!(
+        !output.report.has_errors(),
+        "{:#?}",
+        output.report.diagnostics
+    );
+    let construction = output
+        .construction
+        .expect("diagnostics check retains an unsealed construction");
+    let fields = construction.clone().__typechecker_into_fields();
+    let syntax = TypecheckSyntaxProgram::UnitNative(project.clone());
+    let occurrences = checked_call_occurrences_from_syntax(&fields, &syntax)
+        .expect("fixture derives structural call identities");
+    let user_callables = fields
+        .callables
+        .iter()
+        .filter(|callable| callable.kind == CheckedCallableKind::User)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        user_callables.len(),
+        2,
+        "fixture must expose two independently sealed definitions"
+    );
+
+    let authority = |double_fingerprint: u8, include_triple: bool| {
+        let mut definitions = vec![CheckedImageDefinitionAuthoritySealV1 {
+            root_scope: fields.root_scope,
+            definition_key_digest: [1; 32],
+            fingerprint: [11; 32],
+        }];
+        for (index, callable) in user_callables.iter().enumerate() {
+            if !include_triple && callable.name == "triple" {
+                continue;
+            }
+            definitions.push(CheckedImageDefinitionAuthoritySealV1 {
+                root_scope: callable.scope_id,
+                definition_key_digest: [u8::try_from(index + 2).unwrap(); 32],
+                fingerprint: [if callable.name == "double" {
+                    double_fingerprint
+                } else {
+                    33
+                }; 32],
+            });
+        }
+        CheckedImageKernelAuthorityV1 {
+            schema: CHECKED_IMAGE_KERNEL_AUTHORITY_SCHEMA_V1.to_owned(),
+            source_bundle_digest_v1: fields.source_bundle_digest_v1,
+            role: fields.role,
+            program_metadata_fingerprint: [44; 32],
+            referenced_abi_fingerprint: [55; 32],
+            definitions,
+        }
+    };
+
+    let legacy = seal_project_checked_program_construction_with_call_occurrences(
+        &project,
+        construction.clone(),
+        &occurrences,
+    )
+    .expect("legacy rich-row authority seals");
+    let first = seal_project_checked_program_construction_with_kernel_authority(
+        &project,
+        construction.clone(),
+        &occurrences,
+        &authority(22, true),
+    )
+    .expect("kernel definition authority seals");
+    let second = seal_project_checked_program_construction_with_kernel_authority(
+        &project,
+        construction.clone(),
+        &occurrences,
+        &authority(23, true),
+    )
+    .expect("changed kernel definition authority seals");
+
+    let legacy = legacy.image_handoff();
+    let first = first.image_handoff();
+    let second = second.image_handoff();
+    assert_eq!(legacy.schema, CHECKED_IMAGE_HANDOFF_SCHEMA_V4);
+    assert_eq!(first.schema, CHECKED_IMAGE_HANDOFF_SCHEMA_V4);
+    assert_eq!(legacy.entity_routes, first.entity_routes);
+    assert_eq!(legacy.relocations, first.relocations);
+    assert_eq!(legacy.projections.len(), first.projections.len());
+    for (legacy, kernel) in legacy.projections.iter().zip(&first.projections) {
+        assert_eq!(legacy.stable_key, kernel.stable_key);
+        assert_eq!(legacy.stable_key_digest, kernel.stable_key_digest);
+        assert_eq!(legacy.row_count, kernel.row_count);
+        assert_eq!(legacy.dependency_row_count, kernel.dependency_row_count);
+        assert_eq!(legacy.relocation_span, kernel.relocation_span);
+    }
+
+    let changed = first
+        .projections
+        .iter()
+        .zip(&second.projections)
+        .filter(|(first, second)| first.local_content_digest != second.local_content_digest)
+        .map(|(first, _)| &first.stable_key.owner)
+        .collect::<Vec<_>>();
+    assert!(
+        !changed.is_empty(),
+        "changed definition must invalidate a shard"
+    );
+    assert!(
+        changed.iter().all(|owner| matches!(
+            owner,
+            CheckedShardOwnerKeyV2::Callable { name, .. } if name == "double"
+        )),
+        "only the changed definition owner may be invalidated: {changed:#?}"
+    );
+
+    let error = seal_project_checked_program_construction_with_kernel_authority(
+        &project,
+        construction,
+        &occurrences,
+        &authority(22, false),
+    )
+    .expect_err("missing user definition authority must fail closed");
+    assert!(
+        error.contains("no definition seal for user owner"),
+        "{error}"
+    );
+}
+
+#[test]
 fn project_checked_metadata_reconstruction_uses_only_parser_and_checked_rows() {
     let project = boon_parser::parse_project_syntax(
         "app/RUN.bn",

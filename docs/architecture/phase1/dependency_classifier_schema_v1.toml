@@ -14759,7 +14759,30 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_checked/src/lib.rs"
-name = "CheckedImageHandoffV3"
+name = "CheckedImageDefinitionAuthoritySealV1"
+fields = [
+  { name = "root_scope", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "definition_key_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "fingerprint", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedImageKernelAuthorityV1"
+fields = [
+  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
+  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "program_metadata_fingerprint", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "referenced_abi_fingerprint", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "definitions", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedImageHandoffV4"
 fields = [
   { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },

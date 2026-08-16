@@ -17,7 +17,7 @@ use boon_checked::{
     CheckedStatementKind, LexicalScopeId,
 };
 use boon_checked::{
-    CheckedEvaluationScope, CheckedImageHandoffV3, CheckedImageProjectionIdV2,
+    CheckedEvaluationScope, CheckedImageHandoffV4, CheckedImageProjectionIdV2,
     CheckedImageRowDomainV2, CheckedProgramFields, CheckedShardCallableKindV2,
     CheckedShardOwnerKeyV2, CheckedShardProjectionKeyV2, CheckedShardRegionV2, DeclId, FlowType,
     ProgramRole,
@@ -1469,7 +1469,7 @@ impl DependencyOwnerIndex {
     }
 
     fn derive_from_image_routes(
-        checked_handoff: &CheckedImageHandoffV3,
+        checked_handoff: &CheckedImageHandoffV4,
         execution_handoff: &ExecutionImageHandoffV3,
         execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV2,
@@ -2660,7 +2660,7 @@ struct DependencyCollector {
 
 impl DependencyCollector {
     fn for_presealed_images(
-        checked: &CheckedImageHandoffV3,
+        checked: &CheckedImageHandoffV4,
         execution: &ExecutionImageHandoffV3,
     ) -> Self {
         let checked_rows = checked
@@ -5437,7 +5437,7 @@ fn stable_owner_for_checked_key_v7(
 }
 
 fn execution_projection_owner_v7(
-    checked: &CheckedImageHandoffV3,
+    checked: &CheckedImageHandoffV4,
     execution: &ExecutionImageHandoffV3,
     projection: &ExecutionConstructionProjectionV3,
 ) -> Result<SemanticDependencyStableOwnerV4, CallableDependencyManifestError> {
@@ -5569,7 +5569,7 @@ fn execution_dependency_entity_domain_v7(
 }
 
 fn build_dense_projection_index_v7(
-    checked: &CheckedImageHandoffV3,
+    checked: &CheckedImageHandoffV4,
     execution_handoff: &ExecutionImageHandoffV3,
     execution: &SemanticExecutionImageColumnsV1,
     stable_owners: &BTreeMap<SemanticDependencyOwnerV1, SemanticDependencyStableOwnerV4>,
@@ -6227,7 +6227,7 @@ fn canonical_dependency_hash_with_buffer(
 pub(crate) fn build_callable_dependency_manifest_v7(
     dependency_classifier_schema_digest: [u8; 32],
     checked: &CheckedProgramFields,
-    checked_handoff: &CheckedImageHandoffV3,
+    checked_handoff: &CheckedImageHandoffV4,
     execution_handoff: &ExecutionImageHandoffV3,
     producer_materializations: &[ProducerMaterializationRequest],
     #[cfg(test)] out: &ResolvedOutGraph,

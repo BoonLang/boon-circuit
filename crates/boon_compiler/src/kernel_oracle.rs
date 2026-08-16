@@ -10,10 +10,11 @@
 
 use boon_checked::{
     CheckedCall, CheckedCallableSignature, CheckedContextFormal, CheckedDeclaration,
-    CheckedExpression, CheckedList, CheckedListKeyPolicy, CheckedProgramFields, CheckedScope,
-    CheckedSource, CheckedState, CheckedStateKind, CheckedStatement, DiagnosticSeverity,
-    ExternalTypeEnvironment, FlowMode, FlowType, LexicalScopeId, ObjectShape, Type, TypeDiagnostic,
-    Variant, type_is_recursively_closed,
+    CheckedExpression, CheckedImageDefinitionAuthoritySealV1, CheckedImageKernelAuthorityV1,
+    CheckedList, CheckedListKeyPolicy, CheckedProgramFields, CheckedScope, CheckedSource,
+    CheckedState, CheckedStateKind, CheckedStatement, DiagnosticSeverity, ExternalTypeEnvironment,
+    FlowMode, FlowType, LexicalScopeId, ObjectShape, Type, TypeDiagnostic, Variant,
+    type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
     CheckDemand, KernelAbiCallContextInput, KernelAbiContextualOperation, KernelAbiInput,
@@ -2316,11 +2317,19 @@ pub(crate) fn compiler_diagnostics_from_kernel(
 pub(crate) struct KernelCheckedConstruction {
     pub fields: CheckedProgramFields,
     pub call_occurrences: Box<[StableOccurrenceKey]>,
+    pub checked_image_authority: CheckedImageKernelAuthorityV1,
     pub diagnostics: Box<[TypeDiagnostic]>,
     pub compile_work: KernelCompileWork,
     pub solve_work: KernelSolveWork,
     pub owner_count: usize,
 }
+
+const KERNEL_CHECKED_DEFINITION_KEY_SEAL_DOMAIN_V1: &[u8] =
+    b"boon.kernel-checked-definition-key-seal.v1\0";
+const KERNEL_CHECKED_PROGRAM_METADATA_SEAL_DOMAIN_V1: &[u8] =
+    b"boon.kernel-checked-program-metadata-seal.v1\0";
+const KERNEL_CHECKED_REFERENCED_ABI_SEAL_DOMAIN_V1: &[u8] =
+    b"boon.kernel-checked-referenced-abi-seal.v1\0";
 
 /// Build a complete checked construction from one dense-kernel solve.
 ///
@@ -2397,6 +2406,7 @@ pub(crate) fn checked_construction_from_kernel(
     let mut rows = layout
         .materialize_rows(session.project(), &snapshot, role)
         .map_err(|error| format!("cannot link dense kernel checked rows: {error}"))?;
+    let mut checked_image_definition_seals = Vec::with_capacity(layout.definitions().len());
     for definition in layout.definitions() {
         let key = session
             .project()
@@ -2408,6 +2418,51 @@ pub(crate) fn checked_construction_from_kernel(
                     definition.owner.0
                 )
             })?;
+        // A FUNCTION header statement is declared in its containing scope,
+        // while the stable checked owner is established by the callable body
+        // scope. Non-callable child definitions inherit the owner through the
+        // scope of their public declaration. Using the root statement for both
+        // cases incorrectly grouped every top-level FUNCTION under the program
+        // owner and left its user-callable shards without an authority seal.
+        let root_scope = rows
+            .callables
+            .iter()
+            .find(|callable| {
+                callable.kind == boon_checked::CheckedCallableKind::User
+                    && callable.decl_id == definition.public_declaration
+            })
+            .map(|callable| callable.scope_id)
+            .or_else(|| {
+                rows.declarations
+                    .iter()
+                    .find(|declaration| declaration.id == definition.public_declaration)
+                    .map(|declaration| declaration.scope_id)
+            })
+            .ok_or_else(|| {
+                format!(
+                    "dense kernel checked definition {} has no relocated public declaration {}",
+                    definition.owner.0, definition.public_declaration.0
+                )
+            })?;
+        let definition_key_digest = boon_contract::canonical_serde_hash_v1(
+            KERNEL_CHECKED_DEFINITION_KEY_SEAL_DOMAIN_V1,
+            key,
+        )
+        .map_err(|error| format!("cannot seal dense kernel definition key: {error}"))?;
+        let currentness = snapshot
+            .currentness
+            .get(definition.owner.0 as usize)
+            .ok_or_else(|| {
+                format!(
+                    "dense kernel checked definition {} has no currentness receipt",
+                    definition.owner.0
+                )
+            })?;
+        checked_image_definition_seals.push(CheckedImageDefinitionAuthoritySealV1 {
+            root_scope,
+            definition_key_digest,
+            fingerprint: currentness.fingerprint_v16,
+        });
         let source = project
             .source_layouts()
             .iter()
@@ -2464,9 +2519,32 @@ pub(crate) fn checked_construction_from_kernel(
     fields.lowering_metadata =
         boon_typecheck::derive_project_checked_lowering_metadata(project, &fields, &diagnostics)
             .map_err(|error| format!("cannot finalize dense kernel checked metadata: {error}"))?;
+    let program_metadata_fingerprint = boon_contract::canonical_serde_hash_v1(
+        KERNEL_CHECKED_PROGRAM_METADATA_SEAL_DOMAIN_V1,
+        &(
+            project.source_bundle_digest_v1(),
+            role,
+            project.source_layouts(),
+        ),
+    )
+    .map_err(|error| format!("cannot seal dense kernel checked metadata: {error}"))?;
+    let referenced_abi_fingerprint = boon_contract::canonical_serde_hash_v1(
+        KERNEL_CHECKED_REFERENCED_ABI_SEAL_DOMAIN_V1,
+        session.project().abi(),
+    )
+    .map_err(|error| format!("cannot seal dense kernel referenced ABI: {error}"))?;
+    let checked_image_authority = CheckedImageKernelAuthorityV1 {
+        schema: boon_checked::CHECKED_IMAGE_KERNEL_AUTHORITY_SCHEMA_V1.to_owned(),
+        source_bundle_digest_v1: project.source_bundle_digest_v1(),
+        role,
+        program_metadata_fingerprint,
+        referenced_abi_fingerprint,
+        definitions: checked_image_definition_seals,
+    };
     Ok(KernelCheckedConstruction {
         fields,
         call_occurrences,
+        checked_image_authority,
         diagnostics: diagnostics.into_boxed_slice(),
         compile_work,
         solve_work,
@@ -2507,6 +2585,7 @@ pub(crate) fn compiler_checked_from_kernel(
         owner_work,
         typecheck_ms,
         Some(checked.call_occurrences),
+        Some(Box::new(checked.checked_image_authority)),
     ))
 }
 

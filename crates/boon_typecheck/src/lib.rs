@@ -15614,22 +15614,27 @@ fn checked_declaration_canonical_path(
     Some(segments.join("."))
 }
 
-const CHECKED_IMAGE_PROJECTION_KEY_DOMAIN_V3: &[u8] = b"boon.checked-image-projection-key.v3\0";
-const CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V3: &[u8] = b"boon.checked-image-row-payload.v3\0";
-const CHECKED_IMAGE_ROW_DIGEST_DOMAIN_V3: &[u8] = b"boon.checked-image-row.v3\0";
-const CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V3: &[u8] = b"boon.checked-image-shard.v3\0";
-const CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V3: &[u8] = b"boon.checked-image-handoff.v3\0";
-const CHECKED_STRUCTURAL_CALL_SITE_DOMAIN_V3: &[u8] = b"boon.checked-structural-call-site.v3\0";
+const CHECKED_IMAGE_PROJECTION_KEY_DOMAIN_V4: &[u8] = b"boon.checked-image-projection-key.v4\0";
+const CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V4: &[u8] = b"boon.checked-image-row-payload.v4\0";
+const CHECKED_IMAGE_ROW_DIGEST_DOMAIN_V4: &[u8] = b"boon.checked-image-row.v4\0";
+const CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V4: &[u8] = b"boon.checked-image-shard.v4\0";
+const CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V4: &[u8] = b"boon.checked-image-handoff.v4\0";
+const CHECKED_STRUCTURAL_CALL_SITE_DOMAIN_V4: &[u8] = b"boon.checked-structural-call-site.v4\0";
+const CHECKED_IMAGE_KERNEL_OWNER_AUTHORITY_DOMAIN_V1: &[u8] =
+    b"boon.checked-image-kernel-owner-authority.v1\0";
+const CHECKED_IMAGE_KERNEL_PROJECTION_AUTHORITY_DOMAIN_V1: &[u8] =
+    b"boon.checked-image-kernel-projection-authority.v1\0";
+const CHECKED_IMAGE_KERNEL_SHARD_DIGEST_DOMAIN_V1: &[u8] = b"boon.checked-image-kernel-shard.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct CheckedStructuralCallSiteV3 {
+struct CheckedStructuralCallSiteV4 {
     occurrence: StableOccurrenceKey,
 }
 
 fn checked_structural_call_site_from_syntax(
     parsed: &TypecheckSyntaxProgram,
     call: &CheckedCall,
-) -> Result<CheckedStructuralCallSiteV3, String> {
+) -> Result<CheckedStructuralCallSiteV4, String> {
     let occurrence = parsed
         .stable_occurrence_key(parsed.syntax_expr_id(call.expression))
         .ok_or_else(|| {
@@ -15638,7 +15643,7 @@ fn checked_structural_call_site_from_syntax(
                 call.id.0, call.expression.0
             )
         })?;
-    Ok(CheckedStructuralCallSiteV3 { occurrence })
+    Ok(CheckedStructuralCallSiteV4 { occurrence })
 }
 
 fn checked_call_occurrences_from_syntax(
@@ -15665,7 +15670,9 @@ impl PendingCheckedProjectionIdV2 {
 
 struct PendingCheckedProjectionV2 {
     stable_key_digest: [u8; 32],
+    row_count: u32,
     row_digests: Vec<[u8; 32]>,
+    kernel_authority_seal: Option<[u8; 32]>,
     dependency_row_count: u32,
     relocations: Vec<PendingCheckedProjectionIdV2>,
 }
@@ -15678,18 +15685,32 @@ struct CheckedImageRowFingerprintV2<'a> {
     relocation_stable_key_digests: &'a [[u8; 32]],
 }
 
-struct CheckedImageHandoffBuilderV3 {
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct CheckedImageDefinitionAuthorityIdentityV1 {
+    definition_key_digest: [u8; 32],
+    fingerprint: [u8; 32],
+}
+
+struct CheckedImageKernelAuthorityContextV1 {
+    program_metadata_fingerprint: [u8; 32],
+    referenced_abi_fingerprint: [u8; 32],
+    definition_seals: BTreeMap<CheckedShardOwnerKeyV2, [u8; 32]>,
+}
+
+struct CheckedImageHandoffBuilderV4 {
     ids: BTreeMap<CheckedShardProjectionKeyV2, PendingCheckedProjectionIdV2>,
     projections: Vec<PendingCheckedProjectionV2>,
     entity_routes: Vec<(CheckedImageRowDomainV2, u32, PendingCheckedProjectionIdV2)>,
+    kernel_authority: Option<CheckedImageKernelAuthorityContextV1>,
 }
 
-impl CheckedImageHandoffBuilderV3 {
-    fn new() -> Self {
+impl CheckedImageHandoffBuilderV4 {
+    fn new(kernel_authority: Option<CheckedImageKernelAuthorityContextV1>) -> Self {
         Self {
             ids: BTreeMap::new(),
             projections: Vec::new(),
             entity_routes: Vec::new(),
+            kernel_authority,
         }
     }
 
@@ -15705,14 +15726,57 @@ impl CheckedImageHandoffBuilderV3 {
                 .map_err(|_| "checked image projection registry exceeds u32".to_owned())?,
         );
         let stable_key_digest = boon_contract::canonical_serde_hash_v1(
-            CHECKED_IMAGE_PROJECTION_KEY_DOMAIN_V3,
+            CHECKED_IMAGE_PROJECTION_KEY_DOMAIN_V4,
             &projection,
         )
         .map_err(|error| format!("failed to hash checked projection key: {error}"))?;
+        let kernel_authority_seal = self
+            .kernel_authority
+            .as_ref()
+            .map(|authority| {
+                let definition_seal = authority.definition_seals.get(&projection.owner).copied();
+                if matches!(
+                    projection.owner,
+                    CheckedShardOwnerKeyV2::Callable {
+                        callable_kind: CheckedShardCallableKindV2::User,
+                        ..
+                    }
+                ) && definition_seal.is_none()
+                {
+                    return Err(format!(
+                        "kernel checked-image authority has no definition seal for user owner {:?}",
+                        projection.owner
+                    ));
+                }
+                let ambient_fingerprint = match &projection.owner {
+                    CheckedShardOwnerKeyV2::ProgramTopLevel { .. } => {
+                        Some(authority.program_metadata_fingerprint)
+                    }
+                    CheckedShardOwnerKeyV2::Callable {
+                        callable_kind: CheckedShardCallableKindV2::Builtin
+                            | CheckedShardCallableKindV2::External,
+                        ..
+                    } => Some(authority.referenced_abi_fingerprint),
+                    CheckedShardOwnerKeyV2::Callable {
+                        callable_kind: CheckedShardCallableKindV2::User,
+                        ..
+                    } => None,
+                };
+                boon_contract::canonical_serde_hash_v1(
+                    CHECKED_IMAGE_KERNEL_PROJECTION_AUTHORITY_DOMAIN_V1,
+                    &(ambient_fingerprint, &projection, definition_seal),
+                )
+                .map_err(|error| {
+                    format!("failed to hash checked kernel projection authority: {error}")
+                })
+            })
+            .transpose()?;
         self.ids.insert(projection, id);
         self.projections.push(PendingCheckedProjectionV2 {
             stable_key_digest,
+            row_count: 0,
             row_digests: Vec::new(),
+            kernel_authority_seal,
             dependency_row_count: 0,
             relocations: Vec::new(),
         });
@@ -15730,33 +15794,50 @@ impl CheckedImageHandoffBuilderV3 {
         relocations.dedup();
         relocations.retain(|target| target != &projection);
         let projection = self.intern(projection)?;
-        let payload_digest = boon_contract::canonical_serde_hash_v1(
-            CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V3,
-            payload,
-        )
-        .map_err(|error| format!("failed to hash checked image row: {error}"))?;
         let relocations = relocations
             .into_iter()
             .map(|target| self.intern(target))
             .collect::<Result<Vec<_>, _>>()?;
-        let relocation_stable_key_digests = relocations
-            .iter()
-            .map(|target| self.projections[target.as_usize()].stable_key_digest)
-            .collect::<Vec<_>>();
-        let projection_stable_key_digest =
-            self.projections[projection.as_usize()].stable_key_digest;
-        let row_digest = boon_contract::canonical_serde_hash_v1(
-            CHECKED_IMAGE_ROW_DIGEST_DOMAIN_V3,
-            &CheckedImageRowFingerprintV2 {
-                projection_stable_key_digest,
-                domain,
-                payload_digest,
-                relocation_stable_key_digests: &relocation_stable_key_digests,
-            },
-        )
-        .map_err(|error| format!("failed to hash checked image row fingerprint: {error}"))?;
+        let row_digest = if self.projections[projection.as_usize()]
+            .kernel_authority_seal
+            .is_none()
+        {
+            let payload_digest = boon_contract::canonical_serde_hash_v1(
+                CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V4,
+                payload,
+            )
+            .map_err(|error| format!("failed to hash checked image row: {error}"))?;
+            let relocation_stable_key_digests = relocations
+                .iter()
+                .map(|target| self.projections[target.as_usize()].stable_key_digest)
+                .collect::<Vec<_>>();
+            let projection_stable_key_digest =
+                self.projections[projection.as_usize()].stable_key_digest;
+            Some(
+                boon_contract::canonical_serde_hash_v1(
+                    CHECKED_IMAGE_ROW_DIGEST_DOMAIN_V4,
+                    &CheckedImageRowFingerprintV2 {
+                        projection_stable_key_digest,
+                        domain,
+                        payload_digest,
+                        relocation_stable_key_digests: &relocation_stable_key_digests,
+                    },
+                )
+                .map_err(|error| {
+                    format!("failed to hash checked image row fingerprint: {error}")
+                })?,
+            )
+        } else {
+            None
+        };
         let pending = &mut self.projections[projection.as_usize()];
-        pending.row_digests.push(row_digest);
+        pending.row_count = pending
+            .row_count
+            .checked_add(1)
+            .ok_or_else(|| "checked image shard row count overflow".to_owned())?;
+        if let Some(row_digest) = row_digest {
+            pending.row_digests.push(row_digest);
+        }
         if !relocations.is_empty() {
             pending.dependency_row_count = pending
                 .dependency_row_count
@@ -15784,11 +15865,12 @@ impl CheckedImageHandoffBuilderV3 {
         self,
         source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
-    ) -> Result<CheckedImageHandoffV3, String> {
+    ) -> Result<CheckedImageHandoffV4, String> {
         let Self {
             ids,
             mut projections,
             mut entity_routes,
+            kernel_authority: _,
         } = self;
         let mut key_by_pending_id = vec![None; projections.len()];
         let mut canonical_by_pending_id =
@@ -15817,13 +15899,19 @@ impl CheckedImageHandoffBuilderV3 {
         let mut relocation_arena = Vec::new();
         for (stable_key, pending_id) in &ids {
             let pending = &mut projections[pending_id.as_usize()];
-            if pending.row_digests.is_empty() {
+            if pending.row_count == 0 {
                 return Err(format!(
                     "checked image projection {stable_key:?} has no local rows"
                 ));
             }
-            let row_count = u32::try_from(pending.row_digests.len())
-                .map_err(|_| "checked image shard row count exceeds u32".to_owned())?;
+            if pending.kernel_authority_seal.is_none()
+                && pending.row_count as usize != pending.row_digests.len()
+            {
+                return Err(format!(
+                    "checked image projection {stable_key:?} has incomplete canonical row seals"
+                ));
+            }
+            let row_count = pending.row_count;
             pending.relocations.sort_unstable_by(|left, right| {
                 stable_key_digests[left.as_usize()].cmp(&stable_key_digests[right.as_usize()])
             });
@@ -15841,11 +15929,33 @@ impl CheckedImageHandoffBuilderV3 {
                     .iter()
                     .map(|target| canonical_by_pending_id[target.as_usize()]),
             );
-            let local_content_digest = boon_contract::canonical_serde_hash_v1(
-                CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V3,
-                &(pending.stable_key_digest, &pending.row_digests),
-            )
-            .map_err(|error| format!("failed to hash checked image shard: {error}"))?;
+            let local_content_digest = match pending.kernel_authority_seal {
+                Some(authority_seal) => {
+                    let relocation_stable_key_digests = pending
+                        .relocations
+                        .iter()
+                        .map(|target| stable_key_digests[target.as_usize()])
+                        .collect::<Vec<_>>();
+                    boon_contract::canonical_serde_hash_v1(
+                        CHECKED_IMAGE_KERNEL_SHARD_DIGEST_DOMAIN_V1,
+                        &(
+                            pending.stable_key_digest,
+                            authority_seal,
+                            row_count,
+                            pending.dependency_row_count,
+                            relocation_stable_key_digests,
+                        ),
+                    )
+                    .map_err(|error| {
+                        format!("failed to hash checked kernel image shard: {error}")
+                    })?
+                }
+                None => boon_contract::canonical_serde_hash_v1(
+                    CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V4,
+                    &(pending.stable_key_digest, &pending.row_digests),
+                )
+                .map_err(|error| format!("failed to hash checked image shard: {error}"))?,
+            };
             sealed_projections.push(CheckedImageProjectionV2 {
                 stable_key: stable_key.clone(),
                 stable_key_digest: pending.stable_key_digest,
@@ -15882,9 +15992,9 @@ impl CheckedImageHandoffBuilderV3 {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let local_image_digest = boon_contract::canonical_serde_hash_v1(
-            CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V3,
+            CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V4,
             &(
-                CHECKED_IMAGE_HANDOFF_SCHEMA_V3,
+                CHECKED_IMAGE_HANDOFF_SCHEMA_V4,
                 source_bundle_digest_v1,
                 role,
                 &sealed_projections,
@@ -15893,8 +16003,8 @@ impl CheckedImageHandoffBuilderV3 {
             ),
         )
         .map_err(|error| format!("failed to hash checked image handoff: {error}"))?;
-        Ok(CheckedImageHandoffV3 {
-            schema: CHECKED_IMAGE_HANDOFF_SCHEMA_V3.to_owned(),
+        Ok(CheckedImageHandoffV4 {
+            schema: CHECKED_IMAGE_HANDOFF_SCHEMA_V4.to_owned(),
             source_bundle_digest_v1,
             role,
             projections: sealed_projections,
@@ -15960,6 +16070,60 @@ fn checked_owner_for_scope(
     }
 }
 
+fn checked_image_kernel_authority_context(
+    program: &CheckedProgramFields,
+    callable_owners: &BTreeMap<DeclId, CheckedShardOwnerKeyV2>,
+    authority: &CheckedImageKernelAuthorityV1,
+) -> Result<CheckedImageKernelAuthorityContextV1, String> {
+    if authority.schema != CHECKED_IMAGE_KERNEL_AUTHORITY_SCHEMA_V1 {
+        return Err(format!(
+            "unsupported checked kernel authority schema `{}`",
+            authority.schema
+        ));
+    }
+    if authority.source_bundle_digest_v1 != program.source_bundle_digest_v1
+        || authority.role != program.role
+    {
+        return Err(
+            "checked kernel authority differs from the completed checked program".to_owned(),
+        );
+    }
+    let mut definition_seal_rows =
+        BTreeMap::<CheckedShardOwnerKeyV2, Vec<CheckedImageDefinitionAuthorityIdentityV1>>::new();
+    for definition in &authority.definitions {
+        let owner = checked_owner_for_scope(program, callable_owners, definition.root_scope)?;
+        definition_seal_rows.entry(owner).or_default().push(
+            CheckedImageDefinitionAuthorityIdentityV1 {
+                definition_key_digest: definition.definition_key_digest,
+                fingerprint: definition.fingerprint,
+            },
+        );
+    }
+    let mut definition_seals = BTreeMap::new();
+    for (owner, mut seals) in definition_seal_rows {
+        seals.sort_unstable();
+        if seals
+            .windows(2)
+            .any(|pair| pair[0].definition_key_digest == pair[1].definition_key_digest)
+        {
+            return Err(format!(
+                "checked kernel authority repeats a definition key under owner {owner:?}"
+            ));
+        }
+        let seal = boon_contract::canonical_serde_hash_v1(
+            CHECKED_IMAGE_KERNEL_OWNER_AUTHORITY_DOMAIN_V1,
+            &(&owner, seals),
+        )
+        .map_err(|error| format!("failed to hash checked kernel owner authority: {error}"))?;
+        definition_seals.insert(owner, seal);
+    }
+    Ok(CheckedImageKernelAuthorityContextV1 {
+        program_metadata_fingerprint: authority.program_metadata_fingerprint,
+        referenced_abi_fingerprint: authority.referenced_abi_fingerprint,
+        definition_seals,
+    })
+}
+
 fn checked_authority_projection(
     program: &CheckedProgramFields,
     owner: CheckedShardOwnerKeyV2,
@@ -15979,9 +16143,9 @@ fn checked_authority_projection(
 fn checked_image_handoff(
     program: &CheckedProgramFields,
     parsed: &TypecheckSyntaxProgram,
-) -> Result<CheckedImageHandoffV3, String> {
+) -> Result<CheckedImageHandoffV4, String> {
     let call_occurrences = checked_call_occurrences_from_syntax(program, parsed)?;
-    checked_image_handoff_with_call_occurrences(program, &call_occurrences)
+    checked_image_handoff_with_call_occurrences(program, &call_occurrences, None)
 }
 
 /// Build checked-image receipts from explicit parser-issued call identities.
@@ -15993,7 +16157,8 @@ fn checked_image_handoff(
 fn checked_image_handoff_with_call_occurrences(
     program: &CheckedProgramFields,
     call_occurrences: &[StableOccurrenceKey],
-) -> Result<CheckedImageHandoffV3, String> {
+    kernel_authority: Option<&CheckedImageKernelAuthorityV1>,
+) -> Result<CheckedImageHandoffV4, String> {
     if call_occurrences.len() != program.calls.len() {
         return Err(format!(
             "checked image received {} structural call occurrences for {} call rows",
@@ -16009,6 +16174,11 @@ fn checked_image_handoff_with_call_occurrences(
         .iter()
         .map(|callable| (callable.decl_id, checked_stable_owner(callable)))
         .collect::<BTreeMap<_, _>>();
+    let kernel_authority = kernel_authority
+        .map(|authority| {
+            checked_image_kernel_authority_context(program, &callable_owners, authority)
+        })
+        .transpose()?;
     let declaration_owners = program
         .declarations
         .iter()
@@ -16048,7 +16218,7 @@ fn checked_image_handoff_with_call_occurrences(
         })
         .collect::<Result<BTreeMap<_, _>, String>>()?;
 
-    let mut builder = CheckedImageHandoffBuilderV3::new();
+    let mut builder = CheckedImageHandoffBuilderV4::new(kernel_authority);
     builder.push_row(
         root_interface,
         CheckedImageRowDomainV2::Header,
@@ -16184,7 +16354,7 @@ fn checked_image_handoff_with_call_occurrences(
         )?;
     }
 
-    let mut structural_sites = BTreeMap::<[u8; 32], CheckedStructuralCallSiteV3>::new();
+    let mut structural_sites = BTreeMap::<[u8; 32], CheckedStructuralCallSiteV4>::new();
     let structural_calls = program
         .calls
         .iter()
@@ -16194,11 +16364,11 @@ fn checked_image_handoff_with_call_occurrences(
                 .owner_callable
                 .and_then(|owner| callable_owners.get(&owner).cloned())
                 .unwrap_or_else(|| root_owner.clone());
-            let structural_site = CheckedStructuralCallSiteV3 {
+            let structural_site = CheckedStructuralCallSiteV4 {
                 occurrence: occurrence.clone(),
             };
             let structural_call_site_digest = boon_contract::canonical_serde_hash_v1(
-                CHECKED_STRUCTURAL_CALL_SITE_DOMAIN_V3,
+                CHECKED_STRUCTURAL_CALL_SITE_DOMAIN_V4,
                 &structural_site,
             )
             .map_err(|error| format!("failed to hash checked call site: {error}"))?;
@@ -16547,6 +16717,41 @@ pub fn seal_project_checked_program_construction_with_call_occurrences(
     construction: CheckedProgramConstruction,
     call_occurrences: &[StableOccurrenceKey],
 ) -> Result<CheckedProgram, String> {
+    seal_project_checked_program_construction_with_authority(
+        parsed,
+        construction,
+        call_occurrences,
+        None,
+    )
+}
+
+/// Seal a dense-kernel checked construction from definition-owned receipts.
+///
+/// The row and entity topology is still validated against the completed
+/// checked model, but rich checked payloads are not serialized and hashed a
+/// second time. The kernel authority is accepted only when its source, role,
+/// stable definition keys, and relocated root scopes exactly match this
+/// construction.
+pub fn seal_project_checked_program_construction_with_kernel_authority(
+    parsed: &ProjectSyntaxSnapshot,
+    construction: CheckedProgramConstruction,
+    call_occurrences: &[StableOccurrenceKey],
+    authority: &CheckedImageKernelAuthorityV1,
+) -> Result<CheckedProgram, String> {
+    seal_project_checked_program_construction_with_authority(
+        parsed,
+        construction,
+        call_occurrences,
+        Some(authority),
+    )
+}
+
+fn seal_project_checked_program_construction_with_authority(
+    parsed: &ProjectSyntaxSnapshot,
+    construction: CheckedProgramConstruction,
+    call_occurrences: &[StableOccurrenceKey],
+    authority: Option<&CheckedImageKernelAuthorityV1>,
+) -> Result<CheckedProgram, String> {
     let fields = construction.__typechecker_into_fields();
     if fields.source_bundle_digest_v1 != parsed.source_bundle_digest_v1() {
         return Err(format!(
@@ -16555,7 +16760,8 @@ pub fn seal_project_checked_program_construction_with_call_occurrences(
             parsed.source_bundle_digest_v1()
         ));
     }
-    let image_handoff = checked_image_handoff_with_call_occurrences(&fields, call_occurrences)?;
+    let image_handoff =
+        checked_image_handoff_with_call_occurrences(&fields, call_occurrences, authority)?;
     // SAFETY: the compact checker supplies fields only after successful
     // construction and supplies parser-issued structural call identities in
     // exact dense call order. The source digest and handoff receipts are

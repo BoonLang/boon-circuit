@@ -3986,6 +3986,32 @@ verification. Optimized diagnostics is 736.339 ms with 583.882 ms checking.
 The next runtime cut must therefore remove repeated semantic/OUT construction,
 not claim source gating or WHERE as execution speed.
 
+The checked-image publication cut now consumes definition-owned kernel
+currentness receipts instead of canonically serializing and hashing every rich
+checked row a second time. `CheckedImageHandoffV4` keeps the same dense entity
+routes, projection keys, row counts, dependency counts, and CSR relocations,
+but its local shard seals bind one precomputed authority digest per stable
+checked owner. Program metadata, referenced ABI, and user-definition receipts
+remain separate invalidation domains. A changed function therefore changes
+only that function owner's local shard seals; a missing user-definition seal
+fails closed. The legacy checker uses the independent rich-row V4 path only as
+an oracle.
+
+An initial implementation accidentally serialized every definition receipt
+for every projection under the same owner. On NovyWave that projection-by-
+definition cross-product made deferred handoff regress from about 352 ms to
+554 ms. Pre-sealing each owner's sorted definition receipts once removes that
+multiplier: the accepted optimized handoff is 63.380 ms, an 82% reduction from
+the preceding 351.750 ms receipt. The same run completes verified compilation
+in 3,337.204 ms at 407,032 KiB peak RSS, with 1,575.288 ms semantic
+construction, 382.185 ms backend construction, and 0.729 ms WHERE
+verification. Diagnostics remains 737.546 ms, including 88.804 ms parsing and
+587.784 ms checking. The comparable optimized affected rebuild is 122.46
+seconds at 1,044,524 KiB; it is excluded from Boon execution time. The full
+compiler package, focused exact-currentness regression, and architecture gate
+pass. The largest remaining runtime owners are contextual execution/OUT
+construction and downstream resource/receipt assembly, not WHERE.
+
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not
 spend a full optimized rebuild on every small edit. Keep the latest accepted

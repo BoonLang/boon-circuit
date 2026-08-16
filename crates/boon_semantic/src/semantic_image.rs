@@ -17,7 +17,7 @@ use crate::{
     StaticOwnerId,
 };
 use boon_checked::{
-    CHECKED_IMAGE_HANDOFF_SCHEMA_V3, CheckedImageHandoffV3, CheckedImageProjectionIdV2,
+    CHECKED_IMAGE_HANDOFF_SCHEMA_V4, CheckedImageHandoffV4, CheckedImageProjectionIdV2,
     CheckedImageRowDomainV2, CheckedShardRegionV2, ProgramRole,
 };
 use boon_contract::SourceBundleDigestV1;
@@ -576,14 +576,14 @@ impl ExecutionImageHandoffV2 {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SealedSemanticImageV3 {
     schema: String,
-    checked_handoff: CheckedImageHandoffV3,
+    checked_handoff: CheckedImageHandoffV4,
     execution_handoff: ExecutionImageHandoffV3,
     execution: SemanticExecutionImageColumnsV1,
     seal_digest: [u8; 32],
 }
 
 impl SealedSemanticImageV3 {
-    pub const fn checked_handoff(&self) -> &CheckedImageHandoffV3 {
+    pub const fn checked_handoff(&self) -> &CheckedImageHandoffV4 {
         &self.checked_handoff
     }
 
@@ -605,7 +605,7 @@ impl SealedSemanticImageV3 {
         role: ProgramRole,
     ) -> Result<(), String> {
         if self.schema != SEMANTIC_IMAGE_SCHEMA_V3
-            || self.checked_handoff.schema != CHECKED_IMAGE_HANDOFF_SCHEMA_V3
+            || self.checked_handoff.schema != CHECKED_IMAGE_HANDOFF_SCHEMA_V4
             || self.execution_handoff.schema != EXECUTION_IMAGE_HANDOFF_SCHEMA_V3
         {
             return Err("semantic image contains an unsupported schema".to_owned());
@@ -639,7 +639,7 @@ pub(crate) struct ExecutionFinalized;
 struct PostResourceValidatedV2;
 
 pub(crate) struct SemanticImageBuilder<State> {
-    checked_handoff: CheckedImageHandoffV3,
+    checked_handoff: CheckedImageHandoffV4,
     execution_routes_v3: Option<ExecutionConstructionRoutesV3>,
     execution_image_v3: Option<ExecutionConstructionImageV3>,
     execution: SemanticExecutionImageColumnsV1,
@@ -651,11 +651,11 @@ pub(crate) struct SemanticImageBuilder<State> {
 
 impl SemanticImageBuilder<ExecutionPending> {
     pub(crate) fn execution_pending(
-        checked_handoff: CheckedImageHandoffV3,
+        checked_handoff: CheckedImageHandoffV4,
         execution_routes_v3: ExecutionConstructionRoutesV3,
         execution: SemanticExecutionImageColumnsV1,
     ) -> Result<Self, String> {
-        if checked_handoff.schema != CHECKED_IMAGE_HANDOFF_SCHEMA_V3 {
+        if checked_handoff.schema != CHECKED_IMAGE_HANDOFF_SCHEMA_V4 {
             return Err(format!(
                 "unsupported checked image handoff schema `{}`",
                 checked_handoff.schema
@@ -744,7 +744,7 @@ impl SemanticImageBuilder<ExecutionFinalized> {
         &self.execution
     }
 
-    pub(crate) const fn checked_handoff(&self) -> &CheckedImageHandoffV3 {
+    pub(crate) const fn checked_handoff(&self) -> &CheckedImageHandoffV4 {
         &self.checked_handoff
     }
 
@@ -842,7 +842,7 @@ struct PendingExecutionProjectionV3 {
 }
 
 struct ExecutionImageHandoffBuilderV3<'a> {
-    checked: &'a CheckedImageHandoffV3,
+    checked: &'a CheckedImageHandoffV4,
     construction_image: &'a ExecutionConstructionImageV3,
     ids: BTreeMap<ExecutionConstructionProjectionV3, PendingExecutionProjectionIdV3>,
     stable_digest_ids: BTreeMap<[u8; 32], PendingExecutionProjectionIdV3>,
@@ -864,7 +864,7 @@ struct ExecutionImageHandoffBuilderV3<'a> {
 
 impl<'a> ExecutionImageHandoffBuilderV3<'a> {
     fn new(
-        checked: &'a CheckedImageHandoffV3,
+        checked: &'a CheckedImageHandoffV4,
         construction_image: &'a ExecutionConstructionImageV3,
     ) -> Result<Self, String> {
         if construction_image
@@ -1247,7 +1247,7 @@ struct PendingExecutionProjectionV2 {
 
 #[cfg(test)]
 struct ExecutionImageHandoffBuilderV2<'a> {
-    checked: &'a CheckedImageHandoffV3,
+    checked: &'a CheckedImageHandoffV4,
     construction_image: &'a ExecutionConstructionImageV3,
     path_ids: BTreeMap<
         (
@@ -1271,7 +1271,7 @@ struct ExecutionImageHandoffBuilderV2<'a> {
 #[cfg(test)]
 impl<'a> ExecutionImageHandoffBuilderV2<'a> {
     fn new(
-        checked: &'a CheckedImageHandoffV3,
+        checked: &'a CheckedImageHandoffV4,
         construction_image: &'a ExecutionConstructionImageV3,
     ) -> Result<Self, String> {
         if construction_image
@@ -1739,7 +1739,7 @@ impl<'a> ExecutionImageHandoffBuilderV2<'a> {
 }
 
 fn checked_projection(
-    checked: &CheckedImageHandoffV3,
+    checked: &CheckedImageHandoffV4,
     domain: CheckedImageRowDomainV2,
     dense_index: usize,
 ) -> Result<CheckedImageProjectionIdV2, String> {
@@ -1751,7 +1751,7 @@ fn checked_projection(
 }
 
 fn checked_definition_routes(
-    checked: &CheckedImageHandoffV3,
+    checked: &CheckedImageHandoffV4,
 ) -> Result<Vec<CheckedImageProjectionIdV2>, String> {
     let mut by_owner = BTreeMap::<
         &boon_checked::CheckedShardOwnerKeyV2,
@@ -1791,7 +1791,7 @@ fn checked_definition_routes(
 }
 
 pub(crate) fn execution_construction_routes_v3(
-    checked: &CheckedImageHandoffV3,
+    checked: &CheckedImageHandoffV4,
     out: &ResolvedOutGraph,
 ) -> Result<ExecutionConstructionRoutesV3, String> {
     let trace_started = std::env::var_os("BOON_SEMANTIC_TRACE")
@@ -2018,7 +2018,7 @@ fn static_owner_occurrences_v3(out: &ResolvedOutGraph) -> Result<Vec<OutCallInst
 }
 
 pub(crate) fn execution_construction_image_v3(
-    checked: &CheckedImageHandoffV3,
+    checked: &CheckedImageHandoffV4,
     routes: ExecutionConstructionRoutesV3,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<ExecutionConstructionImageV3, String> {
@@ -2439,7 +2439,7 @@ fn function_projection_v3(
 }
 
 fn execution_image_handoff_v3(
-    checked: &CheckedImageHandoffV3,
+    checked: &CheckedImageHandoffV4,
     construction_image: &ExecutionConstructionImageV3,
     execution: &SemanticExecutionImageColumnsV1,
     core: &crate::program_core::CanonicalProgramCoreV2,
@@ -2924,7 +2924,7 @@ enum ExecutionRouteOracleOwner {
 
 #[cfg(test)]
 fn checked_route_oracle_owner(
-    checked: &CheckedImageHandoffV3,
+    checked: &CheckedImageHandoffV4,
     projection: CheckedImageProjectionIdV2,
 ) -> Result<boon_checked::CheckedShardOwnerKeyV2, String> {
     checked
@@ -2936,7 +2936,7 @@ fn checked_route_oracle_owner(
 #[cfg(test)]
 fn v3_route_oracle_owner(
     handoff: &ExecutionImageHandoffV3,
-    checked: &CheckedImageHandoffV3,
+    checked: &CheckedImageHandoffV4,
     projection: ExecutionImageProjectionIdV3,
 ) -> Result<ExecutionRouteOracleOwner, String> {
     let projection = handoff
@@ -2970,7 +2970,7 @@ fn v3_route_oracle_owner(
 #[cfg(test)]
 fn v2_route_oracle_owner(
     handoff: &ExecutionImageHandoffV2,
-    checked: &CheckedImageHandoffV3,
+    checked: &CheckedImageHandoffV4,
     projection: ExecutionImageProjectionIdV2,
 ) -> Result<ExecutionRouteOracleOwner, String> {
     let projection = handoff
@@ -3022,7 +3022,7 @@ fn v3_domain_in_v2(domain: ExecutionImageRowDomainV3) -> ExecutionImageRowDomain
 fn validate_v3_routes_against_v2_oracle(
     handoff: &ExecutionImageHandoffV3,
     oracle: &ExecutionImageHandoffV2,
-    checked: &CheckedImageHandoffV3,
+    checked: &CheckedImageHandoffV4,
 ) -> Result<(), String> {
     for route in &handoff.entity_routes {
         let oracle_projection = oracle
@@ -3057,7 +3057,7 @@ fn trace_execution_handoff_phase(enabled: bool, name: &str, started: &mut std::t
 
 #[cfg(test)]
 fn execution_image_handoff_v2_oracle(
-    checked: &CheckedImageHandoffV3,
+    checked: &CheckedImageHandoffV4,
     construction_image: &ExecutionConstructionImageV3,
     _out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
@@ -3537,7 +3537,7 @@ fn execution_image_handoff_v2_oracle(
 
 fn semantic_image_seal_digest(
     schema: &str,
-    checked: &CheckedImageHandoffV3,
+    checked: &CheckedImageHandoffV4,
     execution: &ExecutionImageHandoffV3,
 ) -> Result<[u8; 32], String> {
     boon_contract::canonical_serde_hash_v1(

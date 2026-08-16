@@ -294,6 +294,10 @@ pub struct CheckedSourceFromSource {
     /// Parser-issued call identities supplied by the dense kernel. Legacy
     /// checked constructions derive them from parser slots during sealing.
     checked_call_occurrences: Option<Box<[boon_syntax::StableOccurrenceKey]>>,
+    /// Definition-owned checked-image authority emitted only by the dense
+    /// kernel. A verified request consumes it instead of serializing every
+    /// rich checked row to prove the same immutable definitions again.
+    checked_image_kernel_authority: Option<Box<boon_checked::CheckedImageKernelAuthorityV1>>,
 }
 
 /// Produces structured parser/type diagnostics for a failed runtime compile.
@@ -753,8 +757,12 @@ pub fn compile_artifact_oracle_pair(
         &parsed,
         &external_types,
     );
-    let checked =
-        checked_program_from_output(CheckedSyntaxRef::Assembled(&parsed), check_output, None)?;
+    let checked = checked_program_from_output(
+        CheckedSyntaxRef::Assembled(&parsed),
+        check_output,
+        None,
+        None,
+    )?;
     let retained = compile_checked_artifact_oracle_plan(
         checked.clone(),
         false,
@@ -877,6 +885,7 @@ pub(crate) fn checked_source_from_checked_fields(
     owner_work: CompilerOwnerWork,
     typecheck_ms: f64,
     checked_call_occurrences: Option<Box<[boon_syntax::StableOccurrenceKey]>>,
+    checked_image_kernel_authority: Option<Box<boon_checked::CheckedImageKernelAuthorityV1>>,
 ) -> CheckedSourceFromSource {
     let metadata = &fields.lowering_metadata;
     let render_slot_failure_count = metadata
@@ -1005,6 +1014,7 @@ pub(crate) fn checked_source_from_checked_fields(
             total_ms: parse_ms + typecheck_ms,
         },
         checked_call_occurrences,
+        checked_image_kernel_authority,
     }
 }
 
@@ -1086,6 +1096,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         output,
         mut profile,
         checked_call_occurrences,
+        checked_image_kernel_authority,
     } = checked_source;
     let deferred_runtime_handoff = output.construction.is_some();
     let runtime_handoff_started = Instant::now();
@@ -1093,7 +1104,12 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         CheckedSourceSyntax::Assembled(program) => CheckedSyntaxRef::Assembled(program),
         CheckedSourceSyntax::UnitNative(program) => CheckedSyntaxRef::UnitNative(program),
     };
-    let checked = checked_program_from_output(syntax, output, checked_call_occurrences.as_deref())?;
+    let checked = checked_program_from_output(
+        syntax,
+        output,
+        checked_call_occurrences.as_deref(),
+        checked_image_kernel_authority.as_deref(),
+    )?;
     if deferred_runtime_handoff {
         let runtime_handoff_ms = elapsed_ms(runtime_handoff_started);
         profile.typecheck_ms += runtime_handoff_ms;
@@ -1247,6 +1263,7 @@ fn checked_program_from_output(
     syntax: CheckedSyntaxRef<'_>,
     output: boon_checked::CheckOutput,
     checked_call_occurrences: Option<&[boon_syntax::StableOccurrenceKey]>,
+    checked_image_kernel_authority: Option<&boon_checked::CheckedImageKernelAuthorityV1>,
 ) -> CompilerResult<boon_checked::CheckedProgram> {
     if output.report.has_errors() {
         let diagnostics = output
@@ -1297,6 +1314,18 @@ fn checked_program_from_output(
                 "assembled checked construction cannot consume project-native call identities",
             )
             .into()),
+            CheckedSyntaxRef::UnitNative(program)
+                if let (Some(call_occurrences), Some(authority)) =
+                    (checked_call_occurrences, checked_image_kernel_authority) =>
+            {
+                boon_typecheck::seal_project_checked_program_construction_with_kernel_authority(
+                    program,
+                    construction,
+                    call_occurrences,
+                    authority,
+                )
+                .map_err(|error| PlanError::new(error).into())
+            }
             CheckedSyntaxRef::UnitNative(program)
                 if let Some(call_occurrences) = checked_call_occurrences =>
             {

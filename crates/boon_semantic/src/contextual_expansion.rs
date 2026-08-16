@@ -23,7 +23,7 @@ use crate::{
 use boon_checked::{
     CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedContextBinding,
     CheckedContextualOperation, CheckedDeclarationKind, CheckedExprId, CheckedExpression,
-    CheckedExpressionKind, CheckedImageHandoffV3, CheckedMatchPattern, CheckedParameterKind,
+    CheckedExpressionKind, CheckedImageHandoffV4, CheckedMatchPattern, CheckedParameterKind,
     CheckedParameterRequirement, CheckedPassedAccess, CheckedProgramFields, CheckedResourceBinding,
     CheckedStateKind, CheckedTextSegment, CheckedValueUse, ContextFormalId, DeclId, FlowMode,
     FlowType, Type, is_renderable_type,
@@ -1869,7 +1869,7 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
 
 pub(crate) fn derive_semantic_execution_graph(
     program: &CheckedProgramFields,
-    checked_handoff: CheckedImageHandoffV3,
+    checked_handoff: CheckedImageHandoffV4,
     out_net: &OutNet,
     materializations: &[SemanticContextualMaterialization],
     mut arena: SemanticExpressionArena,

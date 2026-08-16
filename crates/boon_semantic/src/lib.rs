@@ -426,67 +426,72 @@ fn distributed_value_structural_root(
     let Some(frame) = frame else {
         return Ok((DistributedCallOccurrenceRoot::Program, Vec::new()));
     };
-    let out_net = program.resolved_out_graph();
-    let mut ancestry = Vec::new();
+    semantic_invocation_ancestry(program, frame)
+}
+
+/// Reads the final compact invocation spine owned by the execution image.
+///
+/// OUT constructs these frames, but it is not retained as a second semantic
+/// graph. The execution handoff owns stable roots while the dense semantic
+/// occurrence row owns parent/call identity; checking both keeps the linker
+/// fail-closed without reconstructing or retaining OUT.
+fn semantic_invocation_ancestry(
+    program: &SemanticProgram,
+    frame: OutCallInstanceId,
+) -> Result<(DistributedCallOccurrenceRoot, Vec<SemanticCallId>), SemanticError> {
+    let execution = program.execution_graph();
+    let handoff = program.semantic_image().execution_handoff();
+    let root_overlay = handoff.invocation(frame).ok_or_else(|| {
+        SemanticError::new(format!(
+            "distributed invocation spine references missing frame {frame}"
+        ))
+    })?;
+    let root = root_overlay.root;
+    let mut call_path = Vec::new();
     let mut next = Some(frame);
-    let mut remaining = out_net.call_instances.len().saturating_add(1);
-    while let Some(call) = next {
+    let mut remaining = execution.call_occurrences.len().saturating_add(1);
+    while let Some(occurrence_id) = next {
         if remaining == 0 {
             return Err(SemanticError::new(format!(
-                "distributed value frame {frame} has cyclic OUT ancestry"
+                "distributed invocation frame {frame} has cyclic ancestry"
             )));
         }
         remaining -= 1;
-        let instance = out_net
-            .call_instances
-            .get(call.as_usize())
-            .filter(|instance| instance.id == call)
+        let occurrence = execution
+            .call_occurrences
+            .get(occurrence_id.as_usize())
+            .filter(|occurrence| occurrence.id == occurrence_id)
             .ok_or_else(|| {
                 SemanticError::new(format!(
-                    "distributed value frame ancestry references missing OUT call {call}"
+                    "distributed invocation ancestry references missing occurrence {occurrence_id}"
                 ))
             })?;
-        ancestry.push(call);
-        next = instance.parent;
-    }
-    ancestry.reverse();
-
-    let producer_root = ancestry.first().and_then(|root| {
-        out_net
-            .producer_roots()
-            .iter()
-            .find(|producer| producer.call == *root)
-    });
-    let root = producer_root
-        .map(|producer| DistributedCallOccurrenceRoot::Producer(producer.spec.identity))
-        .unwrap_or(DistributedCallOccurrenceRoot::Program);
-    let first_static = usize::from(producer_root.is_some());
-    let mut call_path = Vec::with_capacity(ancestry.len().saturating_sub(first_static));
-    for instance in ancestry.into_iter().skip(first_static) {
-        let checked_call = out_net.call_instances[instance.as_usize()]
-            .provenance
-            .call_id
-            .ok_or_else(|| {
-                SemanticError::new(format!(
-                    "distributed value non-root OUT call {instance} has no checked call identity"
-                ))
-            })?;
-        let matches = program
-            .execution_graph()
-            .calls
-            .iter()
-            .filter(|call| call.checked_call == checked_call)
-            .map(|call| call.id)
-            .collect::<Vec<_>>();
-        let [call] = matches.as_slice() else {
+        let overlay = handoff.invocation(occurrence_id).ok_or_else(|| {
+            SemanticError::new(format!(
+                "distributed invocation ancestry references missing overlay {occurrence_id}"
+            ))
+        })?;
+        if overlay.parent != occurrence.parent || overlay.root != root {
             return Err(SemanticError::new(format!(
-                "distributed value OUT call {instance} checked identity {} maps to {} semantic calls",
-                checked_call.0,
-                matches.len()
+                "distributed invocation {occurrence_id} disagrees between its execution row and stable overlay"
             )));
-        };
-        call_path.push(*call);
+        }
+        if let Some(call) = occurrence.call {
+            let definition = execution
+                .calls
+                .get(call.as_usize())
+                .filter(|definition| definition.id == call)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "distributed invocation {occurrence_id} references missing semantic call {call}"
+                    ))
+                })?;
+            let _ = definition;
+            call_path.push(call);
+        }
+        next = occurrence.parent;
     }
+    call_path.reverse();
     Ok((root, call_path))
 }
 
@@ -627,6 +632,10 @@ pub struct SemanticProgram {
     #[cfg(test)]
     execution_graph: SemanticExecutionImageColumnsV1,
     producer_materializations: Vec<ProducerMaterializationRequest>,
+    /// Construction-only OUT is retained solely by tests as an independent
+    /// deep-validation oracle. Production linking consumes the compact
+    /// invocation overlays and does not keep this duplicate graph alive.
+    #[cfg(test)]
     resolved_out_graph: ResolvedOutGraph,
     resource_graph: SemanticResourceGraphV2,
     reactive_graph: SemanticReactiveGraphV1,
@@ -797,6 +806,7 @@ impl SemanticProgram {
         self.dependency_manifest.checked_program_digest
     }
 
+    #[cfg(test)]
     pub const fn resolved_out_graph(&self) -> &ResolvedOutGraph {
         &self.resolved_out_graph
     }
@@ -890,17 +900,17 @@ impl SemanticProgram {
                 .validate_checked_roots(&self.checked_program)
                 .map_err(SemanticError::new)?;
         }
-        execution
-            .validate(&self.resolved_out_graph)
-            .map_err(SemanticError::new)?;
-        self.resource_graph
-            .validate(execution, &self.resolved_out_graph)
-            .map_err(SemanticError::new)?;
-        self.reactive_graph
-            .validate(execution, &self.resource_graph, &self.resolved_out_graph)
-            .map_err(|error| SemanticError::new(error.to_string()))?;
         #[cfg(test)]
         {
+            execution
+                .validate(&self.resolved_out_graph)
+                .map_err(SemanticError::new)?;
+            self.resource_graph
+                .validate(execution, &self.resolved_out_graph)
+                .map_err(SemanticError::new)?;
+            self.reactive_graph
+                .validate(execution, &self.resource_graph, &self.resolved_out_graph)
+                .map_err(|error| SemanticError::new(error.to_string()))?;
             self.lowering_contract
                 .validate(
                     &self.checked_program,
@@ -1439,64 +1449,22 @@ fn semantic_distributed_call_occurrence(
     program: &SemanticProgram,
     frame: OutCallInstanceId,
 ) -> Result<(DistributedCallOccurrenceRoot, String), SemanticError> {
-    let out = program.resolved_out_graph();
-    let mut ancestry = Vec::new();
-    let mut next = Some(frame);
-    let mut remaining = out.call_instances.len().saturating_add(1);
-    while let Some(call) = next {
-        if remaining == 0 {
-            return Err(SemanticError::new(format!(
-                "distributed call frame {frame} has cyclic OUT ancestry"
-            )));
-        }
-        remaining -= 1;
-        let instance = out
-            .call_instances
-            .get(call.as_usize())
-            .filter(|candidate| candidate.id == call)
-            .ok_or_else(|| {
-                SemanticError::new(format!(
-                    "distributed call frame ancestry references missing OUT call {call}"
-                ))
-            })?;
-        ancestry.push(call);
-        next = instance.parent;
-    }
-    ancestry.reverse();
-
-    let producer_root = ancestry.first().and_then(|root| {
-        out.producer_roots()
-            .iter()
-            .find(|producer| producer.call == *root)
-    });
-    let root = producer_root
-        .map(|producer| DistributedCallOccurrenceRoot::Producer(producer.spec.identity))
-        .unwrap_or(DistributedCallOccurrenceRoot::Program);
+    let (root, call_path) = semantic_invocation_ancestry(program, frame)?;
     let mut path = match root {
         DistributedCallOccurrenceRoot::Program => "program".to_owned(),
         DistributedCallOccurrenceRoot::Producer(identity) => {
             format!("producer:{}", digest_hex(&identity))
         }
     };
-    let first_static = usize::from(producer_root.is_some());
-    for call in ancestry.into_iter().skip(first_static) {
-        let checked_call = out.call_instances[call.as_usize()]
-            .provenance
-            .call_id
-            .ok_or_else(|| {
-                SemanticError::new(format!(
-                    "distributed non-root OUT call {call} has no checked call identity"
-                ))
-            })?;
+    for call in call_path {
         let semantic_call = program
             .execution_graph()
             .calls
-            .get(checked_call.0 as usize)
-            .filter(|candidate| candidate.checked_call == checked_call)
+            .get(call.as_usize())
+            .filter(|candidate| candidate.id == call)
             .ok_or_else(|| {
                 SemanticError::new(format!(
-                    "distributed OUT call {call} references missing checked call {}",
-                    checked_call.0
+                    "distributed invocation frame {frame} references missing semantic call {call}"
                 ))
             })?;
         path.push('/');
@@ -1665,22 +1633,32 @@ fn exact_bundle_call_arguments(
                             occurrence.occurrence_path, value
                         ))
                     })?;
-                let call_instance = consumer_program
-                    .resolved_out_graph()
-                    .call_instances
-                    .get(instance.as_usize())
-                    .filter(|candidate| candidate.id == instance)
+                consumer_program
+                    .semantic_image()
+                    .execution_handoff()
+                    .invocation(instance)
                     .ok_or_else(|| {
                         SemanticError::new(format!(
-                            "distributed occurrence `{}` references missing concrete call frame {}",
+                            "distributed occurrence `{}` references missing concrete invocation overlay {}",
                             occurrence.occurrence_path, instance
                         ))
                     })?;
                 let instantiated_value_flow_type = boon_checked::FlowType {
                     mode: value_flow_type.mode,
-                    ty: consumer_program
-                        .resolved_out_graph()
-                        .apply_type_substitutions(call_instance.id, &value_flow_type.ty),
+                    // The concrete semantic value is the final occurrence
+                    // authority. Refine it against the checked principal to
+                    // validate structural compatibility without retaining the
+                    // construction-only OUT substitution graph.
+                    ty: contextual_expansion::refine_runtime_occurrence_type(
+                        &value_definition.flow_type.ty,
+                        &value_flow_type.ty,
+                    )
+                    .map_err(|error| {
+                        SemanticError::new(format!(
+                            "distributed occurrence `{}` cannot refine argument {} against its checked principal: {error}",
+                            occurrence.occurrence_path, value
+                        ))
+                    })?,
                 };
                 if argument.checked_value != *checked_value
                     || argument.value != *value
@@ -3050,6 +3028,7 @@ fn elaborate_with_representation(
             semantic_image_builder.checked_handoff(),
             semantic_image_builder.execution_handoff(),
             &producer_materializations,
+            #[cfg(test)]
             &resolved_out_graph,
             execution_graph,
             &resource_graph,
@@ -3078,6 +3057,7 @@ fn elaborate_with_representation(
         #[cfg(test)]
         execution_graph: execution_graph_oracle,
         producer_materializations,
+        #[cfg(test)]
         resolved_out_graph,
         resource_graph,
         reactive_graph,
@@ -8133,7 +8113,7 @@ result: mapped(value: 0)
     }
 
     #[test]
-    fn semantic_digest_binds_the_complete_resolved_out_graph() {
+    fn semantic_digest_binds_out_derived_storage_shape() {
         let (checked, _, _) = wrapped_out_contract_fixture();
         let mut semantic = elaborate(checked, &[]).unwrap();
         semantic.resolved_out_graph.static_owners[0].child_ordinal =
@@ -8172,6 +8152,7 @@ result: mapped(value: 0)
             semantic.semantic_image.checked_handoff(),
             semantic.semantic_image.execution_handoff(),
             &semantic.producer_materializations,
+            #[cfg(test)]
             &semantic.resolved_out_graph,
             &semantic.execution_graph,
             &semantic.resource_graph,
@@ -8188,7 +8169,7 @@ result: mapped(value: 0)
         semantic.request_graph = Arc::new(dependency_build.request_graph);
         let error = semantic
             .validate()
-            .expect_err("mutated resolved graph must invalidate semantic digest");
+            .expect_err("mutated OUT-derived storage shape must invalidate semantic digest");
         assert!(
             error
                 .to_string()

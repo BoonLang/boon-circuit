@@ -3874,13 +3874,44 @@ whole-compiler speed claim. Diagnostics is 679.852 ms and WHERE verification is
 1.039 ms, again proving WHERE is not the current bottleneck. The optimized Rust
 rebuild took 3 minutes 15 seconds and is excluded from every Boon timing.
 
-The next largest runtime owner is the 289.353 ms dependency-manifest pass:
-88.198 ms re-inventories OUT and 82.446 ms rebuilds projection SCC receipts.
-The next vertical slice must consume definition/execution construction receipts
-directly and delete those rich-graph inventories, not merely move their hashes
-to another phase. In parallel, the now-dead owner-interface/body solver must be
-physically removed as a build-dependency cut; that deletion is measured as Rust
-rebuild closure rather than falsely credited to Boon execution latency.
+Checkpoint `578deede` folded definition-owned semantic dependency receipts and
+checkpoint `ced4b7a9` folded the canonical-core receipt. The following compact
+manifest/OUT ownership slice is now ready for its checkpoint. Production no
+longer retains `ResolvedOutGraph` in `SemanticProgram` or re-inventories it as a
+second manifest proof graph. OUT remains a construction-time graph and a
+test-only independent oracle. Bundle/distributed linking consumes the final
+execution-image invocation overlay, and the manifest binds the domain-separated
+execution handoff receipt. The compact projection builder also streams rows
+directly into its CSR receipt instead of retaining 24,221 pending row objects
+and their per-row target vectors.
+
+The fresh optimized NovyWave verified probe records 3,616.758 ms total and
+3,581.522 ms wall, with 1,596.885 ms in semantic elaboration and 177.985 ms in
+the dependency manifest. The previous accepted optimized sample was 3,704.466
+ms total, 3,663.879 ms wall, 1,657.620 ms semantic, and 233.547 ms manifest, so
+this cut removes 87.708 ms total, 82.357 ms wall, 60.735 ms semantic, and
+55.562 ms manifest. The manifest now contains 19,784 rows instead of 24,221.
+The optimized Rust rebuild took 4 minutes 9 seconds and is excluded from every
+Boon timing. WHERE verification is 0.672 ms; it remains measured and is not a
+material optimization target. The corresponding debug probe records 18,010.538
+ms total, 17,979.268 ms wall, 7,504.709 ms semantic, 824.433 ms manifest, and
+1.179 ms WHERE. Both probes cover all 1,389 definitions with zero unsupported
+owners and exact differential parity.
+
+Focused manifest tests are 20/20 green and the dependency-firewall test is
+green. The 107 compiler library tests are green, but the full package run also
+exposes three pre-existing dense-kernel integration failures in `map_set.rs`.
+They identify missing compact ABIs for Map/Set/List operations and an invalid
+cross-owner BLOCK binding ID. These fail during dense checked construction,
+before semantic elaboration, and therefore are not regressions from this cut.
+They are nevertheless flag-day parity blockers. The next largest correctness
+cut is to close this collection/block coverage family as one kernel tranche;
+only then may the dead owner-interface/body session machinery be physically
+deleted. That deletion is measured as Rust rebuild closure rather than falsely
+credited to Boon execution latency. After parity is restored, the largest
+measured runtime cuts are definition-owned semantic construction (currently
+286.302 ms for execution-graph derivation) and the remaining construction-time
+OUT graph (228.502 ms), not WHERE.
 
 Run the debug probe after each meaningful semantic slice. Run the release probe
 at architecture boundaries or when a debug profile changes materially; do not

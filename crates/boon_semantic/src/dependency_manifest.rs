@@ -8,6 +8,7 @@
 //! `SemanticProgram` retains only their digests and exact owner/callable
 //! implementation identities.
 
+#[cfg(test)]
 use crate::out_net::{OutCallProvenance, OutInputValue, OutPortId, PassedBinding};
 use crate::*;
 #[cfg(test)]
@@ -18,9 +19,11 @@ use boon_checked::{
 use boon_checked::{
     CheckedEvaluationScope, CheckedImageHandoffV3, CheckedImageProjectionIdV2,
     CheckedImageRowDomainV2, CheckedProgramFields, CheckedShardCallableKindV2,
-    CheckedShardOwnerKeyV2, CheckedShardProjectionKeyV2, CheckedShardRegionV2, DeclId, FlowMode,
-    FlowType, ProgramRole, Type, TypeVar,
+    CheckedShardOwnerKeyV2, CheckedShardProjectionKeyV2, CheckedShardRegionV2, DeclId, FlowType,
+    ProgramRole,
 };
+#[cfg(test)]
+use boon_checked::{FlowMode, Type, TypeVar};
 use boon_compilation_db::{
     DenseProjectionGraphBuilder, ProjectionGraphDigestDomains, ProjectionId,
     Revision as CompilationRevision, SealedRequestGraphSnapshot,
@@ -42,7 +45,9 @@ pub const CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V7: &str = "boon.callable-dependen
 const CHECKED_PROGRAM_DIGEST_DOMAIN: &[u8] = b"boon.checked-program.v1\0";
 const DEPENDENCY_COMPONENT_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-components.v1\0";
 const DEPENDENCY_RECORD_PAYLOAD_DOMAIN: &[u8] = b"boon.callable-dependency-record-payload.v1\0";
+#[cfg(test)]
 const DEPENDENCY_OUT_TYPE_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-out-type.v1\0";
+#[cfg(test)]
 const DEPENDENCY_OUT_COMPONENT_RECEIPT_DOMAIN_V2: &[u8] =
     b"boon.callable-dependency-out-component-receipts.v2\0";
 const DEPENDENCY_REACTIVE_COMPONENT_RECEIPT_DOMAIN_V2: &[u8] =
@@ -126,6 +131,8 @@ const DEPENDENCY_SEALED_MANIFEST_DOMAIN_V7: &[u8] =
 const DEPENDENCY_CALLABLE_SET_DOMAIN_V7: &[u8] = b"boon.callable-dependency-callable-set.v7\0";
 const DEPENDENCY_PROGRAM_ROOT_ENTRY_DOMAIN_V7: &[u8] =
     b"boon.callable-dependency-program-root-entry.v7\0";
+const DEPENDENCY_CONSUMED_OUT_EXECUTION_RECEIPT_DOMAIN_V1: &[u8] =
+    b"boon.consumed-out-execution-receipt.v1\0";
 
 macro_rules! dependency_id {
     ($($name:ident),+ $(,)?) => {
@@ -1872,6 +1879,7 @@ impl DependencyOwnerIndex {
             })
     }
 
+    #[cfg(test)]
     fn out_call(
         &self,
         call: OutCallInstanceId,
@@ -4872,15 +4880,6 @@ impl DependencyCollector {
             Ok((key, owner))
         };
 
-        struct PendingDenseProjectionRowV7 {
-            projection: ProjectionId,
-            local_digest: [u8; 32],
-            targets: Vec<ProjectionId>,
-        }
-
-        let mut pending_rows = (0..self.compact_rows.len())
-            .map(|_| None)
-            .collect::<Vec<Option<PendingDenseProjectionRowV7>>>();
         for (index, record) in self.compact_records.iter().copied().enumerate() {
             let record_id = SemanticDependencyRecordId(index);
             let row = self.compact_rows.get(record.row).ok_or_else(|| {
@@ -4894,105 +4893,21 @@ impl DependencyCollector {
                     "remaining dependency {record_id} is not bound by its exact coverage row"
                 )));
             }
-            let (source_key, source_owner) = stable_projection(row)?;
-            let source = presealed.ensure_legacy(source_key, source_owner)?;
-            let references = self
-                .compact_references
-                .get(record.references_start..record.references_end)
-                .ok_or_else(|| {
-                    CallableDependencyManifestError::new(format!(
-                        "remaining dependency {record_id} has an invalid reference span"
-                    ))
-                })?;
-            let mut targets = Vec::new();
-            for reference in references {
-                match reference {
-                    PendingDependencyReference::CallableInterface(callable) => {
-                        targets.push(
-                            presealed
-                                .callable_interfaces
-                                .get(callable)
-                                .copied()
-                                .ok_or_else(|| {
-                                    CallableDependencyManifestError::new(format!(
-                                        "dependency {record_id} references missing callable interface {callable}"
-                                    ))
-                                })?,
-                        );
-                    }
-                    PendingDependencyReference::Entity(entity) => {
-                        if let Some(dependencies) = self.dependencies_by_entity.get(entity) {
-                            for dependency in dependencies.iter().copied() {
-                                if dependency == record_id {
-                                    continue;
-                                }
-                                let target_record = self
-                                    .compact_records
-                                    .get(dependency.as_usize())
-                                    .ok_or_else(|| {
-                                        CallableDependencyManifestError::new(format!(
-                                            "dependency {record_id} references missing dependency {dependency}"
-                                        ))
-                                    })?;
-                                let target_row =
-                                    self.compact_rows.get(target_record.row).ok_or_else(|| {
-                                        CallableDependencyManifestError::new(format!(
-                                            "dependency {dependency} references missing row {}",
-                                            target_record.row
-                                        ))
-                                    })?;
-                                let (target_key, target_owner) = stable_projection(target_row)?;
-                                targets.push(presealed.ensure_legacy(target_key, target_owner)?);
-                            }
-                        } else {
-                            targets.push(
-                                presealed.entity_routes.get(entity).copied().ok_or_else(|| {
-                                    CallableDependencyManifestError::new(format!(
-                                        "dependency {record_id} references unsealed entity {entity:?}"
-                                    ))
-                                })?,
-                            );
-                        }
-                    }
-                    #[cfg(test)]
-                    PendingDependencyReference::Owner(owner) => {
-                        return Err(CallableDependencyManifestError::new(format!(
-                            "V7 production dependency {record_id} uses forbidden broad owner target {owner:?}"
-                        )));
-                    }
-                }
-            }
-            if pending_rows[record.row]
-                .replace(PendingDenseProjectionRowV7 {
-                    projection: source,
-                    local_digest: row.local_digest,
-                    targets,
-                })
-                .is_some()
-            {
-                return Err(CallableDependencyManifestError::new(format!(
-                    "remaining coverage row {} is finalized twice",
-                    record.row
-                )));
-            }
         }
-        for (index, row) in self.compact_rows.iter().enumerate() {
-            if pending_rows[index].is_some() {
-                continue;
-            }
-            if row.dependency.is_some() {
-                return Err(CallableDependencyManifestError::new(format!(
-                    "remaining coverage row {index} has no dependency record"
-                )));
-            }
-            let (projection_key, owner) = stable_projection(row)?;
-            let projection = presealed.ensure_legacy(projection_key, owner)?;
-            pending_rows[index] = Some(PendingDenseProjectionRowV7 {
-                projection,
-                local_digest: row.local_digest,
-                targets: Vec::new(),
-            });
-        }
+
+        // Register each remaining projection exactly once before resolving
+        // forward entity references. The former path allocated one pending
+        // row object (and usually one target Vec) for every semantic row, then
+        // walked that second graph-shaped arena only to fold it back into the
+        // dense request graph below.
+        let row_projections = self
+            .compact_rows
+            .iter()
+            .map(|row| {
+                let (projection_key, owner) = stable_projection(row)?;
+                presealed.ensure_legacy(projection_key, owner)
+            })
+            .collect::<Result<Vec<_>, CallableDependencyManifestError>>()?;
         trace_checkpoint!("resolve_rows");
 
         presealed.finalize_canonical_order()?;
@@ -5009,29 +4924,111 @@ impl DependencyCollector {
         let mut legacy_rows = (0..presealed.projections.len())
             .map(|_| Vec::new())
             .collect::<Vec<Vec<[u8; 32]>>>();
-        for (index, pending) in pending_rows.into_iter().enumerate() {
-            let mut pending = pending.ok_or_else(|| {
-                CallableDependencyManifestError::new(format!(
-                    "remaining coverage row {index} has no pending dense receipt"
-                ))
-            })?;
-            pending
-                .targets
-                .sort_unstable_by_key(|target| canonical_ranks[target.as_usize()]);
-            pending.targets.dedup();
-            let target_digests = pending
-                .targets
-                .iter()
-                .map(|target| stable_key_digests[target.as_usize()])
-                .collect::<Vec<_>>();
+        let mut targets = Vec::new();
+        let mut target_digests = Vec::new();
+        for (row_index, (row, projection)) in self
+            .compact_rows
+            .iter()
+            .zip(row_projections.iter().copied())
+            .enumerate()
+        {
+            targets.clear();
+            if let Some(record_id) = row.dependency {
+                let record = self
+                    .compact_records
+                    .get(record_id.as_usize())
+                    .filter(|record| record.row == row_index)
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "remaining coverage row {row_index} references missing dependency {record_id}"
+                        ))
+                    })?;
+                let references = self
+                    .compact_references
+                    .get(record.references_start..record.references_end)
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "remaining dependency {record_id} has an invalid reference span"
+                        ))
+                    })?;
+                for reference in references {
+                    match reference {
+                        PendingDependencyReference::CallableInterface(callable) => {
+                            targets.push(
+                                presealed
+                                    .callable_interfaces
+                                    .get(callable)
+                                    .copied()
+                                    .ok_or_else(|| {
+                                        CallableDependencyManifestError::new(format!(
+                                            "dependency {record_id} references missing callable interface {callable}"
+                                        ))
+                                    })?,
+                            );
+                        }
+                        PendingDependencyReference::Entity(entity) => {
+                            if let Some(dependencies) = self.dependencies_by_entity.get(entity) {
+                                for dependency in dependencies.iter().copied() {
+                                    if dependency == record_id {
+                                        continue;
+                                    }
+                                    let target_record = self
+                                        .compact_records
+                                        .get(dependency.as_usize())
+                                        .ok_or_else(|| {
+                                            CallableDependencyManifestError::new(format!(
+                                                "dependency {record_id} references missing dependency {dependency}"
+                                            ))
+                                        })?;
+                                    targets.push(
+                                        row_projections
+                                            .get(target_record.row)
+                                            .copied()
+                                            .ok_or_else(|| {
+                                                CallableDependencyManifestError::new(format!(
+                                                    "dependency {dependency} references missing row {}",
+                                                    target_record.row
+                                                ))
+                                            })?,
+                                    );
+                                }
+                            } else {
+                                targets.push(
+                                    presealed.entity_routes.get(entity).copied().ok_or_else(
+                                        || {
+                                            CallableDependencyManifestError::new(format!(
+                                                "dependency {record_id} references unsealed entity {entity:?}"
+                                            ))
+                                        },
+                                    )?,
+                                );
+                            }
+                        }
+                        #[cfg(test)]
+                        PendingDependencyReference::Owner(owner) => {
+                            return Err(CallableDependencyManifestError::new(format!(
+                                "V7 production dependency {record_id} uses forbidden broad owner target {owner:?}"
+                            )));
+                        }
+                    }
+                }
+            }
+            targets.sort_unstable_by_key(|target| canonical_ranks[target.as_usize()]);
+            targets.dedup();
+            target_digests.clear();
+            target_digests.extend(
+                targets
+                    .iter()
+                    .map(|target| stable_key_digests[target.as_usize()]),
+            );
             let digest = compact_projection_row_digest_from_key_digests_v7(
-                stable_key_digests[pending.projection.as_usize()],
-                pending.local_digest,
+                stable_key_digests[projection.as_usize()],
+                row.local_digest,
                 &target_digests,
             )?;
-            legacy_rows[pending.projection.as_usize()].push(digest);
-            for target in pending.targets {
-                presealed.add_target(pending.projection, target)?;
+            legacy_rows[projection.as_usize()].push(digest);
+            for target in targets.iter().copied() {
+                presealed.add_target(projection, target)?;
             }
         }
         for (ordinal, rows) in legacy_rows.into_iter().enumerate() {
@@ -5055,7 +5052,6 @@ impl DependencyCollector {
             presealed.set_receipt(id, receipt)?;
         }
         trace_checkpoint!("fold_rows");
-        presealed.finalize_canonical_order()?;
         let receipt_members = presealed.receipt_members()?;
         let projection_receipts_digest = compact_digest_sequence_v4(
             DEPENDENCY_PROJECTION_RECEIPT_SET_DOMAIN_V7,
@@ -6234,7 +6230,7 @@ pub(crate) fn build_callable_dependency_manifest_v7(
     checked_handoff: &CheckedImageHandoffV3,
     execution_handoff: &ExecutionImageHandoffV3,
     producer_materializations: &[ProducerMaterializationRequest],
-    out: &ResolvedOutGraph,
+    #[cfg(test)] out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV2,
     resource_rows: &ConstructionDependencyRowsV1,
@@ -6393,9 +6389,19 @@ pub(crate) fn build_callable_dependency_manifest_v7(
         "inventory_producer_requests",
         inventory_producer_requests(producer_materializations, &owner_index, &mut collector)
     )?;
+    // OUT is a construction graph, not a second persistent semantic image.
+    // Its concrete invocation ancestry has already been consumed into the V3
+    // invocation overlays, while its instantiated values/effects are sealed
+    // by the execution rows. Re-inventorying every OUT frame here used to
+    // retain and hash the same occurrence graph a second time. Keep a
+    // domain-separated ownership receipt so the public component join remains
+    // explicit without rebuilding the discarded intermediate.
     let resolved_out_graph_digest = phase!(
-        "inventory_out",
-        inventory_out(out, &owner_index, &mut collector)
+        "consume_out_execution_receipt",
+        canonical_dependency_hash(
+            DEPENDENCY_CONSUMED_OUT_EXECUTION_RECEIPT_DOMAIN_V1,
+            &execution_handoff.local_image_digest,
+        )
     )?;
     phase!(
         "ingest_resource_rows",
@@ -7390,15 +7396,20 @@ impl CallableDependencyManifestV7 {
                 self.schema
             )));
         }
+        let expected_consumed_out_receipt = canonical_dependency_hash(
+            DEPENDENCY_CONSUMED_OUT_EXECUTION_RECEIPT_DOMAIN_V1,
+            &image.execution_handoff().local_image_digest,
+        )?;
         if self.source_bundle_digest_v1 != image.checked_handoff().source_bundle_digest_v1
             || self.source_bundle_digest_v1 != image.execution_handoff().source_bundle_digest_v1
             || self.checked_program_digest
                 != CheckedProgramDigestV1(image.checked_handoff().local_image_digest)
+            || self.component_digests.resolved_out_graph != expected_consumed_out_receipt
             || self.component_digests.execution_graph
                 != image.execution_handoff().local_image_digest
         {
             return Err(CallableDependencyManifestError::new(
-                "V7 manifest differs from its sealed checked/execution image",
+                "V7 manifest differs from its sealed checked/execution image or consumed OUT receipt",
             ));
         }
         if self.dependency_classifier_schema_digest
@@ -8998,6 +9009,7 @@ fn inventory_producer_requests(
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct CanonicalOutTypeSubstitutionV1 {
     variable: TypeVar,
@@ -9010,6 +9022,7 @@ struct CanonicalOutTypeSubstitutionV1 {
 /// complete OUT component. Serializing the expanded type tree once per
 /// contextual frame made equivalent inherited environments quadratic in the
 /// number of frames without adding dependency evidence.
+#[cfg(test)]
 #[derive(Serialize)]
 struct CanonicalOutCallHeaderV1<'a> {
     id: OutCallInstanceId,
@@ -9024,12 +9037,14 @@ struct CanonicalOutCallHeaderV1<'a> {
     owner: Option<StaticOwnerId>,
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct CanonicalOutInputBindingV1 {
     formal: DeclId,
     value: CanonicalOutInputValueV1,
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 enum CanonicalOutInputValueV1 {
     Checked(ScopedCheckedExpr),
@@ -9047,6 +9062,7 @@ enum CanonicalOutInputValueV1 {
 /// complete frame in one payload preserves every fact while making the call
 /// the sole invalidation unit, matching the compact invocation overlay used by
 /// the execution image.
+#[cfg(test)]
 #[derive(Serialize)]
 struct CanonicalOutCallFrameV2<'a> {
     header: CanonicalOutCallHeaderV1<'a>,
@@ -9054,6 +9070,7 @@ struct CanonicalOutCallFrameV2<'a> {
     passed: Option<PassedBinding>,
 }
 
+#[cfg(test)]
 fn dependency_out_type_digest<'a>(
     ty: &'a Type,
     cache: &mut HashMap<&'a Type, [u8; 32]>,
@@ -9074,6 +9091,7 @@ fn dependency_out_type_digest<'a>(
     Ok(digest)
 }
 
+#[cfg(test)]
 fn inventory_out(
     out: &ResolvedOutGraph,
     owners: &DependencyOwnerIndex,
@@ -14492,6 +14510,37 @@ ordinary: serve(value: 1)
         reject_component!(view_binding_graph);
         reject_component!(scope_storage_graph);
         reject_component!(memory_graph);
+    }
+
+    #[test]
+    fn v7_out_component_consumes_the_sealed_execution_receipt() {
+        let program = semantic_program_fixture();
+        let expected = canonical_dependency_hash(
+            DEPENDENCY_CONSUMED_OUT_EXECUTION_RECEIPT_DOMAIN_V1,
+            &program
+                .semantic_image
+                .execution_handoff()
+                .local_image_digest,
+        )
+        .expect("execution receipt folds into the consumed OUT component");
+        assert_eq!(
+            program
+                .dependency_manifest
+                .component_digests
+                .resolved_out_graph,
+            expected
+        );
+        assert_ne!(
+            program
+                .dependency_manifest
+                .component_digests
+                .resolved_out_graph,
+            program
+                .dependency_manifest
+                .component_digests
+                .execution_graph,
+            "OUT and execution retain separate domain identities even though execution owns both receipts"
+        );
     }
 
     #[test]

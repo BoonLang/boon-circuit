@@ -47,12 +47,12 @@ members = [
     "crates/boon_native_playground",
     "crates/xtask",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 boon_behavior_harness = { path = "crates/boon_behavior_harness" }

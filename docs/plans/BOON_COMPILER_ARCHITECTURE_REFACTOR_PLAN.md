@@ -4108,6 +4108,57 @@ has not yet deleted the downstream semantic reconstruction owners it enables.
 WHERE is 0.021% of verified time and is explicitly measured, but is not an
 optimization target.
 
+The 2026-08-16 toolchain audit removes another source of irreproducible
+evidence. The repository now pins exact stable Rust 1.97.1 (LLVM 22.1.6) in
+`rust-toolchain.toml`; the workspace keeps an independently checked Rust 1.89
+compatibility floor because the locked `cosmic-text`, `redb`, and `smol_str`
+releases already require 1.89. Cargo uses the Edition-2024, rust-version-aware
+resolver 3, and the FjordPulse builder uses the same exact production compiler.
+The architecture gate rejects a floating/nightly production channel, missing
+rustfmt/clippy components, resolver drift, or a mismatched deployment builder.
+The initial cleanup removed 46.6 GiB of generated workspace target data before
+the clean comparison.
+
+The same-source toolchain experiment does not justify a nightly production
+switch. Clean `boon_cli` release builds take 367.58 seconds and 1,951,496 KiB
+peak RSS on stable 1.97.1, versus 327.09 seconds and 1,896,112 KiB on
+`nightly-2026-08-16` (Rust 1.100.0-nightly, LLVM 23.1.0). The nightly producer
+has identical diagnostics, source digest, work counters, and MachinePlan hash,
+but its five scored NovyWave medians improve verified compilation only from
+2,815.179 to 2,777.685 ms in fresh-process mode and from 2,881.012 to
+2,804.211 ms in empty-session mode. Diagnostics medians are effectively flat:
+stable/nightly are 733.992/736.418 ms fresh and 744.167/747.092 ms through an
+empty session. Nightly parallel frontend compilation with four frontend jobs
+is rejected: it regresses the clean build to 333.09 seconds and raises peak RSS
+to 2,034,312 KiB. A 1--3% runtime difference and an experimental build-only
+gain do not outweigh nightly reproducibility and maintenance costs. ThinLTO,
+PGO, Cranelift, target-native code generation, and unstable MIR/LLVM flags are
+not substitutes for deleting repeated compiler work; evaluate them only after
+the architecture is near its cold gates and always outside canonical
+acceptance first.
+
+The current semantic cleanup removes three accidental multipliers without
+changing the artifact model: dependency retries borrow immutable checked
+expressions instead of cloning full rows; executable provenance resolves over
+the immutable arena rather than cloning every semantic expression; SOURCE and
+state discovery share one checked-occurrence index; and statement-owned states
+use one exact declaration/owner index instead of scanning the expression arena
+per HOLD. The current optimized trace puts semantic execution-graph derivation
+at 143.845 ms versus the preceding 173.289 ms trace, with 63.985 ms still in
+top-level checked-statement expansion and 34.436 ms in arena/provenance work.
+The complete traced sample is 2,803.017 ms, including 1,135.278 ms semantic
+construction and 0.726 ms WHERE verification. This is a bounded cleanup, not
+the next architecture exit: top-level statement ownership, executable receipt
+finalization (138.892 ms), resource construction (119.758 ms), storage
+construction (122.852 ms), canonical core construction (110.477 ms), and
+dependency-manifest assembly (168.278 ms) remain separate reconstruction
+owners.
+
+Updating the architecture gate exposed two stale classifier entries from the
+definition-template checkpoint. `InvalidDefinitionTemplate` and the three
+checked definition execution-template records are now explicitly classified,
+the embedded schema digest advances, and the complete architecture gate passes.
+
 The next biggest cut is to extend the same definition artifact with normalized
 semantic facts and relocations, starting at the largest measured construction
 owners: executable receipt finalization and dependency/resource manifest

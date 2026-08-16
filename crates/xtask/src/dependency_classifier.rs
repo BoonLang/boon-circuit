@@ -1625,11 +1625,10 @@ fields = [
             .parent()
             .and_then(Path::parent)
             .expect("xtask crate is under the workspace root");
-        let path = workspace.join("crates/boon_typecheck/src/lib.rs");
-        let text = fs::read_to_string(&path).expect("typecheck source is readable");
-        let syntax = syn::parse_file(&text).expect("typecheck source parses");
-        let records =
-            extract_top_level_records(&syntax, "crates/boon_typecheck/src/lib.rs").unwrap();
+        let path = workspace.join("crates/boon_checked/src/lib.rs");
+        let text = fs::read_to_string(&path).expect("checked-model source is readable");
+        let syntax = syn::parse_file(&text).expect("checked-model source parses");
+        let records = extract_top_level_records(&syntax, "crates/boon_checked/src/lib.rs").unwrap();
 
         assert_eq!(
             records.get("CheckedParameter").map(|record| &record.schema),

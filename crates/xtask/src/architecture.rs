@@ -70,6 +70,11 @@ pub fn collect_architecture_evidence(workspace: &Path) -> GateEvidence {
     );
     push_check(
         &mut checks,
+        "pinned-production-rust-toolchain",
+        pinned_production_rust_toolchain(workspace),
+    );
+    push_check(
+        &mut checks,
         "dependency-classifier-schema-v1",
         crate::dependency_classifier::verify(workspace),
     );
@@ -137,6 +142,66 @@ pub fn collect_architecture_evidence(workspace: &Path) -> GateEvidence {
     }
 
     empty_evidence(checks)
+}
+
+fn pinned_production_rust_toolchain(workspace: &Path) -> Result<String, String> {
+    let manifest = parse_toml(&workspace.join("Cargo.toml"))?;
+    let resolver = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("resolver"))
+        .and_then(toml::Value::as_str)
+        .ok_or("workspace resolver is missing")?;
+    if resolver != "3" {
+        return Err(format!(
+            "Edition 2024 workspace must use rust-version-aware resolver 3; found {resolver}"
+        ));
+    }
+    let minimum = manifest
+        .get("workspace")
+        .and_then(|workspace| workspace.get("package"))
+        .and_then(|package| package.get("rust-version"))
+        .and_then(toml::Value::as_str)
+        .ok_or("workspace.package.rust-version is missing")?;
+    let toolchain = parse_toml(&workspace.join("rust-toolchain.toml"))?;
+    let channel = toolchain
+        .get("toolchain")
+        .and_then(|toolchain| toolchain.get("channel"))
+        .and_then(toml::Value::as_str)
+        .ok_or("rust-toolchain.toml toolchain.channel is missing")?;
+    if channel.split('.').count() != 3
+        || !channel
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(format!(
+            "production Rust channel must be an exact stable x.y.z release; found {channel}"
+        ));
+    }
+    let components = toolchain
+        .get("toolchain")
+        .and_then(|toolchain| toolchain.get("components"))
+        .and_then(toml::Value::as_array)
+        .ok_or("rust-toolchain.toml toolchain.components is missing")?;
+    for required in ["clippy", "rustfmt"] {
+        if !components
+            .iter()
+            .any(|component| component.as_str() == Some(required))
+        {
+            return Err(format!(
+                "production Rust toolchain omits required component {required}"
+            ));
+        }
+    }
+    let dockerfile = read_text(&workspace.join("deploy/fjordpulse/Dockerfile"))?;
+    let expected_builder = format!("FROM rust:{channel}-bookworm AS builder");
+    if !dockerfile.lines().any(|line| line == expected_builder) {
+        return Err(format!(
+            "FjordPulse builder must use production Rust {channel} exactly"
+        ));
+    }
+    Ok(format!(
+        "production Rust {channel}; compatibility floor {minimum}; resolver {resolver}"
+    ))
 }
 
 fn isolated_native_input_path(workspace: &Path) -> Result<String, String> {

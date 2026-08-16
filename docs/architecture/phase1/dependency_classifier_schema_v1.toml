@@ -9357,6 +9357,15 @@ fields = [
   { name = "callable", disposition = "r-frd-diag-sp-id-pc-n", reviewed = true },
 ]
 
+[[records.variants]]
+name = "InvalidDefinitionTemplate"
+disposition = "r-rd-diag-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "callable", disposition = "r-frd-diag-sp-id-pc-n", reviewed = true },
+  { name = "reason", disposition = "r-rd-diag-sp-id-pc-n", reviewed = true },
+]
+
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/out_net.rs"
@@ -12690,6 +12699,39 @@ fields = [
   { name = "states", disposition = "r-fr-priv-sp-id-n", reviewed = true },
   { name = "lists", disposition = "r-fr-priv-sp-id-n", reviewed = true },
   { name = "occurrences", disposition = "r-f-priv-sp-id-n", reviewed = true },
+  { name = "definition_execution_templates", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedDefinitionExecutionTemplateV1"
+fields = [
+  { name = "schema", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "callable", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "result", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "nodes", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "calls", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedDefinitionExecutionNodeV1"
+fields = [
+  { name = "expression", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "dependencies", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "call", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "selector", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedDefinitionSelectorV1"
+fields = [
+  { name = "input", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "arms", disposition = "r-fc-priv-sp-id-n", reviewed = true },
 ]
 
 [[records]]

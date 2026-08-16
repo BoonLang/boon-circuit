@@ -1953,8 +1953,21 @@ pub(crate) fn derive_semantic_execution_graph(
     required_ordinary_definitions: &BTreeSet<SemanticCallableId>,
     retain_ordinary_calls: bool,
 ) -> Result<SemanticImageBuilder<ExecutionPending>, ExpansionError> {
+    let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+    let mut trace_started = std::time::Instant::now();
+    let mut trace_phase = |phase: &str| {
+        if trace {
+            let now = std::time::Instant::now();
+            eprintln!(
+                "boon_semantic execution_graph {phase} elapsed_ms={:.3}",
+                now.duration_since(trace_started).as_secs_f64() * 1000.0,
+            );
+            trace_started = now;
+        }
+    };
     let execution_routes = execution_construction_routes_v3(&checked_handoff, out_net)
         .map_err(ExpansionError::InvalidLocalBindings)?;
+    trace_phase("construction_routes");
     let lookup = CheckedProgramLookup::new(program);
     let semantic_scope_ids = program
         .scopes
@@ -2056,6 +2069,7 @@ pub(crate) fn derive_semantic_execution_graph(
         &materializations_by_owner,
         &materialization_result_types,
     );
+    trace_phase("static_inventories");
     if retain_ordinary_calls {
         builder.enable_ordinary_call_boundaries();
     }
@@ -2274,6 +2288,7 @@ pub(crate) fn derive_semantic_execution_graph(
                 .collect(),
         });
     }
+    trace_phase("checked_statements");
     builder.set_current_statement(None);
     let mut producer_bodies = Vec::with_capacity(out_net.producer_roots().len());
     let producer_statement_offset = statements.len();
@@ -2304,6 +2319,7 @@ pub(crate) fn derive_semantic_execution_graph(
     }
     builder.set_current_statement(None);
     builder.expand_pending_ordinary_definitions()?;
+    trace_phase("producer_and_ordinary_bodies");
     let ordinary_definition_roots = builder.ordinary_definition_roots.clone();
 
     statements.sort_by_key(|statement| statement.id);
@@ -2536,6 +2552,7 @@ pub(crate) fn derive_semantic_execution_graph(
     statements.sort_by_key(|statement| statement.id);
     synthesize_statement_owned_states(program, &lookup, &mut arena, &mut statements)?;
     resolve_executable_local_provenance(&mut arena.expressions, &statements)?;
+    trace_phase("arena_and_local_provenance");
     let root_specs =
         checked_semantic_root_specs_v1(program).map_err(ExpansionError::InvalidLocalBindings)?;
     for root in &root_specs {
@@ -2703,7 +2720,12 @@ pub(crate) fn derive_semantic_execution_graph(
             })
         })
         .collect::<Result<Vec<_>, ExpansionError>>()?;
-    let source_occurrences =
+    trace_phase("root_inventory");
+    // SOURCE and state identities are both projections over the same finalized
+    // semantic expression arena. Build the checked-to-semantic occurrence CSR
+    // once; SOURCE statement normalization can add only SOURCE-owned wrapper
+    // rows and therefore cannot create a missing state occurrence.
+    let resource_occurrences =
         semantic_expression_occurrences_by_checked(&arena.expressions, program.expressions.len())?;
     let mut sources = Vec::new();
     let mut semantic_source_by_checked_instance = BTreeMap::new();
@@ -2712,7 +2734,7 @@ pub(crate) fn derive_semantic_execution_graph(
             ExpansionError::MissingSourceDeclaration(checked_source.expression),
         )?;
         let mut candidates_by_instance = BTreeMap::new();
-        let checked_candidates = source_occurrences
+        let checked_candidates = resource_occurrences
             .get(checked_source.expression.0 as usize)
             .map(Vec::as_slice)
             .unwrap_or_default();
@@ -2835,8 +2857,6 @@ pub(crate) fn derive_semantic_execution_graph(
             owner: Some(owner),
         });
     }
-    let state_occurrences =
-        semantic_expression_occurrences_by_checked(&arena.expressions, program.expressions.len())?;
     let mut states = Vec::new();
     let mut semantic_state_by_checked_instance = BTreeMap::new();
     for checked_state in &program.states {
@@ -2844,7 +2864,7 @@ pub(crate) fn derive_semantic_execution_graph(
             ExpansionError::MissingStateDeclaration(checked_state.expression),
         )?;
         let mut candidates_by_instance = BTreeMap::new();
-        let checked_candidates = state_occurrences
+        let checked_candidates = resource_occurrences
             .get(checked_state.expression.0 as usize)
             .map(Vec::as_slice)
             .unwrap_or_default();
@@ -2950,6 +2970,7 @@ pub(crate) fn derive_semantic_execution_graph(
         &semantic_source_by_checked_instance,
         &semantic_state_by_checked_instance,
     )?;
+    trace_phase("source_and_state_inventory");
     let execution = SemanticExecutionImageColumnsV1 {
         materializations: materializations.to_vec(),
         expressions: arena.expressions,
@@ -2969,8 +2990,11 @@ pub(crate) fn derive_semantic_execution_graph(
             .collect(),
         checked_expression_origins: arena.checked_expression_origins,
     };
-    SemanticImageBuilder::execution_pending(checked_handoff, execution_routes, execution)
-        .map_err(ExpansionError::InvalidLocalBindings)
+    let builder =
+        SemanticImageBuilder::execution_pending(checked_handoff, execution_routes, execution)
+            .map_err(ExpansionError::InvalidLocalBindings)?;
+    trace_phase("execution_builder");
+    Ok(builder)
 }
 
 fn semantic_expression_occurrences_by_checked(
@@ -4003,6 +4027,30 @@ fn synthesize_statement_owned_states(
         .iter()
         .map(|statement| (statement.id, (statement.value, statement.children.clone())))
         .collect::<BTreeMap<_, _>>();
+    let mut stateful_expressions = BTreeMap::new();
+    for expression in &arena.expressions {
+        let stateful = matches!(expression.kind, SemanticExpressionKind::Hold { .. })
+            || matches!(
+                &expression.kind,
+                SemanticExpressionKind::Latest { branches }
+                    if executable_latest_has_initial(&arena.expressions, branches)
+            )
+            || matches!(
+                expression.kind,
+                SemanticExpressionKind::Call {
+                    callable_kind: SemanticCallableKind::Builtin,
+                    ..
+                } if expression.effect.writes_state
+            );
+        if stateful
+            && let Some(declaration) =
+                resource_declaration(program, lookup, expression.checked_expr_id)
+        {
+            stateful_expressions
+                .entry((declaration, expression.owner))
+                .or_insert(expression.id);
+        }
+    }
     for statement in statements {
         let SemanticStatementKind::Hold {
             path,
@@ -4039,25 +4087,8 @@ fn synthesize_statement_owned_states(
         ) {
             continue;
         }
-        if let Some(existing) = arena.expressions.iter().find(|expression| {
-            expression.owner == owner
-                && resource_declaration(program, lookup, expression.checked_expr_id)
-                    == Some(declaration)
-                && (matches!(expression.kind, SemanticExpressionKind::Hold { .. })
-                    || matches!(
-                        &expression.kind,
-                        SemanticExpressionKind::Latest { branches }
-                            if executable_latest_has_initial(&arena.expressions, branches)
-                    )
-                    || matches!(
-                        expression.kind,
-                        SemanticExpressionKind::Call {
-                            callable_kind: SemanticCallableKind::Builtin,
-                            ..
-                        } if expression.effect.writes_state
-                    ))
-        }) {
-            statement.value = Some(existing.id);
+        if let Some(existing) = stateful_expressions.get(&(declaration, owner)).copied() {
+            statement.value = Some(existing);
             continue;
         }
         let mut pending = statement.children.iter().rev().copied().collect::<Vec<_>>();
@@ -4142,6 +4173,9 @@ fn synthesize_statement_owned_states(
                 },
             },
         );
+        stateful_expressions
+            .entry((declaration, expression_owner))
+            .or_insert(id);
         statement.value = Some(id);
     }
     Ok(())
@@ -4898,17 +4932,23 @@ fn resolve_executable_local_provenance(
             )));
         }
     }
-    let snapshot = expressions.to_vec();
-    let mut resolver = LocalProvenanceResolver {
-        expressions: &snapshot,
-        bindings,
-        declarations,
-        cache: BTreeMap::new(),
+    // Resolution is read-only until every row has a result. Borrow the arena
+    // directly for that phase, then release the resolver before publishing
+    // the provenances in place. Cloning the entire semantic expression graph
+    // here duplicated every kind, flow type, and provenance vector.
+    let provenances = {
+        let immutable_expressions: &[SemanticExpression] = expressions;
+        let mut resolver = LocalProvenanceResolver {
+            expressions: immutable_expressions,
+            bindings,
+            declarations,
+            cache: BTreeMap::new(),
+        };
+        immutable_expressions
+            .iter()
+            .map(|expression| resolver.resolve(expression.id))
+            .collect::<Result<Vec<_>, _>>()?
     };
-    let provenances = snapshot
-        .iter()
-        .map(|expression| resolver.resolve(expression.id))
-        .collect::<Result<Vec<_>, _>>()?;
     for (expression, provenance) in expressions.iter_mut().zip(provenances) {
         expression.provenance = provenance;
     }
@@ -5995,10 +6035,14 @@ impl<'a> SemanticExpressionBuilder<'a> {
         scoped: ScopedCheckedExpr,
         owner: Option<StaticOwnerId>,
     ) -> Result<SemanticExprId, ExpansionError> {
-        let expression = self
-            .lookup
-            .expression(self.program, scoped.expression)
-            .cloned()
+        // The checked image is immutable and lives outside the builder. Keep
+        // a direct reference across expansion instead of cloning the complete
+        // expression (including its flow type) every time the dependency
+        // worklist retries a partially expanded parent.
+        let program = self.program;
+        let lookup = self.lookup;
+        let expression = lookup
+            .expression(program, scoped.expression)
             .ok_or(ExpansionError::MissingExpression(scoped.expression))?;
         let kind = match expression.kind.clone() {
             CheckedExpressionKind::Read {
@@ -6025,7 +6069,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                             frame: scoped.frame,
                         })?;
                     return Ok(self.push(
-                        &expression,
+                        expression,
                         owner,
                         SemanticExpressionKind::ElementState {
                             context: SemanticCallContextId {
@@ -6044,7 +6088,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 {
                     return match binding {
                         SemanticValueBinding::Local(binding) => Ok(self.push(
-                            &expression,
+                            expression,
                             owner,
                             SemanticExpressionKind::LocalRead {
                                 binding,

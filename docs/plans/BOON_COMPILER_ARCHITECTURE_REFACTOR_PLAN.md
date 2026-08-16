@@ -2,8 +2,9 @@
 
 Date: 2026-08-03
 
-Status: active high-leverage execution map, reconciled through unit-native
-checkpoint `a48f488` and the post-M1 identity/evaluator/fact-store/
+Status: active high-leverage execution map, reconciled through the first
+shared document plan-code/function-frame slice on 2026-08-17, unit-native
+checkpoint `a48f488`, and the post-M1 identity/evaluator/fact-store/
 compositional-seal research after the definition-artifact/thin-link and
 structural-identity tranches, while preserving whole-program audit
 checkpoint `d113544`, compact execution-receipt checkpoint `96b1611`,
@@ -254,6 +255,58 @@ database facade, retained-function side table, sealed-plan wrapper, or runtime
 index sidecar would merely coexist with the same hot path. Bounded parallel
 owner evaluation and lower-level container tuning remain later options only
 after a fresh trace shows the structural multipliers have gone.
+
+### First Shared Document Plan-Code Slice (2026-08-17)
+
+The first rank-3 production slice now carries reused ordinary document bodies
+as verified `DocumentFunction` rows and compact `DocumentExprOp::Call`
+parameter frames. `DocumentCompiler` no longer owns
+`ordinary_call_cache_scopes` or recursively republishes every repeated body.
+The plan/runtime contract advances to V11, validates exact call parameter
+frames and an acyclic function graph, indexes functions once, and evaluates a
+call under its caller's retained local environment. One-off exact variants are
+redirected into their sole caller and removed during dense publication; only
+variants with at least two live calls remain in the function table.
+
+The variant key is `{ordinary definition, exact type environment, resolved
+parameter layouts, static control selectors, invocation/owner/materialization
+overlay, lexical and pattern context}`. Static selector shape is retained
+because it chooses occurrence-owned render branches. Invocation capability is
+derived transitively from executable body facts (`ElementState`, retained
+constructors, materialization/locals, and contextual calls), never from a UI
+result tag. `NoElement` therefore remains an ordinary library-defined tag and
+has no compiler meaning.
+
+One same-source, same-host release comparison used the preserved pre-cut
+binary for one fresh-process baseline observation and the new binary for three
+fresh-process observations. It is directional, not the scored 30-sample p95
+protocol:
+
+| NovyWave verified metric | Pre-cut sample | New result |
+| --- | ---: | ---: |
+| document expressions | 33,576 | 31,872 |
+| ordinary recursive call scopes | 2,320 | 0 |
+| document cache scopes | 12,701 | 6,460 |
+| demanded exact variants | n/a | 1,430 |
+| shared ordinary functions | 0 | 280 |
+| inlined one-off variants | n/a | 1,150 |
+| total document functions, including 24 materializations | 24 | 304 |
+| fresh verified wall time | 2,762.462 ms | 2,757.327 ms median |
+| peak RSS | 366,112 KiB | 355,260 KiB median |
+| cumulative allocated bytes | 1,712,003,346 | 1,674,480,753 |
+| public plan validation | 75.623 ms | 74.368 ms median |
+| serialization | 75.770 ms | 69.453 ms median |
+
+The wall-time change is noise-sized and is not accepted as a latency win.
+This slice instead proves the permanent function/frame/runtime boundary,
+deletes 1,704 published expression rows and 6,241 cache scopes, and reduces
+peak RSS by about 10.6 MiB and cumulative allocation by about 37.5 MB. The
+plan digest intentionally changes at the V11 contract boundary; the source
+bundle digest remains exact, diagnostics remain empty, the full compiler,
+plan, and document suites pass, and the ignored full NovyWave verified gate
+passes in debug and release builds. The next speed-bearing expansion must use
+the same demanded shared-code owner in row/scalar and migration lowering,
+rather than polishing this document-only compactor.
 
 ### First V4 Projection-Proof Slice (2026-08-03)
 

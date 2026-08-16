@@ -1,9 +1,11 @@
 use boon_compiler::{
     CompileRequest, CompiledMachinePlanFromSource, CompilerResult, compile_machine_plan,
 };
+use boon_document::runtime::DocumentRuntime;
 use boon_plan::{
     ApplicationIdentity, PlanOpKind, PlanRowExpressionNode, ProgramRole, TargetProfile,
 };
+use boon_plan_executor::{MachineInstance, SessionOptions};
 
 fn compile_test_source(
     source_label: &str,
@@ -129,6 +131,7 @@ document: Document/new(
             Element/label(element: [], style: style(choice: Beta), label: TEXT { beta })
             Element/label(element: [], style: style(choice: Gamma), label: TEXT { gamma })
             Element/label(element: [], style: style(choice: Delta), label: TEXT { delta })
+            Element/label(element: [], style: style(choice: Alpha), label: TEXT { alpha })
         }
     )
 )
@@ -147,11 +150,53 @@ document: Document/new(
     assert!(ordinary.iter().any(|name| name.ends_with("tone")));
     assert!(ordinary.iter().any(|name| name.ends_with("style")));
     let document = compiled.plan.document.as_ref().expect("document plan");
+    assert_eq!(
+        document.functions.len(),
+        1,
+        "only the repeated Alpha specialization should remain as shared plan code"
+    );
+    let mut calls_by_function = std::collections::BTreeMap::new();
+    for function in document.expressions.iter().filter_map(|expression| {
+        let boon_plan::DocumentExprOp::Call { function, .. } = expression.op else {
+            return None;
+        };
+        Some(function)
+    }) {
+        *calls_by_function.entry(function).or_insert(0usize) += 1;
+    }
+    assert!(
+        calls_by_function.values().any(|calls| *calls == 2),
+        "the repeated Alpha specialization must share one compiled function body: {calls_by_function:?}"
+    );
+    assert_eq!(
+        calls_by_function.values().sum::<usize>(),
+        2,
+        "all one-off exact variants must be inlined and removed"
+    );
     assert!(
         document.expressions.len() < 120,
-        "four static calls produced {} document expressions: {ordinary:?}",
+        "five static calls produced {} document expressions: {ordinary:?}",
         document.expressions.len()
     );
+
+    let mut session =
+        MachineInstance::new_quiescent(compiled.plan.clone(), SessionOptions::default())
+            .expect("shared document functions form a runnable MachinePlan");
+    let runtime = DocumentRuntime::new(&mut session)
+        .expect("shared document functions evaluate")
+        .expect("fixture has a document runtime");
+    let labels = runtime
+        .frame()
+        .nodes
+        .values()
+        .filter_map(|node| node.text.as_ref().map(|text| text.text.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        labels.iter().filter(|label| **label == "alpha").count(),
+        2,
+        "both calls through the shared Alpha function must evaluate"
+    );
+    assert!(labels.contains(&"beta") && labels.contains(&"gamma") && labels.contains(&"delta"));
 }
 
 #[test]
@@ -189,6 +234,20 @@ document: Document/new(
         .find(|function| function.name.ends_with("labeled"))
         .expect("retained render function");
     let document = compiled.plan.document.as_ref().expect("document plan");
+    assert_eq!(
+        document.functions.len(),
+        0,
+        "one-off SOURCE/render invocation overlays must be inlined"
+    );
+    assert_eq!(
+        document
+            .expressions
+            .iter()
+            .filter(|expression| matches!(expression.op, boon_plan::DocumentExprOp::Call { .. }))
+            .count(),
+        0,
+        "one-off retained render occurrences must not leave call frames"
+    );
     let labels = document
         .templates
         .iter()

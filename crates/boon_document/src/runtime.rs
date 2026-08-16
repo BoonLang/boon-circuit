@@ -14,7 +14,7 @@ use boon_document_model::{
 use boon_plan::{
     DocumentArgumentRole, DocumentBuiltin, DocumentConstantId, DocumentConstantValue,
     DocumentConstructor, DocumentElementContextId, DocumentExprId, DocumentExprOp,
-    DocumentFunctionId, DocumentMaterialization, DocumentMaterializationId,
+    DocumentFunction, DocumentFunctionId, DocumentMaterialization, DocumentMaterializationId,
     DocumentMaterializationSource, DocumentNameId, DocumentPattern, DocumentRead,
     DocumentRowIdentity, DocumentRuntimeLocalBinding, DocumentScalarOp, DocumentTemplateId,
     ExactNumber, FieldId, ImportId, ListId, MachinePlan, PlanRowExpressionId, ScopeId, SourceId,
@@ -148,6 +148,7 @@ pub struct DocumentMaterializationStats {
 pub struct DocumentRuntime {
     machine_plan: Arc<MachinePlan>,
     expression_ops: Vec<Arc<DocumentExprOp>>,
+    functions: BTreeMap<DocumentFunctionId, DocumentFunction>,
     routes: BTreeMap<SourceId, String>,
     field_names: BTreeMap<FieldId, Vec<String>>,
     row_fields_by_name: BTreeMap<(ListId, String), FieldId>,
@@ -246,6 +247,17 @@ impl DocumentRuntime {
             .iter()
             .map(|expression| Arc::new(expression.op.clone()))
             .collect();
+        let functions = plan
+            .functions
+            .iter()
+            .cloned()
+            .map(|function| (function.id, function))
+            .collect::<BTreeMap<_, _>>();
+        if functions.len() != plan.functions.len() {
+            return Err(DocumentError::InvalidPlan(
+                "document function ids are not unique".to_owned(),
+            ));
+        }
         let routes = machine
             .source_routes
             .iter()
@@ -293,6 +305,7 @@ impl DocumentRuntime {
         let mut runtime = Self {
             machine_plan: machine,
             expression_ops,
+            functions,
             routes,
             field_names,
             row_fields_by_name,
@@ -1941,6 +1954,28 @@ impl<'a> Evaluator<'a> {
                 env.locals = old;
                 value
             }
+            DocumentExprOp::Call {
+                function,
+                arguments,
+            } => {
+                let mut parameters = BTreeMap::new();
+                for argument in arguments {
+                    let value = self.eval(argument.value, env)?;
+                    if parameters.insert(argument.parameter, value).is_some() {
+                        return Err(DocumentError::InvalidPlan(format!(
+                            "document call expression {} binds parameter {} twice",
+                            expression.0, argument.parameter.0
+                        )));
+                    }
+                }
+                self.call_function(
+                    *function,
+                    parameters,
+                    env,
+                    format!("call-{}-{}", function.0, expression.0),
+                    false,
+                )
+            }
             DocumentExprOp::Builtin {
                 builtin,
                 input,
@@ -2530,6 +2565,7 @@ impl<'a> Evaluator<'a> {
                 expressions.push(*result);
                 self.merge_scalar_target_uses(&expressions, env, target, next)
             }
+            DocumentExprOp::Call { .. } => Ok(ScalarTargetUse::Unguarded),
             DocumentExprOp::Builtin {
                 input, arguments, ..
             } => {
@@ -2710,6 +2746,7 @@ impl<'a> Evaluator<'a> {
                     .all(|binding| self.guard_key_expression(binding.value, next))
                     && self.guard_key_expression(*result, next)
             }
+            DocumentExprOp::Call { .. } => false,
             DocumentExprOp::Builtin {
                 input, arguments, ..
             } => {
@@ -2872,20 +2909,29 @@ impl<'a> Evaluator<'a> {
         parameters: BTreeMap<boon_plan::DocumentParameterId, EvalValue>,
         caller: &EvalEnv,
         instance: String,
+        reset_locals: bool,
     ) -> Result<EvalValue, DocumentError> {
         let function = self
             .runtime
-            .plan()
             .functions
-            .iter()
-            .find(|candidate| candidate.id == function)
+            .get(&function)
             .cloned()
             .ok_or_else(|| {
                 DocumentError::InvalidPlan(format!("function {} is missing", function.0))
             })?;
+        let expected = function.parameters.iter().copied().collect::<BTreeSet<_>>();
+        let supplied = parameters.keys().copied().collect::<BTreeSet<_>>();
+        if expected != supplied {
+            return Err(DocumentError::InvalidPlan(format!(
+                "function {} received an invalid parameter frame",
+                function.id.0
+            )));
+        }
         let mut env = caller.clone();
         env.parameters = Arc::new(parameters);
-        env.locals = Arc::new(BTreeMap::new());
+        if reset_locals {
+            env.locals = Arc::new(BTreeMap::new());
+        }
         Arc::make_mut(&mut env.instance).push(instance);
         self.eval(function.body, &mut env)
     }
@@ -3186,6 +3232,7 @@ impl<'a> Evaluator<'a> {
                 parameters,
                 &row_env,
                 format!("materialize-{}-{}", id.0, identity.instance_fragment()),
+                true,
             )?;
             let created = value.node_ids();
             nodes.extend(created);

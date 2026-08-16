@@ -65,6 +65,11 @@ pub fn collect_architecture_evidence(workspace: &Path) -> GateEvidence {
     );
     push_check(
         &mut checks,
+        "shared-document-plan-code",
+        shared_document_plan_code(workspace),
+    );
+    push_check(
+        &mut checks,
         "legacy-owner-solver-test-only",
         legacy_owner_solver_test_only(workspace),
     );
@@ -142,6 +147,62 @@ pub fn collect_architecture_evidence(workspace: &Path) -> GateEvidence {
     }
 
     empty_evidence(checks)
+}
+
+fn shared_document_plan_code(workspace: &Path) -> Result<String, String> {
+    let compiler =
+        read_text(&workspace.join("crates/boon_compiler/src/document_executable_backend.rs"))?;
+    let plan = read_text(&workspace.join("crates/boon_plan/src/document.rs"))?;
+    let plan_root = read_text(&workspace.join("crates/boon_plan/src/lib.rs"))?;
+    let runtime = read_text(&workspace.join("crates/boon_document/src/runtime.rs"))?;
+
+    for retired in [
+        "OrdinaryCallCacheKey",
+        "OrdinaryCallCacheEntry",
+        "ordinary_call_cache_scopes",
+    ] {
+        if compiler.contains(retired) {
+            return Err(format!(
+                "document lowering restored retired per-call body cache owner `{retired}`"
+            ));
+        }
+    }
+    for required in [
+        "struct OrdinaryDocumentFunctionKey",
+        "fn compile_ordinary_function(",
+        "fn inline_single_use_ordinary_functions(",
+        "fn ordinary_function_requires_overlay(",
+        "static_parameter_selectors",
+        "DocumentExprOp::Call",
+    ] {
+        if !compiler.contains(required) {
+            return Err(format!(
+                "document lowering omits shared plan-code boundary `{required}`"
+            ));
+        }
+    }
+    if compiler.contains("is_renderable_type(&function.result_type.ty)") {
+        return Err(
+            "document function sharing must derive occurrence capabilities from its body graph, not a UI result tag"
+                .to_owned(),
+        );
+    }
+    if !plan.contains("Call {\n        function: DocumentFunctionId,")
+        || !plan.contains("verify_document_function_call_graph(self)?;")
+        || !runtime.contains("DocumentExprOp::Call {")
+        || !runtime.contains("self.call_function(")
+        || !plan_root.contains("pub const PLAN_MAJOR_VERSION: u32 = 11;")
+    {
+        return Err(
+            "plan/runtime must carry, validate, and execute V11 compact document call frames"
+                .to_owned(),
+        );
+    }
+
+    Ok(
+        "ordinary document bodies are construction-owned functions with V11 call frames; retired per-call recursive body caches remain absent"
+            .to_owned(),
+    )
 }
 
 fn pinned_production_rust_toolchain(workspace: &Path) -> Result<String, String> {

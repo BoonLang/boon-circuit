@@ -109,17 +109,27 @@ impl StaticDocumentSelector {
     }
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct OrdinaryCallCacheKey {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OrdinaryDocumentFunctionKey {
     function: ir::FunctionId,
-    arguments: Vec<(usize, usize)>,
+    call_instance: Option<usize>,
+    stable_owner: Option<ir::StaticOwnerId>,
+    materialization_locals:
+        BTreeMap<(ir::StaticOwnerId, ir::MaterializationLocalId), DocumentParameterId>,
+    locals: BTreeMap<ir::ExecutableLocalBindingId, DocumentLocalId>,
+    type_substitutions: BTreeMap<TypeVar, Type>,
+    pattern_bindings: BTreeMap<String, PatternBindingContext>,
+    parameter_types: Vec<Type>,
+    static_parameter_selectors: Vec<Option<StaticDocumentSelector>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct OrdinaryCallCacheEntry {
-    call_instance: Option<usize>,
-    type_substitutions: Vec<CheckedTypeSubstitution>,
-    scope: usize,
+struct OrdinaryDocumentFunction {
+    key: OrdinaryDocumentFunctionKey,
+    id: DocumentFunctionId,
+    parameters: Vec<DocumentParameterId>,
+    parameter_values: Vec<DocumentExprId>,
+    call_sites: Vec<(DocumentExprId, Option<DocumentFunctionId>)>,
 }
 
 struct ExecutableCall<'a> {
@@ -149,6 +159,7 @@ struct DocumentCompiler<'a> {
     expressions: Vec<DocumentExpr>,
     expression_cache: BTreeMap<(usize, usize), DocumentExprId>,
     projected_expression_cache: BTreeMap<(usize, usize, Vec<String>), DocumentExprId>,
+    static_expression_selectors: BTreeMap<DocumentExprId, StaticDocumentSelector>,
     functions: Vec<DocumentFunction>,
     function_ids: BTreeSet<DocumentFunctionId>,
     templates: Vec<DocumentTemplate>,
@@ -163,7 +174,9 @@ struct DocumentCompiler<'a> {
     compiled_paths: BTreeMap<(Option<ScopeId>, String), DocumentExprId>,
     compile_stack: Vec<ir::ExecutableExprId>,
     active_ordinary_functions: BTreeSet<ir::FunctionId>,
-    ordinary_call_cache_scopes: BTreeMap<OrdinaryCallCacheKey, Vec<OrdinaryCallCacheEntry>>,
+    ordinary_function_overlay_requirements: BTreeMap<ir::FunctionId, bool>,
+    ordinary_functions: Vec<OrdinaryDocumentFunction>,
+    next_function_id: usize,
     next_cache_scope: usize,
     next_local: usize,
 }
@@ -306,6 +319,7 @@ impl<'a> DocumentCompiler<'a> {
             expressions: Vec::new(),
             expression_cache: BTreeMap::new(),
             projected_expression_cache: BTreeMap::new(),
+            static_expression_selectors: BTreeMap::new(),
             functions: Vec::new(),
             function_ids: BTreeSet::new(),
             templates: Vec::new(),
@@ -319,7 +333,9 @@ impl<'a> DocumentCompiler<'a> {
             compiled_paths: BTreeMap::new(),
             compile_stack: Vec::new(),
             active_ordinary_functions: BTreeSet::new(),
-            ordinary_call_cache_scopes: BTreeMap::new(),
+            ordinary_function_overlay_requirements: BTreeMap::new(),
+            ordinary_functions: Vec::new(),
+            next_function_id: program.scope_index.owners.len(),
             next_cache_scope: program.scope_index.owners.len().saturating_add(1),
             next_local: 0,
         })
@@ -365,22 +381,32 @@ impl<'a> DocumentCompiler<'a> {
             });
             self.templates.sort_by_key(|template| template.id);
         }
-        let root = DocumentRoot {
+        let mut root = DocumentRoot {
             kind: root_kind,
             node: root_node,
             template: root_template,
             expression: root_expression,
         };
-        let view_bindings = self.compile_view_bindings()?;
-        let initial_patch_batch = DocumentPlan::build_initial_patch_batch(
+        let mut view_bindings = self.compile_view_bindings()?;
+        let mut initial_patch_batch = DocumentPlan::build_initial_patch_batch(
             root,
             &self.templates,
             &view_bindings,
             &self.materializations,
         );
+        let inlined_one_offs = self.inline_single_use_ordinary_functions(
+            &mut root,
+            &mut initial_patch_batch,
+            &mut view_bindings,
+        )?;
         if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+            let shared_ordinary_functions = self
+                .ordinary_functions
+                .iter()
+                .filter(|variant| variant.call_sites.len() > 1)
+                .count();
             eprintln!(
-                "boon_compiler document artifacts expressions={} constants={} names={} functions={} templates={} materializations={} expression_cache={} projected_cache={} ordinary_call_scopes={} cache_scopes={}",
+                "boon_compiler document artifacts expressions={} constants={} names={} functions={} templates={} materializations={} expression_cache={} projected_cache={} ordinary_variant_demands={} shared_ordinary_functions={} inlined_one_offs={} cache_scopes={}",
                 self.expressions.len(),
                 self.constants.len(),
                 self.names.len(),
@@ -389,9 +415,33 @@ impl<'a> DocumentCompiler<'a> {
                 self.materializations.len(),
                 self.expression_cache.len(),
                 self.projected_expression_cache.len(),
-                self.ordinary_call_cache_scopes.len(),
+                self.ordinary_functions.len(),
+                shared_ordinary_functions,
+                inlined_one_offs,
                 self.next_cache_scope,
             );
+            eprintln!(
+                "boon_compiler document ordinary function variants sample={:?}",
+                self.ordinary_functions
+                    .iter()
+                    .filter(|variant| variant.call_sites.len() > 1)
+                    .take(16)
+                    .map(|variant| (
+                        variant.id,
+                        variant.key.function,
+                        variant.key.call_instance,
+                        &variant.key.parameter_types,
+                        &variant.key.type_substitutions,
+                    ))
+                    .collect::<Vec<_>>(),
+            );
+            let mut call_histogram = BTreeMap::new();
+            for variant in &self.ordinary_functions {
+                *call_histogram
+                    .entry(variant.call_sites.len())
+                    .or_insert(0usize) += 1;
+            }
+            eprintln!("boon_compiler document ordinary function call histogram={call_histogram:?}");
         }
         Ok(DocumentPlan {
             root,
@@ -405,6 +455,207 @@ impl<'a> DocumentCompiler<'a> {
             view_bindings,
             unresolved_op_count: 0,
         })
+    }
+
+    fn inline_single_use_ordinary_functions(
+        &mut self,
+        root: &mut DocumentRoot,
+        initial_patch_batch: &mut DocumentInitialPatchBatch,
+        view_bindings: &mut [DocumentViewBinding],
+    ) -> Result<usize, PlanError> {
+        let single_use = self
+            .ordinary_functions
+            .iter()
+            .filter_map(|variant| {
+                let [call_site] = variant.call_sites.as_slice() else {
+                    return None;
+                };
+                Some((
+                    variant.id,
+                    variant.parameters.clone(),
+                    variant.parameter_values.clone(),
+                    *call_site,
+                ))
+            })
+            .collect::<Vec<_>>();
+        if single_use.is_empty() {
+            return Ok(0);
+        }
+
+        let mut redirects = vec![None; self.expressions.len()];
+        let mut removed_parameters = BTreeMap::new();
+        let mut owner_redirects = BTreeMap::new();
+        let mut removed_functions = BTreeSet::new();
+        for (function_id, parameters, parameter_values, (call_id, caller_function)) in &single_use {
+            let definition = self
+                .functions
+                .iter()
+                .find(|candidate| candidate.id == *function_id)
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "single-use document function {} has no published definition",
+                        function_id.0
+                    ))
+                })?;
+            if definition.parameters != *parameters || parameters.len() != parameter_values.len() {
+                return Err(PlanError::new(format!(
+                    "single-use document function {} has an inconsistent parameter layout",
+                    function_id.0
+                )));
+            }
+            let call = self.expressions.get(call_id.0).ok_or_else(|| {
+                PlanError::new(format!(
+                    "single-use document function {} references missing call expression {}",
+                    function_id.0, call_id.0
+                ))
+            })?;
+            let DocumentExprOp::Call {
+                function,
+                arguments,
+            } = &call.op
+            else {
+                return Err(PlanError::new(format!(
+                    "single-use document function {} call expression {} is not a call frame",
+                    function_id.0, call_id.0
+                )));
+            };
+            if function != function_id {
+                return Err(PlanError::new(format!(
+                    "single-use document call expression {} targets function {}, expected {}",
+                    call_id.0, function.0, function_id.0
+                )));
+            }
+            let arguments = arguments
+                .iter()
+                .map(|argument| (argument.parameter, argument.value))
+                .collect::<BTreeMap<_, _>>();
+            if arguments.len() != parameters.len() {
+                return Err(PlanError::new(format!(
+                    "single-use document function {} has an incomplete call frame",
+                    function_id.0
+                )));
+            }
+            for (parameter, parameter_value) in parameters.iter().zip(parameter_values) {
+                let argument = arguments.get(parameter).copied().ok_or_else(|| {
+                    PlanError::new(format!(
+                        "single-use document function {} call omits parameter {}",
+                        function_id.0, parameter.0
+                    ))
+                })?;
+                set_document_expression_redirect(
+                    &mut redirects,
+                    *parameter_value,
+                    argument,
+                    "single-use parameter",
+                )?;
+                if removed_parameters.insert(*parameter, argument).is_some() {
+                    return Err(PlanError::new(format!(
+                        "single-use document parameter {} belongs to multiple functions",
+                        parameter.0
+                    )));
+                }
+            }
+            set_document_expression_redirect(
+                &mut redirects,
+                *call_id,
+                definition.body,
+                "single-use call",
+            )?;
+            removed_functions.insert(*function_id);
+            owner_redirects.insert(*function_id, *caller_function);
+        }
+
+        for materialization in &mut self.materializations {
+            if let DocumentMaterializationSource::Parameter {
+                parameter,
+                projection,
+            } = &materialization.source
+                && let Some(argument) = removed_parameters.get(parameter).copied()
+            {
+                if !projection.is_empty() {
+                    return Err(PlanError::new(format!(
+                        "single-use document parameter {} retains a projected materialization source",
+                        parameter.0
+                    )));
+                }
+                materialization.source = DocumentMaterializationSource::Expression {
+                    expression: argument,
+                };
+            }
+        }
+
+        self.functions
+            .retain(|function| !removed_functions.contains(&function.id));
+        for template in &mut self.templates {
+            if let Some(owner) = template.owner_function {
+                template.owner_function = resolve_document_function_owner(
+                    owner,
+                    &owner_redirects,
+                    self.functions.len() + owner_redirects.len(),
+                )?;
+            }
+        }
+
+        let mut dense_ids = vec![None; self.expressions.len()];
+        let mut next = 0usize;
+        for (ordinal, redirect) in redirects.iter().enumerate() {
+            if redirect.is_none() {
+                dense_ids[ordinal] = Some(DocumentExprId(next));
+                next += 1;
+            }
+        }
+        let final_ids = (0..self.expressions.len())
+            .map(|ordinal| {
+                let resolved =
+                    resolve_document_expression_redirect(DocumentExprId(ordinal), &redirects)?;
+                dense_document_expression_id(resolved, &dense_ids)
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?;
+        remap_document_external_expression_refs(
+            root,
+            initial_patch_batch,
+            &mut self.functions,
+            &mut self.templates,
+            &mut self.materializations,
+            view_bindings,
+            |id| final_document_expression_id(id, &final_ids),
+        )?;
+        for expression in &mut self.expressions {
+            remap_document_expression_op(&mut expression.op, &mut |id| {
+                final_document_expression_id(id, &final_ids)
+            })?;
+        }
+
+        let mut compact = Vec::with_capacity(next);
+        for mut expression in std::mem::take(&mut self.expressions) {
+            let Some(id) = dense_ids[expression.id.0] else {
+                continue;
+            };
+            expression.id = id;
+            compact.push(expression);
+        }
+        self.expressions = compact;
+
+        for expression in &self.expressions {
+            match &expression.op {
+                DocumentExprOp::Call { function, .. } if removed_functions.contains(function) => {
+                    return Err(PlanError::new(format!(
+                        "single-use document function {} remains reachable after compaction",
+                        function.0
+                    )));
+                }
+                DocumentExprOp::Read {
+                    read: DocumentRead::Parameter { parameter, .. },
+                } if removed_parameters.contains_key(parameter) => {
+                    return Err(PlanError::new(format!(
+                        "single-use document parameter {} remains reachable after compaction",
+                        parameter.0
+                    )));
+                }
+                _ => {}
+            }
+        }
+        Ok(single_use.len())
     }
 
     fn compile_expression(
@@ -1332,7 +1583,9 @@ impl<'a> DocumentCompiler<'a> {
             )));
         }
         let mut bindings = BTreeMap::new();
-        let mut cache_arguments = Vec::with_capacity(arguments.len());
+        let mut parameter_types = Vec::with_capacity(arguments.len());
+        let mut static_parameter_selectors = Vec::with_capacity(arguments.len());
+        let mut call_arguments = Vec::with_capacity(arguments.len());
         for (argument, parameter) in arguments.into_iter().zip(&function.parameters) {
             if argument.ordinal != parameter.id.ordinal || argument.name != parameter.name {
                 return Err(PlanError::new(format!(
@@ -1342,7 +1595,8 @@ impl<'a> DocumentCompiler<'a> {
             }
             let argument_type = self.invocation_argument_type(argument.value, caller_context)?;
             let value = self.compile_call_argument(argument, caller_context, input_override)?;
-            cache_arguments.push((parameter.id.ordinal, value.0));
+            parameter_types.push(argument_type.clone());
+            static_parameter_selectors.push(self.static_selector(value));
             if bindings
                 .insert(
                     parameter.id,
@@ -1359,10 +1613,6 @@ impl<'a> DocumentCompiler<'a> {
                 )));
             }
         }
-        let cache_key = OrdinaryCallCacheKey {
-            function: function_id,
-            arguments: cache_arguments,
-        };
         let instantiated_type_substitutions = type_substitutions
             .iter()
             .map(|substitution| CheckedTypeSubstitution {
@@ -1373,59 +1623,190 @@ impl<'a> DocumentCompiler<'a> {
                 ),
             })
             .collect::<Vec<_>>();
-        let cache_scope = if let Some(scope) = self
-            .ordinary_call_cache_scopes
-            .get(&cache_key)
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|entry| {
-                        entry.call_instance == overlay_anchor
-                            && entry.type_substitutions == instantiated_type_substitutions
-                    })
-                    .map(|entry| entry.scope)
-            }) {
-            scope
-        } else {
-            let scope = self.allocate_cache_scope();
-            self.ordinary_call_cache_scopes
-                .entry(cache_key)
-                .or_default()
-                .push(OrdinaryCallCacheEntry {
-                    call_instance: overlay_anchor,
-                    type_substitutions: instantiated_type_substitutions.clone(),
-                    scope,
-                });
-            scope
-        };
-        let mut context = caller_context.clone();
-        context.cache_scope = cache_scope;
-        context.call_instance = overlay_anchor;
+        let mut type_environment = caller_context.type_substitutions.clone();
         for substitution in instantiated_type_substitutions {
-            context
-                .type_substitutions
-                .insert(substitution.variable, substitution.value);
+            type_environment.insert(substitution.variable, substitution.value);
         }
-        for (parameter, value) in bindings {
-            if context
-                .function_parameters
-                .insert(parameter, value)
-                .is_some()
-            {
-                return Err(PlanError::new(format!(
-                    "ordinary document call `{name}` binds parameter {} twice",
-                    parameter.ordinal
-                )));
-            }
+        // A result type is not a capability contract: UI libraries may use
+        // arbitrary tags (including `NoElement`) for helpers that still build
+        // retained nodes. Retain an exact invocation overlay whenever the
+        // body transitively consumes occurrence-owned document capabilities;
+        // only genuinely context-free value/style helpers share one body.
+        let requires_overlay = ordinary_function_requires_overlay(
+            self.program,
+            function_id,
+            &mut self.ordinary_function_overlay_requirements,
+        )?;
+        let key = OrdinaryDocumentFunctionKey {
+            function: function_id,
+            call_instance: requires_overlay.then_some(overlay_anchor).flatten(),
+            stable_owner: requires_overlay
+                .then_some(caller_context.stable_owner)
+                .flatten(),
+            materialization_locals: requires_overlay
+                .then(|| caller_context.materialization_locals.clone())
+                .unwrap_or_default(),
+            locals: requires_overlay
+                .then(|| caller_context.locals.clone())
+                .unwrap_or_default(),
+            type_substitutions: type_environment,
+            pattern_bindings: requires_overlay
+                .then(|| caller_context.pattern_bindings.clone())
+                .unwrap_or_default(),
+            parameter_types,
+            static_parameter_selectors,
+        };
+        let (document_function, parameters) =
+            self.compile_ordinary_function(&function, name, key)?;
+        for (parameter, executable) in parameters.into_iter().zip(&function.parameters) {
+            let binding = bindings.get(&executable.id).ok_or_else(|| {
+                PlanError::new(format!(
+                    "ordinary document call `{name}` lost parameter {}",
+                    executable.id.ordinal
+                ))
+            })?;
+            call_arguments.push(DocumentCallArgument {
+                parameter,
+                value: binding.value,
+            });
         }
-        if !self.active_ordinary_functions.insert(function_id) {
+        let body = self
+            .functions
+            .iter()
+            .find(|candidate| candidate.id == document_function)
+            .map(|function| function.body)
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "ordinary document function {} was not published",
+                    document_function.0
+                ))
+            })?;
+        let value_class = self.expressions[body.0].value_class;
+        let call_expression = self.push_expr(
+            expression.id.0,
+            value_class,
+            DocumentExprOp::Call {
+                function: document_function,
+                arguments: call_arguments,
+            },
+        );
+        let variant = self
+            .ordinary_functions
+            .iter_mut()
+            .find(|candidate| candidate.id == document_function)
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "ordinary document function {} lost its construction record",
+                    document_function.0
+                ))
+            })?;
+        variant
+            .call_sites
+            .push((call_expression, caller_context.owner_function));
+        Ok(call_expression)
+    }
+
+    fn compile_ordinary_function(
+        &mut self,
+        function: &ir::ExecutableOrdinaryFunction,
+        name: &str,
+        key: OrdinaryDocumentFunctionKey,
+    ) -> Result<(DocumentFunctionId, Vec<DocumentParameterId>), PlanError> {
+        if let Some(existing) = self
+            .ordinary_functions
+            .iter_mut()
+            .find(|candidate| candidate.key == key)
+        {
+            return Ok((existing.id, existing.parameters.clone()));
+        }
+        if !self.active_ordinary_functions.insert(function.id) {
             return Err(PlanError::new(format!(
                 "ordinary document callable `{name}` is recursive"
             )));
         }
-        let result = self.compile_expression(function.root, &context, None);
-        self.active_ordinary_functions.remove(&function_id);
-        result
+        let id = DocumentFunctionId(self.next_function_id);
+        self.next_function_id = self
+            .next_function_id
+            .checked_add(1)
+            .ok_or_else(|| PlanError::new("document function id overflow"))?;
+        if !self.function_ids.insert(id) {
+            return Err(PlanError::new(format!(
+                "ordinary document callable `{name}` reuses function {}",
+                id.0
+            )));
+        }
+        let parameters = (0..function.parameters.len())
+            .map(|ordinal| parameter_id(id, ordinal))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.ordinary_functions.push(OrdinaryDocumentFunction {
+            key: key.clone(),
+            id,
+            parameters: parameters.clone(),
+            parameter_values: Vec::new(),
+            call_sites: Vec::new(),
+        });
+
+        let mut context = CompileContext {
+            cache_scope: self.allocate_cache_scope(),
+            call_instance: key.call_instance,
+            stable_owner: key.stable_owner,
+            owner_function: Some(id),
+            materialization_locals: key.materialization_locals,
+            locals: key.locals,
+            function_parameters: BTreeMap::new(),
+            type_substitutions: key.type_substitutions,
+            pattern_bindings: key.pattern_bindings,
+        };
+        let mut parameter_values = Vec::with_capacity(parameters.len());
+        for (((parameter, executable), ty), static_selector) in parameters
+            .iter()
+            .copied()
+            .zip(&function.parameters)
+            .zip(key.parameter_types)
+            .zip(key.static_parameter_selectors)
+        {
+            let value = self.push_expr(
+                function.root.0,
+                value_class_for_type(&ty),
+                DocumentExprOp::Read {
+                    read: DocumentRead::Parameter {
+                        parameter,
+                        projection: Vec::new(),
+                    },
+                },
+            );
+            if let Some(selector) = static_selector {
+                self.static_expression_selectors.insert(value, selector);
+            }
+            parameter_values.push(value);
+            context.function_parameters.insert(
+                executable.id,
+                DocumentFunctionParameterBinding { value, ty },
+            );
+        }
+        self.ordinary_functions
+            .iter_mut()
+            .find(|candidate| candidate.id == id)
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "ordinary document function {} lost its parameter construction record",
+                    id.0
+                ))
+            })?
+            .parameter_values = parameter_values;
+        let body = self.compile_expression(function.root, &context, None).map_err(|error| {
+            PlanError::new(format!(
+                "ordinary document callable `{name}` body failed during shared function lowering: {error}"
+            ))
+        });
+        self.active_ordinary_functions.remove(&function.id);
+        let body = body?;
+        self.functions.push(DocumentFunction {
+            id,
+            parameters: parameters.clone(),
+            body,
+        });
+        Ok((id, parameters))
     }
 
     fn invocation_argument_type(
@@ -1542,6 +1923,18 @@ impl<'a> DocumentCompiler<'a> {
             }
             None => {
                 if !context_ordinals.is_empty() || !contexts.is_empty() {
+                    let mut anchor_lineage = Vec::new();
+                    let mut anchor = context.call_instance;
+                    while let Some(id) = anchor {
+                        anchor_lineage.push(id);
+                        anchor = self
+                            .program
+                            .executable
+                            .call_occurrences
+                            .get(id)
+                            .filter(|candidate| candidate.id == id)
+                            .and_then(|candidate| candidate.parent);
+                    }
                     let candidates = self
                         .program
                         .executable
@@ -1549,11 +1942,25 @@ impl<'a> DocumentCompiler<'a> {
                         .iter()
                         .filter(|occurrence| occurrence.checked_call == Some(checked_call))
                         .take(16)
-                        .map(|occurrence| (occurrence.id, occurrence.parent))
+                        .map(|occurrence| {
+                            let mut lineage = vec![occurrence.id];
+                            let mut parent = occurrence.parent;
+                            while let Some(id) = parent {
+                                lineage.push(id);
+                                parent = self
+                                    .program
+                                    .executable
+                                    .call_occurrences
+                                    .get(id)
+                                    .filter(|candidate| candidate.id == id)
+                                    .and_then(|candidate| candidate.parent);
+                            }
+                            (occurrence.id, lineage)
+                        })
                         .collect::<Vec<_>>();
                     return Err(PlanError::new(format!(
-                        "document call {} `{function}` at executable expression {compiler_id} owns contexts but has no concrete invocation below {:?}; candidates={candidates:?}",
-                        checked_call.0, context.call_instance
+                        "document call {} `{function}` at executable expression {compiler_id} owns contexts but has no concrete invocation below {:?}; anchor_lineage={anchor_lineage:?}; candidates={candidates:?}",
+                        checked_call.0, context.call_instance,
                     )));
                 }
                 Vec::new()
@@ -2017,8 +2424,16 @@ impl<'a> DocumentCompiler<'a> {
         input: DocumentExprId,
         arms: &'b [ir::ExecutableSelectArm],
     ) -> Option<&'b ir::ExecutableSelectArm> {
+        let selector = self.static_selector(input)?;
+        arms.iter().find(|arm| selector.matches(&arm.pattern))
+    }
+
+    fn static_selector(&self, input: DocumentExprId) -> Option<StaticDocumentSelector> {
+        if let Some(selector) = self.static_expression_selectors.get(&input) {
+            return Some(selector.clone());
+        }
         let input = self.expressions.get(input.0)?;
-        let selector = match &input.op {
+        Some(match &input.op {
             DocumentExprOp::Constant { constant } => {
                 let constant = self.constants.get(constant.0)?;
                 match &constant.value {
@@ -2041,8 +2456,7 @@ impl<'a> DocumentCompiler<'a> {
                 StaticDocumentSelector::Tag(self.names.get(tag.0)?.clone())
             }
             _ => return None,
-        };
-        arms.iter().find(|arm| selector.matches(&arm.pattern))
+        })
     }
 
     fn compile_pattern(
@@ -2981,6 +3395,212 @@ impl<'a> DocumentCompiler<'a> {
     }
 }
 
+fn set_document_expression_redirect(
+    redirects: &mut [Option<DocumentExprId>],
+    source: DocumentExprId,
+    target: DocumentExprId,
+    kind: &str,
+) -> Result<(), PlanError> {
+    let slot = redirects.get_mut(source.0).ok_or_else(|| {
+        PlanError::new(format!(
+            "{kind} expression {} is outside the document arena",
+            source.0
+        ))
+    })?;
+    if let Some(previous) = slot.replace(target)
+        && previous != target
+    {
+        return Err(PlanError::new(format!(
+            "{kind} expression {} redirects to both {} and {}",
+            source.0, previous.0, target.0
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_document_expression_redirect(
+    mut id: DocumentExprId,
+    redirects: &[Option<DocumentExprId>],
+) -> Result<DocumentExprId, PlanError> {
+    for _ in 0..=redirects.len() {
+        let Some(next) = redirects.get(id.0).ok_or_else(|| {
+            PlanError::new(format!(
+                "document expression redirect references missing expression {}",
+                id.0
+            ))
+        })?
+        else {
+            return Ok(id);
+        };
+        id = *next;
+    }
+    Err(PlanError::new(
+        "single-use document expression redirects contain a cycle",
+    ))
+}
+
+fn dense_document_expression_id(
+    id: DocumentExprId,
+    dense_ids: &[Option<DocumentExprId>],
+) -> Result<DocumentExprId, PlanError> {
+    dense_ids.get(id.0).copied().flatten().ok_or_else(|| {
+        PlanError::new(format!(
+            "document expression {} has no dense post-compaction id",
+            id.0
+        ))
+    })
+}
+
+fn final_document_expression_id(
+    id: DocumentExprId,
+    final_ids: &[DocumentExprId],
+) -> Result<DocumentExprId, PlanError> {
+    final_ids.get(id.0).copied().ok_or_else(|| {
+        PlanError::new(format!(
+            "document expression {} has no final post-compaction id",
+            id.0
+        ))
+    })
+}
+
+fn resolve_document_function_owner(
+    mut owner: DocumentFunctionId,
+    redirects: &BTreeMap<DocumentFunctionId, Option<DocumentFunctionId>>,
+    limit: usize,
+) -> Result<Option<DocumentFunctionId>, PlanError> {
+    for _ in 0..=limit {
+        match redirects.get(&owner) {
+            None => return Ok(Some(owner)),
+            Some(None) => return Ok(None),
+            Some(Some(parent)) => owner = *parent,
+        }
+    }
+    Err(PlanError::new(
+        "single-use document function owner redirects contain a cycle",
+    ))
+}
+
+fn remap_document_external_expression_refs(
+    root: &mut DocumentRoot,
+    initial_patch_batch: &mut DocumentInitialPatchBatch,
+    functions: &mut [DocumentFunction],
+    templates: &mut [DocumentTemplate],
+    materializations: &mut [DocumentMaterialization],
+    view_bindings: &mut [DocumentViewBinding],
+    mut map: impl FnMut(DocumentExprId) -> Result<DocumentExprId, PlanError>,
+) -> Result<(), PlanError> {
+    root.expression = map(root.expression)?;
+    for patch in &mut initial_patch_batch.patches {
+        if let DocumentInitialPatch::MountRoot { expression, .. } = patch {
+            *expression = map(*expression)?;
+        }
+    }
+    for function in functions {
+        function.body = map(function.body)?;
+    }
+    for template in templates {
+        template.expression = map(template.expression)?;
+    }
+    for materialization in materializations {
+        for argument in &mut materialization.template_arguments {
+            argument.value = map(argument.value)?;
+        }
+        if let DocumentMaterializationSource::Expression { expression } =
+            &mut materialization.source
+        {
+            *expression = map(*expression)?;
+        }
+    }
+    for binding in view_bindings {
+        if let DocumentBindingTarget::Expression { expression } = &mut binding.target {
+            *expression = map(*expression)?;
+        }
+    }
+    Ok(())
+}
+
+fn remap_document_expression_op(
+    op: &mut DocumentExprOp,
+    map: &mut impl FnMut(DocumentExprId) -> Result<DocumentExprId, PlanError>,
+) -> Result<(), PlanError> {
+    match op {
+        DocumentExprOp::Absent
+        | DocumentExprOp::Constant { .. }
+        | DocumentExprOp::Read { .. }
+        | DocumentExprOp::Materialize { .. }
+        | DocumentExprOp::RuntimeExpression { .. }
+        | DocumentExprOp::NoElement => {}
+        DocumentExprOp::Project { input, .. } => *input = map(*input)?,
+        DocumentExprOp::Record { fields } | DocumentExprOp::TaggedRecord { fields, .. } => {
+            for field in fields {
+                field.value = map(field.value)?;
+            }
+        }
+        DocumentExprOp::List { items } => {
+            for item in items {
+                item.value = map(item.value)?;
+            }
+        }
+        DocumentExprOp::TextTemplate { segments } => {
+            for segment in segments {
+                if let DocumentTextSegment::Dynamic { value } = segment {
+                    *value = map(*value)?;
+                }
+            }
+        }
+        DocumentExprOp::LocalBlock { bindings, result } => {
+            for binding in bindings {
+                binding.value = map(binding.value)?;
+            }
+            *result = map(*result)?;
+        }
+        DocumentExprOp::Call { arguments, .. } => {
+            for argument in arguments {
+                argument.value = map(argument.value)?;
+            }
+        }
+        DocumentExprOp::Builtin {
+            input, arguments, ..
+        } => {
+            if let Some(value) = input {
+                *value = map(*value)?;
+            }
+            for argument in arguments {
+                argument.value = map(argument.value)?;
+            }
+        }
+        DocumentExprOp::Scalar { left, right, .. } => {
+            *left = map(*left)?;
+            if let Some(value) = right {
+                *value = map(*value)?;
+            }
+        }
+        DocumentExprOp::Select { input, arms } => {
+            *input = map(*input)?;
+            for arm in arms {
+                arm.output = map(arm.output)?;
+            }
+        }
+        DocumentExprOp::Latest { branches } => {
+            for branch in branches {
+                *branch = map(*branch)?;
+            }
+        }
+        DocumentExprOp::Then { input, output } => {
+            *input = map(*input)?;
+            if let Some(value) = output {
+                *value = map(*value)?;
+            }
+        }
+        DocumentExprOp::Constructor { arguments, .. } => {
+            for argument in arguments {
+                argument.value = map(argument.value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn synthetic_scope_id(owner: ir::StaticOwnerId) -> Result<ScopeId, PlanError> {
     let namespace = 1usize << (usize::BITS - 1);
     if owner.0 >= namespace {
@@ -2989,6 +3609,93 @@ fn synthetic_scope_id(owner: ir::StaticOwnerId) -> Result<ScopeId, PlanError> {
         ));
     }
     Ok(ScopeId(namespace | owner.0))
+}
+
+fn ordinary_function_requires_overlay(
+    program: &ErasedProgram,
+    function: ir::FunctionId,
+    memo: &mut BTreeMap<ir::FunctionId, bool>,
+) -> Result<bool, PlanError> {
+    fn visit_function(
+        program: &ErasedProgram,
+        function: ir::FunctionId,
+        memo: &mut BTreeMap<ir::FunctionId, bool>,
+        active: &mut BTreeSet<ir::FunctionId>,
+    ) -> Result<bool, PlanError> {
+        if let Some(requires_overlay) = memo.get(&function) {
+            return Ok(*requires_overlay);
+        }
+        if !active.insert(function) {
+            // Recursive ordinary document call graphs fail during lowering;
+            // keep this preliminary capability walk finite and conservative.
+            return Ok(true);
+        }
+        let definition = program
+            .executable
+            .ordinary_functions
+            .iter()
+            .find(|candidate| candidate.id == function)
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "document overlay analysis references missing function {}",
+                    function.0
+                ))
+            })?;
+        let mut pending = vec![definition.root];
+        let mut visited = BTreeSet::new();
+        let mut requires_overlay = false;
+        while let Some(expression_id) = pending.pop() {
+            if !visited.insert(expression_id) {
+                continue;
+            }
+            let expression = program
+                .executable
+                .expressions
+                .get(expression_id.as_usize())
+                .filter(|candidate| candidate.id == expression_id)
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "document overlay analysis for function {} reaches missing expression {}",
+                        function.0, expression_id.0
+                    ))
+                })?;
+            match &expression.kind {
+                ir::ExecutableExpressionKind::ElementState { .. }
+                | ir::ExecutableExpressionKind::LocalRead { .. }
+                | ir::ExecutableExpressionKind::MaterializationLocal { .. }
+                | ir::ExecutableExpressionKind::Materialize { .. } => {
+                    requires_overlay = true;
+                    break;
+                }
+                ir::ExecutableExpressionKind::Call {
+                    name,
+                    contexts,
+                    context_ordinals,
+                    ..
+                } if document_constructor(name).is_some()
+                    || !contexts.is_empty()
+                    || !context_ordinals.is_empty() =>
+                {
+                    requires_overlay = true;
+                    break;
+                }
+                ir::ExecutableExpressionKind::UserCall {
+                    function: dependency,
+                    ..
+                } if visit_function(program, *dependency, memo, active)? => {
+                    requires_overlay = true;
+                    break;
+                }
+                _ => {}
+            }
+            pending.extend(ir::executable_expression_children(&expression.kind));
+        }
+        active.remove(&function);
+        memo.insert(function, requires_overlay);
+        Ok(requires_overlay)
+    }
+
+    visit_function(program, function, memo, &mut BTreeSet::new())
 }
 
 fn parameter_id(

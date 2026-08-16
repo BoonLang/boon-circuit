@@ -17,7 +17,11 @@ pub use boon_document_model::{
 pub use document::*;
 pub use host::*;
 
-pub const PLAN_MAJOR_VERSION: u32 = 10;
+/// V11 adds construction-owned document functions and compact ordinary-call
+/// frames. V10 readers cannot execute the new `DocumentExprOp::Call` payload,
+/// so this is an explicit runtime contract boundary rather than a silent enum
+/// extension.
+pub const PLAN_MAJOR_VERSION: u32 = 11;
 pub const PLAN_MINOR_VERSION: u32 = 0;
 pub const PERSISTENCE_FORMAT_VERSION: u32 = 5;
 pub const DEFAULT_PERSISTENCE_SCHEMA_VERSION: u64 = 1;

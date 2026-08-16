@@ -154,6 +154,16 @@ pub enum DocumentExprOp {
         bindings: Vec<DocumentLocalBinding>,
         result: DocumentExprId,
     },
+    /// One invocation of a construction-owned document function.
+    ///
+    /// Ordinary Boon definitions are compiled into `DocumentFunction` once
+    /// per exact contextual overlay. Call sites retain only their argument
+    /// frame instead of cloning the complete function body into the document
+    /// expression arena.
+    Call {
+        function: DocumentFunctionId,
+        arguments: Vec<DocumentCallArgument>,
+    },
     Builtin {
         builtin: DocumentBuiltin,
         input: Option<DocumentExprId>,
@@ -686,6 +696,20 @@ impl DocumentPlan {
         if function_ids.len() != self.functions.len() {
             return Err("document function ids are not unique".to_owned());
         }
+        let functions_by_id = self
+            .functions
+            .iter()
+            .map(|function| (function.id, function))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for function in &self.functions {
+            let parameters = function.parameters.iter().copied().collect::<BTreeSet<_>>();
+            if parameters.len() != function.parameters.len() {
+                return Err(format!(
+                    "document function {} contains duplicate parameters",
+                    function.id.0
+                ));
+            }
+        }
         let template_ids = self
             .templates
             .iter()
@@ -863,6 +887,33 @@ impl DocumentPlan {
                     }
                 }
             }
+            if let DocumentExprOp::Call {
+                function,
+                arguments,
+            } = &expression.op
+            {
+                let definition = functions_by_id.get(function).ok_or_else(|| {
+                    format!(
+                        "document expression {} calls missing function {}",
+                        expression.id.0, function.0
+                    )
+                })?;
+                let supplied = arguments
+                    .iter()
+                    .map(|argument| argument.parameter)
+                    .collect::<BTreeSet<_>>();
+                let expected = definition
+                    .parameters
+                    .iter()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if supplied.len() != arguments.len() || supplied != expected {
+                    return Err(format!(
+                        "document expression {} call to function {} has an invalid parameter frame",
+                        expression.id.0, function.0
+                    ));
+                }
+            }
             if let DocumentExprOp::Read {
                 read: DocumentRead::DistributedImport { import },
             } = &expression.op
@@ -951,6 +1002,7 @@ impl DocumentPlan {
         {
             return Err("document function body expression is out of bounds".to_owned());
         }
+        verify_document_function_call_graph(self)?;
         if self.materializations.iter().any(|materialization| {
             !function_ids.contains(&materialization.template_function)
                 || matches!(
@@ -966,6 +1018,77 @@ impl DocumentPlan {
         }
         Ok(())
     }
+}
+
+fn verify_document_function_call_graph(plan: &DocumentPlan) -> Result<(), String> {
+    fn dependencies(
+        plan: &DocumentPlan,
+        function: &DocumentFunction,
+    ) -> Result<BTreeSet<DocumentFunctionId>, String> {
+        let mut dependencies = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let mut pending = vec![function.body];
+        while let Some(expression) = pending.pop() {
+            if !visited.insert(expression) {
+                continue;
+            }
+            let expression = plan.expressions.get(expression.0).ok_or_else(|| {
+                format!(
+                    "document function {} reaches missing expression {}",
+                    function.id.0, expression.0
+                )
+            })?;
+            if let DocumentExprOp::Call {
+                function: dependency,
+                ..
+            } = &expression.op
+            {
+                dependencies.insert(*dependency);
+            }
+            pending.extend(expression.op.expression_refs());
+        }
+        Ok(dependencies)
+    }
+
+    fn visit(
+        function: DocumentFunctionId,
+        graph: &std::collections::BTreeMap<DocumentFunctionId, BTreeSet<DocumentFunctionId>>,
+        state: &mut std::collections::BTreeMap<DocumentFunctionId, u8>,
+    ) -> Result<(), String> {
+        match state.get(&function).copied() {
+            Some(2) => return Ok(()),
+            Some(1) => {
+                return Err(format!(
+                    "document function {} belongs to a recursive call cycle",
+                    function.0
+                ));
+            }
+            _ => {}
+        }
+        state.insert(function, 1);
+        for dependency in graph.get(&function).into_iter().flatten() {
+            if !graph.contains_key(dependency) {
+                return Err(format!(
+                    "document function {} calls missing function {}",
+                    function.0, dependency.0
+                ));
+            }
+            visit(*dependency, graph, state)?;
+        }
+        state.insert(function, 2);
+        Ok(())
+    }
+
+    let graph = plan
+        .functions
+        .iter()
+        .map(|function| Ok((function.id, dependencies(plan, function)?)))
+        .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+    let mut state = std::collections::BTreeMap::new();
+    for function in graph.keys().copied() {
+        visit(function, &graph, &mut state)?;
+    }
+    Ok(())
 }
 
 impl DocumentConstructor {
@@ -1052,7 +1175,7 @@ pub fn verify_map_viewport_constructor_contract(
 }
 
 impl DocumentExprOp {
-    fn expression_refs(&self) -> Vec<DocumentExprId> {
+    pub fn expression_refs(&self) -> Vec<DocumentExprId> {
         match self {
             Self::Absent | Self::Constant { .. } | Self::Read { .. } | Self::NoElement => {
                 Vec::new()
@@ -1074,6 +1197,9 @@ impl DocumentExprOp {
                 .map(|binding| binding.value)
                 .chain(std::iter::once(*result))
                 .collect(),
+            Self::Call { arguments, .. } => {
+                arguments.iter().map(|argument| argument.value).collect()
+            }
             Self::Builtin {
                 input, arguments, ..
             } => input
@@ -1184,5 +1310,86 @@ mod map_viewport_contract_tests {
             .unwrap_err()
             .contains("`camera` has incompatible role")
         );
+    }
+}
+
+#[cfg(test)]
+mod document_function_call_tests {
+    use super::*;
+
+    fn plan(expressions: Vec<DocumentExpr>, functions: Vec<DocumentFunction>) -> DocumentPlan {
+        DocumentPlan {
+            root: DocumentRoot {
+                kind: DocumentRootKind::Document,
+                node: DocumentNodeId(0),
+                template: DocumentTemplateId(0),
+                expression: DocumentExprId(0),
+            },
+            initial_patch_batch: DocumentInitialPatchBatch {
+                root: DocumentNodeId(0),
+                patches: Vec::new(),
+            },
+            names: Vec::new(),
+            constants: Vec::new(),
+            expressions,
+            functions,
+            templates: Vec::new(),
+            materializations: Vec::new(),
+            view_bindings: Vec::new(),
+            unresolved_op_count: 0,
+        }
+    }
+
+    #[test]
+    fn shared_document_function_graph_rejects_recursion() {
+        let expression = DocumentExpr {
+            id: DocumentExprId(0),
+            compiler_id: 0,
+            value_class: DocumentValueClass::DynamicScalar,
+            op: DocumentExprOp::Call {
+                function: DocumentFunctionId(0),
+                arguments: Vec::new(),
+            },
+        };
+        let function = DocumentFunction {
+            id: DocumentFunctionId(0),
+            parameters: Vec::new(),
+            body: expression.id,
+        };
+        let error = verify_document_function_call_graph(&plan(vec![expression], vec![function]))
+            .unwrap_err();
+        assert!(error.contains("recursive call cycle"), "{error}");
+    }
+
+    #[test]
+    fn shared_document_function_graph_accepts_one_way_calls() {
+        let leaf = DocumentExpr {
+            id: DocumentExprId(0),
+            compiler_id: 0,
+            value_class: DocumentValueClass::Static,
+            op: DocumentExprOp::Absent,
+        };
+        let call = DocumentExpr {
+            id: DocumentExprId(1),
+            compiler_id: 1,
+            value_class: DocumentValueClass::DynamicScalar,
+            op: DocumentExprOp::Call {
+                function: DocumentFunctionId(0),
+                arguments: Vec::new(),
+            },
+        };
+        let functions = vec![
+            DocumentFunction {
+                id: DocumentFunctionId(0),
+                parameters: Vec::new(),
+                body: leaf.id,
+            },
+            DocumentFunction {
+                id: DocumentFunctionId(1),
+                parameters: Vec::new(),
+                body: call.id,
+            },
+        ];
+        verify_document_function_call_graph(&plan(vec![leaf, call], functions)).unwrap();
     }
 }

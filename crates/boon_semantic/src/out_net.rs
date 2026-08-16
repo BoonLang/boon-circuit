@@ -1081,7 +1081,8 @@ struct OutNetBuilder<'program, Contract, MakeContract, IsProducer> {
     call_index_by_id: BTreeMap<CheckedCallId, usize>,
     declaration_by_id: BTreeMap<DeclId, &'program CheckedDeclaration>,
     pattern_binding_by_declaration: BTreeMap<DeclId, &'program CheckedPatternBinding>,
-    function_owner_by_scope: BTreeMap<LexicalScopeId, Option<DeclId>>,
+    statements_with_children_by_value: BTreeMap<CheckedExprId, usize>,
+    function_owner_by_scope: Vec<Option<DeclId>>,
     root_expressions: Vec<CheckedExprId>,
     resource_owning_callables: BTreeSet<DeclId>,
     producer_root_specs: Vec<ProducerRootSpec>,
@@ -1143,10 +1144,6 @@ where
             });
         }
 
-        let resource_owning_callables = resource_owning_callables(program, &signature_by_id);
-        let retained_definitions = intent.retained_definitions();
-        let retained_overlay_definitions =
-            retained_overlay_definitions(program, retained_definitions, &signature_by_id);
         let declaration_by_id = program
             .declarations
             .iter()
@@ -1157,11 +1154,27 @@ where
             .iter()
             .map(|binding| (binding.declaration, binding))
             .collect();
-        let function_owner_by_scope = program
-            .scopes
-            .iter()
-            .map(|scope| (scope.id, function_owner_for_scope(program, scope.id)))
-            .collect::<BTreeMap<_, _>>();
+        let mut statements_with_children_by_value = BTreeMap::new();
+        for (index, statement) in program.statements.iter().enumerate() {
+            if !statement.children.is_empty()
+                && let Some(value) = statement.value
+            {
+                statements_with_children_by_value
+                    .entry(value)
+                    .or_insert(index);
+            }
+        }
+        let mut function_owner_by_scope = vec![None; program.scopes.len()];
+        for scope in &program.scopes {
+            if let Some(slot) = function_owner_by_scope.get_mut(scope.id.0 as usize) {
+                *slot = function_owner_for_scope(program, scope.id);
+            }
+        }
+        let resource_owning_callables =
+            resource_owning_callables(program, &signature_by_id, &function_owner_by_scope);
+        let retained_definitions = intent.retained_definitions();
+        let retained_overlay_definitions =
+            retained_overlay_definitions(program, retained_definitions, &signature_by_id);
         let root_expressions = intent.program_schedule_roots().to_vec();
         Self {
             program,
@@ -1170,6 +1183,7 @@ where
             call_index_by_id,
             declaration_by_id,
             pattern_binding_by_declaration,
+            statements_with_children_by_value,
             function_owner_by_scope,
             root_expressions,
             resource_owning_callables,
@@ -1316,7 +1330,7 @@ where
                         && declaration.kind == CheckedDeclarationKind::Field
                         && self
                             .function_owner_by_scope
-                            .get(&declaration.scope_id)
+                            .get(declaration.scope_id.0 as usize)
                             .copied()
                             .flatten()
                             == owner_callable
@@ -1568,9 +1582,11 @@ where
         &self,
         parent_expression: CheckedExprId,
     ) -> Vec<CheckedExprId> {
-        let Some(statement) = self.program.statements.iter().find(|statement| {
-            statement.value == Some(parent_expression) && !statement.children.is_empty()
-        }) else {
+        let Some(statement) = self
+            .statements_with_children_by_value
+            .get(&parent_expression)
+            .and_then(|index| self.program.statements.get(*index))
+        else {
             return Vec::new();
         };
         let mut statements = statement.children.iter().rev().copied().collect::<Vec<_>>();
@@ -1702,7 +1718,7 @@ where
                     && declaration.kind == CheckedDeclarationKind::Field
                     && self
                         .function_owner_by_scope
-                        .get(&declaration.scope_id)
+                        .get(declaration.scope_id.0 as usize)
                         .copied()
                         .flatten()
                         .is_some()
@@ -2216,18 +2232,9 @@ where
     }
 
     fn nearest_repeated_output(&self, expression: CheckedExprId) -> Option<DeclId> {
-        let mut scope = self
-            .program
-            .expressions
-            .iter()
-            .find(|candidate| candidate.id == expression)
-            .map(|expression| expression.scope_id)?;
+        let mut scope = checked_expression(self.program, expression)?.scope_id;
         loop {
-            let checked_scope = self
-                .program
-                .scopes
-                .iter()
-                .find(|candidate| candidate.id == scope)?;
+            let checked_scope = checked_scope(self.program, scope)?;
             if checked_scope.kind == CheckedScopeKind::RepeatedOutput {
                 return checked_scope.owner;
             }
@@ -2411,20 +2418,13 @@ where
                         let port = &self.ports[anchor.as_usize()];
                         let call = port.call;
                         let expression = self.call_instances[call.as_usize()].provenance.expression;
-                        let expression_span = self
-                            .program
-                            .expressions
-                            .iter()
-                            .find(|candidate| candidate.id == expression)
+                        let expression_span = checked_expression(self.program, expression)
                             .map(|expression| expression.span)
                             .unwrap_or_default();
                         let scope_span = match port.binding {
-                            OutPortBinding::Fresh { scope_id, .. } => self
-                                .program
-                                .scopes
-                                .iter()
-                                .find(|scope| scope.id == scope_id)
-                                .map(|scope| scope.span),
+                            OutPortBinding::Fresh { scope_id, .. } => {
+                                checked_scope(self.program, scope_id).map(|scope| scope.span)
+                            }
                             OutPortBinding::Forward { .. } => None,
                         }
                         .unwrap_or(expression_span);
@@ -2438,11 +2438,7 @@ where
                     }
                     StaticOwnerNode::Call(call) => {
                         let expression = self.call_instances[call.as_usize()].provenance.expression;
-                        let span = self
-                            .program
-                            .expressions
-                            .iter()
-                            .find(|candidate| candidate.id == expression)
+                        let span = checked_expression(self.program, expression)
                             .map(|expression| expression.span)
                             .unwrap_or_default();
                         (span, span, expression, 0_u8, call.as_usize())
@@ -2687,10 +2683,7 @@ fn function_owner_for_scope(
     mut scope: LexicalScopeId,
 ) -> Option<DeclId> {
     loop {
-        let checked = program
-            .scopes
-            .iter()
-            .find(|candidate| candidate.id == scope)?;
+        let checked = checked_scope(program, scope)?;
         if checked.kind == CheckedScopeKind::Function {
             return checked.owner;
         }
@@ -2698,27 +2691,49 @@ fn function_owner_for_scope(
     }
 }
 
+fn checked_expression(
+    program: &CheckedProgramFields,
+    expression: CheckedExprId,
+) -> Option<&boon_checked::CheckedExpression> {
+    program
+        .expressions
+        .get(expression.0 as usize)
+        .filter(|candidate| candidate.id == expression)
+}
+
+fn checked_scope(
+    program: &CheckedProgramFields,
+    scope: LexicalScopeId,
+) -> Option<&boon_checked::CheckedScope> {
+    program
+        .scopes
+        .get(scope.0 as usize)
+        .filter(|candidate| candidate.id == scope)
+}
+
 fn resource_owning_callables(
     program: &CheckedProgramFields,
     signatures: &BTreeMap<DeclId, &CheckedCallableSignature>,
+    function_owner_by_scope: &[Option<DeclId>],
 ) -> BTreeSet<DeclId> {
-    let calls = program
-        .calls
-        .iter()
-        .map(|call| (call.id, call))
-        .collect::<BTreeMap<_, _>>();
     let mut owners = BTreeSet::new();
 
     for expression in &program.expressions {
-        let Some(owner) = function_owner_for_scope(program, expression.scope_id) else {
+        let Some(owner) = function_owner_by_scope
+            .get(expression.scope_id.0 as usize)
+            .copied()
+            .flatten()
+        else {
             continue;
         };
         let directly_allocates = match expression.kind {
             boon_checked::CheckedExpressionKind::Source
             | boon_checked::CheckedExpressionKind::Hold { .. }
             | boon_checked::CheckedExpressionKind::Latest { .. } => true,
-            boon_checked::CheckedExpressionKind::Call { call } => calls
-                .get(&call)
+            boon_checked::CheckedExpressionKind::Call { call } => program
+                .calls
+                .get(call.0 as usize)
+                .filter(|candidate| candidate.id == call)
                 .and_then(|call| signatures.get(&call.callable))
                 .is_some_and(|callable| {
                     callable.kind != CheckedCallableKind::User
@@ -2740,7 +2755,11 @@ fn resource_owning_callables(
         ) {
             continue;
         }
-        if let Some(owner) = function_owner_for_scope(program, statement.scope_id) {
+        if let Some(owner) = function_owner_by_scope
+            .get(statement.scope_id.0 as usize)
+            .copied()
+            .flatten()
+        {
             owners.insert(owner);
         }
     }

@@ -1,3 +1,4 @@
+use boon_checked::runtime_type_contains_var;
 #[cfg(test)]
 use boon_parser::ParsedProgram;
 use boon_semantic::program_core::*;
@@ -3070,36 +3071,6 @@ fn verify_runtime_executable_types(program: &ErasedProgram) -> Result<(), String
         pending.extend(executable_expression_children(&expression.kind));
     }
     Ok(())
-}
-
-fn runtime_type_contains_var(ty: &boon_checked::Type) -> bool {
-    match ty {
-        boon_checked::Type::Var(_) => true,
-        boon_checked::Type::List(item) => runtime_type_contains_var(item),
-        boon_checked::Type::Map { key, value } => {
-            runtime_type_contains_var(key) || runtime_type_contains_var(value)
-        }
-        boon_checked::Type::Set(item) => runtime_type_contains_var(item),
-        boon_checked::Type::Union(members) => members.iter().any(runtime_type_contains_var),
-        boon_checked::Type::Function { args, result } => {
-            args.iter().any(runtime_type_contains_var) || runtime_type_contains_var(&result.ty)
-        }
-        boon_checked::Type::Object(shape) => shape.fields.values().any(runtime_type_contains_var),
-        boon_checked::Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
-            boon_checked::Variant::Tag(_) => false,
-            boon_checked::Variant::Tagged { fields, .. } => {
-                fields.fields.values().any(runtime_type_contains_var)
-            }
-        }),
-        boon_checked::Type::Text
-        | boon_checked::Type::Number
-        | boon_checked::Type::Bytes(_)
-        | boon_checked::Type::Bits { .. }
-        | boon_checked::Type::Absent
-        | boon_checked::Type::RenderContract
-        | boon_checked::Type::UnresolvedShape { .. }
-        | boon_checked::Type::Unknown => false,
-    }
 }
 
 fn verify_materialization_locals(

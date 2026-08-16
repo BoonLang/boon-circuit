@@ -20,6 +20,7 @@ use crate::{
     ExecutionPending, OutCallInstanceId, OutInputValue, OutNetId, ResolvedOutGraph as OutNet,
     ScopedCheckedExpr, SemanticImageBuilder, StaticOwnerId, execution_construction_routes_v3,
 };
+pub(crate) use boon_checked::erase_runtime_type_vars;
 use boon_checked::{
     CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedContextBinding,
     CheckedContextualOperation, CheckedDeclarationKind, CheckedExprId, CheckedExpression,
@@ -277,92 +278,83 @@ impl fmt::Display for ExpansionError {
 }
 
 struct CheckedProgramLookup {
-    expressions_by_id: BTreeMap<CheckedExprId, Option<usize>>,
-    declarations_by_id: BTreeMap<DeclId, Option<usize>>,
-    statements_by_id: BTreeMap<boon_checked::CheckedStatementId, Option<usize>>,
-    scopes_by_id: BTreeMap<boon_checked::LexicalScopeId, Option<usize>>,
-    calls_by_id: BTreeMap<CheckedCallId, Option<usize>>,
-    callables_by_declaration: BTreeMap<DeclId, Option<usize>>,
-    declarations_by_scope_and_name:
-        BTreeMap<boon_checked::LexicalScopeId, BTreeMap<String, Option<DeclId>>>,
-    pattern_bindings_by_declaration: BTreeMap<DeclId, Option<usize>>,
-    statements_by_value: BTreeMap<CheckedExprId, Vec<usize>>,
-    element_contexts_by_declaration: BTreeMap<DeclId, Option<(usize, usize)>>,
+    expressions_by_id: Vec<Option<Option<usize>>>,
+    declarations_by_id: Vec<Option<Option<usize>>>,
+    statements_by_id: Vec<Option<Option<usize>>>,
+    scopes_by_id: Vec<Option<Option<usize>>>,
+    calls_by_id: Vec<Option<Option<usize>>>,
+    callables_by_declaration: Vec<Option<Option<usize>>>,
+    declarations_by_scope_and_name: Vec<BTreeMap<String, Option<DeclId>>>,
+    pattern_bindings_by_declaration: Vec<Option<Option<usize>>>,
+    statements_by_value: Vec<Vec<usize>>,
+    element_contexts_by_declaration: Vec<Option<Option<(usize, usize)>>>,
 }
 
 impl CheckedProgramLookup {
     fn new(program: &CheckedProgramFields) -> Self {
-        let mut expressions_by_id = BTreeMap::new();
+        let mut expressions_by_id = Vec::new();
         for (index, expression) in program.expressions.iter().enumerate() {
-            expressions_by_id
-                .entry(expression.id)
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(index));
+            insert_dense_index(&mut expressions_by_id, expression.id.0 as usize, index);
         }
-        let mut declarations_by_id = BTreeMap::new();
+        let mut declarations_by_id = Vec::new();
         for (index, declaration) in program.declarations.iter().enumerate() {
-            declarations_by_id
-                .entry(declaration.id)
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(index));
+            insert_dense_index(&mut declarations_by_id, declaration.id.0 as usize, index);
         }
-        let mut statements_by_id = BTreeMap::new();
+        let mut statements_by_id = Vec::new();
         for (index, statement) in program.statements.iter().enumerate() {
-            statements_by_id
-                .entry(statement.id)
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(index));
+            insert_dense_index(&mut statements_by_id, statement.id.0 as usize, index);
         }
-        let mut scopes_by_id = BTreeMap::new();
+        let mut scopes_by_id = Vec::new();
         for (index, scope) in program.scopes.iter().enumerate() {
-            scopes_by_id
-                .entry(scope.id)
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(index));
+            insert_dense_index(&mut scopes_by_id, scope.id.0 as usize, index);
         }
-        let mut calls_by_id = BTreeMap::new();
+        let mut calls_by_id = Vec::new();
         for (index, call) in program.calls.iter().enumerate() {
-            calls_by_id
-                .entry(call.id)
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(index));
+            insert_dense_index(&mut calls_by_id, call.id.0 as usize, index);
         }
-        let mut callables_by_declaration = BTreeMap::new();
+        let mut callables_by_declaration = Vec::new();
         for (index, callable) in program.callables.iter().enumerate() {
-            callables_by_declaration
-                .entry(callable.decl_id)
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(index));
+            insert_dense_index(
+                &mut callables_by_declaration,
+                callable.decl_id.0 as usize,
+                index,
+            );
         }
-        let mut declarations_by_scope_and_name = BTreeMap::new();
+        let mut declarations_by_scope_and_name = vec![BTreeMap::new(); program.scopes.len()];
         for declaration in &program.declarations {
-            declarations_by_scope_and_name
-                .entry(declaration.scope_id)
-                .or_insert_with(BTreeMap::new)
-                .entry(declaration.name.clone())
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(declaration.id));
-        }
-        let mut pattern_bindings_by_declaration = BTreeMap::new();
-        for (index, binding) in program.pattern_bindings.iter().enumerate() {
-            pattern_bindings_by_declaration
-                .entry(binding.declaration)
-                .and_modify(|entry| *entry = None)
-                .or_insert(Some(index));
-        }
-        let mut statements_by_value = BTreeMap::<CheckedExprId, Vec<usize>>::new();
-        for (index, statement) in program.statements.iter().enumerate() {
-            if let Some(value) = statement.value {
-                statements_by_value.entry(value).or_default().push(index);
+            if let Some(declarations) =
+                declarations_by_scope_and_name.get_mut(declaration.scope_id.0 as usize)
+            {
+                declarations
+                    .entry(declaration.name.clone())
+                    .and_modify(|entry| *entry = None)
+                    .or_insert(Some(declaration.id));
             }
         }
-        let mut element_contexts_by_declaration = BTreeMap::new();
+        let mut pattern_bindings_by_declaration = Vec::new();
+        for (index, binding) in program.pattern_bindings.iter().enumerate() {
+            insert_dense_index(
+                &mut pattern_bindings_by_declaration,
+                binding.declaration.0 as usize,
+                index,
+            );
+        }
+        let mut statements_by_value = vec![Vec::new(); program.expressions.len()];
+        for (index, statement) in program.statements.iter().enumerate() {
+            if let Some(value) = statement.value
+                && let Some(statements) = statements_by_value.get_mut(value.0 as usize)
+            {
+                statements.push(index);
+            }
+        }
+        let mut element_contexts_by_declaration = Vec::new();
         for (call_index, call) in program.calls.iter().enumerate() {
             for (context_index, context) in call.contexts.iter().enumerate() {
-                element_contexts_by_declaration
-                    .entry(context.declaration)
-                    .and_modify(|entry| *entry = None)
-                    .or_insert(Some((call_index, context_index)));
+                insert_dense_value(
+                    &mut element_contexts_by_declaration,
+                    context.declaration.0 as usize,
+                    (call_index, context_index),
+                );
             }
         }
         Self {
@@ -385,8 +377,9 @@ impl CheckedProgramLookup {
         expression: CheckedExprId,
     ) -> Option<&'a CheckedExpression> {
         self.expressions_by_id
-            .get(&expression)
+            .get(expression.0 as usize)
             .copied()
+            .flatten()
             .flatten()
             .and_then(|index| program.expressions.get(index))
             .filter(|candidate| candidate.id == expression)
@@ -398,8 +391,9 @@ impl CheckedProgramLookup {
         declaration: DeclId,
     ) -> Option<&'a boon_checked::CheckedDeclaration> {
         self.declarations_by_id
-            .get(&declaration)
+            .get(declaration.0 as usize)
             .copied()
+            .flatten()
             .flatten()
             .and_then(|index| program.declarations.get(index))
             .filter(|candidate| candidate.id == declaration)
@@ -411,8 +405,9 @@ impl CheckedProgramLookup {
         statement: boon_checked::CheckedStatementId,
     ) -> Option<&'a boon_checked::CheckedStatement> {
         self.statements_by_id
-            .get(&statement)
+            .get(statement.0 as usize)
             .copied()
+            .flatten()
             .flatten()
             .and_then(|index| program.statements.get(index))
             .filter(|candidate| candidate.id == statement)
@@ -424,8 +419,9 @@ impl CheckedProgramLookup {
         scope: boon_checked::LexicalScopeId,
     ) -> Option<&'a boon_checked::CheckedScope> {
         self.scopes_by_id
-            .get(&scope)
+            .get(scope.0 as usize)
             .copied()
+            .flatten()
             .flatten()
             .and_then(|index| program.scopes.get(index))
             .filter(|candidate| candidate.id == scope)
@@ -437,8 +433,9 @@ impl CheckedProgramLookup {
         call: CheckedCallId,
     ) -> Option<&'a boon_checked::CheckedCall> {
         self.calls_by_id
-            .get(&call)
+            .get(call.0 as usize)
             .copied()
+            .flatten()
             .flatten()
             .and_then(|index| program.calls.get(index))
             .filter(|candidate| candidate.id == call)
@@ -450,8 +447,9 @@ impl CheckedProgramLookup {
         declaration: DeclId,
     ) -> Option<&'a boon_checked::CheckedCallableSignature> {
         self.callables_by_declaration
-            .get(&declaration)
+            .get(declaration.0 as usize)
             .copied()
+            .flatten()
             .flatten()
             .and_then(|index| program.callables.get(index))
             .filter(|callable| callable.decl_id == declaration)
@@ -463,7 +461,7 @@ impl CheckedProgramLookup {
         name: &str,
     ) -> Option<DeclId> {
         self.declarations_by_scope_and_name
-            .get(&scope)?
+            .get(scope.0 as usize)?
             .get(name)
             .copied()
             .flatten()
@@ -475,8 +473,9 @@ impl CheckedProgramLookup {
         declaration: DeclId,
     ) -> Option<&'a boon_checked::CheckedPatternBinding> {
         self.pattern_bindings_by_declaration
-            .get(&declaration)
+            .get(declaration.0 as usize)
             .copied()
+            .flatten()
             .flatten()
             .and_then(|index| program.pattern_bindings.get(index))
             .filter(|binding| binding.declaration == declaration)
@@ -484,7 +483,7 @@ impl CheckedProgramLookup {
 
     fn statement_indices_for_value(&self, value: CheckedExprId) -> &[usize] {
         self.statements_by_value
-            .get(&value)
+            .get(value.0 as usize)
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
@@ -499,13 +498,28 @@ impl CheckedProgramLookup {
     )> {
         let (call, context) = self
             .element_contexts_by_declaration
-            .get(&declaration)
+            .get(declaration.0 as usize)
             .copied()
+            .flatten()
             .flatten()?;
         let call = program.calls.get(call)?;
         let context = call.contexts.get(context)?;
         (context.declaration == declaration).then_some((call, context))
     }
+}
+
+fn insert_dense_index(index: &mut Vec<Option<Option<usize>>>, key: usize, value: usize) {
+    insert_dense_value(index, key, value);
+}
+
+fn insert_dense_value<T: Copy>(index: &mut Vec<Option<Option<T>>>, key: usize, value: T) {
+    if index.len() <= key {
+        index.resize(key.saturating_add(1), None);
+    }
+    index[key] = match index[key] {
+        None => Some(Some(value)),
+        Some(_) => Some(None),
+    };
 }
 
 #[derive(Clone)]
@@ -980,66 +994,6 @@ fn concrete_type_in_frame(out_net: &OutNet, ty: &Type, frame: Option<OutCallInst
         |instance| out_net.apply_type_substitutions(instance, ty),
     );
     erase_runtime_type_vars(&ty)
-}
-
-pub(crate) fn erase_runtime_type_vars(ty: &Type) -> Type {
-    match ty {
-        Type::Var(_) => Type::Unknown,
-        Type::List(item) => Type::List(Type::shared(erase_runtime_type_vars(item))),
-        Type::Map { key, value } => Type::Map {
-            key: Box::new(erase_runtime_type_vars(key)),
-            value: Box::new(erase_runtime_type_vars(value)),
-        },
-        Type::Set(item) => Type::Set(Type::shared(erase_runtime_type_vars(item))),
-        Type::Function { args, result } => Type::Function {
-            args: args.iter().map(erase_runtime_type_vars).collect(),
-            result: Box::new(boon_checked::FlowType {
-                mode: result.mode,
-                ty: erase_runtime_type_vars(&result.ty),
-            }),
-        },
-        Type::Object(shape) => Type::object(boon_checked::ObjectShape {
-            fields: shape
-                .fields
-                .iter()
-                .map(|(name, ty)| (name.clone(), erase_runtime_type_vars(ty)))
-                .collect(),
-            field_order: shape.field_order.clone(),
-            open: shape.open,
-        }),
-        Type::VariantSet(variants) => Type::VariantSet(
-            variants
-                .iter()
-                .map(|variant| match variant {
-                    boon_checked::Variant::Tag(tag) => boon_checked::Variant::Tag(tag.clone()),
-                    boon_checked::Variant::Tagged { tag, fields } => {
-                        boon_checked::Variant::Tagged {
-                            tag: tag.clone(),
-                            fields: boon_checked::ObjectShape {
-                                fields: fields
-                                    .fields
-                                    .iter()
-                                    .map(|(name, ty)| (name.clone(), erase_runtime_type_vars(ty)))
-                                    .collect(),
-                                field_order: fields.field_order.clone(),
-                                open: fields.open,
-                            }
-                            .into(),
-                        }
-                    }
-                })
-                .collect(),
-        ),
-        Type::Union(members) => Type::Union(members.iter().map(erase_runtime_type_vars).collect()),
-        Type::Text
-        | Type::Number
-        | Type::Bytes(_)
-        | Type::Bits { .. }
-        | Type::Absent
-        | Type::RenderContract
-        | Type::UnresolvedShape { .. }
-        | Type::Unknown => ty.clone(),
-    }
 }
 
 fn runtime_flush_boundary_flow_type(mut success: FlowType, flush_type: Type) -> FlowType {
@@ -3528,8 +3482,8 @@ fn ensure_resource_definition_statement(
 
     let checked = program
         .statements
-        .iter()
-        .find(|statement| statement.id == checked_statement)
+        .get(checked_statement.0 as usize)
+        .filter(|statement| statement.id == checked_statement)
         .ok_or_else(|| {
             ExpansionError::InvalidLocalBindings(format!(
                 "resource declaration {} references missing checked statement {}",
@@ -4278,8 +4232,8 @@ fn checked_scope(
 ) -> Option<&boon_checked::CheckedScope> {
     program
         .scopes
-        .iter()
-        .find(|candidate| candidate.id == scope)
+        .get(scope.0 as usize)
+        .filter(|candidate| candidate.id == scope)
 }
 
 fn declaration_in_exact_scope(
@@ -7977,6 +7931,19 @@ impl<'a> SemanticExpressionBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dense_checked_index_rejects_duplicate_ids_without_shifting_rows() {
+        let mut index = Vec::new();
+        insert_dense_value(&mut index, 3, 7_u32);
+        assert_eq!(index.get(3).copied().flatten().flatten(), Some(7));
+        assert!(index[..3].iter().all(Option::is_none));
+
+        insert_dense_value(&mut index, 3, 9_u32);
+        assert_eq!(index.get(3), Some(&Some(None)));
+        insert_dense_value(&mut index, 1, 5_u32);
+        assert_eq!(index.get(1).copied().flatten().flatten(), Some(5));
+    }
 
     #[test]
     fn contextual_delimiter_materializes_the_checked_collection_kind() {

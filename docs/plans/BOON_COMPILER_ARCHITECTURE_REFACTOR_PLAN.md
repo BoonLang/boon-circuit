@@ -4022,6 +4022,51 @@ complete compiler.
 The next migration is architecture-first, but production changes only in one
 checker-wide flag day:
 
+The next semantic prerequisite cut removes two accidental costs before adding
+definition-owned semantic templates. Runtime type-variable erasure now has one
+copy-on-change implementation in `boon_checked`; closed shared object, variant,
+and nested type terms retain their allocation identity instead of being rebuilt
+independently by semantic and IR consumers. Semantic checked-row access is now
+dense and ambiguity-aware: expression, statement, declaration, scope, call,
+callable, list, source, and state IDs index sealed vectors directly, while an
+impossible duplicate ID poisons that slot instead of shifting later rows. OUT
+construction likewise pre-indexes function owners and statement children and
+uses dense expression/scope access. It no longer scans all 15,650 expressions
+and up to 4,993 scopes repeatedly while constructing 3,494 NovyWave call
+instances.
+
+The debug probe moved from 16,346.049 ms total and 7,401.199 ms semantic work
+at the start of this cut to 14,874.672 ms total and 5,719.660 ms semantic work.
+Its OUT phase fell from 1,221.643 ms to 321.268 ms and contextual execution
+construction from 1,353.200 ms to 884.052 ms. The accepted fresh optimized
+no-rebuild sample is 695.182 ms diagnostics and 2,868.009 ms verified at
+561,064 KiB peak RSS. Verified compilation contains 1,060.620 ms checking,
+1,198.067 ms semantic construction, 385.513 ms backend construction, and
+0.660 ms WHERE verification. Relative to the preceding accepted 3,337.204 ms
+receipt, verified compilation is 14.1% faster and semantic construction is
+23.9% faster. WHERE is 0.023% of the optimized verified path and remains a
+measured invariant, not an optimization target. The affected optimized Rust
+rebuild took 5 minutes 8 seconds and peaked at 1,900,060 KiB; it is excluded
+from Boon execution latency.
+
+The compiler package remains green with 81 active library tests, one
+intentional large ignored probe, and all 16 integration tests. The kernel
+dependency firewall also passes. Six full `boon_semantic` library tests and one
+`boon_ir` cyclic-list test remain red; direct execution of the August 12 test
+binaries produces the same failures, so they are recorded as pre-existing
+semantic authority debt rather than attributed to this cut. They must be fixed
+as one bounded cyclic/resource-authority tranche, not one serialized failure at
+a time.
+
+This is still a prerequisite, not completion of the definition-artifact step.
+The next largest cut is to make each checked definition publish one normalized
+semantic execution template and compact call-reachability table, then make OUT
+and contextual expansion consume those templates without walking rich checked
+rows again. The template contract belongs at the stable `boon_checked` handoff
+boundary; `boon_semantic` must not depend upward on
+`boon_compiler_kernel`. Once parity holds, delete the corresponding ordinary-
+body scans and retained overlay reconstruction in the same tranche.
+
 1. Finish `DefinitionArtifact` from the dependency bottom upward: declaration
    and lexical-binding identities first, then HOLD state, persistent LIST, and
    SOURCE resource rows. Reuse the existing dense expression and statement

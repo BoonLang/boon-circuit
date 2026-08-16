@@ -309,6 +309,139 @@ impl<'de> Deserialize<'de> for SharedObjectShape {
     }
 }
 
+/// Returns whether a checked type still contains a definition-local runtime
+/// type variable.
+///
+/// Runtime images cannot retain these ordinals: each callable/checker frame
+/// owns an independent variable namespace.  Keeping this predicate beside the
+/// checked type algebra gives every later phase one definition of that
+/// boundary instead of open-coding recursive walks.
+pub fn runtime_type_contains_var(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => true,
+        Type::List(item) | Type::Set(item) => runtime_type_contains_var(item),
+        Type::Map { key, value } => {
+            runtime_type_contains_var(key) || runtime_type_contains_var(value)
+        }
+        Type::Union(members) => members.iter().any(runtime_type_contains_var),
+        Type::Function { args, result } => {
+            args.iter().any(runtime_type_contains_var) || runtime_type_contains_var(&result.ty)
+        }
+        Type::Object(shape) => shape.fields.values().any(runtime_type_contains_var),
+        Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+            Variant::Tag(_) => false,
+            Variant::Tagged { fields, .. } => fields.fields.values().any(runtime_type_contains_var),
+        }),
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown => false,
+    }
+}
+
+/// Canonicalizes a checked type for the runtime namespace.
+///
+/// Every definition-local [`Type::Var`] becomes [`Type::Unknown`].  The walk
+/// is copy-on-change: closed object, collection, and variant subtrees retain
+/// their existing `Arc` identities instead of being recursively rebuilt on
+/// every semantic occurrence.
+pub fn erase_runtime_type_vars(ty: &Type) -> Type {
+    erase_runtime_type_vars_inner(ty).unwrap_or_else(|| ty.clone())
+}
+
+fn erase_runtime_type_vars_inner(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Var(_) => Some(Type::Unknown),
+        Type::List(item) => {
+            erase_runtime_type_vars_inner(item).map(|item| Type::List(Type::shared(item)))
+        }
+        Type::Set(item) => {
+            erase_runtime_type_vars_inner(item).map(|item| Type::Set(Type::shared(item)))
+        }
+        Type::Map { key, value } => {
+            let changed_key = erase_runtime_type_vars_inner(key);
+            let changed_value = erase_runtime_type_vars_inner(value);
+            (changed_key.is_some() || changed_value.is_some()).then(|| Type::Map {
+                key: Box::new(changed_key.unwrap_or_else(|| key.as_ref().clone())),
+                value: Box::new(changed_value.unwrap_or_else(|| value.as_ref().clone())),
+            })
+        }
+        Type::Function { args, result } => {
+            let mut changed_args = None;
+            for (index, argument) in args.iter().enumerate() {
+                if let Some(argument) = erase_runtime_type_vars_inner(argument) {
+                    changed_args.get_or_insert_with(|| args.clone())[index] = argument;
+                }
+            }
+            let changed_result = erase_runtime_type_vars_inner(&result.ty);
+            (changed_args.is_some() || changed_result.is_some()).then(|| Type::Function {
+                args: changed_args.unwrap_or_else(|| args.clone()),
+                result: Box::new(FlowType {
+                    mode: result.mode,
+                    ty: changed_result.unwrap_or_else(|| result.ty.clone()),
+                }),
+            })
+        }
+        Type::Object(shape) => erase_runtime_object_shape(shape).map(Type::Object),
+        Type::VariantSet(variants) => {
+            let mut changed_variants = None;
+            for (index, variant) in variants.iter().enumerate() {
+                let Variant::Tagged { tag, fields } = variant else {
+                    continue;
+                };
+                if let Some(fields) = erase_runtime_object_shape(fields) {
+                    changed_variants.get_or_insert_with(|| variants.as_ref().clone())[index] =
+                        Variant::Tagged {
+                            tag: tag.clone(),
+                            fields,
+                        };
+                }
+            }
+            changed_variants.map(|variants| Type::VariantSet(variants.into()))
+        }
+        Type::Union(members) => {
+            let mut changed_members = None;
+            for (index, member) in members.iter().enumerate() {
+                if let Some(member) = erase_runtime_type_vars_inner(member) {
+                    changed_members.get_or_insert_with(|| members.clone())[index] = member;
+                }
+            }
+            changed_members.map(Type::Union)
+        }
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown => None,
+    }
+}
+
+fn erase_runtime_object_shape(shape: &SharedObjectShape) -> Option<SharedObjectShape> {
+    let mut changed_fields = None;
+    for (name, field) in &shape.fields {
+        if let Some(field) = erase_runtime_type_vars_inner(field) {
+            changed_fields
+                .get_or_insert_with(|| shape.fields.clone())
+                .insert(name.clone(), field);
+        }
+    }
+    changed_fields.map(|fields| {
+        ObjectShape {
+            fields,
+            field_order: shape.field_order.clone(),
+            open: shape.open,
+        }
+        .into()
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TypeDisplayNode {
@@ -3490,6 +3623,46 @@ mod tests {
             &stable_shape,
             substituted_stable_shape
         ));
+    }
+
+    #[test]
+    fn runtime_type_erasure_reuses_closed_shared_subtrees() {
+        let stable_shape = SharedObjectShape::new(ObjectShape::from_ordered_fields(
+            [("label".to_owned(), Type::Text)],
+            false,
+        ));
+        let closed = Type::Object(stable_shape.clone());
+        let Type::Object(closed_erased) = erase_runtime_type_vars(&closed) else {
+            panic!("closed runtime type must remain an object");
+        };
+        assert!(SharedObjectShape::ptr_eq(&stable_shape, &closed_erased));
+        assert!(!runtime_type_contains_var(&closed));
+
+        let root_shape = SharedObjectShape::new(ObjectShape::from_ordered_fields(
+            [
+                ("value".to_owned(), Type::Var(TypeVar(7))),
+                ("stable".to_owned(), Type::Object(stable_shape.clone())),
+            ],
+            false,
+        ));
+        let root = Type::List(Type::shared(Type::Object(root_shape.clone())));
+        assert!(runtime_type_contains_var(&root));
+        let Type::List(erased_item) = erase_runtime_type_vars(&root) else {
+            panic!("runtime erasure must preserve collection shape");
+        };
+        let Type::Object(erased_shape) = erased_item.as_ref() else {
+            panic!("runtime erasure must preserve object item shape");
+        };
+        assert!(!SharedObjectShape::ptr_eq(&root_shape, erased_shape));
+        assert_eq!(erased_shape.fields.get("value"), Some(&Type::Unknown));
+        let Some(Type::Object(erased_stable_shape)) = erased_shape.fields.get("stable") else {
+            panic!("stable field must remain an object");
+        };
+        assert!(SharedObjectShape::ptr_eq(
+            &stable_shape,
+            erased_stable_shape
+        ));
+        assert!(!runtime_type_contains_var(&Type::List(erased_item)));
     }
 
     #[test]

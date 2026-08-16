@@ -55,7 +55,8 @@ pub const MAX_BUNDLE_SEMANTIC_CALL_CROSSING_BYTES_V1: usize = 32 * 1024 * 1024;
 pub const MAX_BUNDLE_SEMANTIC_VALUE_CROSSINGS_V1: usize = 16_384;
 pub const MAX_BUNDLE_SEMANTIC_VALUE_CROSSING_BYTES_V1: usize = 32 * 1024 * 1024;
 const SEMANTIC_PROGRAM_DIGEST_DOMAIN: &[u8] = b"boon.semantic-program.v1\0";
-const CANONICAL_PROGRAM_CORE_DIGEST_DOMAIN: &[u8] = b"boon.canonical-program-core.v2\0";
+const CANONICAL_PROGRAM_CORE_RECEIPT_DOMAIN_V1: &[u8] =
+    b"boon.canonical-program-core-construction-receipt.v1\0";
 const BUNDLE_SEMANTIC_PROGRAM_DIGEST_DOMAIN: &[u8] = b"boon.bundle-semantic-program.v1\0";
 const OUT_PORT_SHAPE_DIGEST_DOMAIN: &[u8] = b"boon.out-port-shape.v1\0";
 const PRODUCER_MATERIALIZATION_IDENTITY_DOMAIN: &[u8] =
@@ -5562,6 +5563,167 @@ fn runtime_type_contains_var(ty: &boon_checked::Type) -> bool {
     }
 }
 
+#[derive(Serialize)]
+struct CanonicalProgramCoreShapeReceiptV1 {
+    executable_expressions: usize,
+    executable_statements: usize,
+    executable_sources: usize,
+    executable_states: usize,
+    executable_roots: usize,
+    executable_functions: usize,
+    executable_ordinary_functions: usize,
+    executable_call_occurrences: usize,
+    scope_owners: usize,
+    scope_locals: usize,
+    scope_fields: usize,
+    scope_bindings: usize,
+    scope_sources: usize,
+    scope_reads: usize,
+    scope_row_values: usize,
+    scope_row_source_projections: usize,
+    scope_dependencies: usize,
+    expression_count: usize,
+    distributed_value_references: usize,
+    distributed_calls: usize,
+    producer_function_instances: usize,
+    debug_source_units: usize,
+    debug_fields: usize,
+    graph_node_count: usize,
+    sources: usize,
+    host_ports: usize,
+    state_cells: usize,
+    activations: usize,
+    pulse_batches: usize,
+    lists: usize,
+    semantic_memory: usize,
+    migration_edges: usize,
+    transient_collections: usize,
+    output_values: usize,
+    derived_values: usize,
+    dependencies: usize,
+    state_update_arms: usize,
+    host_effect_schedules: usize,
+    list_mutations: usize,
+    list_projections: usize,
+    materializations: usize,
+    view_bindings: usize,
+    named_value_interfaces: usize,
+}
+
+/// Compact proof that the canonical core was produced from the already-sealed
+/// semantic domains.
+///
+/// The complete core used to be serialized again here after execution,
+/// resources, reactivity, lowering, storage, view, and memory had each already
+/// published an exact construction receipt. Under a fixed lowering domain the
+/// core is a deterministic projection of those receipts. Retain exact output
+/// cardinalities to fail closed on incomplete construction without rebuilding
+/// a second rich byte image. The exhaustive destructuring deliberately makes a
+/// future core/table field a compile error until this receipt is extended.
+fn canonical_program_core_shape_receipt_v1(
+    core: &program_core::CanonicalProgramCoreV2,
+) -> CanonicalProgramCoreShapeReceiptV1 {
+    let program_core::CanonicalProgramCoreV2 {
+        executable,
+        scope_index,
+        expression_count,
+        distributed_references,
+        producer_function_instances,
+        debug_source_units,
+        debug_fields,
+        graph_node_count,
+        sources,
+        host_ports,
+        state_cells,
+        activations,
+        pulse_batches,
+        lists,
+        semantic_memory,
+        migration_edges,
+        transient_collections,
+        output_values,
+        derived_values,
+        dependencies,
+        state_update_arms,
+        host_effect_schedules,
+        list_mutations,
+        list_projections,
+        materializations,
+        view_bindings,
+        named_value_interfaces,
+    } = core;
+    let program_core::ExecutableProgram {
+        expressions,
+        statements,
+        sources: executable_sources,
+        states: executable_states,
+        roots,
+        functions,
+        ordinary_functions,
+        call_occurrences,
+    } = executable;
+    let program_core::ErasedScopeIndex {
+        owners,
+        locals,
+        fields,
+        bindings,
+        sources: scope_sources,
+        reads,
+        row_values,
+        row_source_projections,
+        dependencies: scope_dependencies,
+    } = scope_index;
+    let program_core::DistributedReferences {
+        value_references,
+        calls,
+    } = distributed_references;
+    CanonicalProgramCoreShapeReceiptV1 {
+        executable_expressions: expressions.len(),
+        executable_statements: statements.len(),
+        executable_sources: executable_sources.len(),
+        executable_states: executable_states.len(),
+        executable_roots: roots.len(),
+        executable_functions: functions.len(),
+        executable_ordinary_functions: ordinary_functions.len(),
+        executable_call_occurrences: call_occurrences.len(),
+        scope_owners: owners.len(),
+        scope_locals: locals.len(),
+        scope_fields: fields.len(),
+        scope_bindings: bindings.len(),
+        scope_sources: scope_sources.len(),
+        scope_reads: reads.len(),
+        scope_row_values: row_values.len(),
+        scope_row_source_projections: row_source_projections.len(),
+        scope_dependencies: scope_dependencies.len(),
+        expression_count: *expression_count,
+        distributed_value_references: value_references.len(),
+        distributed_calls: calls.len(),
+        producer_function_instances: producer_function_instances.len(),
+        debug_source_units: debug_source_units.len(),
+        debug_fields: debug_fields.len(),
+        graph_node_count: *graph_node_count,
+        sources: sources.len(),
+        host_ports: host_ports.len(),
+        state_cells: state_cells.len(),
+        activations: activations.len(),
+        pulse_batches: pulse_batches.len(),
+        lists: lists.len(),
+        semantic_memory: semantic_memory.len(),
+        migration_edges: migration_edges.len(),
+        transient_collections: transient_collections.len(),
+        output_values: output_values.len(),
+        derived_values: derived_values.len(),
+        dependencies: dependencies.len(),
+        state_update_arms: state_update_arms.len(),
+        host_effect_schedules: host_effect_schedules.len(),
+        list_mutations: list_mutations.len(),
+        list_projections: list_projections.len(),
+        materializations: materializations.len(),
+        view_bindings: view_bindings.len(),
+        named_value_interfaces: named_value_interfaces.len(),
+    }
+}
+
 fn semantic_program_digest(
     program: &SemanticProgram,
 ) -> Result<SemanticProgramDigestV1, SemanticError> {
@@ -5571,12 +5733,18 @@ fn semantic_program_digest(
         source_bundle_digest_v1: SourceBundleDigestV1,
         checked_program_digest: CheckedProgramDigestV1,
         component_digests: &'a CallableDependencyComponentDigestsV1,
+        // Canonical-core ownership join. The digest is folded from the
+        // construction-owned domain receipts and exact output shape below.
         canonical_core_digest: [u8; 32],
         dependency_manifest_digest: CallableDependencyManifestDigestV1,
     }
-    let canonical_core_digest = canonical_hash(
-        CANONICAL_PROGRAM_CORE_DIGEST_DOMAIN,
-        &program.canonical_core,
+    let canonical_core_receipt_digest = canonical_hash(
+        CANONICAL_PROGRAM_CORE_RECEIPT_DOMAIN_V1,
+        &(
+            program.semantic_image.seal_digest(),
+            &program.dependency_manifest.component_digests,
+            canonical_program_core_shape_receipt_v1(&program.canonical_core),
+        ),
     )?;
     Ok(SemanticProgramDigestV1(canonical_hash(
         SEMANTIC_PROGRAM_DIGEST_DOMAIN,
@@ -5585,7 +5753,7 @@ fn semantic_program_digest(
             source_bundle_digest_v1: program.source_bundle_digest_v1,
             checked_program_digest: program.dependency_manifest.checked_program_digest,
             component_digests: &program.dependency_manifest.component_digests,
-            canonical_core_digest,
+            canonical_core_digest: canonical_core_receipt_digest,
             dependency_manifest_digest: program.dependency_manifest.manifest_digest,
         },
     )?))
@@ -8021,6 +8189,26 @@ result: mapped(value: 0)
         let error = semantic
             .validate()
             .expect_err("mutated resolved graph must invalidate semantic digest");
+        assert!(
+            error
+                .to_string()
+                .contains("semantic program digest does not match"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn semantic_digest_binds_the_canonical_core_shape_receipt() {
+        let (checked, _, _) = wrapped_out_contract_fixture();
+        let mut semantic = elaborate(checked, &[]).unwrap();
+        semantic
+            .canonical_core
+            .debug_source_units
+            .pop()
+            .expect("fixture has one construction-owned debug source unit");
+        let error = semantic
+            .validate()
+            .expect_err("mutated core shape must invalidate its construction receipt");
         assert!(
             error
                 .to_string()

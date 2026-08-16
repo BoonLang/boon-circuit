@@ -1511,6 +1511,26 @@ Manifest still re-registers 61,844 checked and 31,225 execution receipts in a
 new projection index, and its 7,980-node request graph is still sealed after
 the executable image already owns the relevant construction routes.
 
+The next deletion checkpoint removes the post-hoc full
+`CanonicalProgramCoreV2` serialization. The semantic-program identity now
+folds a versioned canonical-core construction receipt from the sealed semantic
+image, the already-complete component receipts, and an exhaustive fixed-size
+cardinality record for every canonical-core, executable, and scope-index
+table. Exhaustive Rust destructuring makes a future table addition fail to
+compile until the receipt is extended. The canonical core remains immutable
+and non-forgeable outside semantic construction, while the public integrity
+gate still joins its exact construction domains and output shape.
+
+On the optimized NovyWave oracle the semantic-program digest falls from
+107.595 ms to 0.041 ms. Semantic construction falls from 1,764.088 ms to
+1,657.620 ms, and verified compilation from 3,794.617 ms to 3,704.466 ms;
+WHERE verification is 1.266 ms. The debug digest is 0.105 ms. The architecture
+gate, the two focused semantic digest mutation tests, all 107 active compiler
+library tests, and the exact verified NovyWave oracle pass. The six currently
+failing `boon_semantic --lib` fixtures were reproduced unchanged in an
+isolated worktree at the preceding `578deede` checkpoint, so they are tracked
+as pre-existing semantic test debt rather than attributed to this cut.
+
 ### Sixth Whole-System Audit: One Persistent Definition-to-Runnable Graph
 
 The construction-route work is a prerequisite, but it is not the final

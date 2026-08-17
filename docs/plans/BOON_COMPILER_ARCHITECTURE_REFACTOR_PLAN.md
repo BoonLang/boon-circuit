@@ -4810,6 +4810,47 @@ the work below completes the checker authority that will eventually produce the
 resource/storage templates directly. It must not add another semantic DTO
 underneath the old passes or delay the measured resource/storage deletion above.
 
+### Definition-Owned Resource Occurrence Publication (2026-08-17)
+
+The first resource-template slice is complete, but it is deliberately not
+claimed as the resource/storage speed exit. Each checked definition execution
+template now owns the exact SOURCE, HOLD/state, and persistent LIST identities
+whose expressions belong to that definition. The dense kernel publishes those
+identities beside the dependency-first expression template, and the rich
+checked-model derivation remains an exact differential oracle.
+
+Contextual expression construction now relocates SOURCE and state occurrences
+as rows are appended, including constructor-projection copies, synthesized
+statement-owned states, arena rollback, and arena rebasing. The former
+whole-execution `checked expression -> semantic occurrences` CSR construction
+is `cfg(test)` only. Every parser-backed semantic test compares the direct
+SOURCE/state candidate sets with that replay exactly, while the architecture
+gate rejects production references back to the replay. The definition template
+also validates complete function-local LIST ownership even though list-row
+linking remains in the later resource/storage cut.
+
+The full ignored NovyWave semantic gate and direct-kernel checked-image replay
+parity pass. The final pinned-stable incremental release build took 183.76
+seconds and 1,996,644 KiB peak RSS. The traced
+`source_and_state_inventory` envelope moved only from
+17.865 to 15.591 ms: about 2.3 ms, because exact instance selection, statement
+repair, lifetime derivation, resource-ID remapping, and rich resource/storage
+construction still run afterward. Three fresh diagnostics observations have a
+740.453 ms median; five cooled fresh verified observations have a 2,817.633 ms
+median, 1,076.352 ms semantic construction, 0.568 ms WHERE verification, and
+357,996 KiB median peak RSS. This is statistically flat/slower than the preceding
+728.360/2,730.229 ms checkpoint, so no end-to-end performance improvement is
+claimed. All observations have zero diagnostics and the unchanged MachinePlan
+digest `e2d673e3116f03622731f695cf2fb598d3313077845013f776930d38cc2acbea`.
+
+This measurement closes the temptation to keep polishing the occurrence
+index. The next tranche must use the published template plus compact invocation
+frames to construct the final resource and symbolic row-storage rows, then
+delete `exact_resource_instance_expression`, late resource-statement repair,
+rich resource/storage reconstruction, storage Manifest inventory, and their
+canonical-core remapping together. Merely adding another occurrence cache or
+moving one of those walks is rejected.
+
 1. Finish `DefinitionArtifact` from the dependency bottom upward: declaration
    and lexical-binding identities first, then HOLD state, persistent LIST, and
    SOURCE resource rows. Reuse the existing dense expression and statement

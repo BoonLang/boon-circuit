@@ -1539,7 +1539,10 @@ impl<'ast> Visit<'ast> for ProductionIdentifierReferenceCollector<'_> {
 
 fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), String> {
     let ir_path = workspace.join("crates/boon_ir/src/lib.rs");
+    let checked_path = workspace.join("crates/boon_checked/src/lib.rs");
     let semantic_path = workspace.join("crates/boon_semantic/src/lib.rs");
+    let contextual_expansion_path =
+        workspace.join("crates/boon_semantic/src/contextual_expansion.rs");
     let lowering_path = workspace.join("crates/boon_semantic/src/core_lowering.rs");
     let semantic_image_path = workspace.join("crates/boon_semantic/src/semantic_image.rs");
     let reactive_path = workspace.join("crates/boon_semantic/src/reactive.rs");
@@ -1564,7 +1567,9 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     }
 
     let ir = read_text(&ir_path)?;
+    let checked = read_text(&checked_path)?;
     let semantic = read_text(&semantic_path)?;
+    let contextual_expansion = read_text(&contextual_expansion_path)?;
     let lowering = read_text(&lowering_path)?;
     let semantic_image = read_text(&semantic_image_path)?;
     let reactive = read_text(&reactive_path)?;
@@ -1582,6 +1587,12 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         .map_err(|error| format!("cannot parse `{}`: {error}", reactive_path.display()))?;
     let semantic_syntax = syn::parse_file(&semantic)
         .map_err(|error| format!("cannot parse `{}`: {error}", semantic_path.display()))?;
+    let contextual_expansion_syntax = syn::parse_file(&contextual_expansion).map_err(|error| {
+        format!(
+            "cannot parse `{}`: {error}",
+            contextual_expansion_path.display()
+        )
+    })?;
     let resource_syntax = syn::parse_file(&resource)
         .map_err(|error| format!("cannot parse `{}`: {error}", resource_path.display()))?;
     let storage_syntax = syn::parse_file(&storage)
@@ -1902,6 +1913,38 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
                 ));
             }
         }
+    }
+    for required in [
+        "pub sources: Vec<CheckedSourceId>",
+        "pub states: Vec<CheckedStateId>",
+        "pub lists: Vec<CheckedListId>",
+    ] {
+        if !checked.contains(required) {
+            return Err(format!(
+                "checked definition template omits resource ownership field `{required}`"
+            ));
+        }
+    }
+    for required in [
+        "resource_occurrences: Vec<CheckedResourceOccurrence>",
+        "construction-published SOURCE {} occurrences differ from the checked-expression replay oracle",
+        "construction-published state {} occurrences differ from the checked-expression replay oracle",
+        "#[cfg(test)]\nfn semantic_expression_occurrences_by_checked(",
+    ] {
+        if !contextual_expansion.contains(required) {
+            return Err(format!(
+                "semantic resource occurrence publication omits direct/replay proof `{required}`"
+            ));
+        }
+    }
+    let mut resource_occurrence_replay_references =
+        ProductionIdentifierReferenceCollector::new("semantic_expression_occurrences_by_checked");
+    resource_occurrence_replay_references.visit_file(&contextual_expansion_syntax);
+    if !resource_occurrence_replay_references.references.is_empty() {
+        return Err(format!(
+            "production contextual expansion replays checked resource occurrences at {:?}",
+            resource_occurrence_replay_references.references,
+        ));
     }
     for required in [
         "#[cfg(test)]\nfn semantic_storage_scopes_epoch_replay_oracle",

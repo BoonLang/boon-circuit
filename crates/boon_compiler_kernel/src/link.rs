@@ -1618,12 +1618,30 @@ impl KernelCheckedLinkLayout {
             }
             calls.sort_unstable_by_key(|call| call.0);
             calls.dedup();
+            let sources = definition
+                .sources
+                .iter()
+                .map(|source| self.source(owner, source.id.0))
+                .collect::<Result<Vec<_>, _>>()?;
+            let states = definition
+                .states
+                .iter()
+                .map(|state| self.state(owner, state.id.0))
+                .collect::<Result<Vec<_>, _>>()?;
+            let lists = definition
+                .lists
+                .iter()
+                .map(|list| self.list(owner, list.id.0))
+                .collect::<Result<Vec<_>, _>>()?;
             templates.push(CheckedDefinitionExecutionTemplateV1 {
                 schema: CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1.to_owned(),
                 callable,
                 result: self.expression(owner, KernelValueReference::Local(result))?,
                 nodes,
                 calls,
+                sources,
+                states,
+                lists,
             });
         }
         templates.sort_unstable_by_key(|template| template.callable.0);

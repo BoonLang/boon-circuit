@@ -2500,6 +2500,16 @@ pub struct CheckedDefinitionExecutionTemplateV1 {
     pub result: CheckedExprId,
     pub nodes: Vec<CheckedDefinitionExecutionNodeV1>,
     pub calls: Vec<CheckedCallId>,
+    /// Definition-owned runtime resources. Concrete semantic occurrences
+    /// relocate these compact identities through invocation frames; later
+    /// phases must not rediscover ownership by scanning the completed
+    /// expression arena.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<CheckedSourceId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub states: Vec<CheckedStateId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lists: Vec<CheckedListId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2801,12 +2811,41 @@ pub fn derive_checked_definition_execution_templates_v1(
         }
         calls.sort_unstable_by_key(|call| call.0);
         calls.dedup();
+        let owns_scope = |scope: LexicalScopeId| {
+            scope_index_by_id
+                .get(&scope)
+                .and_then(|index| function_owner_by_scope.get(*index))
+                .copied()
+                .flatten()
+                == Some(callable.decl_id)
+        };
+        let sources = program
+            .sources
+            .iter()
+            .filter(|source| owns_scope(source.owner_scope))
+            .map(|source| source.id)
+            .collect();
+        let states = program
+            .states
+            .iter()
+            .filter(|state| owns_scope(state.owner_scope))
+            .map(|state| state.id)
+            .collect();
+        let lists = program
+            .lists
+            .iter()
+            .filter(|list| owns_scope(list.owner_scope))
+            .map(|list| list.id)
+            .collect();
         templates.push(CheckedDefinitionExecutionTemplateV1 {
             schema: CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1.to_owned(),
             callable: callable.decl_id,
             result,
             nodes,
             calls,
+            sources,
+            states,
+            lists,
         });
     }
     templates.sort_unstable_by_key(|template| template.callable.0);

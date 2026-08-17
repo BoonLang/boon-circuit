@@ -12667,6 +12667,9 @@ fields = [
   { name = "result", disposition = "r-fc-priv-sp-id-n", reviewed = true },
   { name = "nodes", disposition = "r-fc-priv-sp-id-n", reviewed = true },
   { name = "calls", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "sources", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "states", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "lists", disposition = "r-fc-priv-sp-id-n", reviewed = true },
 ]
 
 [[records]]

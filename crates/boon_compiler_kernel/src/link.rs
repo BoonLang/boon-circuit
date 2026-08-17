@@ -323,6 +323,17 @@ pub struct KernelCheckedLinkLayout {
     totals: KernelCheckedLinkTotals,
 }
 
+struct KernelCheckedBaseRows {
+    scopes: Box<[CheckedScope]>,
+    declarations: Vec<CheckedDeclaration>,
+    statements: Box<[CheckedStatement]>,
+    callables: Vec<CheckedCallableSignature>,
+    context_formals: Box<[CheckedContextFormal]>,
+    sources: Box<[CheckedSource]>,
+    states: Box<[CheckedState]>,
+    lists: Box<[CheckedList]>,
+}
+
 impl KernelCheckedLinkLayout {
     pub fn new(
         project: &KernelProjectInput,
@@ -583,19 +594,47 @@ impl KernelCheckedLinkLayout {
         snapshot: &KernelCheckedSnapshot,
         role: ProgramRole,
     ) -> Result<KernelCheckedRows, KernelCheckedLinkError> {
-        let scopes = self.materialize_scopes(snapshot)?;
-        let mut declarations = self.materialize_declarations(snapshot)?.into_vec();
-        let mut expressions = self.materialize_expressions(snapshot)?.into_vec();
-        let mut runtime_flow_terms = self.materialize_runtime_flow_terms(snapshot)?;
-        let statements = self.materialize_statements(snapshot)?;
-        let sources = self.materialize_sources(snapshot)?;
-        let states = self.materialize_states(snapshot)?;
-        let lists = self.materialize_lists(snapshot)?;
-        let (user_callables, context_formals) = self.materialize_user_callables(snapshot, role)?;
-        let mut callables = user_callables.into_vec();
-        let (abi_callables, abi_declarations) = self.materialize_abi_callables(project.abi())?;
-        callables.extend(abi_callables);
-        declarations.extend(abi_declarations);
+        let materialize_expression_rows = || {
+            Ok::<_, KernelCheckedLinkError>((
+                self.materialize_expressions(snapshot)?.into_vec(),
+                self.materialize_runtime_flow_terms(snapshot)?,
+            ))
+        };
+        #[cfg(not(target_family = "wasm"))]
+        let (base, (mut expressions, mut runtime_flow_terms)) = if self.totals.expressions >= 4096
+            && std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() >= 2)
+        {
+            std::thread::scope(|scope| {
+                let expression_worker = scope.spawn(materialize_expression_rows);
+                let base = self.materialize_base_rows(project, snapshot, role)?;
+                let expressions = expression_worker.join().map_err(|_| {
+                    KernelCheckedLinkError::new(
+                        "kernel checked expression materialization worker panicked",
+                    )
+                })??;
+                Ok::<_, KernelCheckedLinkError>((base, expressions))
+            })?
+        } else {
+            (
+                self.materialize_base_rows(project, snapshot, role)?,
+                materialize_expression_rows()?,
+            )
+        };
+        #[cfg(target_family = "wasm")]
+        let (base, (mut expressions, mut runtime_flow_terms)) = (
+            self.materialize_base_rows(project, snapshot, role)?,
+            materialize_expression_rows()?,
+        );
+        let KernelCheckedBaseRows {
+            scopes,
+            declarations,
+            statements,
+            callables,
+            context_formals,
+            sources,
+            states,
+            lists,
+        } = base;
         let (calls, call_occurrences) =
             self.materialize_calls(project, snapshot, &callables, &declarations)?;
         let call_result_paths =
@@ -658,6 +697,35 @@ impl KernelCheckedLinkLayout {
             runtime_flow_terms,
             occurrences,
             occurrence_ranges,
+        })
+    }
+
+    fn materialize_base_rows(
+        &self,
+        project: &KernelProjectInput,
+        snapshot: &KernelCheckedSnapshot,
+        role: ProgramRole,
+    ) -> Result<KernelCheckedBaseRows, KernelCheckedLinkError> {
+        let scopes = self.materialize_scopes(snapshot)?;
+        let mut declarations = self.materialize_declarations(snapshot)?.into_vec();
+        let statements = self.materialize_statements(snapshot)?;
+        let sources = self.materialize_sources(snapshot)?;
+        let states = self.materialize_states(snapshot)?;
+        let lists = self.materialize_lists(snapshot)?;
+        let (user_callables, context_formals) = self.materialize_user_callables(snapshot, role)?;
+        let mut callables = user_callables.into_vec();
+        let (abi_callables, abi_declarations) = self.materialize_abi_callables(project.abi())?;
+        callables.extend(abi_callables);
+        declarations.extend(abi_declarations);
+        Ok(KernelCheckedBaseRows {
+            scopes,
+            declarations,
+            statements,
+            callables,
+            context_formals,
+            sources,
+            states,
+            lists,
         })
     }
 

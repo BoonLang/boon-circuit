@@ -4672,6 +4672,44 @@ execution construction (179.451 ms), and resource-authority normalization
 (78.500 ms). Moving those owners, not adding more threads or switching Rust
 toolchains, is the route to a materially lower NovyWave total.
 
+### Deterministic Checked-Row Projection (2026-08-17)
+
+The direct kernel-to-`boon_checked` linker had one further graph-proven
+independent region after definition publication. Expression rows and their
+runtime-flow-term projection depend only on the immutable checked snapshot and
+final prefix layout; scopes, declarations, statements, callable signatures,
+and resource rows do not consume them. Large native images now build those two
+regions in exactly two scoped workers, join them before call/result/resource
+projection, and preserve the original dense row order. Projects below 4,096
+expressions, single-CPU hosts, and Wasm stay serial. This is bounded wall-time
+overlap, not a second checked authority or a substitute for the later direct
+semantic-artifact cut.
+
+The release trace now exposes the formerly opaque checker owners. On the same
+NovyWave image, component convergence is about 274 ms; definition artifact
+construction about 131 ms; dependency/currentness receipts about 72 ms; and
+the pre-cut rich checked-row materializer about 131 ms. Three warm pinned-
+stable runs after the row split have a 105.352 ms median row-materialization
+phase and 121.786 ms complete link-layout median. A one-CPU directional run
+records 141.345 ms and 158.501 ms respectively, so the bounded overlap removes
+roughly 36 ms from that row phase on this host. The three complete verified
+runs have medians of 2,833.169 ms total, 1,173.027 ms checking, 1,068.795 ms
+semantic construction, 0.607 ms WHERE verification, 359.333 ms backend
+construction, and 77.640 ms plan verification. Kernel 107/107, semantic
+178/178 with two intentional ignores, the architecture gate, and every fresh
+MachinePlan verification pass.
+
+The OUT trace's 1,957,896 `cumulative_substitutions` count is deliberately a
+logical ancestry-work metric, not retained storage. Production already owns
+only 5,061 local substitutions in parent-linked invocation frames and applies
+them in one structural walk. Replacing that representation or caching every
+ancestor environment would recreate the quadratic memory the plan forbids.
+The next structural cut therefore remains definition-owned semantic execution
+and proof construction: consume compact definition fragments plus invocation
+overlays directly, then delete the rich occurrence reconstruction and
+retrospective fold owners. Parallel projection is accepted as a small real
+improvement, but it does not satisfy that deletion gate.
+
 The concurrent checker-kernel track remains the first half of the same
 definition-artifact design. Checked/execution receipt replay is already deleted;
 the work below completes the checker authority that will eventually produce the

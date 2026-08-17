@@ -1223,15 +1223,22 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                 solve_us = graph_solve_us.saturating_add(checked_image_us);
                 checked.and_then(|checked| {
                     let checked_link_started = Instant::now();
+                    let checked_link_trace =
+                        std::env::var_os("BOON_KERNEL_TRACE").is_some();
                     let kernel_input = input
                         .as_ref()
                         .expect("a solved kernel graph retains its immutable input");
+                    let layout_started = Instant::now();
                     let layout = KernelCheckedLinkLayout::new(kernel_input, &checked)
                         .map_err(|error| error.to_string())?;
+                    let layout_us = elapsed_us(layout_started.elapsed());
                     checked_link_references = layout.totals().resolved_references;
+                    let rows_started = Instant::now();
                     let mut rows = layout
                         .materialize_rows(kernel_input, &checked, role)
                         .map_err(|error| error.to_string())?;
+                    let rows_us = elapsed_us(rows_started.elapsed());
+                    let rebase_started = Instant::now();
                     for definition in layout.definitions() {
                         let key = kernel_input
                             .links()
@@ -1258,7 +1265,14 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                             source.start_line,
                             source.start_byte,
                         )
-                        .map_err(|error| error.to_string())?;
+                            .map_err(|error| error.to_string())?;
+                    }
+                    if checked_link_trace {
+                        eprintln!(
+                            "kernel-checked-link-detail layout_us={layout_us} rows_us={rows_us} rebase_us={} total_us={}",
+                            elapsed_us(rebase_started.elapsed()),
+                            elapsed_us(checked_link_started.elapsed()),
+                        );
                     }
                     let materialized_scopes = rows.scopes;
                     let materialized_declarations = rows.declarations;

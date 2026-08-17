@@ -29,6 +29,7 @@ use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct KernelExpressionId(pub u32);
@@ -2584,9 +2585,15 @@ impl KernelProjectSolveSession {
     }
 
     pub(crate) fn finish_graph(self) -> Result<KernelSolvedProject, KernelSolveError> {
+        let trace = std::env::var_os("BOON_KERNEL_TRACE").is_some();
+        let solve_started = Instant::now();
         let artifact = self.component.solve_all()?;
+        let solve_us = solve_started.elapsed().as_micros();
+        let public_results_started = Instant::now();
         let public_results = project_public_results(&self.owners, &artifact);
         let public_formals = project_public_formals(&self.owners, &artifact);
+        let public_results_us = public_results_started.elapsed().as_micros();
+        let call_facts_started = Instant::now();
         let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
             &self.owners,
             &artifact,
@@ -2594,6 +2601,12 @@ impl KernelProjectSolveSession {
             &public_formals,
             true,
         );
+        if trace {
+            eprintln!(
+                "kernel-solve-detail component_us={solve_us} public_interfaces_us={public_results_us} call_facts_us={}",
+                call_facts_started.elapsed().as_micros(),
+            );
+        }
         Ok(KernelSolvedProject {
             artifact,
             owners: self.owners,
@@ -2621,10 +2634,19 @@ impl KernelSolvedProject {
     }
 
     pub fn into_checked_snapshot(self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
+        let trace = std::env::var_os("BOON_KERNEL_TRACE").is_some();
+        let total_started = Instant::now();
+        let interface_started = Instant::now();
         let diagnostic_values = self.interface_snapshot().diagnostic_values;
+        let interface_us = interface_started.elapsed().as_micros();
+        let effects_started = Instant::now();
         let owner_effects = project_owner_effect_summaries(&self.owners);
+        let effects_us = effects_started.elapsed().as_micros();
+        let flush_started = Instant::now();
         let expression_flush_types =
             project_expression_flush_types(&self.owners, &self.artifact, &self.public_results);
+        let flush_us = flush_started.elapsed().as_micros();
+        let preparation_started = Instant::now();
         let basis_fingerprints = self
             .owners
             .iter()
@@ -2657,6 +2679,8 @@ impl KernelSolvedProject {
                 },
             )
             .collect::<Vec<_>>();
+        let preparation_us = preparation_started.elapsed().as_micros();
+        let definitions_started = Instant::now();
         let definitions = materialize_project_definitions(
             materializations,
             &self.artifact,
@@ -2664,8 +2688,17 @@ impl KernelSolvedProject {
             &self.public_formals,
             &owner_effects,
         )?;
+        let definitions_us = definitions_started.elapsed().as_micros();
+        let receipts_started = Instant::now();
         let (dependencies, currentness) =
             build_normalized_snapshot_receipts(&definitions, &basis_fingerprints)?;
+        let receipts_us = receipts_started.elapsed().as_micros();
+        if trace {
+            eprintln!(
+                "kernel-checked-detail interface_us={interface_us} effects_us={effects_us} flush_us={flush_us} preparation_us={preparation_us} definitions_us={definitions_us} receipts_us={receipts_us} total_us={}",
+                total_started.elapsed().as_micros(),
+            );
+        }
         Ok(KernelCheckedSnapshot {
             definitions,
             diagnostic_values,

@@ -742,6 +742,7 @@ fn run_sample_batch(
     let output = Command::new(producer)
         .current_dir(workspace)
         .env("RAYON_NUM_THREADS", "1")
+        .env_remove("BOON_KERNEL_EXPERIMENTAL_PARALLEL")
         .args([
             "compiler-sample",
             source,

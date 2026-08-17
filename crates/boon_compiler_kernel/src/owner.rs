@@ -2800,7 +2800,8 @@ fn materialize_project_definitions(
     // before dependency/currentness sealing. Small projects stay serial so a
     // thread launch cannot dominate interactive checks.
     #[cfg(not(target_family = "wasm"))]
-    if materializations.len() >= 64
+    if crate::experimental_parallel_projection_enabled()
+        && materializations.len() >= 64
         && std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() >= 2)
     {
         let right = materializations.split_off(materializations.len() / 2);

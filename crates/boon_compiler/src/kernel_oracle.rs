@@ -2357,8 +2357,13 @@ pub(crate) fn checked_construction_from_kernel(
     project: &ProjectSyntaxSnapshot,
     role: boon_checked::ProgramRole,
 ) -> Result<KernelCheckedConstruction, String> {
+    let trace = std::env::var_os("BOON_KERNEL_TRACE").is_some();
+    let total_started = Instant::now();
+    let phase_started = Instant::now();
     let (source_payloads, source_abi_diagnostics) =
         boon_typecheck::project_source_payload_abi_types_and_diagnostics(project);
+    let source_abi_us = elapsed_us(phase_started.elapsed());
+    let phase_started = Instant::now();
     let PreparedKernelProjectProjection {
         owner_order,
         prepared,
@@ -2371,6 +2376,7 @@ pub(crate) fn checked_construction_from_kernel(
         abi,
         ..
     } = prepare_kernel_project_projection(project, &source_payloads, role);
+    let projection_us = elapsed_us(phase_started.elapsed());
     if !unsupported.is_empty() {
         return Err(format!(
             "dense kernel checked construction does not cover the complete project: {unsupported:#?}"
@@ -2384,24 +2390,30 @@ pub(crate) fn checked_construction_from_kernel(
         ));
     }
 
+    let phase_started = Instant::now();
     let input =
         KernelProjectInput::new_with_abi(project_input, definition_facts, definition_keys, abi)
             .map_err(|error| format!("cannot build dense kernel checked input: {error}"))?;
+    let input_us = elapsed_us(phase_started.elapsed());
     let mut session = KernelSession::new(input);
     // A complete checked request owns every definition body. Solve that
     // demand first, then project diagnostics from the stronger cached image;
     // otherwise a verified compilation would intentionally stop at the
     // interface cone only to extend the same graph immediately afterward.
+    let phase_started = Instant::now();
     let checked_product = session
         .check(CheckDemand::CheckedImage)
         .map_err(|error| format!("cannot materialize dense kernel checked image: {error}"))?;
+    let checked_image_us = elapsed_us(phase_started.elapsed());
     let compile_work = checked_product.compile_work;
     let KernelCheckProduct::CheckedImage(snapshot) = checked_product.product else {
         unreachable!("checked-image demand returns a checked snapshot")
     };
+    let phase_started = Instant::now();
     let diagnostics_product = session
         .check(CheckDemand::Diagnostics)
         .map_err(|error| format!("cannot solve dense kernel checked diagnostics: {error}"))?;
+    let diagnostics_projection_us = elapsed_us(phase_started.elapsed());
     let KernelCheckProduct::Diagnostics(interfaces) = diagnostics_product.product else {
         unreachable!("diagnostics demand returns an interface snapshot")
     };
@@ -2412,6 +2424,7 @@ pub(crate) fn checked_construction_from_kernel(
             active.len()
         ));
     }
+    let phase_started = Instant::now();
     let mut diagnostics = present_kernel_project_diagnostics(
         project,
         &prepared,
@@ -2419,12 +2432,18 @@ pub(crate) fn checked_construction_from_kernel(
         source_abi_diagnostics.as_ref(),
         &interfaces,
     )?;
+    let diagnostics_presentation_us = elapsed_us(phase_started.elapsed());
     let solve_work = snapshot.work;
+    let phase_started = Instant::now();
     let layout = KernelCheckedLinkLayout::new(session.project(), &snapshot)
         .map_err(|error| format!("cannot build dense kernel checked layout: {error}"))?;
+    let layout_us = elapsed_us(phase_started.elapsed());
+    let phase_started = Instant::now();
     let mut rows = layout
         .materialize_rows(session.project(), &snapshot, role)
         .map_err(|error| format!("cannot link dense kernel checked rows: {error}"))?;
+    let rows_us = elapsed_us(phase_started.elapsed());
+    let phase_started = Instant::now();
     let mut checked_image_definition_seals = Vec::with_capacity(layout.definitions().len());
     for definition in layout.definitions() {
         let key = session
@@ -2500,7 +2519,9 @@ pub(crate) fn checked_construction_from_kernel(
         )
         .map_err(|error| format!("cannot rebase dense kernel checked rows: {error}"))?;
     }
+    let seals_and_rebase_us = elapsed_us(phase_started.elapsed());
 
+    let phase_started = Instant::now();
     let call_occurrences = rows.call_occurrences;
     let mut fields = CheckedProgramFields {
         source_bundle_digest_v1: project.source_bundle_digest_v1(),
@@ -2562,6 +2583,13 @@ pub(crate) fn checked_construction_from_kernel(
         definitions: checked_image_definition_seals,
         runtime_flow_terms: rows.runtime_flow_terms,
     };
+    let metadata_us = elapsed_us(phase_started.elapsed());
+    if trace {
+        eprintln!(
+            "kernel-production-checked-detail source_abi_us={source_abi_us} projection_us={projection_us} input_us={input_us} checked_image_us={checked_image_us} diagnostics_projection_us={diagnostics_projection_us} diagnostics_presentation_us={diagnostics_presentation_us} layout_us={layout_us} rows_us={rows_us} seals_rebase_us={seals_and_rebase_us} metadata_us={metadata_us} total_us={}",
+            elapsed_us(total_started.elapsed()),
+        );
+    }
     Ok(KernelCheckedConstruction {
         fields,
         call_occurrences,

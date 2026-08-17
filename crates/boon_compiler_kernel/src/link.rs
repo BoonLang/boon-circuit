@@ -601,25 +601,28 @@ impl KernelCheckedLinkLayout {
             ))
         };
         #[cfg(not(target_family = "wasm"))]
-        let (base, (mut expressions, mut runtime_flow_terms)) = if self.totals.expressions >= 4096
-            && std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() >= 2)
-        {
-            std::thread::scope(|scope| {
-                let expression_worker = scope.spawn(materialize_expression_rows);
-                let base = self.materialize_base_rows(project, snapshot, role)?;
-                let expressions = expression_worker.join().map_err(|_| {
-                    KernelCheckedLinkError::new(
-                        "kernel checked expression materialization worker panicked",
-                    )
-                })??;
-                Ok::<_, KernelCheckedLinkError>((base, expressions))
-            })?
-        } else {
-            (
-                self.materialize_base_rows(project, snapshot, role)?,
-                materialize_expression_rows()?,
-            )
-        };
+        let (base, (mut expressions, mut runtime_flow_terms)) =
+            if crate::experimental_parallel_projection_enabled()
+                && self.totals.expressions >= 4096
+                && std::thread::available_parallelism()
+                    .is_ok_and(|parallelism| parallelism.get() >= 2)
+            {
+                std::thread::scope(|scope| {
+                    let expression_worker = scope.spawn(materialize_expression_rows);
+                    let base = self.materialize_base_rows(project, snapshot, role)?;
+                    let expressions = expression_worker.join().map_err(|_| {
+                        KernelCheckedLinkError::new(
+                            "kernel checked expression materialization worker panicked",
+                        )
+                    })??;
+                    Ok::<_, KernelCheckedLinkError>((base, expressions))
+                })?
+            } else {
+                (
+                    self.materialize_base_rows(project, snapshot, role)?,
+                    materialize_expression_rows()?,
+                )
+            };
         #[cfg(target_family = "wasm")]
         let (base, (mut expressions, mut runtime_flow_terms)) = (
             self.materialize_base_rows(project, snapshot, role)?,

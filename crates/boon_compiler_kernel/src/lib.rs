@@ -27,6 +27,17 @@ pub use session::*;
 pub use solver::*;
 pub use term::*;
 
+/// Whether the non-normative two-worker kernel projection experiment is
+/// enabled for this process.
+///
+/// Cold compiler acceptance is deliberately single-threaded. Keeping the
+/// graph-proven split behind an explicit experiment lets us measure it later
+/// without silently making the production compiler or its reports parallel.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn experimental_parallel_projection_enabled() -> bool {
+    std::env::var_os("BOON_KERNEL_EXPERIMENTAL_PARALLEL").is_some_and(|value| value == "1")
+}
+
 #[cfg(test)]
 mod architecture_tests {
     #[test]

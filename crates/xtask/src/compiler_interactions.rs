@@ -571,6 +571,7 @@ fn run_warm_batch(
     let output = Command::new(producer)
         .current_dir(workspace)
         .env("RAYON_NUM_THREADS", "1")
+        .env_remove("BOON_KERNEL_EXPERIMENTAL_PARALLEL")
         .args([
             "compiler-sample",
             "warm-session",
@@ -801,6 +802,7 @@ fn run_scaling_sample(
     command
         .current_dir(workspace)
         .env("RAYON_NUM_THREADS", "1")
+        .env_remove("BOON_KERNEL_EXPERIMENTAL_PARALLEL")
         .args([
             "compiler-sample",
             "synthetic-scaling",
@@ -834,6 +836,7 @@ fn run_scaling_trace(
     let output = Command::new(producer)
         .current_dir(workspace)
         .env("RAYON_NUM_THREADS", "1")
+        .env_remove("BOON_KERNEL_EXPERIMENTAL_PARALLEL")
         .env("BOON_SEMANTIC_TRACE", "1")
         .args([
             "compiler-sample",

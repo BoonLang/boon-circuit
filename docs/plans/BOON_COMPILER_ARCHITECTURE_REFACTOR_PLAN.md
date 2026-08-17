@@ -4630,22 +4630,19 @@ rows and plan templates relocate those term IDs directly. Do not grow a
 second rich type table or resume proof-codec micro-optimization around this
 handoff.
 
-### Deterministic Checked-Image Definition Publication (2026-08-17)
+### Experimental Checked-Image Definition Publication (2026-08-17)
 
 After graph convergence, the 1,389 NovyWave definition artifacts are mutually
-independent until their ordered dependency/currentness seal. Complete checked-
-image demand now divides that immutable dense definition range into exactly two
-contiguous halves on native hosts with at least two available CPUs and at least
-64 definitions. The current thread materializes the first half while one
-scoped worker materializes the second. Each worker also performs definition-
-local alpha normalization. Definition fingerprinting and currentness hashing
-use the same two-range rule after the dependency graph has been built; results
-are concatenated in the original dense owner order. Solver convergence,
-dependency-graph construction, diagnostic ordering, sparse definition demand,
-small projects, and Wasm remain serial. No worker count above two and no
-nondeterministic work stealing were introduced.
+independent until their ordered dependency/currentness seal. With the explicit
+non-normative `BOON_KERNEL_EXPERIMENTAL_PARALLEL=1` experiment enabled, checked-
+image demand divides that immutable dense range into exactly two contiguous
+halves on native hosts with at least two available CPUs and at least 64
+definitions. The default and every official compiler-performance observation
+remain single-threaded. Results retain the original dense owner order; solver
+convergence, dependency-graph construction, diagnostics, sparse demand, small
+projects, and Wasm remain serial.
 
-A 65-definition regression crosses the production threshold and proves stable
+A 65-definition regression crosses the experimental threshold and proves stable
 dense result order and exact repeated snapshot equality. The kernel suite is
 107 passed, the semantic suite is 178 passed with two intentional ignores, the
 architecture gate passes, and three fresh pinned-stable production verified
@@ -4658,11 +4655,14 @@ ordinary full verified samples have medians of 2,895.206 ms total,
 verification, 379.570 ms backend construction, and 77.896 ms plan
 verification. Whole-compile noise is larger than this cut, so it is accepted
 as deterministic work reduction rather than claimed as a new end-to-end
-latency milestone.
+latency milestone. These measurements predate the single-thread contract audit
+below and are retained only as experiment history.
 
-This is the only safe parallel slice currently justified by the graph. Do not
-parallelize the monolithic solver, semantic authority construction, or plan
-sealing merely because CPU cores are available. The next speed-bearing cut
+This is a useful bounded experiment, not an accepted cold-compiler speed cut.
+It cannot contribute to the one-thread latency target or to a report whose
+`compiler_threads` field is one. Do not parallelize the monolithic solver,
+semantic authority construction, or plan sealing merely because CPU cores are
+available. The next speed-bearing cut
 remains structural: publish the remaining definition type roots and normalized
 resource/row facts once, relocate them through compact invocation frames, and
 delete the corresponding contextual/resource/storage/core reconstruction
@@ -4672,20 +4672,21 @@ execution construction (179.451 ms), and resource-authority normalization
 (78.500 ms). Moving those owners, not adding more threads or switching Rust
 toolchains, is the route to a materially lower NovyWave total.
 
-### Deterministic Checked-Row Projection (2026-08-17)
+### Experimental Checked-Row Projection (2026-08-17)
 
 The direct kernel-to-`boon_checked` linker had one further graph-proven
 independent region after definition publication. Expression rows and their
 runtime-flow-term projection depend only on the immutable checked snapshot and
 final prefix layout; scopes, declarations, statements, callable signatures,
-and resource rows do not consume them. Large native images now build those two
-regions in exactly two scoped workers, join them before call/result/resource
-projection, and preserve the original dense row order. Projects below 4,096
-expressions, single-CPU hosts, and Wasm stay serial. This is bounded wall-time
-overlap, not a second checked authority or a substitute for the later direct
-semantic-artifact cut.
+and resource rows do not consume them. With the same explicit experiment,
+large native images may build those two regions in exactly two scoped workers
+and join them in the original dense row order. Production defaults, official
+cold/warm/scaling measurements, projects below 4,096 expressions, single-CPU
+hosts, and Wasm stay serial. This is optional wall-time overlap, not a second
+checked authority or a substitute for the later direct semantic-artifact cut.
 
-The release trace now exposes the formerly opaque checker owners. On the same
+The historical experimental release trace exposed the formerly opaque checker
+owners. On the same
 NovyWave image, component convergence is about 274 ms; definition artifact
 construction about 131 ms; dependency/currentness receipts about 72 ms; and
 the pre-cut rich checked-row materializer about 131 ms. Three warm pinned-
@@ -4707,8 +4708,42 @@ ancestor environment would recreate the quadratic memory the plan forbids.
 The next structural cut therefore remains definition-owned semantic execution
 and proof construction: consume compact definition fragments plus invocation
 overlays directly, then delete the rich occurrence reconstruction and
-retrospective fold owners. Parallel projection is accepted as a small real
-improvement, but it does not satisfy that deletion gate.
+retrospective fold owners. Parallel projection remains an opt-in experiment
+and does not satisfy that deletion gate.
+
+### Single-Thread Contract Audit and Current Production Owners (2026-08-17)
+
+The preceding two experiments originally became unconditional on multi-core
+hosts while compiler reports continued to declare `compiler_threads = 1`.
+That made the timing protocol internally inconsistent. All three two-worker
+branches now require the exact value
+`BOON_KERNEL_EXPERIMENTAL_PARALLEL=1`, and the cold, warm, and scaling harnesses
+remove that variable explicitly. An architecture gate fixes this contract in
+place. The parallel code remains available for later graph-scheduling research;
+it is not production acceptance evidence.
+
+The production CLI now exposes the checked construction envelope under
+`BOON_KERNEL_TRACE`. Three same-binary, fresh-process, single-thread NovyWave
+samples localized checking around 1.17 seconds and semantic construction around
+1.03 seconds, while WHERE contract verification remained below one millisecond.
+Within checking, dense graph convergence is roughly 0.26 seconds, definition
+and receipt publication roughly 0.24 seconds, rich checked-row materialization
+roughly 0.12 seconds, and a later retrospective checked-image handoff scan
+roughly 0.068 seconds. The exact MachinePlan digest remained unchanged.
+
+A trial that moved prepared owner facts instead of cloning them was
+implemented, tested, rebuilt, and rejected: its three-sample median was
+2.771 seconds versus the preceding 2.734-second directional median, with
+checking effectively unchanged. The trial and an unproven checked-projection
+`HashMap` substitution were deleted. This is the intended measurement rule:
+remove whole ownership passes, and discard complexity that merely moves work.
+
+The next checked cut is construction-owned compact checked-image publication
+emitted beside dense rows and consumed by value. It must make the 0.068-second
+retrospective scan test-only and preserve exact V4 handoff bytes. The larger
+following semantic cut remains definition-owned resource and row-storage
+templates plus compact invocation relocation; it must delete
+resource/storage/core reconstruction rather than cache its result.
 
 The concurrent checker-kernel track remains the first half of the same
 definition-artifact design. Checked/execution receipt replay is already deleted;

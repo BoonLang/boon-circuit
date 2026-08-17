@@ -80,6 +80,11 @@ pub fn collect_architecture_evidence(workspace: &Path) -> GateEvidence {
     );
     push_check(
         &mut checks,
+        "normative-single-thread-compiler",
+        normative_single_thread_compiler(workspace),
+    );
+    push_check(
+        &mut checks,
         "dependency-classifier-schema-v1",
         crate::dependency_classifier::verify(workspace),
     );
@@ -201,6 +206,61 @@ fn shared_document_plan_code(workspace: &Path) -> Result<String, String> {
 
     Ok(
         "ordinary document bodies are construction-owned functions with V11 call frames; retired per-call recursive body caches remain absent"
+            .to_owned(),
+    )
+}
+
+fn normative_single_thread_compiler(workspace: &Path) -> Result<String, String> {
+    let kernel = read_text(&workspace.join("crates/boon_compiler_kernel/src/lib.rs"))?;
+    let owner = read_text(&workspace.join("crates/boon_compiler_kernel/src/owner.rs"))?;
+    let receipt = read_text(&workspace.join("crates/boon_compiler_kernel/src/receipt.rs"))?;
+    let link = read_text(&workspace.join("crates/boon_compiler_kernel/src/link.rs"))?;
+    let performance = read_text(&workspace.join("crates/xtask/src/compiler_performance.rs"))?;
+    let interactions = read_text(&workspace.join("crates/xtask/src/compiler_interactions.rs"))?;
+    let experiment = "experimental_parallel_projection_enabled()";
+    let variable = "BOON_KERNEL_EXPERIMENTAL_PARALLEL";
+
+    if !kernel.contains("value == \"1\"") || !kernel.contains(variable) {
+        return Err(
+            "kernel parallel projection must require the explicit value BOON_KERNEL_EXPERIMENTAL_PARALLEL=1"
+                .to_owned(),
+        );
+    }
+    for (label, source) in [("owner", &owner), ("receipt", &receipt), ("link", &link)] {
+        if source.matches(experiment).count() != 1 {
+            return Err(format!(
+                "kernel {label} projection must have exactly one explicit experimental parallel guard"
+            ));
+        }
+        if source.matches("available_parallelism()").count() != 1 {
+            return Err(format!(
+                "kernel {label} projection changed its bounded parallel branch without updating the single-thread architecture gate"
+            ));
+        }
+    }
+    if performance
+        .matches(&format!("env_remove(\"{variable}\")"))
+        .count()
+        != 1
+    {
+        return Err(
+            "cold compiler performance observations must remove the experimental parallel override"
+                .to_owned(),
+        );
+    }
+    if interactions
+        .matches(&format!("env_remove(\"{variable}\")"))
+        .count()
+        != 3
+    {
+        return Err(
+            "warm and scaling compiler observations must remove every experimental parallel override"
+                .to_owned(),
+        );
+    }
+
+    Ok(
+        "normative compiler observations are single-threaded; three bounded two-worker projections remain explicit experiments only"
             .to_owned(),
     )
 }

@@ -16084,7 +16084,7 @@ fn checked_owner_for_scope(
 
 fn checked_image_kernel_authority_context(
     program: &CheckedProgramFields,
-    callable_owners: &BTreeMap<DeclId, CheckedShardOwnerKeyV2>,
+    scope_owners: &[CheckedShardOwnerKeyV2],
     authority: &CheckedImageKernelAuthorityV1,
 ) -> Result<CheckedImageKernelAuthorityContextV1, String> {
     if authority.schema != CHECKED_IMAGE_KERNEL_AUTHORITY_SCHEMA_V1 {
@@ -16103,7 +16103,7 @@ fn checked_image_kernel_authority_context(
     let mut definition_seal_rows =
         BTreeMap::<CheckedShardOwnerKeyV2, Vec<CheckedImageDefinitionAuthorityIdentityV1>>::new();
     for definition in &authority.definitions {
-        let owner = checked_owner_for_scope(program, callable_owners, definition.root_scope)?;
+        let owner = checked_owner_from_dense_index(scope_owners, definition.root_scope)?;
         definition_seal_rows.entry(owner).or_default().push(
             CheckedImageDefinitionAuthorityIdentityV1 {
                 definition_key_digest: definition.definition_key_digest,
@@ -16134,6 +16134,16 @@ fn checked_image_kernel_authority_context(
         referenced_abi_fingerprint: authority.referenced_abi_fingerprint,
         definition_seals,
     })
+}
+
+fn checked_owner_from_dense_index(
+    owners: &[CheckedShardOwnerKeyV2],
+    scope: LexicalScopeId,
+) -> Result<CheckedShardOwnerKeyV2, String> {
+    owners
+        .get(scope.0 as usize)
+        .cloned()
+        .ok_or_else(|| format!("checked image references missing scope {}", scope.0))
 }
 
 fn checked_authority_projection(
@@ -16186,10 +16196,18 @@ fn checked_image_handoff_with_call_occurrences(
         .iter()
         .map(|callable| (callable.decl_id, checked_stable_owner(callable)))
         .collect::<BTreeMap<_, _>>();
+    // Resolve lexical ownership once per dense scope. The former row loops
+    // restarted a parent walk (and allocated a cycle-detection set) for every
+    // scope, declaration, expression, statement, resource and metadata row.
+    // The checked scope forest is immutable here, so all later publication
+    // uses this one fail-closed index.
+    let scope_owners = program
+        .scopes
+        .iter()
+        .map(|scope| checked_owner_for_scope(program, &callable_owners, scope.id))
+        .collect::<Result<Vec<_>, _>>()?;
     let kernel_authority = kernel_authority
-        .map(|authority| {
-            checked_image_kernel_authority_context(program, &callable_owners, authority)
-        })
+        .map(|authority| checked_image_kernel_authority_context(program, &scope_owners, authority))
         .transpose()?;
     let declaration_owners = program
         .declarations
@@ -16206,7 +16224,7 @@ fn checked_image_handoff_with_call_occurrences(
                         )
                     })?
             } else {
-                checked_owner_for_scope(program, &callable_owners, declaration.scope_id)?
+                checked_owner_from_dense_index(&scope_owners, declaration.scope_id)?
             };
             Ok((declaration.id, owner))
         })
@@ -16215,7 +16233,7 @@ fn checked_image_handoff_with_call_occurrences(
         .expressions
         .iter()
         .map(|expression| {
-            checked_owner_for_scope(program, &callable_owners, expression.scope_id)
+            checked_owner_from_dense_index(&scope_owners, expression.scope_id)
                 .map(checked_definition_projection)
                 .map(|projection| (expression.id, projection))
         })
@@ -16224,7 +16242,7 @@ fn checked_image_handoff_with_call_occurrences(
         .statements
         .iter()
         .map(|statement| {
-            checked_owner_for_scope(program, &callable_owners, statement.scope_id)
+            checked_owner_from_dense_index(&scope_owners, statement.scope_id)
                 .map(checked_definition_projection)
                 .map(|projection| (statement.id, projection))
         })
@@ -16244,11 +16262,8 @@ fn checked_image_handoff_with_call_occurrences(
     )?;
 
     for scope in &program.scopes {
-        let projection = checked_definition_projection(checked_owner_for_scope(
-            program,
-            &callable_owners,
-            scope.id,
-        )?);
+        let projection =
+            checked_definition_projection(checked_owner_from_dense_index(&scope_owners, scope.id)?);
         builder.push_row(
             projection.clone(),
             CheckedImageRowDomainV2::Scope,
@@ -16488,7 +16503,7 @@ fn checked_image_handoff_with_call_occurrences(
         )?;
     }
     for source in &program.sources {
-        let owner = checked_owner_for_scope(program, &callable_owners, source.owner_scope)?;
+        let owner = checked_owner_from_dense_index(&scope_owners, source.owner_scope)?;
         let projection = checked_authority_projection(program, owner, &source.path);
         let relocations = expression_projections
             .get(&source.expression)
@@ -16508,7 +16523,7 @@ fn checked_image_handoff_with_call_occurrences(
         )?;
     }
     for state in &program.states {
-        let owner = checked_owner_for_scope(program, &callable_owners, state.owner_scope)?;
+        let owner = checked_owner_from_dense_index(&scope_owners, state.owner_scope)?;
         let projection = checked_authority_projection(program, owner, &state.path);
         let relocations = [state.expression, state.initial]
             .into_iter()
@@ -16533,7 +16548,7 @@ fn checked_image_handoff_with_call_occurrences(
         )?;
     }
     for list in &program.lists {
-        let owner = checked_owner_for_scope(program, &callable_owners, list.owner_scope)?;
+        let owner = checked_owner_from_dense_index(&scope_owners, list.owner_scope)?;
         let projection = checked_authority_projection(program, owner, &list.path);
         let relocations = expression_projections
             .get(&list.producer)
@@ -16582,7 +16597,7 @@ fn checked_image_handoff_with_call_occurrences(
             .iter()
             .filter_map(|source| program.sources.get(source.0 as usize))
             .filter_map(|source| {
-                checked_owner_for_scope(program, &callable_owners, source.owner_scope).ok()
+                checked_owner_from_dense_index(&scope_owners, source.owner_scope).ok()
             })
             .collect::<BTreeSet<_>>();
         let owner = owners

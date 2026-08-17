@@ -285,7 +285,8 @@ where
     F: Fn(Range<usize>) -> Result<Vec<T>, KernelSolveError> + Sync,
 {
     #[cfg(not(target_family = "wasm"))]
-    if len >= PARALLEL_DEFINITION_THRESHOLD
+    if crate::experimental_parallel_projection_enabled()
+        && len >= PARALLEL_DEFINITION_THRESHOLD
         && std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() >= 2)
     {
         let split = len / 2;

@@ -3144,6 +3144,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn contextual_named_runtime_type_specializes_union_local_alphas() {
+        let checked = Type::List(Type::shared(Type::object(
+            boon_checked::ObjectShape::from_ordered_fields(
+                [(
+                    "title".to_owned(),
+                    Type::Union(vec![Type::Text, Type::Var(boon_checked::TypeVar(0))]),
+                )],
+                false,
+            ),
+        )));
+        let runtime = Type::List(Type::shared(Type::object(
+            boon_checked::ObjectShape::from_ordered_fields(
+                [(
+                    "title".to_owned(),
+                    Type::Union(vec![Type::Text, Type::Text]),
+                )],
+                false,
+            ),
+        )));
+
+        assert_eq!(
+            contextualize_runtime_storage_type(&checked, &runtime)
+                .expect("runtime occurrence specializes the checked local alpha"),
+            runtime,
+        );
+    }
+
+    #[test]
+    fn contextual_named_runtime_type_fills_each_open_union_branch() {
+        let open = Type::object(boon_checked::ObjectShape::new(BTreeMap::new(), true));
+        let row = |title| {
+            Type::List(Type::shared(Type::object(
+                boon_checked::ObjectShape::from_ordered_fields(
+                    [("title".to_owned(), title)],
+                    false,
+                ),
+            )))
+        };
+        let checked = row(Type::Text);
+        let open_runtime = row(Type::Union(vec![open.clone(), open]));
+        let concrete_runtime = row(Type::Union(vec![Type::Text, Type::Text]));
+
+        assert_eq!(
+            contextualize_runtime_storage_type(&checked, &open_runtime)
+                .expect("each occurrence-local open branch accepts the checked contract"),
+            concrete_runtime,
+        );
+        assert_eq!(
+            contextualize_runtime_storage_type(&checked, &concrete_runtime)
+                .expect("the concrete storage occurrence retains its branch structure"),
+            concrete_runtime,
+        );
+    }
+
     fn checked_and_semantic(name: &str, source: &str) -> (CheckedProgram, crate::SemanticProgram) {
         let parsed = boon_parser::parse_source(name, source).expect("parse");
         let output = boon_typecheck::check_program(&parsed);

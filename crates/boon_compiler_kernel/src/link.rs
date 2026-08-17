@@ -12,17 +12,19 @@ use boon_checked::{
     CheckedContextScheme, CheckedContextTypeSubstitution, CheckedContextualOperation,
     CheckedDeclaration, CheckedDeclarationKind, CheckedDefinitionExecutionNodeV1,
     CheckedDefinitionExecutionTemplateV1, CheckedDefinitionSelectorV1, CheckedEffectSummary,
-    CheckedEvaluationScope, CheckedExprId, CheckedExpression, CheckedExpressionKind, CheckedList,
-    CheckedListId, CheckedMatchPattern, CheckedParameter, CheckedParameterKind,
-    CheckedParameterRequirement, CheckedPassedAccess, CheckedPatternBinding, CheckedRecordField,
-    CheckedResourceBinding, CheckedResourceProjectionRequirement,
-    CheckedRuntimeFlowTermProjectionV1, CheckedScope, CheckedScopeKind, CheckedSemanticPath,
-    CheckedSource, CheckedSourceId, CheckedSourceRead, CheckedSpan, CheckedState, CheckedStateId,
-    CheckedStatement, CheckedStatementId, CheckedStatementKind, CheckedTextSegment,
-    CheckedTypeSubstitution, CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType,
-    LexicalScopeId, ObjectShape, ProgramRole, SemanticOccurrence, SemanticOccurrenceKind, Type,
-    TypeVar, Variant,
+    CheckedEvaluationScope, CheckedExprId, CheckedExpression, CheckedExpressionKind,
+    CheckedImageKernelPublicationV1, CheckedImageRowDomainV2, CheckedList, CheckedListId,
+    CheckedMatchPattern, CheckedParameter, CheckedParameterKind, CheckedParameterRequirement,
+    CheckedPassedAccess, CheckedPatternBinding, CheckedRecordField, CheckedResourceBinding,
+    CheckedResourceProjectionRequirement, CheckedRuntimeFlowTermProjectionV1, CheckedScope,
+    CheckedScopeKind, CheckedSemanticPath, CheckedShardCallableKindV2, CheckedShardOwnerKeyV2,
+    CheckedShardProjectionKeyV2, CheckedShardRegionV2, CheckedSource, CheckedSourceId,
+    CheckedSourceRead, CheckedSpan, CheckedState, CheckedStateId, CheckedStatement,
+    CheckedStatementId, CheckedStatementKind, CheckedTextSegment, CheckedTypeSubstitution,
+    CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId, ObjectShape,
+    ProgramRole, SemanticOccurrence, SemanticOccurrenceKind, Type, TypeVar, Variant,
 };
+use boon_contract::SourceBundleDigestV1;
 use boon_syntax::StableOccurrenceKey;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -110,7 +112,7 @@ pub struct KernelCheckedLinkTotals {
 /// artifacts and the existing checked model. Source-unit coordinate rebasing
 /// and project-level semantic indexes remain orchestration concerns; callers
 /// must not re-run per-row linker methods independently.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct KernelCheckedRows {
     pub scopes: Box<[CheckedScope]>,
     pub declarations: Box<[CheckedDeclaration]>,
@@ -131,6 +133,11 @@ pub struct KernelCheckedRows {
     pub lists: Box<[CheckedList]>,
     pub definition_execution_templates: Box<[CheckedDefinitionExecutionTemplateV1]>,
     pub runtime_flow_terms: CheckedRuntimeFlowTermProjectionV1,
+    /// Compact checked-image topology emitted by the same linker that assigns
+    /// final dense row IDs. The compiler appends project metadata rows and the
+    /// typechecker consumes it by value; neither stage replays rich checked
+    /// expression/statement tables.
+    pub checked_image_publication: CheckedImageKernelPublicationV1,
     pub occurrences: Box<[SemanticOccurrence]>,
     occurrence_ranges: Box<[KernelCheckedRowRange]>,
 }
@@ -332,6 +339,569 @@ struct KernelCheckedBaseRows {
     sources: Box<[CheckedSource]>,
     states: Box<[CheckedState]>,
     lists: Box<[CheckedList]>,
+}
+
+fn checked_link_owner(callable: &CheckedCallableSignature) -> CheckedShardOwnerKeyV2 {
+    CheckedShardOwnerKeyV2::Callable {
+        role: callable.role,
+        callable_kind: CheckedShardCallableKindV2::from(callable.kind),
+        name: callable.name.clone(),
+        external_identity: callable.external_identity,
+    }
+}
+
+fn checked_link_definition_projection(
+    owner: CheckedShardOwnerKeyV2,
+) -> CheckedShardProjectionKeyV2 {
+    CheckedShardProjectionKeyV2 {
+        owner,
+        region: CheckedShardRegionV2::Definition,
+    }
+}
+
+fn checked_link_interface_projection(owner: CheckedShardOwnerKeyV2) -> CheckedShardProjectionKeyV2 {
+    CheckedShardProjectionKeyV2 {
+        owner,
+        region: CheckedShardRegionV2::Interface,
+    }
+}
+
+fn checked_link_owner_for_scope(
+    scopes: &[CheckedScope],
+    callable_owners: &BTreeMap<DeclId, CheckedShardOwnerKeyV2>,
+    role: ProgramRole,
+    mut scope: LexicalScopeId,
+) -> Result<CheckedShardOwnerKeyV2, KernelCheckedLinkError> {
+    let mut remaining = scopes.len().saturating_add(1);
+    loop {
+        if remaining == 0 {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked-image scope {} has an ownership cycle",
+                scope.0
+            )));
+        }
+        remaining -= 1;
+        let current = scopes
+            .get(scope.0 as usize)
+            .filter(|candidate| candidate.id == scope)
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel checked-image publication references missing scope {}",
+                    scope.0
+                ))
+            })?;
+        if current.kind == CheckedScopeKind::Function
+            && let Some(owner) = current.owner
+        {
+            return callable_owners.get(&owner).cloned().ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel checked-image function scope {} has no callable owner {}",
+                    scope.0, owner.0
+                ))
+            });
+        }
+        let Some(parent) = current.parent else {
+            return Ok(CheckedShardOwnerKeyV2::ProgramTopLevel { role });
+        };
+        scope = parent;
+    }
+}
+
+fn checked_link_declaration<'a>(
+    declarations: &'a [CheckedDeclaration],
+    id: DeclId,
+) -> Option<&'a CheckedDeclaration> {
+    id.0.checked_sub(1)
+        .and_then(|index| declarations.get(index as usize))
+        .filter(|candidate| candidate.id == id)
+}
+
+fn checked_link_semantic_path(
+    scopes: &[CheckedScope],
+    declarations: &[CheckedDeclaration],
+    path: &CheckedSemanticPath,
+) -> Option<String> {
+    let declaration = checked_link_declaration(declarations, path.anchor)?;
+    if declaration.kind == CheckedDeclarationKind::Function {
+        return (!path.projection.is_empty()).then(|| path.projection.join("."));
+    }
+    let mut segments = vec![declaration.name.clone()];
+    let mut scope = declaration.scope_id;
+    let mut visited = BTreeSet::new();
+    while scope != LexicalScopeId(0) && visited.insert(scope) {
+        let current = scopes
+            .get(scope.0 as usize)
+            .filter(|candidate| candidate.id == scope)?;
+        if current.kind == CheckedScopeKind::Function {
+            break;
+        }
+        if let Some(owner) = current.owner
+            && let Some(owner) = checked_link_declaration(declarations, owner)
+            && matches!(
+                owner.kind,
+                CheckedDeclarationKind::Field
+                    | CheckedDeclarationKind::Source
+                    | CheckedDeclarationKind::Hold
+                    | CheckedDeclarationKind::List
+            )
+        {
+            segments.push(owner.name.clone());
+        }
+        scope = current.parent?;
+    }
+    segments.reverse();
+    let mut result = segments.join(".");
+    if !path.projection.is_empty() {
+        result.push('.');
+        result.push_str(&path.projection.join("."));
+    }
+    Some(result)
+}
+
+fn checked_link_authority_projection(
+    scopes: &[CheckedScope],
+    declarations: &[CheckedDeclaration],
+    owner: CheckedShardOwnerKeyV2,
+    path: &CheckedSemanticPath,
+) -> CheckedShardProjectionKeyV2 {
+    if matches!(owner, CheckedShardOwnerKeyV2::ProgramTopLevel { .. })
+        && let Some(canonical_path) = checked_link_semantic_path(scopes, declarations, path)
+    {
+        return CheckedShardProjectionKeyV2 {
+            owner,
+            region: CheckedShardRegionV2::TopLevelAuthority { canonical_path },
+        };
+    }
+    checked_link_definition_projection(owner)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checked_image_publication_v1(
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    role: ProgramRole,
+    scopes: &[CheckedScope],
+    declarations: &[CheckedDeclaration],
+    statements: &[CheckedStatement],
+    expressions: &[CheckedExpression],
+    callables: &[CheckedCallableSignature],
+    context_formals: &[CheckedContextFormal],
+    calls: &[CheckedCall],
+    call_occurrences: &[StableOccurrenceKey],
+    call_result_paths: &[CheckedCallResultPath],
+    pattern_bindings: &[CheckedPatternBinding],
+    resource_projection_requirements: &[CheckedResourceProjectionRequirement],
+    sources: &[CheckedSource],
+    states: &[CheckedState],
+    lists: &[CheckedList],
+    occurrences: &[SemanticOccurrence],
+) -> Result<CheckedImageKernelPublicationV1, KernelCheckedLinkError> {
+    let error = |message: String| KernelCheckedLinkError::new(message);
+    let root_owner = CheckedShardOwnerKeyV2::ProgramTopLevel { role };
+    let root_definition = checked_link_definition_projection(root_owner.clone());
+    let root_interface = checked_link_interface_projection(root_owner.clone());
+    let callable_owners = callables
+        .iter()
+        .map(|callable| (callable.decl_id, checked_link_owner(callable)))
+        .collect::<BTreeMap<_, _>>();
+    if callable_owners.len() != callables.len() {
+        return Err(KernelCheckedLinkError::new(
+            "kernel checked-image publication received duplicate callable declarations",
+        ));
+    }
+    let scope_owners = scopes
+        .iter()
+        .map(|scope| checked_link_owner_for_scope(scopes, &callable_owners, role, scope.id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut publication =
+        CheckedImageKernelPublicationV1::__kernel_new(source_bundle_digest_v1, role);
+    let root_definition_id = publication
+        .__kernel_intern_projection(root_definition.clone())
+        .map_err(error)?;
+    let root_interface_id = publication
+        .__kernel_intern_projection(root_interface)
+        .map_err(error)?;
+    publication
+        .__kernel_publish_rows(root_interface_id, 1)
+        .map_err(error)?;
+
+    let mut scope_projections = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let projection = publication
+            .__kernel_intern_projection(checked_link_definition_projection(
+                scope_owners[scope.id.0 as usize].clone(),
+            ))
+            .map_err(&error)?;
+        publication
+            .__kernel_publish_rows(projection, 1)
+            .map_err(&error)?;
+        publication
+            .__kernel_route(
+                CheckedImageRowDomainV2::Scope,
+                scope.id.0 as usize,
+                projection,
+            )
+            .map_err(&error)?;
+        scope_projections.push(projection);
+    }
+
+    let declaration_slots = declarations
+        .last()
+        .map(|declaration| declaration.id.0 as usize + 1)
+        .unwrap_or(1);
+    let mut declaration_projections = vec![None; declaration_slots];
+    for declaration in declarations {
+        let owner = if declaration.kind == CheckedDeclarationKind::Function {
+            callable_owners
+                .get(&declaration.id)
+                .cloned()
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel function declaration {} has no stable callable owner",
+                        declaration.id.0
+                    ))
+                })?
+        } else {
+            scope_owners
+                .get(declaration.scope_id.0 as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel declaration {} references missing scope {}",
+                        declaration.id.0, declaration.scope_id.0
+                    ))
+                })?
+        };
+        let projection = publication
+            .__kernel_intern_projection(checked_link_definition_projection(owner))
+            .map_err(&error)?;
+        publication
+            .__kernel_publish_rows(projection, 1)
+            .map_err(&error)?;
+        publication
+            .__kernel_route(
+                CheckedImageRowDomainV2::Declaration,
+                declaration.id.0 as usize,
+                projection,
+            )
+            .map_err(&error)?;
+        let slot = declaration_projections
+            .get_mut(declaration.id.0 as usize)
+            .ok_or_else(|| KernelCheckedLinkError::new("declaration route exceeds dense table"))?;
+        if slot.replace(projection).is_some() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel declaration {} is published twice",
+                declaration.id.0
+            )));
+        }
+    }
+
+    let mut expression_projections = Vec::with_capacity(expressions.len());
+    for expression in expressions {
+        if expression.id.0 as usize != expression_projections.len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked expression {} is non-dense",
+                expression.id.0
+            )));
+        }
+        let owner = scope_owners
+            .get(expression.scope_id.0 as usize)
+            .cloned()
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel expression {} references missing scope {}",
+                    expression.id.0, expression.scope_id.0
+                ))
+            })?;
+        let projection = publication
+            .__kernel_intern_projection(checked_link_definition_projection(owner))
+            .map_err(&error)?;
+        expression_projections.push(projection);
+    }
+
+    let mut statement_projections = Vec::with_capacity(statements.len());
+    for statement in statements {
+        if statement.id.0 as usize != statement_projections.len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked statement {} is non-dense",
+                statement.id.0
+            )));
+        }
+        let owner = scope_owners
+            .get(statement.scope_id.0 as usize)
+            .cloned()
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel statement {} references missing scope {}",
+                    statement.id.0, statement.scope_id.0
+                ))
+            })?;
+        statement_projections.push(
+            publication
+                .__kernel_intern_projection(checked_link_definition_projection(owner))
+                .map_err(&error)?,
+        );
+    }
+
+    for statement in statements {
+        let projection = statement_projections[statement.id.0 as usize];
+        publication
+            .__kernel_publish_dependency_row(
+                projection,
+                statement
+                    .value
+                    .map(|value| expression_projections[value.0 as usize]),
+            )
+            .map_err(&error)?;
+        publication
+            .__kernel_route(
+                CheckedImageRowDomainV2::Statement,
+                statement.id.0 as usize,
+                projection,
+            )
+            .map_err(&error)?;
+    }
+    for expression in expressions {
+        let projection = expression_projections[expression.id.0 as usize];
+        let target = match &expression.kind {
+            CheckedExpressionKind::Read { target, .. }
+            | CheckedExpressionKind::Drain { target, .. } => declaration_projections
+                .get(target.0 as usize)
+                .and_then(|projection| *projection),
+            _ => None,
+        };
+        publication
+            .__kernel_publish_dependency_row(projection, target)
+            .map_err(&error)?;
+        publication
+            .__kernel_route(
+                CheckedImageRowDomainV2::Expression,
+                expression.id.0 as usize,
+                projection,
+            )
+            .map_err(&error)?;
+    }
+
+    let mut callable_projections = BTreeMap::new();
+    for callable in callables {
+        let owner = callable_owners
+            .get(&callable.decl_id)
+            .cloned()
+            .ok_or_else(|| KernelCheckedLinkError::new("callable owner index is incomplete"))?;
+        let projection = publication
+            .__kernel_intern_projection(checked_link_interface_projection(owner))
+            .map_err(&error)?;
+        publication
+            .__kernel_publish_rows(projection, 1)
+            .map_err(&error)?;
+        publication
+            .__kernel_route(
+                CheckedImageRowDomainV2::Callable,
+                callable.decl_id.0 as usize,
+                projection,
+            )
+            .map_err(&error)?;
+        callable_projections.insert(callable.decl_id, projection);
+    }
+    for formal in context_formals {
+        let projection = *callable_projections.get(&formal.callable).ok_or_else(|| {
+            KernelCheckedLinkError::new(format!(
+                "context formal {} references missing callable {}",
+                formal.id.0, formal.callable.0
+            ))
+        })?;
+        publication
+            .__kernel_publish_rows(projection, 1)
+            .map_err(&error)?;
+        publication
+            .__kernel_route(
+                CheckedImageRowDomainV2::ContextFormal,
+                formal.id.0 as usize,
+                projection,
+            )
+            .map_err(&error)?;
+    }
+
+    if calls.len() != call_occurrences.len() {
+        return Err(KernelCheckedLinkError::new(
+            "kernel checked calls and structural occurrences are not aligned",
+        ));
+    }
+    let mut structural_sites = BTreeMap::new();
+    let mut call_projections = Vec::with_capacity(calls.len());
+    for (call, occurrence) in calls.iter().zip(call_occurrences) {
+        let digest =
+            boon_checked::checked_structural_call_site_digest_v4(occurrence).map_err(&error)?;
+        if structural_sites.insert(digest, occurrence).is_some() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked calls share structural occurrence {occurrence:?}"
+            )));
+        }
+        let owner = call
+            .owner_callable
+            .and_then(|owner| callable_owners.get(&owner).cloned())
+            .unwrap_or_else(|| root_owner.clone());
+        let projection = publication
+            .__kernel_intern_projection(CheckedShardProjectionKeyV2 {
+                owner,
+                region: CheckedShardRegionV2::Invocation {
+                    authored_call_site_digest: digest,
+                    identical_site_reverse_ordinal: 0,
+                },
+            })
+            .map_err(&error)?;
+        let callee = *callable_projections.get(&call.callable).ok_or_else(|| {
+            KernelCheckedLinkError::new(format!(
+                "kernel call {} references missing callable {}",
+                call.id.0, call.callable.0
+            ))
+        })?;
+        publication
+            .__kernel_publish_dependency_row(projection, [callee])
+            .map_err(&error)?;
+        publication
+            .__kernel_route(
+                CheckedImageRowDomainV2::Call,
+                call.id.0 as usize,
+                projection,
+            )
+            .map_err(&error)?;
+        call_projections.push(projection);
+    }
+    for path in call_result_paths {
+        let projection = call_projections
+            .get(path.call.0 as usize)
+            .copied()
+            .ok_or_else(|| KernelCheckedLinkError::new("call result path has no call route"))?;
+        publication
+            .__kernel_publish_rows(projection, 1)
+            .map_err(&error)?;
+    }
+    for (index, binding) in pattern_bindings.iter().enumerate() {
+        let projection = declaration_projections
+            .get(binding.declaration.0 as usize)
+            .and_then(|projection| *projection)
+            .unwrap_or(root_definition_id);
+        publication
+            .__kernel_publish_rows(projection, 1)
+            .map_err(&error)?;
+        publication
+            .__kernel_route(CheckedImageRowDomainV2::PatternBinding, index, projection)
+            .map_err(&error)?;
+    }
+    for (index, requirement) in resource_projection_requirements.iter().enumerate() {
+        let projection = expression_projections
+            .get(requirement.expression.0 as usize)
+            .copied()
+            .unwrap_or(root_definition_id);
+        let target = declaration_projections
+            .get(requirement.target.0 as usize)
+            .and_then(|projection| *projection);
+        publication
+            .__kernel_publish_dependency_row(projection, target)
+            .map_err(&error)?;
+        publication
+            .__kernel_route(
+                CheckedImageRowDomainV2::ResourceProjection,
+                index,
+                projection,
+            )
+            .map_err(&error)?;
+    }
+
+    for source in sources {
+        let owner = scope_owners[source.owner_scope.0 as usize].clone();
+        let projection = publication
+            .__kernel_intern_projection(checked_link_authority_projection(
+                scopes,
+                declarations,
+                owner,
+                &source.path,
+            ))
+            .map_err(&error)?;
+        publication
+            .__kernel_publish_dependency_row(
+                projection,
+                [expression_projections[source.expression.0 as usize]],
+            )
+            .map_err(&error)?;
+        publication
+            .__kernel_route(
+                CheckedImageRowDomainV2::Source,
+                source.id.0 as usize,
+                projection,
+            )
+            .map_err(&error)?;
+    }
+    for state in states {
+        let owner = scope_owners[state.owner_scope.0 as usize].clone();
+        let projection = publication
+            .__kernel_intern_projection(checked_link_authority_projection(
+                scopes,
+                declarations,
+                owner,
+                &state.path,
+            ))
+            .map_err(&error)?;
+        let binding = declaration_projections
+            .get(state.binding_declaration.0 as usize)
+            .and_then(|projection| *projection);
+        publication
+            .__kernel_publish_dependency_row(
+                projection,
+                [
+                    Some(expression_projections[state.expression.0 as usize]),
+                    Some(expression_projections[state.initial.0 as usize]),
+                    binding,
+                ]
+                .into_iter()
+                .flatten(),
+            )
+            .map_err(&error)?;
+        publication
+            .__kernel_route(
+                CheckedImageRowDomainV2::State,
+                state.id.0 as usize,
+                projection,
+            )
+            .map_err(&error)?;
+    }
+    for list in lists {
+        let owner = scope_owners[list.owner_scope.0 as usize].clone();
+        let projection = publication
+            .__kernel_intern_projection(checked_link_authority_projection(
+                scopes,
+                declarations,
+                owner,
+                &list.path,
+            ))
+            .map_err(&error)?;
+        publication
+            .__kernel_publish_dependency_row(
+                projection,
+                [expression_projections[list.producer.0 as usize]],
+            )
+            .map_err(&error)?;
+        publication
+            .__kernel_route(
+                CheckedImageRowDomainV2::List,
+                list.id.0 as usize,
+                projection,
+            )
+            .map_err(&error)?;
+    }
+    for (index, occurrence) in occurrences.iter().enumerate() {
+        let projection = declaration_projections
+            .get(occurrence.target.0 as usize)
+            .and_then(|projection| *projection)
+            .unwrap_or(root_definition_id);
+        publication
+            .__kernel_publish_rows(projection, 1)
+            .map_err(&error)?;
+        publication
+            .__kernel_route(CheckedImageRowDomainV2::Occurrence, index, projection)
+            .map_err(&error)?;
+    }
+    Ok(publication)
 }
 
 impl KernelCheckedLinkLayout {
@@ -592,6 +1162,7 @@ impl KernelCheckedLinkLayout {
         &self,
         project: &KernelProjectInput,
         snapshot: &KernelCheckedSnapshot,
+        source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
     ) -> Result<KernelCheckedRows, KernelCheckedLinkError> {
         let materialize_expression_rows = || {
@@ -681,6 +1252,25 @@ impl KernelCheckedLinkLayout {
             &statements,
             &calls,
         )?;
+        let checked_image_publication = checked_image_publication_v1(
+            source_bundle_digest_v1,
+            role,
+            &scopes,
+            &declarations,
+            &statements,
+            &expressions,
+            &callables,
+            &context_formals,
+            &calls,
+            &call_occurrences,
+            &call_result_paths,
+            &pattern_bindings,
+            &resource_projection_requirements,
+            &sources,
+            &states,
+            &lists,
+            &occurrences,
+        )?;
         Ok(KernelCheckedRows {
             scopes,
             declarations: declarations.into_boxed_slice(),
@@ -698,6 +1288,7 @@ impl KernelCheckedLinkLayout {
             lists,
             definition_execution_templates,
             runtime_flow_terms,
+            checked_image_publication,
             occurrences,
             occurrence_ranges,
         })
@@ -6804,7 +7395,19 @@ mod tests {
             CheckedStatementId(1)
         );
         let rows = layout
-            .materialize_rows(&project, &snapshot, ProgramRole::Client)
+            .materialize_rows(
+                &project,
+                &snapshot,
+                SourceBundleDigestV1::new(
+                    "kernel-link-test.bn",
+                    [boon_contract::SourceBundleUnit::new(
+                        "kernel-link-test.bn",
+                        "",
+                    )],
+                )
+                .unwrap(),
+                ProgramRole::Client,
+            )
             .expect("one linker call must materialize the complete checked-row surface");
         assert_eq!(rows.scopes.len(), 1);
         assert_eq!(rows.declarations.len(), 2);

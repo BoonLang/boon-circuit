@@ -5157,7 +5157,7 @@ fn named_value_origin_contract_flow(
         )
         .map_err(|error| {
             SemanticScopeStorageError::new(format!(
-                "checked named-list contract is incompatible with its exact contextual storage occurrence: {error}"
+                "checked named-list contract {projected_checked_type:?} is incompatible with its exact contextual storage occurrence {projected_storage_type:?} (named {projected_named_type:?}, root {root_flow:?}): {error}"
             ))
         })?;
         if contextualized != projected_named_type {
@@ -5165,7 +5165,13 @@ fn named_value_origin_contract_flow(
                 "semantic named-list contract {projected_named_type:?} differs from contextualized checked/storage authority {contextualized:?}"
             )));
         }
-        derive_storage_representation(projected_storage_type, &projected_named_type)?;
+        derive_storage_representation(projected_storage_type, &projected_named_type).map_err(
+            |error| {
+                SemanticScopeStorageError::new(format!(
+                    "named-list checked {projected_checked_type:?}, named {projected_named_type:?}, storage {projected_storage_type:?}, root {root_flow:?}: {error}"
+                ))
+            },
+        )?;
         return Ok(FlowType {
             mode: named_flow.mode,
             ty: projected_named_type,

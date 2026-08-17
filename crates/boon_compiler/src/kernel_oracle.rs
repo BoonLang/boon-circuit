@@ -11,10 +11,11 @@
 use boon_checked::{
     CheckedCall, CheckedCallableSignature, CheckedContextFormal, CheckedDeclaration,
     CheckedExpression, CheckedImageDefinitionAuthoritySealV1, CheckedImageKernelAuthorityV1,
-    CheckedList, CheckedListKeyPolicy, CheckedProgramFields, CheckedScope, CheckedSource,
-    CheckedState, CheckedStateKind, CheckedStatement, DiagnosticSeverity, ExternalTypeEnvironment,
-    FlowMode, FlowType, LexicalScopeId, ObjectShape, Type, TypeDiagnostic, Variant,
-    type_is_recursively_closed,
+    CheckedImageKernelPublicationV1, CheckedImageRowDomainV2, CheckedList, CheckedListKeyPolicy,
+    CheckedProgramFields, CheckedScope, CheckedShardProjectionKeyV2, CheckedShardRegionV2,
+    CheckedSource, CheckedState, CheckedStateKind, CheckedStatement, DiagnosticSeverity,
+    ExternalTypeEnvironment, FlowMode, FlowType, LexicalScopeId, ObjectShape, Type, TypeDiagnostic,
+    Variant, type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
     CheckDemand, KernelAbiCallContextInput, KernelAbiContextualOperation, KernelAbiInput,
@@ -1235,7 +1236,12 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     checked_link_references = layout.totals().resolved_references;
                     let rows_started = Instant::now();
                     let mut rows = layout
-                        .materialize_rows(kernel_input, &checked, role)
+                        .materialize_rows(
+                            kernel_input,
+                            &checked,
+                            project.source_bundle_digest_v1(),
+                            role,
+                        )
                         .map_err(|error| error.to_string())?;
                     let rows_us = elapsed_us(rows_started.elapsed());
                     let rebase_started = Instant::now();
@@ -2329,11 +2335,12 @@ pub(crate) fn compiler_diagnostics_from_kernel(
     })
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct KernelCheckedConstruction {
     pub fields: CheckedProgramFields,
     pub call_occurrences: Box<[StableOccurrenceKey]>,
     pub checked_image_authority: CheckedImageKernelAuthorityV1,
+    pub checked_image_publication: CheckedImageKernelPublicationV1,
     pub diagnostics: Box<[TypeDiagnostic]>,
     pub compile_work: KernelCompileWork,
     pub solve_work: KernelSolveWork,
@@ -2346,6 +2353,115 @@ const KERNEL_CHECKED_PROGRAM_METADATA_SEAL_DOMAIN_V1: &[u8] =
     b"boon.kernel-checked-program-metadata-seal.v1\0";
 const KERNEL_CHECKED_REFERENCED_ABI_SEAL_DOMAIN_V1: &[u8] =
     b"boon.kernel-checked-referenced-abi-seal.v1\0";
+
+fn append_kernel_checked_metadata_publication(
+    fields: &CheckedProgramFields,
+    publication: &mut CheckedImageKernelPublicationV1,
+) -> Result<(), String> {
+    let root_owner = boon_checked::CheckedShardOwnerKeyV2::ProgramTopLevel { role: fields.role };
+    let root_definition = publication.__kernel_intern_projection(CheckedShardProjectionKeyV2 {
+        owner: root_owner.clone(),
+        region: CheckedShardRegionV2::Definition,
+    })?;
+    for chain in &fields.order_chains {
+        let projection = publication
+            .__kernel_projection_for_route(CheckedImageRowDomainV2::Call, chain.call.0 as usize)
+            .ok_or_else(|| {
+                format!(
+                    "kernel order chain references missing checked call {}",
+                    chain.call.0
+                )
+            })?;
+        publication.__kernel_publish_rows(projection, 1)?;
+    }
+    for _ in &fields.lowering_metadata.source_units {
+        publication.__kernel_publish_rows(root_definition, 1)?;
+    }
+    for shape in &fields.lowering_metadata.source_payload_shape_table {
+        let owner = shape
+            .checked_sources
+            .iter()
+            .filter_map(|source| {
+                let projection = publication.__kernel_projection_for_route(
+                    CheckedImageRowDomainV2::Source,
+                    source.0 as usize,
+                )?;
+                publication
+                    .__kernel_projection_key(projection)
+                    .map(|projection| projection.owner.clone())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| root_owner.clone());
+        let projection = publication.__kernel_intern_projection(CheckedShardProjectionKeyV2 {
+            owner,
+            region: CheckedShardRegionV2::Definition,
+        })?;
+        publication.__kernel_publish_rows(projection, 1)?;
+    }
+    publication.__kernel_publish_rows(root_definition, 1)?;
+    for output in &fields.lowering_metadata.output_root_types {
+        let projection = publication
+            .__kernel_projection_for_route(
+                CheckedImageRowDomainV2::Declaration,
+                output.declaration.0 as usize,
+            )
+            .unwrap_or(root_definition);
+        publication.__kernel_publish_rows(projection, 1)?;
+    }
+    for entry in &fields.lowering_metadata.expr_type_table.entries {
+        let projection = fields
+            .expressions
+            .get(entry.expr_id)
+            .and_then(|expression| {
+                publication.__kernel_projection_for_route(
+                    CheckedImageRowDomainV2::Expression,
+                    expression.id.0 as usize,
+                )
+            })
+            .unwrap_or(root_definition);
+        publication.__kernel_publish_rows(projection, 1)?;
+    }
+    for entry in &fields.lowering_metadata.function_type_table.entries {
+        let projection = publication
+            .__kernel_projection_for_route(
+                CheckedImageRowDomainV2::Callable,
+                entry.callable.0 as usize,
+            )
+            .unwrap_or(root_definition);
+        publication.__kernel_publish_rows(projection, 1)?;
+    }
+    let named_values = &fields.lowering_metadata.named_value_type_table;
+    if named_values.checked_statement_sites.len() != named_values.entries.len() {
+        return Err("named-value image rows do not have exact statement-site coverage".to_owned());
+    }
+    for statement in &named_values.checked_statement_sites {
+        let projection = publication
+            .__kernel_projection_for_route(CheckedImageRowDomainV2::Statement, statement.0 as usize)
+            .unwrap_or(root_definition);
+        publication.__kernel_publish_rows(projection, 1)?;
+    }
+    for slot in &fields.lowering_metadata.render_slot_table.slots {
+        let projection = fields
+            .statements
+            .get(slot.slot_statement_id)
+            .and_then(|statement| {
+                publication.__kernel_projection_for_route(
+                    CheckedImageRowDomainV2::Statement,
+                    statement.id.0 as usize,
+                )
+            })
+            .unwrap_or(root_definition);
+        publication.__kernel_publish_rows(projection, 1)?;
+    }
+    publication.__kernel_publish_rows(
+        root_definition,
+        u32::try_from(fields.lowering_metadata.diagnostics.len())
+            .map_err(|_| "kernel checked diagnostic row count exceeds u32".to_owned())?,
+    )?;
+    Ok(())
+}
 
 /// Build a complete checked construction from one dense-kernel solve.
 ///
@@ -2440,7 +2556,12 @@ pub(crate) fn checked_construction_from_kernel(
     let layout_us = elapsed_us(phase_started.elapsed());
     let phase_started = Instant::now();
     let mut rows = layout
-        .materialize_rows(session.project(), &snapshot, role)
+        .materialize_rows(
+            session.project(),
+            &snapshot,
+            project.source_bundle_digest_v1(),
+            role,
+        )
         .map_err(|error| format!("cannot link dense kernel checked rows: {error}"))?;
     let rows_us = elapsed_us(phase_started.elapsed());
     let phase_started = Instant::now();
@@ -2523,6 +2644,7 @@ pub(crate) fn checked_construction_from_kernel(
 
     let phase_started = Instant::now();
     let call_occurrences = rows.call_occurrences;
+    let mut checked_image_publication = rows.checked_image_publication;
     let mut fields = CheckedProgramFields {
         source_bundle_digest_v1: project.source_bundle_digest_v1(),
         role,
@@ -2560,6 +2682,7 @@ pub(crate) fn checked_construction_from_kernel(
     fields.lowering_metadata =
         boon_typecheck::derive_project_checked_lowering_metadata(project, &fields, &diagnostics)
             .map_err(|error| format!("cannot finalize dense kernel checked metadata: {error}"))?;
+    append_kernel_checked_metadata_publication(&fields, &mut checked_image_publication)?;
     let program_metadata_fingerprint = boon_contract::canonical_serde_hash_v1(
         KERNEL_CHECKED_PROGRAM_METADATA_SEAL_DOMAIN_V1,
         &(
@@ -2594,6 +2717,7 @@ pub(crate) fn checked_construction_from_kernel(
         fields,
         call_occurrences,
         checked_image_authority,
+        checked_image_publication,
         diagnostics: diagnostics.into_boxed_slice(),
         compile_work,
         solve_work,
@@ -2635,6 +2759,7 @@ pub(crate) fn compiler_checked_from_kernel(
         typecheck_ms,
         Some(checked.call_occurrences),
         Some(Box::new(checked.checked_image_authority)),
+        Some(Box::new(checked.checked_image_publication)),
     ))
 }
 
@@ -8115,6 +8240,7 @@ fn compact_checked_presentation(
         declaration: Option<KernelDeclarationReference>,
         force: bool,
         raw_expressions: &[&AstExpr],
+        local_by_syntax: &BTreeMap<usize, usize>,
         nodes: &[KernelOwnerNode],
         boundaries: &BTreeMap<usize, KernelScopeId>,
         record_declaration_scopes: &BTreeMap<usize, KernelScopeId>,
@@ -8173,12 +8299,33 @@ fn compact_checked_presentation(
             presentations[expression].declaration = declaration;
         }
         assigned[expression] = true;
-        for input in nodes[expression]
+        let semantic_children = nodes[expression]
             .inputs
             .iter()
             .filter(|input| !matches!(input.role, KernelOwnerEdgeRole::ReadProvider))
-        {
-            let child = input.expression.0 as usize;
+            .map(|input| input.expression.0 as usize);
+        // Some contextual call arguments are retained on an authored pipe as
+        // lexical source rows even though WHILE/WHEN evaluation copies the
+        // actual input into each selected arm. They are intentionally absent
+        // from the solver edge table, but they still live under the authored
+        // callable scope. Walk those syntax-only operands here; later arm and
+        // callback placement can still refine occurrence copies below their
+        // exact lexical boundary.
+        let syntax_only_children = match &raw_expressions[expression].kind {
+            AstExprKind::Call { args, pass, .. } | AstExprKind::Pipe { args, pass, .. } => args
+                .iter()
+                .map(|argument| argument.value)
+                .chain(pass.iter().map(|pass| pass.value))
+                .filter_map(|syntax| local_by_syntax.get(&syntax).copied())
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        let mut children = semantic_children
+            .chain(syntax_only_children)
+            .collect::<Vec<_>>();
+        children.sort_unstable();
+        children.dedup();
+        for child in children {
             if child >= raw_expressions.len() {
                 continue;
             }
@@ -8188,6 +8335,7 @@ fn compact_checked_presentation(
                 declaration,
                 force,
                 raw_expressions,
+                local_by_syntax,
                 nodes,
                 boundaries,
                 record_declaration_scopes,
@@ -8226,6 +8374,7 @@ fn compact_checked_presentation(
                 inherited_declarations[index],
                 true,
                 raw_expressions,
+                local_by_syntax,
                 nodes,
                 &expression_boundaries,
                 &record_declaration_scopes,
@@ -8255,6 +8404,7 @@ fn compact_checked_presentation(
                 inherited_declarations[index],
                 true,
                 raw_expressions,
+                local_by_syntax,
                 nodes,
                 &expression_boundaries,
                 &record_declaration_scopes,
@@ -8273,6 +8423,7 @@ fn compact_checked_presentation(
                 facts.linkage.public_declaration,
                 false,
                 raw_expressions,
+                local_by_syntax,
                 nodes,
                 &expression_boundaries,
                 &record_declaration_scopes,
@@ -8415,6 +8566,7 @@ fn compact_checked_presentation(
                 declaration,
                 true,
                 raw_expressions,
+                local_by_syntax,
                 nodes,
                 &expression_boundaries,
                 &record_declaration_scopes,
@@ -8457,6 +8609,7 @@ fn compact_checked_presentation(
                 declaration,
                 true,
                 raw_expressions,
+                local_by_syntax,
                 nodes,
                 &callback_boundaries,
                 &record_declaration_scopes,
@@ -11370,6 +11523,146 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::time::Instant;
+
+    fn checked_image_first_difference(
+        direct: &boon_checked::CheckedImageHandoffV4,
+        replay: &boon_checked::CheckedImageHandoffV4,
+    ) -> String {
+        if direct.schema != replay.schema {
+            return format!(
+                "schema: direct={:?} replay={:?}",
+                direct.schema, replay.schema
+            );
+        }
+        if direct.source_bundle_digest_v1 != replay.source_bundle_digest_v1 {
+            return "source bundle digest".to_owned();
+        }
+        if direct.role != replay.role {
+            return format!("role: direct={:?} replay={:?}", direct.role, replay.role);
+        }
+        if direct.projections.len() != replay.projections.len() {
+            return format!(
+                "projection count: direct={} replay={}",
+                direct.projections.len(),
+                replay.projections.len()
+            );
+        }
+        for (ordinal, (direct_projection, replay_projection)) in direct
+            .projections
+            .iter()
+            .zip(&replay.projections)
+            .enumerate()
+        {
+            if direct_projection != replay_projection {
+                let direct_relocations =
+                    direct.projection_relocations(boon_checked::CheckedImageProjectionIdV2(
+                        u32::try_from(ordinal).expect("checked projection ordinal exceeds u32"),
+                    ));
+                let replay_relocations =
+                    replay.projection_relocations(boon_checked::CheckedImageProjectionIdV2(
+                        u32::try_from(ordinal).expect("checked projection ordinal exceeds u32"),
+                    ));
+                return format!(
+                    "projection {ordinal} key={:?}: direct_rows={}/{} replay_rows={}/{} direct_relocations={direct_relocations:?} replay_relocations={replay_relocations:?} direct_digest={:02x?} replay_digest={:02x?}",
+                    direct_projection.stable_key,
+                    direct_projection.row_count,
+                    direct_projection.dependency_row_count,
+                    replay_projection.row_count,
+                    replay_projection.dependency_row_count,
+                    direct_projection.local_content_digest,
+                    replay_projection.local_content_digest,
+                );
+            }
+        }
+        if direct.relocations != replay.relocations {
+            let ordinal = direct
+                .relocations
+                .iter()
+                .zip(&replay.relocations)
+                .position(|(direct, replay)| direct != replay)
+                .unwrap_or_else(|| direct.relocations.len().min(replay.relocations.len()));
+            return format!(
+                "relocation {ordinal}: direct={:?} replay={:?} direct_count={} replay_count={}",
+                direct.relocations.get(ordinal),
+                replay.relocations.get(ordinal),
+                direct.relocations.len(),
+                replay.relocations.len(),
+            );
+        }
+        if direct.entity_routes != replay.entity_routes {
+            let ordinal = direct
+                .entity_routes
+                .iter()
+                .zip(&replay.entity_routes)
+                .position(|(direct, replay)| direct != replay)
+                .unwrap_or_else(|| direct.entity_routes.len().min(replay.entity_routes.len()));
+            return format!(
+                "entity route {ordinal}: direct={:?} replay={:?} direct_count={} replay_count={}",
+                direct.entity_routes.get(ordinal),
+                replay.entity_routes.get(ordinal),
+                direct.entity_routes.len(),
+                replay.entity_routes.len(),
+            );
+        }
+        format!(
+            "local image digest: direct={:02x?} replay={:02x?}",
+            direct.local_image_digest, replay.local_image_digest,
+        )
+    }
+
+    fn passed_scope_ownership_mismatches(program: &CheckedProgramFields) -> Vec<String> {
+        let formal_owners = program
+            .context_formals
+            .iter()
+            .map(|formal| (formal.id, formal.callable))
+            .collect::<BTreeMap<_, _>>();
+        let scopes = program
+            .scopes
+            .iter()
+            .map(|scope| (scope.id, scope))
+            .collect::<BTreeMap<_, _>>();
+        let mut mismatches = Vec::new();
+        for expression in &program.expressions {
+            let CheckedExpressionKind::Passed {
+                formal, projection, ..
+            } = &expression.kind
+            else {
+                continue;
+            };
+            let expected = formal_owners.get(formal).copied();
+            let mut scope = Some(expression.scope_id);
+            let mut visited = BTreeSet::new();
+            let mut ancestry = Vec::new();
+            let mut actual = None;
+            while let Some(id) = scope {
+                if !visited.insert(id) {
+                    ancestry.push(format!("cycle({})", id.0));
+                    break;
+                }
+                let Some(row) = scopes.get(&id).copied() else {
+                    ancestry.push(format!("missing({})", id.0));
+                    break;
+                };
+                ancestry.push(format!("{}:{:?}:owner={:?}", row.id.0, row.kind, row.owner));
+                if row.kind == boon_checked::CheckedScopeKind::Function {
+                    actual = row.owner;
+                    break;
+                }
+                scope = row.parent;
+            }
+            if actual != expected {
+                mismatches.push(format!(
+                    "expression={} span={:?} scope={} formal={} projection={projection:?} expected={expected:?} actual={actual:?} ancestry=[{}]",
+                    expression.id.0,
+                    expression.span,
+                    expression.scope_id.0,
+                    formal.0,
+                    ancestry.join(" -> "),
+                ));
+            }
+        }
+        mismatches
+    }
 
     fn alpha_normalize_owner(
         result: &FlowType,
@@ -19313,14 +19606,169 @@ FUNCTION selectable_row(row) {
             )
         };
         let sealed =
-            boon_typecheck::seal_project_checked_program_construction_with_call_occurrences(
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication(
                 &project,
                 construction,
                 &checked.call_occurrences,
+                &checked.checked_image_authority,
+                checked.checked_image_publication,
             )
-            .expect("dense checked construction seals through explicit parser call identities");
+            .expect("dense checked construction seals through its direct image publication");
+        // SAFETY: `expected` is the same completed construction used above;
+        // the replay is an independent topology oracle, not a production
+        // fallback.
+        let replay_construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                expected.clone(),
+            )
+        };
+        let replay =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_authority(
+                &project,
+                replay_construction,
+                &checked.call_occurrences,
+                &checked.checked_image_authority,
+            )
+            .expect("rich checked rows replay the same V4 kernel authority");
+        assert_eq!(
+            sealed.image_handoff(),
+            replay.image_handoff(),
+            "direct checked-image publication must preserve exact V4 bytes",
+        );
         let (sealed, _) = sealed.into_parts();
         assert_eq!(sealed, expected);
+    }
+
+    #[test]
+    fn resource_checked_image_publication_matches_the_rich_v4_replay() {
+        let source = concat!(
+            "store: [\n",
+            "    pulse: SOURCE\n",
+            "    state:\n",
+            "        0 |> HOLD state { pulse |> THEN { 1 } }\n",
+            "    rows:\n",
+            "        LIST {\n",
+            "            1\n",
+            "            2\n",
+            "        }\n",
+            "]\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse checked-image resource fixture");
+        let checked = checked_construction_from_kernel(&project, boon_checked::ProgramRole::Server)
+            .expect("dense kernel builds resource checked rows");
+        assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+        let replay_fields = checked.fields.clone();
+        // SAFETY: both constructions are cloned from the same completed dense
+        // kernel result solely to compare independent sealing paths.
+        let direct_construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                checked.fields,
+            )
+        };
+        let replay_construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                replay_fields,
+            )
+        };
+        let direct =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication(
+                &project,
+                direct_construction,
+                &checked.call_occurrences,
+                &checked.checked_image_authority,
+                checked.checked_image_publication,
+            )
+            .expect("seal direct resource publication");
+        let replay =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_authority(
+                &project,
+                replay_construction,
+                &checked.call_occurrences,
+                &checked.checked_image_authority,
+            )
+            .expect("seal rich resource replay");
+        assert_eq!(direct.image_handoff(), replay.image_handoff());
+    }
+
+    #[test]
+    fn todomvc_checked_publication_matches_replay_and_verifies() {
+        let source_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/todo_mvc_physical/RUN.bn");
+        let (entrypoint, units) = crate::compiler_source_project_for_path(&source_path)
+            .expect("load TodoMVC source bundle");
+        let project = parse_project_syntax(
+            entrypoint,
+            units.into_iter().map(|unit| (unit.path, unit.source)),
+        )
+        .expect("parse TodoMVC unit-native project");
+        let checked = checked_construction_from_kernel(&project, boon_checked::ProgramRole::Client)
+            .expect("dense kernel builds TodoMVC checked rows");
+        assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+        let passed_scope_mismatches = passed_scope_ownership_mismatches(&checked.fields);
+        assert!(
+            passed_scope_mismatches.is_empty(),
+            "TodoMVC kernel PASSED scope ownership mismatches ({}):\n{}",
+            passed_scope_mismatches.len(),
+            passed_scope_mismatches.join("\n"),
+        );
+        let replay_fields = checked.fields.clone();
+        // SAFETY: both constructions are cloned from the same completed dense
+        // kernel result solely to compare independent sealing paths.
+        let direct_construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                checked.fields,
+            )
+        };
+        let replay_construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                replay_fields,
+            )
+        };
+        let direct =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication(
+                &project,
+                direct_construction,
+                &checked.call_occurrences,
+                &checked.checked_image_authority,
+                checked.checked_image_publication,
+            )
+            .expect("seal direct TodoMVC publication");
+        let replay =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_authority(
+                &project,
+                replay_construction,
+                &checked.call_occurrences,
+                &checked.checked_image_authority,
+            )
+            .expect("seal rich TodoMVC replay");
+        assert!(
+            direct.image_handoff() == replay.image_handoff(),
+            "TodoMVC direct checked publication differs: {}",
+            checked_image_first_difference(direct.image_handoff(), replay.image_handoff()),
+        );
+
+        let checked = compiler_checked_from_kernel(
+            project,
+            boon_parser::ParseWorkCounters::default(),
+            0.0,
+            boon_checked::ProgramRole::Client,
+        )
+        .expect("compile TodoMVC checked source through the dense kernel");
+        let compiled = crate::finish_checked_machine_plan_with_cancellation(
+            checked,
+            crate::CheckedCompileRequest::new(
+                crate::TargetProfile::SoftwareDefault,
+                crate::ProgramRole::Client,
+                crate::ApplicationIdentity::compiler_default(),
+            ),
+            None,
+        )
+        .expect("lower TodoMVC dense checked construction to MachinePlan");
+        compiled
+            .seal()
+            .expect("seal TodoMVC dense-kernel MachinePlan");
     }
 
     #[test]
@@ -19699,6 +20147,8 @@ FUNCTION selectable_row(row) {
             let expression_rows = checked.fields.expressions.len();
             let call_rows = checked.fields.calls.len();
             let definition_rows = checked.fields.declarations.len();
+            let replay_fields = std::env::var_os("BOON_KERNEL_CHECKED_REPLAY_PARITY")
+                .map(|_| checked.fields.clone());
             let seal_started = Instant::now();
             // SAFETY: the dense construction helper validates the complete
             // linked graph and lowering metadata before returning.
@@ -19707,13 +20157,41 @@ FUNCTION selectable_row(row) {
                     checked.fields,
                 )
             };
-            boon_typecheck::seal_project_checked_program_construction_with_call_occurrences(
-                &project,
-                construction,
-                &checked.call_occurrences,
-            )
-            .expect("seal NovyWave dense checked image");
+            let sealed =
+                boon_typecheck::seal_project_checked_program_construction_with_kernel_publication(
+                    &project,
+                    construction,
+                    &checked.call_occurrences,
+                    &checked.checked_image_authority,
+                    checked.checked_image_publication,
+                )
+                .expect("seal NovyWave dense checked image");
             let seal_us = elapsed_us(seal_started.elapsed());
+            if let Some(replay_fields) = replay_fields {
+                // SAFETY: this is an opt-in differential oracle over the same
+                // completed fields. It is deliberately outside `seal_us`.
+                let replay_construction = unsafe {
+                    boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                        replay_fields,
+                    )
+                };
+                let replay_started = Instant::now();
+                let replay =
+                    boon_typecheck::seal_project_checked_program_construction_with_kernel_authority(
+                        &project,
+                        replay_construction,
+                        &checked.call_occurrences,
+                        &checked.checked_image_authority,
+                    )
+                    .expect("replay NovyWave checked image from rich rows");
+                let replay_us = elapsed_us(replay_started.elapsed());
+                assert!(
+                    sealed.image_handoff() == replay.image_handoff(),
+                    "NovyWave direct checked publication must preserve exact V4 bytes: {}",
+                    checked_image_first_difference(sealed.image_handoff(), replay.image_handoff(),),
+                );
+                eprintln!("kernel-novywave checked_image_replay_parity=true replay_us={replay_us}");
+            }
             eprintln!(
                 "kernel-novywave production_checked=true profile={} construction_us={} seal_us={} total_us={} owners={} declarations={} expressions={} calls={} linked_operations={} activations={}",
                 if cfg!(debug_assertions) {

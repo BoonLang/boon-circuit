@@ -2652,7 +2652,10 @@ impl<'a> DocumentCompiler<'a> {
                     .map(|source| source.path.as_str())
                     .unwrap_or("<unknown>");
                 Err(PlanError::new(format!(
-                    "document executable read {expression} reads transient payload {field:?}{} from source {source} (`{source_path}`); retained path: {}; retain the event value in HOLD before rendering it",
+                    "document executable read {expression} (checked {}) reads transient payload {field:?}{} from source {source} (`{source_path}`); retained path: {}; retain the event value in HOLD before rendering it",
+                    self.program.executable.expressions[expression.as_usize()]
+                        .checked_expr_id
+                        .0,
                     if projection.is_empty() {
                         String::new()
                     } else {
@@ -4081,6 +4084,7 @@ fn executable_debug_label(program: &ErasedProgram, id: ir::ExecutableExprId) -> 
     };
     let kind = match &expression.kind {
         ir::ExecutableExpressionKind::Call { name, .. } => format!("call {name}"),
+        ir::ExecutableExpressionKind::UserCall { name, .. } => format!("user call {name}"),
         ir::ExecutableExpressionKind::Materialize { materialization } => program
             .materializations
             .get(*materialization)
@@ -4100,7 +4104,7 @@ fn executable_debug_label(program: &ErasedProgram, id: ir::ExecutableExprId) -> 
         ir::ExecutableExpressionKind::List { .. } => "list".to_owned(),
         _ => format!("{:?}", std::mem::discriminant(&expression.kind)),
     };
-    format!("{id}:{kind}")
+    format!("{id}[checked {}]:{kind}", expression.checked_expr_id.0)
 }
 
 fn record_value_class(

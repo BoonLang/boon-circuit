@@ -5,14 +5,20 @@
 //! typechecker may cross the unsafe sealing boundary to create a
 //! proof-bearing [`CheckedProgram`].
 
+mod checked_image_publication;
 mod owner_shard;
 mod type_terms;
+#[doc(hidden)]
+pub use checked_image_publication::{
+    CheckedImageKernelProjectionIdV1, CheckedImageKernelPublicationV1,
+};
 pub use owner_shard::*;
 pub use type_terms::*;
 
 use boon_contract::SourceBundleDigestV1;
 use boon_data::{Bits, ExactNumber};
 pub use boon_document_model::ProgramRole;
+use boon_syntax::StableOccurrenceKey;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::cmp::Ordering;
@@ -2314,6 +2320,25 @@ pub enum CheckedImageRowDomainV2 {
     NamedValueType,
     RenderSlot,
     Diagnostic,
+}
+
+#[derive(Serialize)]
+struct CheckedStructuralCallSiteDigestV4<'a> {
+    occurrence: &'a StableOccurrenceKey,
+}
+
+/// Shared structural-call digest used by direct kernel publication and the
+/// independent rich-row replay. Keeping this at the checked-model boundary
+/// prevents the two publishers from silently choosing different call keys.
+#[doc(hidden)]
+pub fn checked_structural_call_site_digest_v4(
+    occurrence: &StableOccurrenceKey,
+) -> Result<[u8; 32], String> {
+    boon_contract::canonical_serde_hash_v1(
+        b"boon.checked-structural-call-site.v4\0",
+        &CheckedStructuralCallSiteDigestV4 { occurrence },
+    )
+    .map_err(|error| format!("failed to hash checked call site: {error}"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

@@ -3394,6 +3394,7 @@ fn resolve_out_contracts(
                     apply_out_contract_substitutions(&flow_type.ty, &parent_substitutions)
                 }
             };
+            let actual = canonical_runtime_out_actual(actual);
             release_provisional_out_contract_bindings(
                 &input_parameter.flow_type.ty,
                 &actual,
@@ -4341,6 +4342,9 @@ fn concrete_checked_branch_expression_type(
         .transpose()?
         .unwrap_or_default();
     merge_out_contract_substitutions(&mut substitutions, frame_type_environment);
+    let container_is_contextually_closed = out_contract_type_is_resolved(
+        &apply_out_contract_substitutions(&expression.flow_type.ty, &substitutions),
+    );
 
     let mut concrete_branches = Vec::new();
     for branch in branches {
@@ -4366,10 +4370,23 @@ fn concrete_checked_branch_expression_type(
             &substitutions,
             visiting,
         )?;
-        unify_out_contract_type(
+        let concrete =
+            if !container_is_contextually_closed && !out_contract_type_is_resolved(&concrete) {
+                // A definition-local branch correlation that no OUT occurrence
+                // closed has no runtime type-variable identity. Preserve the
+                // branch structure while naming those residual leaves Unknown.
+                // If the enclosing occurrence was already closed by a frame,
+                // remain fail-closed instead: that concrete claim must be proved
+                // by every branch (covered by the regression below).
+                contextual_expansion::erase_runtime_type_vars(&concrete)
+            } else {
+                concrete
+            };
+        unify_out_branch_contract_type(
             &branch_expression.flow_type.ty,
             &concrete,
             &mut substitutions,
+            !container_is_contextually_closed,
         )
         .map_err(|error| {
             SemanticError::new(format!(
@@ -4774,6 +4791,24 @@ fn unify_out_contract_type(
     actual: &boon_checked::Type,
     substitutions: &mut BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
 ) -> Result<(), SemanticError> {
+    unify_out_contract_type_impl(pattern, actual, substitutions, false)
+}
+
+fn unify_out_branch_contract_type(
+    pattern: &boon_checked::Type,
+    actual: &boon_checked::Type,
+    substitutions: &mut BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
+    runtime_unknown_widens: bool,
+) -> Result<(), SemanticError> {
+    unify_out_contract_type_impl(pattern, actual, substitutions, runtime_unknown_widens)
+}
+
+fn unify_out_contract_type_impl(
+    pattern: &boon_checked::Type,
+    actual: &boon_checked::Type,
+    substitutions: &mut BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
+    runtime_unknown_widens: bool,
+) -> Result<(), SemanticError> {
     if !out_contract_type_is_resolved(actual) {
         return Err(SemanticError::new(format!(
             "OUT input has unresolved concrete type {actual:?}"
@@ -4781,6 +4816,17 @@ fn unify_out_contract_type(
     }
     match (pattern, actual) {
         (boon_checked::Type::Var(variable), actual) => match substitutions.get(variable) {
+            Some(existing)
+                if runtime_unknown_widens
+                    && (*existing == boon_checked::Type::Unknown
+                        || *actual == boon_checked::Type::Unknown) =>
+            {
+                // A residual definition-local alpha has already lost its
+                // cross-owner identity. Within an open branch join Unknown is
+                // therefore the stable wider runtime result, independent of
+                // branch order. Ordinary OUT inputs remain strict.
+                substitutions.insert(*variable, boon_checked::Type::Unknown);
+            }
             Some(existing) if out_contract_type_is_resolved(existing) && existing != actual => {
                 if boon_checked::resolved_type_is_assignable_to(actual, existing) {
                     // Preserve the already-known wider bound. The new
@@ -4803,7 +4849,7 @@ fn unify_out_contract_type(
             }
         },
         (boon_checked::Type::List(pattern), boon_checked::Type::List(actual)) => {
-            unify_out_contract_type(pattern, actual, substitutions)
+            unify_out_contract_type_impl(pattern, actual, substitutions, runtime_unknown_widens)
                 .map_err(|error| SemanticError::new(format!("list item: {error}")))?;
         }
         (boon_checked::Type::Union(pattern), boon_checked::Type::Union(actual))
@@ -4816,9 +4862,13 @@ fn unify_out_contract_type(
             // comparing the raw and substituted unions as unrelated concrete
             // types.
             for (index, (pattern, actual)) in pattern.iter().zip(actual).enumerate() {
-                unify_out_contract_type(pattern, actual, substitutions).map_err(|error| {
-                    SemanticError::new(format!("union member {index}: {error}"))
-                })?;
+                unify_out_contract_type_impl(
+                    pattern,
+                    actual,
+                    substitutions,
+                    runtime_unknown_widens,
+                )
+                .map_err(|error| SemanticError::new(format!("union member {index}: {error}")))?;
             }
         }
         (boon_checked::Type::Object(pattern), boon_checked::Type::Object(actual)) => {
@@ -4831,9 +4881,13 @@ fn unify_out_contract_type(
                         "OUT input object is missing required field `{name}`"
                     )));
                 };
-                unify_out_contract_type(pattern, actual_field, substitutions).map_err(|error| {
-                    SemanticError::new(format!("object field `{name}`: {error}"))
-                })?;
+                unify_out_contract_type_impl(
+                    pattern,
+                    actual_field,
+                    substitutions,
+                    runtime_unknown_widens,
+                )
+                .map_err(|error| SemanticError::new(format!("object field `{name}`: {error}")))?;
             }
         }
         (
@@ -4886,7 +4940,13 @@ fn unify_out_contract_type(
                             "OUT input tagged variant is missing required field `{name}`"
                         )));
                     };
-                    unify_out_contract_type(pattern, actual, substitutions).map_err(|error| {
+                    unify_out_contract_type_impl(
+                        pattern,
+                        actual,
+                        substitutions,
+                        runtime_unknown_widens,
+                    )
+                    .map_err(|error| {
                         SemanticError::new(format!("tagged variant field `{name}`: {error}"))
                     })?;
                 }
@@ -4920,12 +4980,23 @@ fn unify_out_contract_type(
                 )));
             }
             for (index, (pattern, actual)) in pattern_args.iter().zip(actual_args).enumerate() {
-                unify_out_contract_type(pattern, actual, substitutions).map_err(|error| {
+                unify_out_contract_type_impl(
+                    pattern,
+                    actual,
+                    substitutions,
+                    runtime_unknown_widens,
+                )
+                .map_err(|error| {
                     SemanticError::new(format!("function argument {index}: {error}"))
                 })?;
             }
-            unify_out_contract_type(&pattern_result.ty, &actual_result.ty, substitutions)
-                .map_err(|error| SemanticError::new(format!("function result: {error}")))?;
+            unify_out_contract_type_impl(
+                &pattern_result.ty,
+                &actual_result.ty,
+                substitutions,
+                runtime_unknown_widens,
+            )
+            .map_err(|error| SemanticError::new(format!("function result: {error}")))?;
         }
         (pattern, actual) if pattern == actual => {}
         (pattern, actual) => {
@@ -5252,6 +5323,19 @@ fn out_contract_type_is_resolved(ty: &boon_checked::Type) -> bool {
         | boon_checked::Type::Absent
         | boon_checked::Type::RenderContract
         | boon_checked::Type::Unknown => true,
+    }
+}
+
+fn canonical_runtime_out_actual(ty: boon_checked::Type) -> boon_checked::Type {
+    if out_contract_type_is_resolved(&ty) {
+        ty
+    } else {
+        // OUT construction has already applied every definition, parent, and
+        // evaluation-frame substitution available to this occurrence. Any
+        // remaining lexical alpha has no runtime identity; canonicalize only
+        // those leaves. Structural placeholders remain unresolved and will
+        // still be rejected by the strict contract unifier.
+        contextual_expansion::erase_runtime_type_vars(&ty)
     }
 }
 
@@ -5800,6 +5884,55 @@ mod tests {
     }
 
     #[test]
+    fn open_branch_runtime_unknown_widens_independently_of_input_order() {
+        let variable = boon_checked::TypeVar(7);
+        for (first, second) in [(&Type::Text, &Type::Unknown), (&Type::Unknown, &Type::Text)] {
+            let mut substitutions = BTreeMap::new();
+            unify_out_branch_contract_type(&Type::Var(variable), first, &mut substitutions, true)
+                .expect("first runtime branch binds the variable");
+            unify_out_branch_contract_type(&Type::Var(variable), second, &mut substitutions, true)
+                .expect("Unknown is the stable wider result of an open runtime branch");
+            assert_eq!(substitutions.get(&variable), Some(&Type::Unknown));
+        }
+
+        let mut strict = BTreeMap::from([(variable, Type::Text)]);
+        unify_out_branch_contract_type(&Type::Var(variable), &Type::Unknown, &mut strict, false)
+            .expect_err("a contextually closed branch container remains fail-closed");
+    }
+
+    #[test]
+    fn runtime_out_actual_erases_only_residual_type_variables() {
+        let actual = Type::List(Type::shared(Type::object(boon_checked::ObjectShape {
+            fields: BTreeMap::from([
+                ("known".to_owned(), Type::Text),
+                ("local".to_owned(), Type::Var(boon_checked::TypeVar(7))),
+            ]),
+            field_order: vec!["known".to_owned(), "local".to_owned()],
+            open: false,
+        })));
+        assert_eq!(
+            canonical_runtime_out_actual(actual),
+            Type::List(Type::shared(Type::object(boon_checked::ObjectShape {
+                fields: BTreeMap::from([
+                    ("known".to_owned(), Type::Text),
+                    ("local".to_owned(), Type::Unknown),
+                ]),
+                field_order: vec!["known".to_owned(), "local".to_owned()],
+                open: false,
+            })))
+        );
+
+        let unresolved = Type::UnresolvedShape {
+            reason: "empty list item".to_owned(),
+        };
+        assert_eq!(
+            canonical_runtime_out_actual(unresolved.clone()),
+            unresolved,
+            "structural placeholders must remain fail-closed",
+        );
+    }
+
+    #[test]
     fn first_concrete_out_input_replaces_an_initial_consumer_scaffold_once() {
         let variable = boon_checked::TypeVar(7);
         let provisional = Type::object(boon_checked::ObjectShape {
@@ -6179,6 +6312,57 @@ result:
             error.to_string().contains("Var(TypeVar(10))"),
             "unexpected branch-container error: {error}",
         );
+    }
+
+    #[test]
+    fn unresolved_branch_container_erases_only_its_runtime_local_alphas() {
+        let (mut fields, graph, container, branches, _) = checked_branch_container_fixture();
+        let variable = boon_checked::TypeVar(10);
+        fields
+            .expressions
+            .iter_mut()
+            .find(|expression| expression.id == container)
+            .expect("WHEN container expression")
+            .flow_type
+            .ty = Type::Var(variable);
+        let branch_outputs = branches
+            .iter()
+            .filter_map(|branch| {
+                fields
+                    .expressions
+                    .iter()
+                    .find(|expression| expression.id == *branch)
+                    .and_then(|expression| match expression.kind {
+                        boon_checked::CheckedExpressionKind::MatchArm {
+                            output: Some(output),
+                            ..
+                        } => Some(output),
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        for expression in fields.expressions.iter_mut().filter(|expression| {
+            branches.contains(&expression.id) || branch_outputs.contains(&expression.id)
+        }) {
+            expression.flow_type.ty = Type::Var(variable);
+        }
+
+        let actual = concrete_checked_branch_expression_type(
+            &fields,
+            &graph,
+            ScopedCheckedExpr {
+                expression: container,
+                frame: None,
+                evaluation_port: None,
+                value_frame: None,
+            },
+            &branches,
+            &BTreeMap::new(),
+            &mut BTreeSet::new(),
+        )
+        .expect("an open runtime branch container erases definition-local alpha names");
+
+        assert_eq!(actual, Type::Unknown);
     }
 
     #[test]

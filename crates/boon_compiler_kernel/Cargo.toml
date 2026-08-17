@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 boon_checked.workspace = true
+boon_contract.workspace = true
 boon_data.workspace = true
 boon_effect_schema.workspace = true
 boon_syntax.workspace = true

@@ -2824,6 +2824,39 @@ fn statement_value_for_expression(
             }),
         );
     }
+    if let SemanticExpressionKind::CanonicalRead {
+        source: Some(source),
+        ..
+    } = &consumer_expression.kind
+    {
+        let source_definition = execution
+            .sources
+            .get(source.source.as_usize())
+            .filter(|candidate| candidate.id == source.source)
+            .ok_or_else(|| {
+                format!(
+                    "semantic declaration {} expression {consumer} references missing exact SOURCE {}",
+                    declaration.0, source.source,
+                )
+            })?;
+        if source_definition.declaration == declaration {
+            let source_exact = exact
+                .iter()
+                .copied()
+                .filter(|occurrence| {
+                    occurrence.value == source_definition.expression
+                        || occurrence.statement == source_definition.statement
+                })
+                .collect::<Vec<_>>();
+            if source_exact.is_empty() {
+                return Err(format!(
+                    "semantic declaration {} expression {consumer} exact SOURCE {} has no matching statement value occurrence",
+                    declaration.0, source.source,
+                ));
+            }
+            exact = source_exact;
+        }
+    }
     let consumer_path = match &consumer_expression.kind {
         SemanticExpressionKind::CanonicalRead {
             path, projection, ..
@@ -3196,11 +3229,19 @@ fn semantic_expression_storage_scopes(
         };
 
     match &value.kind {
+        // A SOURCE read owns an event payload, not persistent list storage.
+        // Its contextual row authority is attached later from the exact
+        // SemanticSourceDef owner in `build_source_resources`; replaying the
+        // lexical declaration here can select unrelated sibling resources
+        // when owner partitioning exports them through one parent field.
+        SemanticExpressionKind::CanonicalRead {
+            source: Some(_), ..
+        } => Ok(BTreeSet::new()),
         SemanticExpressionKind::CanonicalRead {
             target,
             path,
             projection,
-            ..
+            source: None,
         }
         | SemanticExpressionKind::Drain {
             target,

@@ -4745,6 +4745,65 @@ following semantic cut remains definition-owned resource and row-storage
 templates plus compact invocation relocation; it must delete
 resource/storage/core reconstruction rather than cache its result.
 
+### Construction-Owned Checked-Image Publication (2026-08-17)
+
+That checked cut is now complete. The dense kernel linker publishes one
+move-only `CheckedImageKernelPublicationV1` while assigning final checked row
+IDs. The compiler appends only its project-level metadata rows, and the
+typechecker consumes the completed publication directly. The former rich-row
+V4 reconstruction remains test-only as an independent replay oracle; the
+architecture gate rejects production references to it. No selectable legacy
+path or second checked authority was introduced.
+
+The release NovyWave differential proves exact handoff parity between the two
+routes. Direct publication sealing takes 42.380 ms, while replaying the same
+completed rich rows takes 69.183 ms, removing 26.803 ms, or 38.7%, from that
+retrospective boundary. This is a measured pass deletion rather than a cache:
+the direct publication is transported by value and the production typechecker
+does not revisit expression, statement, call, resource, or occurrence tables
+to reconstruct checked-image topology.
+
+The first full application pass exposed four engine invariants that are now
+fixed at their owning boundaries: cyclic top-level union publishers preserve
+their concrete members through authoritative empty projections; named
+semantic statements seal the final occurrence flow after resource
+refinement; SOURCE provenance is distinct from runtime SOURCE containment;
+and an untouched definition-local PASSED alpha becomes an explicit empty
+runtime capture instead of importing the caller's complete source-bearing
+context. TodoMVC now reaches a verified MachinePlan through the direct kernel
+path, and the full ignored NovyWave semantic and release checked-publication
+oracles pass.
+
+The affected regular suites are green: 109 kernel tests, 340 typechecker tests
+with two product-scale ignores, 186 semantic tests with two product-scale
+ignores, 84 compiler library tests with one timing ignore plus all compiler
+integration tests, and 15 checked-model tests. The architecture report passes
+and the tree is formatting-clean.
+
+A freshly rebuilt pinned-stable release binary took 175.59 seconds and
+1,990,124 KiB peak RSS to link incrementally. Three independent, single-thread,
+cache-disabled fresh-process NovyWave observations have a 728.360 ms
+diagnostics median and a 2,730.229 ms verified median. The verified phase
+medians are 73.923 ms parse, 1,182.909 ms checking, 1,040.224 ms semantic
+construction, 0.577 ms WHERE verification, 52.617 ms IR lowering, 11.535 ms IR
+verification, 252.281 ms backend construction, 78.715 ms plan verification,
+and 69.201 ms serialization; median peak RSS is 358,164 KiB. Every observation
+has zero diagnostics and source digest
+`e8b6c437a3f112026ca4f8a58e9f9c98e04cb2e3826a29724f3dc8e72d8bda9b`.
+The current verified MachinePlan digest is
+`e2d673e3116f03622731f695cf2fb598d3313077845013f776930d38cc2acbea`;
+the digest change comes from the accepted checked/semantic correctness repairs,
+not from direct publication, whose V4 bytes match replay exactly.
+
+The result confirms the next ordering. WHERE is already sub-millisecond and
+the deleted checked replay was only tens of milliseconds; checking and
+semantic construction still own roughly 2.22 seconds together. The next
+speed-bearing cut remains definition-owned resource and symbolic row-storage
+templates instantiated through compact occurrence frames. It must delete the
+resource/storage/core reconstruction walks; more proof-codec tuning,
+unconditional threads, or a Rust-nightly switch cannot provide the required
+step change.
+
 The concurrent checker-kernel track remains the first half of the same
 definition-artifact design. Checked/execution receipt replay is already deleted;
 the work below completes the checker authority that will eventually produce the

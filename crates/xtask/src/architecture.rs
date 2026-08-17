@@ -85,6 +85,11 @@ pub fn collect_architecture_evidence(workspace: &Path) -> GateEvidence {
     );
     push_check(
         &mut checks,
+        "construction-owned-checked-image-publication",
+        construction_owned_checked_image_publication(workspace),
+    );
+    push_check(
+        &mut checks,
         "dependency-classifier-schema-v1",
         crate::dependency_classifier::verify(workspace),
     );
@@ -261,6 +266,79 @@ fn normative_single_thread_compiler(workspace: &Path) -> Result<String, String> 
 
     Ok(
         "normative compiler observations are single-threaded; three bounded two-worker projections remain explicit experiments only"
+            .to_owned(),
+    )
+}
+
+fn construction_owned_checked_image_publication(workspace: &Path) -> Result<String, String> {
+    let checked = read_text(&workspace.join("crates/boon_checked/src/lib.rs"))?;
+    let checked_publication =
+        read_text(&workspace.join("crates/boon_checked/src/checked_image_publication.rs"))?;
+    let linker = read_text(&workspace.join("crates/boon_compiler_kernel/src/link.rs"))?;
+    let typecheck = read_text(&workspace.join("crates/boon_typecheck/src/lib.rs"))?;
+    let compiler_path = workspace.join("crates/boon_compiler/src/lib.rs");
+    let compiler = read_text(&compiler_path)?;
+    let compiler_syntax = syn::parse_file(&compiler)
+        .map_err(|error| format!("cannot parse `{}`: {error}", compiler_path.display()))?;
+
+    for (label, source, required) in [
+        (
+            "checked model",
+            &checked_publication,
+            "pub struct CheckedImageKernelPublicationV1",
+        ),
+        (
+            "checked model",
+            &checked,
+            "pub use checked_image_publication::{",
+        ),
+        ("kernel linker", &linker, "checked_image_publication_v1("),
+        (
+            "typechecker seal",
+            &typecheck,
+            "checked_image_handoff_from_kernel_publication(",
+        ),
+        (
+            "typechecker seal",
+            &typecheck,
+            "construction-published checked image differs from the rich-row V4 replay oracle",
+        ),
+        (
+            "compiler handoff",
+            &compiler,
+            "checked_image_kernel_publication",
+        ),
+    ] {
+        if !source.contains(required) {
+            return Err(format!(
+                "{label} omits construction-owned checked-image proof `{required}`"
+            ));
+        }
+    }
+
+    let mut direct = ProductionIdentifierReferenceCollector::new(
+        "seal_project_checked_program_construction_with_kernel_publication",
+    );
+    direct.visit_file(&compiler_syntax);
+    if direct.references.len() != 1 {
+        return Err(format!(
+            "production compiler must consume one move-only checked-image publication; found {:?}",
+            direct.references,
+        ));
+    }
+    let mut replay = ProductionIdentifierReferenceCollector::new(
+        "seal_project_checked_program_construction_with_kernel_authority",
+    );
+    replay.visit_file(&compiler_syntax);
+    if !replay.references.is_empty() {
+        return Err(format!(
+            "production compiler replays rich checked rows at {:?}",
+            replay.references,
+        ));
+    }
+
+    Ok(
+        "dense checked rows publish one compact V4 topology; production verified sealing consumes it by value and rich checked replay is test-only"
             .to_owned(),
     )
 }

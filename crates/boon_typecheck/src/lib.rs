@@ -15631,7 +15631,6 @@ const CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V4: &[u8] = b"boon.checked-image-r
 const CHECKED_IMAGE_ROW_DIGEST_DOMAIN_V4: &[u8] = b"boon.checked-image-row.v4\0";
 const CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V4: &[u8] = b"boon.checked-image-shard.v4\0";
 const CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V4: &[u8] = b"boon.checked-image-handoff.v4\0";
-const CHECKED_STRUCTURAL_CALL_SITE_DOMAIN_V4: &[u8] = b"boon.checked-structural-call-site.v4\0";
 const CHECKED_IMAGE_KERNEL_OWNER_AUTHORITY_DOMAIN_V1: &[u8] =
     b"boon.checked-image-kernel-owner-authority.v1\0";
 const CHECKED_IMAGE_KERNEL_PROJECTION_AUTHORITY_DOMAIN_V1: &[u8] =
@@ -16394,11 +16393,8 @@ fn checked_image_handoff_with_call_occurrences(
             let structural_site = CheckedStructuralCallSiteV4 {
                 occurrence: occurrence.clone(),
             };
-            let structural_call_site_digest = boon_contract::canonical_serde_hash_v1(
-                CHECKED_STRUCTURAL_CALL_SITE_DOMAIN_V4,
-                &structural_site,
-            )
-            .map_err(|error| format!("failed to hash checked call site: {error}"))?;
+            let structural_call_site_digest =
+                boon_checked::checked_structural_call_site_digest_v4(occurrence)?;
             if let Some(previous) = structural_sites
                 .insert(structural_call_site_digest, structural_site.clone())
             {
@@ -16706,6 +16702,73 @@ fn checked_image_handoff_with_call_occurrences(
     builder.finish(program.source_bundle_digest_v1, program.role)
 }
 
+fn checked_image_handoff_from_kernel_publication(
+    program: &CheckedProgramFields,
+    authority: &CheckedImageKernelAuthorityV1,
+    publication: boon_checked::CheckedImageKernelPublicationV1,
+) -> Result<CheckedImageHandoffV4, String> {
+    let callable_owners = program
+        .callables
+        .iter()
+        .map(|callable| (callable.decl_id, checked_stable_owner(callable)))
+        .collect::<BTreeMap<_, _>>();
+    let scope_owners = program
+        .scopes
+        .iter()
+        .map(|scope| checked_owner_for_scope(program, &callable_owners, scope.id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let authority = checked_image_kernel_authority_context(program, &scope_owners, authority)?;
+    let (source_bundle_digest_v1, role, projections, routes) =
+        publication.__typechecker_into_parts();
+    if source_bundle_digest_v1 != program.source_bundle_digest_v1 || role != program.role {
+        return Err(
+            "kernel checked-image publication differs from its completed checked program"
+                .to_owned(),
+        );
+    }
+
+    let mut builder = CheckedImageHandoffBuilderV4::new(Some(authority));
+    let mut pending_ids = Vec::with_capacity(projections.len());
+    for (key, _, _, _) in &projections {
+        pending_ids.push(builder.intern(key.clone())?);
+    }
+    for (ordinal, (_, row_count, dependency_row_count, relocations)) in
+        projections.into_iter().enumerate()
+    {
+        let projection = pending_ids[ordinal];
+        let relocations = relocations
+            .into_iter()
+            .map(|target| {
+                pending_ids.get(target.as_usize()).copied().ok_or_else(|| {
+                    format!(
+                        "kernel checked-image projection {ordinal} references missing relocation {}",
+                        target.as_usize()
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let pending = &mut builder.projections[projection.as_usize()];
+        pending.row_count = row_count;
+        pending.dependency_row_count = dependency_row_count;
+        pending.relocations = relocations;
+    }
+    for ((domain, dense_index), projection) in routes {
+        let projection = pending_ids
+            .get(projection.as_usize())
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "kernel checked-image {domain:?} route {dense_index} references missing projection {}",
+                    projection.as_usize()
+                )
+            })?;
+        builder
+            .entity_routes
+            .push((domain, dense_index, projection));
+    }
+    builder.finish(source_bundle_digest_v1, role)
+}
+
 /// Consume a completed diagnostics construction and grant the runtime checked
 /// capability only after deriving its checked-image receipts.
 ///
@@ -16773,6 +16836,51 @@ pub fn seal_project_checked_program_construction_with_kernel_authority(
     )
 }
 
+/// Seal a dense-kernel construction from its move-only checked-image
+/// publication. Production uses this boundary so granting the runtime checked
+/// capability does not revisit every rich checked row. The historical replay
+/// remains an exact differential oracle in this crate's tests.
+pub fn seal_project_checked_program_construction_with_kernel_publication(
+    parsed: &ProjectSyntaxSnapshot,
+    construction: CheckedProgramConstruction,
+    call_occurrences: &[StableOccurrenceKey],
+    authority: &CheckedImageKernelAuthorityV1,
+    publication: boon_checked::CheckedImageKernelPublicationV1,
+) -> Result<CheckedProgram, String> {
+    let fields = construction.__typechecker_into_fields();
+    if fields.source_bundle_digest_v1 != parsed.source_bundle_digest_v1() {
+        return Err(format!(
+            "checked construction source digest {} differs from parsed source digest {}",
+            fields.source_bundle_digest_v1,
+            parsed.source_bundle_digest_v1()
+        ));
+    }
+    if call_occurrences.len() != fields.calls.len() {
+        return Err(format!(
+            "checked image received {} structural call occurrences for {} call rows",
+            call_occurrences.len(),
+            fields.calls.len(),
+        ));
+    }
+    let image_handoff =
+        checked_image_handoff_from_kernel_publication(&fields, authority, publication)?;
+    #[cfg(test)]
+    {
+        let oracle = checked_image_handoff_with_call_occurrences(
+            &fields,
+            call_occurrences,
+            Some(authority),
+        )?;
+        if image_handoff != oracle {
+            return Err(
+                "construction-published checked image differs from the rich-row V4 replay oracle"
+                    .to_owned(),
+            );
+        }
+    }
+    seal_kernel_checked_program_fields(fields, image_handoff, Some(authority))
+}
+
 fn seal_project_checked_program_construction_with_authority(
     parsed: &ProjectSyntaxSnapshot,
     construction: CheckedProgramConstruction,
@@ -16789,11 +16897,19 @@ fn seal_project_checked_program_construction_with_authority(
     }
     let image_handoff =
         checked_image_handoff_with_call_occurrences(&fields, call_occurrences, authority)?;
+    seal_kernel_checked_program_fields(fields, image_handoff, authority)
+}
+
+fn seal_kernel_checked_program_fields(
+    fields: CheckedProgramFields,
+    image_handoff: CheckedImageHandoffV4,
+    authority: Option<&CheckedImageKernelAuthorityV1>,
+) -> Result<CheckedProgram, String> {
     let runtime_flow_terms = checked_runtime_flow_term_handoff(&fields, &image_handoff, authority)?;
     // SAFETY: the compact checker supplies fields only after successful
-    // construction and supplies parser-issued structural call identities in
-    // exact dense call order. The source digest and handoff receipts are
-    // validated above before granting runtime capability.
+    // construction. Its parser-issued call identities or move-only image
+    // publication have already been validated against this exact source and
+    // V4 authority before granting the runtime capability.
     Ok(unsafe {
         CheckedProgram::from_typechecker_parts_unchecked(fields, image_handoff, runtime_flow_terms)
     })

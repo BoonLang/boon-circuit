@@ -740,6 +740,7 @@ name = "boon_compiler_kernel"
 version = "0.1.0"
 dependencies = [
  "boon_checked",
+ "boon_contract",
  "boon_data",
  "boon_effect_schema",
  "boon_syntax",

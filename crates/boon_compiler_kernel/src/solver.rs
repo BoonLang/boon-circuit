@@ -2304,6 +2304,9 @@ impl ComponentSolver {
     ) {
         let variable = self.root(variable);
         let provider = self.resolve_term_head(provider);
+        let Some(provider) = self.without_top_level_union_self(variable, provider) else {
+            return;
+        };
         if self.occurs(variable, provider) {
             return;
         }
@@ -2318,6 +2321,62 @@ impl ComponentSolver {
         self.replace_binding_dependencies(variable, provider);
         self.cells[variable.0 as usize].binding = Some(provider);
         self.touch(variable);
+    }
+
+    /// Normalize the least fixed point of a top-level value union.
+    ///
+    /// A cyclic `LATEST` pair can produce equations such as
+    /// `left = right | Text` and `right = left | Text`. Once one side has
+    /// published, resolving the other side exposes its own output variable as
+    /// a top-level union member. The general occurs check must continue to
+    /// reject recursive object/list/function shapes, but rejecting this whole
+    /// value union also discards the concrete `Text` member and leaves a
+    /// meaningless result-only alpha. Remove only exact top-level self
+    /// members; a pure recursive union stays open, and nested recursion still
+    /// reaches `replace_binding`'s ordinary occurs check.
+    fn without_top_level_union_self(
+        &mut self,
+        variable: TypeVariableId,
+        provider: TypeTermId,
+    ) -> Option<TypeTermId> {
+        let mut removed_self = false;
+        let mut retained = Vec::new();
+        let mut pending = vec![provider];
+        let mut expanded_variables = Vec::new();
+        while let Some(candidate) = pending.pop() {
+            match self.program.terms.term(candidate).clone() {
+                TypeTerm::Variable(candidate) => {
+                    let candidate = self.root(candidate);
+                    if candidate == variable {
+                        removed_self = true;
+                        continue;
+                    }
+                    if expanded_variables.contains(&candidate) {
+                        retained.push(self.program.terms.variable(candidate));
+                        continue;
+                    }
+                    if let Some(binding) = self.cells[candidate.0 as usize].binding {
+                        expanded_variables.push(candidate);
+                        pending.push(binding);
+                    } else {
+                        retained.push(self.program.terms.variable(candidate));
+                    }
+                }
+                TypeTerm::Union(members) => pending.extend(members.iter().rev().copied()),
+                // Stop at structural terms. A recursive object, list,
+                // function, map, set, or tagged payload must still be rejected
+                // by the ordinary occurs check below; only the directional
+                // value-union spine has least-fixed-point semantics.
+                _ => retained.push(candidate),
+            }
+        }
+        if !removed_self {
+            return Some(provider);
+        }
+        if retained.is_empty() {
+            return None;
+        }
+        Some(self.program.terms.union(retained))
     }
 
     fn merge_equal_terms(&mut self, left: TypeTermId, right: TypeTermId) -> TypeTermId {
@@ -3770,6 +3829,76 @@ mod tests {
                 false,
             ))
         );
+    }
+
+    #[test]
+    fn cyclic_union_publishers_converge_on_their_concrete_members() {
+        let mut builder = ComponentProgramBuilder::new();
+        let left = builder.new_authoritative_provider();
+        let right = builder.new_authoritative_provider();
+        let left_term = builder.variable_term(left);
+        let right_term = builder.variable_term(right);
+        let text = builder.terms().text();
+        builder.add_publish(left, [right_term, text], PublishMode::Union);
+        builder.add_publish(right, [left_term, text], PublishMode::Union);
+        let left_output = builder.add_output(left, FlowMode::Continuous);
+        let right_output = builder.add_output(right, FlowMode::Continuous);
+
+        let artifact = solve_component(builder.finish()).unwrap();
+        assert_eq!(
+            artifact.output(left_output).unwrap().flow_type.ty,
+            Type::Text
+        );
+        assert_eq!(
+            artifact.output(right_output).unwrap().flow_type.ty,
+            Type::Text
+        );
+        assert_eq!(artifact.work.operations, 2);
+        assert!(artifact.work.activations < 10);
+    }
+
+    #[test]
+    fn cyclic_union_publishers_retain_only_their_external_alpha() {
+        let mut builder = ComponentProgramBuilder::new();
+        let formal = builder.new_contextual_hole();
+        let draft = builder.new_authoritative_provider();
+        let title = builder.new_authoritative_provider();
+        let edited = builder.new_authoritative_provider();
+        let edited_block = builder.new_authoritative_provider();
+        builder.add_projection_into(edited, [], edited_block);
+        let update = builder.add_projection(edited_block, []);
+        let text = builder.terms().text();
+        builder.add_publish(draft, [text], PublishMode::Union);
+        let formal_term = builder.variable_term(formal);
+        let update_term = builder.variable_term(update);
+        builder.add_publish(title, [formal_term, update_term], PublishMode::Union);
+        let draft_term = builder.variable_term(draft);
+        let title_term = builder.variable_term(title);
+        builder.add_publish(edited, [draft_term, title_term], PublishMode::Union);
+        let edited_block_output = builder.add_output(edited_block, FlowMode::Continuous);
+        let update_output = builder.add_output(update, FlowMode::Continuous);
+        let title_output = builder.add_output(title, FlowMode::Continuous);
+        let edited_output = builder.add_output(edited, FlowMode::Continuous);
+
+        let artifact = solve_component(builder.finish()).unwrap();
+        let expected = Type::Union(vec![Type::Text, Type::Var(boon_checked::TypeVar(0))].into());
+        assert_eq!(
+            artifact.output(edited_block_output).unwrap().flow_type.ty,
+            expected
+        );
+        assert_eq!(
+            artifact.output(update_output).unwrap().flow_type.ty,
+            expected
+        );
+        assert_eq!(
+            artifact.output(title_output).unwrap().flow_type.ty,
+            expected
+        );
+        assert_eq!(
+            artifact.output(edited_output).unwrap().flow_type.ty,
+            expected
+        );
+        assert!(artifact.work.activations < 20);
     }
 
     #[test]

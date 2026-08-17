@@ -463,6 +463,18 @@ impl CheckedSourceContainmentIndex {
         if !active.insert(node.clone()) {
             return false;
         }
+        // A checked state expression publishes its current durable value. Its
+        // initializer/update graph may consume SOURCE payloads, but those are
+        // scheduling dependencies rather than SOURCE values contained in the
+        // published state. Crossing this boundary would incorrectly make an
+        // ordinary read of a HOLD/LATEST result transient.
+        if lookup
+            .state_for_expression(program, expression_id)
+            .is_some()
+        {
+            active.remove(&node);
+            return false;
+        }
         if lookup
             .source_for_expression(program, expression_id)
             .is_some()
@@ -614,6 +626,13 @@ impl CheckedSourceContainmentIndex {
     ) -> bool {
         let node = CheckedSourceContainmentNode::ListItem(expression_id, projection.to_vec());
         if !active.insert(node.clone()) {
+            return false;
+        }
+        if lookup
+            .state_for_expression(program, expression_id)
+            .is_some()
+        {
+            active.remove(&node);
             return false;
         }
         let result = lookup
@@ -916,15 +935,17 @@ impl CheckedProgramLookup {
         };
         let containment = CheckedSourceContainmentIndex::new(program, &lookup);
         for requirement in &program.resource_projection_requirements {
-            if (!requirement.source_origins.is_empty()
-                || containment.projection_contains_source(
-                    program,
-                    &lookup,
-                    requirement.target,
-                    &requirement.projection,
-                ))
-                && let Some(slot) =
-                    source_bearing_resource_projections.get_mut(requirement.expression.0 as usize)
+            // `source_origins` answers where a value was computed from. A
+            // durable HOLD/LATEST result can therefore have exact SOURCE
+            // origins without containing any transient SOURCE handle. Body
+            // retention needs the separate value-containment fact.
+            if containment.projection_contains_source(
+                program,
+                &lookup,
+                requirement.target,
+                &requirement.projection,
+            ) && let Some(slot) =
+                source_bearing_resource_projections.get_mut(requirement.expression.0 as usize)
             {
                 *slot = true;
             }
@@ -1670,8 +1691,21 @@ pub(crate) fn contextualize_runtime_storage_type(
 ) -> Result<Type, String> {
     refine_runtime_occurrence_type(checked, runtime)?;
 
+    fn is_runtime_placeholder(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }
+        ) || matches!(ty, Type::Object(shape) if shape.open && shape.fields.is_empty())
+    }
+
     fn merge(checked: &Type, runtime: &Type) -> Type {
         if checked == runtime {
+            return checked.clone();
+        }
+        if is_runtime_placeholder(checked) {
+            return runtime.clone();
+        }
+        if is_runtime_placeholder(runtime) {
             return checked.clone();
         }
         match (checked, runtime) {
@@ -1685,6 +1719,27 @@ pub(crate) fn contextualize_runtime_storage_type(
             (Type::Set(checked), Type::Set(runtime)) => {
                 Type::Set(Type::shared(merge(checked, runtime)))
             }
+            (Type::Union(checked), Type::Union(runtime)) if checked.len() == runtime.len() => {
+                Type::Union(
+                    checked
+                        .iter()
+                        .zip(runtime)
+                        .map(|(checked, runtime)| merge(checked, runtime))
+                        .collect(),
+                )
+            }
+            (Type::Union(checked), runtime) if !matches!(runtime, Type::Union(_)) => Type::Union(
+                checked
+                    .iter()
+                    .map(|checked| merge(checked, runtime))
+                    .collect(),
+            ),
+            (checked, Type::Union(runtime)) if !matches!(checked, Type::Union(_)) => Type::Union(
+                runtime
+                    .iter()
+                    .map(|runtime| merge(checked, runtime))
+                    .collect(),
+            ),
             (
                 Type::Map {
                     key: checked_key,
@@ -1732,6 +1787,51 @@ pub(crate) fn contextualize_runtime_storage_type(
         &erase_runtime_type_vars(checked),
         &erase_runtime_type_vars(runtime),
     ))
+}
+
+fn finalize_named_statement_occurrence_flows(
+    expressions: &[SemanticExpression],
+    statements: &mut [SemanticStatement],
+) -> Result<(), ExpansionError> {
+    for statement in statements {
+        if statement.declaration.is_none()
+            || !matches!(
+                statement.kind,
+                SemanticStatementKind::Field { .. }
+                    | SemanticStatementKind::Hold { .. }
+                    | SemanticStatementKind::List { .. }
+            )
+        {
+            continue;
+        }
+        let (Some(existing), Some(value)) = (statement.flow_type.as_ref(), statement.value) else {
+            continue;
+        };
+        let runtime = expressions
+            .get(value.as_usize())
+            .filter(|expression| expression.id == value)
+            .map(|expression| expression.flow_type.clone())
+            .ok_or_else(|| {
+                ExpansionError::InvalidLocalBindings(format!(
+                    "named semantic statement {} references missing value {value}",
+                    statement.id,
+                ))
+            })?;
+        refine_runtime_occurrence_type(&existing.ty, &runtime.ty).map_err(|error| {
+            ExpansionError::InvalidLocalBindings(format!(
+                "named semantic statement {} declaration {:?} flow {:?} cannot represent its finalized occurrence value {value} flow {:?}: {error}",
+                statement.id, statement.declaration, existing, runtime,
+            ))
+        })?;
+        // Expansion memoization lets a later call occurrence refine an
+        // expression that an earlier named statement already references. Seal
+        // the statement only after every occurrence and resource identity has
+        // been discovered, so the statement and its executable value publish
+        // one exact runtime flow. Checked declarations remain the independent
+        // public/template authority.
+        statement.flow_type = Some(runtime);
+    }
+    Ok(())
 }
 
 fn refine_runtime_call_boundary_type(
@@ -2201,6 +2301,7 @@ fn completed_context_formal_flow_types(
 ) -> Result<BTreeMap<ContextFormalId, FlowType>, ExpansionError> {
     let mut owners = BTreeMap::new();
     let mut completed = BTreeMap::new();
+    let mut whole_value_requirements = BTreeSet::new();
     for formal in &program.context_formals {
         if owners.insert(formal.id, formal.callable).is_some()
             || completed
@@ -2236,11 +2337,53 @@ fn completed_context_formal_flow_types(
         let flow_type = completed
             .get_mut(formal)
             .expect("context-formal owner and flow indexes are built together");
+        if projection.is_empty() {
+            whole_value_requirements.insert(*formal);
+        }
         flow_type.ty = add_missing_context_projection(
             &flow_type.ty,
             projection,
             erase_runtime_type_vars(&expression.flow_type.ty),
         );
+    }
+
+    // A retained wrapper may forward its inherited PASSED value without
+    // reading it directly. Preserve an actual whole-value requirement through
+    // that call chain, while allowing a definition-local alpha left untouched
+    // by every selected call to close to an empty runtime capture.
+    loop {
+        let mut changed = false;
+        for call in &program.calls {
+            let CheckedContextBinding::Inherited {
+                formal: caller_formal,
+            } = call.context_binding
+            else {
+                continue;
+            };
+            let target_formal = program
+                .callables
+                .iter()
+                .find(|callable| callable.decl_id == call.callable)
+                .and_then(|callable| callable.context_formal);
+            if target_formal.is_some_and(|formal| whole_value_requirements.contains(&formal)) {
+                changed |= whole_value_requirements.insert(caller_formal);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    for (formal, flow_type) in &mut completed {
+        if !whole_value_requirements.contains(formal)
+            && matches!(flow_type.ty, Type::Var(_) | Type::Unknown)
+        {
+            flow_type.ty = Type::object(boon_checked::ObjectShape {
+                fields: BTreeMap::new(),
+                field_order: Vec::new(),
+                open: true,
+            });
+        }
     }
     Ok(completed)
 }
@@ -3472,6 +3615,7 @@ pub(crate) fn derive_semantic_execution_graph(
         &semantic_source_by_checked_instance,
         &semantic_state_by_checked_instance,
     )?;
+    finalize_named_statement_occurrence_flows(&arena.expressions, &mut statements)?;
     trace_phase("source_and_state_inventory");
     let execution = SemanticExecutionImageColumnsV1 {
         materializations: materializations.to_vec(),
@@ -7669,7 +7813,12 @@ impl<'a> SemanticExpressionBuilder<'a> {
             return self.project(origin, owner, actual, path.clone());
         };
         if shape.fields.is_empty() {
-            return self.project(origin, owner, actual, path.clone());
+            let captured = self.push(origin, owner, SemanticExpressionKind::Object(Vec::new()));
+            self.expressions[captured.as_usize()].flow_type = FlowType {
+                mode,
+                ty: erase_runtime_type_vars(required),
+            };
+            return Ok(captured);
         }
 
         let mut names = Vec::with_capacity(shape.fields.len());
@@ -9469,6 +9618,60 @@ mod tests {
     }
 
     #[test]
+    fn unconstrained_retained_context_alpha_closes_to_an_empty_capture() {
+        let parsed = boon_parser::parse_source(
+            "semantic-empty-retained-context.bn",
+            concat!("FUNCTION view() {\n", "    PASSED.store.value\n", "}\n",),
+        )
+        .unwrap();
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            !checked.report.has_errors(),
+            "diagnostics: {:#?}",
+            checked.report.diagnostics
+        );
+        let (mut program, _) = checked
+            .program
+            .expect("valid contextual callable")
+            .into_parts();
+        let formal = program
+            .callables
+            .iter()
+            .find(|callable| callable.name.ends_with("view"))
+            .and_then(|callable| callable.context_formal)
+            .expect("view PASSED formal");
+        program
+            .context_formals
+            .iter_mut()
+            .find(|candidate| candidate.id == formal)
+            .expect("view context scheme")
+            .scheme
+            .flow_type
+            .ty = Type::Var(boon_checked::TypeVar(0));
+        program.expressions.retain(|expression| {
+            !matches!(
+                expression.kind,
+                CheckedExpressionKind::Passed {
+                    formal: expression_formal,
+                    ..
+                } if expression_formal == formal
+            )
+        });
+
+        let lookup = CheckedProgramLookup::new(&program);
+        let completed = completed_context_formal_flow_types(&program, &lookup)
+            .expect("completed retained context templates")
+            .remove(&formal)
+            .expect("completed retained context template");
+        let Type::Object(shape) = completed.ty else {
+            panic!("an unused PASSED alpha must become an empty runtime object")
+        };
+        assert!(shape.open);
+        assert!(shape.fields.is_empty());
+        assert!(shape.field_order.is_empty());
+    }
+
+    #[test]
     fn named_statement_erases_child_owned_passed_alphas_like_its_semantic_value() {
         let (checked, graph) = semantic_execution_before_resources(
             r#"
@@ -9549,6 +9752,43 @@ FUNCTION view() {
         };
         assert_eq!(event.fields.get("click"), Some(&Type::Unknown));
         assert_eq!(event.fields.get("change"), Some(&Type::Unknown));
+    }
+
+    #[test]
+    fn named_statement_seal_observes_late_occurrence_refinement() {
+        let (_, mut graph) = semantic_execution_before_resources(
+            r#"
+panel: TEXT { ready }
+"#,
+        );
+        let statement_index = graph
+            .statements
+            .iter()
+            .position(|statement| {
+                matches!(
+                    &statement.kind,
+                    SemanticStatementKind::Field { name, .. } if name == "panel"
+                )
+            })
+            .expect("top-level panel statement");
+        let value = graph.statements[statement_index]
+            .value
+            .expect("panel statement expression");
+        graph.expressions[value.as_usize()].flow_type.ty =
+            Type::Union(vec![Type::Text, Type::Text]);
+        assert_ne!(
+            graph.statements[statement_index].flow_type.as_ref(),
+            Some(&graph.expressions[value.as_usize()].flow_type),
+            "the regression requires a refinement after the statement was first constructed",
+        );
+
+        finalize_named_statement_occurrence_flows(&graph.expressions, &mut graph.statements)
+            .expect("late compatible occurrence refinement seals");
+
+        assert_eq!(
+            graph.statements[statement_index].flow_type.as_ref(),
+            Some(&graph.expressions[value.as_usize()].flow_type),
+        );
     }
 
     #[test]
@@ -9975,6 +10215,49 @@ FUNCTION copied_controls(row) {
         );
         assert!(graph.expressions.iter().all(|expression| {
             !matches!(
+                &expression.kind,
+                SemanticExpressionKind::Call {
+                    callable: candidate,
+                    callable_kind: SemanticCallableKind::User,
+                    ..
+                } if *candidate == callable.id
+            )
+        }));
+    }
+
+    #[test]
+    fn state_value_projection_does_not_inherit_update_source_containment() {
+        let graph = semantic_graph(
+            r#"
+store: [
+    events: [change: SOURCE]
+    row: [
+        current:
+            Text/empty()
+            |> HOLD current { events.change.text }
+        controls: events
+    ]
+]
+
+result: render(row: store.row)
+
+FUNCTION render(row) {
+    row.current
+}
+"#,
+        );
+
+        let callable = graph
+            .callables
+            .iter()
+            .find(|callable| callable.name.ends_with("render"))
+            .expect("render callable");
+        assert!(
+            callable.semantic_root.is_some(),
+            "a durable state value must not inherit SOURCE containment from its update graph",
+        );
+        assert!(graph.expressions.iter().any(|expression| {
+            matches!(
                 &expression.kind,
                 SemanticExpressionKind::Call {
                     callable: candidate,

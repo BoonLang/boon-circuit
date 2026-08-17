@@ -298,6 +298,9 @@ pub struct CheckedSourceFromSource {
     /// kernel. A verified request consumes it instead of serializing every
     /// rich checked row to prove the same immutable definitions again.
     checked_image_kernel_authority: Option<Box<boon_checked::CheckedImageKernelAuthorityV1>>,
+    /// Compact projection topology emitted beside the dense kernel rows.
+    /// Verified sealing consumes it by value instead of replaying rich rows.
+    checked_image_kernel_publication: Option<Box<boon_checked::CheckedImageKernelPublicationV1>>,
 }
 
 /// Produces structured parser/type diagnostics for a failed runtime compile.
@@ -762,6 +765,7 @@ pub fn compile_artifact_oracle_pair(
         check_output,
         None,
         None,
+        None,
     )?;
     let retained = compile_checked_artifact_oracle_plan(
         checked.clone(),
@@ -886,6 +890,7 @@ pub(crate) fn checked_source_from_checked_fields(
     typecheck_ms: f64,
     checked_call_occurrences: Option<Box<[boon_syntax::StableOccurrenceKey]>>,
     checked_image_kernel_authority: Option<Box<boon_checked::CheckedImageKernelAuthorityV1>>,
+    checked_image_kernel_publication: Option<Box<boon_checked::CheckedImageKernelPublicationV1>>,
 ) -> CheckedSourceFromSource {
     let metadata = &fields.lowering_metadata;
     let render_slot_failure_count = metadata
@@ -1015,6 +1020,7 @@ pub(crate) fn checked_source_from_checked_fields(
         },
         checked_call_occurrences,
         checked_image_kernel_authority,
+        checked_image_kernel_publication,
     }
 }
 
@@ -1097,6 +1103,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         mut profile,
         checked_call_occurrences,
         checked_image_kernel_authority,
+        checked_image_kernel_publication,
     } = checked_source;
     let deferred_runtime_handoff = output.construction.is_some();
     let runtime_handoff_started = Instant::now();
@@ -1107,8 +1114,9 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
     let checked = checked_program_from_output(
         syntax,
         output,
-        checked_call_occurrences.as_deref(),
-        checked_image_kernel_authority.as_deref(),
+        checked_call_occurrences,
+        checked_image_kernel_authority,
+        checked_image_kernel_publication,
     )?;
     if deferred_runtime_handoff {
         let runtime_handoff_ms = elapsed_ms(runtime_handoff_started);
@@ -1262,8 +1270,9 @@ impl CheckedSyntaxRef<'_> {
 fn checked_program_from_output(
     syntax: CheckedSyntaxRef<'_>,
     output: boon_checked::CheckOutput,
-    checked_call_occurrences: Option<&[boon_syntax::StableOccurrenceKey]>,
-    checked_image_kernel_authority: Option<&boon_checked::CheckedImageKernelAuthorityV1>,
+    checked_call_occurrences: Option<Box<[boon_syntax::StableOccurrenceKey]>>,
+    checked_image_kernel_authority: Option<Box<boon_checked::CheckedImageKernelAuthorityV1>>,
+    checked_image_kernel_publication: Option<Box<boon_checked::CheckedImageKernelPublicationV1>>,
 ) -> CompilerResult<boon_checked::CheckedProgram> {
     if output.report.has_errors() {
         let diagnostics = output
@@ -1306,40 +1315,57 @@ fn checked_program_from_output(
     match (output.program, output.construction) {
         (Some(program), None) => Ok(program),
         (None, Some(construction)) => match syntax {
-            CheckedSyntaxRef::Assembled(program) if checked_call_occurrences.is_none() => {
+            CheckedSyntaxRef::Assembled(program)
+                if checked_call_occurrences.is_none()
+                    && checked_image_kernel_authority.is_none()
+                    && checked_image_kernel_publication.is_none() =>
+            {
                 boon_typecheck::seal_checked_program_construction(program, construction)
                     .map_err(|error| PlanError::new(error).into())
             }
             CheckedSyntaxRef::Assembled(_) => Err(PlanError::new(
-                "assembled checked construction cannot consume project-native call identities",
+                "assembled checked construction cannot consume project-native checked publication",
             )
             .into()),
-            CheckedSyntaxRef::UnitNative(program)
-                if let (Some(call_occurrences), Some(authority)) =
-                    (checked_call_occurrences, checked_image_kernel_authority) =>
-            {
-                boon_typecheck::seal_project_checked_program_construction_with_kernel_authority(
-                    program,
-                    construction,
-                    call_occurrences,
-                    authority,
-                )
-                .map_err(|error| PlanError::new(error).into())
-            }
-            CheckedSyntaxRef::UnitNative(program)
-                if let Some(call_occurrences) = checked_call_occurrences =>
-            {
-                boon_typecheck::seal_project_checked_program_construction_with_call_occurrences(
-                    program,
-                    construction,
-                    call_occurrences,
-                )
-                .map_err(|error| PlanError::new(error).into())
-            }
-            CheckedSyntaxRef::UnitNative(program) => {
-                boon_typecheck::seal_project_checked_program_construction(program, construction)
+            CheckedSyntaxRef::UnitNative(program) => match (
+                checked_call_occurrences,
+                checked_image_kernel_authority,
+                checked_image_kernel_publication,
+            ) {
+                (Some(call_occurrences), Some(authority), Some(publication)) => {
+                    boon_typecheck::seal_project_checked_program_construction_with_kernel_publication(
+                        program,
+                        construction,
+                        &call_occurrences,
+                        &authority,
+                        *publication,
+                    )
                     .map_err(|error| PlanError::new(error).into())
-            }
+                }
+                (Some(_), Some(_), None) => Err(PlanError::new(
+                    "kernel checked authority has no construction-owned image publication",
+                )
+                .into()),
+                (Some(call_occurrences), None, None) => {
+                    boon_typecheck::seal_project_checked_program_construction_with_call_occurrences(
+                        program,
+                        construction,
+                        &call_occurrences,
+                    )
+                    .map_err(|error| PlanError::new(error).into())
+                }
+                (None, None, None) => {
+                    boon_typecheck::seal_project_checked_program_construction(
+                        program,
+                        construction,
+                    )
+                    .map_err(|error| PlanError::new(error).into())
+                }
+                _ => Err(PlanError::new(
+                    "project-native checked publication has inconsistent sidecars",
+                )
+                .into()),
+            },
         },
         (Some(_), Some(_)) => Err(PlanError::new(
             "typecheck produced both a sealed and construction-only CheckedProgram",

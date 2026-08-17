@@ -10,6 +10,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 
 const KERNEL_DEFINITION_BASIS_DOMAIN_V14: &[u8] = b"boon.compiler-kernel.definition-basis.v14\0";
 const KERNEL_PUBLIC_RESULT_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.public-result.v1\0";
@@ -19,6 +20,13 @@ const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V16: &[u8] =
 const KERNEL_DEPENDENCY_IMPORTS_DOMAIN_V2: &[u8] = b"boon.compiler-kernel.dependency-imports.v2\0";
 const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V16: &[u8] =
     b"boon.compiler-kernel.definition-currentness.v16\0";
+const PARALLEL_DEFINITION_THRESHOLD: usize = 64;
+
+struct DefinitionFingerprints {
+    public_result: [u8; 32],
+    artifact: [u8; 32],
+    expressions: BTreeMap<KernelExpressionId, [u8; 32]>,
+}
 
 /// Exact definition-local origin of one dependency edge.
 ///
@@ -230,15 +238,30 @@ pub(crate) fn build_snapshot_receipts(
     ),
     KernelSolveError,
 > {
+    for definition in definitions.iter_mut() {
+        alpha_normalize_definition(definition);
+    }
+    build_normalized_snapshot_receipts(definitions, basis_fingerprints)
+}
+
+/// Seal a project whose definition artifacts have already been normalized in
+/// their independent materialization workers.
+pub(crate) fn build_normalized_snapshot_receipts(
+    definitions: &[DefinitionArtifact],
+    basis_fingerprints: &[[u8; 32]],
+) -> Result<
+    (
+        KernelDefinitionDependencyGraph,
+        Box<[KernelDefinitionCurrentnessReceipt]>,
+    ),
+    KernelSolveError,
+> {
     if definitions.len() != basis_fingerprints.len() {
         return Err(KernelSolveError::new(format!(
             "kernel snapshot has {} definitions but {} basis fingerprints",
             definitions.len(),
             basis_fingerprints.len()
         )));
-    }
-    for definition in definitions.iter_mut() {
-        alpha_normalize_definition(definition);
     }
     let dependency_graph = build_dependency_graph(definitions)?;
     let mut imported_expressions = vec![BTreeSet::new(); definitions.len()];
@@ -247,29 +270,66 @@ pub(crate) fn build_snapshot_receipts(
             imported_expressions[owner.0 as usize].insert(expression);
         }
     }
-    let mut public_result_fingerprints = Vec::with_capacity(definitions.len());
-    let mut artifact_fingerprints = Vec::with_capacity(definitions.len());
-    let mut expression_fingerprints = Vec::with_capacity(definitions.len());
+    let fingerprints = collect_definition_ranges(definitions.len(), |range| {
+        fingerprint_definition_range(range, definitions, &imported_expressions)
+    })?;
+    let receipts = collect_definition_ranges(definitions.len(), |range| {
+        currentness_receipt_range(range, &dependency_graph, basis_fingerprints, &fingerprints)
+    })?;
+    Ok((dependency_graph, receipts.into_boxed_slice()))
+}
+
+fn collect_definition_ranges<T, F>(len: usize, build: F) -> Result<Vec<T>, KernelSolveError>
+where
+    T: Send,
+    F: Fn(Range<usize>) -> Result<Vec<T>, KernelSolveError> + Sync,
+{
+    #[cfg(not(target_family = "wasm"))]
+    if len >= PARALLEL_DEFINITION_THRESHOLD
+        && std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() >= 2)
+    {
+        let split = len / 2;
+        return std::thread::scope(|scope| {
+            let right_worker = scope.spawn(|| build(split..len));
+            let left = build(0..split);
+            let right = right_worker.join();
+            let mut values = left?;
+            values.extend(right.map_err(|_| {
+                KernelSolveError::new("kernel definition receipt worker panicked")
+            })??);
+            Ok(values)
+        });
+    }
+
+    build(0..len)
+}
+
+fn fingerprint_definition_range(
+    range: Range<usize>,
+    definitions: &[DefinitionArtifact],
+    imported_expressions: &[BTreeSet<KernelExpressionId>],
+) -> Result<Vec<DefinitionFingerprints>, KernelSolveError> {
+    let mut fingerprints = Vec::with_capacity(range.len());
     let mut hash_scratch = Vec::new();
-    for definition in definitions.iter() {
-        public_result_fingerprints.push(hash_normalized_flow_type(
+    for definition_index in range {
+        let definition = &definitions[definition_index];
+        let public_result = hash_normalized_flow_type(
             KERNEL_PUBLIC_RESULT_DOMAIN_V1,
             &definition.result,
             &mut hash_scratch,
-        )?);
-        artifact_fingerprints.push(stable_fingerprint(
+        )?;
+        let artifact = stable_fingerprint(
             KERNEL_DEFINITION_ARTIFACT_DOMAIN_V16,
             definition,
             &mut hash_scratch,
-        ));
-        let definition_index = expression_fingerprints.len();
-        let mut definition_expression_fingerprints = BTreeMap::new();
+        );
+        let mut expressions = BTreeMap::new();
         for expression in definition
             .expressions
             .iter()
             .filter(|expression| imported_expressions[definition_index].contains(&expression.id))
         {
-            definition_expression_fingerprints.insert(
+            expressions.insert(
                 expression.id,
                 hash_normalized_flow_type(
                     KERNEL_EXPRESSION_SURFACE_DOMAIN_V1,
@@ -278,11 +338,24 @@ pub(crate) fn build_snapshot_receipts(
                 )?,
             );
         }
-        expression_fingerprints.push(definition_expression_fingerprints);
+        fingerprints.push(DefinitionFingerprints {
+            public_result,
+            artifact,
+            expressions,
+        });
     }
+    Ok(fingerprints)
+}
 
-    let mut receipts = Vec::with_capacity(definitions.len());
-    for definition_index in 0..definitions.len() {
+fn currentness_receipt_range(
+    range: Range<usize>,
+    dependency_graph: &KernelDefinitionDependencyGraph,
+    basis_fingerprints: &[[u8; 32]],
+    fingerprints: &[DefinitionFingerprints],
+) -> Result<Vec<KernelDefinitionCurrentnessReceipt>, KernelSolveError> {
+    let mut receipts = Vec::with_capacity(range.len());
+    let mut hash_scratch = Vec::new();
+    for definition_index in range {
         let owner = KernelOwnerId(
             u32::try_from(definition_index)
                 .expect("kernel definition count exceeds the dense u32 namespace"),
@@ -296,8 +369,8 @@ pub(crate) fn build_snapshot_receipts(
                 let target = dependency.target;
                 let provider = target.owner().0 as usize;
                 match target {
-                    KernelDependencyTarget::Expression { expression, .. } => expression_fingerprints
-                        [provider]
+                    KernelDependencyTarget::Expression { expression, .. } => fingerprints[provider]
+                        .expressions
                         .get(&expression)
                         .copied()
                         .ok_or_else(|| {
@@ -307,14 +380,12 @@ pub(crate) fn build_snapshot_receipts(
                             ))
                         }),
                     KernelDependencyTarget::Declaration { .. } => {
-                        Ok(artifact_fingerprints[provider])
+                        Ok(fingerprints[provider].artifact)
                     }
                     KernelDependencyTarget::Definition(_)
                     | KernelDependencyTarget::PublicDeclaration(_)
                     | KernelDependencyTarget::PublicStatement(_)
-                    | KernelDependencyTarget::Result(_) => {
-                        Ok(public_result_fingerprints[provider])
-                    }
+                    | KernelDependencyTarget::Result(_) => Ok(fingerprints[provider].public_result),
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -324,8 +395,8 @@ pub(crate) fn build_snapshot_receipts(
             &mut hash_scratch,
         );
         let basis_fingerprint_v14 = basis_fingerprints[definition_index];
-        let public_result_fingerprint_v1 = public_result_fingerprints[definition_index];
-        let artifact_fingerprint_v16 = artifact_fingerprints[definition_index];
+        let public_result_fingerprint_v1 = fingerprints[definition_index].public_result;
+        let artifact_fingerprint_v16 = fingerprints[definition_index].artifact;
         let fingerprint_v16 = stable_fingerprint(
             KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V16,
             &(
@@ -343,7 +414,7 @@ pub(crate) fn build_snapshot_receipts(
             fingerprint_v16,
         });
     }
-    Ok((dependency_graph, receipts.into_boxed_slice()))
+    Ok(receipts)
 }
 
 fn build_dependency_graph(

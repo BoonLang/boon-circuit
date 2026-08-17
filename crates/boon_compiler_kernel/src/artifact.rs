@@ -91,6 +91,14 @@ impl ComponentOutputSnapshot {
     pub(crate) fn new(outputs: Box<[Option<ArtifactOutput>]>, work: KernelSolveWork) -> Self {
         Self { outputs, work }
     }
+
+    #[cfg(test)]
+    pub(crate) fn available_output_count(&self) -> usize {
+        self.outputs
+            .iter()
+            .filter(|output| output.is_some())
+            .count()
+    }
 }
 
 impl ComponentOutputs for ComponentOutputSnapshot {

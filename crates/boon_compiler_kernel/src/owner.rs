@@ -6,9 +6,9 @@ use crate::{
     KernelSummaryProgram, KernelSummaryProjectionStep, KernelSummaryRecordEntry,
     KernelSummarySelectArm, KernelSummaryValueId, OutputId, PublishMode, TypeTerm, TypeTermId,
     TypeVariableId, VariantTerm, alpha_normalize_callable_interface_and_diagnostics,
-    alpha_normalize_definition, build_snapshot_receipts, definition_basis_fingerprint,
-    definition_basis_fingerprint_with_buffer, materialize_definition_flow_terms_v1,
-    solve_component,
+    alpha_normalize_definition, build_normalized_snapshot_receipts, build_snapshot_receipts,
+    definition_basis_fingerprint, definition_basis_fingerprint_with_buffer,
+    materialize_definition_flow_terms_v1, solve_component,
 };
 use boon_checked::{
     BytesType, CheckedListKeyPolicy, CheckedStateKind, FlowMode, FlowType, ObjectShape, Type,
@@ -1072,6 +1072,15 @@ struct KernelProjectOwnerOutputs {
     /// sound direct assignability contract for call diagnostics.
     syntax_discriminated_formals: Box<[u32]>,
     basis_fingerprint_v14: [u8; 32],
+}
+
+struct ProjectDefinitionMaterialization {
+    owner_index: usize,
+    owner: KernelProjectOwnerOutputs,
+    synthetic_state_ordinals: Box<[Option<u32>]>,
+    expression_flush_types: Box<[Option<Type>]>,
+    call_facts: Box<[SolvedKernelCallFacts]>,
+    diagnostics: Box<[KernelDiagnosticArtifact]>,
 }
 
 #[derive(Clone, Debug)]
@@ -2622,7 +2631,7 @@ impl KernelSolvedProject {
             .map(|owner| owner.basis_fingerprint_v14)
             .collect::<Vec<_>>();
         let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(&self.owners);
-        let mut definitions = self
+        let materializations = self
             .owners
             .into_vec()
             .into_iter()
@@ -2638,25 +2647,25 @@ impl KernelSolvedProject {
                         call_facts,
                     ),
                     diagnostics,
-                )| {
-                    materialize_project_definition(
-                        owner_index,
-                        owner,
-                        &self.artifact,
-                        &self.public_results,
-                        &self.public_formals,
-                        call_facts,
-                        diagnostics,
-                        &synthetic_state_ordinals,
-                        expression_flush_types,
-                        &owner_effects,
-                    )
+                )| ProjectDefinitionMaterialization {
+                    owner_index,
+                    owner,
+                    synthetic_state_ordinals,
+                    expression_flush_types,
+                    call_facts,
+                    diagnostics,
                 },
             )
-            .collect::<Result<Vec<_>, _>>()?
-            .into_boxed_slice();
+            .collect::<Vec<_>>();
+        let definitions = materialize_project_definitions(
+            materializations,
+            &self.artifact,
+            &self.public_results,
+            &self.public_formals,
+            &owner_effects,
+        )?;
         let (dependencies, currentness) =
-            build_snapshot_receipts(&mut definitions, &basis_fingerprints)?;
+            build_normalized_snapshot_receipts(&definitions, &basis_fingerprints)?;
         Ok(KernelCheckedSnapshot {
             definitions,
             diagnostic_values,
@@ -2743,6 +2752,87 @@ impl KernelSolvedProject {
             work: self.artifact.work,
         })
     }
+}
+
+fn materialize_project_definitions(
+    mut materializations: Vec<ProjectDefinitionMaterialization>,
+    artifact: &ComponentArtifact,
+    public_results: &[FlowType],
+    public_formals: &[Box<[FlowType]>],
+    owner_effects: &[KernelEffectSummary],
+) -> Result<Box<[DefinitionArtifact]>, KernelSolveError> {
+    // A complete checked image contains independent, definition-owned rows
+    // after the project graph has converged. Use exactly two contiguous
+    // workers for a large image, then restore the original dense owner order
+    // before dependency/currentness sealing. Small projects stay serial so a
+    // thread launch cannot dominate interactive checks.
+    #[cfg(not(target_family = "wasm"))]
+    if materializations.len() >= 64
+        && std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() >= 2)
+    {
+        let right = materializations.split_off(materializations.len() / 2);
+        return std::thread::scope(|scope| {
+            let right_worker = scope.spawn(move || {
+                materialize_project_definition_batch(
+                    right,
+                    artifact,
+                    public_results,
+                    public_formals,
+                    owner_effects,
+                )
+            });
+            let left = materialize_project_definition_batch(
+                materializations,
+                artifact,
+                public_results,
+                public_formals,
+                owner_effects,
+            );
+            let right = right_worker.join();
+            let mut definitions = left?;
+            definitions.extend(right.map_err(|_| {
+                KernelSolveError::new("kernel definition materialization worker panicked")
+            })??);
+            Ok(definitions.into_boxed_slice())
+        });
+    }
+
+    materialize_project_definition_batch(
+        materializations,
+        artifact,
+        public_results,
+        public_formals,
+        owner_effects,
+    )
+    .map(Vec::into_boxed_slice)
+}
+
+fn materialize_project_definition_batch(
+    materializations: Vec<ProjectDefinitionMaterialization>,
+    artifact: &ComponentArtifact,
+    public_results: &[FlowType],
+    public_formals: &[Box<[FlowType]>],
+    owner_effects: &[KernelEffectSummary],
+) -> Result<Vec<DefinitionArtifact>, KernelSolveError> {
+    materializations
+        .into_iter()
+        .map(|materialization| {
+            let mut definition = materialize_project_definition(
+                materialization.owner_index,
+                materialization.owner,
+                artifact,
+                public_results,
+                public_formals,
+                materialization.call_facts,
+                materialization.diagnostics,
+                &materialization.synthetic_state_ordinals,
+                materialization.expression_flush_types,
+                owner_effects,
+            )?;
+            alpha_normalize_definition(&mut definition);
+            Ok(definition)
+        })
+        .collect()
 }
 
 fn project_public_results<A: ComponentOutputs + ?Sized>(
@@ -15930,6 +16020,58 @@ mod tests {
             FlowMode::PresentOrAbsent,
             "the user-call frame follows the builtin's eventful actual"
         );
+    }
+
+    #[test]
+    fn large_checked_snapshot_preserves_dense_definition_order_deterministically() {
+        const DEFINITION_COUNT: usize = 65;
+        let owner_type = |owner: usize| {
+            Type::object(ObjectShape::from_ordered_fields(
+                [(format!("owner_{owner}"), Type::Number)],
+                false,
+            ))
+        };
+        let input = KernelProjectProgramInput {
+            owners: (0..DEFINITION_COUNT)
+                .map(|owner| KernelOwnerProgramInput {
+                    nodes: vec![KernelOwnerNode {
+                        kind: KernelOwnerNodeKind::Known(owner_type(owner)),
+                        inputs: Box::new([]),
+                        mode: FlowMode::Continuous,
+                    }]
+                    .into_boxed_slice(),
+                    formal_count: 0,
+                    external_expressions: Box::new([]),
+                    result: KernelExpressionId(0),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        };
+
+        let solved = compile_project_program(&input)
+            .expect("large project compiles")
+            .solve_graph()
+            .expect("large project graph solves");
+        let first = solved
+            .checked_snapshot()
+            .expect("large checked snapshot materializes");
+        let second = solved
+            .checked_snapshot()
+            .expect("repeated large checked snapshot materializes");
+
+        assert_eq!(first, second);
+        assert_eq!(first.definitions.len(), DEFINITION_COUNT);
+        for (owner, definition) in first.definitions.iter().enumerate() {
+            assert_eq!(definition.result.ty, owner_type(owner));
+            let mut standalone = [definition.clone()];
+            let (_, serial_receipt) = build_snapshot_receipts(
+                &mut standalone,
+                &[first.currentness[owner].basis_fingerprint_v14],
+            )
+            .expect("single definition seals serially");
+            assert_eq!(standalone[0], *definition);
+            assert_eq!(serial_receipt[0], first.currentness[owner]);
+        }
     }
 
     #[test]

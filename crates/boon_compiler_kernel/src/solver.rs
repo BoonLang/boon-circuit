@@ -2894,6 +2894,7 @@ fn insert_record_field(fields: &mut Vec<(NameId, TypeTermId)>, name: NameId, val
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifact::ComponentOutputs;
     use crate::{ComponentProgramBuilder, KernelSummarySelectArm, PublishMode};
     use boon_checked::{FlowMode, ObjectShape, Type, Variant};
     use std::{collections::BTreeSet, sync::Arc};

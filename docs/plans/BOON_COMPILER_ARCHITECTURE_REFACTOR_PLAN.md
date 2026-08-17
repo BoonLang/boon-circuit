@@ -3,8 +3,9 @@
 Date: 2026-08-03
 
 Status: active high-leverage execution map, reconciled through the first
-shared document plan-code/function-frame slice on 2026-08-17, unit-native
-checkpoint `a48f488`, and the post-M1 identity/evaluator/fact-store/
+shared document plan-code/function-frame slice and deterministic checked-image
+definition publication cut on 2026-08-17, unit-native checkpoint `a48f488`,
+and the post-M1 identity/evaluator/fact-store/
 compositional-seal research after the definition-artifact/thin-link and
 structural-identity tranches, while preserving whole-program audit
 checkpoint `d113544`, compact execution-receipt checkpoint `96b1611`,
@@ -4603,12 +4604,12 @@ authored `field_order` remains explicit, and the per-definition importer uses a
 sparse reachable-term map instead of zeroing a global-term-sized vector for
 each definition. The checked handoff validates its borrowed digest arena
 without copying it. Focused gates cover non-lexical two-field object parity,
-image/role binding and tamper rejection, the 105-test kernel suite, the
-340-test typechecker suite, the complete compiler suite, the V5 compact proof,
-and the ignored NovyWave semantic gate. The 16 failures in the wider semantic
-suite were reproduced unchanged at the preceding checkpoint and remain
-separate pre-existing proof/retained-occurrence work, not regressions accepted
-by this slice.
+image/role binding and tamper rejection, the kernel and typechecker suites, the
+complete compiler suite, the V5 compact proof, and the ignored NovyWave
+semantic gate. The formerly recorded 16 wider-semantic failures have since
+been repaired at their engine authority boundaries. The current semantic
+library result is 178 passed, zero failed, and two intentionally ignored large
+artifact/NovyWave probes; they are no longer outstanding debt in this plan.
 
 One freshly rebuilt pinned-stable release localization records 60.173 ms for
 V5 execution-image construction and 77.563 ms for the complete resource-
@@ -4628,6 +4629,48 @@ same canonical alpha-normalization order used by receipts, then let semantic
 rows and plan templates relocate those term IDs directly. Do not grow a
 second rich type table or resume proof-codec micro-optimization around this
 handoff.
+
+### Deterministic Checked-Image Definition Publication (2026-08-17)
+
+After graph convergence, the 1,389 NovyWave definition artifacts are mutually
+independent until their ordered dependency/currentness seal. Complete checked-
+image demand now divides that immutable dense definition range into exactly two
+contiguous halves on native hosts with at least two available CPUs and at least
+64 definitions. The current thread materializes the first half while one
+scoped worker materializes the second. Each worker also performs definition-
+local alpha normalization. Definition fingerprinting and currentness hashing
+use the same two-range rule after the dependency graph has been built; results
+are concatenated in the original dense owner order. Solver convergence,
+dependency-graph construction, diagnostic ordering, sparse definition demand,
+small projects, and Wasm remain serial. No worker count above two and no
+nondeterministic work stealing were introduced.
+
+A 65-definition regression crosses the production threshold and proves stable
+dense result order and exact repeated snapshot equality. The kernel suite is
+107 passed, the semantic suite is 178 passed with two intentional ignores, the
+architecture gate passes, and three fresh pinned-stable production verified
+NovyWave runs complete with zero diagnostics and valid MachinePlans. In a
+same-binary directional A/B, five ordinary samples have a 273.695 ms checked-
+image median, while five one-CPU samples that disable the parallel branch have
+a 314.174 ms median: a 40.479 ms or 12.9% reduction in that owner. The three
+ordinary full verified samples have medians of 2,895.206 ms total,
+1,222.588 ms checking, 1,078.346 ms semantic construction, 0.656 ms WHERE
+verification, 379.570 ms backend construction, and 77.896 ms plan
+verification. Whole-compile noise is larger than this cut, so it is accepted
+as deterministic work reduction rather than claimed as a new end-to-end
+latency milestone.
+
+This is the only safe parallel slice currently justified by the graph. Do not
+parallelize the monolithic solver, semantic authority construction, or plan
+sealing merely because CPU cores are available. The next speed-bearing cut
+remains structural: publish the remaining definition type roots and normalized
+resource/row facts once, relocate them through compact invocation frames, and
+delete the corresponding contextual/resource/storage/core reconstruction
+passes. The latest traced semantic owners are canonical core plus execution
+proofs (236.985 ms), dependency-manifest assembly (130.153 ms), contextual
+execution construction (179.451 ms), and resource-authority normalization
+(78.500 ms). Moving those owners, not adding more threads or switching Rust
+toolchains, is the route to a materially lower NovyWave total.
 
 The concurrent checker-kernel track remains the first half of the same
 definition-artifact design. Checked/execution receipt replay is already deleted;

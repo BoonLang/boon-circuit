@@ -20,6 +20,13 @@ primary-reference research below and in
 [`BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`](BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md);
 it does not create a second set of weaker exits.
 
+The post-`dfdb20c` allocation, warm-session, Linux allocator/toolchain, and
+tens-of-milliseconds evidence refines this sequence in
+[`BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md`](BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md).
+That plan prioritizes the cross-phase packed symbol/path/type authority before
+another domain-local fact-store slice because rich names, paths, and recursive
+types now account for the dominant live-object and allocation population.
+
 ## Why This Refactor Exists
 
 The retained-definition work removed the first large semantic multiplier, but

@@ -1,5 +1,9 @@
 # `/goal` Prompt
 
+Status: historical unified-product prompt. Do not use it for the current
+compiler objective. The bounded replacement is
+[`BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md`](BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md).
+
 ```text
 /goal Complete the unified Boon language, verified compiler, universal packed
 runtime, BoonConsole with the first Boon-designed RV32I processor and exact

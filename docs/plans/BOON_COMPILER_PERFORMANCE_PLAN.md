@@ -21,8 +21,12 @@ in
 the post-`e510726` unit-native/fact-store/compositional-seal refinement is
 detailed in
 [`BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`](BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md).
+The 2026-08-21 allocation, warm-session, Linux allocator/toolchain, and
+tens-of-milliseconds evidence is consolidated in
+[`BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md`](BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md).
 This plan remains authoritative for every budget and exit; the refactor plan
-fixes the order and deletion criteria for reaching them.
+and its tens-of-milliseconds refinement fix the current order and deletion
+criteria for reaching them.
 
 ## Purpose And Authority
 

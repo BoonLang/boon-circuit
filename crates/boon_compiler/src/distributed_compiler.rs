@@ -2566,6 +2566,8 @@ fn link_lowered_roles(
                     parse_work: Default::default(),
                     typecheck_work: Default::default(),
                     owner_work: Default::default(),
+                    kernel_compile_work: Default::default(),
+                    kernel_solve_work: Default::default(),
                     parse_ms: program.parse_ms,
                     typecheck_ms: 0.0,
                     semantic_ms: 0.0,

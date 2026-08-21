@@ -1,4 +1,4 @@
-use crate::{OutputId, TypeTermArena, TypeTermId};
+use crate::{FrozenTypeStore, FrozenTypeStoreLayout, OutputId, TypeTermArena, TypeTermId};
 use boon_checked::FlowType;
 use std::sync::Arc;
 
@@ -31,7 +31,9 @@ pub struct KernelSolveWork {
     pub summary_call_activations: u64,
     pub mutations: u64,
     pub union_operations: u64,
-    pub term_materializations: u64,
+    /// Available solver outputs recursively exported to rich compatibility
+    /// `FlowType`s. This is an export-event count, not a recursive node count.
+    pub rich_output_flow_exports: u64,
     pub term_intern_requests: u64,
     pub term_intern_hits: u64,
     pub term_intern_requests_by_kind: [u64; 8],
@@ -39,6 +41,8 @@ pub struct KernelSolveWork {
     pub structural_widen_requests: u64,
     pub structural_widen_hits: u64,
     pub dynamic_dependency_edges: u64,
+    /// Zero for diagnostics-only solves, which do not retain a frozen store.
+    pub frozen_type_store: FrozenTypeStoreLayout,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,7 +51,7 @@ pub struct ArtifactOutput {
     /// Resolved solver-arena term retained until definition finalization.
     /// This ID is meaningful only together with `ComponentArtifact::terms`;
     /// it is never a stable receipt identity.
-    pub term: TypeTermId,
+    pub(crate) term: TypeTermId,
     pub flow_type: FlowType,
     /// Whether this exact runtime occurrence contains a value constructed by
     /// selecting one singleton, invocation-parameter-derived syntax branch.
@@ -70,7 +74,7 @@ pub struct ComponentArtifact {
     // one quiescent graph. Share the frozen solver arena across those cheap
     // snapshot clones; never give its mutable construction caches semantic
     // equality or receipt authority.
-    terms: Arc<TypeTermArena>,
+    terms: Arc<FrozenTypeStore>,
     pub work: KernelSolveWork,
 }
 
@@ -128,11 +132,13 @@ impl ComponentArtifact {
     pub(crate) fn new(
         outputs: Box<[Option<ArtifactOutput>]>,
         terms: TypeTermArena,
-        work: KernelSolveWork,
+        mut work: KernelSolveWork,
     ) -> Self {
+        let terms = Arc::new(terms.freeze());
+        work.frozen_type_store = terms.layout();
         Self {
             outputs,
-            terms: Arc::new(terms),
+            terms,
             work,
         }
     }
@@ -156,7 +162,13 @@ impl ComponentArtifact {
             .count()
     }
 
-    pub fn terms(&self) -> &TypeTermArena {
-        self.terms.as_ref()
+    pub(crate) fn terms(&self) -> &TypeTermArena {
+        self.terms.as_arena()
+    }
+
+    /// Share the one immutable type/symbol store retained by this solved
+    /// component. Snapshot publication clones only this `Arc`.
+    pub(crate) fn type_store(&self) -> Arc<FrozenTypeStore> {
+        Arc::clone(&self.terms)
     }
 }

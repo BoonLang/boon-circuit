@@ -9,6 +9,15 @@ use boon_checked::{
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Revision-local dense identity of one immutable ABI callable.
+///
+/// `KernelAbiInput` sorts callables by canonical name before assigning these
+/// IDs. Owner programs can therefore retain a four-byte equation reference
+/// instead of cloning a callable name and its recursive parameter/result
+/// types into every call occurrence.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct KernelAbiCallableId(pub u32);
+
 /// Immutable compiler/library ABI consumed by one kernel revision.
 ///
 /// These rows are independent of parser arenas and the legacy owner checker.
@@ -78,11 +87,39 @@ impl KernelAbiInput {
         &self.callables
     }
 
+    pub fn indexed_callables(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (KernelAbiCallableId, &KernelCallableAbiInput)> {
+        self.callables.iter().enumerate().map(|(index, callable)| {
+            (
+                KernelAbiCallableId(
+                    u32::try_from(index)
+                        .expect("kernel ABI callable count exceeds the dense u32 namespace"),
+                ),
+                callable,
+            )
+        })
+    }
+
     pub fn callable(&self, name: &str) -> Option<&KernelCallableAbiInput> {
+        self.callable_id(name)
+            .and_then(|callable| self.callable_by_id(callable))
+    }
+
+    pub fn callable_id(&self, name: &str) -> Option<KernelAbiCallableId> {
         self.callables
             .binary_search_by(|callable| callable.name.as_ref().cmp(name))
             .ok()
-            .map(|index| &self.callables[index])
+            .map(|index| {
+                KernelAbiCallableId(
+                    u32::try_from(index)
+                        .expect("kernel ABI callable count exceeds the dense u32 namespace"),
+                )
+            })
+    }
+
+    pub fn callable_by_id(&self, callable: KernelAbiCallableId) -> Option<&KernelCallableAbiInput> {
+        self.callables.get(callable.0 as usize)
     }
 }
 
@@ -307,4 +344,59 @@ fn validate_callable(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boon_checked::{FlowMode, Type};
+
+    fn callable(name: &str) -> KernelCallableAbiInput {
+        KernelCallableAbiInput {
+            name: name.into(),
+            kind: KernelCallableKind::Builtin,
+            intrinsic: None,
+            external_identity: None,
+            parameters: Box::new([]),
+            contexts: Box::new([]),
+            result: FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Text,
+            },
+            result_specialization: KernelAbiResultSpecialization::Fixed,
+            role: ProgramRole::Client,
+            effect: CheckedEffectSummary::default(),
+            contextual_operation: None,
+        }
+    }
+
+    #[test]
+    fn callable_ids_are_dense_name_sorted_and_round_trip() {
+        let abi = KernelAbiInput::new(
+            ProgramRole::Client,
+            [callable("Zulu/value"), callable("Alpha/value")],
+        )
+        .unwrap();
+
+        let indexed = abi
+            .indexed_callables()
+            .map(|(id, callable)| (id, callable.name.as_ref()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            indexed,
+            [
+                (KernelAbiCallableId(0), "Alpha/value"),
+                (KernelAbiCallableId(1), "Zulu/value"),
+            ]
+        );
+        for (id, name) in indexed {
+            assert_eq!(abi.callable_id(name), Some(id));
+            assert_eq!(
+                abi.callable_by_id(id).map(|row| row.name.as_ref()),
+                Some(name)
+            );
+            assert_eq!(abi.callable(name), abi.callable_by_id(id));
+        }
+        assert!(abi.callable_by_id(KernelAbiCallableId(2)).is_none());
+    }
 }

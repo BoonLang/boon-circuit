@@ -22,7 +22,7 @@ pub struct KernelProjectInput {
     links: KernelResolvedProjectLinkOverlay,
     program: KernelProjectProgramInput,
     definition_facts: Box<[KernelDefinitionFactsInput]>,
-    abi: KernelAbiInput,
+    abi: Arc<KernelAbiInput>,
 }
 
 /// One immutable normalized syntax unit. Definitions retain their stable
@@ -146,7 +146,7 @@ impl KernelProjectInput {
             },
             program,
             definition_facts,
-            abi,
+            abi: Arc::new(abi),
         })
     }
 
@@ -170,8 +170,8 @@ impl KernelProjectInput {
         &self.definition_facts
     }
 
-    pub const fn abi(&self) -> &KernelAbiInput {
-        &self.abi
+    pub fn abi(&self) -> &KernelAbiInput {
+        self.abi.as_ref()
     }
 
     pub fn compile(&self) -> Result<crate::KernelProjectProgram, KernelOwnerBuildError> {
@@ -222,6 +222,7 @@ pub struct KernelDemandedCheckArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelDemandedCheckSnapshot {
     pub definitions: Box<[KernelDemandedCheckArtifact]>,
+    pub type_store: Arc<crate::FrozenTypeStore>,
     pub work: crate::KernelSolveWork,
 }
 
@@ -561,6 +562,7 @@ impl KernelSession {
                     .into_boxed_slice();
                 KernelCheckProduct::Definitions(Arc::new(KernelDemandedCheckSnapshot {
                     definitions,
+                    type_store: Arc::clone(&snapshot.type_store),
                     work: snapshot.work,
                 }))
             }
@@ -575,6 +577,7 @@ impl KernelSession {
         &self,
         demanded: KernelDemandedDefinitionSnapshot,
     ) -> Result<KernelDemandedCheckSnapshot, KernelCheckError> {
+        let type_store = Arc::clone(&demanded.type_store);
         let mut definitions = demanded
             .definitions
             .into_vec()
@@ -601,6 +604,7 @@ impl KernelSession {
         definitions.sort_by(|left, right| left.owner.cmp(&right.owner));
         Ok(KernelDemandedCheckSnapshot {
             definitions: definitions.into_boxed_slice(),
+            type_store,
             work: demanded.work,
         })
     }

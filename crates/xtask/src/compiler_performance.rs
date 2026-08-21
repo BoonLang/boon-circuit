@@ -15,10 +15,10 @@ use crate::report_v2::{
     unix_time_ms,
 };
 
-const REPORT_FORMAT_VERSION: u16 = 8;
-const PRODUCER_FORMAT_VERSION: u16 = 7;
+const REPORT_FORMAT_VERSION: u16 = 9;
+const PRODUCER_FORMAT_VERSION: u16 = 8;
 const BUDGET_FORMAT_VERSION: u16 = 3;
-const REPORT_CONTRACT: &str = "boon-compiler-performance-v7";
+const REPORT_CONTRACT: &str = "boon-compiler-performance-v8";
 const DEFAULT_BUDGET: &str = "budgets/compiler.toml";
 const MAX_BUDGET_BYTES: u64 = 64 * 1024;
 const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;
@@ -452,6 +452,25 @@ struct WorkSummary {
     typecheck_inference_call_visits: CountSummary,
     typecheck_diagnostic_replay_requests: CountSummary,
     typecheck_diagnostic_replay_misses: CountSummary,
+    kernel_definition_modules: CountSummary,
+    kernel_linked_operations: CountSummary,
+    kernel_scheduled_work_items: CountSummary,
+    kernel_variables: CountSummary,
+    kernel_operations: CountSummary,
+    kernel_activations: CountSummary,
+    kernel_rich_output_flow_exports: CountSummary,
+    kernel_term_intern_requests: CountSummary,
+    kernel_term_intern_hits: CountSummary,
+    kernel_dynamic_dependency_edges: CountSummary,
+    kernel_frozen_type_store_term_rows: CountSummary,
+    kernel_frozen_type_store_name_rows: CountSummary,
+    kernel_frozen_type_store_child_rows: CountSummary,
+    kernel_frozen_type_store_variant_rows: CountSummary,
+    kernel_frozen_type_store_object_shape_rows: CountSummary,
+    kernel_frozen_type_store_object_field_rows: CountSummary,
+    kernel_frozen_type_store_semantic_order_rows: CountSummary,
+    kernel_frozen_type_store_payload_len_bytes: CountSummary,
+    kernel_frozen_type_store_payload_capacity_bytes: CountSummary,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -2158,6 +2177,47 @@ fn summarize_work(samples: &[Sample]) -> WorkSummary {
         }),
         typecheck_diagnostic_replay_misses: u64_values(|work| {
             work.typecheck.diagnostic_replay_misses
+        }),
+        kernel_definition_modules: u64_values(|work| work.kernel_compile.definition_modules),
+        kernel_linked_operations: u64_values(|work| work.kernel_compile.linked_operations),
+        kernel_scheduled_work_items: u64_values(|work| work.kernel_compile.scheduled_work_items),
+        kernel_variables: u64_values(|work| work.kernel_solve.variables),
+        kernel_operations: u64_values(|work| work.kernel_solve.operations),
+        kernel_activations: u64_values(|work| work.kernel_solve.activations),
+        kernel_rich_output_flow_exports: u64_values(|work| {
+            work.kernel_solve.rich_output_flow_exports
+        }),
+        kernel_term_intern_requests: u64_values(|work| work.kernel_solve.term_intern_requests),
+        kernel_term_intern_hits: u64_values(|work| work.kernel_solve.term_intern_hits),
+        kernel_dynamic_dependency_edges: u64_values(|work| {
+            work.kernel_solve.dynamic_dependency_edges
+        }),
+        kernel_frozen_type_store_term_rows: u64_values(|work| {
+            work.kernel_solve.frozen_type_store.term_rows
+        }),
+        kernel_frozen_type_store_name_rows: u64_values(|work| {
+            work.kernel_solve.frozen_type_store.name_rows
+        }),
+        kernel_frozen_type_store_child_rows: u64_values(|work| {
+            work.kernel_solve.frozen_type_store.child_rows
+        }),
+        kernel_frozen_type_store_variant_rows: u64_values(|work| {
+            work.kernel_solve.frozen_type_store.variant_rows
+        }),
+        kernel_frozen_type_store_object_shape_rows: u64_values(|work| {
+            work.kernel_solve.frozen_type_store.object_shape_rows
+        }),
+        kernel_frozen_type_store_object_field_rows: u64_values(|work| {
+            work.kernel_solve.frozen_type_store.object_field_rows
+        }),
+        kernel_frozen_type_store_semantic_order_rows: u64_values(|work| {
+            work.kernel_solve.frozen_type_store.semantic_order_rows
+        }),
+        kernel_frozen_type_store_payload_len_bytes: u64_values(|work| {
+            work.kernel_solve.frozen_type_store.payload_len_bytes
+        }),
+        kernel_frozen_type_store_payload_capacity_bytes: u64_values(|work| {
+            work.kernel_solve.frozen_type_store.payload_capacity_bytes
         }),
     }
 }

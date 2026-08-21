@@ -2756,6 +2756,8 @@ pub(crate) fn compiler_checked_from_kernel(
         parse_ms,
         boon_typecheck::TypeCheckWorkCounters::default(),
         owner_work,
+        checked.compile_work,
+        checked.solve_work,
         typecheck_ms,
         Some(checked.call_occurrences),
         Some(Box::new(checked.checked_image_authority)),
@@ -3595,9 +3597,8 @@ fn project_kernel_abi(
 fn project_kernel_authoritative_call_shapes_from_abi(
     abi: &KernelAbiInput,
 ) -> BTreeMap<String, AuthoritativeCallSurface> {
-    abi.callables()
-        .iter()
-        .map(|callable| {
+    abi.indexed_callables()
+        .map(|(_, callable)| {
             (
                 callable.name.to_string(),
                 AuthoritativeCallSurface {
@@ -20363,7 +20364,7 @@ FUNCTION selectable_row(row) {
             let retained_snapshot_total_us = source_abi_us.saturating_add(timings.total_us);
             let candidate_total_us = parse_us.saturating_add(retained_snapshot_total_us);
             eprintln!(
-                "kernel-novywave candidate_only=true parity=not_run profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} kernel_total_us={} compile_us={} solve_us={} graph_solve_us={} interface_projection_us={} checked_image_us={} checked_link_layout_us={} checked_link_references={} solved_owners={} container_owners={} unsupported_owners={} residual_modules={} residual_frames={} acyclic_residual_frames={} invocation_frames={} direct_result_summaries={} summary_definition_nodes={} summary_constant_folded_nodes={} summary_selector_fused_records={} summary_deduplicated_nodes={} summary_pruned_nodes={} summary_pruned_inputs={} summary_invoke_nodes={} linked_operations={} scheduled_work_items={} acyclic_initial_work_items={} dominant_module_owner={} dominant_module_operations={} dominant_module_frames={} dominant_module_linked_operations={} variables={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} summary_call_activations={} summary_node_evaluations={} mutations={} term_materializations={} term_intern_requests={} term_intern_hits={} term_intern_requests_by_kind={:?} term_intern_hits_by_kind={:?} structural_widen_requests={} structural_widen_hits={} dynamic_edges={}",
+                "kernel-novywave candidate_only=true parity=not_run profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} kernel_total_us={} compile_us={} solve_us={} graph_solve_us={} interface_projection_us={} checked_image_us={} checked_link_layout_us={} checked_link_references={} solved_owners={} container_owners={} unsupported_owners={} residual_modules={} residual_frames={} acyclic_residual_frames={} invocation_frames={} direct_result_summaries={} summary_definition_nodes={} summary_constant_folded_nodes={} summary_selector_fused_records={} summary_deduplicated_nodes={} summary_pruned_nodes={} summary_pruned_inputs={} summary_invoke_nodes={} linked_operations={} scheduled_work_items={} acyclic_initial_work_items={} dominant_module_owner={} dominant_module_operations={} dominant_module_frames={} dominant_module_linked_operations={} variables={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} summary_call_activations={} summary_node_evaluations={} mutations={} rich_output_flow_exports={} term_intern_requests={} term_intern_hits={} term_intern_requests_by_kind={:?} term_intern_hits_by_kind={:?} structural_widen_requests={} structural_widen_hits={} dynamic_edges={}",
                 if cfg!(debug_assertions) {
                     "debug"
                 } else {
@@ -20414,7 +20415,7 @@ FUNCTION selectable_row(row) {
                 report.work.summary_call_activations,
                 report.work.summary_node_evaluations,
                 report.work.mutations,
-                report.work.term_materializations,
+                report.work.rich_output_flow_exports,
                 report.work.term_intern_requests,
                 report.work.term_intern_hits,
                 report.work.term_intern_requests_by_kind,

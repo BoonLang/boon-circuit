@@ -22,7 +22,8 @@ use boon_checked::{
     CheckedSourceRead, CheckedSpan, CheckedState, CheckedStateId, CheckedStatement,
     CheckedStatementId, CheckedStatementKind, CheckedTextSegment, CheckedTypeSubstitution,
     CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId, ObjectShape,
-    ProgramRole, SemanticOccurrence, SemanticOccurrenceKind, Type, TypeVar, Variant,
+    ProgramRole, SemanticOccurrence, SemanticOccurrenceKind, SharedObjectShape, Type, TypeVar,
+    Variant,
 };
 use boon_contract::SourceBundleDigestV1;
 use boon_syntax::StableOccurrenceKey;
@@ -6942,11 +6943,19 @@ fn definition_type_variables(definition: &crate::DefinitionArtifact) -> BTreeSet
     collect_flow_type_variables(&definition.result, &mut variables);
     for expression in &definition.expressions {
         collect_flow_type_variables(&expression.flow_type, &mut variables);
+        if let Some(flush_type) = &expression.flush_type {
+            collect_type_variables(flush_type, &mut variables);
+        }
         match &expression.kind {
             crate::KernelOwnerNodeKind::Known(ty) | crate::KernelOwnerNodeKind::Source(ty) => {
                 collect_type_variables(ty, &mut variables);
             }
             _ => {}
+        }
+    }
+    for declaration in &definition.declarations {
+        if let Some(flow_type) = &declaration.declared_flow_type {
+            collect_flow_type_variables(flow_type, &mut variables);
         }
     }
     for call in &definition.calls {
@@ -7030,48 +7039,79 @@ fn relocate_type(
     type_variables: KernelCheckedRowRange,
     ty: &Type,
 ) -> Result<Type, KernelCheckedLinkError> {
+    Ok(relocate_type_inner(type_variables, ty)?.unwrap_or_else(|| ty.clone()))
+}
+
+/// Relocate only branches that contain a local type variable. Closed rich
+/// views are compatibility projections over immutable shared nodes and must
+/// not be rebuilt merely to cross the checked linker.
+fn relocate_type_inner(
+    type_variables: KernelCheckedRowRange,
+    ty: &Type,
+) -> Result<Option<Type>, KernelCheckedLinkError> {
     Ok(match ty {
-        Type::Var(variable) => Type::Var(TypeVar(
-            type_variables.resolve(variable.0, "type variable")?,
-        )),
-        Type::VariantSet(variants) => Type::VariantSet(
-            variants
-                .iter()
-                .map(|variant| {
-                    Ok(match variant {
-                        Variant::Tag(tag) => Variant::Tag(tag.clone()),
-                        Variant::Tagged { tag, fields } => Variant::Tagged {
-                            tag: tag.clone(),
-                            fields: relocate_object_shape(type_variables, fields)?.into(),
-                        },
-                    })
-                })
-                .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?
-                .into(),
-        ),
-        Type::Object(shape) => Type::object(relocate_object_shape(type_variables, shape)?),
-        Type::List(item) => Type::List(Type::shared(relocate_type(type_variables, item)?)),
-        Type::Set(item) => Type::Set(Type::shared(relocate_type(type_variables, item)?)),
-        Type::Function { args, result } => Type::Function {
-            args: args
-                .iter()
-                .map(|argument| relocate_type(type_variables, argument))
-                .collect::<Result<Vec<_>, _>>()?,
-            result: Box::new(FlowType {
-                mode: result.mode,
-                ty: relocate_type(type_variables, &result.ty)?,
-            }),
-        },
-        Type::Union(members) => Type::Union(
-            members
-                .iter()
-                .map(|member| relocate_type(type_variables, member))
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        Type::Map { key, value } => Type::Map {
-            key: Box::new(relocate_type(type_variables, key)?),
-            value: Box::new(relocate_type(type_variables, value)?),
-        },
+        Type::Var(variable) => {
+            let relocated = TypeVar(type_variables.resolve(variable.0, "type variable")?);
+            (relocated != *variable).then_some(Type::Var(relocated))
+        }
+        Type::VariantSet(variants) => {
+            let mut relocated_variants = None;
+            for (index, variant) in variants.iter().enumerate() {
+                let Variant::Tagged { tag, fields } = variant else {
+                    continue;
+                };
+                if let Some(fields) = relocate_object_shape_inner(type_variables, fields)? {
+                    relocated_variants
+                        .get_or_insert_with(|| variants.iter().cloned().collect::<Vec<_>>())
+                        [index] = Variant::Tagged {
+                        tag: tag.clone(),
+                        fields: fields.into(),
+                    };
+                }
+            }
+            relocated_variants.map(|variants| Type::VariantSet(variants.into()))
+        }
+        Type::Object(shape) => relocate_object_shape_inner(type_variables, shape)?
+            .map(|shape| Type::Object(shape.into())),
+        Type::List(item) => {
+            relocate_type_inner(type_variables, item)?.map(|item| Type::List(Type::shared(item)))
+        }
+        Type::Set(item) => {
+            relocate_type_inner(type_variables, item)?.map(|item| Type::Set(Type::shared(item)))
+        }
+        Type::Function { args, result } => {
+            let mut relocated_args = None;
+            for (index, argument) in args.iter().enumerate() {
+                if let Some(argument) = relocate_type_inner(type_variables, argument)? {
+                    relocated_args.get_or_insert_with(|| args.clone())[index] = argument;
+                }
+            }
+            let relocated_result = relocate_type_inner(type_variables, &result.ty)?;
+            (relocated_args.is_some() || relocated_result.is_some()).then(|| Type::Function {
+                args: relocated_args.unwrap_or_else(|| args.clone()),
+                result: Box::new(FlowType {
+                    mode: result.mode,
+                    ty: relocated_result.unwrap_or_else(|| result.ty.clone()),
+                }),
+            })
+        }
+        Type::Union(members) => {
+            let mut relocated_members = None;
+            for (index, member) in members.iter().enumerate() {
+                if let Some(member) = relocate_type_inner(type_variables, member)? {
+                    relocated_members.get_or_insert_with(|| members.clone())[index] = member;
+                }
+            }
+            relocated_members.map(Type::Union)
+        }
+        Type::Map { key, value } => {
+            let relocated_key = relocate_type_inner(type_variables, key)?;
+            let relocated_value = relocate_type_inner(type_variables, value)?;
+            (relocated_key.is_some() || relocated_value.is_some()).then(|| Type::Map {
+                key: Box::new(relocated_key.unwrap_or_else(|| key.as_ref().clone())),
+                value: Box::new(relocated_value.unwrap_or_else(|| value.as_ref().clone())),
+            })
+        }
         Type::Text
         | Type::Number
         | Type::Bytes(_)
@@ -7079,23 +7119,27 @@ fn relocate_type(
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
         | Type::Unknown
-        | Type::Bits { .. } => ty.clone(),
+        | Type::Bits { .. } => None,
     })
 }
 
-fn relocate_object_shape(
+fn relocate_object_shape_inner(
     type_variables: KernelCheckedRowRange,
-    shape: &ObjectShape,
-) -> Result<ObjectShape, KernelCheckedLinkError> {
-    Ok(ObjectShape {
-        fields: shape
-            .fields
-            .iter()
-            .map(|(name, ty)| Ok((name.clone(), relocate_type(type_variables, ty)?)))
-            .collect::<Result<_, KernelCheckedLinkError>>()?,
+    shape: &SharedObjectShape,
+) -> Result<Option<ObjectShape>, KernelCheckedLinkError> {
+    let mut relocated_fields = None;
+    for (name, ty) in &shape.fields {
+        if let Some(ty) = relocate_type_inner(type_variables, ty)? {
+            relocated_fields
+                .get_or_insert_with(|| shape.fields.clone())
+                .insert(name.clone(), ty);
+        }
+    }
+    Ok(relocated_fields.map(|fields| ObjectShape {
+        fields,
         field_order: shape.field_order.clone(),
         open: shape.open,
-    })
+    }))
 }
 
 fn resolve_public_declaration(
@@ -7226,6 +7270,50 @@ mod tests {
                 matching_sibling_ordinal: 0,
             }]),
         })
+    }
+
+    #[test]
+    fn type_relocation_copies_only_changed_branches_and_fails_closed() {
+        let closed_list = Type::List(Type::shared(Type::Text));
+        let root = Type::object(ObjectShape::from_ordered_fields(
+            [
+                ("closed".to_owned(), closed_list),
+                ("generic".to_owned(), Type::Var(TypeVar(0))),
+            ],
+            false,
+        ));
+        let relocated = relocate_type(KernelCheckedRowRange { start: 7, len: 1 }, &root)
+            .expect("one dense local variable must relocate");
+        let (Type::Object(original), Type::Object(relocated)) = (&root, &relocated) else {
+            panic!("test types must remain objects");
+        };
+        let (Type::List(original_closed), Type::List(relocated_closed)) = (
+            original.fields.get("closed").unwrap(),
+            relocated.fields.get("closed").unwrap(),
+        ) else {
+            panic!("closed field must remain a list");
+        };
+        assert!(boon_checked::SharedType::ptr_eq(
+            original_closed,
+            relocated_closed
+        ));
+        assert_eq!(
+            relocated.fields.get("generic"),
+            Some(&Type::Var(TypeVar(7)))
+        );
+
+        let identity = Type::List(Type::shared(Type::Var(TypeVar(0))));
+        let relocated_identity =
+            relocate_type(KernelCheckedRowRange { start: 0, len: 1 }, &identity).unwrap();
+        let (Type::List(original), Type::List(relocated)) = (&identity, &relocated_identity) else {
+            panic!("identity test types must remain lists");
+        };
+        assert!(boon_checked::SharedType::ptr_eq(original, relocated));
+
+        let out_of_range = Type::List(Type::shared(Type::Var(TypeVar(1))));
+        let error = relocate_type(KernelCheckedRowRange { start: 4, len: 1 }, &out_of_range)
+            .expect_err("a nested non-dense local variable must fail closed");
+        assert!(error.to_string().contains("outside local range"));
     }
 
     fn facts(
@@ -7569,6 +7657,42 @@ mod tests {
             CheckedValueUse::RenderSlot
         );
         assert_eq!(materialized_statements[1].children, [CheckedStatementId(0)]);
+
+        let mut hidden_type_rows = (*snapshot).clone();
+        for definition in &mut hidden_type_rows.definitions {
+            definition.expressions[0].flush_type = Some(Type::Var(TypeVar(0)));
+            definition.declarations[0].declared_flow_type = Some(FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Var(TypeVar(1)),
+            });
+        }
+        let hidden_layout = KernelCheckedLinkLayout::new(&project, &hidden_type_rows)
+            .expect("flush and declared types must own complete dense alpha ranges");
+        assert_eq!(hidden_layout.totals().type_variables, 4);
+        assert_eq!(
+            hidden_layout.definitions()[0].type_variables,
+            KernelCheckedRowRange { start: 0, len: 2 }
+        );
+        assert_eq!(
+            hidden_layout.definitions()[1].type_variables,
+            KernelCheckedRowRange { start: 2, len: 2 }
+        );
+        let hidden_expressions = hidden_layout
+            .materialize_expressions(&hidden_type_rows)
+            .expect("flush types must relocate through their definition alpha range");
+        assert_eq!(
+            hidden_expressions[0].flush_type,
+            Some(Type::Var(TypeVar(0)))
+        );
+        assert_eq!(
+            hidden_expressions[1].flush_type,
+            Some(Type::Var(TypeVar(2)))
+        );
+        let hidden_declarations = hidden_layout
+            .materialize_declarations(&hidden_type_rows)
+            .expect("declared flow types must relocate through their definition alpha range");
+        assert_eq!(hidden_declarations[0].flow_type.ty, Type::Var(TypeVar(1)));
+        assert_eq!(hidden_declarations[1].flow_type.ty, Type::Var(TypeVar(3)));
 
         let mut generic = (*snapshot).clone();
         for definition in &mut generic.definitions {

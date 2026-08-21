@@ -1,7 +1,8 @@
 use crate::{NameId, TypeTerm, TypeTermArena, TypeTermId, TypeVariableId};
 use boon_checked::FlowMode;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -186,84 +187,388 @@ impl From<TypeTermId> for KernelSummaryCallInput {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum KernelOperation {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackedRange {
+    start: u32,
+    len: u32,
+}
+
+impl PackedRange {
+    fn from_bounds(start: usize, end: usize, label: &str) -> Self {
+        let start = u32::try_from(start).unwrap_or_else(|_| panic!("{label} start exceeds u32"));
+        let len = u32::try_from(end - start as usize)
+            .unwrap_or_else(|_| panic!("{label} length exceeds u32"));
+        Self { start, len }
+    }
+
+    fn bounds(self) -> std::ops::Range<usize> {
+        let start = self.start as usize;
+        start..start + self.len as usize
+    }
+}
+
+/// Fixed-width operation rows plus shared operand columns.
+///
+/// Construction writes these same columns directly, so a finished component
+/// owns no per-operation operand boxes and pays no temporary boxed form. The
+/// hot solver reads borrowed slices through `KernelOperationRef`.
+#[derive(Clone, Debug)]
+pub(crate) struct PackedOperationTable {
+    rows: Box<[PackedOperation]>,
+    terms: Box<[TypeTermId]>,
+    names: Box<[NameId]>,
+    patterns: Box<[KernelPattern]>,
+    select_arms: Box<[KernelSelectArm]>,
+    record_entries: Box<[KernelRecordEntry]>,
+    summary_programs: Box<[Arc<KernelSummaryProgram>]>,
+    summary_inputs: Box<[KernelSummaryCallInput]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackedOperation {
     Unify {
         left: TypeTermId,
         right: TypeTermId,
     },
-    /// One ordered whole-value lexical equation. Evaluation preserves true
-    /// equality/backflow, while the packed provider/consumer roles make its
-    /// initial dataflow direction explicit to the scheduler.
     Alias {
         provider: TypeVariableId,
         consumer: TypeVariableId,
     },
     Publish {
         output: TypeVariableId,
-        inputs: Box<[TypeTermId]>,
+        inputs: PackedRange,
         mode: PublishMode,
     },
-    /// One explicit projection equation. Chained field reads compile into one
-    /// operation per segment, so every intermediate occurrence is refreshed.
     Projection {
         provider: TypeVariableId,
         field: Option<NameId>,
         consumer: TypeVariableId,
     },
-    /// Directional projection through one authored match pattern. This is a
-    /// single packed equation because ordinary field projections cannot
-    /// retain which tagged-variant arm introduced a payload binding.
     PatternProjection {
         provider: TypeVariableId,
-        pattern: KernelPattern,
-        fields: Box<[NameId]>,
+        pattern: u32,
+        fields: PackedRange,
         consumer: TypeVariableId,
     },
-    /// Directional extraction of one collection component authority. This is
-    /// the compact residual behind contextual callback bindings and Map ABI
-    /// correlations; it never equates the producer with the occurrence.
     CollectionProjection {
         provider: TypeVariableId,
         kind: KernelCollectionProjectionKind,
         consumer: TypeVariableId,
     },
-    /// One collection authority. Item/key/value inputs are widened directly
-    /// into the final collection term, avoiding mutable intermediate cells.
     Collection {
         output: TypeVariableId,
         kind: KernelCollectionOperationKind,
-        inputs: Box<[TypeTermId]>,
-        values: Box<[TypeTermId]>,
+        inputs: PackedRange,
+        values: PackedRange,
     },
-    /// One syntax-discriminated branch join. A singleton tag selects the
-    /// first matching non-absent arm. Multiple closed outputs structurally
-    /// widen like the language's WHEN/LATEST rules; unresolved generic arms
-    /// remain a symbolic union until their invocation frame settles.
     Select {
         output: TypeVariableId,
         selector: TypeVariableId,
-        /// The selector is derived from an invocation formal. A singleton
-        /// selector therefore proves that this occurrence chose one authored
-        /// syntax branch rather than merely joining a definition's principal
-        /// result surface.
         selector_parameter_derived: bool,
-        arms: Box<[KernelSelectArm]>,
+        arms: PackedRange,
     },
-    /// One ordered record assembly. Spread fields and explicit fields replace
-    /// earlier values without changing the first-authored field position.
     Record {
         output: TypeVariableId,
         tag: Option<NameId>,
-        entries: Box<[KernelRecordEntry]>,
+        entries: PackedRange,
     },
-    /// One invocation of immutable definition-result bytecode. Only its
-    /// projected formal/external inputs and result are occurrence-local.
     SummaryCall {
         output: TypeVariableId,
-        program: Arc<KernelSummaryProgram>,
-        inputs: Box<[KernelSummaryCallInput]>,
+        program: u32,
+        inputs: PackedRange,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum KernelOperationRef<'a> {
+    Unify {
+        left: TypeTermId,
+        right: TypeTermId,
+    },
+    Alias {
+        provider: TypeVariableId,
+        consumer: TypeVariableId,
+    },
+    Publish {
+        output: TypeVariableId,
+        inputs: &'a [TypeTermId],
+        mode: PublishMode,
+    },
+    Projection {
+        provider: TypeVariableId,
+        field: Option<NameId>,
+        consumer: TypeVariableId,
+    },
+    PatternProjection {
+        provider: TypeVariableId,
+        pattern: &'a KernelPattern,
+        fields: &'a [NameId],
+        consumer: TypeVariableId,
+    },
+    CollectionProjection {
+        provider: TypeVariableId,
+        kind: KernelCollectionProjectionKind,
+        consumer: TypeVariableId,
+    },
+    Collection {
+        output: TypeVariableId,
+        kind: KernelCollectionOperationKind,
+        inputs: &'a [TypeTermId],
+        values: &'a [TypeTermId],
+    },
+    Select {
+        output: TypeVariableId,
+        selector: TypeVariableId,
+        selector_parameter_derived: bool,
+        arms: &'a [KernelSelectArm],
+    },
+    Record {
+        output: TypeVariableId,
+        tag: Option<NameId>,
+        entries: &'a [KernelRecordEntry],
+    },
+    SummaryCall {
+        output: TypeVariableId,
+        program: &'a Arc<KernelSummaryProgram>,
+        inputs: &'a [KernelSummaryCallInput],
+    },
+}
+
+#[derive(Debug, Default)]
+struct PackedOperationBuilder {
+    rows: Vec<PackedOperation>,
+    terms: Vec<TypeTermId>,
+    names: Vec<NameId>,
+    patterns: Vec<KernelPattern>,
+    select_arms: Vec<KernelSelectArm>,
+    record_entries: Vec<KernelRecordEntry>,
+    summary_programs: Vec<Arc<KernelSummaryProgram>>,
+    summary_inputs: Vec<KernelSummaryCallInput>,
+}
+
+impl PackedOperationBuilder {
+    fn get(&self, index: usize) -> KernelOperationRef<'_> {
+        operation_ref(
+            &self.rows,
+            &self.terms,
+            &self.names,
+            &self.patterns,
+            &self.select_arms,
+            &self.record_entries,
+            &self.summary_programs,
+            &self.summary_inputs,
+            index,
+        )
+    }
+
+    fn push(&mut self, operation: PackedOperation) -> OperationId {
+        let id = OperationId(
+            u32::try_from(self.rows.len()).expect("kernel operation count exceeds u32"),
+        );
+        self.rows.push(operation);
+        id
+    }
+
+    fn append_terms(&mut self, values: impl IntoIterator<Item = TypeTermId>) -> PackedRange {
+        append_column(&mut self.terms, values, "kernel operation term column")
+    }
+
+    fn append_names(&mut self, values: impl IntoIterator<Item = NameId>) -> PackedRange {
+        append_column(&mut self.names, values, "kernel operation name column")
+    }
+
+    fn push_pattern(&mut self, pattern: KernelPattern) -> u32 {
+        let id =
+            u32::try_from(self.patterns.len()).expect("kernel operation pattern count exceeds u32");
+        self.patterns.push(pattern);
+        id
+    }
+
+    fn append_select_arms(
+        &mut self,
+        arms: impl IntoIterator<Item = KernelSelectArm>,
+    ) -> PackedRange {
+        append_column(
+            &mut self.select_arms,
+            arms,
+            "kernel operation select-arm column",
+        )
+    }
+
+    fn append_record_entries(
+        &mut self,
+        entries: impl IntoIterator<Item = KernelRecordEntry>,
+    ) -> PackedRange {
+        append_column(
+            &mut self.record_entries,
+            entries,
+            "kernel operation record-entry column",
+        )
+    }
+
+    fn push_summary_program(&mut self, program: Arc<KernelSummaryProgram>) -> u32 {
+        let id = u32::try_from(self.summary_programs.len())
+            .expect("kernel summary program count exceeds u32");
+        self.summary_programs.push(program);
+        id
+    }
+
+    fn append_summary_inputs(
+        &mut self,
+        inputs: impl IntoIterator<Item = KernelSummaryCallInput>,
+    ) -> PackedRange {
+        append_column(
+            &mut self.summary_inputs,
+            inputs,
+            "kernel summary input column",
+        )
+    }
+
+    fn finish(self) -> PackedOperationTable {
+        PackedOperationTable {
+            rows: self.rows.into_boxed_slice(),
+            terms: self.terms.into_boxed_slice(),
+            names: self.names.into_boxed_slice(),
+            patterns: self.patterns.into_boxed_slice(),
+            select_arms: self.select_arms.into_boxed_slice(),
+            record_entries: self.record_entries.into_boxed_slice(),
+            summary_programs: self.summary_programs.into_boxed_slice(),
+            summary_inputs: self.summary_inputs.into_boxed_slice(),
+        }
+    }
+}
+
+impl PackedOperationTable {
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub(crate) fn get(&self, index: usize) -> KernelOperationRef<'_> {
+        operation_ref(
+            &self.rows,
+            &self.terms,
+            &self.names,
+            &self.patterns,
+            &self.select_arms,
+            &self.record_entries,
+            &self.summary_programs,
+            &self.summary_inputs,
+            index,
+        )
+    }
+
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = KernelOperationRef<'_>> + '_ {
+        (0..self.len()).map(|index| self.get(index))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn operation_ref<'a>(
+    rows: &[PackedOperation],
+    terms: &'a [TypeTermId],
+    names: &'a [NameId],
+    patterns: &'a [KernelPattern],
+    select_arms: &'a [KernelSelectArm],
+    record_entries: &'a [KernelRecordEntry],
+    summary_programs: &'a [Arc<KernelSummaryProgram>],
+    summary_inputs: &'a [KernelSummaryCallInput],
+    index: usize,
+) -> KernelOperationRef<'a> {
+    let row = *rows.get(index).expect("kernel operation index is in range");
+    match row {
+        PackedOperation::Unify { left, right } => KernelOperationRef::Unify { left, right },
+        PackedOperation::Alias { provider, consumer } => {
+            KernelOperationRef::Alias { provider, consumer }
+        }
+        PackedOperation::Publish {
+            output,
+            inputs,
+            mode,
+        } => KernelOperationRef::Publish {
+            output,
+            inputs: &terms[inputs.bounds()],
+            mode,
+        },
+        PackedOperation::Projection {
+            provider,
+            field,
+            consumer,
+        } => KernelOperationRef::Projection {
+            provider,
+            field,
+            consumer,
+        },
+        PackedOperation::PatternProjection {
+            provider,
+            pattern,
+            fields,
+            consumer,
+        } => KernelOperationRef::PatternProjection {
+            provider,
+            pattern: &patterns[pattern as usize],
+            fields: &names[fields.bounds()],
+            consumer,
+        },
+        PackedOperation::CollectionProjection {
+            provider,
+            kind,
+            consumer,
+        } => KernelOperationRef::CollectionProjection {
+            provider,
+            kind,
+            consumer,
+        },
+        PackedOperation::Collection {
+            output,
+            kind,
+            inputs,
+            values,
+        } => KernelOperationRef::Collection {
+            output,
+            kind,
+            inputs: &terms[inputs.bounds()],
+            values: &terms[values.bounds()],
+        },
+        PackedOperation::Select {
+            output,
+            selector,
+            selector_parameter_derived,
+            arms,
+        } => KernelOperationRef::Select {
+            output,
+            selector,
+            selector_parameter_derived,
+            arms: &select_arms[arms.bounds()],
+        },
+        PackedOperation::Record {
+            output,
+            tag,
+            entries,
+        } => KernelOperationRef::Record {
+            output,
+            tag,
+            entries: &record_entries[entries.bounds()],
+        },
+        PackedOperation::SummaryCall {
+            output,
+            program,
+            inputs,
+        } => KernelOperationRef::SummaryCall {
+            output,
+            program: &summary_programs[program as usize],
+            inputs: &summary_inputs[inputs.bounds()],
+        },
+    }
+}
+
+fn append_column<T>(
+    column: &mut Vec<T>,
+    values: impl IntoIterator<Item = T>,
+    label: &str,
+) -> PackedRange {
+    let start = column.len();
+    column.extend(values);
+    PackedRange::from_bounds(start, column.len(), label)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -283,7 +588,7 @@ pub struct ProgramOutput {
 pub struct ComponentProgram {
     pub(crate) terms: TypeTermArena,
     pub(crate) variables: Box<[VariableSpec]>,
-    pub(crate) operations: Box<[Arc<KernelOperation>]>,
+    pub(crate) operations: PackedOperationTable,
     pub(crate) residual_frames: Box<[ResidualOperationFrame]>,
     pub(crate) work_items: Box<[ProgramOperationRef]>,
     pub(crate) instruction_count: u64,
@@ -387,7 +692,7 @@ impl ComponentProgram {
 pub struct ComponentProgramBuilder {
     terms: TypeTermArena,
     variables: Vec<VariableSpec>,
-    operations: Vec<KernelOperation>,
+    operations: PackedOperationBuilder,
     residual_frames: Vec<ResidualOperationFrame>,
     work_order: Vec<BuilderWorkItem>,
     outputs: Vec<ProgramOutput>,
@@ -451,11 +756,11 @@ impl ComponentProgramBuilder {
     }
 
     pub fn add_unify(&mut self, left: TypeTermId, right: TypeTermId) -> OperationId {
-        self.push_operation(KernelOperation::Unify { left, right })
+        self.push_operation(PackedOperation::Unify { left, right })
     }
 
     pub fn add_alias(&mut self, provider: TypeVariableId, consumer: TypeVariableId) -> OperationId {
-        self.push_operation(KernelOperation::Alias { provider, consumer })
+        self.push_operation(PackedOperation::Alias { provider, consumer })
     }
 
     pub fn add_publish(
@@ -471,9 +776,10 @@ impl ComponentProgramBuilder {
         if mode != PublishMode::Unify {
             self.mark_authoritative(output);
         }
-        self.push_operation(KernelOperation::Publish {
+        let inputs = self.operations.append_terms(inputs);
+        self.push_operation(PackedOperation::Publish {
             output,
-            inputs: inputs.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            inputs,
             mode,
         })
     }
@@ -502,29 +808,33 @@ impl ComponentProgramBuilder {
         path: impl IntoIterator<Item = NameId>,
         consumer: TypeVariableId,
     ) {
-        let path = path.into_iter().collect::<Vec<_>>();
-        if path.is_empty() {
-            self.push_operation(KernelOperation::Projection {
+        let mut path = path.into_iter().peekable();
+        let Some(first) = path.next() else {
+            self.push_operation(PackedOperation::Projection {
                 provider,
                 field: None,
                 consumer,
             });
             return;
-        }
+        };
         let mut provider = provider;
-        let last = path.len() - 1;
-        for (index, field) in path.into_iter().enumerate() {
-            let next = if index == last {
+        let mut field = first;
+        loop {
+            let next = if path.peek().is_none() {
                 consumer
             } else {
                 self.new_variable()
             };
-            self.push_operation(KernelOperation::Projection {
+            self.push_operation(PackedOperation::Projection {
                 provider,
                 field: Some(field),
                 consumer: next,
             });
             provider = next;
+            let Some(next_field) = path.next() else {
+                break;
+            };
+            field = next_field;
         }
     }
 
@@ -535,10 +845,12 @@ impl ComponentProgramBuilder {
         fields: impl IntoIterator<Item = NameId>,
         consumer: TypeVariableId,
     ) -> OperationId {
-        self.push_operation(KernelOperation::PatternProjection {
+        let pattern = self.operations.push_pattern(pattern);
+        let fields = self.operations.append_names(fields);
+        self.push_operation(PackedOperation::PatternProjection {
             provider,
             pattern,
-            fields: fields.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            fields,
             consumer,
         })
     }
@@ -560,11 +872,12 @@ impl ComponentProgramBuilder {
         arms: impl IntoIterator<Item = KernelSelectArm>,
     ) -> OperationId {
         self.mark_authoritative(output);
-        self.push_operation(KernelOperation::Select {
+        let arms = self.operations.append_select_arms(arms);
+        self.push_operation(PackedOperation::Select {
             output,
             selector,
             selector_parameter_derived,
-            arms: arms.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            arms,
         })
     }
 
@@ -574,7 +887,7 @@ impl ComponentProgramBuilder {
         consumer: TypeVariableId,
     ) -> OperationId {
         self.mark_authoritative(consumer);
-        self.push_operation(KernelOperation::CollectionProjection {
+        self.push_operation(PackedOperation::CollectionProjection {
             provider,
             kind: KernelCollectionProjectionKind::Item,
             consumer,
@@ -587,7 +900,7 @@ impl ComponentProgramBuilder {
         consumer: TypeVariableId,
     ) -> OperationId {
         self.mark_authoritative(consumer);
-        self.push_operation(KernelOperation::CollectionProjection {
+        self.push_operation(PackedOperation::CollectionProjection {
             provider,
             kind: KernelCollectionProjectionKind::MapKey,
             consumer,
@@ -600,7 +913,7 @@ impl ComponentProgramBuilder {
         consumer: TypeVariableId,
     ) -> OperationId {
         self.mark_authoritative(consumer);
-        self.push_operation(KernelOperation::CollectionProjection {
+        self.push_operation(PackedOperation::CollectionProjection {
             provider,
             kind: KernelCollectionProjectionKind::MapValue,
             consumer,
@@ -615,11 +928,13 @@ impl ComponentProgramBuilder {
         values: impl IntoIterator<Item = TypeTermId>,
     ) -> OperationId {
         self.mark_authoritative(output);
-        self.push_operation(KernelOperation::Collection {
+        let inputs = self.operations.append_terms(inputs);
+        let values = self.operations.append_terms(values);
+        self.push_operation(PackedOperation::Collection {
             output,
             kind,
-            inputs: inputs.into_iter().collect::<Vec<_>>().into_boxed_slice(),
-            values: values.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            inputs,
+            values,
         })
     }
 
@@ -630,10 +945,11 @@ impl ComponentProgramBuilder {
         entries: impl IntoIterator<Item = KernelRecordEntry>,
     ) -> OperationId {
         self.mark_authoritative(output);
-        self.push_operation(KernelOperation::Record {
+        let entries = self.operations.append_record_entries(entries);
+        self.push_operation(PackedOperation::Record {
             output,
             tag,
-            entries: entries.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            entries,
         })
     }
 
@@ -648,14 +964,14 @@ impl ComponentProgramBuilder {
         T: Into<KernelSummaryCallInput>,
     {
         self.mark_authoritative(output);
-        self.push_operation(KernelOperation::SummaryCall {
+        let program = self.operations.push_summary_program(program);
+        let inputs = self
+            .operations
+            .append_summary_inputs(inputs.into_iter().map(Into::into));
+        self.push_operation(PackedOperation::SummaryCall {
             output,
             program,
-            inputs: inputs
-                .into_iter()
-                .map(Into::into)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            inputs,
         })
     }
 
@@ -716,188 +1032,124 @@ impl ComponentProgramBuilder {
             frame.names = name_cache.into();
         }
 
-        let mut reverse = vec![BTreeSet::<ProgramConsumer>::new(); self.variables.len()];
-        let mut work_items = Vec::new();
-        let mut dependency_offsets = Vec::new();
-        let mut forward_dependencies = Vec::new();
-        let mut operation_outputs = Vec::<Box<[TypeVariableId]>>::new();
+        // Size the topology first, then write each final column exactly once.
+        // The previous Vec<BTreeSet<_>> reverse index allocated one tree node
+        // per edge, one Arc per operation, and one boxed output slice per work
+        // item. Dense IDs already give us deterministic sort/dedup order, so
+        // none of those pointer-owning staging structures are needed.
+        let mut work_item_count = 0_usize;
+        let mut dependency_count = 0_usize;
+        let mut output_count = 0_usize;
         let mut instruction_count = 0_u64;
+        let mut consumer_counts = vec![0_u32; self.variables.len()];
+        visit_program_topology(
+            &self.work_order,
+            &self.operations,
+            &self.residual_frames,
+            &self.terms,
+            |_, instructions, dependencies, outputs| {
+                work_item_count = work_item_count
+                    .checked_add(1)
+                    .expect("kernel work-item count exceeds usize");
+                dependency_count = dependency_count
+                    .checked_add(dependencies.len())
+                    .expect("kernel dependency edge count exceeds usize");
+                output_count = output_count
+                    .checked_add(outputs.len())
+                    .expect("kernel operation-output edge count exceeds usize");
+                instruction_count = instruction_count.saturating_add(instructions);
+                for dependency in dependencies {
+                    let count = consumer_counts
+                        .get_mut(dependency.0 as usize)
+                        .expect("kernel operation references an undeclared variable");
+                    *count = count
+                        .checked_add(1)
+                        .expect("kernel variable consumer count exceeds u32");
+                }
+            },
+        );
+        u32::try_from(work_item_count).expect("kernel operation count exceeds u32");
+        u32::try_from(dependency_count).expect("kernel dependency edge count exceeds u32");
+        u32::try_from(output_count).expect("kernel operation-output edge count exceeds u32");
+
+        let mut work_items = Vec::with_capacity(work_item_count);
+        let mut dependency_offsets = Vec::with_capacity(work_item_count + 1);
+        let mut forward_dependencies = Vec::with_capacity(dependency_count);
+        let mut output_offsets = Vec::with_capacity(work_item_count + 1);
+        let mut flat_operation_outputs = Vec::with_capacity(output_count);
         dependency_offsets.push(0);
-        for item in &self.work_order {
-            match *item {
-                BuilderWorkItem::Direct(index) => {
-                    instruction_count = instruction_count.saturating_add(1);
-                    let operation_id = OperationId(
-                        u32::try_from(work_items.len())
-                            .expect("kernel operation count exceeds u32"),
-                    );
-                    work_items.push(ProgramOperationRef::Direct(index));
-                    operation_outputs.push(
-                        operation_output(&self.operations[index as usize], None)
-                            .into_iter()
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice(),
-                    );
-                    let mut operation_dependencies = BTreeSet::new();
-                    collect_operation_variables(
-                        &self.operations[index as usize],
-                        &self.terms,
-                        &mut operation_dependencies,
-                    );
-                    for dependency in operation_dependencies {
-                        assert!(
-                            (dependency.0 as usize) < reverse.len(),
-                            "kernel operation references an undeclared variable"
-                        );
-                        reverse[dependency.0 as usize].insert(ProgramConsumer {
-                            operation: operation_id,
-                        });
-                        forward_dependencies.push(dependency);
-                    }
-                    dependency_offsets.push(
-                        u32::try_from(forward_dependencies.len())
-                            .expect("kernel dependency edge count exceeds u32"),
-                    );
-                }
-                BuilderWorkItem::Residual(frame_index) => {
-                    let frame = &self.residual_frames[frame_index as usize];
-                    instruction_count =
-                        instruction_count.saturating_add(frame.module.operation_count() as u64);
-                    let fully_acyclic = frame.module.acyclic_initial_operation_count()
-                        == frame.module.operation_count() as u64;
-                    if fully_acyclic {
-                        let operation_id = OperationId(
-                            u32::try_from(work_items.len())
-                                .expect("kernel operation count exceeds u32"),
-                        );
-                        work_items.push(ProgramOperationRef::ResidualFrame { frame: frame_index });
-                        let mut outputs = BTreeSet::new();
-                        let mut dependencies = BTreeSet::new();
-                        for operation_index in 0..frame.module.operations.len() {
-                            if let Some(output) = operation_output(
-                                &frame.module.operations[operation_index],
-                                Some(&frame.variables),
-                            ) {
-                                outputs.insert(output);
-                            }
-                        }
-                        for operation_index in 0..frame.module.operations.len() {
-                            let module_operation = OperationId(
-                                u32::try_from(operation_index)
-                                    .expect("kernel residual operation count exceeds u32"),
-                            );
-                            let operation_dependencies = frame
-                                .module
-                                .operation_dependencies(module_operation)
-                                .iter()
-                                .map(|dependency| frame.variables[dependency.0 as usize])
-                                .collect::<BTreeSet<_>>();
-                            dependencies.extend(operation_dependencies.iter().copied());
-                        }
-                        // The module's authored topological order owns every
-                        // value it writes internally. Only formal/imported
-                        // roots are frame-level subscriptions; retaining
-                        // internal intermediates here reactivated the whole
-                        // frame after its own instructions had already
-                        // consumed them.
-                        dependencies.retain(|dependency| !outputs.contains(dependency));
-                        operation_outputs.push(outputs.into_iter().collect());
-                        for dependency in dependencies {
-                            assert!(
-                                (dependency.0 as usize) < reverse.len(),
-                                "kernel residual operation references an undeclared frame variable"
-                            );
-                            forward_dependencies.push(dependency);
-                            reverse[dependency.0 as usize].insert(ProgramConsumer {
-                                operation: operation_id,
-                            });
-                        }
-                        dependency_offsets.push(
-                            u32::try_from(forward_dependencies.len())
-                                .expect("kernel dependency edge count exceeds u32"),
-                        );
-                    } else {
-                        // Cyclic residual modules retain instruction-grained
-                        // scheduling. They are the small exceptional tail;
-                        // acyclic definitions use one compact frame work item.
-                        for operation_index in 0..frame.module.operations.len() {
-                            let operation_id = OperationId(
-                                u32::try_from(work_items.len())
-                                    .expect("kernel operation count exceeds u32"),
-                            );
-                            work_items.push(ProgramOperationRef::Residual {
-                                frame: frame_index,
-                                operation: u32::try_from(operation_index)
-                                    .expect("kernel residual operation count exceeds u32"),
-                            });
-                            operation_outputs.push(
-                                operation_output(
-                                    &frame.module.operations[operation_index],
-                                    Some(&frame.variables),
-                                )
-                                .into_iter()
-                                .collect::<Vec<_>>()
-                                .into_boxed_slice(),
-                            );
-                            let module_operation = OperationId(
-                                u32::try_from(operation_index)
-                                    .expect("kernel residual operation count exceeds u32"),
-                            );
-                            for dependency in frame.module.operation_dependencies(module_operation)
-                            {
-                                let dependency = frame.variables[dependency.0 as usize];
-                                assert!(
-                                    (dependency.0 as usize) < reverse.len(),
-                                    "kernel residual operation references an undeclared frame variable"
-                                );
-                                reverse[dependency.0 as usize].insert(ProgramConsumer {
-                                    operation: operation_id,
-                                });
-                                forward_dependencies.push(dependency);
-                            }
-                            dependency_offsets.push(
-                                u32::try_from(forward_dependencies.len())
-                                    .expect("kernel dependency edge count exceeds u32"),
-                            );
-                        }
-                    }
-                }
-            }
+        output_offsets.push(0);
+        visit_program_topology(
+            &self.work_order,
+            &self.operations,
+            &self.residual_frames,
+            &self.terms,
+            |reference, _, dependencies, outputs| {
+                work_items.push(reference);
+                forward_dependencies.extend_from_slice(dependencies);
+                dependency_offsets.push(
+                    u32::try_from(forward_dependencies.len())
+                        .expect("kernel dependency edge count exceeds u32"),
+                );
+                flat_operation_outputs.extend_from_slice(outputs);
+                output_offsets.push(
+                    u32::try_from(flat_operation_outputs.len())
+                        .expect("kernel operation-output edge count exceeds u32"),
+                );
+            },
+        );
+        debug_assert_eq!(work_items.len(), work_item_count);
+        debug_assert_eq!(forward_dependencies.len(), dependency_count);
+        debug_assert_eq!(flat_operation_outputs.len(), output_count);
+
+        let mut consumer_offsets = Vec::with_capacity(consumer_counts.len() + 1);
+        consumer_offsets.push(0_u32);
+        for count in consumer_counts {
+            let next = consumer_offsets
+                .last()
+                .copied()
+                .expect("kernel consumer offsets contain zero")
+                .checked_add(count)
+                .expect("kernel consumer edge count exceeds u32");
+            consumer_offsets.push(next);
         }
-        let mut offsets = Vec::with_capacity(reverse.len() + 1);
-        let mut consumers = Vec::new();
-        offsets.push(0);
-        for variable_consumers in reverse {
-            consumers.extend(variable_consumers);
-            offsets.push(
-                u32::try_from(consumers.len()).expect("kernel consumer edge count exceeds u32"),
-            );
+        debug_assert_eq!(
+            consumer_offsets.last().copied().unwrap_or(0) as usize,
+            dependency_count,
+        );
+        let mut consumer_cursors = consumer_offsets[..self.variables.len()].to_vec();
+        let mut consumers = vec![
+            ProgramConsumer {
+                operation: OperationId(0),
+            };
+            dependency_count
+        ];
+        for operation in 0..work_items.len() {
+            let operation_id =
+                OperationId(u32::try_from(operation).expect("kernel operation count exceeds u32"));
+            let start = dependency_offsets[operation] as usize;
+            let end = dependency_offsets[operation + 1] as usize;
+            for dependency in &forward_dependencies[start..end] {
+                let cursor = &mut consumer_cursors[dependency.0 as usize];
+                consumers[*cursor as usize] = ProgramConsumer {
+                    operation: operation_id,
+                };
+                *cursor = cursor
+                    .checked_add(1)
+                    .expect("kernel consumer cursor exceeds u32");
+            }
         }
         let (initial_order, acyclic_initial_operations) = initial_operation_order(
             self.variables.len(),
-            &operation_outputs,
+            &output_offsets,
+            &flat_operation_outputs,
             &dependency_offsets,
             &forward_dependencies,
         );
-        let mut output_offsets = Vec::with_capacity(operation_outputs.len() + 1);
-        let mut flat_operation_outputs = Vec::new();
-        output_offsets.push(0);
-        for outputs in &operation_outputs {
-            flat_operation_outputs.extend(outputs.iter().copied());
-            output_offsets.push(
-                u32::try_from(flat_operation_outputs.len())
-                    .expect("kernel operation-output edge count exceeds u32"),
-            );
-        }
         ComponentProgram {
             terms: self.terms,
             variables: self.variables.into_boxed_slice(),
-            operations: self
-                .operations
-                .into_iter()
-                .map(Arc::new)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            operations: self.operations.finish(),
             residual_frames: self.residual_frames.into_boxed_slice(),
             work_items: work_items.into_boxed_slice(),
             instruction_count,
@@ -907,59 +1159,174 @@ impl ComponentProgramBuilder {
             dependencies: forward_dependencies.into_boxed_slice(),
             output_offsets: output_offsets.into_boxed_slice(),
             operation_outputs: flat_operation_outputs.into_boxed_slice(),
-            consumer_offsets: offsets.into_boxed_slice(),
+            consumer_offsets: consumer_offsets.into_boxed_slice(),
             consumers: consumers.into_boxed_slice(),
             outputs: self.outputs.into_boxed_slice(),
         }
     }
 
-    fn push_operation(&mut self, operation: KernelOperation) -> OperationId {
-        let id = OperationId(
-            u32::try_from(self.operations.len()).expect("kernel operation count exceeds u32"),
-        );
-        self.operations.push(operation);
+    fn push_operation(&mut self, operation: PackedOperation) -> OperationId {
+        let id = self.operations.push(operation);
         self.work_order.push(BuilderWorkItem::Direct(id.0));
         id
     }
 }
 
-pub(crate) fn operation_output(
-    operation: &KernelOperation,
+fn visit_program_topology(
+    work_order: &[BuilderWorkItem],
+    operations: &PackedOperationBuilder,
+    residual_frames: &[ResidualOperationFrame],
+    terms: &TypeTermArena,
+    mut visit: impl FnMut(ProgramOperationRef, u64, &[TypeVariableId], &[TypeVariableId]),
+) {
+    let mut dependencies = Vec::<TypeVariableId>::new();
+    let mut outputs = Vec::<TypeVariableId>::new();
+    let mut publish = |reference: ProgramOperationRef,
+                       instruction_count: u64,
+                       dependencies: &mut Vec<TypeVariableId>,
+                       outputs: &mut Vec<TypeVariableId>| {
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        outputs.sort_unstable();
+        outputs.dedup();
+        visit(reference, instruction_count, dependencies, outputs);
+        dependencies.clear();
+        outputs.clear();
+    };
+
+    for item in work_order {
+        match *item {
+            BuilderWorkItem::Direct(index) => {
+                let operation = operations.get(index as usize);
+                if let Some(output) = operation_ref_output(operation, None) {
+                    outputs.push(output);
+                }
+                collect_operation_variables(operation, terms, &mut dependencies);
+                publish(
+                    ProgramOperationRef::Direct(index),
+                    1,
+                    &mut dependencies,
+                    &mut outputs,
+                );
+            }
+            BuilderWorkItem::Residual(frame_index) => {
+                let frame = &residual_frames[frame_index as usize];
+                let fully_acyclic = frame.module.acyclic_initial_operation_count()
+                    == frame.module.operation_count() as u64;
+                if fully_acyclic {
+                    for operation in frame.module.operations.iter() {
+                        if let Some(output) =
+                            operation_ref_output(operation, Some(&frame.variables))
+                        {
+                            outputs.push(output);
+                        }
+                    }
+                    for operation_index in 0..frame.module.operations.len() {
+                        let module_operation = OperationId(
+                            u32::try_from(operation_index)
+                                .expect("kernel residual operation count exceeds u32"),
+                        );
+                        dependencies.extend(
+                            frame
+                                .module
+                                .operation_dependencies(module_operation)
+                                .iter()
+                                .map(|dependency| frame.variables[dependency.0 as usize]),
+                        );
+                    }
+                    dependencies.sort_unstable();
+                    dependencies.dedup();
+                    outputs.sort_unstable();
+                    outputs.dedup();
+                    // The module's authored topological order owns every
+                    // value it writes internally. Only formal/imported roots
+                    // are frame-level subscriptions.
+                    dependencies.retain(|dependency| outputs.binary_search(dependency).is_err());
+                    publish(
+                        ProgramOperationRef::ResidualFrame { frame: frame_index },
+                        frame.module.operation_count() as u64,
+                        &mut dependencies,
+                        &mut outputs,
+                    );
+                } else {
+                    // Cyclic residual modules retain instruction-grained
+                    // scheduling. They are the small exceptional tail.
+                    for operation_index in 0..frame.module.operations.len() {
+                        let operation = frame.module.operations.get(operation_index);
+                        if let Some(output) =
+                            operation_ref_output(operation, Some(&frame.variables))
+                        {
+                            outputs.push(output);
+                        }
+                        let module_operation = OperationId(
+                            u32::try_from(operation_index)
+                                .expect("kernel residual operation count exceeds u32"),
+                        );
+                        dependencies.extend(
+                            frame
+                                .module
+                                .operation_dependencies(module_operation)
+                                .iter()
+                                .map(|dependency| frame.variables[dependency.0 as usize]),
+                        );
+                        publish(
+                            ProgramOperationRef::Residual {
+                                frame: frame_index,
+                                operation: module_operation.0,
+                            },
+                            1,
+                            &mut dependencies,
+                            &mut outputs,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn operation_ref_output(
+    operation: KernelOperationRef<'_>,
     variables: Option<&[TypeVariableId]>,
 ) -> Option<TypeVariableId> {
     let output = match operation {
-        KernelOperation::Publish { output, .. }
-        | KernelOperation::Select { output, .. }
-        | KernelOperation::Record { output, .. }
-        | KernelOperation::Collection { output, .. }
-        | KernelOperation::SummaryCall { output, .. } => Some(*output),
-        KernelOperation::Alias { consumer, .. }
-        | KernelOperation::Projection { consumer, .. }
-        | KernelOperation::PatternProjection { consumer, .. }
-        | KernelOperation::CollectionProjection { consumer, .. } => Some(*consumer),
-        KernelOperation::Unify { .. } => None,
+        KernelOperationRef::Publish { output, .. }
+        | KernelOperationRef::Select { output, .. }
+        | KernelOperationRef::Record { output, .. }
+        | KernelOperationRef::Collection { output, .. }
+        | KernelOperationRef::SummaryCall { output, .. } => Some(output),
+        KernelOperationRef::Alias { consumer, .. }
+        | KernelOperationRef::Projection { consumer, .. }
+        | KernelOperationRef::PatternProjection { consumer, .. }
+        | KernelOperationRef::CollectionProjection { consumer, .. } => Some(consumer),
+        KernelOperationRef::Unify { .. } => None,
     }?;
     Some(variables.map_or(output, |variables| variables[output.0 as usize]))
 }
 
 fn initial_operation_order(
     variable_count: usize,
-    outputs: &[Box<[TypeVariableId]>],
+    output_offsets: &[u32],
+    outputs: &[TypeVariableId],
     dependency_offsets: &[u32],
     dependencies: &[TypeVariableId],
 ) -> (Vec<OperationId>, u64) {
+    let operation_count = output_offsets.len().saturating_sub(1);
     let mut writers = vec![None::<usize>; variable_count];
-    for (operation, operation_outputs) in outputs.iter().enumerate() {
-        for output in operation_outputs {
+    for operation in 0..operation_count {
+        let start = output_offsets[operation] as usize;
+        let end = output_offsets[operation + 1] as usize;
+        for output in &outputs[start..end] {
             let writer = &mut writers[output.0 as usize];
             if writer.is_none() {
                 *writer = Some(operation);
             }
         }
     }
-    let mut outgoing = vec![Vec::<usize>::new(); outputs.len()];
-    let mut indegree = vec![0_u32; outputs.len()];
-    for consumer in 0..outputs.len() {
+    let mut outgoing_counts = vec![0_u32; operation_count];
+    let mut indegree = vec![0_u32; operation_count];
+    let mut dependency_writers = Vec::<usize>::new();
+    for consumer in 0..operation_count {
         let start = dependency_offsets[consumer] as usize;
         let end = dependency_offsets[consumer + 1] as usize;
         for dependency in &dependencies[start..end] {
@@ -969,18 +1336,63 @@ fn initial_operation_order(
             if writer == consumer {
                 continue;
             }
-            outgoing[writer].push(consumer);
+            dependency_writers.push(writer);
+        }
+        dependency_writers.sort_unstable();
+        dependency_writers.dedup();
+        for writer in dependency_writers.drain(..) {
+            outgoing_counts[writer] = outgoing_counts[writer]
+                .checked_add(1)
+                .expect("kernel operation edge count exceeds u32");
             indegree[consumer] = indegree[consumer].saturating_add(1);
         }
     }
-    let mut ready = indegree
-        .iter()
-        .enumerate()
-        .filter_map(|(operation, indegree)| (*indegree == 0).then_some(operation))
-        .collect::<BTreeSet<_>>();
-    let mut ordered = Vec::with_capacity(outputs.len());
-    let mut emitted = vec![false; outputs.len()];
-    while let Some(operation) = ready.pop_first() {
+    let mut outgoing_offsets = Vec::with_capacity(operation_count + 1);
+    outgoing_offsets.push(0_u32);
+    for count in outgoing_counts {
+        let next = outgoing_offsets
+            .last()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(count)
+            .expect("kernel operation edge count exceeds u32");
+        outgoing_offsets.push(next);
+    }
+    let mut outgoing_cursors = outgoing_offsets[..operation_count].to_vec();
+    let mut outgoing = vec![0_u32; outgoing_offsets.last().copied().unwrap_or(0) as usize];
+    for consumer in 0..operation_count {
+        let start = dependency_offsets[consumer] as usize;
+        let end = dependency_offsets[consumer + 1] as usize;
+        for dependency in &dependencies[start..end] {
+            let Some(writer) = writers[dependency.0 as usize] else {
+                continue;
+            };
+            if writer == consumer {
+                continue;
+            }
+            dependency_writers.push(writer);
+        }
+        dependency_writers.sort_unstable();
+        dependency_writers.dedup();
+        for writer in dependency_writers.drain(..) {
+            let cursor = &mut outgoing_cursors[writer];
+            outgoing[*cursor as usize] =
+                u32::try_from(consumer).expect("kernel operation count exceeds u32");
+            *cursor = cursor
+                .checked_add(1)
+                .expect("kernel operation edge cursor exceeds u32");
+        }
+    }
+    let mut ready = BinaryHeap::with_capacity(operation_count);
+    ready.extend(
+        indegree
+            .iter()
+            .enumerate()
+            .filter_map(|(operation, indegree)| (*indegree == 0).then_some(Reverse(operation))),
+    );
+    let mut ordered = Vec::with_capacity(operation_count);
+    let mut emitted = vec![false; operation_count];
+    while let Some(Reverse(operation)) = ready.pop() {
         if emitted[operation] {
             continue;
         }
@@ -988,10 +1400,13 @@ fn initial_operation_order(
         ordered.push(OperationId(
             u32::try_from(operation).expect("kernel operation count exceeds u32"),
         ));
-        for consumer in &outgoing[operation] {
-            indegree[*consumer] -= 1;
-            if indegree[*consumer] == 0 {
-                ready.insert(*consumer);
+        let start = outgoing_offsets[operation] as usize;
+        let end = outgoing_offsets[operation + 1] as usize;
+        for consumer in &outgoing[start..end] {
+            let consumer = *consumer as usize;
+            indegree[consumer] -= 1;
+            if indegree[consumer] == 0 {
+                ready.push(Reverse(consumer));
             }
         }
     }
@@ -1012,7 +1427,7 @@ fn initial_operation_order(
 }
 
 fn link_residual_operation_terms(
-    operation: &KernelOperation,
+    operation: KernelOperationRef<'_>,
     source: &TypeTermArena,
     target: &mut TypeTermArena,
     variables: &[TypeVariableId],
@@ -1020,42 +1435,42 @@ fn link_residual_operation_terms(
     name_cache: &mut [Option<NameId>],
 ) {
     match operation {
-        KernelOperation::Unify { left, right } => {
-            link_residual_term(*left, source, target, variables, term_cache, name_cache);
-            link_residual_term(*right, source, target, variables, term_cache, name_cache);
+        KernelOperationRef::Unify { left, right } => {
+            link_residual_term(left, source, target, variables, term_cache, name_cache);
+            link_residual_term(right, source, target, variables, term_cache, name_cache);
         }
-        KernelOperation::Alias { .. } => {}
-        KernelOperation::Publish { inputs, .. } => {
+        KernelOperationRef::Alias { .. } => {}
+        KernelOperationRef::Publish { inputs, .. } => {
             for input in inputs {
                 link_residual_term(*input, source, target, variables, term_cache, name_cache);
             }
         }
-        KernelOperation::Projection { field, .. } => {
+        KernelOperationRef::Projection { field, .. } => {
             if let Some(name) = field {
-                link_residual_name(*name, source, target, name_cache);
+                link_residual_name(name, source, target, name_cache);
             }
         }
-        KernelOperation::PatternProjection { fields, .. } => {
+        KernelOperationRef::PatternProjection { fields, .. } => {
             for field in fields {
                 link_residual_name(*field, source, target, name_cache);
             }
         }
-        KernelOperation::CollectionProjection { .. } => {}
-        KernelOperation::Collection { inputs, values, .. } => {
+        KernelOperationRef::CollectionProjection { .. } => {}
+        KernelOperationRef::Collection { inputs, values, .. } => {
             for input in inputs.iter().chain(values.iter()) {
                 link_residual_term(*input, source, target, variables, term_cache, name_cache);
             }
         }
-        KernelOperation::Select { arms, .. } => {
+        KernelOperationRef::Select { arms, .. } => {
             for arm in arms {
                 link_residual_term(
                     arm.output, source, target, variables, term_cache, name_cache,
                 );
             }
         }
-        KernelOperation::Record { tag, entries, .. } => {
+        KernelOperationRef::Record { tag, entries, .. } => {
             if let Some(name) = tag {
-                link_residual_name(*name, source, target, name_cache);
+                link_residual_name(name, source, target, name_cache);
             }
             for entry in entries {
                 match entry {
@@ -1071,7 +1486,7 @@ fn link_residual_operation_terms(
                 }
             }
         }
-        KernelOperation::SummaryCall { .. } => {
+        KernelOperationRef::SummaryCall { .. } => {
             panic!("parametric summary calls cannot be nested inside residual modules")
         }
     }
@@ -1099,76 +1514,76 @@ fn link_residual_name(
 }
 
 fn collect_operation_variables(
-    operation: &KernelOperation,
+    operation: KernelOperationRef<'_>,
     terms: &TypeTermArena,
-    output: &mut BTreeSet<TypeVariableId>,
+    output: &mut Vec<TypeVariableId>,
 ) {
     match operation {
-        KernelOperation::Unify { left, right } => {
-            collect_term_variables(*left, terms, output);
-            collect_term_variables(*right, terms, output);
+        KernelOperationRef::Unify { left, right } => {
+            collect_term_variables(left, terms, output);
+            collect_term_variables(right, terms, output);
         }
-        KernelOperation::Alias { provider, consumer } => {
-            output.insert(*provider);
-            output.insert(*consumer);
+        KernelOperationRef::Alias { provider, consumer } => {
+            output.push(provider);
+            output.push(consumer);
         }
-        KernelOperation::Publish {
+        KernelOperationRef::Publish {
             output: variable,
             inputs,
             ..
         } => {
-            output.insert(*variable);
+            output.push(variable);
             for input in inputs {
                 collect_term_variables(*input, terms, output);
             }
         }
-        KernelOperation::Projection {
+        KernelOperationRef::Projection {
             provider, consumer, ..
         } => {
-            output.insert(*provider);
-            output.insert(*consumer);
+            output.push(provider);
+            output.push(consumer);
         }
-        KernelOperation::PatternProjection {
+        KernelOperationRef::PatternProjection {
             provider, consumer, ..
         } => {
-            output.insert(*provider);
-            output.insert(*consumer);
+            output.push(provider);
+            output.push(consumer);
         }
-        KernelOperation::CollectionProjection {
+        KernelOperationRef::CollectionProjection {
             provider, consumer, ..
         } => {
-            output.insert(*provider);
-            output.insert(*consumer);
+            output.push(provider);
+            output.push(consumer);
         }
-        KernelOperation::Collection {
+        KernelOperationRef::Collection {
             output: variable,
             inputs,
             values,
             ..
         } => {
-            output.insert(*variable);
+            output.push(variable);
             for input in inputs.iter().chain(values.iter()) {
                 collect_term_variables(*input, terms, output);
             }
         }
-        KernelOperation::Select {
+        KernelOperationRef::Select {
             output: variable,
             selector,
             arms,
             ..
         } => {
-            output.insert(*variable);
-            output.insert(*selector);
+            output.push(variable);
+            output.push(selector);
             for arm in arms {
                 collect_term_variables(arm.output, terms, output);
             }
         }
-        KernelOperation::Record {
+        KernelOperationRef::Record {
             output: variable,
             entries,
             ..
         } => {
-            output.insert(*variable);
+            output.push(variable);
             for entry in entries {
                 let value = match entry {
                     KernelRecordEntry::Field { value, .. }
@@ -1177,19 +1592,19 @@ fn collect_operation_variables(
                 collect_term_variables(value, terms, output);
             }
         }
-        KernelOperation::SummaryCall {
+        KernelOperationRef::SummaryCall {
             output: variable,
             inputs,
             ..
         } => {
-            output.insert(*variable);
+            output.push(variable);
             for input in inputs {
                 match input {
                     KernelSummaryCallInput::Term(term) => {
                         collect_term_variables(*term, terms, output);
                     }
                     KernelSummaryCallInput::Projection { provider, .. } => {
-                        output.insert(*provider);
+                        output.push(*provider);
                     }
                 }
             }
@@ -1200,11 +1615,11 @@ fn collect_operation_variables(
 pub(crate) fn collect_term_variables(
     term: TypeTermId,
     terms: &TypeTermArena,
-    output: &mut BTreeSet<TypeVariableId>,
+    output: &mut Vec<TypeVariableId>,
 ) {
     match terms.term(term) {
         TypeTerm::Variable(variable) => {
-            output.insert(*variable);
+            output.push(variable);
         }
         TypeTerm::VariantSet(variants) => {
             for variant in variants {
@@ -1219,13 +1634,13 @@ pub(crate) fn collect_term_variables(
             }
         }
         TypeTerm::List(item) | TypeTerm::Set(item) => {
-            collect_term_variables(*item, terms, output);
+            collect_term_variables(item, terms, output);
         }
         TypeTerm::Function { args, result, .. } => {
             for argument in args {
                 collect_term_variables(*argument, terms, output);
             }
-            collect_term_variables(*result, terms, output);
+            collect_term_variables(result, terms, output);
         }
         TypeTerm::Union(members) => {
             for member in members {
@@ -1233,8 +1648,8 @@ pub(crate) fn collect_term_variables(
             }
         }
         TypeTerm::Map { key, value } => {
-            collect_term_variables(*key, terms, output);
-            collect_term_variables(*value, terms, output);
+            collect_term_variables(key, terms, output);
+            collect_term_variables(value, terms, output);
         }
         TypeTerm::Text
         | TypeTerm::Number
@@ -1300,5 +1715,59 @@ mod tests {
         );
         assert!(program.consumers(projection).is_empty());
         assert!(program.consumers(constant).is_empty());
+    }
+
+    #[test]
+    fn initial_order_prefers_lowest_ready_id_and_keeps_an_ascending_cycle_tail() {
+        let mut builder = ComponentProgramBuilder::new();
+        let independent = builder.new_variable();
+        let cycle_left = builder.new_variable();
+        let cycle_right = builder.new_variable();
+        let cycle_left_term = builder.variable_term(cycle_left);
+        let cycle_right_term = builder.variable_term(cycle_right);
+        let text = builder.terms().text();
+        builder.add_publish(independent, [text], PublishMode::Replace);
+        builder.add_publish(cycle_left, [cycle_right_term], PublishMode::Replace);
+        builder.add_publish(cycle_right, [cycle_left_term], PublishMode::Replace);
+        let program = builder.finish();
+
+        assert_eq!(
+            program.initial_order.as_ref(),
+            [OperationId(0), OperationId(1), OperationId(2)]
+        );
+        assert_eq!(program.acyclic_initial_operation_count(), 1);
+    }
+
+    #[test]
+    fn packed_topology_columns_are_byte_for_byte_deterministic() {
+        let build = || {
+            let mut builder = ComponentProgramBuilder::new();
+            let left = builder.new_variable();
+            let right = builder.new_variable();
+            let output = builder.new_variable();
+            let left_term = builder.variable_term(left);
+            let right_term = builder.variable_term(right);
+            let text = builder.terms().text();
+            let number = builder.terms().number();
+            builder.add_publish(left, [text], PublishMode::Replace);
+            builder.add_publish(right, [number], PublishMode::Replace);
+            builder.add_publish(
+                output,
+                [left_term, right_term, left_term],
+                PublishMode::Union,
+            );
+            builder.finish()
+        };
+        let left = build();
+        let right = build();
+
+        assert_eq!(left.work_items, right.work_items);
+        assert_eq!(left.initial_order, right.initial_order);
+        assert_eq!(left.dependency_offsets, right.dependency_offsets);
+        assert_eq!(left.dependencies, right.dependencies);
+        assert_eq!(left.output_offsets, right.output_offsets);
+        assert_eq!(left.operation_outputs, right.operation_outputs);
+        assert_eq!(left.consumer_offsets, right.consumer_offsets);
+        assert_eq!(left.consumers, right.consumers);
     }
 }

@@ -16,7 +16,7 @@ use crate::{
     ProducerConfiguration, compiler_allocation_counters, reset_compiler_allocation_counters,
 };
 
-const FORMAT_VERSION: u16 = 7;
+const FORMAT_VERSION: u16 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -357,6 +357,107 @@ struct TypeCheckWorkSample {
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
+struct KernelResidualModuleWorkSample {
+    owner: u32,
+    operations: u32,
+    frames: u32,
+    linked_operations: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct KernelCompileWorkSample {
+    definition_modules: u64,
+    principal_expressions: u64,
+    residual_type_modules: u64,
+    residual_module_operations: u64,
+    residual_module_terms: u64,
+    residual_frames: u64,
+    linked_operations: u64,
+    scheduled_work_items: u64,
+    acyclic_residual_frames: u64,
+    dominant_module_owner: u64,
+    dominant_module_operations: u64,
+    dominant_module_frames: u64,
+    dominant_module_linked_operations: u64,
+    residual_module_ranking: [KernelResidualModuleWorkSample; 16],
+    linked_terms: u64,
+    acyclic_initial_operations: u64,
+    compiled_call_sites: u64,
+    invocation_frames: u64,
+    reused_invocation_frames: u64,
+    direct_result_summaries: u64,
+    summary_definition_nodes: u64,
+    summary_constant_folded_nodes: u64,
+    summary_selector_fused_records: u64,
+    summary_deduplicated_nodes: u64,
+    summary_pruned_nodes: u64,
+    summary_pruned_inputs: u64,
+    summary_invoke_nodes: u64,
+    principal_result_reuses: u64,
+    principal_expression_reuses: u64,
+    pruned_invocation_expressions: u64,
+    specialization_plans: u64,
+    reused_specialization_plans: u64,
+    max_call_depth: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct KernelSummaryDefinitionWorkSample {
+    definition: u32,
+    program_evaluations: u64,
+    node_evaluations: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct FrozenTypeStoreLayoutSample {
+    term_rows: u64,
+    term_capacity: u64,
+    name_rows: u64,
+    name_capacity: u64,
+    name_bytes: u64,
+    name_byte_capacity: u64,
+    child_rows: u64,
+    child_capacity: u64,
+    variant_rows: u64,
+    variant_capacity: u64,
+    object_shape_rows: u64,
+    object_shape_capacity: u64,
+    object_field_rows: u64,
+    object_field_capacity: u64,
+    semantic_order_rows: u64,
+    semantic_order_capacity: u64,
+    payload_len_bytes: u64,
+    payload_capacity_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct KernelSolveWorkSample {
+    variables: u64,
+    scheduled_work_items: u64,
+    operations: u64,
+    activations: u64,
+    unify_activations: u64,
+    publish_activations: u64,
+    projection_activations: u64,
+    select_activations: u64,
+    record_activations: u64,
+    summary_node_evaluations: u64,
+    summary_definition_ranking: [KernelSummaryDefinitionWorkSample; 16],
+    summary_call_activations: u64,
+    mutations: u64,
+    union_operations: u64,
+    rich_output_flow_exports: u64,
+    term_intern_requests: u64,
+    term_intern_hits: u64,
+    term_intern_requests_by_kind: [u64; 8],
+    term_intern_hits_by_kind: [u64; 8],
+    structural_widen_requests: u64,
+    structural_widen_hits: u64,
+    dynamic_dependency_edges: u64,
+    frozen_type_store: FrozenTypeStoreLayoutSample,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
 struct WorkSample {
     source_units: usize,
     parsed_expressions: usize,
@@ -366,6 +467,8 @@ struct WorkSample {
     cancellation_checkpoints: usize,
     parse: ParserWorkSample,
     typecheck: TypeCheckWorkSample,
+    kernel_compile: KernelCompileWorkSample,
+    kernel_solve: KernelSolveWorkSample,
 }
 
 macro_rules! parser_work_sample {
@@ -462,6 +565,110 @@ macro_rules! merge_owner_work_sample {
 
 macro_rules! owner_work_sample {
     ($work:expr) => {{ merge_owner_work_sample!(TypeCheckWorkSample::default(), $work) }};
+}
+
+macro_rules! kernel_compile_work_sample {
+    ($work:expr) => {{
+        let work = $work;
+        KernelCompileWorkSample {
+            definition_modules: work.definition_modules,
+            principal_expressions: work.principal_expressions,
+            residual_type_modules: work.residual_type_modules,
+            residual_module_operations: work.residual_module_operations,
+            residual_module_terms: work.residual_module_terms,
+            residual_frames: work.residual_frames,
+            linked_operations: work.linked_operations,
+            scheduled_work_items: work.scheduled_work_items,
+            acyclic_residual_frames: work.acyclic_residual_frames,
+            dominant_module_owner: work.dominant_module_owner,
+            dominant_module_operations: work.dominant_module_operations,
+            dominant_module_frames: work.dominant_module_frames,
+            dominant_module_linked_operations: work.dominant_module_linked_operations,
+            residual_module_ranking: work.residual_module_ranking.map(|entry| {
+                KernelResidualModuleWorkSample {
+                    owner: entry.owner,
+                    operations: entry.operations,
+                    frames: entry.frames,
+                    linked_operations: entry.linked_operations,
+                }
+            }),
+            linked_terms: work.linked_terms,
+            acyclic_initial_operations: work.acyclic_initial_operations,
+            compiled_call_sites: work.compiled_call_sites,
+            invocation_frames: work.invocation_frames,
+            reused_invocation_frames: work.reused_invocation_frames,
+            direct_result_summaries: work.direct_result_summaries,
+            summary_definition_nodes: work.summary_definition_nodes,
+            summary_constant_folded_nodes: work.summary_constant_folded_nodes,
+            summary_selector_fused_records: work.summary_selector_fused_records,
+            summary_deduplicated_nodes: work.summary_deduplicated_nodes,
+            summary_pruned_nodes: work.summary_pruned_nodes,
+            summary_pruned_inputs: work.summary_pruned_inputs,
+            summary_invoke_nodes: work.summary_invoke_nodes,
+            principal_result_reuses: work.principal_result_reuses,
+            principal_expression_reuses: work.principal_expression_reuses,
+            pruned_invocation_expressions: work.pruned_invocation_expressions,
+            specialization_plans: work.specialization_plans,
+            reused_specialization_plans: work.reused_specialization_plans,
+            max_call_depth: work.max_call_depth,
+        }
+    }};
+}
+
+macro_rules! kernel_solve_work_sample {
+    ($work:expr) => {{
+        let work = $work;
+        KernelSolveWorkSample {
+            variables: work.variables,
+            scheduled_work_items: work.scheduled_work_items,
+            operations: work.operations,
+            activations: work.activations,
+            unify_activations: work.unify_activations,
+            publish_activations: work.publish_activations,
+            projection_activations: work.projection_activations,
+            select_activations: work.select_activations,
+            record_activations: work.record_activations,
+            summary_node_evaluations: work.summary_node_evaluations,
+            summary_definition_ranking: work.summary_definition_ranking.map(|entry| {
+                KernelSummaryDefinitionWorkSample {
+                    definition: entry.definition,
+                    program_evaluations: entry.program_evaluations,
+                    node_evaluations: entry.node_evaluations,
+                }
+            }),
+            summary_call_activations: work.summary_call_activations,
+            mutations: work.mutations,
+            union_operations: work.union_operations,
+            rich_output_flow_exports: work.rich_output_flow_exports,
+            term_intern_requests: work.term_intern_requests,
+            term_intern_hits: work.term_intern_hits,
+            term_intern_requests_by_kind: work.term_intern_requests_by_kind,
+            term_intern_hits_by_kind: work.term_intern_hits_by_kind,
+            structural_widen_requests: work.structural_widen_requests,
+            structural_widen_hits: work.structural_widen_hits,
+            dynamic_dependency_edges: work.dynamic_dependency_edges,
+            frozen_type_store: FrozenTypeStoreLayoutSample {
+                term_rows: work.frozen_type_store.term_rows,
+                term_capacity: work.frozen_type_store.term_capacity,
+                name_rows: work.frozen_type_store.name_rows,
+                name_capacity: work.frozen_type_store.name_capacity,
+                name_bytes: work.frozen_type_store.name_bytes,
+                name_byte_capacity: work.frozen_type_store.name_byte_capacity,
+                child_rows: work.frozen_type_store.child_rows,
+                child_capacity: work.frozen_type_store.child_capacity,
+                variant_rows: work.frozen_type_store.variant_rows,
+                variant_capacity: work.frozen_type_store.variant_capacity,
+                object_shape_rows: work.frozen_type_store.object_shape_rows,
+                object_shape_capacity: work.frozen_type_store.object_shape_capacity,
+                object_field_rows: work.frozen_type_store.object_field_rows,
+                object_field_capacity: work.frozen_type_store.object_field_capacity,
+                semantic_order_rows: work.frozen_type_store.semantic_order_rows,
+                semantic_order_capacity: work.frozen_type_store.semantic_order_capacity,
+                payload_len_bytes: work.frozen_type_store.payload_len_bytes,
+                payload_capacity_bytes: work.frozen_type_store.payload_capacity_bytes,
+            },
+        }
+    }};
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -1324,6 +1531,8 @@ fn diagnostics_work_and_phase(
             checked_calls: diagnostics.profile.call_count,
             parse: parser_work_sample!(diagnostics.profile.parse_work),
             typecheck: owner_work_sample!(diagnostics.profile.owner_work),
+            kernel_compile: kernel_compile_work_sample!(diagnostics.profile.kernel_compile_work),
+            kernel_solve: kernel_solve_work_sample!(diagnostics.profile.kernel_solve_work),
             ..WorkSample::default()
         },
         PhaseSample {
@@ -1350,6 +1559,8 @@ fn compiled_work_and_phase(
                 typecheck_work_sample!(compiled.profile.typecheck_work),
                 compiled.profile.owner_work
             ),
+            kernel_compile: kernel_compile_work_sample!(compiled.profile.kernel_compile_work),
+            kernel_solve: kernel_solve_work_sample!(compiled.profile.kernel_solve_work),
         },
         PhaseSample {
             parse_ms: compiled.profile.parse_ms,

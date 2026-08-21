@@ -1,11 +1,11 @@
 use crate::{
     ArtifactOutput, ComponentArtifact, ComponentOutputSnapshot, ComponentProgram,
     KERNEL_SUMMARY_DEFINITION_RANKING_LEN, KernelCollectionOperationKind,
-    KernelCollectionProjectionKind, KernelOperation, KernelPattern, KernelRecordEntry,
+    KernelCollectionProjectionKind, KernelOperationRef, KernelPattern, KernelRecordEntry,
     KernelSelectArm, KernelSolveWork, KernelSummaryCallInput, KernelSummaryDefinitionWork,
     KernelSummaryNode, KernelSummaryProgram, KernelSummaryRecordEntry, NameId, OperationId,
-    ProgramConsumer, ProgramOperationRef, PublishMode, ResidualOperationFrame, TypeTerm,
-    TypeTermId, TypeVariableId, VariantTerm,
+    PackedOperationTable, ProgramConsumer, ProgramOperationRef, PublishMode,
+    ResidualOperationFrame, TypeTerm, TypeTermHead, TypeTermId, TypeVariableId, VariantTerm,
 };
 use boon_checked::FlowType;
 use std::collections::VecDeque;
@@ -203,21 +203,21 @@ impl ComponentSolveSession {
 
 fn validate_single_writers(program: &ComponentProgram) -> Result<(), KernelSolveError> {
     let mut writers = vec![None::<OperationId>; program.variables.len()];
-    let mut register = |kind: &KernelOperation,
+    let mut register = |kind: KernelOperationRef<'_>,
                         variables: Option<&[TypeVariableId]>,
                         operation: OperationId|
      -> Result<(), KernelSolveError> {
         let output = match kind {
-            KernelOperation::Publish { output, .. } => Some(*output),
-            KernelOperation::Alias { consumer, .. }
-            | KernelOperation::Projection { consumer, .. }
-            | KernelOperation::PatternProjection { consumer, .. }
-            | KernelOperation::CollectionProjection { consumer, .. } => Some(*consumer),
-            KernelOperation::Select { output, .. }
-            | KernelOperation::Record { output, .. }
-            | KernelOperation::Collection { output, .. }
-            | KernelOperation::SummaryCall { output, .. } => Some(*output),
-            KernelOperation::Unify { .. } => None,
+            KernelOperationRef::Publish { output, .. } => Some(output),
+            KernelOperationRef::Alias { consumer, .. }
+            | KernelOperationRef::Projection { consumer, .. }
+            | KernelOperationRef::PatternProjection { consumer, .. }
+            | KernelOperationRef::CollectionProjection { consumer, .. } => Some(consumer),
+            KernelOperationRef::Select { output, .. }
+            | KernelOperationRef::Record { output, .. }
+            | KernelOperationRef::Collection { output, .. }
+            | KernelOperationRef::SummaryCall { output, .. } => Some(output),
+            KernelOperationRef::Unify { .. } => None,
         }
         .map(|output| variables.map_or(output, |variables| variables[output.0 as usize]));
         let Some(output) = output else {
@@ -236,16 +236,12 @@ fn validate_single_writers(program: &ComponentProgram) -> Result<(), KernelSolve
             OperationId(u32::try_from(index).expect("kernel operation count exceeds u32"));
         match *work_item {
             ProgramOperationRef::Direct(direct) => {
-                register(
-                    program.operations[direct as usize].as_ref(),
-                    None,
-                    operation,
-                )?;
+                register(program.operations.get(direct as usize), None, operation)?;
             }
             ProgramOperationRef::ResidualFrame { frame } => {
                 let frame = &program.residual_frames[frame as usize];
                 for kind in frame.module.operations.iter() {
-                    register(kind.as_ref(), Some(frame.variables.as_ref()), operation)?;
+                    register(kind, Some(frame.variables.as_ref()), operation)?;
                 }
             }
             ProgramOperationRef::Residual {
@@ -254,7 +250,7 @@ fn validate_single_writers(program: &ComponentProgram) -> Result<(), KernelSolve
             } => {
                 let frame = &program.residual_frames[frame as usize];
                 register(
-                    frame.module.operations[residual as usize].as_ref(),
+                    frame.module.operations.get(residual as usize),
                     Some(frame.variables.as_ref()),
                     operation,
                 )?;
@@ -308,7 +304,7 @@ struct ComponentSolver {
 }
 
 struct SolverExecution {
-    operations: Box<[std::sync::Arc<KernelOperation>]>,
+    operations: PackedOperationTable,
     residual_frames: Box<[ResidualOperationFrame]>,
     work_items: Box<[ProgramOperationRef]>,
     initial_order: Box<[OperationId]>,
@@ -428,8 +424,8 @@ impl ComponentSolver {
             let has_directional = match work_items[operation.0 as usize] {
                 ProgramOperationRef::Direct(direct) => {
                     instruction_counts[operation.0 as usize] = 1;
-                    let operation_kind = operations[direct as usize].as_ref();
-                    if matches!(operation_kind, KernelOperation::Unify { .. }) {
+                    let operation_kind = operations.get(direct as usize);
+                    if matches!(operation_kind, KernelOperationRef::Unify { .. }) {
                         static_equalities.push((operation, StaticEqualityRef::Direct(direct)));
                         false
                     } else {
@@ -444,7 +440,7 @@ impl ComponentSolver {
                     for (residual, operation_kind) in
                         frame_value.module.operations.iter().enumerate()
                     {
-                        if matches!(operation_kind.as_ref(), KernelOperation::Unify { .. }) {
+                        if matches!(operation_kind, KernelOperationRef::Unify { .. }) {
                             static_equalities.push((
                                 operation,
                                 StaticEqualityRef::Residual {
@@ -464,10 +460,11 @@ impl ComponentSolver {
                     operation: residual,
                 } => {
                     instruction_counts[operation.0 as usize] = 1;
-                    let operation_kind = residual_frames[frame as usize].module.operations
-                        [residual as usize]
-                        .as_ref();
-                    if matches!(operation_kind, KernelOperation::Unify { .. }) {
+                    let operation_kind = residual_frames[frame as usize]
+                        .module
+                        .operations
+                        .get(residual as usize);
+                    if matches!(operation_kind, KernelOperationRef::Unify { .. }) {
                         static_equalities.push((
                             operation,
                             StaticEqualityRef::Residual {
@@ -680,7 +677,8 @@ impl ComponentSolver {
             }
             let variable = self.program.terms.variable(output.variable);
             let term = self.resolve_term(variable);
-            self.work.term_materializations = self.work.term_materializations.saturating_add(1);
+            self.work.rich_output_flow_exports =
+                self.work.rich_output_flow_exports.saturating_add(1);
             outputs.push(Some(ArtifactOutput {
                 id: output.id,
                 term,
@@ -744,7 +742,7 @@ impl ComponentSolver {
         self.active_operation = Some(operation);
         let result = match execution.work_items[operation.0 as usize] {
             ProgramOperationRef::Direct(direct) => {
-                let operation_kind = execution.operations[direct as usize].as_ref();
+                let operation_kind = execution.operations.get(direct as usize);
                 self.work.activations = self.work.activations.saturating_add(1);
                 self.count_operation_activation(operation_kind);
                 self.evaluate(operation_kind)
@@ -758,8 +756,8 @@ impl ComponentSolver {
                     else {
                         unreachable!("residual modules cannot contain nested physical frames")
                     };
-                    let operation_kind = frame_value.module.operations[residual as usize].as_ref();
-                    if matches!(operation_kind, KernelOperation::Unify { .. }) {
+                    let operation_kind = frame_value.module.operations.get(residual as usize);
+                    if matches!(operation_kind, KernelOperationRef::Unify { .. }) {
                         continue;
                     }
                     self.work.activations = self.work.activations.saturating_add(1);
@@ -778,7 +776,7 @@ impl ComponentSolver {
                 operation: residual,
             } => {
                 let frame_value = &execution.residual_frames[frame as usize];
-                let operation_kind = frame_value.module.operations[residual as usize].as_ref();
+                let operation_kind = frame_value.module.operations.get(residual as usize);
                 self.work.activations = self.work.activations.saturating_add(1);
                 self.count_operation_activation(operation_kind);
                 self.evaluate_residual(frame as usize, frame_value, operation_kind)
@@ -796,94 +794,96 @@ impl ComponentSolver {
         self.work.activations = self.work.activations.saturating_add(1);
         match operation {
             StaticEqualityRef::Direct(operation) => {
-                let operation = execution.operations[operation as usize].as_ref();
+                let operation = execution.operations.get(operation as usize);
                 self.count_operation_activation(operation);
                 self.evaluate(operation)
             }
             StaticEqualityRef::Residual { frame, operation } => {
                 let frame_value = &execution.residual_frames[frame as usize];
-                let operation = frame_value.module.operations[operation as usize].as_ref();
+                let operation = frame_value.module.operations.get(operation as usize);
                 self.count_operation_activation(operation);
                 self.evaluate_residual(frame as usize, frame_value, operation)
             }
         }
     }
 
-    fn count_operation_activation(&mut self, operation: &KernelOperation) {
+    fn count_operation_activation(&mut self, operation: KernelOperationRef<'_>) {
         let counter = match operation {
-            KernelOperation::Unify { .. } | KernelOperation::Alias { .. } => {
+            KernelOperationRef::Unify { .. } | KernelOperationRef::Alias { .. } => {
                 &mut self.work.unify_activations
             }
-            KernelOperation::Publish { .. } => &mut self.work.publish_activations,
-            KernelOperation::Projection { .. }
-            | KernelOperation::PatternProjection { .. }
-            | KernelOperation::CollectionProjection { .. } => &mut self.work.projection_activations,
-            KernelOperation::Collection { .. } => &mut self.work.publish_activations,
-            KernelOperation::Select { .. } => &mut self.work.select_activations,
-            KernelOperation::Record { .. } | KernelOperation::SummaryCall { .. } => {
+            KernelOperationRef::Publish { .. } => &mut self.work.publish_activations,
+            KernelOperationRef::Projection { .. }
+            | KernelOperationRef::PatternProjection { .. }
+            | KernelOperationRef::CollectionProjection { .. } => {
+                &mut self.work.projection_activations
+            }
+            KernelOperationRef::Collection { .. } => &mut self.work.publish_activations,
+            KernelOperationRef::Select { .. } => &mut self.work.select_activations,
+            KernelOperationRef::Record { .. } | KernelOperationRef::SummaryCall { .. } => {
                 &mut self.work.record_activations
             }
         };
         *counter = counter.saturating_add(1);
     }
 
-    fn evaluate(&mut self, operation: &KernelOperation) -> Result<(), KernelSolveError> {
+    fn evaluate(&mut self, operation: KernelOperationRef<'_>) -> Result<(), KernelSolveError> {
         match operation {
-            KernelOperation::Unify { left, right } => {
+            KernelOperationRef::Unify { left, right } => {
                 self.work.union_operations = self.work.union_operations.saturating_add(1);
-                self.unify_terms(*left, *right);
+                self.unify_terms(left, right);
             }
-            KernelOperation::Alias { provider, consumer } => {
+            KernelOperationRef::Alias { provider, consumer } => {
                 self.work.union_operations = self.work.union_operations.saturating_add(1);
-                let provider_variable = *provider;
+                let provider_variable = provider;
                 let provider = self.program.terms.variable(provider_variable);
-                self.bind_equal(*consumer, provider);
+                self.bind_equal(consumer, provider);
                 let selected = self.variable_syntax_selected(provider_variable);
-                self.set_syntax_selected(*consumer, selected);
+                self.set_syntax_selected(consumer, selected);
             }
-            KernelOperation::Publish {
+            KernelOperationRef::Publish {
                 output,
                 inputs,
                 mode,
-            } => self.publish(*output, inputs, *mode)?,
-            KernelOperation::Projection {
+            } => self.publish(output, inputs, mode)?,
+            KernelOperationRef::Projection {
                 provider,
                 field,
                 consumer,
-            } => self.project(*provider, *field, *consumer),
-            KernelOperation::PatternProjection {
+            } => self.project(provider, field, consumer),
+            KernelOperationRef::PatternProjection {
                 provider,
                 pattern,
                 fields,
                 consumer,
-            } => self.project_pattern(*provider, pattern, fields, *consumer),
-            KernelOperation::CollectionProjection {
+            } => self.project_pattern(provider, pattern, fields, consumer),
+            KernelOperationRef::CollectionProjection {
                 provider,
                 kind,
                 consumer,
-            } => self.project_collection_component(*provider, *kind, *consumer),
-            KernelOperation::Collection {
+            } => self.project_collection_component(provider, kind, consumer),
+            KernelOperationRef::Collection {
                 output,
                 kind,
                 inputs,
                 values,
-            } => self.collection(*output, *kind, inputs, values),
-            KernelOperation::Select {
+            } => self.collection(output, kind, inputs, values),
+            KernelOperationRef::Select {
                 output,
                 selector,
                 selector_parameter_derived,
                 arms,
-            } => self.select(*output, *selector, *selector_parameter_derived, arms),
-            KernelOperation::Record {
+            } => self.select(output, selector, selector_parameter_derived, arms),
+            KernelOperationRef::Record {
                 output,
                 tag,
                 entries,
-            } => self.record(*output, *tag, entries)?,
-            KernelOperation::SummaryCall {
+            } => self.record(output, tag, entries)?,
+            KernelOperationRef::SummaryCall {
                 output,
                 program,
                 inputs,
-            } => self.summary_call(*output, program, inputs)?,
+            } => self.summary_call(output, program, inputs)?,
         }
         Ok(())
     }
@@ -892,39 +892,39 @@ impl ComponentSolver {
         &mut self,
         frame_index: usize,
         frame: &ResidualOperationFrame,
-        operation: &KernelOperation,
+        operation: KernelOperationRef<'_>,
     ) -> Result<(), KernelSolveError> {
         let variable = |variable: TypeVariableId| frame.variables[variable.0 as usize];
         match operation {
-            KernelOperation::Unify { left, right } => {
+            KernelOperationRef::Unify { left, right } => {
                 self.work.union_operations = self.work.union_operations.saturating_add(1);
-                let left = self.import_frame_term(frame_index, frame, *left);
-                let right = self.import_frame_term(frame_index, frame, *right);
+                let left = self.import_frame_term(frame_index, frame, left);
+                let right = self.import_frame_term(frame_index, frame, right);
                 self.unify_terms(left, right);
             }
-            KernelOperation::Alias { provider, consumer } => {
+            KernelOperationRef::Alias { provider, consumer } => {
                 self.work.union_operations = self.work.union_operations.saturating_add(1);
-                let provider_variable = variable(*provider);
+                let provider_variable = variable(provider);
                 let provider = self.program.terms.variable(provider_variable);
-                let consumer = variable(*consumer);
+                let consumer = variable(consumer);
                 self.bind_equal(consumer, provider);
                 let selected = self.variable_syntax_selected(provider_variable);
                 self.set_syntax_selected(consumer, selected);
             }
-            KernelOperation::Publish {
+            KernelOperationRef::Publish {
                 output,
                 inputs,
                 mode,
-            } => self.publish_residual(frame_index, frame, variable(*output), inputs, *mode)?,
-            KernelOperation::Projection {
+            } => self.publish_residual(frame_index, frame, variable(output), inputs, mode)?,
+            KernelOperationRef::Projection {
                 provider,
                 field,
                 consumer,
             } => {
                 let field = field.map(|field| self.import_frame_name(frame_index, frame, field));
-                self.project(variable(*provider), field, variable(*consumer));
+                self.project(variable(provider), field, variable(consumer));
             }
-            KernelOperation::PatternProjection {
+            KernelOperationRef::PatternProjection {
                 provider,
                 pattern,
                 fields,
@@ -934,29 +934,24 @@ impl ComponentSolver {
                     .iter()
                     .map(|field| self.import_frame_name(frame_index, frame, *field))
                     .collect::<Vec<_>>();
-                self.project_pattern(variable(*provider), pattern, &fields, variable(*consumer));
+                self.project_pattern(variable(provider), pattern, &fields, variable(consumer));
             }
-            KernelOperation::CollectionProjection {
+            KernelOperationRef::CollectionProjection {
                 provider,
                 kind,
                 consumer,
             } => {
-                self.project_collection_component(variable(*provider), *kind, variable(*consumer));
+                self.project_collection_component(variable(provider), kind, variable(consumer));
             }
-            KernelOperation::Collection {
+            KernelOperationRef::Collection {
                 output,
                 kind,
                 inputs,
                 values,
-            } => self.collection_residual(
-                frame_index,
-                frame,
-                variable(*output),
-                *kind,
-                inputs,
-                values,
-            ),
-            KernelOperation::Select {
+            } => {
+                self.collection_residual(frame_index, frame, variable(output), kind, inputs, values)
+            }
+            KernelOperationRef::Select {
                 output,
                 selector,
                 selector_parameter_derived,
@@ -964,17 +959,17 @@ impl ComponentSolver {
             } => self.select_residual(
                 frame_index,
                 frame,
-                variable(*output),
-                variable(*selector),
-                *selector_parameter_derived,
+                variable(output),
+                variable(selector),
+                selector_parameter_derived,
                 arms,
             ),
-            KernelOperation::Record {
+            KernelOperationRef::Record {
                 output,
                 tag,
                 entries,
-            } => self.record_residual(frame_index, frame, variable(*output), *tag, entries)?,
-            KernelOperation::SummaryCall { .. } => {
+            } => self.record_residual(frame_index, frame, variable(output), tag, entries)?,
+            KernelOperationRef::SummaryCall { .. } => {
                 return Err(KernelSolveError::new(
                     "parametric summary calls cannot execute inside residual modules",
                 ));
@@ -1393,28 +1388,30 @@ impl ComponentSolver {
     ) -> Option<TypeTermId> {
         let provider = self.resolve_term_head(provider);
         match pattern {
-            KernelPattern::Tag { name, .. } => match self.program.terms.term(provider).clone() {
-                TypeTerm::VariantSet(variants) => {
-                    variants
-                        .into_vec()
-                        .into_iter()
-                        .find_map(|variant| match variant {
-                            VariantTerm::Tagged { tag, fields }
-                                if self.program.terms.name(tag) == name.as_ref() =>
-                            {
-                                Some(fields)
-                            }
-                            VariantTerm::Tag(tag)
-                                if self.program.terms.name(tag) == name.as_ref() =>
-                            {
-                                Some(self.program.terms.object([], false))
-                            }
-                            VariantTerm::Tag(_) | VariantTerm::Tagged { .. } => None,
-                        })
-                }
-                TypeTerm::Union(members) => {
-                    let matches = members
-                        .into_vec()
+            KernelPattern::Tag { name, .. } => match self.program.terms.term_head(provider) {
+                TypeTermHead::VariantSet(variants) => self
+                    .program
+                    .terms
+                    .variant_terms(variants)
+                    .to_vec()
+                    .into_iter()
+                    .find_map(|variant| match variant {
+                        VariantTerm::Tagged { tag, fields }
+                            if self.program.terms.name(tag) == name.as_ref() =>
+                        {
+                            Some(fields)
+                        }
+                        VariantTerm::Tag(tag) if self.program.terms.name(tag) == name.as_ref() => {
+                            Some(self.program.terms.object([], false))
+                        }
+                        VariantTerm::Tag(_) | VariantTerm::Tagged { .. } => None,
+                    }),
+                TypeTermHead::Union(members) => {
+                    let matches = self
+                        .program
+                        .terms
+                        .term_ids(members)
+                        .to_vec()
                         .into_iter()
                         .filter_map(|member| self.narrow_pattern_payload(member, pattern))
                         .collect::<Vec<_>>();
@@ -1430,7 +1427,7 @@ impl ComponentSolver {
             KernelPattern::Text if matches!(self.program.terms.term(provider), TypeTerm::Text) => {
                 Some(provider)
             }
-            KernelPattern::Bits { width } if matches!(self.program.terms.term(provider), TypeTerm::Bits(actual) if actual == width) => {
+            KernelPattern::Bits { width } if matches!(self.program.terms.term(provider), TypeTerm::Bits(actual) if actual == *width) => {
                 Some(provider)
             }
             KernelPattern::Wildcard | KernelPattern::Binding { .. } => Some(provider),
@@ -1512,19 +1509,27 @@ impl ComponentSolver {
         kind: KernelCollectionProjectionKind,
     ) -> Option<TypeTermId> {
         let provider = self.resolve_term_head(provider);
-        match (kind, self.program.terms.term(provider).clone()) {
-            (KernelCollectionProjectionKind::Item, TypeTerm::List(item))
-            | (KernelCollectionProjectionKind::Item, TypeTerm::Set(item)) => Some(item),
-            (KernelCollectionProjectionKind::MapKey, TypeTerm::Map { key, .. }) => Some(key),
-            (KernelCollectionProjectionKind::MapValue, TypeTerm::Map { value, .. }) => Some(value),
-            (_, TypeTerm::Union(members)) => {
+        match (kind, self.program.terms.term_head(provider)) {
+            (KernelCollectionProjectionKind::Item, TypeTermHead::List(item))
+            | (KernelCollectionProjectionKind::Item, TypeTermHead::Set(item)) => Some(item),
+            (KernelCollectionProjectionKind::MapKey, TypeTermHead::Map { key, .. }) => Some(key),
+            (KernelCollectionProjectionKind::MapValue, TypeTermHead::Map { value, .. }) => {
+                Some(value)
+            }
+            (_, TypeTermHead::Union(members)) => {
+                let members = self.program.terms.term_ids(members).to_vec();
                 let items = members
-                    .iter()
-                    .filter_map(|member| self.collection_component_type(*member, kind))
+                    .into_iter()
+                    .filter_map(|member| self.collection_component_type(member, kind))
                     .collect::<Vec<_>>();
                 (!items.is_empty()).then(|| self.program.terms.union(items))
             }
-            (_, TypeTerm::Variable(_) | TypeTerm::Unknown | TypeTerm::UnresolvedShape(_)) => None,
+            (
+                _,
+                TypeTermHead::Variable(_)
+                | TypeTermHead::Unknown
+                | TypeTermHead::UnresolvedShape(_),
+            ) => None,
             _ => None,
         }
     }
@@ -1593,7 +1598,7 @@ impl ComponentSolver {
             KernelPattern::Number => matches!(self.program.terms.term(selector), TypeTerm::Number),
             KernelPattern::Text => matches!(self.program.terms.term(selector), TypeTerm::Text),
             KernelPattern::Bits { width } => {
-                matches!(self.program.terms.term(selector), TypeTerm::Bits(actual) if actual == width)
+                matches!(self.program.terms.term(selector), TypeTerm::Bits(actual) if actual == *width)
             }
             KernelPattern::Tag { name, .. } => {
                 matches!(self.program.terms.term(selector), TypeTerm::VariantSet(variants) if variants.iter().any(|variant| self.program.terms.name(variant.tag()) == name.as_ref()))
@@ -2037,8 +2042,8 @@ impl ComponentSolver {
 
     fn erase_unbound_contextual_holes(&mut self, term: TypeTermId) -> TypeTermId {
         let term = self.resolve_term(term);
-        match self.program.terms.term(term).clone() {
-            TypeTerm::Variable(variable) => {
+        match self.program.terms.term_head(term) {
+            TypeTermHead::Variable(variable) => {
                 let root = self.root(variable);
                 if self.cells[root.0 as usize].contextual_hole
                     && self.cells[root.0 as usize].binding.is_none()
@@ -2048,9 +2053,12 @@ impl ComponentSolver {
                     self.program.terms.variable(root)
                 }
             }
-            TypeTerm::VariantSet(variants) => {
-                let variants = variants
-                    .into_vec()
+            TypeTermHead::VariantSet(variants) => {
+                let variants = self
+                    .program
+                    .terms
+                    .variant_terms(variants)
+                    .to_vec()
                     .into_iter()
                     .map(|variant| match variant {
                         VariantTerm::Tag(tag) => VariantTerm::Tag(tag),
@@ -2062,55 +2070,66 @@ impl ComponentSolver {
                     .collect::<Vec<_>>();
                 self.program.terms.variant_set_preserving_order(variants)
             }
-            TypeTerm::Object { fields, open } => {
-                let fields = fields
+            TypeTermHead::Object { shape, open } => {
+                let fields = self
+                    .program
+                    .terms
+                    .object_fields_for_shape(shape)
                     .into_vec()
                     .into_iter()
                     .map(|field| (field.name, self.erase_unbound_contextual_holes(field.ty)))
                     .collect::<Vec<_>>();
                 self.program.terms.object(fields, open)
             }
-            TypeTerm::List(item) => {
+            TypeTermHead::List(item) => {
                 let item = self.erase_unbound_contextual_holes(item);
                 self.program.terms.list(item)
             }
-            TypeTerm::Set(item) => {
+            TypeTermHead::Set(item) => {
                 let item = self.erase_unbound_contextual_holes(item);
                 self.program.terms.set(item)
             }
-            TypeTerm::Map { key, value } => {
+            TypeTermHead::Map { key, value } => {
                 let key = self.erase_unbound_contextual_holes(key);
                 let value = self.erase_unbound_contextual_holes(value);
                 self.program.terms.map(key, value)
             }
-            TypeTerm::Function {
+            TypeTermHead::Function {
                 args,
                 result_mode,
                 result,
             } => {
-                let args = args
-                    .iter()
-                    .map(|argument| self.erase_unbound_contextual_holes(*argument))
+                let args = self
+                    .program
+                    .terms
+                    .term_ids(args)
+                    .to_vec()
+                    .into_iter()
+                    .map(|argument| self.erase_unbound_contextual_holes(argument))
                     .collect::<Vec<_>>();
                 let result = self.erase_unbound_contextual_holes(result);
                 self.program.terms.function(args, result_mode, result)
             }
-            TypeTerm::Union(members) => {
-                let members = members
-                    .iter()
-                    .map(|member| self.erase_unbound_contextual_holes(*member))
+            TypeTermHead::Union(members) => {
+                let members = self
+                    .program
+                    .terms
+                    .term_ids(members)
+                    .to_vec()
+                    .into_iter()
+                    .map(|member| self.erase_unbound_contextual_holes(member))
                     .collect::<Vec<_>>();
                 self.program.terms.union(members)
             }
-            TypeTerm::Text
-            | TypeTerm::Number
-            | TypeTerm::Bytes(_)
-            | TypeTerm::Absent
-            | TypeTerm::OpenObjectPlaceholder
-            | TypeTerm::RenderContract
-            | TypeTerm::UnresolvedShape(_)
-            | TypeTerm::Unknown
-            | TypeTerm::Bits(_) => term,
+            TypeTermHead::Text
+            | TypeTermHead::Number
+            | TypeTermHead::Bytes(_)
+            | TypeTermHead::Absent
+            | TypeTermHead::OpenObjectPlaceholder
+            | TypeTermHead::RenderContract
+            | TypeTermHead::UnresolvedShape(_)
+            | TypeTermHead::Unknown
+            | TypeTermHead::Bits(_) => term,
         }
     }
 
@@ -2119,26 +2138,31 @@ impl ComponentSolver {
         spread: TypeTermId,
         fields: &mut Vec<(NameId, TypeTermId)>,
     ) -> Result<(), KernelSolveError> {
-        match self.program.terms.term(spread).clone() {
-            TypeTerm::Object {
-                fields: spread_fields,
-                ..
-            } => {
+        match self.program.terms.term_head(spread) {
+            TypeTermHead::Object { shape, .. } => {
+                let spread_fields = self.program.terms.object_fields_for_shape(shape).into_vec();
                 for field in spread_fields {
                     insert_record_field(fields, field.name, field.ty);
                 }
             }
-            TypeTerm::Union(members) => {
+            TypeTermHead::Union(members) => {
+                let members = self.program.terms.term_ids(members).to_vec();
                 for member in members {
                     self.merge_record_spread(member, fields)?;
                 }
             }
-            TypeTerm::VariantSet(variants)
-                if variants
+            TypeTermHead::VariantSet(variants)
+                if self
+                    .program
+                    .terms
+                    .variant_terms(variants)
                     .iter()
                     .any(|variant| self.program.terms.name(variant.tag()) == "UNPLUGGED") => {}
-            TypeTerm::Variable(_) | TypeTerm::Unknown | TypeTerm::UnresolvedShape(_) => {}
-            invalid => {
+            TypeTermHead::Variable(_)
+            | TypeTermHead::Unknown
+            | TypeTermHead::UnresolvedShape(_) => {}
+            _ => {
+                let invalid = self.program.terms.term(spread);
                 return Err(KernelSolveError::new(format!(
                     "kernel record spread in operation {:?} expects a record value, found {invalid:?}",
                     self.active_operation
@@ -2150,23 +2174,24 @@ impl ComponentSolver {
 
     fn project_field(&mut self, provider: TypeTermId, field: NameId) -> Option<TypeTermId> {
         let provider = self.resolve_term_head(provider);
-        match self.program.terms.term(provider).clone() {
-            TypeTerm::Object { fields, .. } => fields
-                .iter()
-                .find(|candidate| candidate.name == field)
-                .map(|candidate| candidate.ty),
-            TypeTerm::Union(members) => {
+        match self.program.terms.term_head(provider) {
+            TypeTermHead::Object { shape, .. } => {
+                self.program.terms.lookup_object_field(shape, field)
+            }
+            TypeTermHead::Union(members) => {
+                let members = self.program.terms.term_ids(members).to_vec();
                 let projected = members
-                    .iter()
-                    .filter_map(|member| self.project_field(*member, field))
+                    .into_iter()
+                    .filter_map(|member| self.project_field(member, field))
                     .collect::<Vec<_>>();
                 (!projected.is_empty()).then(|| self.program.terms.union(projected))
             }
-            TypeTerm::VariantSet(variants) => {
+            TypeTermHead::VariantSet(variants) => {
+                let variants = self.program.terms.variant_terms(variants).to_vec();
                 let projected = variants
-                    .iter()
+                    .into_iter()
                     .filter_map(|variant| match variant {
-                        VariantTerm::Tagged { fields, .. } => self.project_field(*fields, field),
+                        VariantTerm::Tagged { fields, .. } => self.project_field(fields, field),
                         VariantTerm::Tag(_) => None,
                     })
                     .collect::<Vec<_>>();
@@ -2178,13 +2203,21 @@ impl ComponentSolver {
 
     fn open_shape_may_contain_field(&mut self, provider: TypeTermId, field: NameId) -> bool {
         let provider = self.resolve_term_head(provider);
-        match self.program.terms.term(provider).clone() {
-            TypeTerm::Object { fields, open } => {
-                open && fields.iter().all(|candidate| candidate.name != field)
+        match self.program.terms.term_head(provider) {
+            TypeTermHead::Object { shape, open } => {
+                open && self
+                    .program
+                    .terms
+                    .lookup_object_field(shape, field)
+                    .is_none()
             }
-            TypeTerm::Union(members) => members
-                .iter()
-                .any(|member| self.open_shape_may_contain_field(*member, field)),
+            TypeTermHead::Union(members) => self
+                .program
+                .terms
+                .term_ids(members)
+                .to_vec()
+                .into_iter()
+                .any(|member| self.open_shape_may_contain_field(member, field)),
             _ => false,
         }
     }
@@ -2194,7 +2227,7 @@ impl ComponentSolver {
             let TypeTerm::Variable(variable) = self.program.terms.term(term) else {
                 return term;
             };
-            let root = self.root(*variable);
+            let root = self.root(variable);
             match self.cells[root.0 as usize].binding {
                 Some(binding) => term = binding,
                 None => return self.program.terms.variable(root),
@@ -2208,11 +2241,11 @@ impl ComponentSolver {
         // their current structural heads and only unify overlapping fields,
         // silently dropping fields learned by a later equality.
         if let TypeTerm::Variable(variable) = self.program.terms.term(left) {
-            self.bind_equal(*variable, right);
+            self.bind_equal(variable, right);
             return;
         }
         if let TypeTerm::Variable(variable) = self.program.terms.term(right) {
-            self.bind_equal(*variable, left);
+            self.bind_equal(variable, left);
             return;
         }
         let left = self.resolve_term_head(left);
@@ -2220,28 +2253,51 @@ impl ComponentSolver {
         if left == right {
             return;
         }
-        let left_term = self.program.terms.term(left).clone();
-        let right_term = self.program.terms.term(right).clone();
+        let left_term = self.program.terms.term_head(left);
+        let right_term = self.program.terms.term_head(right);
         match (left_term, right_term) {
-            (TypeTerm::Variable(_), TypeTerm::Unknown | TypeTerm::UnresolvedShape(_))
-            | (TypeTerm::Unknown | TypeTerm::UnresolvedShape(_), TypeTerm::Variable(_)) => {}
-            (TypeTerm::Variable(variable), _) => self.bind_equal(variable, right),
-            (_, TypeTerm::Variable(variable)) => self.bind_equal(variable, left),
-            (TypeTerm::Object { fields: left, .. }, TypeTerm::Object { fields: right, .. }) => {
-                for left in left.iter() {
-                    if let Some(right) = right.iter().find(|right| right.name == left.name) {
+            (
+                TypeTermHead::Variable(_),
+                TypeTermHead::Unknown | TypeTermHead::UnresolvedShape(_),
+            )
+            | (
+                TypeTermHead::Unknown | TypeTermHead::UnresolvedShape(_),
+                TypeTermHead::Variable(_),
+            ) => {}
+            (TypeTermHead::Variable(variable), _) => self.bind_equal(variable, right),
+            (_, TypeTermHead::Variable(variable)) => self.bind_equal(variable, left),
+            (
+                TypeTermHead::Object {
+                    shape: left_shape, ..
+                },
+                TypeTermHead::Object {
+                    shape: right_shape, ..
+                },
+            ) => {
+                let left_fields = self
+                    .program
+                    .terms
+                    .object_fields_for_shape(left_shape)
+                    .into_vec();
+                let right_fields = self
+                    .program
+                    .terms
+                    .object_fields_for_shape(right_shape)
+                    .into_vec();
+                for left in left_fields {
+                    if let Some(right) = right_fields.iter().find(|right| right.name == left.name) {
                         self.unify_terms(left.ty, right.ty);
                     }
                 }
             }
-            (TypeTerm::List(left), TypeTerm::List(right))
-            | (TypeTerm::Set(left), TypeTerm::Set(right)) => self.unify_terms(left, right),
+            (TypeTermHead::List(left), TypeTermHead::List(right))
+            | (TypeTermHead::Set(left), TypeTermHead::Set(right)) => self.unify_terms(left, right),
             (
-                TypeTerm::Map {
+                TypeTermHead::Map {
                     key: left_key,
                     value: left_value,
                 },
-                TypeTerm::Map {
+                TypeTermHead::Map {
                     key: right_key,
                     value: right_value,
                 },
@@ -2250,25 +2306,27 @@ impl ComponentSolver {
                 self.unify_terms(left_value, right_value);
             }
             (
-                TypeTerm::Function {
+                TypeTermHead::Function {
                     args: left_args,
                     result: left_result,
                     ..
                 },
-                TypeTerm::Function {
+                TypeTermHead::Function {
                     args: right_args,
                     result: right_result,
                     ..
                 },
             ) if left_args.len() == right_args.len() => {
-                for (left, right) in left_args.iter().zip(right_args.iter()) {
-                    self.unify_terms(*left, *right);
+                let left_args = self.program.terms.term_ids(left_args).to_vec();
+                let right_args = self.program.terms.term_ids(right_args).to_vec();
+                for (left, right) in left_args.into_iter().zip(right_args) {
+                    self.unify_terms(left, right);
                 }
                 self.unify_terms(left_result, right_result);
             }
             // A union is a directional value surface. Equating it with a
             // concrete requirement must not collapse every branch together.
-            (TypeTerm::Union(_), _) | (_, TypeTerm::Union(_)) => {}
+            (TypeTermHead::Union(_), _) | (_, TypeTermHead::Union(_)) => {}
             _ => {}
         }
     }
@@ -2276,7 +2334,7 @@ impl ComponentSolver {
     fn bind_equal(&mut self, variable: TypeVariableId, incoming: TypeTermId) {
         let variable = self.root(variable);
         if let TypeTerm::Variable(other) = self.program.terms.term(incoming) {
-            self.union_variables(variable, *other);
+            self.union_variables(variable, other);
             return;
         }
         let incoming = self.resolve_term_head(incoming);
@@ -2344,8 +2402,8 @@ impl ComponentSolver {
         let mut pending = vec![provider];
         let mut expanded_variables = Vec::new();
         while let Some(candidate) = pending.pop() {
-            match self.program.terms.term(candidate).clone() {
-                TypeTerm::Variable(candidate) => {
+            match self.program.terms.term_head(candidate) {
+                TypeTermHead::Variable(candidate) => {
                     let candidate = self.root(candidate);
                     if candidate == variable {
                         removed_self = true;
@@ -2362,7 +2420,9 @@ impl ComponentSolver {
                         retained.push(self.program.terms.variable(candidate));
                     }
                 }
-                TypeTerm::Union(members) => pending.extend(members.iter().rev().copied()),
+                TypeTermHead::Union(members) => {
+                    pending.extend(self.program.terms.term_ids(members).iter().rev().copied())
+                }
                 // Stop at structural terms. A recursive object, list,
                 // function, map, set, or tagged payload must still be rejected
                 // by the ordinary occurs check below; only the directional
@@ -2381,13 +2441,11 @@ impl ComponentSolver {
 
     fn merge_equal_terms(&mut self, left: TypeTermId, right: TypeTermId) -> TypeTermId {
         if let TypeTerm::Variable(variable) = self.program.terms.term(left) {
-            let variable = *variable;
             self.bind_equal(variable, right);
             let root = self.root(variable);
             return self.program.terms.variable(root);
         }
         if let TypeTerm::Variable(variable) = self.program.terms.term(right) {
-            let variable = *variable;
             self.bind_equal(variable, left);
             let root = self.root(variable);
             return self.program.terms.variable(root);
@@ -2397,23 +2455,32 @@ impl ComponentSolver {
         if left == right {
             return left;
         }
-        let left_term = self.program.terms.term(left).clone();
-        let right_term = self.program.terms.term(right).clone();
+        let left_term = self.program.terms.term_head(left);
+        let right_term = self.program.terms.term_head(right);
         match (left_term, right_term) {
-            (TypeTerm::Variable(_), _) | (_, TypeTerm::Variable(_)) => {
+            (TypeTermHead::Variable(_), _) | (_, TypeTermHead::Variable(_)) => {
                 unreachable!("term heads were resolved above")
             }
             (
-                TypeTerm::Object {
-                    fields: left_fields,
+                TypeTermHead::Object {
+                    shape: left_shape,
                     open: left_open,
                 },
-                TypeTerm::Object {
-                    fields: right_fields,
+                TypeTermHead::Object {
+                    shape: right_shape,
                     open: right_open,
                 },
             ) => {
-                let mut fields = left_fields.into_vec();
+                let mut fields = self
+                    .program
+                    .terms
+                    .object_fields_for_shape(left_shape)
+                    .into_vec();
+                let right_fields = self
+                    .program
+                    .terms
+                    .object_fields_for_shape(right_shape)
+                    .into_vec();
                 for right in right_fields {
                     if let Some(index) = fields.iter().position(|left| left.name == right.name) {
                         fields[index].ty = self.merge_equal_terms(fields[index].ty, right.ty);
@@ -2426,20 +2493,20 @@ impl ComponentSolver {
                     left_open || right_open,
                 )
             }
-            (TypeTerm::List(left), TypeTerm::List(right)) => {
+            (TypeTermHead::List(left), TypeTermHead::List(right)) => {
                 let item = self.merge_equal_terms(left, right);
                 self.program.terms.list(item)
             }
-            (TypeTerm::Set(left), TypeTerm::Set(right)) => {
+            (TypeTermHead::Set(left), TypeTermHead::Set(right)) => {
                 let item = self.merge_equal_terms(left, right);
                 self.program.terms.set(item)
             }
             (
-                TypeTerm::Map {
+                TypeTermHead::Map {
                     key: left_key,
                     value: left_value,
                 },
-                TypeTerm::Map {
+                TypeTermHead::Map {
                     key: right_key,
                     value: right_value,
                 },
@@ -2449,21 +2516,23 @@ impl ComponentSolver {
                 self.program.terms.map(key, value)
             }
             (
-                TypeTerm::Function {
+                TypeTermHead::Function {
                     args: left_args,
                     result_mode: left_mode,
                     result: left_result,
                 },
-                TypeTerm::Function {
+                TypeTermHead::Function {
                     args: right_args,
                     result_mode: right_mode,
                     result: right_result,
                 },
             ) if left_args.len() == right_args.len() && left_mode == right_mode => {
+                let left_args = self.program.terms.term_ids(left_args).to_vec();
+                let right_args = self.program.terms.term_ids(right_args).to_vec();
                 let args = left_args
-                    .iter()
-                    .zip(right_args.iter())
-                    .map(|(left, right)| self.merge_equal_terms(*left, *right))
+                    .into_iter()
+                    .zip(right_args)
+                    .map(|(left, right)| self.merge_equal_terms(left, right))
                     .collect::<Vec<_>>();
                 let result = self.merge_equal_terms(left_result, right_result);
                 self.program.terms.function(args, left_mode, result)
@@ -2545,14 +2614,14 @@ impl ComponentSolver {
         if !self.program.terms.has_variable(term) {
             return term;
         }
-        let source = self.program.terms.term(term).clone();
-        if !matches!(source, TypeTerm::Variable(_))
+        let source = self.program.terms.term_head(term);
+        if !matches!(source, TypeTermHead::Variable(_))
             && self.resolve_cache_seen[term.0 as usize] == generation
         {
             return self.resolve_cache_values[term.0 as usize];
         }
         let resolved = match source {
-            TypeTerm::Variable(variable) => {
+            TypeTermHead::Variable(variable) => {
                 let root = self.root(variable);
                 if self.resolve_active[root.0 as usize] == generation {
                     return self.program.terms.variable(root);
@@ -2566,9 +2635,12 @@ impl ComponentSolver {
                 self.resolve_active[root.0 as usize] = 0;
                 resolved
             }
-            TypeTerm::VariantSet(variants) => {
-                let variants = variants
-                    .into_vec()
+            TypeTermHead::VariantSet(variants) => {
+                let variants = self
+                    .program
+                    .terms
+                    .variant_terms(variants)
+                    .to_vec()
                     .into_iter()
                     .map(|variant| match variant {
                         VariantTerm::Tag(tag) => VariantTerm::Tag(tag),
@@ -2580,55 +2652,66 @@ impl ComponentSolver {
                     .collect::<Vec<_>>();
                 self.program.terms.variant_set_preserving_order(variants)
             }
-            TypeTerm::Object { fields, open } => {
-                let fields = fields
+            TypeTermHead::Object { shape, open } => {
+                let fields = self
+                    .program
+                    .terms
+                    .object_fields_for_shape(shape)
                     .into_vec()
                     .into_iter()
                     .map(|field| (field.name, self.resolve_term_inner(field.ty, generation)))
                     .collect::<Vec<_>>();
                 self.program.terms.object(fields, open)
             }
-            TypeTerm::List(item) => {
+            TypeTermHead::List(item) => {
                 let item = self.resolve_term_inner(item, generation);
                 self.program.terms.list(item)
             }
-            TypeTerm::Set(item) => {
+            TypeTermHead::Set(item) => {
                 let item = self.resolve_term_inner(item, generation);
                 self.program.terms.set(item)
             }
-            TypeTerm::Map { key, value } => {
+            TypeTermHead::Map { key, value } => {
                 let key = self.resolve_term_inner(key, generation);
                 let value = self.resolve_term_inner(value, generation);
                 self.program.terms.map(key, value)
             }
-            TypeTerm::Function {
+            TypeTermHead::Function {
                 args,
                 result_mode,
                 result,
             } => {
-                let args = args
-                    .iter()
-                    .map(|argument| self.resolve_term_inner(*argument, generation))
+                let args = self
+                    .program
+                    .terms
+                    .term_ids(args)
+                    .to_vec()
+                    .into_iter()
+                    .map(|argument| self.resolve_term_inner(argument, generation))
                     .collect::<Vec<_>>();
                 let result = self.resolve_term_inner(result, generation);
                 self.program.terms.function(args, result_mode, result)
             }
-            TypeTerm::Union(members) => {
-                let members = members
-                    .iter()
-                    .map(|member| self.resolve_term_inner(*member, generation))
+            TypeTermHead::Union(members) => {
+                let members = self
+                    .program
+                    .terms
+                    .term_ids(members)
+                    .to_vec()
+                    .into_iter()
+                    .map(|member| self.resolve_term_inner(member, generation))
                     .collect::<Vec<_>>();
                 self.program.terms.union(members)
             }
-            TypeTerm::Text
-            | TypeTerm::Number
-            | TypeTerm::Bytes(_)
-            | TypeTerm::Absent
-            | TypeTerm::OpenObjectPlaceholder
-            | TypeTerm::RenderContract
-            | TypeTerm::UnresolvedShape(_)
-            | TypeTerm::Unknown
-            | TypeTerm::Bits(_) => term,
+            TypeTermHead::Text
+            | TypeTermHead::Number
+            | TypeTermHead::Bytes(_)
+            | TypeTermHead::Absent
+            | TypeTermHead::OpenObjectPlaceholder
+            | TypeTermHead::RenderContract
+            | TypeTermHead::UnresolvedShape(_)
+            | TypeTermHead::Unknown
+            | TypeTermHead::Bits(_) => term,
         };
         if !matches!(self.program.terms.term(term), TypeTerm::Variable(_)) {
             self.resolve_cache_seen[term.0 as usize] = generation;
@@ -2836,7 +2919,7 @@ fn term_occurs(
     }
     match terms.term(term) {
         TypeTerm::Variable(candidate) => {
-            let candidate = readonly_cell_root(cells, *candidate);
+            let candidate = readonly_cell_root(cells, candidate);
             if candidate == variable {
                 return true;
             }
@@ -2860,19 +2943,19 @@ fn term_occurs(
             .iter()
             .any(|field| term_occurs(terms, cells, active, generation, variable, field.ty)),
         TypeTerm::List(item) | TypeTerm::Set(item) => {
-            term_occurs(terms, cells, active, generation, variable, *item)
+            term_occurs(terms, cells, active, generation, variable, item)
         }
         TypeTerm::Function { args, result, .. } => {
             args.iter()
                 .any(|argument| term_occurs(terms, cells, active, generation, variable, *argument))
-                || term_occurs(terms, cells, active, generation, variable, *result)
+                || term_occurs(terms, cells, active, generation, variable, result)
         }
         TypeTerm::Union(members) => members
             .iter()
             .any(|member| term_occurs(terms, cells, active, generation, variable, *member)),
         TypeTerm::Map { key, value } => {
-            term_occurs(terms, cells, active, generation, variable, *key)
-                || term_occurs(terms, cells, active, generation, variable, *value)
+            term_occurs(terms, cells, active, generation, variable, key)
+                || term_occurs(terms, cells, active, generation, variable, value)
         }
         TypeTerm::Text
         | TypeTerm::Number
@@ -2907,7 +2990,7 @@ fn collect_term_variables_dense(
                 let index = variable.0 as usize;
                 if variable_seen[index] != generation {
                     variable_seen[index] = generation;
-                    output.push(*variable);
+                    output.push(variable);
                 }
             }
             TypeTerm::VariantSet(variants) => {
@@ -2919,15 +3002,15 @@ fn collect_term_variables_dense(
             TypeTerm::Object { fields, .. } => {
                 stack.extend(fields.iter().map(|field| field.ty));
             }
-            TypeTerm::List(item) | TypeTerm::Set(item) => stack.push(*item),
+            TypeTerm::List(item) | TypeTerm::Set(item) => stack.push(item),
             TypeTerm::Function { args, result, .. } => {
-                stack.push(*result);
+                stack.push(result);
                 stack.extend(args.iter().copied());
             }
             TypeTerm::Union(members) => stack.extend(members.iter().copied()),
             TypeTerm::Map { key, value } => {
-                stack.push(*value);
-                stack.push(*key);
+                stack.push(value);
+                stack.push(key);
             }
             TypeTerm::Text
             | TypeTerm::Number
@@ -3748,6 +3831,20 @@ mod tests {
             ))
         );
         assert_eq!(artifact.work.activations, artifact.work.operations);
+    }
+
+    #[test]
+    fn invalid_record_spread_diagnostic_does_not_expose_packed_storage_coordinates() {
+        let mut builder = ComponentProgramBuilder::new();
+        let output = builder.new_authoritative_provider();
+        let invalid_variant = builder.terms_mut().variant_tag("NotARecord");
+        let invalid = builder.terms_mut().variant_set([invalid_variant]);
+        builder.add_record(output, None, [KernelRecordEntry::Spread { value: invalid }]);
+
+        let error = solve_component(builder.finish()).expect_err("variant spread must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("found VariantSet([Tag(NameId("));
+        assert!(!message.contains("TermSpan"));
     }
 
     #[test]

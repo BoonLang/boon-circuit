@@ -18,7 +18,7 @@ mod term;
 
 pub use abi::*;
 pub use artifact::*;
-pub use artifact_terms::*;
+pub(crate) use artifact_terms::*;
 pub use link::*;
 pub use owner::*;
 pub use program::*;

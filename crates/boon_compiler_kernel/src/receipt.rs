@@ -5,7 +5,7 @@ use crate::{
     KernelOwnerNodeKind, KernelOwnerProgramInput, KernelSolveError, KernelStatementChildReference,
     KernelStatementReference, KernelValueReference,
 };
-use boon_checked::{FlowType, ObjectShape, Type, TypeVar, Variant};
+use boon_checked::{FlowType, ObjectShape, SharedObjectShape, Type, TypeVar, Variant};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -943,63 +943,86 @@ fn alpha_normalize_type(
     variables: &mut BTreeMap<TypeVar, TypeVar>,
     next: &mut u32,
 ) -> Type {
+    alpha_normalize_type_inner(ty, variables, next).unwrap_or_else(|| ty.clone())
+}
+
+/// Copy-on-change alpha normalization.
+///
+/// Most checked types are closed immutable `Arc` subtrees. Rebuilding every
+/// object map, field name, field-order vector, collection edge, and variant
+/// vector merely to discover that it contains no variable was one of the
+/// checked-publication allocation multipliers. `None` means the original
+/// subtree is already valid and can be shared verbatim.
+fn alpha_normalize_type_inner(
+    ty: &Type,
+    variables: &mut BTreeMap<TypeVar, TypeVar>,
+    next: &mut u32,
+) -> Option<Type> {
     match ty {
-        Type::Var(variable) => Type::Var(*variables.entry(*variable).or_insert_with(|| {
-            let normalized = TypeVar(*next);
-            *next = next.saturating_add(1);
-            normalized
-        })),
-        Type::Object(shape) => Type::object(ObjectShape {
-            fields: shape
-                .fields
-                .iter()
-                .map(|(name, ty)| (name.clone(), alpha_normalize_type(ty, variables, next)))
-                .collect(),
-            field_order: shape.field_order.clone(),
-            open: shape.open,
-        }),
-        Type::List(item) => Type::List(Type::shared(alpha_normalize_type(item, variables, next))),
-        Type::Set(item) => Type::Set(Type::shared(alpha_normalize_type(item, variables, next))),
-        Type::Map { key, value } => Type::Map {
-            key: Box::new(alpha_normalize_type(key, variables, next)),
-            value: Box::new(alpha_normalize_type(value, variables, next)),
-        },
-        Type::Function { args, result } => Type::Function {
-            args: args
-                .iter()
-                .map(|argument| alpha_normalize_type(argument, variables, next))
-                .collect(),
-            result: Box::new(alpha_normalize_flow_type(result, variables, next)),
-        },
-        Type::VariantSet(variants) => Type::VariantSet(
-            variants
-                .iter()
-                .map(|variant| match variant {
-                    Variant::Tag(tag) => Variant::Tag(tag.clone()),
-                    Variant::Tagged { tag, fields } => Variant::Tagged {
+        Type::Var(variable) => {
+            let normalized = *variables.entry(*variable).or_insert_with(|| {
+                let normalized = TypeVar(*next);
+                *next = next.saturating_add(1);
+                normalized
+            });
+            (normalized != *variable).then_some(Type::Var(normalized))
+        }
+        Type::Object(shape) => alpha_normalize_object_shape(shape, variables, next)
+            .map(|shape| Type::Object(shape.into())),
+        Type::List(item) => alpha_normalize_type_inner(item, variables, next)
+            .map(|item| Type::List(Type::shared(item))),
+        Type::Set(item) => alpha_normalize_type_inner(item, variables, next)
+            .map(|item| Type::Set(Type::shared(item))),
+        Type::Map { key, value } => {
+            let normalized_key = alpha_normalize_type_inner(key, variables, next);
+            let normalized_value = alpha_normalize_type_inner(value, variables, next);
+            (normalized_key.is_some() || normalized_value.is_some()).then(|| Type::Map {
+                key: Box::new(normalized_key.unwrap_or_else(|| key.as_ref().clone())),
+                value: Box::new(normalized_value.unwrap_or_else(|| value.as_ref().clone())),
+            })
+        }
+        Type::Function { args, result } => {
+            let mut normalized_args = None;
+            for (index, argument) in args.iter().enumerate() {
+                if let Some(argument) = alpha_normalize_type_inner(argument, variables, next) {
+                    normalized_args.get_or_insert_with(|| args.clone())[index] = argument;
+                }
+            }
+            let normalized_result = alpha_normalize_type_inner(&result.ty, variables, next);
+            (normalized_args.is_some() || normalized_result.is_some()).then(|| Type::Function {
+                args: normalized_args.unwrap_or_else(|| args.clone()),
+                result: Box::new(FlowType {
+                    mode: result.mode,
+                    ty: normalized_result.unwrap_or_else(|| result.ty.clone()),
+                }),
+            })
+        }
+        Type::VariantSet(variants) => {
+            let mut normalized_variants = None;
+            for (index, variant) in variants.iter().enumerate() {
+                let Variant::Tagged { tag, fields } = variant else {
+                    continue;
+                };
+                if let Some(fields) = alpha_normalize_object_shape(fields, variables, next) {
+                    normalized_variants
+                        .get_or_insert_with(|| variants.iter().cloned().collect::<Vec<_>>())
+                        [index] = Variant::Tagged {
                         tag: tag.clone(),
-                        fields: ObjectShape {
-                            fields: fields
-                                .fields
-                                .iter()
-                                .map(|(name, ty)| {
-                                    (name.clone(), alpha_normalize_type(ty, variables, next))
-                                })
-                                .collect(),
-                            field_order: fields.field_order.clone(),
-                            open: fields.open,
-                        }
-                        .into(),
-                    },
-                })
-                .collect(),
-        ),
-        Type::Union(members) => Type::Union(
-            members
-                .iter()
-                .map(|member| alpha_normalize_type(member, variables, next))
-                .collect(),
-        ),
+                        fields: fields.into(),
+                    };
+                }
+            }
+            normalized_variants.map(|variants| Type::VariantSet(variants.into()))
+        }
+        Type::Union(members) => {
+            let mut normalized_members = None;
+            for (index, member) in members.iter().enumerate() {
+                if let Some(member) = alpha_normalize_type_inner(member, variables, next) {
+                    normalized_members.get_or_insert_with(|| members.clone())[index] = member;
+                }
+            }
+            normalized_members.map(Type::Union)
+        }
         Type::Text
         | Type::Number
         | Type::Bytes(_)
@@ -1007,8 +1030,28 @@ fn alpha_normalize_type(
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
         | Type::Unknown
-        | Type::Bits { .. } => ty.clone(),
+        | Type::Bits { .. } => None,
     }
+}
+
+fn alpha_normalize_object_shape(
+    shape: &SharedObjectShape,
+    variables: &mut BTreeMap<TypeVar, TypeVar>,
+    next: &mut u32,
+) -> Option<ObjectShape> {
+    let mut normalized_fields = None;
+    for (name, ty) in &shape.fields {
+        if let Some(ty) = alpha_normalize_type_inner(ty, variables, next) {
+            normalized_fields
+                .get_or_insert_with(|| shape.fields.clone())
+                .insert(name.clone(), ty);
+        }
+    }
+    normalized_fields.map(|fields| ObjectShape {
+        fields,
+        field_order: shape.field_order.clone(),
+        open: shape.open,
+    })
 }
 
 fn checked_u32(value: usize, context: &str) -> Result<u32, KernelSolveError> {
@@ -1123,6 +1166,45 @@ mod tests {
         compile_project_program_with_definition_facts,
     };
     use boon_checked::FlowMode;
+
+    #[test]
+    fn alpha_normalization_shares_closed_immutable_subtrees() {
+        let closed = Type::object(ObjectShape::from_ordered_fields(
+            [("name".to_owned(), Type::Text)],
+            false,
+        ));
+        let Type::Object(closed_shape) = &closed else {
+            unreachable!()
+        };
+        let unchanged = alpha_normalize_type(&closed, &mut BTreeMap::new(), &mut 0);
+        let Type::Object(unchanged_shape) = &unchanged else {
+            unreachable!()
+        };
+        assert!(boon_checked::SharedObjectShape::ptr_eq(
+            closed_shape,
+            unchanged_shape
+        ));
+
+        let generic = Type::object(ObjectShape::from_ordered_fields(
+            [
+                ("closed".to_owned(), closed.clone()),
+                ("value".to_owned(), Type::Var(TypeVar(29))),
+            ],
+            false,
+        ));
+        let normalized = alpha_normalize_type(&generic, &mut BTreeMap::new(), &mut 0);
+        let Type::Object(normalized) = normalized else {
+            unreachable!()
+        };
+        assert_eq!(normalized.fields["value"], Type::Var(TypeVar(0)));
+        let Type::Object(normalized_closed) = &normalized.fields["closed"] else {
+            unreachable!()
+        };
+        assert!(boon_checked::SharedObjectShape::ptr_eq(
+            closed_shape,
+            normalized_closed
+        ));
+    }
 
     fn value_owner(nodes: Vec<KernelOwnerNode>) -> KernelOwnerProgramInput {
         KernelOwnerProgramInput {

@@ -1,11 +1,12 @@
 use crate::solver::ComponentSolveSession;
 use crate::{
     ComponentArtifact, ComponentOutputs, ComponentProgram, ComponentProgramBuilder,
-    KernelCollectionOperationKind, KernelDefinitionFlowTermsV1, KernelPattern, KernelRecordEntry,
-    KernelSelectArm, KernelSolveError, KernelSolveWork, KernelSummaryCallInput, KernelSummaryNode,
+    DefinitionTermProofScratch, FrozenTypeStore, KernelCollectionOperationKind,
+    KernelDefinitionFlowTermsV1, KernelPattern, KernelRecordEntry, KernelSelectArm,
+    KernelSolveError, KernelSolveWork, KernelSummaryCallInput, KernelSummaryNode,
     KernelSummaryProgram, KernelSummaryProjectionStep, KernelSummaryRecordEntry,
-    KernelSummarySelectArm, KernelSummaryValueId, OutputId, PublishMode, TypeTerm, TypeTermId,
-    TypeVariableId, VariantTerm, alpha_normalize_callable_interface_and_diagnostics,
+    KernelSummarySelectArm, KernelSummaryValueId, OutputId, PublishMode, TypeTerm, TypeTermHead,
+    TypeTermId, TypeVariableId, VariantTerm, alpha_normalize_callable_interface_and_diagnostics,
     alpha_normalize_definition, build_normalized_snapshot_receipts, build_snapshot_receipts,
     definition_basis_fingerprint, definition_basis_fingerprint_with_buffer,
     materialize_definition_flow_terms_v1, solve_component,
@@ -1007,6 +1008,16 @@ pub struct KernelResidualModuleWork {
     pub operations: u32,
     pub frames: u32,
     pub linked_operations: u64,
+}
+
+fn residual_module_precedes(
+    candidate: KernelResidualModuleWork,
+    current: KernelResidualModuleWork,
+) -> bool {
+    candidate.linked_operations > current.linked_operations
+        || (candidate.linked_operations == current.linked_operations
+            && candidate.linked_operations > 0
+            && candidate.owner < current.owner)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2207,11 +2218,10 @@ pub struct DefinitionArtifact {
     /// Principal callable formal surfaces in dense declaration order. This is
     /// empty for non-callable definitions.
     pub formals: Box<[FlowType]>,
-    /// Canonical definition-owned flow terms retained directly from the
-    /// solved type DAG. Rich `FlowType` fields remain a compatibility
-    /// projection during the vertical cut and must materialize exactly from
-    /// this authority.
-    /// Direct solved-DAG handoff. This derived sidecar is deliberately absent
+    /// Internal solved-DAG proof sidecar for the result, formals, and
+    /// expression flows. Rich `FlowType` fields remain the production
+    /// compatibility authority until the store-qualified packed consumer
+    /// lands. This derived sidecar is deliberately absent
     /// from the rich V16 artifact serialization/currentness contract while the
     /// semantic V5 consumer is landing; its own structural digest is the only
     /// stable identity.
@@ -2240,7 +2250,7 @@ pub struct DefinitionArtifact {
 }
 
 impl DefinitionArtifact {
-    pub fn flow_terms(&self) -> &KernelDefinitionFlowTermsV1 {
+    pub(crate) fn flow_terms(&self) -> &KernelDefinitionFlowTermsV1 {
         &self.flow_terms
     }
 }
@@ -2275,6 +2285,7 @@ impl Hash for DefinitionArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelDefinitionSnapshot {
     pub definition: DefinitionArtifact,
+    pub type_store: Arc<FrozenTypeStore>,
     pub dependencies: crate::KernelDefinitionDependencyGraph,
     pub currentness: crate::KernelDefinitionCurrentnessReceipt,
     pub work: KernelSolveWork,
@@ -2284,6 +2295,7 @@ pub struct KernelDefinitionSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCheckedSnapshot {
     pub definitions: Box<[DefinitionArtifact]>,
+    pub type_store: Arc<FrozenTypeStore>,
     pub diagnostic_values: Box<[KernelDiagnosticValueArtifact]>,
     pub dependencies: crate::KernelDefinitionDependencyGraph,
     pub currentness: Box<[crate::KernelDefinitionCurrentnessReceipt]>,
@@ -2325,6 +2337,7 @@ pub struct KernelDemandedDefinitionArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelDemandedDefinitionSnapshot {
     pub definitions: Box<[KernelDemandedDefinitionArtifact]>,
+    pub type_store: Arc<FrozenTypeStore>,
     pub work: KernelSolveWork,
 }
 
@@ -2372,6 +2385,7 @@ impl KernelOwnerProgram {
             .position(|output| *output == self.result_output)
             .expect("owner result belongs to its expression outputs");
         result.mode = self.expression_modes[result_index];
+        let mut term_proof_scratch = DefinitionTermProofScratch::default();
         let flow_terms = materialize_definition_flow_terms_v1(
             artifact.terms(),
             &self
@@ -2409,6 +2423,7 @@ impl KernelOwnerProgram {
                     )
                 })
                 .collect::<Vec<_>>(),
+            &mut term_proof_scratch,
         )?;
         let formal_flows = self
             .formal_outputs
@@ -2478,8 +2493,10 @@ impl KernelOwnerProgram {
         let [currentness] = currentness.as_ref() else {
             unreachable!("one standalone kernel definition produces one receipt")
         };
+        let type_store = artifact.type_store();
         Ok(KernelDefinitionSnapshot {
             definition,
+            type_store,
             dependencies,
             currentness: *currentness,
             work: artifact.work,
@@ -2636,6 +2653,7 @@ impl KernelSolvedProject {
     pub fn into_checked_snapshot(self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
         let trace = std::env::var_os("BOON_KERNEL_TRACE").is_some();
         let total_started = Instant::now();
+        let type_store = self.artifact.type_store();
         let interface_started = Instant::now();
         let diagnostic_values = self.interface_snapshot().diagnostic_values;
         let interface_us = interface_started.elapsed().as_micros();
@@ -2701,6 +2719,7 @@ impl KernelSolvedProject {
         }
         Ok(KernelCheckedSnapshot {
             definitions,
+            type_store,
             diagnostic_values,
             dependencies,
             currentness,
@@ -2719,6 +2738,7 @@ impl KernelSolvedProject {
         self,
         demanded: &[KernelOwnerId],
     ) -> Result<KernelDemandedDefinitionSnapshot, KernelSolveError> {
+        let type_store = self.artifact.type_store();
         let mut demanded = demanded.to_vec();
         demanded.sort_unstable();
         demanded.dedup();
@@ -2737,6 +2757,7 @@ impl KernelSolvedProject {
             project_expression_flush_types(&self.owners, &self.artifact, &self.public_results);
         let mut demanded_iter = demanded.into_iter().peekable();
         let mut definitions = Vec::with_capacity(demanded_iter.len());
+        let mut term_proof_scratch = DefinitionTermProofScratch::default();
         for (
             (
                 (((owner_index, owner), synthetic_state_ordinals), expression_flush_types),
@@ -2772,6 +2793,7 @@ impl KernelSolvedProject {
                 &synthetic_state_ordinals,
                 expression_flush_types,
                 &owner_effects,
+                &mut term_proof_scratch,
             )?;
             alpha_normalize_definition(&mut definition);
             definitions.push(KernelDemandedDefinitionArtifact {
@@ -2782,6 +2804,7 @@ impl KernelSolvedProject {
         debug_assert!(demanded_iter.next().is_none());
         Ok(KernelDemandedDefinitionSnapshot {
             definitions: definitions.into_boxed_slice(),
+            type_store,
             work: self.artifact.work,
         })
     }
@@ -2848,6 +2871,7 @@ fn materialize_project_definition_batch(
     public_formals: &[Box<[FlowType]>],
     owner_effects: &[KernelEffectSummary],
 ) -> Result<Vec<DefinitionArtifact>, KernelSolveError> {
+    let mut term_proof_scratch = DefinitionTermProofScratch::default();
     materializations
         .into_iter()
         .map(|materialization| {
@@ -2862,6 +2886,7 @@ fn materialize_project_definition_batch(
                 &materialization.synthetic_state_ordinals,
                 materialization.expression_flush_types,
                 owner_effects,
+                &mut term_proof_scratch,
             )?;
             alpha_normalize_definition(&mut definition);
             Ok(definition)
@@ -3781,6 +3806,7 @@ fn materialize_project_definition(
     synthetic_state_ordinals: &[Option<u32>],
     expression_flush_types: Box<[Option<Type>]>,
     owner_effects: &[KernelEffectSummary],
+    term_proof_scratch: &mut DefinitionTermProofScratch,
 ) -> Result<DefinitionArtifact, KernelSolveError> {
     let result = public_results[owner_index].clone();
     let flow_terms = materialize_definition_flow_terms_v1(
@@ -3820,6 +3846,7 @@ fn materialize_project_definition(
                 )
             })
             .collect::<Vec<_>>(),
+        term_proof_scratch,
     )?;
     let expression_flows = owner
         .expressions
@@ -7034,12 +7061,6 @@ pub fn compile_project_program_with_definition_facts(
             .copied()
             .unwrap_or_default();
         let linked = operations.saturating_mul(frames);
-        if linked > compile_work.dominant_module_linked_operations {
-            compile_work.dominant_module_owner = key.target.0 as u64;
-            compile_work.dominant_module_operations = operations;
-            compile_work.dominant_module_frames = frames;
-            compile_work.dominant_module_linked_operations = linked;
-        }
         let candidate = KernelResidualModuleWork {
             owner: key.target.0,
             operations: u32::try_from(operations)
@@ -7047,10 +7068,25 @@ pub fn compile_project_program_with_definition_facts(
             frames: u32::try_from(frames).expect("kernel residual module frame count exceeds u32"),
             linked_operations: linked,
         };
+        let dominant = KernelResidualModuleWork {
+            owner: u32::try_from(compile_work.dominant_module_owner)
+                .expect("kernel dominant module owner exceeds u32"),
+            operations: u32::try_from(compile_work.dominant_module_operations)
+                .expect("kernel dominant module operation count exceeds u32"),
+            frames: u32::try_from(compile_work.dominant_module_frames)
+                .expect("kernel dominant module frame count exceeds u32"),
+            linked_operations: compile_work.dominant_module_linked_operations,
+        };
+        if residual_module_precedes(candidate, dominant) {
+            compile_work.dominant_module_owner = u64::from(candidate.owner);
+            compile_work.dominant_module_operations = u64::from(candidate.operations);
+            compile_work.dominant_module_frames = u64::from(candidate.frames);
+            compile_work.dominant_module_linked_operations = candidate.linked_operations;
+        }
         if let Some(position) = compile_work
             .residual_module_ranking
             .iter()
-            .position(|current| candidate.linked_operations > current.linked_operations)
+            .position(|current| residual_module_precedes(candidate, *current))
         {
             for index in (position + 1..KERNEL_RESIDUAL_MODULE_RANKING_LEN).rev() {
                 compile_work.residual_module_ranking[index] =
@@ -10427,24 +10463,23 @@ fn constant_summary_project_field(
     provider: TypeTermId,
     field: crate::NameId,
 ) -> Option<TypeTermId> {
-    match builder.terms().term(provider).clone() {
-        TypeTerm::Object { fields, .. } => fields
-            .iter()
-            .find(|candidate| candidate.name == field)
-            .map(|candidate| candidate.ty),
-        TypeTerm::Union(members) => {
+    match builder.terms().term_head(provider) {
+        TypeTermHead::Object { shape, .. } => builder.terms().lookup_object_field(shape, field),
+        TypeTermHead::Union(members) => {
+            let members = builder.terms().term_ids(members).to_vec();
             let projected = members
-                .iter()
-                .filter_map(|member| constant_summary_project_field(builder, *member, field))
+                .into_iter()
+                .filter_map(|member| constant_summary_project_field(builder, member, field))
                 .collect::<Vec<_>>();
             (!projected.is_empty()).then(|| builder.terms_mut().union(projected))
         }
-        TypeTerm::VariantSet(variants) => {
+        TypeTermHead::VariantSet(variants) => {
+            let variants = builder.terms().variant_terms(variants).to_vec();
             let projected = variants
-                .iter()
+                .into_iter()
                 .filter_map(|variant| match variant {
                     VariantTerm::Tagged { fields, .. } => {
-                        constant_summary_project_field(builder, *fields, field)
+                        constant_summary_project_field(builder, fields, field)
                     }
                     VariantTerm::Tag(_) => None,
                 })
@@ -10547,7 +10582,7 @@ fn constant_summary_pattern_accepts(
         KernelPattern::Number => matches!(builder.terms().term(selector), TypeTerm::Number),
         KernelPattern::Text => matches!(builder.terms().term(selector), TypeTerm::Text),
         KernelPattern::Bits { width } => {
-            matches!(builder.terms().term(selector), TypeTerm::Bits(actual) if actual == width)
+            matches!(builder.terms().term(selector), TypeTerm::Bits(actual) if actual == *width)
         }
         KernelPattern::Tag { name, .. } => {
             matches!(builder.terms().term(selector), TypeTerm::VariantSet(variants) if variants.iter().any(|variant| builder.terms().name(variant.tag()) == name.as_ref()))
@@ -10600,27 +10635,30 @@ fn merge_constant_summary_spread(
     spread: TypeTermId,
     fields: &mut Vec<(crate::NameId, TypeTermId)>,
 ) -> bool {
-    match builder.terms().term(spread).clone() {
-        TypeTerm::Object {
-            fields: spread_fields,
-            ..
-        } => {
+    match builder.terms().term_head(spread) {
+        TypeTermHead::Object { shape, .. } => {
+            let spread_fields = builder.terms().object_fields_for_shape(shape).into_vec();
             for field in spread_fields {
                 insert_constant_summary_field(fields, field.name, field.ty);
             }
             true
         }
-        TypeTerm::Union(members) => members
-            .iter()
-            .all(|member| merge_constant_summary_spread(builder, *member, fields)),
-        TypeTerm::VariantSet(variants)
-            if variants
+        TypeTermHead::Union(members) => builder
+            .terms()
+            .term_ids(members)
+            .to_vec()
+            .into_iter()
+            .all(|member| merge_constant_summary_spread(builder, member, fields)),
+        TypeTermHead::VariantSet(variants)
+            if builder
+                .terms()
+                .variant_terms(variants)
                 .iter()
                 .any(|variant| builder.terms().name(variant.tag()) == "UNPLUGGED") =>
         {
             true
         }
-        TypeTerm::Unknown | TypeTerm::UnresolvedShape(_) => true,
+        TypeTermHead::Unknown | TypeTermHead::UnresolvedShape(_) => true,
         _ => false,
     }
 }
@@ -14349,6 +14387,30 @@ mod tests {
     }
 
     #[test]
+    fn residual_module_ranking_breaks_equal_work_ties_by_owner() {
+        let owner_1086 = KernelResidualModuleWork {
+            owner: 1086,
+            operations: 15,
+            frames: 15,
+            linked_operations: 225,
+        };
+        let owner_1087 = KernelResidualModuleWork {
+            owner: 1087,
+            ..owner_1086
+        };
+
+        assert!(residual_module_precedes(owner_1086, owner_1087));
+        assert!(!residual_module_precedes(owner_1087, owner_1086));
+        assert!(residual_module_precedes(
+            KernelResidualModuleWork {
+                linked_operations: 226,
+                ..owner_1087
+            },
+            owner_1086,
+        ));
+    }
+
+    #[test]
     fn solved_call_result_owns_a_widened_generic_substitution() {
         let variable = TypeVar(0);
         let admin = Type::VariantSet(vec![Variant::Tag("Admin".to_owned())].into());
@@ -16585,8 +16647,8 @@ mod tests {
         assert_eq!(program.compile_work().invocation_frames, 0);
         assert!(program.component().operations.iter().any(|operation| {
             matches!(
-                operation.as_ref(),
-                crate::KernelOperation::SummaryCall { program, .. }
+                operation,
+                crate::KernelOperationRef::SummaryCall { program, .. }
                     if program.nodes.iter().any(|node| matches!(node, KernelSummaryNode::Select { .. }))
                         && program.nodes.iter().all(|node| !matches!(node, KernelSummaryNode::Invoke { .. }))
             )
@@ -18169,8 +18231,8 @@ mod tests {
             .component()
             .operations
             .iter()
-            .filter_map(|operation| match operation.as_ref() {
-                crate::KernelOperation::SummaryCall { program, .. } => Some(program),
+            .filter_map(|operation| match operation {
+                crate::KernelOperationRef::SummaryCall { program, .. } => Some(program),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -18280,8 +18342,8 @@ mod tests {
             .component()
             .operations
             .iter()
-            .filter_map(|operation| match operation.as_ref() {
-                crate::KernelOperation::SummaryCall {
+            .filter_map(|operation| match operation {
+                crate::KernelOperationRef::SummaryCall {
                     program, inputs, ..
                 } if program.definition == 0 => Some((program, inputs)),
                 _ => None,
@@ -18678,8 +18740,8 @@ mod tests {
             .component()
             .operations
             .iter()
-            .find_map(|operation| match operation.as_ref() {
-                crate::KernelOperation::SummaryCall { inputs, .. }
+            .find_map(|operation| match operation {
+                crate::KernelOperationRef::SummaryCall { inputs, .. }
                     if inputs.iter().any(|input| {
                         matches!(
                             input,
@@ -18775,8 +18837,8 @@ mod tests {
         assert_eq!(program.compile_work().invocation_frames, 0);
         assert!(program.component().operations.iter().any(|operation| {
             matches!(
-                operation.as_ref(),
-                crate::KernelOperation::SummaryCall { program, .. }
+                operation,
+                crate::KernelOperationRef::SummaryCall { program, .. }
                     if program.nodes.iter().any(|node| {
                         matches!(node, KernelSummaryNode::Projection { .. })
                     })
@@ -19088,8 +19150,8 @@ mod tests {
         );
         assert!(program.component().operations.iter().any(|operation| {
             matches!(
-                operation.as_ref(),
-                crate::KernelOperation::SummaryCall { program, .. }
+                operation,
+                crate::KernelOperationRef::SummaryCall { program, .. }
                     if program.nodes.iter().any(|node| matches!(node, KernelSummaryNode::Select { .. }))
             )
         }));

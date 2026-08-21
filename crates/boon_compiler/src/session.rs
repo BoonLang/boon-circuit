@@ -2,7 +2,10 @@ use crate::{
     CheckedCompileRequest, CheckedSourceFromSource, CompiledSealedMachinePlanFromSource,
     CompilerDiagnostics, CompilerResult, CompilerSourceUnit,
     finish_checked_machine_plan_with_cancellation,
-    kernel_oracle::{compiler_checked_from_kernel, compiler_diagnostics_from_kernel},
+    kernel_oracle::{
+        compiler_checked_from_kernel, compiler_diagnostics_from_kernel,
+        compiler_editor_checked_from_kernel,
+    },
 };
 use boon_compilation_db::{
     RequestAbortReason, RequestEvaluationStats, RequestEvaluatorGraph, RequestFamily,
@@ -749,7 +752,7 @@ impl CompilerSession {
 
         if intent == CompileIntent::EditorDiagnostics {
             if state.checked.is_none() {
-                state.checked = Some(compile_project_checked_with_kernel(state)?);
+                state.checked = Some(compile_project_checked_with_kernel(state, true)?);
             }
             if cancellation.is_canceled() {
                 state.checked = None;
@@ -766,7 +769,7 @@ impl CompilerSession {
             .is_some_and(|(compiled_revision, _)| *compiled_revision == revision);
         if !current_artifact_available {
             if state.checked.is_none() {
-                state.checked = Some(compile_project_checked_with_kernel(state)?);
+                state.checked = Some(compile_project_checked_with_kernel(state, false)?);
             }
             if cancellation.is_canceled() {
                 state.checked = None;
@@ -815,10 +818,20 @@ impl CompilerSession {
 
 fn compile_project_checked_with_kernel(
     state: &mut ProjectState,
+    editor_projections: bool,
 ) -> CompilerResult<CheckedSourceFromSource> {
     let (project, parse_work, parse_ms) = parse_project_syntax_snapshot(state)?;
-    compiler_checked_from_kernel(project, parse_work, parse_ms, state.source.program_role)
-        .map_err(session_error)
+    if editor_projections {
+        compiler_editor_checked_from_kernel(
+            project,
+            parse_work,
+            parse_ms,
+            state.source.program_role,
+        )
+    } else {
+        compiler_checked_from_kernel(project, parse_work, parse_ms, state.source.program_role)
+    }
+    .map_err(session_error)
 }
 
 fn parse_project_syntax_snapshot(
@@ -1307,7 +1320,17 @@ mod tests {
     #[test]
     fn public_diagnostics_stays_lean_and_editor_rows_are_explicitly_demanded() {
         let mut session = CompilerSession::new();
-        let project = session.open_project(project("value: 1")).unwrap();
+        let project = session
+            .open_project(project(concat!(
+                "store: [\n",
+                "    count: 0 |> HOLD count {\n",
+                "        increment |> THEN { count + 1 }\n",
+                "    }\n",
+                "]\n\n",
+                "increment: SOURCE\n",
+                "value: store.count\n",
+            )))
+            .unwrap();
         let revision = session.revision(project).unwrap();
         let token = CancellationToken::new();
         {
@@ -1325,6 +1348,14 @@ mod tests {
             let output = &result.editor_diagnostics().unwrap().output;
             assert!(output.program.is_none());
             assert!(output.construction.is_some());
+            assert!(
+                !output
+                    .checked_program_fields()
+                    .expect("editor request retains checked fields")
+                    .resource_projection_requirements
+                    .is_empty(),
+                "editor demand must explicitly project rich resource rows",
+            );
         }
         let first_plan = session
             .request(project, revision, CompileIntent::VerifiedPreview, &token)

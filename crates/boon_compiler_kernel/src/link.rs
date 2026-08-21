@@ -15,21 +15,22 @@ use boon_checked::{
     CheckedEvaluationScope, CheckedExprId, CheckedExpression, CheckedExpressionKind,
     CheckedImageKernelPublicationV1, CheckedImageRowDomainV2, CheckedList, CheckedListId,
     CheckedMatchPattern, CheckedParameter, CheckedParameterKind, CheckedParameterRequirement,
-    CheckedPassedAccess, CheckedPatternBinding, CheckedRecordField, CheckedResourceBinding,
-    CheckedResourceProjectionRequirement, CheckedRuntimeFlowTermProjectionV1, CheckedScope,
-    CheckedScopeKind, CheckedSemanticPath, CheckedShardCallableKindV2, CheckedShardOwnerKeyV2,
-    CheckedShardProjectionKeyV2, CheckedShardRegionV2, CheckedSource, CheckedSourceId,
-    CheckedSourceRead, CheckedSpan, CheckedState, CheckedStateId, CheckedStatement,
-    CheckedStatementId, CheckedStatementKind, CheckedTextSegment, CheckedTypeSubstitution,
-    CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId, ObjectShape,
-    ProgramRole, SemanticOccurrence, SemanticOccurrenceKind, SharedObjectShape, Type, TypeVar,
-    Variant,
+    CheckedPassedAccess, CheckedPatternBinding, CheckedProgram, CheckedProgramFields,
+    CheckedRecordField, CheckedResourceBinding, CheckedResourceProjectionRequirement,
+    CheckedRuntimeFlowTermProjectionV1, CheckedScope, CheckedScopeKind, CheckedSemanticPath,
+    CheckedShardCallableKindV2, CheckedShardOwnerKeyV2, CheckedShardProjectionKeyV2,
+    CheckedShardRegionV2, CheckedSource, CheckedSourceId, CheckedSourceRead, CheckedSpan,
+    CheckedState, CheckedStateId, CheckedStatement, CheckedStatementId, CheckedStatementKind,
+    CheckedTextSegment, CheckedTypeSubstitution, CheckedValueUse, ContextFormalId, DeclId,
+    FlowMode, FlowType, LexicalScopeId, ObjectShape, ProgramRole, SemanticOccurrence,
+    SemanticOccurrenceKind, SharedObjectShape, Type, TypeVar, Variant,
 };
 use boon_contract::SourceBundleDigestV1;
 use boon_syntax::StableOccurrenceKey;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KernelCheckedRowRange {
@@ -128,7 +129,10 @@ pub struct KernelCheckedRows {
     pub call_occurrences: Box<[StableOccurrenceKey]>,
     pub call_result_paths: Box<[CheckedCallResultPath]>,
     pub pattern_bindings: Box<[CheckedPatternBinding]>,
-    pub resource_projection_requirements: Box<[CheckedResourceProjectionRequirement]>,
+    /// Move-only packed authority bound by the linker that produced these
+    /// rows. Rich paths, origins, and recursive types are projected only by
+    /// the explicit oracle/editor method on `KernelCheckedLinkLayout`.
+    pub semantic_input: KernelSemanticInputConstructionV1,
     pub sources: Box<[CheckedSource]>,
     pub states: Box<[CheckedState]>,
     pub lists: Box<[CheckedList]>,
@@ -331,6 +335,528 @@ pub struct KernelCheckedLinkLayout {
     totals: KernelCheckedLinkTotals,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KernelSemanticResourceProjectionLocatorV1 {
+    owner: KernelOwnerId,
+    ordinal: u32,
+    expression: CheckedExprId,
+    target: DeclId,
+}
+
+/// Move-only construction authority transported beside the compatibility
+/// checked image.
+///
+/// This owns the packed definition-code/type authority and its sole dense
+/// relocation layout. Transitional `DefinitionArtifact` DTOs are deliberately
+/// not retained; later normalized definition modules will extend this input
+/// directly. The checked image may still expose rich rows for explicit editor
+/// or oracle requests, but ordinary semantic compilation consumes this
+/// authority instead of reconstructing packed facts from those rows.
+#[derive(Debug, Eq, PartialEq)]
+pub struct KernelSemanticInputConstructionV1 {
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    role: ProgramRole,
+    definition_count: usize,
+    definition_code: Arc<crate::DefinitionCodeStore>,
+    expression_count: u32,
+    declaration_count: u32,
+    source_count: u32,
+    source_ranges: Box<[KernelCheckedRowRange]>,
+    resource_projections: Box<[KernelSemanticResourceProjectionLocatorV1]>,
+    resource_projection_by_expression: Box<[u32]>,
+}
+
+/// Checked-image-bound packed input accepted by the kernel semantic route.
+///
+/// Dense IDs remain revision-local and are valid only together with this
+/// exact source/image authority. Public views never expose bare `SymbolId` or
+/// `TypeTermId` values.
+#[derive(Debug)]
+pub struct KernelSemanticInputV1 {
+    construction: KernelSemanticInputConstructionV1,
+    checked_image_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+pub struct KernelSemanticResourceProjectionRef<'a> {
+    input: &'a KernelSemanticInputV1,
+    locator: KernelSemanticResourceProjectionLocatorV1,
+}
+
+pub struct KernelSemanticResourceOriginIter<'a> {
+    input: &'a KernelSemanticInputV1,
+    owner: KernelOwnerId,
+    requirement_ordinal: usize,
+    next: usize,
+    len: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct KernelSemanticResourceOriginRef<'a> {
+    input: &'a KernelSemanticInputV1,
+    owner: KernelOwnerId,
+    source_owner: KernelOwnerId,
+    source: crate::KernelSourceId,
+    payload_projection: &'a [boon_contract::SymbolId],
+}
+
+impl KernelSemanticInputConstructionV1 {
+    pub fn resource_projection_count(&self) -> usize {
+        self.resource_projections.len()
+    }
+
+    fn from_linked_rows(
+        source_bundle_digest_v1: SourceBundleDigestV1,
+        role: ProgramRole,
+        snapshot: &KernelCheckedSnapshot,
+        layout: &KernelCheckedLinkLayout,
+        resource_projections: Box<[KernelSemanticResourceProjectionLocatorV1]>,
+    ) -> Result<Self, KernelCheckedLinkError> {
+        if snapshot.definitions.len() != layout.definitions.len()
+            || snapshot.definition_code.definition_count() != layout.definitions.len()
+        {
+            return Err(KernelCheckedLinkError::new(
+                "kernel semantic input definition authorities disagree",
+            ));
+        }
+        if !Arc::ptr_eq(&snapshot.type_store, snapshot.definition_code.type_store()) {
+            return Err(KernelCheckedLinkError::new(
+                "kernel semantic input detached its packed type authority",
+            ));
+        }
+        let mut resource_projection_by_expression =
+            vec![u32::MAX; layout.totals.expressions as usize];
+        for (index, requirement) in resource_projections.iter().enumerate() {
+            let index = u32::try_from(index).map_err(|_| {
+                KernelCheckedLinkError::new("kernel semantic resource-projection count exceeds u32")
+            })?;
+            let slot = resource_projection_by_expression
+                .get_mut(requirement.expression.0 as usize)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel semantic resource projection references missing expression {}",
+                        requirement.expression.0,
+                    ))
+                })?;
+            if *slot != u32::MAX {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel semantic input repeats resource projection for expression {}",
+                    requirement.expression.0,
+                )));
+            }
+            *slot = index;
+        }
+        let definition_count = snapshot.definitions.len();
+        Ok(Self {
+            source_bundle_digest_v1,
+            role,
+            definition_count,
+            definition_code: Arc::clone(&snapshot.definition_code),
+            expression_count: layout.totals.expressions,
+            declaration_count: layout.totals.declarations.saturating_sub(1),
+            source_count: layout.totals.sources,
+            source_ranges: layout
+                .definitions
+                .iter()
+                .map(|definition| definition.sources)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            resource_projections,
+            resource_projection_by_expression: resource_projection_by_expression.into_boxed_slice(),
+        })
+    }
+
+    pub fn seal(
+        self,
+        checked: &CheckedProgram,
+    ) -> Result<KernelSemanticInputV1, KernelCheckedLinkError> {
+        self.validate_checked_shape(
+            checked.source_bundle_digest_v1,
+            checked.role,
+            checked.expressions.len(),
+            checked.declarations.len(),
+            checked.sources.len(),
+        )?;
+        let handoff = checked.image_handoff();
+        let routed_resources = handoff
+            .entity_routes
+            .iter()
+            .filter(|route| route.domain == CheckedImageRowDomainV2::ResourceProjection)
+            .count();
+        if routed_resources != self.resource_projections.len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel semantic input has {} resource projections but checked image routes {routed_resources}",
+                self.resource_projections.len(),
+            )));
+        }
+        for (ordinal, requirement) in self.resource_projections.iter().enumerate() {
+            let resource_projection = handoff
+                .entity_projection(CheckedImageRowDomainV2::ResourceProjection, ordinal)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel semantic resource projection {ordinal} has no checked-image route",
+                    ))
+                })?;
+            let expression_projection = handoff
+                .entity_projection(
+                    CheckedImageRowDomainV2::Expression,
+                    requirement.expression.0 as usize,
+                )
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel semantic resource projection {ordinal} expression {} has no checked-image route",
+                        requirement.expression.0,
+                    ))
+                })?;
+            if resource_projection != expression_projection {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel semantic resource projection {ordinal} is detached from expression {}",
+                    requirement.expression.0,
+                )));
+            }
+            let target_projection = handoff
+                .entity_projection(
+                    CheckedImageRowDomainV2::Declaration,
+                    requirement.target.0 as usize,
+                )
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel semantic resource projection {ordinal} target {} has no checked-image route",
+                        requirement.target.0,
+                    ))
+                })?;
+            if target_projection != resource_projection
+                && !handoff
+                    .projection_relocations(resource_projection)
+                    .is_some_and(|relocations| relocations.contains(&target_projection))
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel semantic resource projection {ordinal} has no relocation to target {}",
+                    requirement.target.0,
+                )));
+            }
+        }
+        Ok(KernelSemanticInputV1 {
+            construction: self,
+            checked_image_digest: handoff.local_image_digest,
+        })
+    }
+
+    fn validate_checked_shape(
+        &self,
+        source_bundle_digest_v1: SourceBundleDigestV1,
+        role: ProgramRole,
+        expression_count: usize,
+        declaration_count: usize,
+        source_count: usize,
+    ) -> Result<(), KernelCheckedLinkError> {
+        if self.source_bundle_digest_v1 != source_bundle_digest_v1 {
+            return Err(KernelCheckedLinkError::new(
+                "kernel semantic input source digest differs from checked image",
+            ));
+        }
+        if self.role != role {
+            return Err(KernelCheckedLinkError::new(
+                "kernel semantic input role differs from checked image",
+            ));
+        }
+        for (label, actual, expected) in [
+            (
+                "expression",
+                expression_count,
+                self.expression_count as usize,
+            ),
+            (
+                "declaration",
+                declaration_count,
+                self.declaration_count as usize,
+            ),
+            ("source", source_count, self.source_count as usize),
+        ] {
+            if actual != expected {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel semantic input {label} count {expected} differs from checked count {actual}",
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl KernelSemanticInputV1 {
+    pub fn validate_checked_authority(
+        &self,
+        source_bundle_digest_v1: SourceBundleDigestV1,
+        role: ProgramRole,
+        checked_image_digest: [u8; 32],
+        expression_count: usize,
+        declaration_count: usize,
+        source_count: usize,
+    ) -> Result<(), KernelCheckedLinkError> {
+        self.construction.validate_checked_shape(
+            source_bundle_digest_v1,
+            role,
+            expression_count,
+            declaration_count,
+            source_count,
+        )?;
+        if self.checked_image_digest != checked_image_digest {
+            return Err(KernelCheckedLinkError::new(
+                "kernel semantic input checked-image digest is stale",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn definition_count(&self) -> usize {
+        self.construction.definition_count
+    }
+
+    pub fn resource_projection_count(&self) -> usize {
+        self.construction.resource_projections.len()
+    }
+
+    pub fn resource_projection(
+        &self,
+        expression: CheckedExprId,
+    ) -> Option<KernelSemanticResourceProjectionRef<'_>> {
+        let index = *self
+            .construction
+            .resource_projection_by_expression
+            .get(expression.0 as usize)?;
+        (index != u32::MAX).then(|| KernelSemanticResourceProjectionRef {
+            input: self,
+            locator: self.construction.resource_projections[index as usize],
+        })
+    }
+
+    pub fn resource_projections(
+        &self,
+    ) -> impl ExactSizeIterator<Item = KernelSemanticResourceProjectionRef<'_>> {
+        self.construction
+            .resource_projections
+            .iter()
+            .copied()
+            .map(|locator| KernelSemanticResourceProjectionRef {
+                input: self,
+                locator,
+            })
+    }
+
+    /// Validate every editor DTO fact that semantic compilation consumes
+    /// against this packed authority. Origin-free `required_type` values are
+    /// presentation-only and are not rematerialized merely to compare them a
+    /// second time. The ordinary runtime path supplies no rich rows and pays
+    /// no projection cost; editor-to-verified promotion uses this check before
+    /// discarding the already-inspected compatibility rows.
+    pub fn validate_rich_resource_projections(
+        &self,
+        checked: &CheckedProgramFields,
+    ) -> Result<(), KernelCheckedLinkError> {
+        if checked.resource_projection_requirements.is_empty() {
+            return Ok(());
+        }
+        if checked.resource_projection_requirements.len() != self.resource_projection_count() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "checked editor image has {} rich resource projections but packed authority has {}",
+                checked.resource_projection_requirements.len(),
+                self.resource_projection_count(),
+            )));
+        }
+        let mut seen = vec![false; self.resource_projection_count()];
+        for rich in &checked.resource_projection_requirements {
+            let index = self
+                .construction
+                .resource_projection_by_expression
+                .get(rich.expression.0 as usize)
+                .copied()
+                .filter(|index| *index != u32::MAX)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "checked editor resource projection expression {} has no packed authority",
+                        rich.expression.0,
+                    ))
+                })? as usize;
+            if std::mem::replace(&mut seen[index], true) {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "checked editor resource projection repeats expression {}",
+                    rich.expression.0,
+                )));
+            }
+            let packed = KernelSemanticResourceProjectionRef {
+                input: self,
+                locator: self.construction.resource_projections[index],
+            };
+            if packed.target() != rich.target
+                || !packed
+                    .projection()
+                    .eq(rich.projection.iter().map(String::as_str))
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "checked editor resource projection {} differs from packed target/path authority",
+                    rich.expression.0,
+                )));
+            }
+            if packed.origin_count() != rich.source_origins.len() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "checked editor resource projection {} has {} origins but packed authority has {}",
+                    rich.expression.0,
+                    rich.source_origins.len(),
+                    packed.origin_count(),
+                )));
+            }
+            for (packed_origin, rich_origin) in packed.origins().zip(&rich.source_origins) {
+                if packed_origin.source() != rich_origin.source
+                    || !packed_origin
+                        .payload_projection()
+                        .eq(rich_origin.payload_projection.iter().map(String::as_str))
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "checked editor resource projection {} has an origin that differs from packed authority",
+                        rich.expression.0,
+                    )));
+                }
+            }
+            if packed.origin_count() > 0 {
+                let published_type = checked
+                    .expressions
+                    .get(rich.expression.0 as usize)
+                    .filter(|expression| expression.id == rich.expression)
+                    .map(|expression| &expression.flow_type.ty)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "checked editor resource projection references missing expression {}",
+                            rich.expression.0,
+                        ))
+                    })?;
+                if &rich.required_type != published_type {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "checked editor resource projection {} required type differs from its packed published type",
+                        rich.expression.0,
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'a> KernelSemanticResourceProjectionRef<'a> {
+    fn code(self) -> crate::DefinitionCodeRef<'a> {
+        self.input
+            .construction
+            .definition_code
+            .definition(self.locator.owner)
+            .expect("sealed kernel semantic definition exists")
+    }
+
+    pub const fn expression(self) -> CheckedExprId {
+        self.locator.expression
+    }
+
+    pub const fn target(self) -> DeclId {
+        self.locator.target
+    }
+
+    pub fn projection(self) -> impl ExactSizeIterator<Item = &'a str> {
+        let input = self.input;
+        self.code()
+            .resource_projection_path_symbols(self.locator.ordinal as usize)
+            .expect("sealed kernel semantic resource projection path exists")
+            .iter()
+            .map(move |symbol| {
+                input
+                    .construction
+                    .definition_code
+                    .symbol(*symbol)
+                    .expect("sealed kernel semantic symbol belongs to its text authority")
+            })
+    }
+
+    pub fn origin_count(self) -> usize {
+        self.code()
+            .resource_projection_origin_count(self.locator.ordinal as usize)
+            .expect("sealed kernel semantic resource projection exists")
+    }
+
+    pub fn origins(self) -> KernelSemanticResourceOriginIter<'a> {
+        KernelSemanticResourceOriginIter {
+            input: self.input,
+            owner: self.locator.owner,
+            requirement_ordinal: self.locator.ordinal as usize,
+            next: 0,
+            len: self.origin_count(),
+        }
+    }
+}
+
+impl<'a> Iterator for KernelSemanticResourceOriginIter<'a> {
+    type Item = KernelSemanticResourceOriginRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.len {
+            return None;
+        }
+        let origin_ordinal = self.next;
+        self.next += 1;
+        let code = self
+            .input
+            .construction
+            .definition_code
+            .definition(self.owner)
+            .expect("sealed kernel semantic definition exists");
+        let (source_owner, source, payload_projection) = code
+            .resource_projection_origin(self.requirement_ordinal, origin_ordinal)
+            .expect("sealed kernel semantic resource origin exists");
+        Some(KernelSemanticResourceOriginRef {
+            input: self.input,
+            owner: self.owner,
+            source_owner,
+            source,
+            payload_projection,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len.saturating_sub(self.next);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for KernelSemanticResourceOriginIter<'_> {}
+
+impl<'a> KernelSemanticResourceOriginRef<'a> {
+    pub fn source(self) -> CheckedSourceId {
+        let range = self
+            .input
+            .construction
+            .source_ranges
+            .get(self.source_owner.0 as usize)
+            .copied()
+            .expect("sealed kernel semantic resource origin owner exists");
+        CheckedSourceId(
+            range
+                .resolve(self.source.0, "semantic source")
+                .expect("sealed kernel semantic resource origin relocates"),
+        )
+    }
+
+    pub fn payload_projection(self) -> impl ExactSizeIterator<Item = &'a str> {
+        let input = self.input;
+        self.payload_projection.iter().map(move |symbol| {
+            input
+                .construction
+                .definition_code
+                .symbol(*symbol)
+                .expect("sealed kernel semantic symbol belongs to its text authority")
+        })
+    }
+
+    pub const fn requirement_owner(self) -> KernelOwnerId {
+        self.owner
+    }
+}
+
 struct KernelCheckedBaseRows {
     scopes: Box<[CheckedScope]>,
     declarations: Vec<CheckedDeclaration>,
@@ -490,7 +1016,7 @@ fn checked_image_publication_v1(
     call_occurrences: &[StableOccurrenceKey],
     call_result_paths: &[CheckedCallResultPath],
     pattern_bindings: &[CheckedPatternBinding],
-    resource_projection_requirements: &[CheckedResourceProjectionRequirement],
+    resource_projection_requirements: &[KernelSemanticResourceProjectionLocatorV1],
     sources: &[CheckedSource],
     states: &[CheckedState],
     lists: &[CheckedList],
@@ -1222,8 +1748,7 @@ impl KernelCheckedLinkLayout {
         let call_result_paths =
             self.materialize_call_result_paths(&declarations, &callables, &expressions, &calls)?;
         let pattern_bindings = self.materialize_pattern_bindings(snapshot)?;
-        let resource_projection_requirements =
-            self.materialize_resource_projection_requirements(snapshot, &expressions)?;
+        let semantic_resource_projections = self.semantic_resource_projection_locators(snapshot)?;
         #[cfg(test)]
         {
             let replay =
@@ -1257,11 +1782,18 @@ impl KernelCheckedLinkLayout {
             &call_occurrences,
             &call_result_paths,
             &pattern_bindings,
-            &resource_projection_requirements,
+            &semantic_resource_projections,
             &sources,
             &states,
             &lists,
             &occurrences,
+        )?;
+        let semantic_input = KernelSemanticInputConstructionV1::from_linked_rows(
+            source_bundle_digest_v1,
+            role,
+            snapshot,
+            self,
+            semantic_resource_projections,
         )?;
         Ok(KernelCheckedRows {
             scopes,
@@ -1274,7 +1806,7 @@ impl KernelCheckedLinkLayout {
             call_occurrences,
             call_result_paths,
             pattern_bindings,
-            resource_projection_requirements,
+            semantic_input,
             sources,
             states,
             lists,
@@ -1385,7 +1917,115 @@ impl KernelCheckedLinkLayout {
         Ok(CheckedRuntimeFlowTermProjectionV1::from_runtime_flow_digests(digests))
     }
 
-    fn materialize_resource_projection_requirements(
+    fn semantic_resource_projection_locators(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<Box<[KernelSemanticResourceProjectionLocatorV1]>, KernelCheckedLinkError> {
+        self.validate_snapshot_definition_count(snapshot, "semantic resource projection")?;
+        let mut requirements = Vec::new();
+        for owner_index in 0..snapshot.definitions.len() {
+            let owner = checked_owner_id(owner_index, "semantic resource projection")?;
+            let code = snapshot.definition_code.definition(owner).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel semantic resource projection has no definition code for owner {}",
+                    owner.0,
+                ))
+            })?;
+            for ordinal in 0..code.resource_projection_requirement_count() {
+                let requirement = code
+                    .resource_projection_requirements()
+                    .get(ordinal)
+                    .copied()
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel semantic resource projection {}:{} disappeared",
+                            owner.0, ordinal,
+                        ))
+                    })?;
+                for symbol in code
+                    .resource_projection_path_symbols(ordinal)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel semantic resource projection {}:{} has an invalid path",
+                            owner.0, ordinal,
+                        ))
+                    })?
+                {
+                    snapshot.definition_code.symbol(*symbol).ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel semantic resource projection {}:{} has a foreign symbol",
+                            owner.0, ordinal,
+                        ))
+                    })?;
+                }
+                let origin_count =
+                    code.resource_projection_origin_count(ordinal)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel semantic resource projection {}:{} has no origin span",
+                                owner.0, ordinal,
+                            ))
+                        })?;
+                if origin_count > 0
+                    && !code
+                        .resource_projection_required_is_published(ordinal)
+                        .unwrap_or(false)
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel semantic resource projection {}:{} does not publish its required type",
+                        owner.0, ordinal,
+                    )));
+                }
+                for origin_ordinal in 0..origin_count {
+                    let (source_owner, source, payload_projection) = code
+                        .resource_projection_origin(ordinal, origin_ordinal)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel semantic resource projection {}:{} has an invalid origin {}",
+                                owner.0, ordinal, origin_ordinal,
+                            ))
+                        })?;
+                    self.source(source_owner, source.0)?;
+                    for symbol in payload_projection {
+                        snapshot.definition_code.symbol(*symbol).ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel semantic resource origin {}:{}:{} has a foreign symbol",
+                                owner.0, ordinal, origin_ordinal,
+                            ))
+                        })?;
+                    }
+                }
+                requirements.push(KernelSemanticResourceProjectionLocatorV1 {
+                    owner,
+                    ordinal: u32::try_from(ordinal).map_err(|_| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel semantic resource projection count for owner {} exceeds u32",
+                            owner.0,
+                        ))
+                    })?,
+                    expression: self
+                        .expression(owner, KernelValueReference::Local(requirement.expression()))?,
+                    target: self.declaration(owner, requirement.target())?,
+                });
+            }
+        }
+        requirements.sort_unstable_by_key(|requirement| requirement.expression.0);
+        if requirements
+            .windows(2)
+            .any(|pair| pair[0].expression == pair[1].expression)
+        {
+            return Err(KernelCheckedLinkError::new(
+                "kernel semantic resource projections repeat an expression",
+            ));
+        }
+        Ok(requirements.into_boxed_slice())
+    }
+
+    /// Explicit rich projection retained for checked-model differential tests
+    /// and editor/export requests. Ordinary verified compilation must consume
+    /// `KernelSemanticInputV1` instead.
+    #[doc(hidden)]
+    pub fn materialize_rich_resource_projection_requirements(
         &self,
         snapshot: &KernelCheckedSnapshot,
         expressions: &[CheckedExpression],
@@ -6980,7 +7620,7 @@ mod tests {
         assert!(rows.call_occurrences.is_empty());
         assert!(rows.call_result_paths.is_empty());
         assert!(rows.pattern_bindings.is_empty());
-        assert!(rows.resource_projection_requirements.is_empty());
+        assert_eq!(rows.semantic_input.resource_projection_count(), 0);
         assert_eq!(rows.occurrences.len(), 3);
         assert_eq!(
             rows.occurrences

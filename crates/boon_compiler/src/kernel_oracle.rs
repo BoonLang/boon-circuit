@@ -1281,6 +1281,12 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                             elapsed_us(checked_link_started.elapsed()),
                         );
                     }
+                    let materialized_resource_projection_requirements = layout
+                        .materialize_rich_resource_projection_requirements(
+                            &checked,
+                            &rows.expressions,
+                        )
+                        .map_err(|error| error.to_string())?;
                     let materialized_scopes = rows.scopes;
                     let materialized_declarations = rows.declarations;
                     let materialized_expressions = rows.expressions;
@@ -1291,8 +1297,6 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     let materialized_call_occurrences = rows.call_occurrences;
                     let materialized_call_result_paths = rows.call_result_paths;
                     let materialized_pattern_bindings = rows.pattern_bindings;
-                    let materialized_resource_projection_requirements =
-                        rows.resource_projection_requirements;
                     let materialized_sources = rows.sources;
                     let materialized_states = rows.states;
                     let materialized_lists = rows.lists;
@@ -2370,6 +2374,7 @@ pub(crate) fn compiler_diagnostics_from_kernel(
 #[derive(Debug)]
 pub(crate) struct KernelCheckedConstruction {
     pub fields: CheckedProgramFields,
+    pub semantic_input: boon_compiler_kernel::KernelSemanticInputConstructionV1,
     pub call_occurrences: Box<[StableOccurrenceKey]>,
     pub checked_image_authority: CheckedImageKernelAuthorityV1,
     pub checked_image_publication: CheckedImageKernelPublicationV1,
@@ -2377,6 +2382,12 @@ pub(crate) struct KernelCheckedConstruction {
     pub compile_work: KernelCompileWork,
     pub solve_work: KernelSolveWork,
     pub owner_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelCheckedProjectionDemand {
+    RuntimePacked,
+    EditorRich,
 }
 
 const KERNEL_CHECKED_DEFINITION_KEY_SEAL_DOMAIN_V1: &[u8] =
@@ -2501,9 +2512,10 @@ fn append_kernel_checked_metadata_publication(
 /// constraint, interface, body, shard, or compatibility-assembly request.
 /// Parser-issued identities are used only for source relocation and the
 /// deterministic checked metadata post-pass.
-pub(crate) fn checked_construction_from_kernel(
+fn checked_construction_from_kernel(
     project: &ProjectSyntaxSnapshot,
     role: boon_checked::ProgramRole,
+    projection_demand: KernelCheckedProjectionDemand,
 ) -> Result<KernelCheckedConstruction, String> {
     let trace = std::env::var_os("BOON_KERNEL_TRACE").is_some();
     let total_started = Instant::now();
@@ -2675,7 +2687,16 @@ pub(crate) fn checked_construction_from_kernel(
     let seals_and_rebase_us = elapsed_us(phase_started.elapsed());
 
     let phase_started = Instant::now();
+    let resource_projection_requirements = match projection_demand {
+        KernelCheckedProjectionDemand::RuntimePacked => Box::new([]),
+        KernelCheckedProjectionDemand::EditorRich => layout
+            .materialize_rich_resource_projection_requirements(&snapshot, &rows.expressions)
+            .map_err(|error| {
+                format!("cannot project dense kernel editor resource rows: {error}")
+            })?,
+    };
     let call_occurrences = rows.call_occurrences;
+    let semantic_input = rows.semantic_input;
     let mut checked_image_publication = rows.checked_image_publication;
     let mut fields = CheckedProgramFields {
         source_bundle_digest_v1: project.source_bundle_digest_v1(),
@@ -2693,7 +2714,7 @@ pub(crate) fn checked_construction_from_kernel(
         call_result_paths: rows.call_result_paths.into_vec(),
         order_chains: Vec::new(),
         pattern_bindings: rows.pattern_bindings.into_vec(),
-        resource_projection_requirements: rows.resource_projection_requirements.into_vec(),
+        resource_projection_requirements: resource_projection_requirements.into_vec(),
         sources: rows.sources.into_vec(),
         states: rows.states.into_vec(),
         lists: rows.lists.into_vec(),
@@ -2747,6 +2768,7 @@ pub(crate) fn checked_construction_from_kernel(
     }
     Ok(KernelCheckedConstruction {
         fields,
+        semantic_input,
         call_occurrences,
         checked_image_authority,
         checked_image_publication,
@@ -2764,7 +2786,36 @@ pub(crate) fn compiler_checked_from_kernel(
     role: boon_checked::ProgramRole,
 ) -> Result<crate::CheckedSourceFromSource, String> {
     let started = Instant::now();
-    let checked = checked_construction_from_kernel(&project, role)?;
+    let checked = checked_construction_from_kernel(
+        &project,
+        role,
+        KernelCheckedProjectionDemand::RuntimePacked,
+    )?;
+    checked_source_from_kernel_construction(project, parse_work, parse_ms, started, checked)
+}
+
+pub(crate) fn compiler_editor_checked_from_kernel(
+    project: ProjectSyntaxSnapshot,
+    parse_work: boon_parser::ParseWorkCounters,
+    parse_ms: f64,
+    role: boon_checked::ProgramRole,
+) -> Result<crate::CheckedSourceFromSource, String> {
+    let started = Instant::now();
+    let checked = checked_construction_from_kernel(
+        &project,
+        role,
+        KernelCheckedProjectionDemand::EditorRich,
+    )?;
+    checked_source_from_kernel_construction(project, parse_work, parse_ms, started, checked)
+}
+
+fn checked_source_from_kernel_construction(
+    project: ProjectSyntaxSnapshot,
+    parse_work: boon_parser::ParseWorkCounters,
+    parse_ms: f64,
+    started: Instant,
+    checked: KernelCheckedConstruction,
+) -> Result<crate::CheckedSourceFromSource, String> {
     let owner_work = crate::CompilerOwnerWork {
         statements: u64::try_from(checked.fields.statements.len()).unwrap_or(u64::MAX),
         expressions: u64::try_from(checked.fields.expressions.len()).unwrap_or(u64::MAX),
@@ -2783,6 +2834,7 @@ pub(crate) fn compiler_checked_from_kernel(
     Ok(crate::checked_source_from_checked_fields(
         project,
         checked.fields,
+        checked.semantic_input,
         &checked.diagnostics,
         parse_work,
         parse_ms,
@@ -19685,8 +19737,12 @@ FUNCTION address(row) {{
         let project =
             parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
                 .expect("parse dense checked-construction fixture");
-        let checked = checked_construction_from_kernel(&project, boon_checked::ProgramRole::Server)
-            .expect("dense kernel builds complete checked rows");
+        let checked = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("dense kernel builds complete checked rows");
         assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
         assert!(checked.owner_count > 0);
         assert!(checked.compile_work.linked_operations > 0);
@@ -19774,8 +19830,12 @@ FUNCTION address(row) {{
         let project =
             parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
                 .expect("parse checked-image resource fixture");
-        let checked = checked_construction_from_kernel(&project, boon_checked::ProgramRole::Server)
-            .expect("dense kernel builds resource checked rows");
+        let checked = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("dense kernel builds resource checked rows");
         assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
         let replay_fields = checked.fields.clone();
         // SAFETY: both constructions are cloned from the same completed dense
@@ -19811,6 +19871,112 @@ FUNCTION address(row) {{
     }
 
     #[test]
+    fn packed_resource_semantics_match_rich_replay_and_require_the_packed_authority() {
+        let source = concat!(
+            "store: [\n",
+            "    count: 0 |> HOLD count {\n",
+            "        increment |> THEN { count + 1 }\n",
+            "    }\n",
+            "]\n\n",
+            "increment: SOURCE\n",
+            "value: store.count\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse packed semantic resource fixture");
+        let checked = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("build editor-rich packed semantic fixture");
+        assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+        assert!(
+            !checked.fields.resource_projection_requirements.is_empty(),
+            "fixture must exercise an actual resource projection",
+        );
+        let replay_fields = checked.fields.clone();
+        // SAFETY: both values come from the same completed dense construction;
+        // this test deliberately compares the packed and rich semantic routes.
+        let direct_construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                checked.fields,
+            )
+        };
+        let replay_construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                replay_fields,
+            )
+        };
+        let direct =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication(
+                &project,
+                direct_construction,
+                &checked.call_occurrences,
+                &checked.checked_image_authority,
+                checked.checked_image_publication,
+            )
+            .expect("seal packed semantic checked image");
+        let replay =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_authority(
+                &project,
+                replay_construction,
+                &checked.call_occurrences,
+                &checked.checked_image_authority,
+            )
+            .expect("seal rich semantic checked replay");
+        let packed_input = checked
+            .semantic_input
+            .seal(&direct)
+            .expect("bind packed semantic authority to checked image");
+        let packed = boon_semantic::elaborate_kernel(direct, packed_input, &[])
+            .expect("packed resource semantics elaborate");
+        let rich = boon_semantic::elaborate(replay, &[])
+            .expect("rich resource replay semantics elaborate");
+        assert_eq!(packed.digest(), rich.digest());
+        let packed_ir = boon_ir::erase_and_lower(
+            boon_verify::verify_explicit_contracts(packed)
+                .expect("packed semantic contracts verify"),
+        )
+        .expect("packed semantics lower to IR");
+        let rich_ir = boon_ir::erase_and_lower(
+            boon_verify::verify_explicit_contracts(rich).expect("rich semantic contracts verify"),
+        )
+        .expect("rich semantics lower to IR");
+        assert_eq!(packed_ir, rich_ir);
+
+        let compact = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::RuntimePacked,
+        )
+        .expect("build runtime-packed semantic fixture");
+        assert!(compact.fields.resource_projection_requirements.is_empty());
+        // SAFETY: this is the completed dense runtime construction. The test
+        // intentionally withholds its packed semantic token afterward.
+        let compact_construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                compact.fields,
+            )
+        };
+        let compact_program =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication(
+                &project,
+                compact_construction,
+                &compact.call_occurrences,
+                &compact.checked_image_authority,
+                compact.checked_image_publication,
+            )
+            .expect("seal runtime-packed checked image");
+        let error = boon_semantic::elaborate(compact_program, &[])
+            .expect_err("compact resource rows without packed authority must fail closed");
+        assert!(
+            error.to_string().contains("rich semantic input contains 0"),
+            "unexpected missing packed-authority error: {error}",
+        );
+    }
+
+    #[test]
     fn todomvc_checked_publication_matches_replay_and_verifies() {
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/todo_mvc_physical/RUN.bn");
@@ -19821,8 +19987,12 @@ FUNCTION address(row) {{
             units.into_iter().map(|unit| (unit.path, unit.source)),
         )
         .expect("parse TodoMVC unit-native project");
-        let checked = checked_construction_from_kernel(&project, boon_checked::ProgramRole::Client)
-            .expect("dense kernel builds TodoMVC checked rows");
+        let checked = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Client,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("dense kernel builds TodoMVC checked rows");
         assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
         let passed_scope_mismatches = passed_scope_ownership_mismatches(&checked.fields);
         assert!(
@@ -19908,8 +20078,12 @@ FUNCTION address(row) {{
         let project =
             parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
                 .expect("parse kernel SOURCE fixture");
-        let kernel = checked_construction_from_kernel(&project, boon_checked::ProgramRole::Server)
-            .expect("kernel SOURCE checks");
+        let kernel = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("kernel SOURCE checks");
         let [legacy_source] = legacy.sources.as_slice() else {
             panic!("legacy fixture must expose one SOURCE")
         };
@@ -19958,8 +20132,12 @@ FUNCTION address(row) {{
         let project =
             parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
                 .expect("parse kernel function SOURCE");
-        let kernel = checked_construction_from_kernel(&project, boon_checked::ProgramRole::Server)
-            .expect("kernel function SOURCE");
+        let kernel = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("kernel function SOURCE");
         for fields in [&legacy, &kernel.fields] {
             let [source] = fields.sources.as_slice() else {
                 panic!("function fixture must expose one nested SOURCE")
@@ -20034,8 +20212,12 @@ FUNCTION address(row) {{
         let project =
             parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
                 .expect("parse kernel stateful call");
-        let kernel = checked_construction_from_kernel(&project, boon_checked::ProgramRole::Server)
-            .expect("kernel stateful call");
+        let kernel = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("kernel stateful call");
         let summarize = |fields: &CheckedProgramFields| {
             fields
                 .states
@@ -20252,10 +20434,18 @@ FUNCTION address(row) {{
             );
         }
         if std::env::var_os("BOON_KERNEL_PRODUCTION_CHECKED").is_some() {
+            let replay_parity = std::env::var_os("BOON_KERNEL_CHECKED_REPLAY_PARITY").is_some();
             let checked_started = Instant::now();
-            let checked =
-                checked_construction_from_kernel(&project, boon_checked::ProgramRole::Client)
-                    .expect("compile NovyWave complete checked construction through KernelSession");
+            let checked = checked_construction_from_kernel(
+                &project,
+                boon_checked::ProgramRole::Client,
+                if replay_parity {
+                    KernelCheckedProjectionDemand::EditorRich
+                } else {
+                    KernelCheckedProjectionDemand::RuntimePacked
+                },
+            )
+            .expect("compile NovyWave complete checked construction through KernelSession");
             let construction_us = elapsed_us(checked_started.elapsed());
             assert!(
                 checked.diagnostics.is_empty(),
@@ -20265,8 +20455,7 @@ FUNCTION address(row) {{
             let expression_rows = checked.fields.expressions.len();
             let call_rows = checked.fields.calls.len();
             let definition_rows = checked.fields.declarations.len();
-            let replay_fields = std::env::var_os("BOON_KERNEL_CHECKED_REPLAY_PARITY")
-                .map(|_| checked.fields.clone());
+            let replay_fields = replay_parity.then(|| checked.fields.clone());
             let seal_started = Instant::now();
             // SAFETY: the dense construction helper validates the complete
             // linked graph and lowering metadata before returning.

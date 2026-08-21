@@ -57,6 +57,7 @@ struct SemanticLowerProfile {
 
 fn verify_and_lower_checked_profiled(
     checked: boon_checked::CheckedProgram,
+    kernel_semantic_input: boon_compiler_kernel::KernelSemanticInputV1,
     producer_requests: &[boon_semantic::ProducerMaterializationRequest],
     cancellation: &mut CancellationProbe<'_>,
 ) -> Result<
@@ -69,7 +70,9 @@ fn verify_and_lower_checked_profiled(
 > {
     cancellation.checkpoint()?;
     let semantic_started = Instant::now();
-    let semantic = elaborate_checked(checked, producer_requests)?;
+    let semantic =
+        boon_semantic::elaborate_kernel(checked, kernel_semantic_input, producer_requests)
+            .map_err(|error| error.to_string())?;
     let semantic_ms = elapsed_ms(semantic_started);
     cancellation.checkpoint()?;
     let contract_verify_started = Instant::now();
@@ -120,13 +123,6 @@ impl<'a> CancellationProbe<'a> {
             Ok(())
         }
     }
-}
-
-fn elaborate_checked(
-    checked: boon_checked::CheckedProgram,
-    producer_requests: &[boon_semantic::ProducerMaterializationRequest],
-) -> Result<boon_semantic::SemanticProgram, String> {
-    elaborate_checked_with_external_event_identities(checked, producer_requests, &[])
 }
 
 fn elaborate_checked_with_external_event_identities(
@@ -303,6 +299,10 @@ pub struct CheckedSourceFromSource {
     /// Compact projection topology emitted beside the dense kernel rows.
     /// Verified sealing consumes it by value instead of replaying rich rows.
     checked_image_kernel_publication: Option<Box<boon_checked::CheckedImageKernelPublicationV1>>,
+    /// Move-only packed definition authority for the ordinary kernel semantic
+    /// route. It is sealed to the checked image immediately before semantic
+    /// elaboration and never enters the serializable checked DTO.
+    kernel_semantic_input: boon_compiler_kernel::KernelSemanticInputConstructionV1,
 }
 
 /// Produces structured parser/type diagnostics for a failed runtime compile.
@@ -837,7 +837,7 @@ fn compile_checked_artifact_oracle_plan(
 }
 
 pub fn check_source(request: CompilerCheckRequest<'_>) -> CompilerResult<CheckedSourceFromSource> {
-    check_kernel_source(request)
+    check_editor_kernel_source(request)
 }
 
 /// Checks one compiler-service revision while retaining editor projections and
@@ -847,7 +847,7 @@ pub fn check_source(request: CompilerCheckRequest<'_>) -> CompilerResult<Checked
 pub fn check_editor_source(
     request: CompilerCheckRequest<'_>,
 ) -> CompilerResult<CheckedSourceFromSource> {
-    check_kernel_source(request)
+    check_editor_kernel_source(request)
 }
 
 /// Compiler-service diagnostics path. It returns the complete checked
@@ -856,7 +856,7 @@ pub fn check_editor_source(
 pub fn check_diagnostics_source(
     request: CompilerCheckRequest<'_>,
 ) -> CompilerResult<CheckedSourceFromSource> {
-    check_kernel_source(request)
+    check_editor_kernel_source(request)
 }
 
 /// Produces the complete diagnostics product directly, without constructing
@@ -902,9 +902,25 @@ fn check_kernel_source(
         .map_err(|error| PlanError::new(error).into())
 }
 
+fn check_editor_kernel_source(
+    request: CompilerCheckRequest<'_>,
+) -> CompilerResult<CheckedSourceFromSource> {
+    let parse_started = Instant::now();
+    let (project, parse_work) = parse_kernel_compile_source(request.source)?;
+    let parse_ms = elapsed_ms(parse_started);
+    kernel_oracle::compiler_editor_checked_from_kernel(
+        project,
+        parse_work,
+        parse_ms,
+        request.program_role,
+    )
+    .map_err(|error| PlanError::new(error).into())
+}
+
 pub(crate) fn checked_source_from_checked_fields(
     syntax: ProjectSyntaxSnapshot,
     fields: boon_checked::CheckedProgramFields,
+    kernel_semantic_input: boon_compiler_kernel::KernelSemanticInputConstructionV1,
     diagnostics: &[boon_checked::TypeDiagnostic],
     parse_work: ParseWorkCounters,
     parse_ms: f64,
@@ -1048,6 +1064,7 @@ pub(crate) fn checked_source_from_checked_fields(
         checked_call_occurrences,
         checked_image_kernel_authority,
         checked_image_kernel_publication,
+        kernel_semantic_input,
     }
 }
 
@@ -1131,6 +1148,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         checked_call_occurrences,
         checked_image_kernel_authority,
         checked_image_kernel_publication,
+        kernel_semantic_input,
     } = checked_source;
     let deferred_runtime_handoff = output.construction.is_some();
     let runtime_handoff_started = Instant::now();
@@ -1145,6 +1163,9 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         checked_image_kernel_authority,
         checked_image_kernel_publication,
     )?;
+    let kernel_semantic_input = kernel_semantic_input
+        .seal(&checked)
+        .map_err(|error| PlanError::new(error.to_string()))?;
     if deferred_runtime_handoff {
         let runtime_handoff_ms = elapsed_ms(runtime_handoff_started);
         profile.typecheck_ms += runtime_handoff_ms;
@@ -1162,6 +1183,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
     }
     finish_checked_program_to_machine_plan(
         checked,
+        kernel_semantic_input,
         profile.source_unit_count,
         profile.expression_count,
         profile.parse_work,
@@ -1184,6 +1206,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
 #[allow(clippy::too_many_arguments)]
 fn finish_checked_program_to_machine_plan(
     checked: boon_checked::CheckedProgram,
+    kernel_semantic_input: boon_compiler_kernel::KernelSemanticInputV1,
     source_unit_count: usize,
     parsed_expression_count: usize,
     parse_work: ParseWorkCounters,
@@ -1217,7 +1240,7 @@ fn finish_checked_program_to_machine_plan(
     }
     let lower_started = Instant::now();
     let (ir, request_graph, semantic_profile) =
-        verify_and_lower_checked_profiled(checked, &[], &mut cancellation)?;
+        verify_and_lower_checked_profiled(checked, kernel_semantic_input, &[], &mut cancellation)?;
     let lower_ms = elapsed_ms(lower_started);
     cancellation.checkpoint().map_err(PlanError::new)?;
     let verify_started = Instant::now();

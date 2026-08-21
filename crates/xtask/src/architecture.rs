@@ -231,7 +231,15 @@ fn normative_single_thread_compiler(workspace: &Path) -> Result<String, String> 
                 .to_owned(),
         );
     }
-    for (label, source) in [("owner", &owner), ("receipt", &receipt), ("link", &link)] {
+    if owner.matches(experiment).count() != 0
+        || owner.matches("available_parallelism()").count() != 0
+    {
+        return Err(
+            "kernel owner projection must remain single-threaded after packed definition-code construction removed its parallel materializer"
+                .to_owned(),
+        );
+    }
+    for (label, source) in [("receipt", &receipt), ("link", &link)] {
         if source.matches(experiment).count() != 1 {
             return Err(format!(
                 "kernel {label} projection must have exactly one explicit experimental parallel guard"
@@ -265,7 +273,7 @@ fn normative_single_thread_compiler(workspace: &Path) -> Result<String, String> 
     }
 
     Ok(
-        "normative compiler observations are single-threaded; three bounded two-worker projections remain explicit experiments only"
+        "normative compiler observations are single-threaded; two bounded two-worker projections remain explicit experiments only"
             .to_owned(),
     )
 }

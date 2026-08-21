@@ -3124,7 +3124,7 @@ mod tests {
     }
 
     fn retained_definition_build(program: &CheckedProgramFields) -> OutNetBuild {
-        let retained = crate::contextual_expansion::ordinary_callable_declarations(program);
+        let retained = crate::contextual_expansion::ordinary_callable_declarations(program, None);
         OutNet::build_with_retained_definitions(
             program,
             Vec::new(),
@@ -3194,7 +3194,7 @@ result: outer(value: TEXT { hello })
 "#,
         );
         let retained_definitions =
-            crate::contextual_expansion::ordinary_callable_declarations(&program);
+            crate::contextual_expansion::ordinary_callable_declarations(&program, None);
         for name in ["identity", "label", "outer"] {
             let callable = program
                 .callables
@@ -3267,7 +3267,7 @@ result: rows |> mapped(row, new: row.value + 1)
 "#,
         );
         let retained_out =
-            crate::contextual_expansion::ordinary_callable_declarations(&out_program);
+            crate::contextual_expansion::ordinary_callable_declarations(&out_program, None);
         let mapped = out_program
             .callables
             .iter()
@@ -3291,7 +3291,7 @@ result: controls()
 "#,
         );
         let retained_resource =
-            crate::contextual_expansion::ordinary_callable_declarations(&resource_program);
+            crate::contextual_expansion::ordinary_callable_declarations(&resource_program, None);
         let controls = resource_program
             .callables
             .iter()

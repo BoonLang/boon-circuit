@@ -297,11 +297,11 @@ struct CheckedProgramLookup {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum CheckedSourceContainmentNode {
-    Declaration(DeclId, Vec<String>),
-    Expression(CheckedExprId, Vec<String>),
-    ListItem(CheckedExprId, Vec<String>),
-    Output(DeclId, Vec<String>),
+enum CheckedSourceContainmentNode<'a> {
+    Declaration(DeclId, Vec<&'a str>),
+    Expression(CheckedExprId, Vec<&'a str>),
+    ListItem(CheckedExprId, Vec<&'a str>),
+    Output(DeclId, Vec<&'a str>),
 }
 
 /// Definition-local SOURCE containment is distinct from exact payload
@@ -387,23 +387,23 @@ impl CheckedSourceContainmentIndex {
         }
     }
 
-    fn projection_contains_source(
+    fn projection_contains_source<'a>(
         &self,
-        program: &CheckedProgramFields,
+        program: &'a CheckedProgramFields,
         lookup: &CheckedProgramLookup,
         target: DeclId,
-        projection: &[String],
+        projection: &[&'a str],
     ) -> bool {
         self.declaration_contains_source(program, lookup, target, projection, &mut BTreeSet::new())
     }
 
-    fn declaration_contains_source(
+    fn declaration_contains_source<'a>(
         &self,
-        program: &CheckedProgramFields,
+        program: &'a CheckedProgramFields,
         lookup: &CheckedProgramLookup,
         target: DeclId,
-        projection: &[String],
-        active: &mut BTreeSet<CheckedSourceContainmentNode>,
+        projection: &[&'a str],
+        active: &mut BTreeSet<CheckedSourceContainmentNode<'a>>,
     ) -> bool {
         let node = CheckedSourceContainmentNode::Declaration(target, projection.to_vec());
         if !active.insert(node.clone()) {
@@ -411,7 +411,14 @@ impl CheckedSourceContainmentIndex {
         }
         let direct = program.sources.iter().any(|source| {
             source.path.anchor == target
-                && projection.starts_with(source.path.projection.as_slice())
+                && source.path.projection.len() <= projection.len()
+                && source
+                    .path
+                    .projection
+                    .iter()
+                    .map(String::as_str)
+                    .zip(projection.iter().copied())
+                    .all(|(source, candidate)| source == candidate)
         });
         let result = direct
             || lookup
@@ -451,13 +458,13 @@ impl CheckedSourceContainmentIndex {
         result
     }
 
-    fn expression_contains_source(
+    fn expression_contains_source<'a>(
         &self,
-        program: &CheckedProgramFields,
+        program: &'a CheckedProgramFields,
         lookup: &CheckedProgramLookup,
         expression_id: CheckedExprId,
-        projection: &[String],
-        active: &mut BTreeSet<CheckedSourceContainmentNode>,
+        projection: &[&'a str],
+        active: &mut BTreeSet<CheckedSourceContainmentNode<'a>>,
     ) -> bool {
         let node = CheckedSourceContainmentNode::Expression(expression_id, projection.to_vec());
         if !active.insert(node.clone()) {
@@ -496,7 +503,10 @@ impl CheckedSourceContainmentIndex {
                 target,
                 projection: read_projection,
             } => {
-                let mut combined = read_projection.clone();
+                let mut combined = read_projection
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
                 combined.extend_from_slice(projection);
                 self.declaration_contains_source(program, lookup, *target, &combined, active)
             }
@@ -616,13 +626,13 @@ impl CheckedSourceContainmentIndex {
         result
     }
 
-    fn list_item_contains_source(
+    fn list_item_contains_source<'a>(
         &self,
-        program: &CheckedProgramFields,
+        program: &'a CheckedProgramFields,
         lookup: &CheckedProgramLookup,
         expression_id: CheckedExprId,
-        projection: &[String],
-        active: &mut BTreeSet<CheckedSourceContainmentNode>,
+        projection: &[&'a str],
+        active: &mut BTreeSet<CheckedSourceContainmentNode<'a>>,
     ) -> bool {
         let node = CheckedSourceContainmentNode::ListItem(expression_id, projection.to_vec());
         if !active.insert(node.clone()) {
@@ -751,13 +761,13 @@ impl CheckedSourceContainmentIndex {
         result
     }
 
-    fn output_contains_source(
+    fn output_contains_source<'a>(
         &self,
-        program: &CheckedProgramFields,
+        program: &'a CheckedProgramFields,
         lookup: &CheckedProgramLookup,
         target: DeclId,
-        projection: &[String],
-        active: &mut BTreeSet<CheckedSourceContainmentNode>,
+        projection: &[&'a str],
+        active: &mut BTreeSet<CheckedSourceContainmentNode<'a>>,
     ) -> bool {
         let node = CheckedSourceContainmentNode::Output(target, projection.to_vec());
         if !active.insert(node.clone()) {
@@ -914,8 +924,7 @@ impl CheckedProgramLookup {
                 *slot = true;
             }
         }
-        let mut source_bearing_resource_projections = vec![false; program.expressions.len()];
-        let mut lookup = Self {
+        Self {
             expressions_by_id,
             declarations_by_id,
             statements_by_id,
@@ -931,27 +940,56 @@ impl CheckedProgramLookup {
             source_declarations,
             state_declarations,
             function_owner_by_scope,
-            source_bearing_resource_projections: Vec::new(),
-        };
-        let containment = CheckedSourceContainmentIndex::new(program, &lookup);
+            source_bearing_resource_projections: vec![false; program.expressions.len()],
+        }
+    }
+
+    fn populate_source_bearing_resource_projections<'a>(
+        &mut self,
+        program: &'a CheckedProgramFields,
+        kernel_input: Option<&'a boon_compiler_kernel::KernelSemanticInputV1>,
+    ) {
+        self.source_bearing_resource_projections.fill(false);
+        let containment = CheckedSourceContainmentIndex::new(program, self);
+        // `source_origins` answers where a value was computed from. A durable
+        // HOLD/LATEST result can therefore have exact SOURCE origins without
+        // containing any transient SOURCE handle. Body retention needs this
+        // independently evaluated value-containment fact.
+        if let Some(kernel_input) = kernel_input {
+            for requirement in kernel_input.resource_projections() {
+                let projection = requirement.projection().collect::<Vec<_>>();
+                if containment.projection_contains_source(
+                    program,
+                    self,
+                    requirement.target(),
+                    &projection,
+                ) && let Some(slot) = self
+                    .source_bearing_resource_projections
+                    .get_mut(requirement.expression().0 as usize)
+                {
+                    *slot = true;
+                }
+            }
+            return;
+        }
         for requirement in &program.resource_projection_requirements {
-            // `source_origins` answers where a value was computed from. A
-            // durable HOLD/LATEST result can therefore have exact SOURCE
-            // origins without containing any transient SOURCE handle. Body
-            // retention needs the separate value-containment fact.
+            let projection = requirement
+                .projection
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
             if containment.projection_contains_source(
                 program,
-                &lookup,
+                self,
                 requirement.target,
-                &requirement.projection,
-            ) && let Some(slot) =
-                source_bearing_resource_projections.get_mut(requirement.expression.0 as usize)
+                &projection,
+            ) && let Some(slot) = self
+                .source_bearing_resource_projections
+                .get_mut(requirement.expression.0 as usize)
             {
                 *slot = true;
             }
         }
-        lookup.source_bearing_resource_projections = source_bearing_resource_projections;
-        lookup
     }
 
     fn expression<'a>(
@@ -6046,10 +6084,14 @@ fn ordinary_callable_body_dependencies(
     Some(dependencies)
 }
 
-pub(crate) fn ordinary_callable_declarations(program: &CheckedProgramFields) -> BTreeSet<DeclId> {
+pub(crate) fn ordinary_callable_declarations(
+    program: &CheckedProgramFields,
+    kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
+) -> BTreeSet<DeclId> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     let started = trace.then(std::time::Instant::now);
-    let lookup = CheckedProgramLookup::new(program);
+    let mut lookup = CheckedProgramLookup::new(program);
+    lookup.populate_source_bearing_resource_projections(program, kernel_input);
     let base_candidates = program
         .callables
         .iter()
@@ -9248,7 +9290,7 @@ mod tests {
             .expect("valid fixture has exact contextual bindings");
         let producer_roots =
             crate::resolve_producer_roots(&program, &[]).expect("fixture has no producer errors");
-        let retained = ordinary_callable_declarations(&program);
+        let retained = ordinary_callable_declarations(&program, None);
         let out = crate::out_net::OutNet::<crate::OutPortContractV1>::
             try_build_with_retained_definitions(
                 &program,
@@ -9260,7 +9302,7 @@ mod tests {
             .expect("valid fixture has an OUT graph");
         assert!(!out.has_errors(), "OUT diagnostics: {:#?}", out.diagnostics);
         let mut out = out.graph;
-        crate::resolve_out_contracts(&program, &mut out)
+        crate::resolve_out_contracts(&program, &mut out, None)
             .expect("valid fixture resolves OUT contracts");
         crate::validate_out_contracts(&program, &out)
             .expect("valid fixture validates OUT contracts");

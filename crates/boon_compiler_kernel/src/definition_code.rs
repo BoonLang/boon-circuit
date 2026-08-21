@@ -118,6 +118,10 @@ impl DefinitionCodeStore {
             })
     }
 
+    pub(crate) fn symbol(&self, symbol: SymbolId) -> Option<&str> {
+        self.types.as_arena().text_snapshot().symbol(symbol)
+    }
+
     pub(crate) fn materialization_cache(&self) -> DefinitionTypeMaterializationCache {
         DefinitionTypeMaterializationCache {
             // Most compatibility projections already own the exact rich type
@@ -494,6 +498,47 @@ impl<'a> DefinitionCodeRef<'a> {
             .origins
             .get(&self.store.resource_projection_origins)
             .expect("sealed definition-code resource-projection origin span is valid")
+    }
+
+    pub(crate) fn resource_projection_path_symbols(self, ordinal: usize) -> Option<&'a [SymbolId]> {
+        let requirement = self.resource_projection_requirements().get(ordinal)?;
+        requirement
+            .projection
+            .get(&self.store.resource_projection_symbols)
+    }
+
+    pub(crate) fn resource_projection_origin_count(self, ordinal: usize) -> Option<usize> {
+        let requirement = self.resource_projection_requirements().get(ordinal)?;
+        Some(self.resource_projection_origins(requirement).len())
+    }
+
+    pub(crate) fn resource_projection_origin(
+        self,
+        requirement_ordinal: usize,
+        origin_ordinal: usize,
+    ) -> Option<(KernelOwnerId, crate::KernelSourceId, &'a [SymbolId])> {
+        let requirement = self
+            .resource_projection_requirements()
+            .get(requirement_ordinal)?;
+        let origin = self
+            .resource_projection_origins(requirement)
+            .get(origin_ordinal)?;
+        Some((
+            origin.owner,
+            origin.source,
+            origin
+                .payload_projection
+                .get(&self.store.resource_projection_symbols)?,
+        ))
+    }
+
+    pub(crate) fn resource_projection_required_is_published(self, ordinal: usize) -> Option<bool> {
+        let requirement = self.resource_projection_requirements().get(ordinal)?;
+        Some(
+            self.published_expression(requirement.expression.0 as usize)?
+                .term
+                == requirement.required_term,
+        )
     }
 
     pub(crate) fn alpha_variables(self) -> &'a [TypeVariableId] {

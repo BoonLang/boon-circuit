@@ -33,8 +33,8 @@ pub use storage_contract::*;
 pub use view_contract::*;
 
 use boon_checked::{
-    CheckedExternalDeclarationIdentityV1, CheckedProgram, CheckedProgramFields, DeclId,
-    runtime_type_contains_var,
+    CheckedExternalDeclarationIdentityV1, CheckedImageRowDomainV2, CheckedProgram,
+    CheckedProgramFields, DeclId, runtime_type_contains_var,
 };
 use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
@@ -2702,6 +2702,28 @@ pub fn elaborate_with_external_event_identities(
         producer_materializations,
         external_event_identities,
         true,
+        None,
+    )
+}
+
+/// Consume the packed definition authority emitted by the dense checker.
+///
+/// This is the only ordinary verified route. The separate rich entrypoint is
+/// retained for distributed/legacy input and explicit differential oracles.
+/// Runtime requests carry no rich resource rows. Editor-to-verified promotion
+/// validates any explicitly requested rich rows against this packed authority,
+/// then releases them before constructing the semantic graph.
+pub fn elaborate_kernel(
+    checked_program: CheckedProgram,
+    kernel_input: boon_compiler_kernel::KernelSemanticInputV1,
+    producer_materializations: &[ProducerMaterializationRequest],
+) -> Result<SemanticProgram, SemanticError> {
+    elaborate_with_representation(
+        checked_program,
+        producer_materializations,
+        &[],
+        true,
+        Some(kernel_input),
     )
 }
 
@@ -2716,7 +2738,7 @@ pub fn elaborate_flat_test_oracle(
     checked_program: CheckedProgram,
     producer_materializations: &[ProducerMaterializationRequest],
 ) -> Result<SemanticProgram, SemanticError> {
-    elaborate_with_representation(checked_program, producer_materializations, &[], false)
+    elaborate_with_representation(checked_program, producer_materializations, &[], false, None)
 }
 
 fn elaborate_with_representation(
@@ -2724,6 +2746,7 @@ fn elaborate_with_representation(
     producer_materializations: &[ProducerMaterializationRequest],
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
     retain_ordinary_calls: bool,
+    kernel_input: Option<boon_compiler_kernel::KernelSemanticInputV1>,
 ) -> Result<SemanticProgram, SemanticError> {
     let trace_elaboration = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! elaboration_phase {
@@ -2743,8 +2766,45 @@ fn elaborate_with_representation(
         }};
     }
 
-    let (checked_program, checked_handoff, runtime_flow_terms) =
+    let (mut checked_program, checked_handoff, runtime_flow_terms) =
         checked_program.into_semantic_parts();
+    let resource_route_count = checked_handoff
+        .entity_routes
+        .iter()
+        .filter(|route| route.domain == CheckedImageRowDomainV2::ResourceProjection)
+        .count();
+    if let Some(kernel_input) = kernel_input.as_ref() {
+        if resource_route_count != kernel_input.resource_projection_count() {
+            return Err(SemanticError::new(format!(
+                "kernel semantic input has {} resource projections but checked image routes {resource_route_count}",
+                kernel_input.resource_projection_count(),
+            )));
+        }
+        kernel_input
+            .validate_checked_authority(
+                checked_program.source_bundle_digest_v1,
+                checked_program.role,
+                checked_handoff.local_image_digest,
+                checked_program.expressions.len(),
+                checked_program.declarations.len(),
+                checked_program.sources.len(),
+            )
+            .map_err(|error| SemanticError::new(error.to_string()))?;
+        kernel_input
+            .validate_rich_resource_projections(&checked_program)
+            .map_err(|error| SemanticError::new(error.to_string()))?;
+        // Editor requests explicitly materialize these compatibility DTOs.
+        // Verified promotion consumes the packed authority and releases the
+        // rich paths/origins before any semantic graph is constructed.
+        drop(std::mem::take(
+            &mut checked_program.resource_projection_requirements,
+        ));
+    } else if resource_route_count != checked_program.resource_projection_requirements.len() {
+        return Err(SemanticError::new(format!(
+            "checked image routes {resource_route_count} resource projections but rich semantic input contains {}",
+            checked_program.resource_projection_requirements.len(),
+        )));
+    }
     let source_bundle_digest_v1 = checked_program.source_bundle_digest_v1;
     let role = checked_program.role;
     if trace_elaboration {
@@ -2778,7 +2838,12 @@ fn elaborate_with_representation(
     )?;
     let verified_intent = elaboration_phase!("verified_semantic_intent", {
         let retained_definitions = retain_ordinary_calls
-            .then(|| contextual_expansion::ordinary_callable_declarations(&checked_program))
+            .then(|| {
+                contextual_expansion::ordinary_callable_declarations(
+                    &checked_program,
+                    kernel_input.as_ref(),
+                )
+            })
             .unwrap_or_default();
         verified_intent::VerifiedSemanticIntentV1::build(
             &checked_program,
@@ -2839,7 +2904,11 @@ fn elaborate_with_representation(
     }
     elaboration_phase!(
         "resolve_out_contracts",
-        resolve_out_contracts(&checked_program, &mut resolved_out_graph)
+        resolve_out_contracts(
+            &checked_program,
+            &mut resolved_out_graph,
+            kernel_input.as_ref(),
+        )
     )?;
     elaboration_phase!(
         "validate_out_contracts",
@@ -3271,6 +3340,7 @@ fn out_contract_resolution_order(graph: &ResolvedOutGraph) -> Result<Vec<usize>,
 fn resolve_out_contracts(
     program: &CheckedProgramFields,
     graph: &mut ResolvedOutGraph,
+    kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
 ) -> Result<(), SemanticError> {
     let resolution_order = out_contract_resolution_order(graph)?;
     for port_index in resolution_order {
@@ -3376,6 +3446,7 @@ fn resolve_out_contracts(
                     concrete_checked_expression_type(
                         program,
                         graph,
+                        kernel_input,
                         *scoped,
                         &input_substitutions,
                         &mut BTreeSet::new(),
@@ -3487,6 +3558,7 @@ fn resolve_out_contracts(
 fn concrete_checked_expression_type(
     program: &CheckedProgramFields,
     graph: &ResolvedOutGraph,
+    kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
     scoped: ScopedCheckedExpr,
     active_substitutions: &BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
     visiting: &mut BTreeSet<(boon_checked::CheckedExprId, Option<OutCallInstanceId>)>,
@@ -3728,6 +3800,7 @@ fn concrete_checked_expression_type(
                             concrete_checked_expression_type(
                                 program,
                                 graph,
+                                kernel_input,
                                 *input,
                                 &input_substitutions,
                                 visiting,
@@ -3792,6 +3865,7 @@ fn concrete_checked_expression_type(
                     return concrete_checked_expression_type(
                         program,
                         graph,
+                        kernel_input,
                         ScopedCheckedExpr {
                             expression: result_expression,
                             frame: Some(instance_id),
@@ -3818,6 +3892,7 @@ fn concrete_checked_expression_type(
             } => concrete_checked_expression_type(
                 program,
                 graph,
+                kernel_input,
                 ScopedCheckedExpr {
                     expression: *result,
                     frame: scoped.frame,
@@ -3835,6 +3910,7 @@ fn concrete_checked_expression_type(
                     let field_type = concrete_checked_expression_type(
                         program,
                         graph,
+                        kernel_input,
                         ScopedCheckedExpr {
                             expression: field.value,
                             frame: scoped.frame,
@@ -3882,6 +3958,7 @@ fn concrete_checked_expression_type(
                     let field_type = concrete_checked_expression_type(
                         program,
                         graph,
+                        kernel_input,
                         ScopedCheckedExpr {
                             expression: field.value,
                             frame: scoped.frame,
@@ -3933,6 +4010,7 @@ fn concrete_checked_expression_type(
                 concrete_checked_branch_expression_type(
                     program,
                     graph,
+                    kernel_input,
                     scoped,
                     arms,
                     active_substitutions,
@@ -3943,6 +4021,7 @@ fn concrete_checked_expression_type(
                 concrete_checked_branch_expression_type(
                     program,
                     graph,
+                    kernel_input,
                     scoped,
                     branches,
                     active_substitutions,
@@ -3975,6 +4054,7 @@ fn concrete_checked_expression_type(
                 let base = concrete_checked_expression_type(
                     program,
                     graph,
+                    kernel_input,
                     passed.value,
                     active_substitutions,
                     visiting,
@@ -3991,6 +4071,7 @@ fn concrete_checked_expression_type(
             } => {
                 if let Some(payload_type) = exact_checked_resource_projection_type(
                     program,
+                    kernel_input,
                     scoped.expression,
                     active_substitutions,
                 )? {
@@ -4153,6 +4234,7 @@ fn concrete_checked_expression_type(
                             concrete_checked_expression_type(
                                 program,
                                 graph,
+                                kernel_input,
                                 *actual,
                                 active_substitutions,
                                 visiting,
@@ -4298,6 +4380,7 @@ fn concrete_checked_expression_type(
 fn concrete_checked_branch_expression_type(
     program: &CheckedProgramFields,
     graph: &ResolvedOutGraph,
+    kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
     scoped: ScopedCheckedExpr,
     branches: &[boon_checked::CheckedExprId],
     active_substitutions: &BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
@@ -4361,6 +4444,7 @@ fn concrete_checked_branch_expression_type(
         let concrete = concrete_checked_expression_type(
             program,
             graph,
+            kernel_input,
             ScopedCheckedExpr {
                 expression: *branch,
                 frame: scoped.frame,
@@ -4414,25 +4498,102 @@ fn concrete_checked_branch_expression_type(
 
 fn exact_checked_resource_projection_type(
     program: &CheckedProgramFields,
+    kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
     expression: boon_checked::CheckedExprId,
     substitutions: &BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
 ) -> Result<Option<boon_checked::Type>, SemanticError> {
-    let requirements = program
+    if let Some(kernel_input) = kernel_input {
+        let Some(requirement) = kernel_input.resource_projection(expression) else {
+            return Ok(None);
+        };
+        if requirement.origin_count() == 0 {
+            return Ok(None);
+        }
+        let published_type = program
+            .expressions
+            .get(expression.0 as usize)
+            .filter(|candidate| candidate.id == expression)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "kernel resource projection references missing checked expression {}",
+                    expression.0,
+                ))
+            })?
+            .flow_type
+            .ty
+            .clone();
+        let required_type = apply_out_contract_substitutions(&published_type, substitutions);
+        let mut exact_type = None;
+        for origin in requirement.origins() {
+            let source_id = origin.source();
+            let source = program
+                .sources
+                .get(source_id.0 as usize)
+                .filter(|source| source.id == source_id)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "checked expression {} resource projection references missing source {}",
+                        expression.0, source_id.0,
+                    ))
+                })?;
+            let source_type = apply_out_contract_substitutions(&source.payload_type, substitutions);
+            let projected =
+                project_out_contract_type_segments(source_type, origin.payload_projection())
+                    .map_err(|error| {
+                        let projection = origin.payload_projection().collect::<Vec<_>>();
+                        SemanticError::new(format!(
+                            "checked expression {} source {} payload projection {:?}: {error}",
+                            expression.0, source_id.0, projection,
+                        ))
+                    })?;
+            merge_exact_resource_origin_type(expression, source_id, projected, &mut exact_type)?;
+        }
+        let exact_type = exact_type.expect("nonempty kernel source origins");
+        validate_resource_required_type(
+            program,
+            expression,
+            &required_type,
+            &published_type,
+            &exact_type,
+            || {
+                requirement
+                    .origins()
+                    .filter_map(|origin| {
+                        let source_id = origin.source();
+                        program
+                            .sources
+                            .get(source_id.0 as usize)
+                            .filter(|source| source.id == source_id)
+                            .map(|source| {
+                                format!(
+                                    "source {} path {:?} line {} projection {:?}",
+                                    source.id.0,
+                                    source.path,
+                                    source.span.line,
+                                    origin.payload_projection().collect::<Vec<_>>(),
+                                )
+                            })
+                    })
+                    .collect()
+            },
+        )?;
+        return Ok(Some(exact_type));
+    }
+
+    let mut requirements = program
         .resource_projection_requirements
         .iter()
-        .filter(|requirement| requirement.expression == expression)
-        .collect::<Vec<_>>();
-    let requirement = match requirements.as_slice() {
-        [] => return Ok(None),
-        [requirement] => *requirement,
-        _ => {
-            return Err(SemanticError::new(format!(
-                "checked expression {} has {} resource projection requirements",
-                expression.0,
-                requirements.len()
-            )));
-        }
+        .filter(|requirement| requirement.expression == expression);
+    let Some(requirement) = requirements.next() else {
+        return Ok(None);
     };
+    if requirements.next().is_some() {
+        let count = 2 + requirements.count();
+        return Err(SemanticError::new(format!(
+            "checked expression {} has {count} resource projection requirements",
+            expression.0,
+        )));
+    }
     if requirement.source_origins.is_empty() {
         return Ok(None);
     }
@@ -4458,53 +4619,87 @@ fn exact_checked_resource_projection_type(
                     expression.0, origin.source.0, origin.payload_projection
                 ))
             })?;
-        if !out_contract_type_is_resolved(&projected) {
-            return Err(SemanticError::new(format!(
-                "checked expression {} source {} payload projection has unresolved type {projected:?}",
-                expression.0, origin.source.0
-            )));
-        }
-        match &exact_type {
-            Some(existing) if existing != &projected => {
-                return Err(SemanticError::new(format!(
-                    "checked expression {} source payload origins disagree: {existing:?} versus {projected:?}",
-                    expression.0
-                )));
-            }
-            Some(_) => {}
-            None => exact_type = Some(projected),
-        }
+        merge_exact_resource_origin_type(expression, origin.source, projected, &mut exact_type)?;
     }
     let exact_type = exact_type.expect("nonempty checked source origins");
-    if out_contract_type_is_resolved(&required_type) && required_type != exact_type {
-        let expression_detail = program
-            .expressions
-            .iter()
-            .find(|candidate| candidate.id == expression)
-            .map(|candidate| format!(" line {} kind {:?}", candidate.span.line, candidate.kind))
-            .unwrap_or_default();
-        let origins = requirement
-            .source_origins
-            .iter()
-            .filter_map(|origin| {
-                program
-                    .sources
-                    .get(origin.source.0 as usize)
-                    .filter(|source| source.id == origin.source)
-                    .map(|source| {
-                        format!(
-                            "source {} path {:?} line {} projection {:?}",
-                            source.id.0, source.path, source.span.line, origin.payload_projection
-                        )
-                    })
-            })
-            .collect::<Vec<_>>();
+    validate_resource_required_type(
+        program,
+        expression,
+        &required_type,
+        &requirement.required_type,
+        &exact_type,
+        || {
+            requirement
+                .source_origins
+                .iter()
+                .filter_map(|origin| {
+                    program
+                        .sources
+                        .get(origin.source.0 as usize)
+                        .filter(|source| source.id == origin.source)
+                        .map(|source| {
+                            format!(
+                                "source {} path {:?} line {} projection {:?}",
+                                source.id.0,
+                                source.path,
+                                source.span.line,
+                                origin.payload_projection,
+                            )
+                        })
+                })
+                .collect()
+        },
+    )?;
+    Ok(Some(exact_type))
+}
+
+fn merge_exact_resource_origin_type(
+    expression: boon_checked::CheckedExprId,
+    source: boon_checked::CheckedSourceId,
+    projected: boon_checked::Type,
+    exact_type: &mut Option<boon_checked::Type>,
+) -> Result<(), SemanticError> {
+    if !out_contract_type_is_resolved(&projected) {
         return Err(SemanticError::new(format!(
-            "checked expression {}{expression_detail} resource requirement type {required_type:?} (raw {:?}) differs from exact source payload type {exact_type:?}; origins: {origins:?}",
-            expression.0, requirement.required_type,
+            "checked expression {} source {} payload projection has unresolved type {projected:?}",
+            expression.0, source.0,
         )));
     }
-    Ok(Some(exact_type))
+    match exact_type {
+        Some(existing) if existing != &projected => Err(SemanticError::new(format!(
+            "checked expression {} source payload origins disagree: {existing:?} versus {projected:?}",
+            expression.0,
+        ))),
+        Some(_) => Ok(()),
+        None => {
+            *exact_type = Some(projected);
+            Ok(())
+        }
+    }
+}
+
+fn validate_resource_required_type(
+    program: &CheckedProgramFields,
+    expression: boon_checked::CheckedExprId,
+    required_type: &boon_checked::Type,
+    raw_required_type: &boon_checked::Type,
+    exact_type: &boon_checked::Type,
+    origins: impl FnOnce() -> Vec<String>,
+) -> Result<(), SemanticError> {
+    if !out_contract_type_is_resolved(required_type) || required_type == exact_type {
+        return Ok(());
+    }
+    let expression_detail = program
+        .expressions
+        .iter()
+        .find(|candidate| candidate.id == expression)
+        .map(|candidate| format!(" line {} kind {:?}", candidate.span.line, candidate.kind))
+        .unwrap_or_default();
+    Err(SemanticError::new(format!(
+        "checked expression {}{expression_detail} resource requirement type {required_type:?} (raw {raw_required_type:?}) differs from exact source payload type {exact_type:?}; origins: {:?}",
+        expression.0,
+        origins(),
+    )))
 }
 
 fn apply_out_contract_substitutions(
@@ -4515,8 +4710,15 @@ fn apply_out_contract_substitutions(
 }
 
 fn project_out_contract_type(
-    mut ty: boon_checked::Type,
+    ty: boon_checked::Type,
     fields: &[String],
+) -> Result<boon_checked::Type, SemanticError> {
+    project_out_contract_type_segments(ty, fields.iter().map(String::as_str))
+}
+
+fn project_out_contract_type_segments<'a>(
+    mut ty: boon_checked::Type,
+    fields: impl IntoIterator<Item = &'a str>,
 ) -> Result<boon_checked::Type, SemanticError> {
     for field in fields {
         let boon_checked::Type::Object(shape) = ty else {
@@ -6093,6 +6295,7 @@ result: identity(value: 1)
         let actual = concrete_checked_expression_type(
             &checked,
             &graph,
+            None,
             ScopedCheckedExpr {
                 expression: checked_call.expression,
                 frame: None,
@@ -6152,6 +6355,7 @@ result: identity(value: 1)
         let actual = concrete_checked_expression_type(
             &checked,
             &graph,
+            None,
             ScopedCheckedExpr {
                 expression: checked_call.expression,
                 frame: None,
@@ -6258,6 +6462,7 @@ result:
         let actual = concrete_checked_branch_expression_type(
             &fields,
             &graph,
+            None,
             ScopedCheckedExpr {
                 expression: container,
                 frame: None,
@@ -6296,6 +6501,7 @@ result:
         let error = concrete_checked_branch_expression_type(
             &fields,
             &graph,
+            None,
             ScopedCheckedExpr {
                 expression: container,
                 frame: None,
@@ -6350,6 +6556,7 @@ result:
         let actual = concrete_checked_branch_expression_type(
             &fields,
             &graph,
+            None,
             ScopedCheckedExpr {
                 expression: container,
                 frame: None,
@@ -6375,7 +6582,7 @@ result:
         let fields: boon_checked::CheckedProgramFields =
             toml::from_str(&encoded).expect("temporary checked artifact decodes");
         let producer_roots = resolve_producer_roots(&fields, &[]).unwrap();
-        let retained = contextual_expansion::ordinary_callable_declarations(&fields);
+        let retained = contextual_expansion::ordinary_callable_declarations(&fields, None);
         let intent =
             verified_intent::VerifiedSemanticIntentV1::build(&fields, &producer_roots, retained)
                 .expect("cached NovyWave semantic intent");
@@ -6389,7 +6596,7 @@ result:
         .expect("cached NovyWave OUT graph builds");
         assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
         let mut graph = out_net.graph.clone();
-        resolve_out_contracts(&fields, &mut graph)
+        resolve_out_contracts(&fields, &mut graph, None)
             .expect("cached artifact resolves every NovyWave OUT contract");
         let compact_expression = fields
             .expressions
@@ -6494,7 +6701,7 @@ result:
             }
             frame = instance.parent;
         }
-        let retained = contextual_expansion::ordinary_callable_declarations(&fields);
+        let retained = contextual_expansion::ordinary_callable_declarations(&fields, None);
         contextual_expansion::derive_contextual_materializations(&fields, &graph, &retained, true)
             .expect("cached artifact derives every NovyWave contextual materialization");
     }
@@ -7646,6 +7853,7 @@ FUNCTION selectable_row(row) {
         assert_eq!(
             exact_checked_resource_projection_type(
                 &checked,
+                None,
                 address_read.expression,
                 &BTreeMap::new()
             )
@@ -7662,7 +7870,7 @@ FUNCTION selectable_row(row) {
         .unwrap();
         assert!(!out_net.has_errors());
         let mut graph = out_net.graph;
-        resolve_out_contracts(&checked, &mut graph)
+        resolve_out_contracts(&checked, &mut graph, None)
             .expect("mapped source payload projection resolves its OUT contract");
         assert!(
             graph
@@ -7730,7 +7938,7 @@ store: [
         .unwrap();
         assert!(!out_net.has_errors());
         let mut graph = out_net.graph;
-        resolve_out_contracts(&checked, &mut graph)
+        resolve_out_contracts(&checked, &mut graph, None)
             .expect("OUT resolution must preserve the checked arm-local payload type");
         assert!(
             graph
@@ -8226,7 +8434,7 @@ result: mapped(value: 0)
             checked.report.diagnostics,
         );
         let checked = checked.program.expect("retained-call checked program");
-        let retained = contextual_expansion::ordinary_callable_declarations(&checked);
+        let retained = contextual_expansion::ordinary_callable_declarations(&checked, None);
         for name in ["classify", "rows"] {
             let callable = checked
                 .callables
@@ -8281,6 +8489,7 @@ result: mapped(value: 0)
         let exact = concrete_checked_expression_type(
             &checked,
             &out_net.graph,
+            None,
             ScopedCheckedExpr {
                 expression: classify_call.expression,
                 frame: Some(rows_instance),
@@ -8301,6 +8510,7 @@ result: mapped(value: 0)
         let missing_root_frame = concrete_checked_expression_type(
             &checked,
             &out_net.graph,
+            None,
             ScopedCheckedExpr {
                 expression: classify_call.expression,
                 frame: None,
@@ -8317,7 +8527,7 @@ result: mapped(value: 0)
                 .contains("references missing OUT call instance"),
         );
         let mut graph = out_net.graph;
-        resolve_out_contracts(&checked, &mut graph)
+        resolve_out_contracts(&checked, &mut graph, None)
             .expect("a resolved retained-call occurrence must supply the OUT input type");
         assert!(
             graph

@@ -16866,16 +16866,106 @@ pub fn seal_project_checked_program_construction_with_kernel_publication(
         checked_image_handoff_from_kernel_publication(&fields, authority, publication)?;
     #[cfg(test)]
     {
+        let packed_resource_routes = image_handoff
+            .entity_routes
+            .iter()
+            .filter(|route| route.domain == CheckedImageRowDomainV2::ResourceProjection)
+            .collect::<Vec<_>>();
+        let has_packed_only_resource_rows = fields.resource_projection_requirements.is_empty()
+            && !packed_resource_routes.is_empty();
         let oracle = checked_image_handoff_with_call_occurrences(
             &fields,
             call_occurrences,
             Some(authority),
         )?;
-        if image_handoff != oracle {
-            return Err(
-                "construction-published checked image differs from the rich-row V4 replay oracle"
-                    .to_owned(),
-            );
+        if has_packed_only_resource_rows {
+            for (expected, route) in packed_resource_routes.iter().enumerate() {
+                if route.dense_index as usize != expected {
+                    return Err(format!(
+                        "construction-published packed resource route {} is not dense index {expected}",
+                        route.dense_index,
+                    ));
+                }
+            }
+            let actual_nonresource_routes = image_handoff
+                .entity_routes
+                .iter()
+                .filter(|route| route.domain != CheckedImageRowDomainV2::ResourceProjection)
+                .collect::<Vec<_>>();
+            let oracle_nonresource_routes = oracle
+                .entity_routes
+                .iter()
+                .filter(|route| route.domain != CheckedImageRowDomainV2::ResourceProjection)
+                .collect::<Vec<_>>();
+            if actual_nonresource_routes != oracle_nonresource_routes
+                || image_handoff.projections.len() != oracle.projections.len()
+            {
+                return Err(
+                    "construction-published packed resource image changes a non-resource route or projection"
+                        .to_owned(),
+                );
+            }
+            let mut resource_rows_by_projection = BTreeMap::new();
+            for route in packed_resource_routes {
+                *resource_rows_by_projection
+                    .entry(route.projection)
+                    .or_insert(0u32) += 1;
+            }
+            for (index, (actual, expected)) in image_handoff
+                .projections
+                .iter()
+                .zip(&oracle.projections)
+                .enumerate()
+            {
+                let projection = CheckedImageProjectionIdV2(index as u32);
+                let extra_rows = resource_rows_by_projection
+                    .get(&projection)
+                    .copied()
+                    .unwrap_or(0);
+                if extra_rows == 0 {
+                    if actual != expected {
+                        return Err(format!(
+                            "construction-published packed resource image changes unrelated projection {index}",
+                        ));
+                    }
+                    continue;
+                }
+                if actual.stable_key != expected.stable_key
+                    || actual.stable_key_digest != expected.stable_key_digest
+                    || actual.row_count != expected.row_count.saturating_add(extra_rows)
+                    || actual.dependency_row_count < expected.dependency_row_count
+                    || actual.dependency_row_count
+                        > expected.dependency_row_count.saturating_add(extra_rows)
+                {
+                    return Err(format!(
+                        "construction-published packed resource image has invalid projection delta at {index}",
+                    ));
+                }
+                let actual_relocations = image_handoff
+                    .projection_relocations(projection)
+                    .ok_or_else(|| {
+                        format!("packed projection {index} has an invalid relocation span")
+                    })?;
+                let expected_relocations =
+                    oracle.projection_relocations(projection).ok_or_else(|| {
+                        format!("rich oracle projection {index} has an invalid relocation span")
+                    })?;
+                if expected_relocations
+                    .iter()
+                    .any(|target| !actual_relocations.contains(target))
+                {
+                    return Err(format!(
+                        "construction-published packed resource image removes an unrelated relocation at projection {index}",
+                    ));
+                }
+            }
+        } else {
+            if image_handoff != oracle {
+                return Err(
+                    "construction-published checked image differs from the rich-row V4 replay oracle"
+                        .to_owned(),
+                );
+            }
         }
     }
     seal_kernel_checked_program_fields(fields, image_handoff, Some(authority))

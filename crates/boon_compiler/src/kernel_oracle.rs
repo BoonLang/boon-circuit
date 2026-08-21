@@ -603,10 +603,17 @@ struct PreparedKernelProjectProjection {
     dependency_pruning_us: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedProjectionRetention {
+    Runtime,
+    Oracle,
+}
+
 fn prepare_kernel_project_projection(
     project: &ProjectSyntaxSnapshot,
     source_payloads: &BTreeMap<String, Type>,
     role: boon_checked::ProgramRole,
+    retention: PreparedProjectionRetention,
 ) -> PreparedKernelProjectProjection {
     let owner_order = project.stable_check_owner_keys().collect::<Vec<_>>();
     let input_owners = owner_order.len();
@@ -657,15 +664,18 @@ fn prepare_kernel_project_projection(
     let mut resource_ordinals =
         BTreeMap::<(StableCheckOwnerKey, PreparedResourceSyntheticKind), usize>::new();
     for owner in &mut prepared {
-        for synthetic in &owner.resource_synthetic_paths {
-            let ordinal = resource_ordinals
-                .entry((synthetic.anchor.clone(), synthetic.kind))
-                .or_default();
-            let projection = match synthetic.kind {
+        for synthetic_index in 0..owner.resource_synthetic_paths.len() {
+            let synthetic = &owner.resource_synthetic_paths[synthetic_index];
+            let anchor = synthetic.anchor.clone();
+            let kind = synthetic.kind;
+            let row = synthetic.row;
+            let ordinal = resource_ordinals.entry((anchor, kind)).or_default();
+            let projection = match kind {
                 PreparedResourceSyntheticKind::List => owner
+                    .payload_mut()
                     .definition_facts
                     .lists
-                    .get_mut(synthetic.row)
+                    .get_mut(row)
                     .map(|list| &mut list.projection),
             }
             .expect("prepared synthetic resource row is in range");
@@ -673,7 +683,7 @@ fn prepare_kernel_project_projection(
                 projection.is_empty(),
                 "a synthetic resource path must begin without a structural projection"
             );
-            let prefix = match synthetic.kind {
+            let prefix = match kind {
                 PreparedResourceSyntheticKind::List => "list",
             };
             *projection = vec![format!("{prefix}_{ordinal}").into_boxed_str()].into_boxed_slice();
@@ -873,7 +883,7 @@ fn prepare_kernel_project_projection(
         .and_then(|dense| dense.to_string_lossy().parse::<usize>().ok())
         && let Some(prepared_index) = active.get(dense).copied()
     {
-        let compact = &prepared[prepared_index].compact;
+        let compact = &prepared[prepared_index].payload().compact;
         eprintln!(
             "kernel-owner-trace dense_owner={dense} stable_owner={:#?} formals={} result={} nodes={}",
             prepared[prepared_index].owner,
@@ -899,101 +909,91 @@ fn prepare_kernel_project_projection(
             );
         }
     }
-    let project_input = KernelProjectProgramInput {
-        owners: active
-            .iter()
-            .map(|prepared_index| {
-                let owner = &prepared[*prepared_index];
-                let mut compact = owner.compact.clone();
-                compact.external_expressions = owner
-                    .external_expressions
-                    .iter()
-                    .map(|external| {
-                        let target = prepared_by_owner[&external.owner];
-                        let kernel_target = match &external.target {
-                            PreparedExternalTarget::Result => KernelExternalTarget::Result,
-                            PreparedExternalTarget::Expression(expression) => {
-                                let expression = prepared[target]
-                                    .expressions
-                                    .iter()
-                                    .position(|candidate| candidate == expression)
-                                    .expect("active external expression was validated");
-                                KernelExternalTarget::Expression(KernelExpressionId(
-                                    u32::try_from(expression)
-                                        .expect("kernel owner expression count exceeds u32"),
-                                ))
-                            }
-                        };
-                        KernelExternalExpression {
-                            owner: dense_owner[target].expect("active target has a dense owner"),
-                            target: kernel_target,
+    // Resolve cross-owner coordinates while the source-shaped payloads are
+    // still borrowed in place. The completed payload is moved—not cloned—into
+    // the kernel input below.
+    for prepared_index in active.iter().copied() {
+        let (external_expressions, call_targets) = {
+            let owner = &prepared[prepared_index];
+            let external_expressions = owner
+                .external_expressions
+                .iter()
+                .map(|external| {
+                    let target = prepared_by_owner[&external.owner];
+                    let kernel_target = match &external.target {
+                        PreparedExternalTarget::Result => KernelExternalTarget::Result,
+                        PreparedExternalTarget::Expression(expression) => {
+                            let expression = prepared[target]
+                                .expressions
+                                .iter()
+                                .position(|candidate| candidate == expression)
+                                .expect("active external expression was validated");
+                            KernelExternalTarget::Expression(KernelExpressionId(
+                                u32::try_from(expression)
+                                    .expect("kernel owner expression count exceeds u32"),
+                            ))
                         }
-                    })
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
-                for call in &owner.call_targets {
-                    let target = prepared_by_owner[&call.owner];
-                    let node = compact
-                        .nodes
-                        .get_mut(call.node)
-                        .expect("prepared user call node is local");
-                    let KernelOwnerNodeKind::UserCall {
-                        target: call_target,
-                        ..
-                    } = &mut node.kind
-                    else {
-                        panic!("prepared user call target references a non-call node")
                     };
-                    *call_target =
-                        dense_owner[target].expect("active call target has a dense owner");
-                }
-                compact
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-    };
-    let definition_facts = active
-        .iter()
-        .map(|prepared_index| {
-            let owner = &prepared[*prepared_index];
-            let dense_current =
-                dense_owner[*prepared_index].expect("active resource owner has a dense owner ID");
-            let mut facts = owner.definition_facts.clone();
-            facts.presentation.containing_scope = resolved_containing_scopes[*prepared_index]
-                .expect("active owner has a resolved containing scope");
-            for target in &owner.statement_child_targets {
-                let prepared_target = prepared_by_owner[&target.owner];
-                let child = facts.statements[target.statement]
-                    .children
-                    .get_mut(target.child)
-                    .expect("prepared statement child target is in range");
-                let KernelStatementChildReference::Owner(owner) = child else {
-                    panic!("prepared external statement child became local")
-                };
-                *owner = dense_owner[prepared_target]
-                    .expect("active statement child target has a dense owner");
-            }
-            for target in &owner.lexical_owner_targets {
-                let prepared_target = prepared_by_owner[&target.owner];
-                let binding = facts
-                    .lexical_bindings
-                    .get_mut(target.binding)
-                    .expect("prepared lexical owner target is in range");
-                let dense_target =
-                    dense_owner[prepared_target].expect("active lexical target has a dense owner");
-                match (&mut binding.target, &target.declaration) {
+                    KernelExternalExpression {
+                        owner: dense_owner[target].expect("active target has a dense owner"),
+                        target: kernel_target,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let call_targets = owner
+                .call_targets
+                .iter()
+                .map(|call| {
+                    let target = prepared_by_owner[&call.owner];
                     (
-                        KernelLexicalBindingTargetInput::Declaration(
-                            KernelDeclarationReference::OwnerPublic(owner),
-                        ),
-                        None,
-                    ) => *owner = dense_target,
+                        call.node,
+                        dense_owner[target].expect("active call target has a dense owner"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (external_expressions, call_targets)
+        };
+        let compact = &mut prepared[prepared_index].payload_mut().compact;
+        compact.external_expressions = external_expressions;
+        for (call, dense_target) in call_targets {
+            let node = compact
+                .nodes
+                .get_mut(call)
+                .expect("prepared user call node is local");
+            let KernelOwnerNodeKind::UserCall { target, .. } = &mut node.kind else {
+                panic!("prepared user call target references a non-call node")
+            };
+            *target = dense_target;
+        }
+    }
+
+    for prepared_index in active.iter().copied() {
+        let dense_current =
+            dense_owner[prepared_index].expect("active resource owner has a dense owner ID");
+        let (statement_children, lexical_targets, resource_targets) = {
+            let owner = &prepared[prepared_index];
+            let statement_children = owner
+                .statement_child_targets
+                .iter()
+                .map(|target| {
+                    let prepared_target = prepared_by_owner[&target.owner];
                     (
-                        KernelLexicalBindingTargetInput::Declaration(
-                            KernelDeclarationReference::OwnerDeclaration { owner, declaration },
-                        ),
-                        Some((arm, ordinal)),
-                    ) => {
+                        target.statement,
+                        target.child,
+                        dense_owner[prepared_target]
+                            .expect("active statement target has a dense owner"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let lexical_targets = owner
+                .lexical_owner_targets
+                .iter()
+                .map(|target| {
+                    let prepared_target = prepared_by_owner[&target.owner];
+                    let dense_target = dense_owner[prepared_target]
+                        .expect("active lexical target has a dense owner");
+                    let declaration = target.declaration.as_ref().map(|(arm, ordinal)| {
                         let arm = prepared[prepared_target]
                             .expressions
                             .iter()
@@ -1006,108 +1006,175 @@ fn prepare_kernel_project_projection(
                             ),
                             ordinal: *ordinal,
                         };
-                        let external_declaration = prepared[prepared_target]
+                        prepared[prepared_target]
+                            .payload()
                             .definition_facts
                             .declarations
                             .iter()
                             .find(|candidate| candidate.origin == origin)
                             .expect("active external pattern binding has a declaration")
-                            .id;
-                        *owner = dense_target;
-                        *declaration = external_declaration;
-                    }
-                    _ => panic!("prepared lexical owner target changed reference kind"),
-                }
-            }
-            for target in &owner.resource_owner_targets {
-                let prepared_target = prepared_by_owner[&target.owner];
-                let dense_target =
-                    dense_owner[prepared_target].expect("active resource target has a dense owner");
-                match target.field {
-                    PreparedResourceOwnerField::LinkagePublicDeclaration => {
-                        let Some(KernelDeclarationReference::OwnerPublic(owner)) =
-                            &mut facts.linkage.public_declaration
-                        else {
-                            panic!("prepared definition public declaration target became local")
-                        };
-                        *owner = dense_target;
-                    }
-                    PreparedResourceOwnerField::SourceDeclaration(row) => {
-                        let KernelDeclarationReference::OwnerPublic(owner) =
-                            &mut facts.sources[row].declaration
-                        else {
-                            panic!("prepared SOURCE declaration target became local")
-                        };
-                        *owner = dense_target;
-                    }
-                    PreparedResourceOwnerField::SourceStatement(row) => {
-                        let KernelStatementReference::OwnerPublic(owner) =
-                            &mut facts.sources[row].statement
-                        else {
-                            panic!("prepared SOURCE statement target became local")
-                        };
-                        *owner = dense_target;
-                    }
-                    PreparedResourceOwnerField::StateBindingDeclaration(row) => {
-                        let KernelDeclarationReference::OwnerPublic(owner) =
-                            &mut facts.states[row].binding_declaration
-                        else {
-                            panic!("prepared state binding target became local")
-                        };
-                        *owner = dense_target;
-                    }
-                    PreparedResourceOwnerField::StateDeclaration(row) => {
-                        let KernelDeclarationReference::OwnerPublic(owner) =
-                            &mut facts.states[row].declaration
-                        else {
-                            panic!("prepared state declaration target became local")
-                        };
-                        *owner = dense_target;
-                    }
-                    PreparedResourceOwnerField::StateStatement(row) => {
-                        let KernelStatementReference::OwnerPublic(owner) =
-                            &mut facts.states[row].statement
-                        else {
-                            panic!("prepared state statement target became local")
-                        };
-                        *owner = dense_target;
-                    }
-                    PreparedResourceOwnerField::ListDeclaration(row) => {
-                        let KernelDeclarationReference::OwnerPublic(owner) =
-                            &mut facts.lists[row].declaration
-                        else {
-                            panic!("prepared LIST declaration target became local")
-                        };
-                        *owner = dense_target;
-                    }
-                    PreparedResourceOwnerField::ListStatement(row) => {
-                        let parent_authority =
-                            project_inline_list_authority_owner(&project_input, dense_target)
-                                == Some(dense_current);
-                        if parent_authority {
-                            facts.lists[row].statement =
-                                KernelStatementReference::OwnerPublic(dense_target);
-                        } else if let KernelStatementReference::OwnerPublic(owner) =
-                            &mut facts.lists[row].statement
-                        {
-                            // This is the no-local-statement fallback. It is
-                            // still an owner reference and must be relocated.
-                            *owner = dense_target;
-                        }
-                    }
-                }
-            }
-            facts
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
+                            .id
+                    });
+                    (target.binding, dense_target, declaration)
+                })
+                .collect::<Vec<_>>();
+            let resource_targets = owner
+                .resource_owner_targets
+                .iter()
+                .map(|target| {
+                    let prepared_target = prepared_by_owner[&target.owner];
+                    let dense_target = dense_owner[prepared_target]
+                        .expect("active resource target has a dense owner");
+                    let parent_authority =
+                        matches!(target.field, PreparedResourceOwnerField::ListStatement(_))
+                            && prepared_inline_list_authority_owner(
+                                &prepared,
+                                &active,
+                                dense_target,
+                            ) == Some(dense_current);
+                    (target.field, dense_target, parent_authority)
+                })
+                .collect::<Vec<_>>();
+            (statement_children, lexical_targets, resource_targets)
+        };
 
-    let project_is_empty = project_input.owners.is_empty();
+        let facts = &mut prepared[prepared_index].payload_mut().definition_facts;
+        facts.presentation.containing_scope = resolved_containing_scopes[prepared_index]
+            .expect("active owner has a resolved containing scope");
+        for (statement, child, dense_target) in statement_children {
+            let child = facts.statements[statement]
+                .children
+                .get_mut(child)
+                .expect("prepared statement child target is in range");
+            let KernelStatementChildReference::Owner(owner) = child else {
+                panic!("prepared external statement child became local")
+            };
+            *owner = dense_target;
+        }
+        for (binding, dense_target, external_declaration) in lexical_targets {
+            let binding = facts
+                .lexical_bindings
+                .get_mut(binding)
+                .expect("prepared lexical owner target is in range");
+            match (&mut binding.target, external_declaration) {
+                (
+                    KernelLexicalBindingTargetInput::Declaration(
+                        KernelDeclarationReference::OwnerPublic(owner),
+                    ),
+                    None,
+                ) => *owner = dense_target,
+                (
+                    KernelLexicalBindingTargetInput::Declaration(
+                        KernelDeclarationReference::OwnerDeclaration { owner, declaration },
+                    ),
+                    Some(external_declaration),
+                ) => {
+                    *owner = dense_target;
+                    *declaration = external_declaration;
+                }
+                _ => panic!("prepared lexical owner target changed reference kind"),
+            }
+        }
+        for (field, dense_target, parent_authority) in resource_targets {
+            match field {
+                PreparedResourceOwnerField::LinkagePublicDeclaration => {
+                    let Some(KernelDeclarationReference::OwnerPublic(owner)) =
+                        &mut facts.linkage.public_declaration
+                    else {
+                        panic!("prepared definition public declaration target became local")
+                    };
+                    *owner = dense_target;
+                }
+                PreparedResourceOwnerField::SourceDeclaration(row) => {
+                    let KernelDeclarationReference::OwnerPublic(owner) =
+                        &mut facts.sources[row].declaration
+                    else {
+                        panic!("prepared SOURCE declaration target became local")
+                    };
+                    *owner = dense_target;
+                }
+                PreparedResourceOwnerField::SourceStatement(row) => {
+                    let KernelStatementReference::OwnerPublic(owner) =
+                        &mut facts.sources[row].statement
+                    else {
+                        panic!("prepared SOURCE statement target became local")
+                    };
+                    *owner = dense_target;
+                }
+                PreparedResourceOwnerField::StateBindingDeclaration(row) => {
+                    let KernelDeclarationReference::OwnerPublic(owner) =
+                        &mut facts.states[row].binding_declaration
+                    else {
+                        panic!("prepared state binding target became local")
+                    };
+                    *owner = dense_target;
+                }
+                PreparedResourceOwnerField::StateDeclaration(row) => {
+                    let KernelDeclarationReference::OwnerPublic(owner) =
+                        &mut facts.states[row].declaration
+                    else {
+                        panic!("prepared state declaration target became local")
+                    };
+                    *owner = dense_target;
+                }
+                PreparedResourceOwnerField::StateStatement(row) => {
+                    let KernelStatementReference::OwnerPublic(owner) =
+                        &mut facts.states[row].statement
+                    else {
+                        panic!("prepared state statement target became local")
+                    };
+                    *owner = dense_target;
+                }
+                PreparedResourceOwnerField::ListDeclaration(row) => {
+                    let KernelDeclarationReference::OwnerPublic(owner) =
+                        &mut facts.lists[row].declaration
+                    else {
+                        panic!("prepared LIST declaration target became local")
+                    };
+                    *owner = dense_target;
+                }
+                PreparedResourceOwnerField::ListStatement(row) => {
+                    if parent_authority {
+                        facts.lists[row].statement =
+                            KernelStatementReference::OwnerPublic(dense_target);
+                    } else if let KernelStatementReference::OwnerPublic(owner) =
+                        &mut facts.lists[row].statement
+                    {
+                        *owner = dense_target;
+                    }
+                }
+            }
+        }
+    }
+
+    let project_is_empty = active.is_empty();
     let definition_keys = active
         .iter()
         .map(|prepared_index| prepared[*prepared_index].owner.clone())
         .collect::<Vec<_>>()
         .into_boxed_slice();
+    let mut project_owners = Vec::with_capacity(active.len());
+    let mut definition_facts = Vec::with_capacity(active.len());
+    for prepared_index in active.iter().copied() {
+        let payload = prepared[prepared_index]
+            .payload
+            .take()
+            .expect("active prepared owner has one compiler payload");
+        if retention == PreparedProjectionRetention::Oracle {
+            prepared[prepared_index].payload = Some(payload.clone());
+        }
+        project_owners.push(payload.compact);
+        definition_facts.push(payload.definition_facts);
+    }
+    if retention == PreparedProjectionRetention::Runtime {
+        for owner in &mut prepared {
+            owner.payload = None;
+        }
+    }
+    let project_input = KernelProjectProgramInput {
+        owners: project_owners.into_boxed_slice(),
+    };
+    let definition_facts = definition_facts.into_boxed_slice();
     PreparedKernelProjectProjection {
         owner_order,
         input_owners,
@@ -1162,7 +1229,12 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
         owner_projection_us,
         direct_projection_elapsed,
         dependency_pruning_us,
-    } = prepare_kernel_project_projection(project, source_payloads, role);
+    } = prepare_kernel_project_projection(
+        project,
+        source_payloads,
+        role,
+        PreparedProjectionRetention::Oracle,
+    );
     let mut program_compile_us = 0;
     let mut graph_solve_us = 0;
     let mut interface_projection_us = 0;
@@ -1435,49 +1507,49 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     let owner = &prepared[*prepared_index];
                     assert_eq!(
                         artifact.relocations.expressions,
-                        owner.definition_facts.relocations.expressions,
+                        owner.payload().definition_facts.relocations.expressions,
                         "kernel definition artifacts retain every stable expression relocation"
                     );
                     assert_eq!(
                         artifact.relocations.statements,
-                        owner.definition_facts.relocations.statements,
+                        owner.payload().definition_facts.relocations.statements,
                         "kernel definition artifacts retain every stable statement relocation"
                     );
                     assert_eq!(
                         artifact.presentation.scopes,
-                        owner.definition_facts.presentation.scopes,
+                        owner.payload().definition_facts.presentation.scopes,
                         "kernel definition artifacts retain every compact scope row"
                     );
                     assert_eq!(
                         artifact.presentation.expressions,
-                        owner.definition_facts.presentation.expressions,
+                        owner.payload().definition_facts.presentation.expressions,
                         "kernel definition artifacts retain every checked-expression presentation row"
                     );
                     assert_eq!(
                         artifact.presentation.statements,
-                        owner.definition_facts.presentation.statements,
+                        owner.payload().definition_facts.presentation.statements,
                         "kernel definition artifacts retain every checked-statement presentation row"
                     );
                     assert_eq!(
                         artifact.presentation.declarations,
-                        owner.definition_facts.presentation.declarations,
+                        owner.payload().definition_facts.presentation.declarations,
                         "kernel definition artifacts retain every checked-declaration presentation row"
                     );
                     let presentation_scope_count = artifact.presentation.scopes.len();
                     assert_eq!(
                         artifact.expression_payloads,
-                        owner.definition_facts.expression_payloads,
+                        owner.payload().definition_facts.expression_payloads,
                         "kernel definition artifacts retain every exact expression semantic payload"
                     );
                     assert_eq!(
                         artifact.call_syntax.len(),
-                        owner.definition_facts.call_syntax.len(),
+                        owner.payload().definition_facts.call_syntax.len(),
                         "kernel definition artifacts retain every authored call surface"
                     );
                     for (linked, authored) in artifact
                         .call_syntax
                         .iter()
-                        .zip(owner.definition_facts.call_syntax.iter())
+                        .zip(owner.payload().definition_facts.call_syntax.iter())
                     {
                         assert_eq!(linked.expression, authored.expression);
                         assert_eq!(linked.function, authored.function);
@@ -1497,13 +1569,13 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     }
                     assert_eq!(
                         artifact.execution_shapes.len(),
-                        owner.definition_facts.execution_shapes.len(),
+                        owner.payload().definition_facts.execution_shapes.len(),
                         "kernel definition artifacts retain every lossy structural execution shape"
                     );
                     for (linked, authored) in artifact
                         .execution_shapes
                         .iter()
-                        .zip(owner.definition_facts.execution_shapes.iter())
+                        .zip(owner.payload().definition_facts.execution_shapes.iter())
                     {
                         assert_eq!(linked.expression(), authored.expression());
                     }
@@ -1690,6 +1762,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                                             )
                                         });
                                     let declaration = target
+                                        .payload()
                                         .definition_facts
                                         .declarations
                                         .get(declaration.0 as usize)
@@ -1757,6 +1830,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                                     )
                                 });
                             let declaration = target
+                                .payload()
                                 .definition_facts
                                 .declarations
                                 .get(declaration.0 as usize)
@@ -1811,6 +1885,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                                         )
                                     });
                                 let declaration = target
+                                    .payload()
                                     .definition_facts
                                     .declarations
                                     .get(declaration.0 as usize)
@@ -2241,7 +2316,12 @@ pub(crate) fn compiler_diagnostics_from_kernel(
         definition_keys,
         abi,
         ..
-    } = prepare_kernel_project_projection(&project, &source_payloads, role);
+    } = prepare_kernel_project_projection(
+        &project,
+        &source_payloads,
+        role,
+        PreparedProjectionRetention::Runtime,
+    );
     if !unsupported.is_empty() {
         if std::env::var_os("BOON_KERNEL_DIAGNOSTICS_UNSUPPORTED_TRACE").is_some() {
             eprintln!(
@@ -2285,6 +2365,7 @@ pub(crate) fn compiler_diagnostics_from_kernel(
         &project,
         &prepared,
         &active,
+        session.project().definition_facts(),
         source_abi_diagnostics.as_ref(),
         &interfaces,
     )?;
@@ -2305,9 +2386,9 @@ pub(crate) fn compiler_diagnostics_from_kernel(
     }
     let call_count = active
         .iter()
-        .map(|owner| {
-            prepared[*owner]
-                .compact
+        .enumerate()
+        .map(|(dense, _)| {
+            session.project().program().owners[dense]
                 .nodes
                 .iter()
                 .filter(|node| {
@@ -2331,8 +2412,9 @@ pub(crate) fn compiler_diagnostics_from_kernel(
     let owner_work = crate::CompilerOwnerWork {
         statements: active
             .iter()
-            .map(|owner| {
-                u64::try_from(prepared[*owner].definition_facts.statements.len())
+            .enumerate()
+            .map(|(dense, _)| {
+                u64::try_from(session.project().definition_facts()[dense].statements.len())
                     .unwrap_or(u64::MAX)
             })
             .sum(),
@@ -2535,7 +2617,12 @@ fn checked_construction_from_kernel(
         definition_keys,
         abi,
         ..
-    } = prepare_kernel_project_projection(project, &source_payloads, role);
+    } = prepare_kernel_project_projection(
+        project,
+        &source_payloads,
+        role,
+        PreparedProjectionRetention::Runtime,
+    );
     let projection_us = elapsed_us(phase_started.elapsed());
     if !unsupported.is_empty() {
         return Err(format!(
@@ -2589,6 +2676,7 @@ fn checked_construction_from_kernel(
         project,
         &prepared,
         &active,
+        session.project().definition_facts(),
         source_abi_diagnostics.as_ref(),
         &interfaces,
     )?;
@@ -2862,6 +2950,7 @@ fn present_kernel_project_diagnostics(
     project: &ProjectSyntaxSnapshot,
     prepared: &[PreparedOwner],
     active: &[usize],
+    definition_facts: &[KernelDefinitionFactsInput],
     source_abi_diagnostics: &[TypeDiagnostic],
     interfaces: &KernelInterfaceSnapshot,
 ) -> Result<Vec<TypeDiagnostic>, String> {
@@ -2893,7 +2982,11 @@ fn present_kernel_project_diagnostics(
     ));
     for diagnostic in interfaces.diagnostics.iter() {
         diagnostics.push(present_kernel_interface_diagnostic(
-            project, prepared, active, diagnostic,
+            project,
+            prepared,
+            active,
+            definition_facts,
+            diagnostic,
         )?);
     }
     diagnostics.extend(project_kernel_interface_render_slot_diagnostics(
@@ -2917,6 +3010,7 @@ fn present_kernel_interface_diagnostic(
     project: &ProjectSyntaxSnapshot,
     prepared: &[PreparedOwner],
     active: &[usize],
+    definition_facts: &[KernelDefinitionFactsInput],
     diagnostic: &boon_compiler_kernel::KernelDiagnosticArtifact,
 ) -> Result<TypeDiagnostic, String> {
     let prepared_index = *active
@@ -2992,14 +3086,14 @@ fn present_kernel_interface_diagnostic(
     else {
         return Err("kernel call-input diagnostic has a non-call-input payload".to_owned());
     };
-    let target = active
+    let target_dense = active
         .iter()
-        .copied()
-        .filter_map(|target| prepared.get(target))
-        .find(|candidate| &candidate.owner == target)
+        .position(|prepared_index| &prepared[*prepared_index].owner == target)
         .ok_or_else(|| format!("kernel diagnostic targets missing owner {target:?}"))?;
-    let parameter_name = target
-        .definition_facts
+    let target = &prepared[active[target_dense]];
+    let parameter_name = definition_facts
+        .get(target_dense)
+        .ok_or_else(|| format!("kernel diagnostic target {target_dense} has no definition facts"))?
         .declarations
         .iter()
         .find_map(|declaration| {
@@ -3319,7 +3413,11 @@ struct PreparedOwner {
     owner: StableCheckOwnerKey,
     expressions: Box<[StableExpressionKey]>,
     statements: Box<[StableStatementKey]>,
-    definition_facts: KernelDefinitionFactsInput,
+    /// The source-shaped compiler payload exists only while dense links are
+    /// resolved. Production moves it into `KernelProjectInput`; the explicit
+    /// differential oracle may retain one post-relocation copy for exact
+    /// kernel-input-to-artifact checks.
+    payload: Option<PreparedOwnerPayload>,
     render_slots: Box<[Box<str>]>,
     statement_child_targets: Box<[PreparedStatementChildTarget]>,
     containing_scope_targets: Box<[PreparedContainingScopeTarget]>,
@@ -3328,7 +3426,6 @@ struct PreparedOwner {
     resource_synthetic_paths: Box<[PreparedResourceSyntheticPath]>,
     external_expressions: Box<[PreparedExternalExpression]>,
     call_targets: Box<[PreparedCallTarget]>,
-    compact: KernelOwnerProgramInput,
     result_expression: Option<StableExpressionKey>,
     public_child_owner_fields: Box<[(String, StableCheckOwnerKey)]>,
     generic_formal_reads: Box<[StableExpressionKey]>,
@@ -3338,6 +3435,26 @@ struct PreparedOwner {
     detached_generic_reads: Box<[StableExpressionKey]>,
     legacy_no_element_dependents: Box<[StableExpressionKey]>,
     legacy_source_container_modes: Box<[StableExpressionKey]>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedOwnerPayload {
+    compact: KernelOwnerProgramInput,
+    definition_facts: KernelDefinitionFactsInput,
+}
+
+impl PreparedOwner {
+    fn payload(&self) -> &PreparedOwnerPayload {
+        self.payload
+            .as_ref()
+            .expect("prepared owner compiler payload has already been consumed")
+    }
+
+    fn payload_mut(&mut self) -> &mut PreparedOwnerPayload {
+        self.payload
+            .as_mut()
+            .expect("prepared owner compiler payload has already been consumed")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6475,7 +6592,15 @@ fn compact_owner_view(
         owner,
         expressions: expressions.into_boxed_slice(),
         statements,
-        definition_facts,
+        payload: Some(PreparedOwnerPayload {
+            definition_facts,
+            compact: KernelOwnerProgramInput {
+                nodes: nodes.into_boxed_slice(),
+                formal_count: checked_u32(formal_count, "formal count")?,
+                external_expressions: Box::new([]),
+                result: checked_kernel_expression(result_index)?,
+            },
+        }),
         render_slots: render_slots
             .into_iter()
             .map(|(slot, _)| slot)
@@ -6488,12 +6613,6 @@ fn compact_owner_view(
         resource_synthetic_paths,
         external_expressions: external_expressions.into_boxed_slice(),
         call_targets: call_targets.into_boxed_slice(),
-        compact: KernelOwnerProgramInput {
-            nodes: nodes.into_boxed_slice(),
-            formal_count: checked_u32(formal_count, "formal count")?,
-            external_expressions: Box::new([]),
-            result: checked_kernel_expression(result_index)?,
-        },
         result_expression,
         public_child_owner_fields,
         generic_formal_reads,
@@ -9172,11 +9291,15 @@ fn kernel_inline_list_authority_root(
 /// parent field through `List/map`, `List/filter`, `List/append`, or another
 /// transparent carrier. Parser nesting alone cannot prove that relationship;
 /// the dense external-result edge can.
-fn project_inline_list_authority_owner(
-    project: &KernelProjectProgramInput,
+fn prepared_inline_list_authority_owner(
+    prepared: &[PreparedOwner],
+    active: &[usize],
     owner: KernelOwnerId,
 ) -> Option<KernelOwnerId> {
-    let input = project.owners.get(owner.0 as usize)?;
+    let input = &prepared
+        .get(*active.get(owner.0 as usize)?)?
+        .payload()
+        .compact;
     let mut current = input.result;
     let mut visited = BTreeSet::new();
     while visited.insert(current) {
@@ -9186,7 +9309,10 @@ fn project_inline_list_authority_owner(
             return match external.target {
                 KernelExternalTarget::Result => Some(external.owner),
                 KernelExternalTarget::Expression(expression) => {
-                    let target = project.owners.get(external.owner.0 as usize)?;
+                    let target = &prepared
+                        .get(*active.get(external.owner.0 as usize)?)?
+                        .payload()
+                        .compact;
                     kernel_inline_list_authority_root(&target.nodes, expression)
                         .map(|_| external.owner)
                 }
@@ -19029,6 +19155,7 @@ mod tests {
             &project,
             &BTreeMap::new(),
             boon_checked::ProgramRole::Client,
+            PreparedProjectionRetention::Runtime,
         );
         assert!(
             prepared
@@ -19037,6 +19164,13 @@ mod tests {
                 .all(|owner| matches!(owner, StableCheckOwnerKey::UnitRoot(_))),
             "every declared nested owner must project: {:#?}",
             prepared.unsupported
+        );
+        assert!(
+            prepared
+                .prepared
+                .iter()
+                .all(|owner| owner.payload.is_none()),
+            "runtime preparation must move every source-shaped owner payload into the kernel input",
         );
         let hold = prepared
             .definition_keys

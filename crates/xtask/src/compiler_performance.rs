@@ -3,21 +3,25 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::compiler_producer::{
+    ExpectedProducer, ProducerIdentity, ProducerMetadata, ProducerSetIdentity,
+    validate_producer_metadata,
+};
 use crate::compiler_work_sample::{WorkSample, require_current_prebuilt_producer};
 use crate::report_v2::{
     ExpectedIdentity, ReportStatus, ToolResult, current_identity, sha256_bytes, sha256_file,
     unix_time_ms,
 };
 
-const REPORT_FORMAT_VERSION: u16 = 6;
-const PRODUCER_FORMAT_VERSION: u16 = 5;
-const BUDGET_FORMAT_VERSION: u16 = 2;
-const REPORT_CONTRACT: &str = "boon-compiler-performance-v5";
+const REPORT_FORMAT_VERSION: u16 = 8;
+const PRODUCER_FORMAT_VERSION: u16 = 7;
+const BUDGET_FORMAT_VERSION: u16 = 3;
+const REPORT_CONTRACT: &str = "boon-compiler-performance-v7";
 const DEFAULT_BUDGET: &str = "budgets/compiler.toml";
-const PRODUCER_PATH: &str = "target/release/boon_cli";
 const MAX_BUDGET_BYTES: u64 = 64 * 1024;
-const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SAMPLE_OUTPUT_BYTES: usize = 512 * 1024;
 const MAX_SAMPLE_COUNT: usize = 128;
 
@@ -52,6 +56,18 @@ struct ExampleLineEntry {
 struct BudgetProtocol {
     build_profile: String,
     target_profile: String,
+    product_producer: String,
+    evidence_producer: String,
+    product_kind: String,
+    product_allocator: String,
+    evidence_kind: String,
+    evidence_allocator: String,
+    evidence_instrumentation: String,
+    evidence_counter_scope: String,
+    target_cpu: String,
+    profile_options: String,
+    rustflags: String,
+    producer_pair_schedule: String,
     setup_samples: usize,
     scored_samples: usize,
     compiler_threads: usize,
@@ -165,7 +181,7 @@ struct CompilerPerformanceReport {
     generated_unix_ms: u64,
     identity: ExpectedIdentity,
     budget: BudgetIdentity,
-    producer: ProducerIdentity,
+    producers: ProducerSetIdentity,
     protocol: ProtocolEvidence,
     phase_acceptance: PhaseAcceptanceProjection,
     fixtures: Vec<FixtureReport>,
@@ -206,16 +222,19 @@ struct BudgetIdentity {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ProducerIdentity {
-    path: String,
-    sha256: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 struct ProtocolEvidence {
     build_profile: String,
     target_profile: String,
+    product_kind: String,
+    product_allocator: String,
+    evidence_kind: String,
+    evidence_allocator: String,
+    evidence_instrumentation: String,
+    evidence_counter_scope: String,
+    target_cpu: String,
+    profile_options: String,
+    rustflags: String,
+    producer_pair_schedule: String,
     default_setup_samples: usize,
     default_scored_samples: usize,
     effective_setup_samples: usize,
@@ -262,15 +281,21 @@ struct MetricReport {
     intent: SampleIntent,
     setup_samples: usize,
     scored_samples: Vec<Sample>,
+    evidence_scored_samples: Vec<Sample>,
+    evidence_parity_pass: bool,
     cache_hit_count: u64,
     observed_source_bundle_digests: Vec<String>,
     observed_diagnostics_fingerprint_v1: Vec<String>,
     observed_plan_sha256: Vec<String>,
     elapsed_ms: MillisSummary,
+    compiler_cpu_ms: MillisSummary,
+    compiler_minor_page_faults: CountSummary,
+    compiler_major_page_faults: CountSummary,
     peak_rss_kib: RssSummary,
     allocations: AllocationSummary,
     work: WorkSummary,
     phase_ms: PhaseSummary,
+    export: ExportSummary,
     evaluation: MetricEvaluation,
 }
 
@@ -281,6 +306,19 @@ struct Sample {
     observation_started_unix_us: u64,
     compiler_artifact_ready_unix_us: u64,
     elapsed_ms: f64,
+    #[serde(default)]
+    normative_elapsed_ms: f64,
+    #[serde(default)]
+    process_to_artifact_ms: f64,
+    #[serde(default)]
+    process_exit_ms: f64,
+    #[serde(default)]
+    startup_and_cli_ms: f64,
+    #[serde(default)]
+    post_artifact_ms: f64,
+    compiler_cpu_ms: f64,
+    compiler_minor_page_faults: u64,
+    compiler_major_page_faults: u64,
     peak_rss_kib: u64,
     source_bundle_digest_v1: String,
     diagnostics_fingerprint_v1: Option<String>,
@@ -290,6 +328,16 @@ struct Sample {
     allocations: AllocationSample,
     work: WorkSample,
     phase: PhaseSample,
+    export: ExportSample,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExportSample {
+    kind: String,
+    elapsed_ms: f64,
+    output_bytes: u64,
+    sha256: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -312,11 +360,10 @@ struct PhaseSample {
     ir_validation_ms: f64,
     backend_ms: f64,
     plan_validation_ms: f64,
-    serialization_ms: f64,
 }
 
 impl PhaseSample {
-    fn values(self) -> [f64; 9] {
+    fn values(self) -> [f64; 8] {
         [
             self.parse_ms,
             self.typecheck_ms,
@@ -326,7 +373,6 @@ impl PhaseSample {
             self.ir_validation_ms,
             self.backend_ms,
             self.plan_validation_ms,
-            self.serialization_ms,
         ]
     }
 }
@@ -335,6 +381,7 @@ impl PhaseSample {
 #[serde(deny_unknown_fields)]
 struct SampleBatch {
     format_version: u16,
+    producer: ProducerMetadata,
     source: String,
     intent: SampleIntent,
     compiler_state: String,
@@ -418,13 +465,21 @@ struct PhaseSummary {
     ir_validation: MillisSummary,
     backend: MillisSummary,
     plan_validation: MillisSummary,
-    serialization: MillisSummary,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExportSummary {
+    kinds: Vec<String>,
+    elapsed_ms: MillisSummary,
+    output_bytes: CountSummary,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct MetricEvaluation {
     status: ReportStatus,
+    evidence_parity_pass: bool,
     p95_budget_pass: bool,
     peak_rss_budget_pass: bool,
     cache_disabled_pass: bool,
@@ -436,10 +491,24 @@ struct MetricEvaluation {
 #[derive(Default)]
 struct CollectedSamples {
     scored: Vec<Sample>,
+    evidence_scored: Vec<Sample>,
+    evidence_parity_pass: bool,
     cache_hit_count: u64,
     source_digests: BTreeSet<String>,
     diagnostics_fingerprints: BTreeSet<String>,
     plan_hashes: BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct ObservedProducerMetadata {
+    product: Option<ProducerMetadata>,
+    evidence: Option<ProducerMetadata>,
+}
+
+struct ExecutedSampleBatch {
+    batch: SampleBatch,
+    process_started_unix_us: u64,
+    process_exit_ms: f64,
 }
 
 pub fn run(
@@ -496,13 +565,15 @@ pub fn run(
             let diagnostics = &mode.diagnostics;
             let verified = &mode.verified;
             println!(
-                "  {} {}: diagnostics_ms[p50={:.3},p95={:.3}] verified_ms[p50={:.3},p95={:.3}] phases_p50_ms[semantic={:.3},where_verify={:.3},ir_lower={:.3},ir_verify={:.3},backend={:.3},plan_verify={:.3}] phases_p95_ms[semantic={:.3},where_verify={:.3},ir_lower={:.3},ir_verify={:.3},backend={:.3},plan_verify={:.3}]",
+                "  {} {}: diagnostics_ms[p50={:.3},p95={:.3},cpu_p50={:.3}] verified_ms[p50={:.3},p95={:.3},cpu_p50={:.3}] phases_p50_ms[semantic={:.3},where_verify={:.3},ir_lower={:.3},ir_verify={:.3},backend={:.3},plan_verify={:.3}] phases_p95_ms[semantic={:.3},where_verify={:.3},ir_lower={:.3},ir_verify={:.3},backend={:.3},plan_verify={:.3}] report_export_ms[p50={:.3},p95={:.3}]",
                 fixture.id,
                 mode.mode.as_str(),
                 diagnostics.elapsed_ms.p50,
                 diagnostics.elapsed_ms.p95,
+                diagnostics.compiler_cpu_ms.p50,
                 verified.elapsed_ms.p50,
                 verified.elapsed_ms.p95,
+                verified.compiler_cpu_ms.p50,
                 verified.phase_ms.semantic.p50,
                 verified.phase_ms.contract_verify.p50,
                 verified.phase_ms.ir_lower.p50,
@@ -515,6 +586,8 @@ pub fn run(
                 verified.phase_ms.ir_validation.p95,
                 verified.phase_ms.backend.p95,
                 verified.phase_ms.plan_validation.p95,
+                verified.export.elapsed_ms.p50,
+                verified.export.elapsed_ms.p95,
             );
         }
     }
@@ -529,24 +602,42 @@ fn collect(
     setup_samples: usize,
     scored_samples: usize,
 ) -> ToolResult<()> {
-    let producer_path = workspace.join(PRODUCER_PATH);
-    require_current_prebuilt_producer(workspace, &producer_path)?;
     let before = current_identity(workspace)?;
-    let producer_digest = sha256_file(&producer_path)?;
+    let product_path = workspace.join(safe_relative_path(
+        &budget.protocol.product_producer,
+        "product producer path",
+    )?);
+    let evidence_path = workspace.join(safe_relative_path(
+        &budget.protocol.evidence_producer,
+        "evidence producer path",
+    )?);
+    require_current_prebuilt_producer(workspace, &product_path)?;
+    require_current_prebuilt_producer(workspace, &evidence_path)?;
+    let product_digest = sha256_file(&product_path)?;
+    let evidence_digest = sha256_file(&evidence_path)?;
+    let mut observed_producers = ObservedProducerMetadata::default();
     let mut fixtures = Vec::with_capacity(budget.fixtures.len());
     for fixture in &budget.fixtures {
         fixtures.push(collect_fixture(
             workspace,
-            &producer_path,
+            &before,
+            &product_path,
+            product_digest.as_str(),
+            &evidence_path,
+            evidence_digest.as_str(),
+            &budget.protocol,
+            &mut observed_producers,
             fixture,
             setup_samples,
             scored_samples,
         )?);
     }
-    let after_producer_digest = sha256_file(&producer_path)?;
-    if after_producer_digest != producer_digest {
+    let after_product_digest = sha256_file(&product_path)?;
+    let after_evidence_digest = sha256_file(&evidence_path)?;
+    if after_product_digest != product_digest || after_evidence_digest != evidence_digest {
         return Err(
-            "release compiler sample producer changed while performance was being measured".into(),
+            "a release compiler sample producer changed while performance was being measured"
+                .into(),
         );
     }
     let after = current_identity(workspace)?;
@@ -580,9 +671,21 @@ fn collect(
             format_version: budget.format_version,
             owner_plan: budget.owner_plan.clone(),
         },
-        producer: ProducerIdentity {
-            path: PRODUCER_PATH.to_owned(),
-            sha256: producer_digest.as_str().to_owned(),
+        producers: ProducerSetIdentity {
+            product: ProducerIdentity {
+                path: budget.protocol.product_producer.clone(),
+                sha256: product_digest.as_str().to_owned(),
+                metadata: observed_producers
+                    .product
+                    .ok_or("no product producer metadata was observed")?,
+            },
+            evidence: ProducerIdentity {
+                path: budget.protocol.evidence_producer.clone(),
+                sha256: evidence_digest.as_str().to_owned(),
+                metadata: observed_producers
+                    .evidence
+                    .ok_or("no evidence producer metadata was observed")?,
+            },
         },
         protocol: protocol_evidence(budget, setup_samples, scored_samples),
         phase_acceptance,
@@ -601,7 +704,13 @@ fn collect(
 
 fn collect_fixture(
     workspace: &Path,
-    producer: &Path,
+    identity: &ExpectedIdentity,
+    product: &Path,
+    product_digest: &str,
+    evidence: &Path,
+    evidence_digest: &str,
+    protocol: &BudgetProtocol,
+    observed_producers: &mut ObservedProducerMetadata,
     budget: &FixtureBudget,
     setup_samples: usize,
     scored_samples: usize,
@@ -620,7 +729,13 @@ fn collect_fixture(
     for mode in [ColdMode::FreshProcess, ColdMode::EmptySession] {
         let diagnostics = collect_metric(
             workspace,
-            producer,
+            identity,
+            product,
+            product_digest,
+            evidence,
+            evidence_digest,
+            protocol,
+            observed_producers,
             &budget.source,
             mode,
             SampleIntent::Diagnostics,
@@ -630,7 +745,13 @@ fn collect_fixture(
         )?;
         let verified = collect_metric(
             workspace,
-            producer,
+            identity,
+            product,
+            product_digest,
+            evidence,
+            evidence_digest,
+            protocol,
+            observed_producers,
             &budget.source,
             mode,
             SampleIntent::Verified,
@@ -698,7 +819,13 @@ fn collect_fixture(
 #[allow(clippy::too_many_arguments)]
 fn collect_metric(
     workspace: &Path,
-    producer: &Path,
+    identity: &ExpectedIdentity,
+    product: &Path,
+    product_digest: &str,
+    evidence: &Path,
+    evidence_digest: &str,
+    protocol: &BudgetProtocol,
+    observed_producers: &mut ObservedProducerMetadata,
     source: &str,
     mode: ColdMode,
     intent: SampleIntent,
@@ -713,10 +840,69 @@ fn collect_metric(
     // prevents allocator high-water marks or future process-local caches from
     // leaking setup/warm state into the empty-session RSS and timing samples.
     for sample_index in 0..setup_samples + scored_samples {
-        let batch = run_sample_batch(workspace, producer, source, mode, intent, 1)?;
+        let product_first = sample_index % 2 == 0;
+        let (product_batch, evidence_batch) = if product_first {
+            let product_batch = run_sample_batch(workspace, product, source, mode, intent, 1)?;
+            let evidence_batch = run_sample_batch(workspace, evidence, source, mode, intent, 1)?;
+            (product_batch, evidence_batch)
+        } else {
+            let evidence_batch = run_sample_batch(workspace, evidence, source, mode, intent, 1)?;
+            let product_batch = run_sample_batch(workspace, product, source, mode, intent, 1)?;
+            (product_batch, evidence_batch)
+        };
+        let product_batch = enrich_and_validate_batch(
+            workspace,
+            identity,
+            product_digest,
+            &protocol.product_producer,
+            &protocol.product_kind,
+            &protocol.product_allocator,
+            "none",
+            "none",
+            protocol,
+            product_batch,
+            source,
+            mode,
+            intent,
+            1,
+        )?;
+        let evidence_batch = enrich_and_validate_batch(
+            workspace,
+            identity,
+            evidence_digest,
+            &protocol.evidence_producer,
+            &protocol.evidence_kind,
+            &protocol.evidence_allocator,
+            &protocol.evidence_instrumentation,
+            &protocol.evidence_counter_scope,
+            protocol,
+            evidence_batch,
+            source,
+            mode,
+            intent,
+            1,
+        )?;
+        observe_producer_metadata(
+            &mut observed_producers.product,
+            &product_batch.producer,
+            "product",
+        )?;
+        observe_producer_metadata(
+            &mut observed_producers.evidence,
+            &evidence_batch.producer,
+            "evidence",
+        )?;
+        validate_product_evidence_parity(&product_batch, &evidence_batch)?;
         absorb_batch(
             &mut collected,
-            batch,
+            product_batch,
+            source,
+            intent,
+            sample_index >= setup_samples,
+        )?;
+        absorb_evidence_batch(
+            &mut collected,
+            evidence_batch,
             source,
             intent,
             sample_index >= setup_samples,
@@ -737,8 +923,10 @@ fn run_sample_batch(
     mode: ColdMode,
     intent: SampleIntent,
     samples: usize,
-) -> ToolResult<SampleBatch> {
+) -> ToolResult<ExecutedSampleBatch> {
     let sample_count = samples.to_string();
+    let process_started_unix_us = unix_time_us()?;
+    let process_started = Instant::now();
     let output = Command::new(producer)
         .current_dir(workspace)
         .env("RAYON_NUM_THREADS", "1")
@@ -754,6 +942,7 @@ fn run_sample_batch(
             sample_count.as_str(),
         ])
         .output()?;
+    let process_exit_ms = duration_ms(process_started.elapsed());
     if !output.status.success() {
         return Err(format!(
             "compiler sample {} {} failed with {}: {}",
@@ -781,8 +970,140 @@ fn run_sample_batch(
             bounded_lossy(&output.stdout, 4096)
         )
     })?;
-    validate_sample_batch(&batch, source, mode, intent, samples)?;
+    Ok(ExecutedSampleBatch {
+        batch,
+        process_started_unix_us,
+        process_exit_ms,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enrich_and_validate_batch(
+    workspace: &Path,
+    identity: &ExpectedIdentity,
+    producer_digest: &str,
+    producer_path: &str,
+    product_kind: &str,
+    allocator_id: &str,
+    allocation_instrumentation: &str,
+    allocation_counter_scope: &str,
+    protocol: &BudgetProtocol,
+    execution: ExecutedSampleBatch,
+    source: &str,
+    mode: ColdMode,
+    intent: SampleIntent,
+    samples: usize,
+) -> ToolResult<SampleBatch> {
+    let ExecutedSampleBatch {
+        mut batch,
+        process_started_unix_us,
+        process_exit_ms,
+    } = execution;
+    validate_producer_metadata(
+        workspace,
+        identity,
+        &batch.producer,
+        ExpectedProducer {
+            path: producer_path,
+            sha256: producer_digest,
+            product_kind,
+            allocator_id,
+            allocation_instrumentation,
+            allocation_counter_scope,
+            cargo_profile: &protocol.build_profile,
+            target_cpu: &protocol.target_cpu,
+            profile_options: &protocol.profile_options,
+            rustflags: &protocol.rustflags,
+        },
+    )?;
+    if batch.samples.len() != 1 || samples != 1 {
+        return Err(
+            "external process endpoint accounting requires one observation per process".into(),
+        );
+    }
+    let sample = batch.samples.first_mut().expect("one sample checked");
+    let artifact_delta_us = sample
+        .compiler_artifact_ready_unix_us
+        .checked_sub(process_started_unix_us)
+        .ok_or("compiler artifact timestamp predates the collector process start")?;
+    let process_to_artifact_ms = artifact_delta_us as f64 / 1_000.0;
+    if process_to_artifact_ms > process_exit_ms + 1.0 {
+        return Err(format!(
+            "compiler artifact endpoint {process_to_artifact_ms:.3}ms exceeds process-exit endpoint {process_exit_ms:.3}ms"
+        )
+        .into());
+    }
+    sample.process_to_artifact_ms = process_to_artifact_ms;
+    sample.process_exit_ms = process_exit_ms;
+    sample.startup_and_cli_ms = (process_to_artifact_ms - sample.elapsed_ms).max(0.0);
+    sample.post_artifact_ms = (process_exit_ms - process_to_artifact_ms).max(0.0);
+    sample.normative_elapsed_ms = match mode {
+        ColdMode::FreshProcess => process_to_artifact_ms,
+        ColdMode::EmptySession => sample.elapsed_ms,
+    };
+    validate_sample_batch(
+        &batch,
+        source,
+        mode,
+        intent,
+        samples,
+        allocation_instrumentation != "none",
+    )?;
     Ok(batch)
+}
+
+fn observe_producer_metadata(
+    observed: &mut Option<ProducerMetadata>,
+    candidate: &ProducerMetadata,
+    lane: &str,
+) -> ToolResult<()> {
+    match observed {
+        Some(previous) if previous != candidate => {
+            Err(format!("{lane} producer metadata changed during collection").into())
+        }
+        Some(_) => Ok(()),
+        None => {
+            *observed = Some(candidate.clone());
+            Ok(())
+        }
+    }
+}
+
+fn validate_product_evidence_parity(
+    product: &SampleBatch,
+    evidence: &SampleBatch,
+) -> ToolResult<()> {
+    if product.source != evidence.source
+        || product.intent != evidence.intent
+        || product.compiler_state != evidence.compiler_state
+        || product.target_profile != evidence.target_profile
+        || product.program_role != evidence.program_role
+        || product.compiler_threads != evidence.compiler_threads
+        || product.compiler_caches != evidence.compiler_caches
+        || product.cache_hit_count != evidence.cache_hit_count
+        || product.samples.len() != evidence.samples.len()
+    {
+        return Err("product/evidence compiler sample batch contracts differ".into());
+    }
+    for (product, evidence) in product.samples.iter().zip(&evidence.samples) {
+        validate_product_evidence_sample_parity(product, evidence)?;
+    }
+    Ok(())
+}
+
+fn validate_product_evidence_sample_parity(product: &Sample, evidence: &Sample) -> ToolResult<()> {
+    if product.source_bundle_digest_v1 != evidence.source_bundle_digest_v1
+        || product.diagnostics_fingerprint_v1 != evidence.diagnostics_fingerprint_v1
+        || product.diagnostic_count != evidence.diagnostic_count
+        || product.full_document_typecheck_coverage != evidence.full_document_typecheck_coverage
+        || product.plan_sha256 != evidence.plan_sha256
+        || product.work != evidence.work
+    {
+        return Err(
+            "product/evidence compiler observations differ semantically or in owned work".into(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_sample_batch(
@@ -791,6 +1112,7 @@ fn validate_sample_batch(
     mode: ColdMode,
     intent: SampleIntent,
     samples: usize,
+    allocation_instrumented: bool,
 ) -> ToolResult<()> {
     if batch.format_version != PRODUCER_FORMAT_VERSION {
         return Err(format!(
@@ -836,12 +1158,16 @@ fn validate_sample_batch(
         .into());
     }
     for sample in &batch.samples {
-        validate_sample_shape(sample, intent)?;
+        validate_sample_shape(sample, intent, allocation_instrumented)?;
     }
     Ok(())
 }
 
-fn validate_sample_shape(sample: &Sample, intent: SampleIntent) -> ToolResult<()> {
+fn validate_sample_shape(
+    sample: &Sample,
+    intent: SampleIntent,
+    allocation_instrumented: bool,
+) -> ToolResult<()> {
     if sample.producer_pid == 0
         || sample.observation_started_unix_us == 0
         || sample.compiler_artifact_ready_unix_us < sample.observation_started_unix_us
@@ -849,6 +1175,12 @@ fn validate_sample_shape(sample: &Sample, intent: SampleIntent) -> ToolResult<()
         return Err("compiler sample process/time evidence is invalid".into());
     }
     if !finite_nonnegative(sample.elapsed_ms)
+        || !finite_positive(sample.normative_elapsed_ms)
+        || !finite_positive(sample.process_to_artifact_ms)
+        || !finite_positive(sample.process_exit_ms)
+        || !finite_nonnegative(sample.startup_and_cli_ms)
+        || !finite_nonnegative(sample.post_artifact_ms)
+        || !finite_nonnegative(sample.compiler_cpu_ms)
         || sample
             .phase
             .values()
@@ -860,8 +1192,12 @@ fn validate_sample_shape(sample: &Sample, intent: SampleIntent) -> ToolResult<()
     if sample.peak_rss_kib == 0 {
         return Err("compiler sample peak RSS is unavailable or zero".into());
     }
-    if sample.allocations.allocation_calls == 0 || sample.allocations.allocated_bytes == 0 {
-        return Err("compiler sample allocation counters are unavailable or zero".into());
+    if allocation_instrumented {
+        if sample.allocations.allocation_calls == 0 || sample.allocations.allocated_bytes == 0 {
+            return Err("instrumented compiler allocation counters are unavailable or zero".into());
+        }
+    } else if sample.allocations != AllocationSample::default() {
+        return Err("uninstrumented product compiler emitted allocation counters".into());
     }
     if !sample.work.has_cold_complete_frontend_work() {
         return Err("compiler sample frontend work counters are incomplete or inconsistent".into());
@@ -909,11 +1245,17 @@ fn validate_sample_shape(sample: &Sample, intent: SampleIntent) -> ToolResult<()
                 || sample.phase.ir_validation_ms != 0.0
                 || sample.phase.backend_ms != 0.0
                 || sample.phase.plan_validation_ms != 0.0
-                || sample.phase.serialization_ms != 0.0
             {
                 return Err(
                     "diagnostics sample phase ownership is incomplete or overlapping".into(),
                 );
+            }
+            if sample.export.kind != "none"
+                || sample.export.elapsed_ms != 0.0
+                || sample.export.output_bytes != 0
+                || sample.export.sha256.is_some()
+            {
+                return Err("diagnostics sample unexpectedly performed report export".into());
             }
         }
         (SampleIntent::Verified, Some(digest)) => {
@@ -934,9 +1276,18 @@ fn validate_sample_shape(sample: &Sample, intent: SampleIntent) -> ToolResult<()
                 || !finite_positive(sample.phase.ir_validation_ms)
                 || !finite_positive(sample.phase.backend_ms)
                 || !finite_positive(sample.phase.plan_validation_ms)
-                || !finite_positive(sample.phase.serialization_ms)
             {
                 return Err("verified sample omitted a required compiler/report phase".into());
+            }
+            if sample.export.kind != "pretty-json-machine-plan-sha256"
+                || !finite_positive(sample.export.elapsed_ms)
+                || sample.export.output_bytes == 0
+                || sample.export.sha256.as_deref() != Some(digest.as_str())
+            {
+                return Err(
+                    "verified sample report export is missing, malformed, or differs from its plan oracle"
+                        .into(),
+                );
             }
         }
         (SampleIntent::Diagnostics, Some(_)) => {
@@ -987,6 +1338,23 @@ fn absorb_batch(
     Ok(())
 }
 
+fn absorb_evidence_batch(
+    collected: &mut CollectedSamples,
+    batch: SampleBatch,
+    source: &str,
+    intent: SampleIntent,
+    scored: bool,
+) -> ToolResult<()> {
+    if batch.source != source || batch.intent != intent {
+        return Err("compiler evidence batch identity changed after validation".into());
+    }
+    collected.evidence_parity_pass = true;
+    if scored {
+        collected.evidence_scored.extend(batch.samples);
+    }
+    Ok(())
+}
+
 fn absorb_sample(collected: &mut CollectedSamples, sample: &Sample) {
     collected
         .source_digests
@@ -1011,7 +1379,7 @@ fn metric_report(
         collected
             .scored
             .iter()
-            .map(|sample| sample.elapsed_ms)
+            .map(|sample| sample.normative_elapsed_ms)
             .collect(),
     );
     let peak_rss_kib = summarize_rss(
@@ -1021,9 +1389,31 @@ fn metric_report(
             .map(|sample| sample.peak_rss_kib)
             .collect(),
     );
-    let allocations = summarize_allocations(&collected.scored);
-    let work = summarize_work(&collected.scored);
+    let compiler_cpu_ms = summarize_ms(
+        collected
+            .scored
+            .iter()
+            .map(|sample| sample.compiler_cpu_ms)
+            .collect(),
+    );
+    let compiler_minor_page_faults = summarize_counts(
+        collected
+            .scored
+            .iter()
+            .map(|sample| sample.compiler_minor_page_faults)
+            .collect(),
+    );
+    let compiler_major_page_faults = summarize_counts(
+        collected
+            .scored
+            .iter()
+            .map(|sample| sample.compiler_major_page_faults)
+            .collect(),
+    );
+    let allocations = summarize_allocations(&collected.evidence_scored);
+    let work = summarize_work(&collected.evidence_scored);
     let phase_ms = summarize_phases(&collected.scored);
+    let export = summarize_exports(&collected.scored);
     let observed_source_bundle_digests = collected.source_digests.into_iter().collect::<Vec<_>>();
     let observed_diagnostics_fingerprint_v1 = collected
         .diagnostics_fingerprints
@@ -1034,6 +1424,7 @@ fn metric_report(
         intent,
         elapsed_ms,
         peak_rss_kib,
+        collected.evidence_parity_pass,
         collected.cache_hit_count,
         &observed_source_bundle_digests,
         &observed_diagnostics_fingerprint_v1,
@@ -1044,15 +1435,21 @@ fn metric_report(
         intent,
         setup_samples,
         scored_samples: collected.scored,
+        evidence_scored_samples: collected.evidence_scored,
+        evidence_parity_pass: collected.evidence_parity_pass,
         cache_hit_count: collected.cache_hit_count,
         observed_source_bundle_digests,
         observed_diagnostics_fingerprint_v1,
         observed_plan_sha256,
         elapsed_ms,
+        compiler_cpu_ms,
+        compiler_minor_page_faults,
+        compiler_major_page_faults,
         peak_rss_kib,
         allocations,
         work,
         phase_ms,
+        export,
         evaluation,
     }
 }
@@ -1061,6 +1458,7 @@ fn evaluate_metric(
     intent: SampleIntent,
     elapsed_ms: MillisSummary,
     peak_rss_kib: RssSummary,
+    evidence_parity_pass: bool,
     cache_hit_count: u64,
     source_digests: &[String],
     diagnostics_fingerprints: &[String],
@@ -1095,7 +1493,8 @@ fn evaluate_metric(
                     == Some(budget.machine_plan_sha256.as_str())
         }
     };
-    let pass = p95_budget_pass
+    let pass = evidence_parity_pass
+        && p95_budget_pass
         && peak_rss_budget_pass
         && cache_disabled_pass
         && source_digest_pass
@@ -1107,6 +1506,7 @@ fn evaluate_metric(
         } else {
             ReportStatus::Fail
         },
+        evidence_parity_pass,
         p95_budget_pass,
         peak_rss_budget_pass,
         cache_disabled_pass,
@@ -1299,16 +1699,28 @@ fn validate_report(
     if report.budget != expected_budget {
         return Err("compiler performance report budget identity is stale".into());
     }
-    let producer_path = workspace.join(PRODUCER_PATH);
-    require_current_prebuilt_producer(workspace, &producer_path)?;
-    let producer_digest = sha256_file(&producer_path)?;
-    let expected_producer = ProducerIdentity {
-        path: PRODUCER_PATH.to_owned(),
-        sha256: producer_digest.as_str().to_owned(),
-    };
-    if report.producer != expected_producer {
-        return Err("compiler performance report producer identity is stale".into());
-    }
+    validate_report_producer(
+        workspace,
+        &expected_identity,
+        &report.producers.product,
+        &budget.protocol.product_producer,
+        &budget.protocol.product_kind,
+        &budget.protocol.product_allocator,
+        "none",
+        "none",
+        &budget.protocol,
+    )?;
+    validate_report_producer(
+        workspace,
+        &expected_identity,
+        &report.producers.evidence,
+        &budget.protocol.evidence_producer,
+        &budget.protocol.evidence_kind,
+        &budget.protocol.evidence_allocator,
+        &budget.protocol.evidence_instrumentation,
+        &budget.protocol.evidence_counter_scope,
+        &budget.protocol,
+    )?;
     let expected_protocol = protocol_evidence(budget, setup_samples, scored_samples);
     if report.protocol != expected_protocol
         || report.run_classification != classification(budget, setup_samples, scored_samples)
@@ -1357,6 +1769,52 @@ fn validate_report(
         );
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_report_producer(
+    workspace: &Path,
+    identity: &ExpectedIdentity,
+    producer: &ProducerIdentity,
+    expected_path: &str,
+    expected_kind: &str,
+    expected_allocator: &str,
+    expected_instrumentation: &str,
+    expected_counter_scope: &str,
+    protocol: &BudgetProtocol,
+) -> ToolResult<()> {
+    if producer.path != expected_path {
+        return Err(format!(
+            "compiler report producer path is {}; expected {expected_path}",
+            producer.path
+        )
+        .into());
+    }
+    let path = workspace.join(safe_relative_path(expected_path, "producer path")?);
+    require_current_prebuilt_producer(workspace, &path)?;
+    let digest = sha256_file(&path)?;
+    if producer.sha256 != digest.as_str() {
+        return Err(
+            format!("compiler performance producer {expected_path} identity is stale").into(),
+        );
+    }
+    validate_producer_metadata(
+        workspace,
+        identity,
+        &producer.metadata,
+        ExpectedProducer {
+            path: expected_path,
+            sha256: digest.as_str(),
+            product_kind: expected_kind,
+            allocator_id: expected_allocator,
+            allocation_instrumentation: expected_instrumentation,
+            allocation_counter_scope: expected_counter_scope,
+            cargo_profile: &protocol.build_profile,
+            target_cpu: &protocol.target_cpu,
+            profile_options: &protocol.profile_options,
+            rustflags: &protocol.rustflags,
+        },
+    )
 }
 
 fn validate_fixture_report(
@@ -1487,6 +1945,8 @@ fn validate_metric_report(
     if report.intent != intent
         || report.setup_samples != setup_samples
         || report.scored_samples.len() != scored_samples
+        || report.evidence_scored_samples.len() != scored_samples
+        || !report.evidence_parity_pass
     {
         return Err(format!(
             "{} metric sampling shape differs from the requested protocol",
@@ -1495,7 +1955,17 @@ fn validate_metric_report(
         .into());
     }
     for sample in &report.scored_samples {
-        validate_sample_shape(sample, intent)?;
+        validate_sample_shape(sample, intent, false)?;
+    }
+    for sample in &report.evidence_scored_samples {
+        validate_sample_shape(sample, intent, true)?;
+    }
+    for (product, evidence) in report
+        .scored_samples
+        .iter()
+        .zip(&report.evidence_scored_samples)
+    {
+        validate_product_evidence_sample_parity(product, evidence)?;
     }
     if report
         .scored_samples
@@ -1512,7 +1982,7 @@ fn validate_metric_report(
         report
             .scored_samples
             .iter()
-            .map(|sample| sample.elapsed_ms)
+            .map(|sample| sample.normative_elapsed_ms)
             .collect(),
     );
     let rss = summarize_rss(
@@ -1522,14 +1992,40 @@ fn validate_metric_report(
             .map(|sample| sample.peak_rss_kib)
             .collect(),
     );
-    let allocations = summarize_allocations(&report.scored_samples);
-    let work = summarize_work(&report.scored_samples);
+    let cpu = summarize_ms(
+        report
+            .scored_samples
+            .iter()
+            .map(|sample| sample.compiler_cpu_ms)
+            .collect(),
+    );
+    let minor_faults = summarize_counts(
+        report
+            .scored_samples
+            .iter()
+            .map(|sample| sample.compiler_minor_page_faults)
+            .collect(),
+    );
+    let major_faults = summarize_counts(
+        report
+            .scored_samples
+            .iter()
+            .map(|sample| sample.compiler_major_page_faults)
+            .collect(),
+    );
+    let allocations = summarize_allocations(&report.evidence_scored_samples);
+    let work = summarize_work(&report.evidence_scored_samples);
     let phases = summarize_phases(&report.scored_samples);
+    let export = summarize_exports(&report.scored_samples);
     if report.elapsed_ms != elapsed
+        || report.compiler_cpu_ms != cpu
+        || report.compiler_minor_page_faults != minor_faults
+        || report.compiler_major_page_faults != major_faults
         || report.peak_rss_kib != rss
         || report.allocations != allocations
         || report.work != work
         || report.phase_ms != phases
+        || report.export != export
     {
         return Err(format!(
             "{} metric nearest-rank summaries do not match its scored samples",
@@ -1551,6 +2047,7 @@ fn validate_metric_report(
         intent,
         elapsed,
         rss,
+        report.evidence_parity_pass,
         report.cache_hit_count,
         &report.observed_source_bundle_digests,
         &report.observed_diagnostics_fingerprint_v1,
@@ -1678,7 +2175,29 @@ fn summarize_phases(samples: &[Sample]) -> PhaseSummary {
         ir_validation: values(|phase| phase.ir_validation_ms),
         backend: values(|phase| phase.backend_ms),
         plan_validation: values(|phase| phase.plan_validation_ms),
-        serialization: values(|phase| phase.serialization_ms),
+    }
+}
+
+fn summarize_exports(samples: &[Sample]) -> ExportSummary {
+    ExportSummary {
+        kinds: samples
+            .iter()
+            .map(|sample| sample.export.kind.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
+        elapsed_ms: summarize_ms(
+            samples
+                .iter()
+                .map(|sample| sample.export.elapsed_ms)
+                .collect(),
+        ),
+        output_bytes: summarize_counts(
+            samples
+                .iter()
+                .map(|sample| sample.export.output_bytes)
+                .collect(),
+        ),
     }
 }
 
@@ -1697,6 +2216,16 @@ fn protocol_evidence(
     ProtocolEvidence {
         build_profile: budget.protocol.build_profile.clone(),
         target_profile: budget.protocol.target_profile.clone(),
+        product_kind: budget.protocol.product_kind.clone(),
+        product_allocator: budget.protocol.product_allocator.clone(),
+        evidence_kind: budget.protocol.evidence_kind.clone(),
+        evidence_allocator: budget.protocol.evidence_allocator.clone(),
+        evidence_instrumentation: budget.protocol.evidence_instrumentation.clone(),
+        evidence_counter_scope: budget.protocol.evidence_counter_scope.clone(),
+        target_cpu: budget.protocol.target_cpu.clone(),
+        profile_options: budget.protocol.profile_options.clone(),
+        rustflags: budget.protocol.rustflags.clone(),
+        producer_pair_schedule: budget.protocol.producer_pair_schedule.clone(),
         default_setup_samples: budget.protocol.setup_samples,
         default_scored_samples: budget.protocol.scored_samples,
         effective_setup_samples: setup_samples,
@@ -1752,6 +2281,19 @@ fn validate_budget(workspace: &Path, budget: &BudgetManifest) -> ToolResult<()> 
     safe_relative_path(&budget.report, "budget report path")?;
     if budget.protocol.build_profile != "release"
         || budget.protocol.target_profile != "software_default"
+        || budget.protocol.product_producer.is_empty()
+        || budget.protocol.evidence_producer.is_empty()
+        || budget.protocol.product_producer == budget.protocol.evidence_producer
+        || budget.protocol.product_kind.is_empty()
+        || budget.protocol.product_allocator.is_empty()
+        || budget.protocol.evidence_kind.is_empty()
+        || budget.protocol.evidence_allocator.is_empty()
+        || budget.protocol.evidence_instrumentation != "thread-local-rust-global-allocator"
+        || budget.protocol.evidence_counter_scope
+            != "single-compiler-thread-rust-global-allocator-events"
+        || budget.protocol.target_cpu.is_empty()
+        || budget.protocol.profile_options.is_empty()
+        || budget.protocol.producer_pair_schedule != "alternating-by-observation-index"
         || budget.protocol.compiler_threads != 1
         || budget.protocol.compiler_caches != "disabled"
         || budget.protocol.cold_modes.len() != 2
@@ -1764,6 +2306,8 @@ fn validate_budget(workspace: &Path, budget: &BudgetManifest) -> ToolResult<()> 
     {
         return Err("compiler budget protocol differs from the cold acceptance contract".into());
     }
+    safe_relative_path(&budget.protocol.product_producer, "product producer path")?;
+    safe_relative_path(&budget.protocol.evidence_producer, "evidence producer path")?;
     validate_effective_samples(
         budget.protocol.setup_samples,
         budget.protocol.scored_samples,
@@ -1958,10 +2502,9 @@ fn validate_scaling_budget(scaling: &ScalingBudget) -> ToolResult<()> {
             return Err(format!("invalid scaling workload `{}`", workload.id).into());
         }
         let expected = match workload.id.as_str() {
-            "call-depth" | "call-site-count" => ("diagnostics", "typecheck-inference-call-visits"),
-            "contextual-call-site-count" | "static-branch-count" => {
-                ("verified", "semantic-graph-nodes")
-            }
+            "call-depth" | "call-site-count" => ("diagnostics", "checked-calls"),
+            "contextual-call-site-count" => ("verified", "semantic-graph-nodes"),
+            "static-branch-count" => ("verified", "checked-expressions"),
             "source-unit-count" => ("diagnostics", "parse-source-units-attempted"),
             "dependency-cone-size" => ("verified", "dependency-scc-components"),
             other => return Err(format!("unsupported scaling workload `{other}`").into()),
@@ -2033,6 +2576,16 @@ fn finite_positive(value: f64) -> bool {
 
 fn finite_nonnegative(value: f64) -> bool {
     value.is_finite() && value >= 0.0
+}
+
+fn duration_ms(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+fn unix_time_us() -> ToolResult<u64> {
+    Ok(u64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros(),
+    )?)
 }
 
 fn status_name(status: ReportStatus) -> &'static str {

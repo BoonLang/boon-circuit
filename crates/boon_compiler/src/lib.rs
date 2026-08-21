@@ -855,6 +855,25 @@ pub fn check_diagnostics_source(
     check_kernel_source(request)
 }
 
+/// Produces the complete diagnostics product directly, without constructing
+/// the rich checked compatibility image required by editor/export consumers.
+/// This is the fresh-process counterpart of `CompileIntent::Diagnostics` in a
+/// newly created [`CompilerSession`].
+pub fn compile_diagnostics_source(
+    request: CompilerCheckRequest<'_>,
+) -> CompilerResult<CompilerDiagnostics> {
+    let parse_started = Instant::now();
+    let (project, parse_work) = parse_kernel_compile_source(request.source)?;
+    let parse_ms = elapsed_ms(parse_started);
+    kernel_oracle::compiler_diagnostics_from_kernel(
+        project,
+        parse_work,
+        parse_ms,
+        request.program_role,
+    )
+    .map_err(|error| PlanError::new(error).into())
+}
+
 /// Checks source for a request that will continue through semantic sealing and
 /// lowering. Successful checks keep lowering-owned tables only in the
 /// `CheckedProgram`; error results retain the same complete diagnostics as

@@ -1,6 +1,8 @@
 mod architecture;
+mod compiler_allocator;
 mod compiler_interactions;
 mod compiler_performance;
+mod compiler_producer;
 mod compiler_work_sample;
 mod dependency_classifier;
 mod fjordpulse_traceability;
@@ -140,6 +142,18 @@ fn run_standalone(workspace: &Path, args: &[String]) -> ToolResult<Option<Report
                 report.map(|path| resolve_path(workspace, path)),
                 setup_samples,
                 scored_samples,
+            )
+            .map(Some)
+        }
+        "verify-compiler-allocator" => {
+            let (check_existing, report, setup_samples, scored_samples) =
+                parse_compiler_performance_options(&args[1..])?;
+            compiler_allocator::run(
+                workspace,
+                check_existing,
+                report.map(|path| resolve_path(workspace, path)),
+                setup_samples.unwrap_or(1),
+                scored_samples.unwrap_or(20),
             )
             .map(Some)
         }
@@ -324,6 +338,9 @@ fn print_help(manifest: &HandoffManifest) {
     println!("  verify-packed-baseline [--check-existing] [--report <path>]");
     println!(
         "  verify-compiler-performance [--check-existing] [--report <path>] [--setup-samples N] [--scored-samples N]"
+    );
+    println!(
+        "  verify-compiler-allocator [--check-existing] [--report <path>] [--setup-samples N] [--scored-samples N]"
     );
     println!(
         "  verify-compiler-interactions [--check-existing] [--report <path>] [--setup-samples N] [--scored-samples N]"

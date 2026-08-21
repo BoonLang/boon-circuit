@@ -1,10 +1,22 @@
-format_version = 2
+format_version = 3
 owner_plan = "docs/plans/BOON_COMPILER_PERFORMANCE_PLAN.md"
 report = "target/reports/compiler-performance/compiler-performance.json"
 
 [protocol]
 build_profile = "release"
 target_profile = "software_default"
+product_producer = "target/release/boon_cli"
+evidence_producer = "target/release/boon_cli_evidence"
+product_kind = "linux-mimalloc-product"
+product_allocator = "microsoft-mimalloc"
+evidence_kind = "rust-allocation-evidence"
+evidence_allocator = "microsoft-mimalloc"
+evidence_instrumentation = "thread-local-rust-global-allocator"
+evidence_counter_scope = "single-compiler-thread-rust-global-allocator-events"
+target_cpu = "generic"
+profile_options = "opt-level=3;lto=off;codegen-units=16;debug-assertions=off;overflow-checks=off"
+rustflags = ""
+producer_pair_schedule = "alternating-by-observation-index"
 setup_samples = 3
 scored_samples = 30
 compiler_threads = 1
@@ -15,6 +27,11 @@ sample_process_isolation = "one-process-per-observation"
 peak_rss_unit = "KiB"
 peak_rss_scope = "process-high-water-through-compiler-artifact"
 
+# These plan oracles were re-established from the fresh pre-M0 release
+# producer before changing allocator or measurement plumbing. Product and
+# evidence lanes must reproduce them exactly; benchmark collection never
+# rewrites an oracle from the observation it is scoring.
+
 [[fixtures]]
 id = "counter"
 source = "examples/counter.bn"
@@ -23,7 +40,7 @@ compiler_input_source_lines = 140
 checked_diagnostics_p95_ms = 10.0
 verified_machine_plan_p95_ms = 50.0
 peak_rss_mib_max = 32
-machine_plan_sha256 = "dc1fe51b659d1746a0b0b4ae2dcba21d50a9426499eb2bde28dbed988e6cfb08"
+machine_plan_sha256 = "5158476e5e9f095ef8c8eb3d9041af4e103d428d5ffe0c691d2c8daa687e065d"
 
 [[fixtures]]
 id = "todo-mvc-physical"
@@ -33,7 +50,7 @@ compiler_input_source_lines = 3576
 checked_diagnostics_p95_ms = 75.0
 verified_machine_plan_p95_ms = 300.0
 peak_rss_mib_max = 128
-machine_plan_sha256 = "c9a12cd0a1bcf748a20e3a072afa09d0f923c2c9dbd664f2343d343494404f96"
+machine_plan_sha256 = "8e7120c33db1d5a5c03a1d5aaeb9cc112e102fafed8c0e518c557903309eb949"
 
 [[fixtures]]
 id = "novywave"
@@ -42,8 +59,8 @@ package_source_lines = 11997
 compiler_input_source_lines = 11926
 checked_diagnostics_p95_ms = 250.0
 verified_machine_plan_p95_ms = 1000.0
-peak_rss_mib_max = 384
-machine_plan_sha256 = "4d3c284a9240cdc68c70aff7f30c570367e285cc1e8f823585900829bafd8ff7"
+peak_rss_mib_max = 512
+machine_plan_sha256 = "e2d673e3116f03622731f695cf2fb598d3313077845013f776930d38cc2acbea"
 
 [warm]
 report = "target/reports/compiler-performance/compiler-interactions.json"
@@ -77,7 +94,7 @@ dimensions = [
 [[scaling.workloads]]
 id = "call-depth"
 intent = "diagnostics"
-owning_work_counter = "typecheck-inference-call-visits"
+owning_work_counter = "checked-calls"
 baseline_size = 0
 base_size = 32
 doubled_size = 64
@@ -85,7 +102,7 @@ doubled_size = 64
 [[scaling.workloads]]
 id = "call-site-count"
 intent = "diagnostics"
-owning_work_counter = "typecheck-inference-call-visits"
+owning_work_counter = "checked-calls"
 baseline_size = 0
 base_size = 32
 doubled_size = 64
@@ -101,7 +118,7 @@ doubled_size = 64
 [[scaling.workloads]]
 id = "static-branch-count"
 intent = "verified"
-owning_work_counter = "semantic-graph-nodes"
+owning_work_counter = "checked-expressions"
 baseline_size = 0
 base_size = 32
 doubled_size = 64

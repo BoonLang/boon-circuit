@@ -24,11 +24,18 @@ pub(crate) fn require_current_prebuilt_producer(
         workspace.join("Cargo.lock"),
         workspace.join("rust-toolchain.toml"),
         workspace.join(".cargo"),
-        workspace.join("crates"),
+        workspace.join("third_party/mimalloc-3.5.0"),
     ] {
         if input.exists() {
             newest_build_input(&input, &mut newest)?;
         }
+    }
+    for entry in fs::read_dir(workspace.join("crates"))? {
+        let path = entry?.path();
+        if path.file_name().is_some_and(|name| name == "xtask") {
+            continue;
+        }
+        newest_build_input(&path, &mut newest)?;
     }
     if let Some((modified, input)) = newest.filter(|(modified, _)| *modified > producer_modified) {
         let _ = modified;

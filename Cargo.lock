@@ -697,6 +697,8 @@ dependencies = [
  "boon_compiler",
  "boon_plan",
  "boon_runtime",
+ "cc",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

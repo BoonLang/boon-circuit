@@ -1,0 +1,2 @@
+# Preserve byte-identical vendored upstream sources.
+third_party/mimalloc-3.5.0/** -whitespace

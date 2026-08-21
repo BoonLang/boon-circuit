@@ -1,20 +1,22 @@
 use boon_compiler::{
     CancellationToken, CheckedCompileRequest, CompileIntent, CompilerCheckRequest, CompilerProject,
-    CompilerSession, UnitUpdate, check_runtime_source, compiler_source_project_for_path,
-    finish_checked_sealed_machine_plan,
+    CompilerSession, UnitUpdate, check_runtime_source, compile_diagnostics_source,
+    compiler_source_project_for_path, finish_checked_sealed_machine_plan,
 };
 use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use crate::allocator::CompilerAllocationCounters;
 use crate::{
-    CompilerAllocationCounters, compiler_allocation_counters, reset_compiler_allocation_counters,
+    ProducerConfiguration, compiler_allocation_counters, reset_compiler_allocation_counters,
 };
 
-const FORMAT_VERSION: u16 = 5;
+const FORMAT_VERSION: u16 = 7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -41,6 +43,7 @@ impl SampleMode {
 #[derive(Debug, Serialize)]
 struct SampleBatch {
     format_version: u16,
+    producer: ProducerMetadata,
     source: String,
     intent: SampleIntent,
     compiler_state: &'static str,
@@ -57,6 +60,7 @@ struct SampleBatch {
 #[derive(Debug, Serialize)]
 struct WarmSessionBatch {
     format_version: u16,
+    producer: ProducerMetadata,
     workload: &'static str,
     source: String,
     switch_source: String,
@@ -75,6 +79,9 @@ struct WarmSessionBatch {
     original_unit_sha256: String,
     edited_unit_sha256: String,
     compiler_request_count: u64,
+    initial_resident_rss_kib: u64,
+    final_resident_rss_kib: u64,
+    peak_rss_kib: u64,
     edits: Vec<WarmEditSample>,
     switches: Vec<LoadedSwitchSample>,
     cancellation: CancellationEvidence,
@@ -99,6 +106,7 @@ struct WarmEditSample {
     source_bundle_digest_v1: String,
     plan_sha256: String,
     published_revision: u64,
+    resident_rss_kib: u64,
     diagnostics_allocations: AllocationSample,
     preview_allocations: AllocationSample,
     diagnostics_work: WorkSample,
@@ -150,6 +158,7 @@ struct LatestGenerationEvidence {
 #[derive(Debug, Serialize)]
 struct SyntheticScalingBatch {
     format_version: u16,
+    producer: ProducerMetadata,
     workload: &'static str,
     generator: &'static str,
     dimension: String,
@@ -169,12 +178,60 @@ struct SyntheticScalingBatch {
     phase: PhaseSample,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ProducerMetadata {
+    product_kind: &'static str,
+    binary_path: String,
+    binary_sha256: String,
+    build_source_head: &'static str,
+    build_source_workspace_sha256: &'static str,
+    build_source_dirty: bool,
+    build_input_scope: &'static str,
+    rustc_release: &'static str,
+    rustc_commit: &'static str,
+    rustc_commit_date: &'static str,
+    llvm_version: &'static str,
+    target_triple: &'static str,
+    target_cpu: &'static str,
+    cargo_profile: &'static str,
+    profile_options: &'static str,
+    rustflags: &'static str,
+    allocator: AllocatorMetadata,
+    allocation_instrumentation: &'static str,
+    allocation_counter_scope: &'static str,
+    ld_preload: Option<String>,
+    mimalloc_environment: Vec<EnvironmentValue>,
+    transparent_hugepage_enabled: String,
+    transparent_hugepage_defrag: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct AllocatorMetadata {
+    id: &'static str,
+    version: &'static str,
+    upstream_tag: Option<&'static str>,
+    upstream_commit: Option<&'static str>,
+    source_sha256: Option<&'static str>,
+    static_archive_sha256: Option<&'static str>,
+    linkage: &'static str,
+    build_options: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct EnvironmentValue {
+    name: String,
+    value: String,
+}
+
 #[derive(Debug, Serialize)]
 struct Sample {
     producer_pid: u32,
     observation_started_unix_us: u64,
     compiler_artifact_ready_unix_us: u64,
     elapsed_ms: f64,
+    compiler_cpu_ms: f64,
+    compiler_minor_page_faults: u64,
+    compiler_major_page_faults: u64,
     peak_rss_kib: u64,
     source_bundle_digest_v1: String,
     diagnostics_fingerprint_v1: Option<String>,
@@ -184,6 +241,26 @@ struct Sample {
     allocations: AllocationSample,
     work: WorkSample,
     phase: PhaseSample,
+    export: ExportSample,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ExportSample {
+    kind: &'static str,
+    elapsed_ms: f64,
+    output_bytes: u64,
+    sha256: Option<String>,
+}
+
+impl ExportSample {
+    const fn none() -> Self {
+        Self {
+            kind: "none",
+            elapsed_ms: 0.0,
+            output_bytes: 0,
+            sha256: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -397,13 +474,60 @@ struct PhaseSample {
     ir_validation_ms: f64,
     backend_ms: f64,
     plan_validation_ms: f64,
-    serialization_ms: f64,
 }
 
-pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessUsage {
+    cpu_us: u64,
+    minor_page_faults: u64,
+    major_page_faults: u64,
+}
+
+impl ProcessUsage {
+    fn current() -> Self {
+        #[cfg(unix)]
+        {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+            let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+            if status == 0 {
+                let usage = unsafe { usage.assume_init() };
+                let time_us = |value: libc::timeval| {
+                    u64::try_from(value.tv_sec)
+                        .unwrap_or(0)
+                        .saturating_mul(1_000_000)
+                        .saturating_add(u64::try_from(value.tv_usec).unwrap_or(0))
+                };
+                return Self {
+                    cpu_us: time_us(usage.ru_utime).saturating_add(time_us(usage.ru_stime)),
+                    minor_page_faults: u64::try_from(usage.ru_minflt).unwrap_or(0),
+                    major_page_faults: u64::try_from(usage.ru_majflt).unwrap_or(0),
+                };
+            }
+        }
+        Self::default()
+    }
+
+    fn since(self, started: Self) -> Self {
+        Self {
+            cpu_us: self.cpu_us.saturating_sub(started.cpu_us),
+            minor_page_faults: self
+                .minor_page_faults
+                .saturating_sub(started.minor_page_faults),
+            major_page_faults: self
+                .major_page_faults
+                .saturating_sub(started.major_page_faults),
+        }
+    }
+}
+
+pub fn run(
+    args: &[String],
+    producer: ProducerConfiguration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_producer_runtime(producer)?;
     match args.first().map(String::as_str) {
-        Some("warm-session") => return warm_session_sample(&args[1..]),
-        Some("synthetic-scaling") => return synthetic_scaling_sample(&args[1..]),
+        Some("warm-session") => return warm_session_sample(&args[1..], producer),
+        Some("synthetic-scaling") => return synthetic_scaling_sample(&args[1..], producer),
         _ => {}
     }
     let source = args
@@ -439,16 +563,16 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..sample_count {
         samples.push(match (mode, intent) {
             (SampleMode::FreshProcess, SampleIntent::Diagnostics) => {
-                diagnostics_sample(Path::new(source))?
+                diagnostics_sample(Path::new(source), producer)?
             }
             (SampleMode::FreshProcess, SampleIntent::Verified) => {
-                verified_sample(Path::new(source))?
+                verified_sample(Path::new(source), producer)?
             }
             (SampleMode::EmptySession, SampleIntent::Diagnostics) => {
-                session_diagnostics_sample(Path::new(source))?
+                session_diagnostics_sample(Path::new(source), producer)?
             }
             (SampleMode::EmptySession, SampleIntent::Verified) => {
-                session_verified_sample(Path::new(source))?
+                session_verified_sample(Path::new(source), producer)?
             }
         });
     }
@@ -456,6 +580,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         std::io::stdout().lock(),
         &SampleBatch {
             format_version: FORMAT_VERSION,
+            producer: producer_metadata(producer)?,
             source: source.clone(),
             intent,
             compiler_state: mode.compiler_state(),
@@ -476,7 +601,110 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn warm_session_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn captured_allocations(producer: ProducerConfiguration) -> AllocationSample {
+    if producer
+        .allocation_instrumentation
+        .records_rust_global_allocations()
+    {
+        compiler_allocation_counters().into()
+    } else {
+        AllocationSample::default()
+    }
+}
+
+fn validate_producer_runtime(
+    producer: ProducerConfiguration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if producer.allocator.id == "microsoft-mimalloc" {
+        #[cfg(target_os = "linux")]
+        {
+            let version = crate::allocator::MimallocAllocator::runtime_version();
+            if version != 30_500 {
+                return Err(format!(
+                    "linked mimalloc reports version {version}; exact 3.5.0 (30500) is required"
+                )
+                .into());
+            }
+        }
+        if std::env::var("LD_PRELOAD")
+            .ok()
+            .is_some_and(|value| value.to_ascii_lowercase().contains("mimalloc"))
+        {
+            return Err(
+                "refusing to combine statically linked mimalloc with an LD_PRELOAD mimalloc".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn producer_metadata(
+    producer: ProducerConfiguration,
+) -> Result<ProducerMetadata, Box<dyn std::error::Error>> {
+    validate_producer_runtime(producer)?;
+    let executable = std::env::current_exe()?.canonicalize()?;
+    let binary_sha256 = hex_digest(Sha256::digest(fs::read(&executable)?));
+    let mut mimalloc_environment = std::env::vars()
+        .filter(|(name, _)| name.starts_with("MIMALLOC_"))
+        .map(|(name, value)| EnvironmentValue { name, value })
+        .collect::<Vec<_>>();
+    mimalloc_environment.sort_by(|left, right| left.name.cmp(&right.name));
+    let allocator = producer.allocator;
+    Ok(ProducerMetadata {
+        product_kind: producer.product_kind,
+        binary_path: executable.to_string_lossy().into_owned(),
+        binary_sha256,
+        build_source_head: env!("BOON_BUILD_SOURCE_HEAD"),
+        build_source_workspace_sha256: env!("BOON_BUILD_SOURCE_WORKSPACE_SHA256"),
+        build_source_dirty: env!("BOON_BUILD_SOURCE_DIRTY") == "true",
+        build_input_scope: "workspace-cargo-toolchain-and-crates-excluding-xtask-plus-mimalloc-v1",
+        rustc_release: env!("BOON_RUSTC_RELEASE"),
+        rustc_commit: env!("BOON_RUSTC_COMMIT"),
+        rustc_commit_date: env!("BOON_RUSTC_COMMIT_DATE"),
+        llvm_version: env!("BOON_LLVM_VERSION"),
+        target_triple: env!("BOON_BUILD_TARGET"),
+        target_cpu: env!("BOON_BUILD_TARGET_CPU"),
+        cargo_profile: env!("BOON_BUILD_PROFILE"),
+        profile_options: env!("BOON_BUILD_PROFILE_OPTIONS"),
+        rustflags: env!("BOON_BUILD_RUSTFLAGS"),
+        allocator: AllocatorMetadata {
+            id: allocator.id,
+            version: allocator.version,
+            upstream_tag: allocator.upstream_tag,
+            upstream_commit: allocator.upstream_commit,
+            source_sha256: allocator.source_sha256,
+            static_archive_sha256: allocator.static_archive_sha256,
+            linkage: allocator.linkage,
+            build_options: allocator.build_options,
+        },
+        allocation_instrumentation: producer.allocation_instrumentation.as_str(),
+        allocation_counter_scope: if producer
+            .allocation_instrumentation
+            .records_rust_global_allocations()
+        {
+            "single-compiler-thread-rust-global-allocator-events"
+        } else {
+            "none"
+        },
+        ld_preload: std::env::var("LD_PRELOAD")
+            .ok()
+            .filter(|value| !value.is_empty()),
+        mimalloc_environment,
+        transparent_hugepage_enabled: read_policy("/sys/kernel/mm/transparent_hugepage/enabled"),
+        transparent_hugepage_defrag: read_policy("/sys/kernel/mm/transparent_hugepage/defrag"),
+    })
+}
+
+fn read_policy(path: &str) -> String {
+    fs::read_to_string(path)
+        .map(|value| value.trim().to_owned())
+        .unwrap_or_else(|error| format!("unavailable:{error}"))
+}
+
+fn warm_session_sample(
+    args: &[String],
+    producer: ProducerConfiguration,
+) -> Result<(), Box<dyn std::error::Error>> {
     let source = args
         .first()
         .ok_or("warm-session sample requires a primary source path")?;
@@ -576,6 +804,7 @@ fn warm_session_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>
                 .plan(),
         )?
     };
+    let initial_resident_rss_kib = current_rss_kib();
 
     let mut edits = Vec::with_capacity(total_samples);
     let mut current_is_edited = false;
@@ -608,7 +837,7 @@ fn warm_session_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>
         )?;
         let diagnostics_request_ms = duration_ms(diagnostics_started.elapsed());
         let edit_to_diagnostics_ms = duration_ms(edit_started.elapsed());
-        let diagnostics_allocations = compiler_allocation_counters().into();
+        let diagnostics_allocations = captured_allocations(producer);
         let (
             diagnostic_count,
             full_document_typecheck_coverage,
@@ -646,7 +875,7 @@ fn warm_session_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>
         )?;
         let verified_preview_request_ms = duration_ms(preview_started.elapsed());
         let edit_to_verified_preview_ms = duration_ms(edit_started.elapsed());
-        let preview_allocations = compiler_allocation_counters().into();
+        let preview_allocations = captured_allocations(producer);
         let (source_bundle_digest_v1, plan_sha256, preview_work, preview_phase) = {
             let compiled = preview_result
                 .compiled()
@@ -691,6 +920,7 @@ fn warm_session_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>
             source_bundle_digest_v1,
             plan_sha256,
             published_revision: published_revision.0,
+            resident_rss_kib: current_rss_kib(),
             diagnostics_allocations,
             preview_allocations,
             diagnostics_work,
@@ -718,7 +948,7 @@ fn warm_session_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>
             .ok_or("loaded switch target has no verified bundle")?;
         let loaded_bundle_lookup_ms = duration_ms(lookup_started.elapsed());
         let acknowledgement_ms = duration_ms(switch_started.elapsed());
-        let allocations = compiler_allocation_counters();
+        let allocations = captured_allocations(producer);
         let selected_plan_sha256 = plan_sha256(compiled.plan.plan())?;
         switches.push(LoadedSwitchSample {
             sequence,
@@ -839,11 +1069,26 @@ fn warm_session_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>
             && last_good_revision_after_stale_request == last_good_revision_before
             && published_revision == latest_revision,
     };
+    let final_resident_rss_kib = current_rss_kib();
+    // `/proc` values are separately sampled snapshots. Preserve the maximum
+    // directly observed resident value even if the later VmHWM read races a
+    // page-accounting update by one sampling interval.
+    let session_peak_rss_kib = peak_rss_kib()
+        .max(initial_resident_rss_kib)
+        .max(final_resident_rss_kib)
+        .max(
+            edits
+                .iter()
+                .map(|sample| sample.resident_rss_kib)
+                .max()
+                .unwrap_or(0),
+        );
 
     serde_json::to_writer(
         std::io::stdout().lock(),
         &WarmSessionBatch {
             format_version: FORMAT_VERSION,
+            producer: producer_metadata(producer)?,
             workload: "warm-session-v1",
             source: source.clone(),
             switch_source,
@@ -862,6 +1107,9 @@ fn warm_session_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>
             original_unit_sha256,
             edited_unit_sha256,
             compiler_request_count,
+            initial_resident_rss_kib,
+            final_resident_rss_kib,
+            peak_rss_kib: session_peak_rss_kib,
             edits,
             switches,
             cancellation,
@@ -872,7 +1120,10 @@ fn warm_session_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
-fn synthetic_scaling_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+fn synthetic_scaling_sample(
+    args: &[String],
+    producer: ProducerConfiguration,
+) -> Result<(), Box<dyn std::error::Error>> {
     let dimension = args
         .first()
         .ok_or("synthetic-scaling requires a dimension")?;
@@ -910,7 +1161,7 @@ fn synthetic_scaling_sample(args: &[String]) -> Result<(), Box<dyn std::error::E
         &CancellationToken::new(),
     )?;
     let elapsed_ms = duration_ms(started.elapsed());
-    let allocations = compiler_allocation_counters().into();
+    let allocations = captured_allocations(producer);
     let peak_rss_kib = peak_rss_kib();
     let (source_bundle_digest_v1, plan_sha256, work, phase) = match intent {
         SampleIntent::Diagnostics => {
@@ -943,6 +1194,7 @@ fn synthetic_scaling_sample(args: &[String]) -> Result<(), Box<dyn std::error::E
         std::io::stdout().lock(),
         &SyntheticScalingBatch {
             format_version: FORMAT_VERSION,
+            producer: producer_metadata(producer)?,
             workload: "synthetic-scaling-v1",
             generator: "boon-synthetic-scaling-v1",
             dimension: dimension.clone(),
@@ -1147,13 +1399,59 @@ fn required_usize_option(
         })
 }
 
-fn diagnostics_sample(source: &Path) -> Result<Sample, Box<dyn std::error::Error>> {
-    session_diagnostics_sample(source)
-}
-
-fn session_diagnostics_sample(source: &Path) -> Result<Sample, Box<dyn std::error::Error>> {
+fn diagnostics_sample(
+    source: &Path,
+    producer: ProducerConfiguration,
+) -> Result<Sample, Box<dyn std::error::Error>> {
     reset_compiler_allocation_counters();
     let observation_started_unix_us = unix_time_us()?;
+    let usage_started = ProcessUsage::current();
+    let started = Instant::now();
+    let diagnostics = compile_diagnostics_source(CompilerCheckRequest::source_path(
+        source,
+        ProgramRole::Client,
+    ))?;
+    let elapsed_ms = duration_ms(started.elapsed());
+    let usage = ProcessUsage::current().since(usage_started);
+    let allocations = captured_allocations(producer);
+    let compiler_artifact_ready_unix_us = unix_time_us()?;
+    let compiler_peak_rss_kib = peak_rss_kib();
+    if diagnostics.has_errors() {
+        return Err(format!(
+            "performance fixture produced {} diagnostic(s)",
+            diagnostics.profile.diagnostic_count
+        )
+        .into());
+    }
+    let (work, phase) = diagnostics_work_and_phase(&diagnostics);
+    Ok(Sample {
+        producer_pid: std::process::id(),
+        observation_started_unix_us,
+        compiler_artifact_ready_unix_us,
+        elapsed_ms,
+        compiler_cpu_ms: usage.cpu_us as f64 / 1_000.0,
+        compiler_minor_page_faults: usage.minor_page_faults,
+        compiler_major_page_faults: usage.major_page_faults,
+        peak_rss_kib: compiler_peak_rss_kib,
+        source_bundle_digest_v1: diagnostics.source_bundle_digest_v1().to_string(),
+        diagnostics_fingerprint_v1: Some(hex_digest(diagnostics.fingerprint_v1())),
+        diagnostic_count: diagnostics.profile.diagnostic_count,
+        full_document_typecheck_coverage: Some(diagnostics.full_document_typecheck_coverage()),
+        plan_sha256: None,
+        allocations,
+        work,
+        phase,
+        export: ExportSample::none(),
+    })
+}
+
+fn session_diagnostics_sample(
+    source: &Path,
+    producer: ProducerConfiguration,
+) -> Result<Sample, Box<dyn std::error::Error>> {
+    reset_compiler_allocation_counters();
+    let observation_started_unix_us = unix_time_us()?;
+    let usage_started = ProcessUsage::current();
     let started = Instant::now();
     let (entrypoint, units) = compiler_source_project_for_path(source)?;
     let mut session = CompilerSession::new();
@@ -1175,7 +1473,8 @@ fn session_diagnostics_sample(source: &Path) -> Result<Sample, Box<dyn std::erro
         .diagnostics()
         .ok_or("diagnostics session request returned no diagnostics result")?;
     let elapsed_ms = duration_ms(started.elapsed());
-    let allocations = compiler_allocation_counters().into();
+    let usage = ProcessUsage::current().since(usage_started);
+    let allocations = captured_allocations(producer);
     let compiler_artifact_ready_unix_us = unix_time_us()?;
     let compiler_peak_rss_kib = peak_rss_kib();
     if diagnostics.has_errors() {
@@ -1191,6 +1490,9 @@ fn session_diagnostics_sample(source: &Path) -> Result<Sample, Box<dyn std::erro
         observation_started_unix_us,
         compiler_artifact_ready_unix_us,
         elapsed_ms,
+        compiler_cpu_ms: usage.cpu_us as f64 / 1_000.0,
+        compiler_minor_page_faults: usage.minor_page_faults,
+        compiler_major_page_faults: usage.major_page_faults,
         peak_rss_kib: compiler_peak_rss_kib,
         source_bundle_digest_v1: diagnostics.source_bundle_digest_v1().to_string(),
         diagnostics_fingerprint_v1: Some(hex_digest(diagnostics.fingerprint_v1())),
@@ -1200,12 +1502,17 @@ fn session_diagnostics_sample(source: &Path) -> Result<Sample, Box<dyn std::erro
         allocations,
         work,
         phase,
+        export: ExportSample::none(),
     })
 }
 
-fn verified_sample(source: &Path) -> Result<Sample, Box<dyn std::error::Error>> {
+fn verified_sample(
+    source: &Path,
+    producer: ProducerConfiguration,
+) -> Result<Sample, Box<dyn std::error::Error>> {
     reset_compiler_allocation_counters();
     let observation_started_unix_us = unix_time_us()?;
+    let usage_started = ProcessUsage::current();
     let started = Instant::now();
     let checked = check_runtime_source(CompilerCheckRequest::source_path(
         source,
@@ -1220,18 +1527,23 @@ fn verified_sample(source: &Path) -> Result<Sample, Box<dyn std::error::Error>> 
         ),
     )?;
     let elapsed_ms = duration_ms(started.elapsed());
-    let allocations = compiler_allocation_counters().into();
+    let allocations = captured_allocations(producer);
     compiled_sample(
         &compiled,
         elapsed_ms,
         allocations,
         observation_started_unix_us,
+        usage_started,
     )
 }
 
-fn session_verified_sample(source: &Path) -> Result<Sample, Box<dyn std::error::Error>> {
+fn session_verified_sample(
+    source: &Path,
+    producer: ProducerConfiguration,
+) -> Result<Sample, Box<dyn std::error::Error>> {
     reset_compiler_allocation_counters();
     let observation_started_unix_us = unix_time_us()?;
+    let usage_started = ProcessUsage::current();
     let started = Instant::now();
     let (entrypoint, units) = compiler_source_project_for_path(source)?;
     let mut session = CompilerSession::new();
@@ -1253,12 +1565,13 @@ fn session_verified_sample(source: &Path) -> Result<Sample, Box<dyn std::error::
         .compiled()
         .ok_or("verified session request returned no compiled result")?;
     let elapsed_ms = duration_ms(started.elapsed());
-    let allocations = compiler_allocation_counters().into();
+    let allocations = captured_allocations(producer);
     compiled_sample(
         compiled,
         elapsed_ms,
         allocations,
         observation_started_unix_us,
+        usage_started,
     )
 }
 
@@ -1267,11 +1580,13 @@ fn compiled_sample(
     elapsed_ms: f64,
     allocations: AllocationSample,
     observation_started_unix_us: u64,
+    usage_started: ProcessUsage,
 ) -> Result<Sample, Box<dyn std::error::Error>> {
     // Capture the compiler high-water mark before verifier/report-only work
     // below can allocate a second representation of the plan.
     let compiler_peak_rss_kib = peak_rss_kib();
     let compiler_artifact_ready_unix_us = unix_time_us()?;
+    let usage = ProcessUsage::current().since(usage_started);
     let plan_validation_ms = compiled.profile.plan_validation_ms;
     let validation = compiled.plan.verification();
     if validation.status != "pass" {
@@ -1281,18 +1596,22 @@ fn compiled_sample(
     let mut plan_hasher = Sha256Writer::default();
     serde_json::to_writer_pretty(&mut plan_hasher, compiled.plan.plan())?;
     let serialization_ms = duration_ms(serialization_started.elapsed());
+    let output_bytes = plan_hasher.bytes_written();
     let plan_sha256 = hex_digest(plan_hasher.finish());
     Ok(Sample {
         producer_pid: std::process::id(),
         observation_started_unix_us,
         compiler_artifact_ready_unix_us,
         elapsed_ms,
+        compiler_cpu_ms: usage.cpu_us as f64 / 1_000.0,
+        compiler_minor_page_faults: usage.minor_page_faults,
+        compiler_major_page_faults: usage.major_page_faults,
         peak_rss_kib: compiler_peak_rss_kib,
         source_bundle_digest_v1: compiled.source_bundle_digest_v1.to_string(),
         diagnostics_fingerprint_v1: None,
         diagnostic_count: 0,
         full_document_typecheck_coverage: None,
-        plan_sha256: Some(plan_sha256),
+        plan_sha256: Some(plan_sha256.clone()),
         allocations,
         work: compiled_work_and_phase(compiled).0,
         phase: PhaseSample {
@@ -1304,23 +1623,36 @@ fn compiled_sample(
             ir_validation_ms: compiled.profile.verify_ms,
             backend_ms: compiled.profile.compile_ms,
             plan_validation_ms,
-            serialization_ms,
+        },
+        export: ExportSample {
+            kind: "pretty-json-machine-plan-sha256",
+            elapsed_ms: serialization_ms,
+            output_bytes,
+            sha256: Some(plan_sha256),
         },
     })
 }
 
 #[derive(Default)]
-struct Sha256Writer(Sha256);
+struct Sha256Writer {
+    hasher: Sha256,
+    bytes_written: u64,
+}
 
 impl Sha256Writer {
     fn finish(self) -> [u8; 32] {
-        self.0.finalize().into()
+        self.hasher.finalize().into()
+    }
+
+    fn bytes_written(&self) -> u64 {
+        self.bytes_written
     }
 }
 
 impl Write for Sha256Writer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.update(bytes);
+        self.hasher.update(bytes);
+        self.bytes_written = self.bytes_written.saturating_add(bytes.len() as u64);
         Ok(bytes.len())
     }
 
@@ -1392,7 +1724,25 @@ fn peak_rss_kib() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(target_os = "linux")]
+fn current_rss_kib() -> u64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0;
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 #[cfg(not(target_os = "linux"))]
 fn peak_rss_kib() -> u64 {
+    0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_rss_kib() -> u64 {
     0
 }

@@ -4,20 +4,23 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
+use crate::compiler_producer::{
+    ExpectedProducer, ProducerIdentity, ProducerMetadata, ProducerSetIdentity,
+    validate_producer_metadata,
+};
 use crate::compiler_work_sample::{WorkSample, require_current_prebuilt_producer};
 use crate::report_v2::{
     ExpectedIdentity, ReportStatus, ToolResult, current_identity, sha256_bytes, sha256_file,
     unix_time_ms,
 };
 
-const FORMAT_VERSION: u16 = 4;
-const PRODUCER_FORMAT_VERSION: u16 = 5;
-const BUDGET_FORMAT_VERSION: u16 = 2;
-const REPORT_CONTRACT: &str = "boon-compiler-interactions-v3";
+const FORMAT_VERSION: u16 = 6;
+const PRODUCER_FORMAT_VERSION: u16 = 7;
+const BUDGET_FORMAT_VERSION: u16 = 3;
+const REPORT_CONTRACT: &str = "boon-compiler-interactions-v5";
 const DEFAULT_BUDGET: &str = "budgets/compiler.toml";
-const PRODUCER_PATH: &str = "target/release/boon_cli";
 const MAX_BUDGET_BYTES: u64 = 64 * 1024;
-const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SAMPLE_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SAMPLE_COUNT: usize = 128;
 
@@ -38,6 +41,18 @@ struct BudgetManifest {
 struct BudgetProtocol {
     build_profile: String,
     target_profile: String,
+    product_producer: String,
+    evidence_producer: String,
+    product_kind: String,
+    product_allocator: String,
+    evidence_kind: String,
+    evidence_allocator: String,
+    evidence_instrumentation: String,
+    evidence_counter_scope: String,
+    target_cpu: String,
+    profile_options: String,
+    rustflags: String,
+    producer_pair_schedule: String,
     setup_samples: usize,
     scored_samples: usize,
     compiler_threads: usize,
@@ -122,7 +137,7 @@ struct CompilerInteractionsReport {
     generated_unix_ms: u64,
     identity: ExpectedIdentity,
     budget: BudgetIdentity,
-    producer: ProducerIdentity,
+    producers: ProducerSetIdentity,
     protocol: ProtocolEvidence,
     warm: WarmReport,
     scaling: Vec<ScalingReport>,
@@ -140,14 +155,17 @@ struct BudgetIdentity {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct ProducerIdentity {
-    path: String,
-    sha256: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 struct ProtocolEvidence {
+    product_kind: String,
+    product_allocator: String,
+    evidence_kind: String,
+    evidence_allocator: String,
+    evidence_instrumentation: String,
+    evidence_counter_scope: String,
+    target_cpu: String,
+    profile_options: String,
+    rustflags: String,
+    producer_pair_schedule: String,
     default_setup_samples: usize,
     default_scored_samples: usize,
     effective_setup_samples: usize,
@@ -163,11 +181,15 @@ struct ProtocolEvidence {
 struct WarmReport {
     status: ReportStatus,
     raw: WarmSessionBatch,
+    evidence_raw: WarmSessionBatch,
+    evidence_parity_pass: bool,
     diagnostics_edit_to_ready_ms: MillisSummary,
     verified_preview_edit_to_ready_ms: MillisSummary,
     update_ack_ms: MillisSummary,
     loaded_bundle_lookup_ms: MillisSummary,
     switch_ack_ms: MillisSummary,
+    resident_rss_kib: CountSummary,
+    peak_rss_kib: u64,
     cancellation_stop_ms: f64,
     latest_generation_publish_ms: f64,
     evaluation: WarmEvaluation,
@@ -176,6 +198,7 @@ struct WarmReport {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WarmEvaluation {
+    evidence_parity_pass: bool,
     diagnostics_p95_pass: bool,
     diagnostics_p99_pass: bool,
     diagnostics_max_pass: bool,
@@ -185,6 +208,8 @@ struct WarmEvaluation {
     switch_ack_pass: bool,
     switch_no_compile_pass: bool,
     switch_no_allocation_pass: bool,
+    session_peak_rss_pass: bool,
+    session_tail_growth_pass: bool,
     pre_canceled_request_pass: bool,
     latest_generation_pass: bool,
     in_flight_supersession_supported: bool,
@@ -216,12 +241,16 @@ struct ScalingReport {
 struct ScalingPoint {
     size: usize,
     setup_producer_pids: Vec<u32>,
+    evidence_setup_producer_pids: Vec<u32>,
     scored_samples: Vec<SyntheticScalingBatch>,
+    evidence_scored_samples: Vec<SyntheticScalingBatch>,
+    evidence_parity_pass: bool,
     elapsed_ms: MillisSummary,
     allocation_calls: CountSummary,
     allocated_bytes: CountSummary,
     parse_source_units_attempted: CountSummary,
     parsed_expressions: CountSummary,
+    checked_expressions: CountSummary,
     typecheck_inference_call_visits: CountSummary,
     checked_calls: CountSummary,
     semantic_graph_nodes: CountSummary,
@@ -235,6 +264,7 @@ struct ScalingPoint {
 struct ScalingEvaluation {
     source_identity_pass: bool,
     process_isolation_pass: bool,
+    evidence_parity_pass: bool,
     allocation_calls_ratio_pass: bool,
     allocated_bytes_ratio_pass: bool,
     owning_work_ratio_pass: bool,
@@ -264,6 +294,7 @@ struct CountSummary {
 #[serde(deny_unknown_fields)]
 struct WarmSessionBatch {
     format_version: u16,
+    producer: ProducerMetadata,
     workload: String,
     source: String,
     switch_source: String,
@@ -282,6 +313,9 @@ struct WarmSessionBatch {
     original_unit_sha256: String,
     edited_unit_sha256: String,
     compiler_request_count: u64,
+    initial_resident_rss_kib: u64,
+    final_resident_rss_kib: u64,
+    peak_rss_kib: u64,
     edits: Vec<WarmEditSample>,
     switches: Vec<LoadedSwitchSample>,
     cancellation: CancellationEvidence,
@@ -307,6 +341,7 @@ struct WarmEditSample {
     source_bundle_digest_v1: String,
     plan_sha256: String,
     published_revision: u64,
+    resident_rss_kib: u64,
     diagnostics_allocations: AllocationSample,
     preview_allocations: AllocationSample,
     diagnostics_work: WorkSample,
@@ -362,6 +397,7 @@ struct LatestGenerationEvidence {
 #[serde(deny_unknown_fields)]
 struct SyntheticScalingBatch {
     format_version: u16,
+    producer: ProducerMetadata,
     workload: String,
     generator: String,
     dimension: String,
@@ -401,11 +437,10 @@ struct PhaseSample {
     ir_validation_ms: f64,
     backend_ms: f64,
     plan_validation_ms: f64,
-    serialization_ms: f64,
 }
 
 impl PhaseSample {
-    const fn values(self) -> [f64; 9] {
+    const fn values(self) -> [f64; 8] {
         [
             self.parse_ms,
             self.typecheck_ms,
@@ -415,7 +450,6 @@ impl PhaseSample {
             self.ir_validation_ms,
             self.backend_ms,
             self.plan_validation_ms,
-            self.serialization_ms,
         ]
     }
 }
@@ -488,30 +522,80 @@ fn collect(
     setup_samples: usize,
     scored_samples: usize,
 ) -> ToolResult<()> {
-    let producer_path = workspace.join(PRODUCER_PATH);
-    require_current_prebuilt_producer(workspace, &producer_path)?;
     let before = current_identity(workspace)?;
-    let producer_digest = sha256_file(&producer_path)?.as_str().to_owned();
+    let product_path = workspace.join(safe_relative_path(
+        &budget.protocol.product_producer,
+        "product producer path",
+    )?);
+    let evidence_path = workspace.join(safe_relative_path(
+        &budget.protocol.evidence_producer,
+        "evidence producer path",
+    )?);
+    require_current_prebuilt_producer(workspace, &product_path)?;
+    require_current_prebuilt_producer(workspace, &evidence_path)?;
+    let product_digest = sha256_file(&product_path)?.as_str().to_owned();
+    let evidence_digest = sha256_file(&evidence_path)?.as_str().to_owned();
     let warm_batch = run_warm_batch(
         workspace,
-        &producer_path,
+        &product_path,
         &budget.warm,
         setup_samples,
         scored_samples,
     )?;
-    let warm = warm_report(warm_batch, &budget.warm)?;
+    let warm_evidence_batch = run_warm_batch(
+        workspace,
+        &evidence_path,
+        &budget.warm,
+        setup_samples,
+        scored_samples,
+    )?;
+    validate_interaction_producer(
+        workspace,
+        &before,
+        &warm_batch.producer,
+        &product_digest,
+        &budget.protocol.product_producer,
+        &budget.protocol.product_kind,
+        &budget.protocol.product_allocator,
+        "none",
+        "none",
+        &budget.protocol,
+    )?;
+    validate_interaction_producer(
+        workspace,
+        &before,
+        &warm_evidence_batch.producer,
+        &evidence_digest,
+        &budget.protocol.evidence_producer,
+        &budget.protocol.evidence_kind,
+        &budget.protocol.evidence_allocator,
+        &budget.protocol.evidence_instrumentation,
+        &budget.protocol.evidence_counter_scope,
+        &budget.protocol,
+    )?;
+    validate_warm_product_evidence_parity(&warm_batch, &warm_evidence_batch)?;
+    let product_metadata = warm_batch.producer.clone();
+    let evidence_metadata = warm_evidence_batch.producer.clone();
+    let warm = warm_report(warm_batch, warm_evidence_batch, &budget.warm)?;
     let mut scaling = Vec::with_capacity(budget.scaling.workloads.len());
     for workload in &budget.scaling.workloads {
         scaling.push(collect_scaling(
             workspace,
-            &producer_path,
+            &before,
+            &product_path,
+            &product_digest,
+            &evidence_path,
+            &evidence_digest,
+            &budget.protocol,
             workload,
             budget.scaling.maximum_doubling_ratio,
             setup_samples,
             scored_samples,
         )?);
     }
-    if sha256_file(&producer_path)?.as_str() != producer_digest {
+    if sha256_file(&product_path)?.as_str() != product_digest
+        || sha256_file(&evidence_path)?.as_str() != evidence_digest
+    {
         return Err("compiler interaction producer changed during measurement".into());
     }
     let after = current_identity(workspace)?;
@@ -539,9 +623,17 @@ fn collect(
             format_version: budget.format_version,
             owner_plan: budget.owner_plan.clone(),
         },
-        producer: ProducerIdentity {
-            path: PRODUCER_PATH.to_owned(),
-            sha256: producer_digest,
+        producers: ProducerSetIdentity {
+            product: ProducerIdentity {
+                path: budget.protocol.product_producer.clone(),
+                sha256: product_digest,
+                metadata: product_metadata,
+            },
+            evidence: ProducerIdentity {
+                path: budget.protocol.evidence_producer.clone(),
+                sha256: evidence_digest,
+                metadata: evidence_metadata,
+            },
         },
         protocol: protocol_evidence(budget, setup_samples, scored_samples),
         warm,
@@ -595,7 +687,173 @@ fn run_warm_batch(
     Ok(batch)
 }
 
-fn warm_report(raw: WarmSessionBatch, budget: &WarmBudget) -> ToolResult<WarmReport> {
+#[allow(clippy::too_many_arguments)]
+fn validate_interaction_producer(
+    workspace: &Path,
+    identity: &ExpectedIdentity,
+    metadata: &ProducerMetadata,
+    digest: &str,
+    path: &str,
+    kind: &str,
+    allocator: &str,
+    instrumentation: &str,
+    counter_scope: &str,
+    protocol: &BudgetProtocol,
+) -> ToolResult<()> {
+    validate_producer_metadata(
+        workspace,
+        identity,
+        metadata,
+        ExpectedProducer {
+            path,
+            sha256: digest,
+            product_kind: kind,
+            allocator_id: allocator,
+            allocation_instrumentation: instrumentation,
+            allocation_counter_scope: counter_scope,
+            cargo_profile: &protocol.build_profile,
+            target_cpu: &protocol.target_cpu,
+            profile_options: &protocol.profile_options,
+            rustflags: &protocol.rustflags,
+        },
+    )
+}
+
+fn validate_warm_product_evidence_parity(
+    product: &WarmSessionBatch,
+    evidence: &WarmSessionBatch,
+) -> ToolResult<()> {
+    if product.workload != evidence.workload
+        || product.source != evidence.source
+        || product.switch_source != evidence.switch_source
+        || product.edit_unit != evidence.edit_unit
+        || product.compiler_threads != evidence.compiler_threads
+        || product.compiler_caches != evidence.compiler_caches
+        || product.setup_samples != evidence.setup_samples
+        || product.scored_samples != evidence.scored_samples
+        || product.primary_project_id != evidence.primary_project_id
+        || product.switch_project_id != evidence.switch_project_id
+        || product.base_revision != evidence.base_revision
+        || product.initial_source_bundle_digest_v1 != evidence.initial_source_bundle_digest_v1
+        || product.initial_plan_sha256 != evidence.initial_plan_sha256
+        || product.switch_plan_sha256 != evidence.switch_plan_sha256
+        || product.original_unit_sha256 != evidence.original_unit_sha256
+        || product.edited_unit_sha256 != evidence.edited_unit_sha256
+        || product.compiler_request_count != evidence.compiler_request_count
+        || product.edits.len() != evidence.edits.len()
+        || product.switches.len() != evidence.switches.len()
+    {
+        return Err("warm product/evidence batch identities differ".into());
+    }
+    for (product, evidence) in product.edits.iter().zip(&evidence.edits) {
+        if product.sequence != evidence.sequence
+            || product.scored != evidence.scored
+            || product.direction != evidence.direction
+            || product.previous_revision != evidence.previous_revision
+            || product.revision != evidence.revision
+            || product.last_good_revision_before != evidence.last_good_revision_before
+            || product.diagnostic_count != evidence.diagnostic_count
+            || product.full_document_typecheck_coverage != evidence.full_document_typecheck_coverage
+            || product.source_bundle_digest_v1 != evidence.source_bundle_digest_v1
+            || product.plan_sha256 != evidence.plan_sha256
+            || product.published_revision != evidence.published_revision
+            || product.diagnostics_work != evidence.diagnostics_work
+            || product.preview_work != evidence.preview_work
+        {
+            return Err("warm product/evidence edit results or owned work differ".into());
+        }
+        if product.diagnostics_allocations != AllocationSample::default()
+            || product.preview_allocations != AllocationSample::default()
+            || evidence.diagnostics_allocations.allocation_calls == 0
+            || evidence.diagnostics_allocations.allocated_bytes == 0
+            || evidence.preview_allocations.allocation_calls == 0
+            || evidence.preview_allocations.allocated_bytes == 0
+        {
+            return Err("warm product/evidence allocation lanes are invalid".into());
+        }
+    }
+    for (product, evidence) in product.switches.iter().zip(&evidence.switches) {
+        if product.sequence != evidence.sequence
+            || product.scored != evidence.scored
+            || product.from_project_id != evidence.from_project_id
+            || product.to_project_id != evidence.to_project_id
+            || product.selected_revision != evidence.selected_revision
+            || product.compiler_requests_before != evidence.compiler_requests_before
+            || product.compiler_requests_after != evidence.compiler_requests_after
+            || product.selected_plan_sha256 != evidence.selected_plan_sha256
+            || product.allocation_calls != 0
+            || product.allocated_bytes != 0
+            || evidence.allocation_calls != 0
+            || evidence.allocated_bytes != 0
+        {
+            return Err("warm product/evidence loaded-switch results differ".into());
+        }
+    }
+    let product_cancellation = &product.cancellation;
+    let evidence_cancellation = &evidence.cancellation;
+    if product_cancellation.scope != evidence_cancellation.scope
+        || product_cancellation.revision != evidence_cancellation.revision
+        || product_cancellation.token_canceled_before_request
+            != evidence_cancellation.token_canceled_before_request
+        || product_cancellation.request_rejected != evidence_cancellation.request_rejected
+        || product_cancellation.last_good_revision_before
+            != evidence_cancellation.last_good_revision_before
+        || product_cancellation.last_good_revision_after
+            != evidence_cancellation.last_good_revision_after
+        || product_cancellation.publication_unchanged != evidence_cancellation.publication_unchanged
+        || product_cancellation.in_flight_supersession_supported
+            != evidence_cancellation.in_flight_supersession_supported
+    {
+        return Err("warm product/evidence cancellation semantics differ".into());
+    }
+    let product_latest = &product.latest_generation;
+    let evidence_latest = &evidence.latest_generation;
+    if product_latest.stale_revision != evidence_latest.stale_revision
+        || product_latest.latest_revision != evidence_latest.latest_revision
+        || product_latest.stale_request_rejected != evidence_latest.stale_request_rejected
+        || product_latest.last_good_revision_after_stale_request
+            != evidence_latest.last_good_revision_after_stale_request
+        || product_latest.published_revision != evidence_latest.published_revision
+        || product_latest.no_stale_publication != evidence_latest.no_stale_publication
+    {
+        return Err("warm product/evidence latest-generation semantics differ".into());
+    }
+    Ok(())
+}
+
+fn validate_scaling_product_evidence_parity(
+    product: &SyntheticScalingBatch,
+    evidence: &SyntheticScalingBatch,
+) -> ToolResult<()> {
+    if product.workload != evidence.workload
+        || product.generator != evidence.generator
+        || product.dimension != evidence.dimension
+        || product.size != evidence.size
+        || product.intent != evidence.intent
+        || product.compiler_threads != evidence.compiler_threads
+        || product.compiler_caches != evidence.compiler_caches
+        || product.revision != evidence.revision
+        || product.synthetic_source_sha256 != evidence.synthetic_source_sha256
+        || product.source_bundle_digest_v1 != evidence.source_bundle_digest_v1
+        || product.plan_sha256 != evidence.plan_sha256
+        || product.work != evidence.work
+    {
+        return Err("scaling product/evidence results or owned work differ".into());
+    }
+    if product.allocations != AllocationSample::default()
+        || evidence.allocations.allocation_calls == 0
+        || evidence.allocations.allocated_bytes == 0
+    {
+        return Err("scaling product/evidence allocation lanes are invalid".into());
+    }
+    Ok(())
+}
+
+fn warm_report(
+    raw: WarmSessionBatch,
+    evidence_raw: WarmSessionBatch,
+    budget: &WarmBudget,
+) -> ToolResult<WarmReport> {
     let scored_edits = raw
         .edits
         .iter()
@@ -636,8 +894,15 @@ fn warm_report(raw: WarmSessionBatch, budget: &WarmBudget) -> ToolResult<WarmRep
             .map(|sample| sample.acknowledgement_ms)
             .collect(),
     );
+    let resident_rss_kib = summarize_counts(
+        scored_edits
+            .iter()
+            .map(|sample| sample.resident_rss_kib)
+            .collect(),
+    );
     let evaluation = warm_evaluation(
         &raw,
+        &evidence_raw,
         budget,
         diagnostics_edit_to_ready_ms,
         verified_preview_edit_to_ready_ms,
@@ -645,22 +910,28 @@ fn warm_report(raw: WarmSessionBatch, budget: &WarmBudget) -> ToolResult<WarmRep
         switch_ack_ms,
     );
     let status = warm_status(&evaluation);
+    let peak_rss_kib = raw.peak_rss_kib;
     Ok(WarmReport {
         status,
         cancellation_stop_ms: raw.cancellation.stop_latency_ms,
         latest_generation_publish_ms: raw.latest_generation.publish_latest_ms,
         raw,
+        evidence_raw,
+        evidence_parity_pass: true,
         diagnostics_edit_to_ready_ms,
         verified_preview_edit_to_ready_ms,
         update_ack_ms,
         loaded_bundle_lookup_ms,
         switch_ack_ms,
+        resident_rss_kib,
+        peak_rss_kib,
         evaluation,
     })
 }
 
 fn warm_evaluation(
     raw: &WarmSessionBatch,
+    evidence_raw: &WarmSessionBatch,
     budget: &WarmBudget,
     diagnostics: MillisSummary,
     preview: MillisSummary,
@@ -672,7 +943,7 @@ fn warm_evaluation(
         .iter()
         .filter(|sample| sample.scored)
         .all(|sample| sample.compiler_requests_before == sample.compiler_requests_after);
-    let switch_no_allocation_pass = raw
+    let switch_no_allocation_pass = evidence_raw
         .switches
         .iter()
         .filter(|sample| sample.scored)
@@ -682,7 +953,17 @@ fn warm_evaluation(
         && raw.cancellation.request_rejected
         && raw.cancellation.publication_unchanged
         && raw.cancellation.stop_latency_ms <= budget.cancellation_max_ms;
+    let mut tail_rss = raw
+        .edits
+        .iter()
+        .skip(raw.edits.len() / 2)
+        .map(|sample| sample.resident_rss_kib)
+        .collect::<Vec<_>>();
+    tail_rss.push(raw.final_resident_rss_kib);
+    let tail_min = tail_rss.iter().copied().min().unwrap_or(0);
+    let tail_max = tail_rss.iter().copied().max().unwrap_or(u64::MAX);
     WarmEvaluation {
+        evidence_parity_pass: true,
         diagnostics_p95_pass: diagnostics.p95 <= budget.checked_diagnostics_p95_ms,
         diagnostics_p99_pass: diagnostics.p99 <= budget.checked_diagnostics_p99_ms,
         diagnostics_max_pass: diagnostics.max <= budget.checked_diagnostics_max_ms,
@@ -692,6 +973,15 @@ fn warm_evaluation(
         switch_ack_pass: switch_ack.p95 <= budget.switch_ack_p95_ms,
         switch_no_compile_pass,
         switch_no_allocation_pass,
+        session_peak_rss_pass: raw.peak_rss_kib <= 512 * 1024,
+        session_tail_growth_pass: raw.initial_resident_rss_kib > 0
+            && raw.final_resident_rss_kib > 0
+            && tail_min > 0
+            && tail_max.saturating_sub(tail_min) <= 128 * 1024
+            && raw
+                .final_resident_rss_kib
+                .saturating_sub(raw.initial_resident_rss_kib)
+                <= 256 * 1024,
         pre_canceled_request_pass,
         latest_generation_pass: raw.latest_generation.stale_request_rejected
             && raw.latest_generation.no_stale_publication
@@ -706,7 +996,8 @@ fn warm_evaluation(
 }
 
 fn warm_status(evaluation: &WarmEvaluation) -> ReportStatus {
-    let passes = evaluation.diagnostics_p95_pass
+    let passes = evaluation.evidence_parity_pass
+        && evaluation.diagnostics_p95_pass
         && evaluation.diagnostics_p99_pass
         && evaluation.diagnostics_max_pass
         && evaluation.verified_preview_p95_pass
@@ -715,6 +1006,8 @@ fn warm_status(evaluation: &WarmEvaluation) -> ReportStatus {
         && evaluation.switch_ack_pass
         && evaluation.switch_no_compile_pass
         && evaluation.switch_no_allocation_pass
+        && evaluation.session_peak_rss_pass
+        && evaluation.session_tail_growth_pass
         && evaluation.pre_canceled_request_pass
         && evaluation.latest_generation_pass
         && evaluation.in_flight_supersession_supported
@@ -729,7 +1022,12 @@ fn warm_status(evaluation: &WarmEvaluation) -> ReportStatus {
 
 fn collect_scaling(
     workspace: &Path,
-    producer: &Path,
+    identity: &ExpectedIdentity,
+    product: &Path,
+    product_digest: &str,
+    evidence: &Path,
+    evidence_digest: &str,
+    protocol: &BudgetProtocol,
     budget: &ScalingWorkloadBudget,
     maximum_ratio: f64,
     setup_samples: usize,
@@ -737,7 +1035,12 @@ fn collect_scaling(
 ) -> ToolResult<ScalingReport> {
     let baseline = collect_scaling_point(
         workspace,
-        producer,
+        identity,
+        product,
+        product_digest,
+        evidence,
+        evidence_digest,
+        protocol,
         budget,
         budget.baseline_size,
         setup_samples,
@@ -745,7 +1048,12 @@ fn collect_scaling(
     )?;
     let base = collect_scaling_point(
         workspace,
-        producer,
+        identity,
+        product,
+        product_digest,
+        evidence,
+        evidence_digest,
+        protocol,
         budget,
         budget.base_size,
         setup_samples,
@@ -753,7 +1061,12 @@ fn collect_scaling(
     )?;
     let doubled = collect_scaling_point(
         workspace,
-        producer,
+        identity,
+        product,
+        product_digest,
+        evidence,
+        evidence_digest,
+        protocol,
         budget,
         budget.doubled_size,
         setup_samples,
@@ -764,30 +1077,130 @@ fn collect_scaling(
 
 fn collect_scaling_point(
     workspace: &Path,
-    producer: &Path,
+    identity: &ExpectedIdentity,
+    product: &Path,
+    product_digest: &str,
+    evidence: &Path,
+    evidence_digest: &str,
+    protocol: &BudgetProtocol,
     budget: &ScalingWorkloadBudget,
     size: usize,
     setup_samples: usize,
     scored_samples: usize,
 ) -> ToolResult<ScalingPoint> {
     let mut setup_producer_pids = Vec::with_capacity(setup_samples);
-    for _ in 0..setup_samples {
-        let sample = run_scaling_sample(workspace, producer, budget, size, false)?;
-        setup_producer_pids.push(sample.producer_pid);
+    let mut evidence_setup_producer_pids = Vec::with_capacity(setup_samples);
+    for sample_index in 0..setup_samples {
+        let (product_sample, evidence_sample) = run_scaling_pair(
+            workspace,
+            identity,
+            product,
+            product_digest,
+            evidence,
+            evidence_digest,
+            protocol,
+            budget,
+            size,
+            sample_index,
+        )?;
+        setup_producer_pids.push(product_sample.producer_pid);
+        evidence_setup_producer_pids.push(evidence_sample.producer_pid);
     }
     let mut scored = Vec::with_capacity(scored_samples);
-    for _ in 0..scored_samples {
-        scored.push(run_scaling_sample(
-            workspace, producer, budget, size, false,
-        )?);
+    let mut evidence_scored = Vec::with_capacity(scored_samples);
+    for sample_index in 0..scored_samples {
+        let (product_sample, evidence_sample) = run_scaling_pair(
+            workspace,
+            identity,
+            product,
+            product_digest,
+            evidence,
+            evidence_digest,
+            protocol,
+            budget,
+            size,
+            setup_samples + sample_index,
+        )?;
+        scored.push(product_sample);
+        evidence_scored.push(evidence_sample);
     }
     let trace = if budget.owning_work_counter == "dependency-scc-components" {
-        let (_, trace) = run_scaling_trace(workspace, producer, budget, size)?;
+        let (sample, trace) = run_scaling_trace(workspace, product, budget, size)?;
+        validate_interaction_producer(
+            workspace,
+            identity,
+            &sample.producer,
+            product_digest,
+            &protocol.product_producer,
+            &protocol.product_kind,
+            &protocol.product_allocator,
+            "none",
+            "none",
+            protocol,
+        )?;
         Some(trace)
     } else {
         None
     };
-    scaling_point(size, setup_producer_pids, scored, trace)
+    scaling_point(
+        size,
+        setup_producer_pids,
+        evidence_setup_producer_pids,
+        scored,
+        evidence_scored,
+        trace,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_scaling_pair(
+    workspace: &Path,
+    identity: &ExpectedIdentity,
+    product: &Path,
+    product_digest: &str,
+    evidence: &Path,
+    evidence_digest: &str,
+    protocol: &BudgetProtocol,
+    budget: &ScalingWorkloadBudget,
+    size: usize,
+    sample_index: usize,
+) -> ToolResult<(SyntheticScalingBatch, SyntheticScalingBatch)> {
+    let (product_sample, evidence_sample) = if sample_index.is_multiple_of(2) {
+        (
+            run_scaling_sample(workspace, product, budget, size, false)?,
+            run_scaling_sample(workspace, evidence, budget, size, false)?,
+        )
+    } else {
+        let evidence_sample = run_scaling_sample(workspace, evidence, budget, size, false)?;
+        let product_sample = run_scaling_sample(workspace, product, budget, size, false)?;
+        (product_sample, evidence_sample)
+    };
+    validate_interaction_producer(
+        workspace,
+        identity,
+        &product_sample.producer,
+        product_digest,
+        &protocol.product_producer,
+        &protocol.product_kind,
+        &protocol.product_allocator,
+        "none",
+        "none",
+        protocol,
+    )?;
+    validate_interaction_producer(
+        workspace,
+        identity,
+        &evidence_sample.producer,
+        evidence_digest,
+        &protocol.evidence_producer,
+        &protocol.evidence_kind,
+        &protocol.evidence_allocator,
+        &protocol.evidence_instrumentation,
+        &protocol.evidence_counter_scope,
+        protocol,
+    )?;
+    validate_scaling_product_evidence_parity(&product_sample, &evidence_sample)?;
+    Ok((product_sample, evidence_sample))
 }
 
 fn run_scaling_sample(
@@ -860,7 +1273,9 @@ fn run_scaling_trace(
 fn scaling_point(
     size: usize,
     setup_producer_pids: Vec<u32>,
+    evidence_setup_producer_pids: Vec<u32>,
     scored_samples: Vec<SyntheticScalingBatch>,
+    evidence_scored_samples: Vec<SyntheticScalingBatch>,
     trace: Option<SccTraceEvidence>,
 ) -> ToolResult<ScalingPoint> {
     let source_sha256 = one_digest(
@@ -882,43 +1297,49 @@ fn scaling_point(
             .collect(),
     );
     let allocation_calls = summarize_counts(
-        scored_samples
+        evidence_scored_samples
             .iter()
             .map(|sample| sample.allocations.allocation_calls)
             .collect(),
     );
     let allocated_bytes = summarize_counts(
-        scored_samples
+        evidence_scored_samples
             .iter()
             .map(|sample| sample.allocations.allocated_bytes)
             .collect(),
     );
     let checked_calls = summarize_counts(
-        scored_samples
+        evidence_scored_samples
             .iter()
             .map(|sample| sample.work.checked_calls as u64)
             .collect(),
     );
     let typecheck_inference_call_visits = summarize_counts(
-        scored_samples
+        evidence_scored_samples
             .iter()
             .map(|sample| sample.work.typecheck.inference_call_visits)
             .collect(),
     );
     let parse_source_units_attempted = summarize_counts(
-        scored_samples
+        evidence_scored_samples
             .iter()
             .map(|sample| sample.work.parse.source_units_attempted as u64)
             .collect(),
     );
     let parsed_expressions = summarize_counts(
-        scored_samples
+        evidence_scored_samples
             .iter()
             .map(|sample| sample.work.parsed_expressions as u64)
             .collect(),
     );
+    let checked_expressions = summarize_counts(
+        evidence_scored_samples
+            .iter()
+            .map(|sample| sample.work.checked_expressions as u64)
+            .collect(),
+    );
     let semantic_graph_nodes = summarize_counts(
-        scored_samples
+        evidence_scored_samples
             .iter()
             .map(|sample| sample.work.semantic_graph_nodes as u64)
             .collect(),
@@ -926,12 +1347,16 @@ fn scaling_point(
     Ok(ScalingPoint {
         size,
         setup_producer_pids,
+        evidence_setup_producer_pids,
         scored_samples,
+        evidence_scored_samples,
+        evidence_parity_pass: true,
         elapsed_ms,
         allocation_calls,
         allocated_bytes,
         parse_source_units_attempted,
         parsed_expressions,
+        checked_expressions,
         typecheck_inference_call_visits,
         checked_calls,
         semantic_graph_nodes,
@@ -975,13 +1400,25 @@ fn scaling_report(
     let process_isolation_pass = [&baseline, &base, &doubled].into_iter().all(|point| {
         point.setup_producer_pids.iter().all(|pid| *pid != 0)
             && point
+                .evidence_setup_producer_pids
+                .iter()
+                .all(|pid| *pid != 0)
+            && point
                 .scored_samples
                 .iter()
                 .all(|sample| sample.producer_pid != 0)
+            && point
+                .evidence_scored_samples
+                .iter()
+                .all(|sample| sample.producer_pid != 0)
     });
+    let evidence_parity_pass = [&baseline, &base, &doubled]
+        .into_iter()
+        .all(|point| point.evidence_parity_pass);
     let evaluation = ScalingEvaluation {
         source_identity_pass,
         process_isolation_pass,
+        evidence_parity_pass,
         allocation_calls_ratio_pass: ratio_pass(
             allocation_calls_fixed_overhead_ratio,
             maximum_ratio,
@@ -1010,6 +1447,8 @@ fn scaling_report(
 fn owning_work(point: &ScalingPoint, counter: &str) -> ToolResult<u64> {
     match counter {
         "typecheck-inference-call-visits" => Ok(point.typecheck_inference_call_visits.p95),
+        "checked-calls" => Ok(point.checked_calls.p95),
+        "checked-expressions" => Ok(point.checked_expressions.p95),
         "parse-source-units-attempted" => Ok(point.parse_source_units_attempted.p95),
         "semantic-graph-nodes" => Ok(point.semantic_graph_nodes.p95),
         "dependency-scc-components" => point
@@ -1027,6 +1466,7 @@ fn owning_work(point: &ScalingPoint, counter: &str) -> ToolResult<u64> {
 fn scaling_status(evaluation: &ScalingEvaluation) -> ReportStatus {
     if evaluation.source_identity_pass
         && evaluation.process_isolation_pass
+        && evaluation.evidence_parity_pass
         && evaluation.allocation_calls_ratio_pass
         && evaluation.allocated_bytes_ratio_pass
         && evaluation.owning_work_ratio_pass
@@ -1060,6 +1500,10 @@ fn validate_warm_batch(
         || batch.primary_project_id == 0
         || batch.switch_project_id == 0
         || batch.primary_project_id == batch.switch_project_id
+        || batch.initial_resident_rss_kib == 0
+        || batch.final_resident_rss_kib == 0
+        || batch.peak_rss_kib < batch.initial_resident_rss_kib
+        || batch.peak_rss_kib < batch.final_resident_rss_kib
         || batch.edits.len() != total
         || batch.switches.len() != total
     {
@@ -1100,35 +1544,77 @@ fn validate_warm_batch(
         } else {
             "reverse"
         };
-        if sample.sequence != index
-            || sample.scored != (index >= setup_samples)
-            || sample.direction != expected_direction
-            || sample.previous_revision + 1 != sample.revision
-            || sample.revision != expected_revision
-            || sample.last_good_revision_before != sample.previous_revision
-            || sample.published_revision != sample.revision
-            || sample.diagnostic_count != 0
-            || !sample.full_document_typecheck_coverage
-            || !warm_edit_times_valid(sample)
-            || sample.diagnostics_work.source_units == 0
-            || sample.diagnostics_work.parsed_expressions == 0
-            || sample.diagnostics_work.checked_expressions == 0
-            || !has_single_unit_edit_frontend_work(&sample.diagnostics_work)
-            || sample.diagnostics_work.semantic_graph_nodes != 0
-            || !has_single_unit_edit_frontend_work(&sample.preview_work)
-            || sample.preview_work.semantic_graph_nodes == 0
-            || sample
+        let mut failures = Vec::new();
+        let mut require = |pass: bool, label: &'static str| {
+            if !pass {
+                failures.push(label);
+            }
+        };
+        require(sample.sequence == index, "sequence");
+        require(sample.scored == (index >= setup_samples), "scored");
+        require(sample.direction == expected_direction, "direction");
+        require(
+            sample.previous_revision.checked_add(1) == Some(sample.revision),
+            "revision-step",
+        );
+        require(sample.revision == expected_revision, "expected-revision");
+        require(
+            sample.last_good_revision_before == sample.previous_revision,
+            "last-good-before",
+        );
+        require(
+            sample.published_revision == sample.revision,
+            "published-revision",
+        );
+        require(sample.resident_rss_kib > 0, "resident-rss");
+        require(
+            sample.resident_rss_kib <= batch.peak_rss_kib,
+            "resident-rss-within-peak",
+        );
+        require(sample.diagnostic_count == 0, "diagnostics");
+        require(
+            sample.full_document_typecheck_coverage,
+            "typecheck-coverage",
+        );
+        require(warm_edit_times_valid(sample), "timing-order");
+        require(
+            has_single_unit_edit_frontend_work(&sample.diagnostics_work),
+            "diagnostics-work",
+        );
+        require(
+            sample.diagnostics_work.semantic_graph_nodes == 0,
+            "diagnostics-phase-boundary",
+        );
+        require(
+            has_fully_reused_preview_frontend_work(&sample.preview_work),
+            "preview-work",
+        );
+        require(
+            sample.preview_work.semantic_graph_nodes > 0,
+            "preview-semantics",
+        );
+        require(
+            sample
                 .diagnostics_phase
                 .values()
                 .into_iter()
-                .any(|value| !finite_nonnegative(value))
-            || sample
+                .all(finite_nonnegative),
+            "diagnostics-phase-times",
+        );
+        require(
+            sample
                 .preview_phase
                 .values()
                 .into_iter()
-                .any(|value| !finite_nonnegative(value))
-        {
-            return Err(format!("warm edit sample {index} has inconsistent evidence").into());
+                .all(finite_nonnegative),
+            "preview-phase-times",
+        );
+        if !failures.is_empty() {
+            return Err(format!(
+                "warm edit sample {index} has inconsistent evidence: {}",
+                failures.join(", ")
+            )
+            .into());
         }
         validate_sha256(&sample.source_bundle_digest_v1, "warm edit source bundle")?;
         validate_sha256(&sample.plan_sha256, "warm edit plan")?;
@@ -1258,6 +1744,19 @@ fn has_single_unit_edit_frontend_work(work: &WorkSample) -> bool {
         && work.parse.source_units_reused.checked_add(1) == Some(work.source_units)
 }
 
+fn has_fully_reused_preview_frontend_work(work: &WorkSample) -> bool {
+    work.source_units > 0
+        && work.parsed_expressions > 0
+        && work.checked_expressions > 0
+        && work.parse.source_units_attempted == 0
+        && work.parse.source_units_parsed == 0
+        && work.parse.source_units_reused == work.source_units
+        && work.typecheck.owner_statements > 0
+        && work.typecheck.owner_expressions > 0
+        && work.typecheck.owner_local_constraints > 0
+        && work.typecheck.owner_unification_steps > 0
+}
+
 fn validate_scaling_sample(
     sample: &SyntheticScalingBatch,
     budget: &ScalingWorkloadBudget,
@@ -1275,8 +1774,6 @@ fn validate_scaling_sample(
         || sample.revision != 0
         || !finite_nonnegative(sample.elapsed_ms)
         || sample.peak_rss_kib == 0
-        || sample.allocations.allocation_calls == 0
-        || sample.allocations.allocated_bytes == 0
         || sample.work.source_units == 0
         || sample.work.parsed_expressions == 0
         || sample.work.checked_expressions == 0
@@ -1302,7 +1799,7 @@ fn validate_scaling_sample(
 }
 
 fn parse_scc_trace(stderr: &[u8]) -> ToolResult<SccTraceEvidence> {
-    const PREFIX: &str = "boon_semantic dependency_manifest graph:counts ";
+    const PREFIX: &str = "boon_semantic dependency_manifest_v7 projection_graph:counts ";
     let text = std::str::from_utf8(stderr)?;
     let matches = text
         .lines()
@@ -1356,6 +1853,19 @@ fn validate_budget(workspace: &Path, budget: &BudgetManifest) -> ToolResult<()> 
         || budget.fixtures.is_empty()
         || budget.protocol.build_profile != "release"
         || budget.protocol.target_profile != "software_default"
+        || budget.protocol.product_producer.is_empty()
+        || budget.protocol.evidence_producer.is_empty()
+        || budget.protocol.product_producer == budget.protocol.evidence_producer
+        || budget.protocol.product_kind.is_empty()
+        || budget.protocol.product_allocator.is_empty()
+        || budget.protocol.evidence_kind.is_empty()
+        || budget.protocol.evidence_allocator.is_empty()
+        || budget.protocol.evidence_instrumentation != "thread-local-rust-global-allocator"
+        || budget.protocol.evidence_counter_scope
+            != "single-compiler-thread-rust-global-allocator-events"
+        || budget.protocol.target_cpu.is_empty()
+        || budget.protocol.profile_options.is_empty()
+        || budget.protocol.producer_pair_schedule != "alternating-by-observation-index"
         || budget.protocol.compiler_threads != 1
         || budget.protocol.compiler_caches != "disabled"
         || budget.protocol.cold_modes != ["fresh-process", "empty-session"]
@@ -1366,6 +1876,8 @@ fn validate_budget(workspace: &Path, budget: &BudgetManifest) -> ToolResult<()> 
     {
         return Err("compiler interaction budget protocol is invalid".into());
     }
+    safe_relative_path(&budget.protocol.product_producer, "product producer path")?;
+    safe_relative_path(&budget.protocol.evidence_producer, "evidence producer path")?;
     validate_effective_samples(
         budget.protocol.setup_samples,
         budget.protocol.scored_samples,
@@ -1451,12 +1963,9 @@ fn validate_budget(workspace: &Path, budget: &BudgetManifest) -> ToolResult<()> 
             .into());
         }
         let expected = match workload.id.as_str() {
-            "call-depth" | "call-site-count" => {
-                (SampleIntent::Diagnostics, "typecheck-inference-call-visits")
-            }
-            "contextual-call-site-count" | "static-branch-count" => {
-                (SampleIntent::Verified, "semantic-graph-nodes")
-            }
+            "call-depth" | "call-site-count" => (SampleIntent::Diagnostics, "checked-calls"),
+            "contextual-call-site-count" => (SampleIntent::Verified, "semantic-graph-nodes"),
+            "static-branch-count" => (SampleIntent::Verified, "checked-expressions"),
             "source-unit-count" => (SampleIntent::Diagnostics, "parse-source-units-attempted"),
             "dependency-cone-size" => (SampleIntent::Verified, "dependency-scc-components"),
             other => return Err(format!("unsupported scaling workload `{other}`").into()),
@@ -1507,7 +2016,8 @@ fn validate_report(
     if report.format_version != FORMAT_VERSION || report.contract != REPORT_CONTRACT {
         return Err("compiler interaction report contract is unsupported".into());
     }
-    if report.identity != current_identity(workspace)? {
+    let expected_identity = current_identity(workspace)?;
+    if report.identity != expected_identity {
         return Err("compiler interaction report source/tool identity is stale".into());
     }
     let expected_budget = BudgetIdentity {
@@ -1519,15 +2029,28 @@ fn validate_report(
     if report.budget != expected_budget {
         return Err("compiler interaction report budget identity is stale".into());
     }
-    let producer_path = workspace.join(PRODUCER_PATH);
-    require_current_prebuilt_producer(workspace, &producer_path)?;
-    let expected_producer = ProducerIdentity {
-        path: PRODUCER_PATH.to_owned(),
-        sha256: sha256_file(&producer_path)?.as_str().to_owned(),
-    };
-    if report.producer != expected_producer {
-        return Err("compiler interaction report producer identity is stale".into());
-    }
+    validate_interaction_report_producer(
+        workspace,
+        &expected_identity,
+        &report.producers.product,
+        &budget.protocol.product_producer,
+        &budget.protocol.product_kind,
+        &budget.protocol.product_allocator,
+        "none",
+        "none",
+        &budget.protocol,
+    )?;
+    validate_interaction_report_producer(
+        workspace,
+        &expected_identity,
+        &report.producers.evidence,
+        &budget.protocol.evidence_producer,
+        &budget.protocol.evidence_kind,
+        &budget.protocol.evidence_allocator,
+        &budget.protocol.evidence_instrumentation,
+        &budget.protocol.evidence_counter_scope,
+        &budget.protocol,
+    )?;
     if report.protocol != protocol_evidence(budget, setup_samples, scored_samples)
         || report.run_classification != classification(budget, setup_samples, scored_samples)
     {
@@ -1540,7 +2063,24 @@ fn validate_report(
         setup_samples,
         scored_samples,
     )?;
-    let expected_warm = warm_report(report.warm.raw.clone(), &budget.warm)?;
+    validate_warm_batch(
+        workspace,
+        &report.warm.evidence_raw,
+        &budget.warm,
+        setup_samples,
+        scored_samples,
+    )?;
+    if report.warm.raw.producer != report.producers.product.metadata
+        || report.warm.evidence_raw.producer != report.producers.evidence.metadata
+    {
+        return Err("warm compiler producer metadata differs from report provenance".into());
+    }
+    validate_warm_product_evidence_parity(&report.warm.raw, &report.warm.evidence_raw)?;
+    let expected_warm = warm_report(
+        report.warm.raw.clone(),
+        report.warm.evidence_raw.clone(),
+        &budget.warm,
+    )?;
     if report.warm != expected_warm {
         return Err("compiler interaction warm summaries/evaluation are inconsistent".into());
     }
@@ -1550,6 +2090,7 @@ fn validate_report(
     for (scaling, workload) in report.scaling.iter().zip(&budget.scaling.workloads) {
         validate_scaling_point(
             &scaling.baseline,
+            &report.producers,
             workload,
             workload.baseline_size,
             setup_samples,
@@ -1557,6 +2098,7 @@ fn validate_report(
         )?;
         validate_scaling_point(
             &scaling.base,
+            &report.producers,
             workload,
             workload.base_size,
             setup_samples,
@@ -1564,6 +2106,7 @@ fn validate_report(
         )?;
         validate_scaling_point(
             &scaling.doubled,
+            &report.producers,
             workload,
             workload.doubled_size,
             setup_samples,
@@ -1576,8 +2119,24 @@ fn validate_report(
             scaling.base.clone(),
             scaling.doubled.clone(),
         )?;
-        if scaling != &expected {
-            return Err(format!("scaling report `{}` is inconsistent", workload.id).into());
+        if !scaling_reports_equivalent(scaling, &expected) {
+            return Err(format!(
+                "scaling report `{}` is inconsistent: status {:?}/{:?}, elapsed ratio {:?}/{:?}, allocation-call ratio {:?}/{:?}, allocated-byte ratio {:?}/{:?}, owning-work ratio {:?}/{:?}, evaluation {:?}/{:?}",
+                workload.id,
+                scaling.status,
+                expected.status,
+                scaling.elapsed_ms_fixed_overhead_ratio,
+                expected.elapsed_ms_fixed_overhead_ratio,
+                scaling.allocation_calls_fixed_overhead_ratio,
+                expected.allocation_calls_fixed_overhead_ratio,
+                scaling.allocated_bytes_fixed_overhead_ratio,
+                expected.allocated_bytes_fixed_overhead_ratio,
+                scaling.owning_work_fixed_overhead_ratio,
+                expected.owning_work_fixed_overhead_ratio,
+                scaling.evaluation,
+                expected.evaluation,
+            )
+            .into());
         }
     }
     let expected_missing = vec![
@@ -1599,8 +2158,90 @@ fn validate_report(
     Ok(())
 }
 
+fn scaling_reports_equivalent(left: &ScalingReport, right: &ScalingReport) -> bool {
+    left.id == right.id
+        && left.intent == right.intent
+        && left.owning_work_counter == right.owning_work_counter
+        && close_f64(left.maximum_doubling_ratio, right.maximum_doubling_ratio)
+        && left.status == right.status
+        && left.baseline == right.baseline
+        && left.base == right.base
+        && left.doubled == right.doubled
+        && close_optional_f64(
+            left.elapsed_ms_fixed_overhead_ratio,
+            right.elapsed_ms_fixed_overhead_ratio,
+        )
+        && close_optional_f64(
+            left.allocation_calls_fixed_overhead_ratio,
+            right.allocation_calls_fixed_overhead_ratio,
+        )
+        && close_optional_f64(
+            left.allocated_bytes_fixed_overhead_ratio,
+            right.allocated_bytes_fixed_overhead_ratio,
+        )
+        && close_optional_f64(
+            left.owning_work_fixed_overhead_ratio,
+            right.owning_work_fixed_overhead_ratio,
+        )
+        && left.evaluation == right.evaluation
+}
+
+fn close_optional_f64(left: Option<f64>, right: Option<f64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => close_f64(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn close_f64(left: f64, right: f64) -> bool {
+    finite_nonnegative(left)
+        && finite_nonnegative(right)
+        && (left - right).abs() <= 1.0e-12 * left.abs().max(right.abs()).max(1.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_interaction_report_producer(
+    workspace: &Path,
+    identity: &ExpectedIdentity,
+    producer: &ProducerIdentity,
+    expected_path: &str,
+    expected_kind: &str,
+    expected_allocator: &str,
+    expected_instrumentation: &str,
+    expected_counter_scope: &str,
+    protocol: &BudgetProtocol,
+) -> ToolResult<()> {
+    if producer.path != expected_path {
+        return Err(format!(
+            "compiler interaction producer path is {}; expected {expected_path}",
+            producer.path
+        )
+        .into());
+    }
+    let path = workspace.join(safe_relative_path(expected_path, "producer path")?);
+    require_current_prebuilt_producer(workspace, &path)?;
+    let digest = sha256_file(&path)?;
+    if producer.sha256 != digest.as_str() {
+        return Err(format!("compiler interaction producer {expected_path} is stale").into());
+    }
+    validate_interaction_producer(
+        workspace,
+        identity,
+        &producer.metadata,
+        digest.as_str(),
+        expected_path,
+        expected_kind,
+        expected_allocator,
+        expected_instrumentation,
+        expected_counter_scope,
+        protocol,
+    )
+}
+
 fn validate_scaling_point(
     point: &ScalingPoint,
+    producers: &ProducerSetIdentity,
     budget: &ScalingWorkloadBudget,
     size: usize,
     setup_samples: usize,
@@ -1608,8 +2249,15 @@ fn validate_scaling_point(
 ) -> ToolResult<()> {
     if point.size != size
         || point.setup_producer_pids.len() != setup_samples
+        || point.evidence_setup_producer_pids.len() != setup_samples
         || point.scored_samples.len() != scored_samples
+        || point.evidence_scored_samples.len() != scored_samples
         || point.setup_producer_pids.iter().any(|pid| *pid == 0)
+        || point
+            .evidence_setup_producer_pids
+            .iter()
+            .any(|pid| *pid == 0)
+        || !point.evidence_parity_pass
     {
         return Err(format!(
             "scaling point {}/{} has invalid sampling shape",
@@ -1619,6 +2267,22 @@ fn validate_scaling_point(
     }
     for sample in &point.scored_samples {
         validate_scaling_sample(sample, budget, size)?;
+        if sample.producer != producers.product.metadata {
+            return Err("scaling product producer metadata changed".into());
+        }
+    }
+    for sample in &point.evidence_scored_samples {
+        validate_scaling_sample(sample, budget, size)?;
+        if sample.producer != producers.evidence.metadata {
+            return Err("scaling evidence producer metadata changed".into());
+        }
+    }
+    for (product, evidence) in point
+        .scored_samples
+        .iter()
+        .zip(&point.evidence_scored_samples)
+    {
+        validate_scaling_product_evidence_parity(product, evidence)?;
     }
     let expected_trace = if budget.owning_work_counter == "dependency-scc-components" {
         point.dependency_scc
@@ -1645,7 +2309,9 @@ fn validate_scaling_point(
     let expected = scaling_point(
         size,
         point.setup_producer_pids.clone(),
+        point.evidence_setup_producer_pids.clone(),
         point.scored_samples.clone(),
+        point.evidence_scored_samples.clone(),
         expected_trace,
     )?;
     if point != &expected {
@@ -1695,6 +2361,16 @@ fn protocol_evidence(
     scored_samples: usize,
 ) -> ProtocolEvidence {
     ProtocolEvidence {
+        product_kind: budget.protocol.product_kind.clone(),
+        product_allocator: budget.protocol.product_allocator.clone(),
+        evidence_kind: budget.protocol.evidence_kind.clone(),
+        evidence_allocator: budget.protocol.evidence_allocator.clone(),
+        evidence_instrumentation: budget.protocol.evidence_instrumentation.clone(),
+        evidence_counter_scope: budget.protocol.evidence_counter_scope.clone(),
+        target_cpu: budget.protocol.target_cpu.clone(),
+        profile_options: budget.protocol.profile_options.clone(),
+        rustflags: budget.protocol.rustflags.clone(),
+        producer_pair_schedule: budget.protocol.producer_pair_schedule.clone(),
         default_setup_samples: budget.protocol.setup_samples,
         default_scored_samples: budget.protocol.scored_samples,
         effective_setup_samples: setup_samples,

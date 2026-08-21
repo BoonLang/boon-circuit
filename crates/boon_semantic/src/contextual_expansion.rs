@@ -18,7 +18,12 @@ use crate::execution::{
 };
 use crate::{
     ExecutionPending, OutCallInstanceId, OutInputValue, OutNetId, ResolvedOutGraph as OutNet,
-    ScopedCheckedExpr, SemanticImageBuilder, StaticOwnerId, execution_construction_routes_v3,
+    ScopedCheckedExpr, SemanticImageBuilder, StaticOwnerId,
+    definition_templates::{
+        DefinitionExecutionTemplateRef, definition_execution_template,
+        definition_execution_templates,
+    },
+    execution_construction_routes_v3,
 };
 pub(crate) use boon_checked::erase_runtime_type_vars;
 use boon_checked::{
@@ -1347,6 +1352,7 @@ fn push_default_order_direction(
 
 pub(crate) fn derive_contextual_materializations(
     program: &CheckedProgramFields,
+    kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
     out_net: &OutNet,
     retained_ordinary_declarations: &BTreeSet<DeclId>,
     retain_ordinary_calls: bool,
@@ -1484,6 +1490,7 @@ pub(crate) fn derive_contextual_materializations(
     let mut required_ordinary_definitions = BTreeSet::new();
     let builder_indexes = SemanticExpressionBuilderIndexes::new(
         program,
+        kernel_input,
         out_net,
         retained_ordinary_declarations,
         &lookup,
@@ -5377,19 +5384,40 @@ enum SemanticValueFrameKey {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SemanticValueBinding {
     Local(SemanticLocalBindingId),
     Projection {
         input: ScopedCheckedExpr,
-        fields: Vec<String>,
+        fields: SemanticValueProjectionSpan,
     },
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SemanticValueProjectionSpan {
+    start: usize,
+    len: usize,
+}
+
+impl SemanticValueProjectionSpan {
+    fn get<'a>(self, fields: &'a [String]) -> &'a [String] {
+        fields
+            .get(self.start..self.start + self.len)
+            .expect("sealed semantic value projection belongs to its field column")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SemanticValueFrameBinding {
+    declaration: DeclId,
+    value: SemanticValueBinding,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct SemanticValueFrame {
-    bindings: BTreeMap<DeclId, SemanticValueBinding>,
-    local_ids: BTreeMap<DeclId, SemanticLocalBindingId>,
+    parent: Option<usize>,
+    binding_start: usize,
+    binding_len: usize,
 }
 
 fn runtime_value_provenance() -> SemanticValueProvenance {
@@ -5895,27 +5923,26 @@ fn ordinary_callable_body_dependencies(
     program: &CheckedProgramFields,
     lookup: &CheckedProgramLookup,
     callable: &boon_checked::CheckedCallableSignature,
-    template: &boon_checked::CheckedDefinitionExecutionTemplateV1,
+    template: DefinitionExecutionTemplateRef<'_>,
     candidates: &BTreeSet<DeclId>,
 ) -> Option<BTreeSet<DeclId>> {
     let Some(root) = callable.result_expression else {
         return None;
     };
-    if template.schema != boon_checked::CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1
-        || template.callable != callable.decl_id
-        || template.result != root
-        || template.nodes.last().map(|node| node.expression) != Some(root)
+    if !template.has_expected_schema()
+        || template.callable() != callable.decl_id
+        || template.result() != root
+        || template.nodes().last().map(|node| node.expression()) != Some(root)
     {
         return None;
     }
     let expression_ids = template
-        .nodes
-        .iter()
-        .map(|node| node.expression)
+        .nodes()
+        .map(|node| node.expression())
         .collect::<BTreeSet<_>>();
-    if expression_ids.len() != template.nodes.len()
-        || template.nodes.iter().any(|node| {
-            node.dependencies
+    if expression_ids.len() != template.node_count()
+        || template.nodes().any(|node| {
+            node.dependencies()
                 .iter()
                 .any(|dependency| !expression_ids.contains(dependency))
         })
@@ -5924,8 +5951,8 @@ fn ordinary_callable_body_dependencies(
     }
     let mut dependencies = BTreeSet::new();
     let mut calls = BTreeSet::new();
-    for node in &template.nodes {
-        let expression_id = node.expression;
+    for node in template.nodes() {
+        let expression_id = node.expression();
         if lookup.has_source_bearing_resource_projection(expression_id) {
             return None;
         }
@@ -5975,7 +6002,7 @@ fn ordinary_callable_body_dependencies(
                 }
             }
             CheckedExpressionKind::Call { call } => {
-                if node.call != Some(*call) || node.selector.is_some() {
+                if node.call() != Some(*call) || node.selector().is_some() {
                     return None;
                 }
                 calls.insert(*call);
@@ -6067,17 +6094,20 @@ fn ordinary_callable_body_dependencies(
             | CheckedExpressionKind::Then { .. }
             | CheckedExpressionKind::Invalid { .. } => return None,
         }
-        match (&expression.kind, &node.selector) {
+        let selector = node.selector();
+        match (&expression.kind, selector) {
             (CheckedExpressionKind::When { input, arms }, Some(selector))
-                if selector.input == *input && selector.arms == *arms && node.call.is_none() => {}
-            (CheckedExpressionKind::Call { call }, None) if node.call == Some(*call) => {}
+                if selector.input() == *input
+                    && selector.arms() == arms.as_slice()
+                    && node.call().is_none() => {}
+            (CheckedExpressionKind::Call { call }, None) if node.call() == Some(*call) => {}
             (CheckedExpressionKind::When { .. }, _) | (_, Some(_)) => return None,
-            _ if node.call.is_some() => return None,
+            _ if node.call().is_some() => return None,
             _ => {}
         }
     }
-    if calls != template.calls.iter().copied().collect::<BTreeSet<_>>()
-        || calls.len() != template.calls.len()
+    if calls != template.calls().iter().copied().collect::<BTreeSet<_>>()
+        || calls.len() != template.calls().len()
     {
         return None;
     }
@@ -6098,11 +6128,6 @@ pub(crate) fn ordinary_callable_declarations(
         .filter(|callable| ordinary_callable_base_candidate(program, callable))
         .map(|callable| callable.decl_id)
         .collect::<BTreeSet<_>>();
-    let templates = program
-        .definition_execution_templates
-        .iter()
-        .map(|template| (template.callable, template))
-        .collect::<BTreeMap<_, _>>();
     let mut dependents = BTreeMap::<DeclId, BTreeSet<DeclId>>::new();
     let mut pending_rejections = Vec::new();
     for callable in program
@@ -6110,7 +6135,8 @@ pub(crate) fn ordinary_callable_declarations(
         .iter()
         .filter(|callable| base_candidates.contains(&callable.decl_id))
     {
-        let Some(template) = templates.get(&callable.decl_id).copied() else {
+        let Some(template) = definition_execution_template(program, kernel_input, callable.decl_id)
+        else {
             pending_rejections.push(callable.decl_id);
             continue;
         };
@@ -6213,6 +6239,7 @@ impl StaticSelectorValue {
 impl SemanticExpressionBuilderIndexes {
     fn new(
         program: &CheckedProgramFields,
+        kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
         out_net: &OutNet,
         retained_ordinary_declarations: &BTreeSet<DeclId>,
         lookup: &CheckedProgramLookup,
@@ -6257,7 +6284,7 @@ impl SemanticExpressionBuilderIndexes {
             .collect();
         let callables_with_holds = hold_owners.values().copied().collect();
         let (source_by_expression, state_by_expression) =
-            definition_resource_expression_indexes(program, lookup)?;
+            definition_resource_expression_indexes(program, kernel_input, lookup)?;
         Ok(Self {
             callable_ids,
             call_ids,
@@ -6281,23 +6308,24 @@ impl SemanticExpressionBuilderIndexes {
 /// lookup at expression construction O(1).
 fn definition_resource_expression_indexes(
     program: &CheckedProgramFields,
+    kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
     lookup: &CheckedProgramLookup,
 ) -> Result<(Vec<Option<CheckedSourceId>>, Vec<Option<CheckedStateId>>), ExpansionError> {
-    let templates = program
-        .definition_execution_templates
-        .iter()
-        .map(|template| (template.callable, template))
-        .collect::<BTreeMap<_, _>>();
-    if templates.len() != program.definition_execution_templates.len() {
-        return Err(ExpansionError::InvalidLocalBindings(
-            "checked definition templates repeat a callable resource owner".to_owned(),
-        ));
+    if kernel_input.is_none() {
+        let mut seen = BTreeSet::new();
+        if definition_execution_templates(program, None)
+            .any(|template| !seen.insert(template.callable()))
+        {
+            return Err(ExpansionError::InvalidLocalBindings(
+                "checked definition templates repeat a callable resource owner".to_owned(),
+            ));
+        }
     }
     let mut claimed_sources = vec![None; program.sources.len()];
     let mut claimed_states = vec![None; program.states.len()];
     let mut claimed_lists = vec![None; program.lists.len()];
-    for template in &program.definition_execution_templates {
-        for source in &template.sources {
+    for template in definition_execution_templates(program, kernel_input) {
+        for source in template.sources() {
             let definition = program
                 .sources
                 .get(source.0 as usize)
@@ -6305,24 +6333,26 @@ fn definition_resource_expression_indexes(
                 .ok_or_else(|| {
                     ExpansionError::InvalidLocalBindings(format!(
                         "callable {} template references missing source {}",
-                        template.callable.0, source.0,
+                        template.callable().0,
+                        source.0,
                     ))
                 })?;
-            if lookup.function_owner(definition.owner_scope) != Some(template.callable) {
+            if lookup.function_owner(definition.owner_scope) != Some(template.callable()) {
                 return Err(ExpansionError::InvalidLocalBindings(format!(
                     "callable {} template source {} is not owned by its definition",
-                    template.callable.0, source.0,
+                    template.callable().0,
+                    source.0,
                 )));
             }
             let slot = &mut claimed_sources[source.0 as usize];
-            if slot.replace(template.callable).is_some() {
+            if slot.replace(template.callable()).is_some() {
                 return Err(ExpansionError::InvalidLocalBindings(format!(
                     "checked source {} is claimed by multiple definition templates",
                     source.0,
                 )));
             }
         }
-        for state in &template.states {
+        for state in template.states() {
             let definition = program
                 .states
                 .get(state.0 as usize)
@@ -6330,24 +6360,26 @@ fn definition_resource_expression_indexes(
                 .ok_or_else(|| {
                     ExpansionError::InvalidLocalBindings(format!(
                         "callable {} template references missing state {}",
-                        template.callable.0, state.0,
+                        template.callable().0,
+                        state.0,
                     ))
                 })?;
-            if lookup.function_owner(definition.owner_scope) != Some(template.callable) {
+            if lookup.function_owner(definition.owner_scope) != Some(template.callable()) {
                 return Err(ExpansionError::InvalidLocalBindings(format!(
                     "callable {} template state {} is not owned by its definition",
-                    template.callable.0, state.0,
+                    template.callable().0,
+                    state.0,
                 )));
             }
             let slot = &mut claimed_states[state.0 as usize];
-            if slot.replace(template.callable).is_some() {
+            if slot.replace(template.callable()).is_some() {
                 return Err(ExpansionError::InvalidLocalBindings(format!(
                     "checked state {} is claimed by multiple definition templates",
                     state.0,
                 )));
             }
         }
-        for list in &template.lists {
+        for list in template.lists() {
             let definition = program
                 .lists
                 .get(list.0 as usize)
@@ -6355,17 +6387,19 @@ fn definition_resource_expression_indexes(
                 .ok_or_else(|| {
                     ExpansionError::InvalidLocalBindings(format!(
                         "callable {} template references missing list {}",
-                        template.callable.0, list.0,
+                        template.callable().0,
+                        list.0,
                     ))
                 })?;
-            if lookup.function_owner(definition.owner_scope) != Some(template.callable) {
+            if lookup.function_owner(definition.owner_scope) != Some(template.callable()) {
                 return Err(ExpansionError::InvalidLocalBindings(format!(
                     "callable {} template list {} is not owned by its definition",
-                    template.callable.0, list.0,
+                    template.callable().0,
+                    list.0,
                 )));
             }
             let slot = &mut claimed_lists[list.0 as usize];
-            if slot.replace(template.callable).is_some() {
+            if slot.replace(template.callable()).is_some() {
                 return Err(ExpansionError::InvalidLocalBindings(format!(
                     "checked list {} is claimed by multiple definition templates",
                     list.0,
@@ -6445,6 +6479,8 @@ pub(crate) struct SemanticExpressionBuilder<'a> {
     frame_stack: Vec<Option<OutCallInstanceId>>,
     current_statement: Option<SemanticStatementId>,
     value_frames: Vec<SemanticValueFrame>,
+    value_frame_bindings: Vec<SemanticValueFrameBinding>,
+    value_frame_projection_fields: Vec<String>,
     value_frame_by_key: BTreeMap<SemanticValueFrameKey, usize>,
     next_local_binding: usize,
     defer_nested_expansion: bool,
@@ -6485,6 +6521,8 @@ impl<'a> SemanticExpressionBuilder<'a> {
             frame_stack: Vec::new(),
             current_statement: None,
             value_frames: Vec::new(),
+            value_frame_bindings: Vec::new(),
+            value_frame_projection_fields: Vec::new(),
             value_frame_by_key: BTreeMap::new(),
             next_local_binding: 0,
             defer_nested_expansion: false,
@@ -6573,14 +6611,36 @@ impl<'a> SemanticExpressionBuilder<'a> {
         self.current_statement = statement;
     }
 
-    fn parent_value_bindings(
+    fn local_value_binding(&self, frame: usize, target: DeclId) -> Option<SemanticValueBinding> {
+        let frame = self.value_frames.get(frame)?;
+        self.value_frame_bindings
+            .get(frame.binding_start..frame.binding_start + frame.binding_len)?
+            .iter()
+            .rev()
+            .find(|binding| binding.declaration == target)
+            .map(|binding| binding.value)
+    }
+
+    fn value_binding(
         &self,
-        parent: Option<usize>,
-    ) -> BTreeMap<DeclId, SemanticValueBinding> {
-        parent
-            .and_then(|frame| self.value_frames.get(frame))
-            .map(|frame| frame.bindings.clone())
-            .unwrap_or_default()
+        mut frame: Option<usize>,
+        target: DeclId,
+    ) -> Option<SemanticValueBinding> {
+        // Frames only point to an earlier lexical parent. Keep a hard bound so
+        // corrupt construction state can never turn lookup into an infinite
+        // walk.
+        let mut remaining = self.value_frames.len();
+        while let Some(frame_id) = frame {
+            if remaining == 0 {
+                return None;
+            }
+            remaining -= 1;
+            if let Some(binding) = self.local_value_binding(frame_id, target) {
+                return Some(binding);
+            }
+            frame = self.value_frames.get(frame_id)?.parent;
+        }
+        None
     }
 
     fn intern_block_value_frame(
@@ -6588,7 +6648,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
         scoped: ScopedCheckedExpr,
         owner: Option<StaticOwnerId>,
         declarations: &[DeclId],
-    ) -> (usize, BTreeMap<DeclId, SemanticLocalBindingId>) {
+    ) -> usize {
         let key = SemanticValueFrameKey::Block {
             expression: scoped.expression,
             frame: scoped.frame,
@@ -6596,27 +6656,26 @@ impl<'a> SemanticExpressionBuilder<'a> {
             owner,
         };
         if let Some(frame) = self.value_frame_by_key.get(&key).copied() {
-            return (frame, self.value_frames[frame].local_ids.clone());
+            return frame;
         }
 
-        let mut bindings = self.parent_value_bindings(scoped.value_frame);
-        let local_ids = declarations
-            .iter()
-            .copied()
-            .map(|declaration| {
-                let id = SemanticLocalBindingId(self.next_local_binding);
-                self.next_local_binding += 1;
-                bindings.insert(declaration, SemanticValueBinding::Local(id));
-                (declaration, id)
-            })
-            .collect::<BTreeMap<_, _>>();
+        let binding_start = self.value_frame_bindings.len();
+        for declaration in declarations.iter().copied() {
+            let id = SemanticLocalBindingId(self.next_local_binding);
+            self.next_local_binding += 1;
+            self.value_frame_bindings.push(SemanticValueFrameBinding {
+                declaration,
+                value: SemanticValueBinding::Local(id),
+            });
+        }
         let frame = self.value_frames.len();
         self.value_frames.push(SemanticValueFrame {
-            bindings,
-            local_ids: local_ids.clone(),
+            parent: scoped.value_frame,
+            binding_start,
+            binding_len: declarations.len(),
         });
         self.value_frame_by_key.insert(key, frame);
-        (frame, local_ids)
+        frame
     }
 
     fn intern_select_value_frame(
@@ -6625,7 +6684,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
         owner: Option<StaticOwnerId>,
         arm: CheckedExprId,
         input: CheckedExprId,
-        bindings: &[(DeclId, Vec<String>)],
+        bindings: Vec<(DeclId, Vec<String>)>,
     ) -> usize {
         let key = SemanticValueFrameKey::SelectArm {
             arm,
@@ -6637,25 +6696,32 @@ impl<'a> SemanticExpressionBuilder<'a> {
             return frame;
         }
 
-        let mut frame_bindings = self.parent_value_bindings(scoped.value_frame);
-        frame_bindings.extend(bindings.iter().cloned().map(|(declaration, fields)| {
-            (
+        let binding_start = self.value_frame_bindings.len();
+        for (declaration, fields) in bindings {
+            let field_start = self.value_frame_projection_fields.len();
+            let field_len = fields.len();
+            self.value_frame_projection_fields.extend(fields);
+            self.value_frame_bindings.push(SemanticValueFrameBinding {
                 declaration,
-                SemanticValueBinding::Projection {
+                value: SemanticValueBinding::Projection {
                     input: ScopedCheckedExpr {
                         expression: input,
                         frame: scoped.frame,
                         evaluation_port: None,
                         value_frame: scoped.value_frame,
                     },
-                    fields,
+                    fields: SemanticValueProjectionSpan {
+                        start: field_start,
+                        len: field_len,
+                    },
                 },
-            )
-        }));
+            });
+        }
         let frame = self.value_frames.len();
         self.value_frames.push(SemanticValueFrame {
-            bindings: frame_bindings,
-            local_ids: BTreeMap::new(),
+            parent: scoped.value_frame,
+            binding_start,
+            binding_len: self.value_frame_bindings.len() - binding_start,
         });
         self.value_frame_by_key.insert(key, frame);
         frame
@@ -7076,12 +7142,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                         },
                     ));
                 }
-                if let Some(binding) = scoped
-                    .value_frame
-                    .and_then(|frame| self.value_frames.get(frame))
-                    .and_then(|frame| frame.bindings.get(&target))
-                    .cloned()
-                {
+                if let Some(binding) = self.value_binding(scoped.value_frame, target) {
                     return match binding {
                         SemanticValueBinding::Local(binding) => Ok(self.push(
                             expression,
@@ -7092,10 +7153,9 @@ impl<'a> SemanticExpressionBuilder<'a> {
                                 projection,
                             },
                         )),
-                        SemanticValueBinding::Projection {
-                            input,
-                            fields: mut binding_fields,
-                        } => {
+                        SemanticValueBinding::Projection { input, fields } => {
+                            let mut binding_fields =
+                                fields.get(&self.value_frame_projection_fields).to_vec();
                             let input = self.expand(input)?;
                             binding_fields.extend(projection);
                             let projected =
@@ -7571,8 +7631,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     .iter()
                     .map(|binding| binding.declaration)
                     .collect::<Vec<_>>();
-                let (frame, binding_ids) =
-                    self.intern_block_value_frame(scoped, owner, &declarations);
+                let frame = self.intern_block_value_frame(scoped, owner, &declarations);
                 let result = result.ok_or(ExpansionError::MissingExpression(scoped.expression))?;
                 let bindings = bindings
                     .into_iter()
@@ -7587,7 +7646,15 @@ impl<'a> SemanticExpressionBuilder<'a> {
                             self.flush_boundary_origin_for_value(binding.value, value);
                         let value = self.wrap_flush_boundary(boundary_expression, value, owner)?;
                         Ok(SemanticBlockBinding {
-                            id: binding_ids[&binding.declaration],
+                            id: match self.local_value_binding(frame, binding.declaration) {
+                                Some(SemanticValueBinding::Local(id)) => id,
+                                Some(SemanticValueBinding::Projection { .. }) | None => {
+                                    return Err(ExpansionError::InvalidLocalBindings(format!(
+                                        "semantic block frame lost declaration {}",
+                                        binding.declaration.0,
+                                    )));
+                                }
+                            },
                             declaration: binding.declaration,
                             value,
                         })
@@ -8396,7 +8463,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
             let value_frame = if frame_bindings.is_empty() {
                 scoped.value_frame
             } else {
-                Some(self.intern_select_value_frame(scoped, owner, *child, input, &frame_bindings))
+                Some(self.intern_select_value_frame(scoped, owner, *child, input, frame_bindings))
             };
             arms.push(SemanticSelectArm {
                 pattern: pattern.clone(),
@@ -9307,7 +9374,7 @@ mod tests {
         crate::validate_out_contracts(&program, &out)
             .expect("valid fixture validates OUT contracts");
         let (materializations, arena, indexes, required) =
-            derive_contextual_materializations(&program, &out, &retained, true)
+            derive_contextual_materializations(&program, None, &out, &retained, true)
                 .expect("valid fixture derives contextual materializations");
         let builder = derive_semantic_execution_graph(
             &program,
@@ -10318,9 +10385,14 @@ FUNCTION nested() {
             .iter()
             .find(|template| template.callable == wrapper.decl_id)
             .expect("wrapper definition template");
-        let dependencies =
-            ordinary_callable_body_dependencies(&program, &lookup, wrapper, template, &candidates)
-                .expect("pure structural wrapper is an ordinary candidate");
+        let dependencies = ordinary_callable_body_dependencies(
+            &program,
+            &lookup,
+            wrapper,
+            DefinitionExecutionTemplateRef::Rich(template),
+            &candidates,
+        )
+        .expect("pure structural wrapper is an ordinary candidate");
         assert_eq!(
             dependencies,
             BTreeSet::from([nested.decl_id]),

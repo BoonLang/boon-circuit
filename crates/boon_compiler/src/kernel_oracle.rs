@@ -2695,6 +2695,15 @@ fn checked_construction_from_kernel(
                 format!("cannot project dense kernel editor resource rows: {error}")
             })?,
     };
+    let definition_execution_templates = match projection_demand {
+        KernelCheckedProjectionDemand::RuntimePacked => Box::new([]),
+        KernelCheckedProjectionDemand::EditorRich => rows
+            .semantic_input
+            .materialize_rich_definition_execution_templates(),
+    };
+    if projection_demand == KernelCheckedProjectionDemand::EditorRich {
+        rows.semantic_input.expect_rich_editor_projection();
+    }
     let call_occurrences = rows.call_occurrences;
     let semantic_input = rows.semantic_input;
     let mut checked_image_publication = rows.checked_image_publication;
@@ -2719,7 +2728,7 @@ fn checked_construction_from_kernel(
         states: rows.states.into_vec(),
         lists: rows.lists.into_vec(),
         occurrences: rows.occurrences.into_vec(),
-        definition_execution_templates: rows.definition_execution_templates.into_vec(),
+        definition_execution_templates: definition_execution_templates.into_vec(),
     };
     let (order_chains, order_diagnostics) = boon_typecheck::derive_checked_order_chains(&fields);
     fields.order_chains = order_chains;
@@ -19862,6 +19871,161 @@ FUNCTION address(row) {{
     }
 
     #[test]
+    fn runtime_definition_execution_uses_the_flat_kernel_authority() {
+        let source = concat!(
+            "FUNCTION double(input) {\n",
+            "    input + input\n",
+            "}\n",
+            "value: double(input: 2)\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse packed definition-execution fixture");
+        let checked = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::RuntimePacked,
+        )
+        .expect("build runtime-packed definition-execution fixture");
+        assert!(checked.diagnostics.is_empty(), "{:#?}", checked.diagnostics);
+        assert!(
+            checked.fields.definition_execution_templates.is_empty(),
+            "runtime construction must not materialize rich definition templates",
+        );
+
+        let rich = checked
+            .semantic_input
+            .materialize_rich_definition_execution_templates();
+        let derived =
+            boon_checked::derive_checked_definition_execution_templates_v1(&checked.fields)
+                .expect("derive independent rich definition-execution oracle");
+        assert!(!rich.is_empty(), "fixture must contain a callable template");
+        assert_eq!(rich.as_ref(), derived.as_slice());
+
+        // SAFETY: the runtime fields and publication come from the same
+        // completed dense construction; this test binds the moved packed
+        // authority through the ordinary checked-image pairing route.
+        let construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                checked.fields,
+            )
+        };
+        let (program, pairing) =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication_and_pairing(
+                &project,
+                construction,
+                &checked.call_occurrences,
+                &checked.checked_image_authority,
+                checked.checked_image_publication,
+            )
+            .expect("seal runtime-packed definition-execution fixture");
+        let packed = checked
+            .semantic_input
+            .seal(&program, &pairing)
+            .expect("bind flat definition-execution authority");
+        packed
+            .validate_rich_definition_execution_templates(&rich)
+            .expect("editor projection must match its flat authority");
+        packed
+            .validate_rich_definition_execution_templates(&[])
+            .expect("runtime path deliberately supplies no rich templates");
+
+        let mut packed_templates = packed.definition_execution_templates();
+        assert_eq!(packed_templates.len(), rich.len());
+        for rich_template in &rich {
+            let packed_template = packed_templates
+                .next()
+                .expect("flat authority has every rich template");
+            assert_eq!(packed_template.callable(), rich_template.callable);
+            assert_eq!(packed_template.result(), rich_template.result);
+            assert_eq!(packed_template.calls(), rich_template.calls.as_slice());
+            assert_eq!(packed_template.sources(), rich_template.sources.as_slice());
+            assert_eq!(packed_template.states(), rich_template.states.as_slice());
+            assert_eq!(packed_template.lists(), rich_template.lists.as_slice());
+
+            let mut packed_nodes = packed_template.nodes();
+            assert_eq!(packed_nodes.len(), rich_template.nodes.len());
+            for rich_node in &rich_template.nodes {
+                let packed_node = packed_nodes
+                    .next()
+                    .expect("flat authority has every rich execution node");
+                assert_eq!(packed_node.expression(), rich_node.expression);
+                assert_eq!(
+                    packed_node.dependencies(),
+                    rich_node.dependencies.as_slice(),
+                );
+                assert_eq!(packed_node.call(), rich_node.call);
+                match (packed_node.selector(), &rich_node.selector) {
+                    (None, None) => {}
+                    (Some(packed_selector), Some(rich_selector)) => {
+                        assert_eq!(packed_selector.input(), rich_selector.input);
+                        assert_eq!(packed_selector.arms(), rich_selector.arms.as_slice());
+                    }
+                    (packed_selector, rich_selector) => panic!(
+                        "flat/rich selector presence differs: packed={} rich={}",
+                        packed_selector.is_some(),
+                        rich_selector.is_some(),
+                    ),
+                }
+            }
+            assert!(packed_nodes.next().is_none());
+        }
+        assert!(packed_templates.next().is_none());
+
+        let mut drifted = rich.clone();
+        drifted[0].schema.push_str(".drifted");
+        assert!(
+            packed
+                .validate_rich_definition_execution_templates(&drifted)
+                .is_err(),
+            "editor validation must reject a rich template that drifted from packed authority",
+        );
+    }
+
+    #[test]
+    fn editor_projection_cannot_masquerade_as_runtime_omission() {
+        let source = concat!(
+            "FUNCTION double(input) {\n",
+            "    input + input\n",
+            "}\n",
+            "value: double(input: 2)\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse strict editor-projection fixture");
+        let mut checked = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("build strict editor-projection fixture");
+        assert!(!checked.fields.definition_execution_templates.is_empty());
+        checked.fields.definition_execution_templates.clear();
+
+        // SAFETY: the mutation deliberately removes only an editor projection
+        // that is outside checked-image topology. The sealed packed authority
+        // must still remember that EditorRich promised the complete family.
+        let construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                checked.fields,
+            )
+        };
+        let (program, pairing) =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication_and_pairing(
+                &project,
+                construction,
+                &checked.call_occurrences,
+                &checked.checked_image_authority,
+                checked.checked_image_publication,
+            )
+            .expect("seal editor checked image without compatibility-only template rows");
+        assert!(
+            checked.semantic_input.seal(&program, &pairing).is_err(),
+            "EditorRich must reject an accidentally omitted rich template family",
+        );
+    }
+
+    #[test]
     fn resource_checked_image_publication_matches_the_rich_v4_replay() {
         let source = concat!(
             "store: [\n",
@@ -20060,6 +20224,111 @@ FUNCTION address(row) {{
             error.to_string().contains("rich semantic input contains 0"),
             "unexpected missing packed-authority error: {error}",
         );
+    }
+
+    #[test]
+    fn runtime_packed_definition_templates_match_rich_semantics_through_ir() {
+        let source = r#"
+rows:
+    LIST { [first: 1] }
+    |> List/map(item, new: stateful_row(row: item))
+
+FUNCTION increment(value) {
+    value + 1
+}
+
+FUNCTION stateful_row(row) {
+    [
+        toggle: SOURCE
+        first: row.first |> HOLD first {
+            toggle |> THEN {
+                row.first == 1 |> WHEN {
+                    True => increment(value: first)
+                    False => first
+                }
+            }
+        }
+    ]
+}
+"#;
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse packed definition-template semantic fixture");
+
+        let packed = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::RuntimePacked,
+        )
+        .expect("build RuntimePacked definition-template fixture");
+        assert!(packed.diagnostics.is_empty(), "{:#?}", packed.diagnostics);
+        assert!(packed.fields.definition_execution_templates.is_empty());
+        let packed_construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                packed.fields,
+            )
+        };
+        let (packed_program, packed_pairing) =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication_and_pairing(
+                &project,
+                packed_construction,
+                &packed.call_occurrences,
+                &packed.checked_image_authority,
+                packed.checked_image_publication,
+            )
+            .expect("seal RuntimePacked definition-template fixture");
+        let packed_input = packed
+            .semantic_input
+            .seal(&packed_program, &packed_pairing)
+            .expect("bind RuntimePacked definition-template authority");
+        assert!(
+            packed_input.definition_execution_templates().len() >= 2,
+            "fixture must exercise nested user definitions",
+        );
+
+        let rich = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("build EditorRich definition-template fixture");
+        assert!(rich.diagnostics.is_empty(), "{:#?}", rich.diagnostics);
+        assert!(rich.fields.definition_execution_templates.len() >= 2);
+        let rich_construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(rich.fields)
+        };
+        let rich_program =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_authority(
+                &project,
+                rich_construction,
+                &rich.call_occurrences,
+                &rich.checked_image_authority,
+            )
+            .expect("seal EditorRich definition-template replay");
+        assert_eq!(
+            packed_program.image_handoff().local_image_digest,
+            rich_program.image_handoff().local_image_digest,
+        );
+
+        let packed_semantic = boon_semantic::elaborate_kernel(packed_program, packed_input, &[])
+            .expect("RuntimePacked definition templates elaborate");
+        let rich_semantic = boon_semantic::elaborate(rich_program, &[])
+            .expect("EditorRich definition templates elaborate");
+        assert_eq!(packed_semantic.digest(), rich_semantic.digest());
+
+        let packed_verified = boon_verify::verify_explicit_contracts(packed_semantic)
+            .expect("RuntimePacked definition-template semantics verify");
+        let rich_verified = boon_verify::verify_explicit_contracts(rich_semantic)
+            .expect("EditorRich definition-template semantics verify");
+        assert_eq!(
+            packed_verified.verification_manifest(),
+            rich_verified.verification_manifest(),
+        );
+        let packed_ir = boon_ir::erase_and_lower(packed_verified)
+            .expect("RuntimePacked definition-template semantics lower to IR");
+        let rich_ir = boon_ir::erase_and_lower(rich_verified)
+            .expect("EditorRich definition-template semantics lower to IR");
+        assert_eq!(packed_ir, rich_ir);
     }
 
     #[test]

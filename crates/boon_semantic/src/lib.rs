@@ -2,6 +2,7 @@
 
 mod contextual_expansion;
 mod core_lowering;
+mod definition_templates;
 mod dependency_manifest;
 mod execution;
 mod lowering_contract;
@@ -2793,11 +2794,20 @@ fn elaborate_with_representation(
         kernel_input
             .validate_rich_resource_projections(&checked_program)
             .map_err(|error| SemanticError::new(error.to_string()))?;
+        kernel_input
+            .validate_rich_definition_execution_templates(
+                &checked_program.definition_execution_templates,
+            )
+            .map_err(|error| SemanticError::new(error.to_string()))?;
         // Editor requests explicitly materialize these compatibility DTOs.
-        // Verified promotion consumes the packed authority and releases the
-        // rich paths/origins before any semantic graph is constructed.
+        // Verified promotion validates them against the packed authority and
+        // releases both resource paths and definition templates before any
+        // semantic graph is constructed.
         drop(std::mem::take(
             &mut checked_program.resource_projection_requirements,
+        ));
+        drop(std::mem::take(
+            &mut checked_program.definition_execution_templates,
         ));
     } else if resource_route_count != checked_program.resource_projection_requirements.len() {
         return Err(SemanticError::new(format!(
@@ -2857,6 +2867,7 @@ fn elaborate_with_representation(
         "out_net",
         out_net::OutNet::<OutPortContractV1>::try_build_with_intent(
             &checked_program,
+            kernel_input.as_ref(),
             producer_roots,
             &verified_intent,
             |call, _, entry| provisional_out_port_contract(&checked_program, call, entry),
@@ -2923,6 +2934,7 @@ fn elaborate_with_representation(
         "derive_contextual_materializations",
         contextual_expansion::derive_contextual_materializations(
             &checked_program,
+            kernel_input.as_ref(),
             &resolved_out_graph,
             verified_intent.retained_definitions(),
             retain_ordinary_calls,
@@ -6588,6 +6600,7 @@ result:
                 .expect("cached NovyWave semantic intent");
         let out_net = out_net::OutNet::<OutPortContractV1>::try_build_with_intent(
             &fields,
+            None,
             producer_roots,
             &intent,
             |call, _, entry| provisional_out_port_contract(&fields, call, entry),
@@ -6702,8 +6715,10 @@ result:
             frame = instance.parent;
         }
         let retained = contextual_expansion::ordinary_callable_declarations(&fields, None);
-        contextual_expansion::derive_contextual_materializations(&fields, &graph, &retained, true)
-            .expect("cached artifact derives every NovyWave contextual materialization");
+        contextual_expansion::derive_contextual_materializations(
+            &fields, None, &graph, &retained, true,
+        )
+        .expect("cached artifact derives every NovyWave contextual materialization");
     }
 
     fn checked_role(

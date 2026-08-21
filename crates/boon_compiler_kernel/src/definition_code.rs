@@ -21,6 +21,27 @@ struct Span32 {
 }
 
 impl Span32 {
+    fn from_bounds(start: usize, end: usize, label: &str) -> Result<Self, KernelSolveError> {
+        let start = u32::try_from(start).map_err(|_| {
+            KernelSolveError::new(format!(
+                "kernel definition-code {label} column start exceeds u32"
+            ))
+        })?;
+        let end = u32::try_from(end).map_err(|_| {
+            KernelSolveError::new(format!(
+                "kernel definition-code {label} column end exceeds u32"
+            ))
+        })?;
+        Ok(Self {
+            start,
+            len: end.checked_sub(start).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel definition-code {label} column is not monotonic"
+                ))
+            })?,
+        })
+    }
+
     fn append<T>(
         column: &mut Vec<T>,
         rows: impl IntoIterator<Item = T>,
@@ -48,6 +69,88 @@ impl Span32 {
         let end = start.checked_add(self.len as usize)?;
         column.get(start..end)
     }
+
+    fn contains(self, index: usize) -> bool {
+        let start = self.start as usize;
+        start
+            .checked_add(self.len as usize)
+            .is_some_and(|end| index >= start && index < end)
+    }
+}
+
+const MISSING_EXECUTION_ROW: u32 = u32::MAX;
+
+/// One expression in a definition-local namespace.
+///
+/// The pair remains valid before checked-image linking and does not make a
+/// reusable definition module depend on a project-global expression offset.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct PackedExpressionRef {
+    owner: KernelOwnerId,
+    expression: crate::KernelExpressionId,
+}
+
+impl PackedExpressionRef {
+    pub(crate) const fn new(owner: KernelOwnerId, expression: crate::KernelExpressionId) -> Self {
+        Self { owner, expression }
+    }
+
+    pub(crate) const fn owner(self) -> KernelOwnerId {
+        self.owner
+    }
+
+    pub(crate) const fn expression(self) -> crate::KernelExpressionId {
+        self.expression
+    }
+}
+
+/// One call in a definition-local namespace.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct PackedCallRef {
+    owner: KernelOwnerId,
+    ordinal: u32,
+}
+
+impl PackedCallRef {
+    const NONE: Self = Self {
+        owner: KernelOwnerId(u32::MAX),
+        ordinal: u32::MAX,
+    };
+
+    pub(crate) const fn new(owner: KernelOwnerId, ordinal: u32) -> Self {
+        Self { owner, ordinal }
+    }
+
+    pub(crate) const fn owner(self) -> KernelOwnerId {
+        self.owner
+    }
+
+    pub(crate) const fn ordinal(self) -> u32 {
+        self.ordinal
+    }
+
+    const fn is_none(self) -> bool {
+        self.ordinal == u32::MAX
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackedExecutionSelector {
+    input: PackedExpressionRef,
+    arms: Span32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackedExecutionNode {
+    expression: PackedExpressionRef,
+    dependencies: Span32,
+    call: PackedCallRef,
+    selector: u32,
+    template_owner: KernelOwnerId,
 }
 
 /// One definition header in the permanent packed compiler output.
@@ -70,6 +173,14 @@ struct DefinitionCode {
     list_item_types: Span32,
     resource_projection_requirements: Span32,
     alpha_variables: Span32,
+    /// Dense reverse index for this definition's local expressions. Values
+    /// address `DefinitionCodeStore::execution_nodes`; `u32::MAX` means the
+    /// expression is not retained by any callable execution template.
+    execution_node_by_expression: Span32,
+    /// `u32::MAX` means this definition is not a callable execution template.
+    execution_result: u32,
+    execution_nodes: Span32,
+    execution_calls: Span32,
     stable_digest: [u8; 32],
 }
 
@@ -97,6 +208,12 @@ pub struct DefinitionCodeStore {
     resource_projection_origins: Box<[PackedSourceRead]>,
     resource_projection_symbols: Box<[SymbolId]>,
     alpha_variables: Box<[TypeVariableId]>,
+    execution_nodes: Box<[PackedExecutionNode]>,
+    execution_dependencies: Box<[PackedExpressionRef]>,
+    execution_selectors: Box<[PackedExecutionSelector]>,
+    execution_selector_arms: Box<[PackedExpressionRef]>,
+    execution_calls: Box<[PackedCallRef]>,
+    execution_node_by_expression: Box<[u32]>,
 }
 
 impl DefinitionCodeStore {
@@ -118,6 +235,18 @@ impl DefinitionCodeStore {
             })
     }
 
+    #[cfg(test)]
+    pub(crate) fn execution_node(
+        &self,
+        expression: PackedExpressionRef,
+    ) -> Option<PackedExecutionNodeRef<'_>> {
+        let node = self.expression_node_slot(expression).copied()?;
+        (node != MISSING_EXECUTION_ROW).then(|| PackedExecutionNodeRef {
+            store: self,
+            node: &self.execution_nodes[node as usize],
+        })
+    }
+
     pub(crate) fn symbol(&self, symbol: SymbolId) -> Option<&str> {
         self.types.as_arena().text_snapshot().symbol(symbol)
     }
@@ -130,6 +259,245 @@ impl DefinitionCodeStore {
             // may need one exceptional type.
             types: Vec::new(),
         }
+    }
+
+    fn expression_node_slot(&self, expression: PackedExpressionRef) -> Option<&u32> {
+        let definition = self.definitions.get(expression.owner.0 as usize)?;
+        if expression.expression.0 >= definition.expressions.len {
+            return None;
+        }
+        definition
+            .execution_node_by_expression
+            .get(&self.execution_node_by_expression)?
+            .get(expression.expression.0 as usize)
+    }
+
+    fn call_exists(&self, call: PackedCallRef) -> bool {
+        !call.is_none()
+            && self
+                .definitions
+                .get(call.owner.0 as usize)
+                .is_some_and(|definition| call.ordinal < definition.calls.len)
+    }
+
+    /// Validate the permanent execution columns in every build profile.
+    ///
+    /// Unlike recursive type validation, these checks are inexpensive and
+    /// protect borrowed semantic accessors from malformed raw coordinates.
+    fn validate_execution(&self) -> Result<(), KernelSolveError> {
+        for (owner_index, definition) in self.definitions.iter().enumerate() {
+            let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+                KernelSolveError::new("kernel definition-code execution owner exceeds u32")
+            })?);
+            let local_nodes = definition
+                .execution_node_by_expression
+                .get(&self.execution_node_by_expression)
+                .filter(|rows| rows.len() == definition.expressions.len as usize)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner_index} has an invalid execution-node index span"
+                    ))
+                })?;
+            let template_nodes = definition
+                .execution_nodes
+                .get(&self.execution_nodes)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner_index} has an invalid execution-node span"
+                    ))
+                })?;
+            let template_calls = definition
+                .execution_calls
+                .get(&self.execution_calls)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner_index} has an invalid execution-call span"
+                    ))
+                })?;
+            if template_calls.windows(2).any(|calls| calls[0] >= calls[1]) {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code owner {owner_index} execution calls are not strictly ordered"
+                )));
+            }
+            for call in template_calls {
+                if !self.call_exists(*call) {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner_index} execution template references a missing call {}:{}",
+                        call.owner.0, call.ordinal,
+                    )));
+                }
+            }
+
+            let has_template = definition.execution_result != MISSING_EXECUTION_ROW;
+            if !has_template {
+                if !template_nodes.is_empty() || !template_calls.is_empty() {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner_index} has execution rows without a template result"
+                    )));
+                }
+            } else {
+                if definition.execution_result >= definition.expressions.len {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner_index} execution result {} is outside its local expressions",
+                        definition.execution_result,
+                    )));
+                }
+                let result_node = local_nodes[definition.execution_result as usize];
+                if result_node == MISSING_EXECUTION_ROW
+                    || !definition.execution_nodes.contains(result_node as usize)
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner_index} execution result has no node in its template"
+                    )));
+                }
+                if template_nodes.is_empty() {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner_index} execution template is empty"
+                    )));
+                }
+            }
+
+            for (local, node_index) in local_nodes.iter().copied().enumerate() {
+                if node_index == MISSING_EXECUTION_ROW {
+                    continue;
+                }
+                let node = self
+                    .execution_nodes
+                    .get(node_index as usize)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel definition-code owner {owner_index} local expression {local} references a missing execution node {node_index}"
+                        ))
+                    })?;
+                if node.expression
+                    != PackedExpressionRef::new(
+                        owner,
+                        crate::KernelExpressionId(u32::try_from(local).map_err(|_| {
+                            KernelSolveError::new(
+                                "kernel definition-code local expression ordinal exceeds u32",
+                            )
+                        })?),
+                    )
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner_index} local expression {local} points to the wrong execution node"
+                    )));
+                }
+            }
+        }
+
+        for (node_index, node) in self.execution_nodes.iter().enumerate() {
+            let template = self
+                .definitions
+                .get(node.template_owner.0 as usize)
+                .filter(|definition| definition.execution_result != MISSING_EXECUTION_ROW)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel execution node {node_index} references missing template owner {}",
+                        node.template_owner.0,
+                    ))
+                })?;
+            if !template.execution_nodes.contains(node_index) {
+                return Err(KernelSolveError::new(format!(
+                    "kernel execution node {node_index} is outside template owner {}",
+                    node.template_owner.0,
+                )));
+            }
+            if self.expression_node_slot(node.expression).copied() != Some(node_index as u32) {
+                return Err(KernelSolveError::new(format!(
+                    "kernel execution node {node_index} has no unique reverse expression index"
+                )));
+            }
+            let dependencies = node
+                .dependencies
+                .get(&self.execution_dependencies)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel execution node {node_index} has an invalid dependency span"
+                    ))
+                })?;
+            if dependencies
+                .windows(2)
+                .any(|dependencies| dependencies[0] >= dependencies[1])
+            {
+                return Err(KernelSolveError::new(format!(
+                    "kernel execution node {node_index} dependencies are not strictly ordered"
+                )));
+            }
+            for dependency in dependencies {
+                let dependency_node = self
+                    .expression_node_slot(*dependency)
+                    .copied()
+                    .filter(|node| *node != MISSING_EXECUTION_ROW)
+                    .and_then(|node| self.execution_nodes.get(node as usize))
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel execution node {node_index} references a missing dependency {}:{}",
+                            dependency.owner.0, dependency.expression.0,
+                        ))
+                    })?;
+                if dependency_node.template_owner != node.template_owner {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel execution node {node_index} crosses execution templates through dependency {}:{}",
+                        dependency.owner.0, dependency.expression.0,
+                    )));
+                }
+            }
+            if !node.call.is_none() {
+                if !self.call_exists(node.call)
+                    || template
+                        .execution_calls
+                        .get(&self.execution_calls)
+                        .is_none_or(|calls| calls.binary_search(&node.call).is_err())
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel execution node {node_index} references call {}:{} outside its template",
+                        node.call.owner.0, node.call.ordinal,
+                    )));
+                }
+            }
+            if node.selector != MISSING_EXECUTION_ROW {
+                let selector = self
+                    .execution_selectors
+                    .get(node.selector as usize)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel execution node {node_index} references missing selector {}",
+                            node.selector,
+                        ))
+                    })?;
+                let arms = selector
+                    .arms
+                    .get(&self.execution_selector_arms)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel execution node {node_index} has an invalid selector-arm span"
+                        ))
+                    })?;
+                for (label, expression) in std::iter::once(("input", selector.input))
+                    .chain(arms.iter().copied().map(|arm| ("arm", arm)))
+                {
+                    let selector_node = self
+                        .expression_node_slot(expression)
+                        .copied()
+                        .filter(|node| *node != MISSING_EXECUTION_ROW)
+                        .and_then(|node| self.execution_nodes.get(node as usize))
+                        .ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "kernel execution node {node_index} references a missing selector {label} {}:{}",
+                                expression.owner.0, expression.expression.0,
+                            ))
+                        })?;
+                    if selector_node.template_owner != node.template_owner {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel execution node {node_index} crosses execution templates through selector {label} {}:{}",
+                            expression.owner.0, expression.expression.0,
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[cfg(debug_assertions)]
@@ -445,9 +813,109 @@ pub struct DefinitionCodeRef<'a> {
     code: &'a DefinitionCode,
 }
 
+/// Store-qualified borrowed view of one callable execution template.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PackedDefinitionExecutionRef<'a> {
+    code: DefinitionCodeRef<'a>,
+}
+
+/// Store-qualified borrowed view of one execution node.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PackedExecutionNodeRef<'a> {
+    store: &'a DefinitionCodeStore,
+    node: &'a PackedExecutionNode,
+}
+
+/// Store-qualified borrowed view of one sparse selector row.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PackedExecutionSelectorRef<'a> {
+    store: &'a DefinitionCodeStore,
+    selector: &'a PackedExecutionSelector,
+}
+
+pub(crate) struct PackedExecutionNodeIter<'a> {
+    store: &'a DefinitionCodeStore,
+    nodes: std::slice::Iter<'a, PackedExecutionNode>,
+}
+
+impl<'a> Iterator for PackedExecutionNodeIter<'a> {
+    type Item = PackedExecutionNodeRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.nodes.next().map(|node| PackedExecutionNodeRef {
+            store: self.store,
+            node,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.nodes.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for PackedExecutionNodeIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.nodes.next_back().map(|node| PackedExecutionNodeRef {
+            store: self.store,
+            node,
+        })
+    }
+}
+
+impl ExactSizeIterator for PackedExecutionNodeIter<'_> {}
+
 impl<'a> DefinitionCodeRef<'a> {
     pub const fn owner(self) -> KernelOwnerId {
         self.owner
+    }
+
+    pub(crate) const fn has_execution_template(self) -> bool {
+        self.code.execution_result != MISSING_EXECUTION_ROW
+    }
+
+    pub(crate) fn execution_template(self) -> Option<PackedDefinitionExecutionRef<'a>> {
+        self.has_execution_template()
+            .then_some(PackedDefinitionExecutionRef { code: self })
+    }
+
+    pub(crate) fn execution_result(self) -> Option<PackedExpressionRef> {
+        self.has_execution_template().then(|| {
+            PackedExpressionRef::new(
+                self.owner,
+                crate::KernelExpressionId(self.code.execution_result),
+            )
+        })
+    }
+
+    pub(crate) fn execution_nodes(self) -> PackedExecutionNodeIter<'a> {
+        PackedExecutionNodeIter {
+            store: self.store,
+            nodes: self
+                .code
+                .execution_nodes
+                .get(&self.store.execution_nodes)
+                .expect("sealed definition-code execution-node span is valid")
+                .iter(),
+        }
+    }
+
+    pub(crate) fn execution_calls(self) -> &'a [PackedCallRef] {
+        self.code
+            .execution_calls
+            .get(&self.store.execution_calls)
+            .expect("sealed definition-code execution-call span is valid")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execution_node_for_local_expression(
+        self,
+        expression: crate::KernelExpressionId,
+    ) -> Option<PackedExecutionNodeRef<'a>> {
+        if expression.0 >= self.code.expressions.len {
+            return None;
+        }
+        self.store
+            .execution_node(PackedExpressionRef::new(self.owner, expression))
     }
 
     pub(crate) fn formals(self) -> &'a [KernelArtifactFlowTermV1] {
@@ -807,6 +1275,84 @@ impl<'a> DefinitionCodeRef<'a> {
     }
 }
 
+impl<'a> PackedDefinitionExecutionRef<'a> {
+    #[cfg(test)]
+    pub(crate) const fn owner(self) -> KernelOwnerId {
+        self.code.owner
+    }
+
+    pub(crate) fn result(self) -> PackedExpressionRef {
+        self.code
+            .execution_result()
+            .expect("packed execution view always has a result")
+    }
+
+    pub(crate) fn nodes(self) -> PackedExecutionNodeIter<'a> {
+        self.code.execution_nodes()
+    }
+
+    pub(crate) fn calls(self) -> &'a [PackedCallRef] {
+        self.code.execution_calls()
+    }
+
+    pub(crate) const fn source_count(self) -> usize {
+        self.code.code.source_payload_types.len as usize
+    }
+
+    pub(crate) const fn state_count(self) -> usize {
+        self.code.code.state_flows.len as usize
+    }
+
+    pub(crate) const fn list_count(self) -> usize {
+        self.code.code.list_item_types.len as usize
+    }
+}
+
+impl<'a> PackedExecutionNodeRef<'a> {
+    pub(crate) const fn template_owner(self) -> KernelOwnerId {
+        self.node.template_owner
+    }
+
+    pub(crate) const fn expression(self) -> PackedExpressionRef {
+        self.node.expression
+    }
+
+    pub(crate) fn dependencies(self) -> &'a [PackedExpressionRef] {
+        self.node
+            .dependencies
+            .get(&self.store.execution_dependencies)
+            .expect("sealed definition-code execution-dependency span is valid")
+    }
+
+    pub(crate) const fn call(self) -> Option<PackedCallRef> {
+        if self.node.call.is_none() {
+            None
+        } else {
+            Some(self.node.call)
+        }
+    }
+
+    pub(crate) fn selector(self) -> Option<PackedExecutionSelectorRef<'a>> {
+        (self.node.selector != MISSING_EXECUTION_ROW).then(|| PackedExecutionSelectorRef {
+            store: self.store,
+            selector: &self.store.execution_selectors[self.node.selector as usize],
+        })
+    }
+}
+
+impl<'a> PackedExecutionSelectorRef<'a> {
+    pub(crate) const fn input(self) -> PackedExpressionRef {
+        self.selector.input
+    }
+
+    pub(crate) fn arms(self) -> &'a [PackedExpressionRef] {
+        self.selector
+            .arms
+            .get(&self.store.execution_selector_arms)
+            .expect("sealed definition-code execution-selector-arm span is valid")
+    }
+}
+
 /// Phase-local recursive export cache shared by every definition materialized
 /// into the compatibility checked image. It is deliberately external to the
 /// frozen store and is dropped with the linker phase.
@@ -1115,6 +1661,24 @@ pub(crate) struct DefinitionAdditionalTypeRoots<'a> {
     pub(crate) stable_digest: [u8; 32],
 }
 
+/// Capability for the one execution template currently being appended.
+///
+/// Tokens are deliberately opaque and single-use. They prevent an owner-side
+/// traversal from accidentally appending rows to a template that has already
+/// been sealed or to a different definition's active template.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DefinitionExecutionTemplateToken {
+    owner: KernelOwnerId,
+    serial: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveExecutionTemplate {
+    token: DefinitionExecutionTemplateToken,
+    result: PackedExpressionRef,
+    node_start: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct DefinitionCodeBuilder {
     definitions: Vec<DefinitionCode>,
@@ -1132,6 +1696,17 @@ pub(crate) struct DefinitionCodeBuilder {
     resource_projection_origins: Vec<PackedSourceRead>,
     resource_projection_symbols: Vec<SymbolId>,
     alpha_variables: Vec<TypeVariableId>,
+    execution_nodes: Vec<PackedExecutionNode>,
+    execution_dependencies: Vec<PackedExpressionRef>,
+    execution_selectors: Vec<PackedExecutionSelector>,
+    execution_selector_arms: Vec<PackedExpressionRef>,
+    execution_calls: Vec<PackedCallRef>,
+    execution_node_by_expression: Vec<u32>,
+    /// Phase-local duplicate/exact-membership check. It is deliberately not
+    /// retained in the immutable store.
+    execution_node_by_call: Vec<u32>,
+    active_execution: Option<ActiveExecutionTemplate>,
+    next_execution_serial: u32,
 }
 
 impl DefinitionCodeBuilder {
@@ -1152,7 +1727,354 @@ impl DefinitionCodeBuilder {
             resource_projection_origins: Vec::new(),
             resource_projection_symbols: Vec::new(),
             alpha_variables: Vec::with_capacity(alpha_variables),
+            execution_nodes: Vec::new(),
+            execution_dependencies: Vec::new(),
+            execution_selectors: Vec::new(),
+            execution_selector_arms: Vec::new(),
+            execution_calls: Vec::new(),
+            execution_node_by_expression: Vec::with_capacity(flows.saturating_sub(definitions)),
+            execution_node_by_call: Vec::new(),
+            active_execution: None,
+            next_execution_serial: 0,
         }
+    }
+
+    /// Reserve the project-wide execution columns once before walking any
+    /// template. Passing exact counts yields zero column growth during node
+    /// publication; safe upper bounds are also accepted.
+    pub(crate) fn reserve_execution(
+        &mut self,
+        nodes: usize,
+        dependencies: usize,
+        selectors: usize,
+        selector_arms: usize,
+        calls: usize,
+    ) {
+        self.execution_nodes.reserve(nodes);
+        self.execution_dependencies.reserve(dependencies);
+        self.execution_selectors.reserve(selectors);
+        self.execution_selector_arms.reserve(selector_arms);
+        self.execution_calls.reserve(calls);
+    }
+
+    fn execution_expression_slot_index(
+        &self,
+        expression: PackedExpressionRef,
+    ) -> Result<usize, KernelSolveError> {
+        let definition = self
+            .definitions
+            .get(expression.owner.0 as usize)
+            .ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel execution references missing definition {}",
+                    expression.owner.0,
+                ))
+            })?;
+        if expression.expression.0 >= definition.expressions.len {
+            return Err(KernelSolveError::new(format!(
+                "kernel execution references expression {}:{} outside local range 0..{}",
+                expression.owner.0, expression.expression.0, definition.expressions.len,
+            )));
+        }
+        (definition.execution_node_by_expression.start as usize)
+            .checked_add(expression.expression.0 as usize)
+            .filter(|index| *index < self.execution_node_by_expression.len())
+            .ok_or_else(|| {
+                KernelSolveError::new(
+                    "kernel execution expression reverse-index coordinate overflows its column",
+                )
+            })
+    }
+
+    fn execution_call_slot_index(&self, call: PackedCallRef) -> Result<usize, KernelSolveError> {
+        if call.is_none() {
+            return Err(KernelSolveError::new(
+                "kernel execution cannot publish the reserved missing-call reference",
+            ));
+        }
+        let definition = self.definitions.get(call.owner.0 as usize).ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel execution references missing call owner {}",
+                call.owner.0,
+            ))
+        })?;
+        if call.ordinal >= definition.calls.len {
+            return Err(KernelSolveError::new(format!(
+                "kernel execution references call {}:{} outside local range 0..{}",
+                call.owner.0, call.ordinal, definition.calls.len,
+            )));
+        }
+        (definition.calls.start as usize)
+            .checked_add(call.ordinal as usize)
+            .filter(|index| *index < self.execution_node_by_call.len())
+            .ok_or_else(|| {
+                KernelSolveError::new(
+                    "kernel execution call reverse-index coordinate overflows its column",
+                )
+            })
+    }
+
+    fn require_active_execution(
+        &self,
+        token: DefinitionExecutionTemplateToken,
+    ) -> Result<ActiveExecutionTemplate, KernelSolveError> {
+        self.active_execution
+            .filter(|active| active.token == token)
+            .ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel execution token {}:{} is stale or belongs to another active template",
+                    token.owner.0, token.serial,
+                ))
+            })
+    }
+
+    /// Begin one callable template after all definition type headers exist.
+    pub(crate) fn begin_execution_template(
+        &mut self,
+        owner: KernelOwnerId,
+        result: PackedExpressionRef,
+    ) -> Result<DefinitionExecutionTemplateToken, KernelSolveError> {
+        if self.active_execution.is_some() {
+            return Err(KernelSolveError::new(
+                "kernel definition-code cannot begin a second execution template while one is active",
+            ));
+        }
+        if result.owner != owner {
+            return Err(KernelSolveError::new(format!(
+                "kernel execution template owner {} has result in definition {}",
+                owner.0, result.owner.0,
+            )));
+        }
+        let _ = self.execution_expression_slot_index(result)?;
+        let definition = self.definitions.get(owner.0 as usize).ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel execution template references missing owner {}",
+                owner.0,
+            ))
+        })?;
+        if definition.execution_result != MISSING_EXECUTION_ROW {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition-code owner {} already has an execution template",
+                owner.0,
+            )));
+        }
+        let serial = self.next_execution_serial;
+        self.next_execution_serial =
+            self.next_execution_serial.checked_add(1).ok_or_else(|| {
+                KernelSolveError::new(
+                    "kernel definition-code execution token namespace exceeds u32",
+                )
+            })?;
+        let token = DefinitionExecutionTemplateToken { owner, serial };
+        self.active_execution = Some(ActiveExecutionTemplate {
+            token,
+            result,
+            node_start: self.execution_nodes.len(),
+        });
+        Ok(token)
+    }
+
+    /// Append one already-normalized execution node without allocating an
+    /// owned dependency or selector vector.
+    pub(crate) fn push_execution_node(
+        &mut self,
+        token: DefinitionExecutionTemplateToken,
+        expression: PackedExpressionRef,
+        dependencies: &[PackedExpressionRef],
+        call: Option<PackedCallRef>,
+        selector: Option<(PackedExpressionRef, &[PackedExpressionRef])>,
+    ) -> Result<(), KernelSolveError> {
+        let active = self.require_active_execution(token)?;
+        let expression_slot = self.execution_expression_slot_index(expression)?;
+        if self.execution_node_by_expression[expression_slot] != MISSING_EXECUTION_ROW {
+            return Err(KernelSolveError::new(format!(
+                "kernel execution repeats expression {}:{} across templates",
+                expression.owner.0, expression.expression.0,
+            )));
+        }
+        if dependencies
+            .windows(2)
+            .any(|dependencies| dependencies[0] >= dependencies[1])
+        {
+            return Err(KernelSolveError::new(format!(
+                "kernel execution node {}:{} dependencies are not strictly ordered",
+                expression.owner.0, expression.expression.0,
+            )));
+        }
+        for dependency in dependencies {
+            let _ = self.execution_expression_slot_index(*dependency)?;
+        }
+        let call_slot = call
+            .map(|call| self.execution_call_slot_index(call))
+            .transpose()?;
+        if call_slot.is_some_and(|slot| self.execution_node_by_call[slot] != MISSING_EXECUTION_ROW)
+        {
+            let call = call.expect("call slot exists only for a call");
+            return Err(KernelSolveError::new(format!(
+                "kernel execution repeats call {}:{} across nodes",
+                call.owner.0, call.ordinal,
+            )));
+        }
+        if let Some((input, arms)) = selector {
+            let _ = self.execution_expression_slot_index(input)?;
+            for (index, arm) in arms.iter().copied().enumerate() {
+                let _ = self.execution_expression_slot_index(arm)?;
+                if arms[..index].contains(&arm) {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel execution node {}:{} repeats selector arm {}:{}",
+                        expression.owner.0, expression.expression.0, arm.owner.0, arm.expression.0,
+                    )));
+                }
+            }
+        }
+
+        let dependency_span = Span32::append(
+            &mut self.execution_dependencies,
+            dependencies.iter().copied(),
+        )?;
+        let selector = if let Some((input, arms)) = selector {
+            let arms = Span32::append(&mut self.execution_selector_arms, arms.iter().copied())?;
+            let index = u32::try_from(self.execution_selectors.len()).map_err(|_| {
+                KernelSolveError::new("kernel definition-code execution selector count exceeds u32")
+            })?;
+            self.execution_selectors
+                .push(PackedExecutionSelector { input, arms });
+            index
+        } else {
+            MISSING_EXECUTION_ROW
+        };
+        let node_index = u32::try_from(self.execution_nodes.len()).map_err(|_| {
+            KernelSolveError::new("kernel definition-code execution node count exceeds u32")
+        })?;
+        self.execution_nodes.push(PackedExecutionNode {
+            expression,
+            dependencies: dependency_span,
+            call: call.unwrap_or(PackedCallRef::NONE),
+            selector,
+            template_owner: active.token.owner,
+        });
+        self.execution_node_by_expression[expression_slot] = node_index;
+        if let Some(call_slot) = call_slot {
+            self.execution_node_by_call[call_slot] = node_index;
+        }
+        Ok(())
+    }
+
+    /// Seal the active template after validating its complete membership.
+    pub(crate) fn finish_execution_template(
+        &mut self,
+        token: DefinitionExecutionTemplateToken,
+        calls: &[PackedCallRef],
+    ) -> Result<(), KernelSolveError> {
+        let active = self.require_active_execution(token)?;
+        if calls.windows(2).any(|calls| calls[0] >= calls[1]) {
+            return Err(KernelSolveError::new(format!(
+                "kernel execution template owner {} calls are not strictly ordered",
+                token.owner.0,
+            )));
+        }
+        let node_end = self.execution_nodes.len();
+        if active.node_start == node_end {
+            return Err(KernelSolveError::new(format!(
+                "kernel execution template owner {} has no nodes",
+                token.owner.0,
+            )));
+        }
+        let result_slot = self.execution_expression_slot_index(active.result)?;
+        let result_node = self.execution_node_by_expression[result_slot];
+        if result_node == MISSING_EXECUTION_ROW
+            || (result_node as usize) < active.node_start
+            || (result_node as usize) >= node_end
+        {
+            return Err(KernelSolveError::new(format!(
+                "kernel execution template owner {} has no node for result expression {}",
+                token.owner.0, active.result.expression.0,
+            )));
+        }
+
+        for call in calls {
+            let slot = self.execution_call_slot_index(*call)?;
+            let node = self.execution_node_by_call[slot];
+            if node == MISSING_EXECUTION_ROW
+                || (node as usize) < active.node_start
+                || (node as usize) >= node_end
+            {
+                return Err(KernelSolveError::new(format!(
+                    "kernel execution template owner {} lists call {}:{} without a node",
+                    token.owner.0, call.owner.0, call.ordinal,
+                )));
+            }
+        }
+        for (offset, node) in self.execution_nodes[active.node_start..node_end]
+            .iter()
+            .enumerate()
+        {
+            let node_index = active.node_start + offset;
+            if node.template_owner != token.owner {
+                return Err(KernelSolveError::new(format!(
+                    "kernel execution node {node_index} belongs to template {} instead of {}",
+                    node.template_owner.0, token.owner.0,
+                )));
+            }
+            for dependency in node
+                .dependencies
+                .get(&self.execution_dependencies)
+                .expect("builder-created execution dependency span is valid")
+            {
+                let slot = self.execution_expression_slot_index(*dependency)?;
+                let dependency_node = self.execution_node_by_expression[slot];
+                if dependency_node == MISSING_EXECUTION_ROW
+                    || (dependency_node as usize) < active.node_start
+                    || (dependency_node as usize) >= node_end
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel execution node {node_index} has dependency {}:{} outside template owner {}",
+                        dependency.owner.0, dependency.expression.0, token.owner.0,
+                    )));
+                }
+            }
+            if !node.call.is_none() && calls.binary_search(&node.call).is_err() {
+                return Err(KernelSolveError::new(format!(
+                    "kernel execution node {node_index} call {}:{} is absent from template owner {}",
+                    node.call.owner.0, node.call.ordinal, token.owner.0,
+                )));
+            }
+            if node.selector != MISSING_EXECUTION_ROW {
+                let selector = &self.execution_selectors[node.selector as usize];
+                for expression in std::iter::once(selector.input).chain(
+                    selector
+                        .arms
+                        .get(&self.execution_selector_arms)
+                        .expect("builder-created selector-arm span is valid")
+                        .iter()
+                        .copied(),
+                ) {
+                    let slot = self.execution_expression_slot_index(expression)?;
+                    let selector_node = self.execution_node_by_expression[slot];
+                    if selector_node == MISSING_EXECUTION_ROW
+                        || (selector_node as usize) < active.node_start
+                        || (selector_node as usize) >= node_end
+                    {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel execution node {node_index} has selector expression {}:{} outside template owner {}",
+                            expression.owner.0, expression.expression.0, token.owner.0,
+                        )));
+                    }
+                }
+            }
+        }
+
+        let execution_nodes = Span32::from_bounds(active.node_start, node_end, "execution-node")?;
+        let execution_calls = Span32::append(&mut self.execution_calls, calls.iter().copied())?;
+        let definition = self
+            .definitions
+            .get_mut(token.owner.0 as usize)
+            .expect("active execution template owner was validated at begin");
+        definition.execution_result = active.result.expression.0;
+        definition.execution_nodes = execution_nodes;
+        definition.execution_calls = execution_calls;
+        self.active_execution = None;
+        Ok(())
     }
 
     pub(crate) fn push(
@@ -1172,6 +2094,10 @@ impl DefinitionCodeBuilder {
         }
         let formals = Span32::append(&mut self.flows, formal_flows.iter().copied())?;
         let expressions = Span32::append(&mut self.flows, expression_flows.iter().copied())?;
+        let execution_node_by_expression = Span32::append(
+            &mut self.execution_node_by_expression,
+            (0..expression_flows.len()).map(|_| MISSING_EXECUTION_ROW),
+        )?;
         if additional.expression_flush_types.len() != expressions.len as usize
             || additional.expression_kind_types.len() != expressions.len as usize
         {
@@ -1243,6 +2169,13 @@ impl DefinitionCodeBuilder {
             });
         }
         let calls = Span32::append(&mut self.calls, packed_calls)?;
+        if self.execution_node_by_call.len() != calls.start as usize {
+            return Err(KernelSolveError::new(
+                "kernel definition-code call and execution-call indexes lost alignment",
+            ));
+        }
+        self.execution_node_by_call
+            .extend((0..calls.len).map(|_| MISSING_EXECUTION_ROW));
         let diagnostic_types = Span32::append(
             &mut self.diagnostic_types,
             additional.diagnostic_types.iter().copied(),
@@ -1395,6 +2328,10 @@ impl DefinitionCodeBuilder {
             list_item_types,
             resource_projection_requirements,
             alpha_variables,
+            execution_node_by_expression,
+            execution_result: MISSING_EXECUTION_ROW,
+            execution_nodes: Span32::default(),
+            execution_calls: Span32::default(),
             stable_digest: additional.stable_digest,
         });
         Ok(())
@@ -1404,6 +2341,12 @@ impl DefinitionCodeBuilder {
         self,
         types: Arc<FrozenTypeStore>,
     ) -> Result<DefinitionCodeStore, KernelSolveError> {
+        if let Some(active) = self.active_execution {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition-code execution template owner {} was not finished",
+                active.token.owner.0,
+            )));
+        }
         let store = DefinitionCodeStore {
             types,
             definitions: self.definitions.into_boxed_slice(),
@@ -1423,7 +2366,14 @@ impl DefinitionCodeBuilder {
             resource_projection_origins: self.resource_projection_origins.into_boxed_slice(),
             resource_projection_symbols: self.resource_projection_symbols.into_boxed_slice(),
             alpha_variables: self.alpha_variables.into_boxed_slice(),
+            execution_nodes: self.execution_nodes.into_boxed_slice(),
+            execution_dependencies: self.execution_dependencies.into_boxed_slice(),
+            execution_selectors: self.execution_selectors.into_boxed_slice(),
+            execution_selector_arms: self.execution_selector_arms.into_boxed_slice(),
+            execution_calls: self.execution_calls.into_boxed_slice(),
+            execution_node_by_expression: self.execution_node_by_expression.into_boxed_slice(),
         };
+        store.validate_execution()?;
         #[cfg(debug_assertions)]
         store.validate()?;
         Ok(store)
@@ -1434,6 +2384,62 @@ impl DefinitionCodeBuilder {
 mod tests {
     use super::*;
     use crate::TypeTermArena;
+
+    fn push_test_definition(
+        builder: &mut DefinitionCodeBuilder,
+        owner: u32,
+        flow: KernelArtifactFlowTermV1,
+        expression_count: usize,
+        call_count: usize,
+        source_count: usize,
+        state_count: usize,
+        list_count: usize,
+    ) {
+        let expressions = vec![flow; expression_count];
+        let calls = vec![
+            PackedCallFactsInput {
+                substitution_start: 0,
+                substitution_len: 0,
+                syntax_discriminated_result: false,
+            };
+            call_count
+        ];
+        let expression_flush_types = vec![None; expression_count];
+        let expression_kind_types = vec![None; expression_count];
+        let source_payload_types = vec![flow.term; source_count];
+        let state_flows = vec![
+            PackedFlow {
+                mode: flow.mode,
+                term: flow.term,
+            };
+            state_count
+        ];
+        let list_item_types = vec![flow.term; list_count];
+        builder
+            .push(
+                KernelOwnerId(owner),
+                flow,
+                &[],
+                &expressions,
+                DefinitionAdditionalTypeRoots {
+                    expression_flush_types: &expression_flush_types,
+                    expression_kind_types: &expression_kind_types,
+                    declaration_flows: &[],
+                    calls: &calls,
+                    call_substitutions: &[],
+                    diagnostic_types: &[],
+                    source_payload_types: &source_payload_types,
+                    state_flows: &state_flows,
+                    list_item_types: &list_item_types,
+                    resource_projection_requirements: &[],
+                    resource_projection_origins: &[],
+                    resource_projection_symbols: &[],
+                    alpha_variables: &[],
+                    stable_digest: [owner as u8; 32],
+                },
+            )
+            .unwrap();
+    }
 
     #[test]
     fn span32_appends_and_borrows_exact_rows() {
@@ -1446,6 +2452,150 @@ mod tests {
     fn span32_rejects_out_of_bounds_borrow() {
         let span = Span32 { start: 2, len: 2 };
         assert_eq!(span.get(&[1_u32, 2, 3]), None);
+    }
+
+    #[test]
+    fn packed_execution_rows_borrow_cross_definition_facts_without_rich_dtos() {
+        let arena = TypeTermArena::new();
+        let unknown = arena.unknown();
+        let flow = KernelArtifactFlowTermV1 {
+            mode: FlowMode::Continuous,
+            term: unknown,
+            stable_digest: [0; 32],
+            runtime_erased_digest: [0; 32],
+        };
+        let mut builder = DefinitionCodeBuilder::with_capacity(2, 4, 0);
+        push_test_definition(&mut builder, 0, flow, 3, 0, 1, 1, 1);
+        push_test_definition(&mut builder, 1, flow, 1, 1, 0, 0, 0);
+        builder.reserve_execution(3, 2, 1, 1, 1);
+
+        let root = PackedExpressionRef::new(KernelOwnerId(0), crate::KernelExpressionId(0));
+        let arm = PackedExpressionRef::new(KernelOwnerId(0), crate::KernelExpressionId(1));
+        let external = PackedExpressionRef::new(KernelOwnerId(1), crate::KernelExpressionId(0));
+        let call = PackedCallRef::new(KernelOwnerId(1), 0);
+        let token = builder
+            .begin_execution_template(KernelOwnerId(0), root)
+            .unwrap();
+        builder
+            .push_execution_node(token, arm, &[], None, None)
+            .unwrap();
+        builder
+            .push_execution_node(token, external, &[], Some(call), None)
+            .unwrap();
+        builder
+            .push_execution_node(
+                token,
+                root,
+                &[arm, external],
+                None,
+                Some((external, &[arm])),
+            )
+            .unwrap();
+        builder.finish_execution_template(token, &[call]).unwrap();
+
+        let store = builder.finish(Arc::new(arena.freeze())).unwrap();
+        let definition = store.definition(KernelOwnerId(0)).unwrap();
+        assert!(definition.has_execution_template());
+        assert_eq!(definition.execution_result(), Some(root));
+        assert_eq!(definition.execution_calls(), &[call]);
+
+        let template = definition.execution_template().unwrap();
+        assert_eq!(template.owner(), KernelOwnerId(0));
+        assert_eq!(template.result(), root);
+        assert_eq!(template.nodes().len(), 3);
+        assert_eq!(template.calls(), &[call]);
+        assert_eq!(template.source_count(), 1);
+        assert_eq!(template.state_count(), 1);
+        assert_eq!(template.list_count(), 1);
+
+        let root_node = definition
+            .execution_node_for_local_expression(crate::KernelExpressionId(0))
+            .unwrap();
+        assert_eq!(root_node.template_owner(), KernelOwnerId(0));
+        assert_eq!(root_node.expression(), root);
+        assert_eq!(root_node.dependencies(), &[arm, external]);
+        assert_eq!(root_node.call(), None);
+        let selector = root_node.selector().unwrap();
+        assert_eq!(selector.input(), external);
+        assert_eq!(selector.arms(), &[arm]);
+
+        let external_node = store.execution_node(external).unwrap();
+        assert_eq!(external_node.template_owner(), KernelOwnerId(0));
+        assert_eq!(external_node.call(), Some(call));
+        let external_definition = store.definition(KernelOwnerId(1)).unwrap();
+        assert!(!external_definition.has_execution_template());
+        assert!(
+            external_definition
+                .execution_node_for_local_expression(crate::KernelExpressionId(0))
+                .is_some()
+        );
+        assert!(
+            definition
+                .execution_node_for_local_expression(crate::KernelExpressionId(2))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn execution_template_rejects_dangling_dependencies_at_finish() {
+        let arena = TypeTermArena::new();
+        let unknown = arena.unknown();
+        let flow = KernelArtifactFlowTermV1 {
+            mode: FlowMode::Continuous,
+            term: unknown,
+            stable_digest: [0; 32],
+            runtime_erased_digest: [0; 32],
+        };
+        let mut builder = DefinitionCodeBuilder::with_capacity(1, 2, 0);
+        push_test_definition(&mut builder, 0, flow, 2, 0, 0, 0, 0);
+        let root = PackedExpressionRef::new(KernelOwnerId(0), crate::KernelExpressionId(0));
+        let missing = PackedExpressionRef::new(KernelOwnerId(0), crate::KernelExpressionId(1));
+        let token = builder
+            .begin_execution_template(KernelOwnerId(0), root)
+            .unwrap();
+        builder
+            .push_execution_node(token, root, &[missing], None, None)
+            .unwrap();
+        let error = builder.finish_execution_template(token, &[]).unwrap_err();
+        assert!(error.to_string().contains("outside template owner 0"));
+    }
+
+    #[test]
+    fn execution_builder_rejects_duplicate_nodes_arms_and_calls() {
+        let arena = TypeTermArena::new();
+        let unknown = arena.unknown();
+        let flow = KernelArtifactFlowTermV1 {
+            mode: FlowMode::Continuous,
+            term: unknown,
+            stable_digest: [0; 32],
+            runtime_erased_digest: [0; 32],
+        };
+        let mut builder = DefinitionCodeBuilder::with_capacity(1, 2, 0);
+        push_test_definition(&mut builder, 0, flow, 2, 1, 0, 0, 0);
+        let root = PackedExpressionRef::new(KernelOwnerId(0), crate::KernelExpressionId(0));
+        let arm = PackedExpressionRef::new(KernelOwnerId(0), crate::KernelExpressionId(1));
+        let call = PackedCallRef::new(KernelOwnerId(0), 0);
+        let token = builder
+            .begin_execution_template(KernelOwnerId(0), root)
+            .unwrap();
+        let duplicate_arm = builder
+            .push_execution_node(token, arm, &[], None, Some((root, &[root, root])))
+            .unwrap_err();
+        assert!(duplicate_arm.to_string().contains("repeats selector arm"));
+        builder
+            .push_execution_node(token, arm, &[], Some(call), None)
+            .unwrap();
+        let duplicate_node = builder
+            .push_execution_node(token, arm, &[], None, None)
+            .unwrap_err();
+        assert!(duplicate_node.to_string().contains("repeats expression"));
+        builder
+            .push_execution_node(token, root, &[arm], None, None)
+            .unwrap();
+        let duplicate_call = builder
+            .finish_execution_template(token, &[call, call])
+            .unwrap_err();
+        assert!(duplicate_call.to_string().contains("not strictly ordered"));
     }
 
     #[test]

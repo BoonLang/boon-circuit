@@ -5,8 +5,8 @@ use crate::{
     DefinitionTermProofScratch, FrozenTypeStore, KernelCollectionOperationKind, KernelPattern,
     KernelRecordEntry, KernelSelectArm, KernelSolveError, KernelSolveWork, KernelSummaryCallInput,
     KernelSummaryNode, KernelSummaryProgram, KernelSummaryProjectionStep, KernelSummaryRecordEntry,
-    KernelSummarySelectArm, KernelSummaryValueId, OutputId, PackedCallFactsInput,
-    PackedCallTypeSubstitution, PackedDiagnosticTypes, PackedFlow,
+    KernelSummarySelectArm, KernelSummaryValueId, OutputId, PackedCallFactsInput, PackedCallRef,
+    PackedCallTypeSubstitution, PackedDiagnosticTypes, PackedExpressionRef, PackedFlow,
     PackedResourceProjectionRequirementInput, PackedSourceReadInput, PublishMode, TypeTerm,
     TypeTermHead, TypeTermId, TypeVariableId, UnsealedComponentArtifact, VariantTerm,
     alpha_normalize_callable_interface_and_diagnostics, build_packed_snapshot_receipts,
@@ -14,8 +14,8 @@ use crate::{
     definition_basis_fingerprint_with_buffer, solve_component,
 };
 use boon_checked::{
-    BytesType, CheckedListKeyPolicy, CheckedStateKind, FlowMode, FlowType, ObjectShape, Type,
-    Variant, canonical_union_type, type_is_recursively_closed,
+    BytesType, CheckedListKeyPolicy, CheckedParameterKind, CheckedStateKind, FlowMode, FlowType,
+    ObjectShape, Type, Variant, canonical_union_type, type_is_recursively_closed,
 };
 use boon_contract::{ProjectTextSnapshot, SymbolId};
 use boon_data::{Bits, ExactNumber, ExactNumberParseReason, ExactRoundingRule};
@@ -2848,6 +2848,7 @@ impl KernelProjectSolveSession {
             project_resource_projection_facts(&self.owners, &self.abi, &mut artifact)?;
         let definition_code = build_definition_code_builder(
             &self.owners,
+            &self.abi,
             &mut artifact,
             &flush_terms,
             call_facts,
@@ -4931,6 +4932,7 @@ fn project_resource_projection_facts(
 
 fn build_definition_code_builder(
     owners: &[KernelProjectOwnerOutputs],
+    abi: &crate::KernelAbiInput,
     artifact: &mut UnsealedComponentArtifact,
     flush_terms: &ProjectExpressionFlushTerms,
     call_facts: Box<[Box<[SolvedKernelCallFacts]>]>,
@@ -5279,7 +5281,1069 @@ fn build_definition_code_builder(
             },
         )?;
     }
+    build_definition_execution_code(owners, abi, &mut builder)?;
     Ok(builder)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PackedDeclarationKey {
+    owner: KernelOwnerId,
+    declaration: KernelDeclarationId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackedStatementRef {
+    owner: KernelOwnerId,
+    statement: KernelStatementId,
+}
+
+fn definition_execution_owner<'a>(
+    owners: &'a [KernelProjectOwnerOutputs],
+    owner: KernelOwnerId,
+    context: &str,
+) -> Result<&'a KernelProjectOwnerOutputs, KernelSolveError> {
+    owners.get(owner.0 as usize).ok_or_else(|| {
+        KernelSolveError::new(format!(
+            "kernel packed execution {context} references missing owner {}",
+            owner.0,
+        ))
+    })
+}
+
+fn definition_execution_expression(
+    owners: &[KernelProjectOwnerOutputs],
+    owner: KernelOwnerId,
+    expression: KernelExpressionId,
+    context: &str,
+) -> Result<PackedExpressionRef, KernelSolveError> {
+    let definition = definition_execution_owner(owners, owner, context)?;
+    if !definition
+        .expression_artifacts
+        .get(expression.0 as usize)
+        .is_some_and(|row| row.id == expression)
+    {
+        return Err(KernelSolveError::new(format!(
+            "kernel packed execution {context} references missing expression {}:{}",
+            owner.0, expression.0,
+        )));
+    }
+    Ok(PackedExpressionRef::new(owner, expression))
+}
+
+fn definition_execution_value(
+    owners: &[KernelProjectOwnerOutputs],
+    owner: KernelOwnerId,
+    value: KernelValueReference,
+    context: &str,
+) -> Result<PackedExpressionRef, KernelSolveError> {
+    match value {
+        KernelValueReference::Local(expression) => {
+            definition_execution_expression(owners, owner, expression, context)
+        }
+        KernelValueReference::External(external) => match external.target {
+            KernelExternalTarget::Expression(expression) => {
+                definition_execution_expression(owners, external.owner, expression, context)
+            }
+            KernelExternalTarget::Result => {
+                let target = definition_execution_owner(owners, external.owner, context)?;
+                let expression = target.linkage.result_expression.ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel packed execution {context} references owner {} without a result expression",
+                        external.owner.0,
+                    ))
+                })?;
+                definition_execution_expression(owners, external.owner, expression, context)
+            }
+        },
+    }
+}
+
+fn definition_execution_declaration(
+    owners: &[KernelProjectOwnerOutputs],
+    mut owner: KernelOwnerId,
+    mut reference: KernelDeclarationReference,
+    context: &str,
+) -> Result<PackedDeclarationKey, KernelSolveError> {
+    for _ in 0..=owners.len() {
+        match reference {
+            KernelDeclarationReference::Local(declaration) => {
+                let definition = definition_execution_owner(owners, owner, context)?;
+                if !definition
+                    .declarations
+                    .get(declaration.0 as usize)
+                    .is_some_and(|row| row.id == declaration)
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel packed execution {context} references missing declaration {}:{}",
+                        owner.0, declaration.0,
+                    )));
+                }
+                return Ok(PackedDeclarationKey { owner, declaration });
+            }
+            KernelDeclarationReference::OwnerDeclaration {
+                owner: target,
+                declaration,
+            } => {
+                owner = target;
+                reference = KernelDeclarationReference::Local(declaration);
+            }
+            KernelDeclarationReference::OwnerPublic(target) => {
+                owner = target;
+                reference = definition_execution_owner(owners, target, context)?
+                    .linkage
+                    .public_declaration
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel packed execution {context} references owner {} without a public declaration",
+                            target.0,
+                        ))
+                    })?;
+            }
+        }
+    }
+    Err(KernelSolveError::new(format!(
+        "kernel packed execution {context} contains a public-declaration cycle",
+    )))
+}
+
+fn definition_execution_scope_callable(
+    owners: &[KernelProjectOwnerOutputs],
+    mut owner: KernelOwnerId,
+    mut scope: KernelScopeReference,
+    context: &str,
+) -> Result<Option<PackedDeclarationKey>, KernelSolveError> {
+    let scope_limit = owners
+        .iter()
+        .map(|owner| owner.presentation.scopes.len())
+        .sum::<usize>()
+        .saturating_add(owners.len())
+        .saturating_add(1);
+    for _ in 0..scope_limit {
+        match scope {
+            KernelScopeReference::ProjectRoot => return Ok(None),
+            KernelScopeReference::Containing => {
+                scope = definition_execution_owner(owners, owner, context)?
+                    .presentation
+                    .containing_scope;
+            }
+            KernelScopeReference::Owner {
+                owner: target,
+                scope: target_scope,
+            } => {
+                owner = target;
+                scope = KernelScopeReference::Local(target_scope);
+            }
+            KernelScopeReference::Local(scope_id) => {
+                let definition = definition_execution_owner(owners, owner, context)?;
+                let row = definition
+                    .presentation
+                    .scopes
+                    .get(scope_id.0 as usize)
+                    .filter(|row| row.id == scope_id)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel packed execution {context} references missing scope {}:{}",
+                            owner.0, scope_id.0,
+                        ))
+                    })?;
+                if row.kind == KernelScopeKind::Function {
+                    return row
+                        .owner
+                        .map(|declaration| {
+                            definition_execution_declaration(owners, owner, declaration, context)
+                        })
+                        .transpose();
+                }
+                scope = row.parent;
+            }
+        }
+    }
+    Err(KernelSolveError::new(format!(
+        "kernel packed execution {context} contains a lexical-scope cycle",
+    )))
+}
+
+fn definition_execution_statement<'a>(
+    owners: &'a [KernelProjectOwnerOutputs],
+    owner: KernelOwnerId,
+    statement: KernelStatementId,
+    context: &str,
+) -> Result<&'a KernelStatementArtifact, KernelSolveError> {
+    definition_execution_owner(owners, owner, context)?
+        .statements
+        .get(statement.0 as usize)
+        .filter(|row| row.id == statement)
+        .ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel packed execution {context} references missing statement {}:{}",
+                owner.0, statement.0,
+            ))
+        })
+}
+
+fn definition_execution_statement_child(
+    owners: &[KernelProjectOwnerOutputs],
+    owner: KernelOwnerId,
+    child: KernelStatementChildReference,
+) -> Result<PackedStatementRef, KernelSolveError> {
+    let reference = match child {
+        KernelStatementChildReference::Local(statement) => PackedStatementRef { owner, statement },
+        KernelStatementChildReference::Owner(owner) => PackedStatementRef {
+            owner,
+            statement: definition_execution_owner(owners, owner, "statement child")?
+                .linkage
+                .root_statement
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel packed execution statement child owner {} has no root statement",
+                        owner.0,
+                    ))
+                })?,
+        },
+    };
+    definition_execution_statement(
+        owners,
+        reference.owner,
+        reference.statement,
+        "statement child",
+    )?;
+    Ok(reference)
+}
+
+fn definition_execution_offsets(
+    counts: impl IntoIterator<Item = usize>,
+    label: &str,
+) -> Result<Vec<u32>, KernelSolveError> {
+    let mut offsets = Vec::new();
+    offsets.push(0_u32);
+    for count in counts {
+        let count = u32::try_from(count).map_err(|_| {
+            KernelSolveError::new(format!(
+                "kernel packed execution {label} definition count exceeds u32",
+            ))
+        })?;
+        let next = offsets
+            .last()
+            .copied()
+            .expect("packed execution offsets contain their zero origin")
+            .checked_add(count)
+            .ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel packed execution {label} namespace exceeds u32",
+                ))
+            })?;
+        offsets.push(next);
+    }
+    Ok(offsets)
+}
+
+fn definition_execution_expression_index(
+    offsets: &[u32],
+    expression: PackedExpressionRef,
+) -> Result<usize, KernelSolveError> {
+    let owner = expression.owner().0 as usize;
+    let start = *offsets.get(owner).ok_or_else(|| {
+        KernelSolveError::new(format!(
+            "kernel packed execution expression references missing owner {}",
+            expression.owner().0,
+        ))
+    })?;
+    let end = *offsets.get(owner + 1).ok_or_else(|| {
+        KernelSolveError::new(format!(
+            "kernel packed execution expression owner {} has no range end",
+            expression.owner().0,
+        ))
+    })?;
+    let index = start
+        .checked_add(expression.expression().0)
+        .filter(|index| *index < end)
+        .ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel packed execution expression {}:{} is outside its dense range",
+                expression.owner().0,
+                expression.expression().0,
+            ))
+        })?;
+    Ok(index as usize)
+}
+
+fn definition_execution_statement_index(
+    offsets: &[u32],
+    statement: PackedStatementRef,
+) -> Result<usize, KernelSolveError> {
+    let owner = statement.owner.0 as usize;
+    let start = *offsets.get(owner).ok_or_else(|| {
+        KernelSolveError::new(format!(
+            "kernel packed execution statement references missing owner {}",
+            statement.owner.0,
+        ))
+    })?;
+    let end = *offsets.get(owner + 1).ok_or_else(|| {
+        KernelSolveError::new(format!(
+            "kernel packed execution statement owner {} has no range end",
+            statement.owner.0,
+        ))
+    })?;
+    let index = start
+        .checked_add(statement.statement.0)
+        .filter(|index| *index < end)
+        .ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel packed execution statement {}:{} is outside its dense range",
+                statement.owner.0, statement.statement.0,
+            ))
+        })?;
+    Ok(index as usize)
+}
+
+fn definition_execution_call_syntax<'a>(
+    definition: &'a KernelProjectOwnerOutputs,
+    expression: KernelExpressionId,
+) -> Result<&'a KernelCallSyntaxArtifact, KernelSolveError> {
+    let mut matching = definition
+        .call_syntax
+        .iter()
+        .filter(|syntax| syntax.expression == expression);
+    let syntax = matching.next().ok_or_else(|| {
+        KernelSolveError::new(format!(
+            "kernel packed execution call expression {} has no authored syntax",
+            expression.0,
+        ))
+    })?;
+    if matching.next().is_some() {
+        return Err(KernelSolveError::new(format!(
+            "kernel packed execution repeats call syntax for expression {}",
+            expression.0,
+        )));
+    }
+    Ok(syntax)
+}
+
+fn append_definition_execution_statement_dependencies(
+    owners: &[KernelProjectOwnerOutputs],
+    expression_offsets: &[u32],
+    statement_offsets: &[u32],
+    root: PackedExpressionRef,
+    statement_root_by_expression: &[Option<PackedStatementRef>],
+    statement_generations: &mut [u32],
+    generation: u32,
+    statement_stack: &mut Vec<PackedStatementRef>,
+    dependencies: &mut Vec<PackedExpressionRef>,
+) -> Result<(), KernelSolveError> {
+    let Some(root_statement) = statement_root_by_expression
+        .get(definition_execution_expression_index(
+            expression_offsets,
+            root,
+        )?)
+        .copied()
+        .flatten()
+    else {
+        return Ok(());
+    };
+    let root_row = definition_execution_statement(
+        owners,
+        root_statement.owner,
+        root_statement.statement,
+        "statement dependency root",
+    )?;
+    statement_stack.clear();
+    for child in root_row.children.iter().rev().copied() {
+        statement_stack.push(definition_execution_statement_child(
+            owners,
+            root_statement.owner,
+            child,
+        )?);
+    }
+    while let Some(statement) = statement_stack.pop() {
+        let index = definition_execution_statement_index(statement_offsets, statement)?;
+        let seen = statement_generations.get_mut(index).ok_or_else(|| {
+            KernelSolveError::new("kernel packed execution statement generation is out of range")
+        })?;
+        if *seen == generation {
+            continue;
+        }
+        *seen = generation;
+        let row = definition_execution_statement(
+            owners,
+            statement.owner,
+            statement.statement,
+            "statement dependency",
+        )?;
+        let value = row
+            .value
+            .map(|value| {
+                definition_execution_value(
+                    owners,
+                    statement.owner,
+                    value,
+                    "statement dependency value",
+                )
+            })
+            .transpose()?;
+        if let Some(value) = value
+            && value != root
+        {
+            dependencies.push(value);
+            continue;
+        }
+        for child in row.children.iter().rev().copied() {
+            statement_stack.push(definition_execution_statement_child(
+                owners,
+                statement.owner,
+                child,
+            )?);
+        }
+    }
+    Ok(())
+}
+
+fn definition_execution_conditional_shape<'a>(
+    definition: &'a KernelProjectOwnerOutputs,
+    expression: KernelExpressionId,
+) -> Result<Option<&'a KernelExecutionShapeArtifact>, KernelSolveError> {
+    let mut matching = definition.execution_shapes.iter().filter(|shape| {
+        shape.expression() == expression
+            && matches!(shape, KernelExecutionShapeArtifact::Conditional { .. })
+    });
+    let shape = matching.next();
+    if matching.next().is_some() {
+        return Err(KernelSolveError::new(format!(
+            "kernel packed execution repeats a conditional shape for expression {}",
+            expression.0,
+        )));
+    }
+    Ok(shape)
+}
+
+fn definition_execution_block_shape<'a>(
+    definition: &'a KernelProjectOwnerOutputs,
+    expression: KernelExpressionId,
+) -> Result<&'a KernelExecutionShapeArtifact, KernelSolveError> {
+    let mut matching = definition.execution_shapes.iter().filter(|shape| {
+        shape.expression() == expression
+            && matches!(shape, KernelExecutionShapeArtifact::Block { .. })
+    });
+    let shape = matching.next().ok_or_else(|| {
+        KernelSolveError::new(format!(
+            "kernel packed execution BLOCK expression {} has no shape",
+            expression.0,
+        ))
+    })?;
+    if matching.next().is_some() {
+        return Err(KernelSolveError::new(format!(
+            "kernel packed execution repeats a BLOCK shape for expression {}",
+            expression.0,
+        )));
+    }
+    Ok(shape)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_definition_execution_dependencies(
+    owners: &[KernelProjectOwnerOutputs],
+    abi: &crate::KernelAbiInput,
+    expression_offsets: &[u32],
+    statement_offsets: &[u32],
+    call_by_expression: &[u32],
+    statement_root_by_expression: &[Option<PackedStatementRef>],
+    read_provider_present: &[bool],
+    read_provider_callable: &[Option<PackedDeclarationKey>],
+    template_callable: PackedDeclarationKey,
+    expression: PackedExpressionRef,
+    statement_generations: &mut [u32],
+    statement_generation: &mut u32,
+    statement_stack: &mut Vec<PackedStatementRef>,
+    dependencies: &mut Vec<PackedExpressionRef>,
+) -> Result<(), KernelSolveError> {
+    dependencies.clear();
+    let owner = expression.owner();
+    let definition = definition_execution_owner(owners, owner, "node dependency")?;
+    let expression_row = definition
+        .expression_artifacts
+        .get(expression.expression().0 as usize)
+        .filter(|row| row.id == expression.expression())
+        .ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel packed execution references missing node {}:{}",
+                owner.0,
+                expression.expression().0,
+            ))
+        })?;
+    let payload = definition
+        .expression_payloads
+        .get(expression.expression().0 as usize)
+        .ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel packed execution node {}:{} has no semantic payload",
+                owner.0,
+                expression.expression().0,
+            ))
+        })?;
+    if matches!(payload, KernelExpressionSemanticPayload::Delimiter) {
+        return Ok(());
+    }
+
+    let flat_expression = definition_execution_expression_index(expression_offsets, expression)?;
+    let call_ordinal = *call_by_expression.get(flat_expression).ok_or_else(|| {
+        KernelSolveError::new("kernel packed execution call index is out of range")
+    })?;
+    if call_ordinal != u32::MAX {
+        let call = definition
+            .calls
+            .get(call_ordinal as usize)
+            .filter(|call| call.expression == expression.expression())
+            .ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel packed execution call {}:{} is missing",
+                    owner.0, call_ordinal,
+                ))
+            })?;
+        let abi_callable = match &call.target {
+            KernelCallTarget::User { .. } => None,
+            KernelCallTarget::RenderConstructor { .. }
+            | KernelCallTarget::PureBuiltin { .. }
+            | KernelCallTarget::FixedAbi
+            | KernelCallTarget::HostEffect { .. }
+            | KernelCallTarget::FieldProjection { .. } => {
+                let syntax = definition_execution_call_syntax(definition, expression.expression())?;
+                Some(abi.callable(&syntax.function).ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel packed execution call `{}` has no immutable ABI contract",
+                        syntax.function,
+                    ))
+                })?)
+            }
+        };
+        for input in &expression_row.inputs {
+            let consumed = match (&call.target, &input.role) {
+                (KernelCallTarget::User { .. }, KernelOwnerEdgeRole::CallArgument { .. }) => true,
+                (KernelCallTarget::User { .. }, KernelOwnerEdgeRole::CallOutArgument { .. }) => {
+                    false
+                }
+                (_, KernelOwnerEdgeRole::AbiArgument { name }) => {
+                    let callable = abi_callable.expect("non-user call has an ABI contract");
+                    let parameter = callable
+                        .parameters
+                        .iter()
+                        .find(|parameter| parameter.name.as_ref() == name.as_ref())
+                        .or_else(|| {
+                            (name.as_ref() == "$pipe").then(|| {
+                                callable
+                                    .parameters
+                                    .iter()
+                                    .find(|parameter| parameter.kind == CheckedParameterKind::Value)
+                            })?
+                        })
+                        .ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "kernel packed execution call `{}` has no ABI parameter `{name}`",
+                                callable.name,
+                            ))
+                        })?;
+                    parameter.kind == CheckedParameterKind::Value
+                }
+                (_, role) => {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel packed execution call {}:{} has non-call input role {role:?}",
+                        owner.0,
+                        expression.expression().0,
+                    )));
+                }
+            };
+            if consumed {
+                dependencies.push(definition_execution_value(
+                    owners,
+                    owner,
+                    input.value,
+                    "call dependency",
+                )?);
+            }
+        }
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        return Ok(());
+    }
+
+    for input in &expression_row.inputs {
+        if matches!(
+            input.role,
+            KernelOwnerEdgeRole::CallOutArgument { .. } | KernelOwnerEdgeRole::HoldUpdate
+        ) {
+            continue;
+        }
+        if matches!(input.role, KernelOwnerEdgeRole::ReadProvider) {
+            let present = *read_provider_present.get(flat_expression).ok_or_else(|| {
+                KernelSolveError::new(
+                    "kernel packed execution read-provider presence index is out of range",
+                )
+            })?;
+            if !present {
+                return Err(KernelSolveError::new(format!(
+                    "kernel packed execution read {}:{} has no lexical callable authority",
+                    owner.0,
+                    expression.expression().0,
+                )));
+            }
+            if read_provider_callable
+                .get(flat_expression)
+                .copied()
+                .flatten()
+                != Some(template_callable)
+            {
+                continue;
+            }
+        }
+        dependencies.push(definition_execution_value(
+            owners,
+            owner,
+            input.value,
+            "expression dependency",
+        )?);
+    }
+
+    if matches!(
+        expression_row.kind,
+        KernelOwnerNodeKind::Hold | KernelOwnerNodeKind::MatchArm { .. }
+    ) {
+        *statement_generation = statement_generation.wrapping_add(1);
+        if *statement_generation == 0 {
+            statement_generations.fill(0);
+            *statement_generation = 1;
+        }
+        append_definition_execution_statement_dependencies(
+            owners,
+            expression_offsets,
+            statement_offsets,
+            expression,
+            statement_root_by_expression,
+            statement_generations,
+            *statement_generation,
+            statement_stack,
+            dependencies,
+        )?;
+    }
+    if matches!(expression_row.kind, KernelOwnerNodeKind::Block) {
+        let KernelExecutionShapeArtifact::Block {
+            bindings, result, ..
+        } = definition_execution_block_shape(definition, expression.expression())?
+        else {
+            unreachable!("BLOCK shape helper returned a non-BLOCK row")
+        };
+        for binding in bindings {
+            dependencies.push(definition_execution_value(
+                owners,
+                owner,
+                binding.value,
+                "BLOCK binding dependency",
+            )?);
+        }
+        if let Some(result) = result {
+            dependencies.push(definition_execution_value(
+                owners,
+                owner,
+                *result,
+                "BLOCK result dependency",
+            )?);
+        }
+    }
+    dependencies.sort_unstable();
+    dependencies.dedup();
+    Ok(())
+}
+
+fn collect_definition_execution_selector(
+    owners: &[KernelProjectOwnerOutputs],
+    expression: PackedExpressionRef,
+    arms: &mut Vec<PackedExpressionRef>,
+) -> Result<Option<PackedExpressionRef>, KernelSolveError> {
+    arms.clear();
+    let definition = definition_execution_owner(owners, expression.owner(), "selector")?;
+    let Some(shape) = definition_execution_conditional_shape(definition, expression.expression())?
+    else {
+        return Ok(None);
+    };
+    let KernelExecutionShapeArtifact::Conditional { kind, .. } = shape else {
+        unreachable!("conditional-shape helper returned a non-conditional row")
+    };
+    if *kind == KernelConditionalKind::While {
+        return Ok(None);
+    }
+    let row = definition
+        .expression_artifacts
+        .get(expression.expression().0 as usize)
+        .filter(|row| row.id == expression.expression())
+        .ok_or_else(|| KernelSolveError::new("kernel packed execution selector node is missing"))?;
+    let mut selector_inputs = row
+        .inputs
+        .iter()
+        .filter(|input| matches!(input.role, KernelOwnerEdgeRole::WhenInput));
+    let selector = selector_inputs.next().ok_or_else(|| {
+        KernelSolveError::new(format!(
+            "kernel packed execution WHEN {}:{} has no selector input",
+            expression.owner().0,
+            expression.expression().0,
+        ))
+    })?;
+    if selector_inputs.next().is_some() {
+        return Err(KernelSolveError::new(format!(
+            "kernel packed execution WHEN {}:{} has multiple selector inputs",
+            expression.owner().0,
+            expression.expression().0,
+        )));
+    }
+    for arm in row
+        .inputs
+        .iter()
+        .filter(|input| matches!(input.role, KernelOwnerEdgeRole::WhenArm))
+    {
+        arms.push(definition_execution_value(
+            owners,
+            expression.owner(),
+            arm.value,
+            "WHEN arm",
+        )?);
+    }
+    definition_execution_value(owners, expression.owner(), selector.value, "WHEN selector")
+        .map(Some)
+}
+
+fn build_definition_execution_code(
+    owners: &[KernelProjectOwnerOutputs],
+    abi: &crate::KernelAbiInput,
+    builder: &mut DefinitionCodeBuilder,
+) -> Result<(), KernelSolveError> {
+    let expression_offsets = definition_execution_offsets(
+        owners.iter().map(|owner| owner.expression_artifacts.len()),
+        "expression",
+    )?;
+    let statement_offsets = definition_execution_offsets(
+        owners.iter().map(|owner| owner.statements.len()),
+        "statement",
+    )?;
+    let expression_count = expression_offsets.last().copied().unwrap_or(0) as usize;
+    let statement_count = statement_offsets.last().copied().unwrap_or(0) as usize;
+    let dependency_capacity = owners
+        .iter()
+        .flat_map(|owner| owner.expression_artifacts.iter())
+        .map(|expression| expression.inputs.len())
+        .sum::<usize>()
+        .saturating_add(
+            owners
+                .iter()
+                .flat_map(|owner| owner.execution_shapes.iter())
+                .map(|shape| match shape {
+                    KernelExecutionShapeArtifact::Block {
+                        bindings, result, ..
+                    } => bindings.len().saturating_add(usize::from(result.is_some())),
+                    _ => 0,
+                })
+                .sum(),
+        )
+        .saturating_add(statement_count);
+    let selector_capacity = owners
+        .iter()
+        .flat_map(|owner| owner.execution_shapes.iter())
+        .filter(|shape| {
+            matches!(
+                shape,
+                KernelExecutionShapeArtifact::Conditional {
+                    kind: KernelConditionalKind::When,
+                    ..
+                }
+            )
+        })
+        .count();
+    let selector_arm_capacity = owners
+        .iter()
+        .flat_map(|owner| owner.expression_artifacts.iter())
+        .flat_map(|expression| expression.inputs.iter())
+        .filter(|input| matches!(input.role, KernelOwnerEdgeRole::WhenArm))
+        .count();
+    let call_capacity = owners.iter().map(|owner| owner.calls.len()).sum();
+    builder.reserve_execution(
+        expression_count,
+        dependency_capacity,
+        selector_capacity,
+        selector_arm_capacity,
+        call_capacity,
+    );
+
+    let mut call_by_expression = vec![u32::MAX; expression_count];
+    let mut statement_root_by_expression = vec![None; expression_count];
+    let mut read_provider_present = vec![false; expression_count];
+    let mut read_provider_callable = vec![None; expression_count];
+
+    for (owner_index, definition) in owners.iter().enumerate() {
+        let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+            KernelSolveError::new("kernel packed execution definition count exceeds u32")
+        })?);
+        for (ordinal, call) in definition.calls.iter().enumerate() {
+            let expression = definition_execution_expression(
+                owners,
+                owner,
+                call.expression,
+                "call reverse index",
+            )?;
+            let index = definition_execution_expression_index(&expression_offsets, expression)?;
+            let ordinal = u32::try_from(ordinal).map_err(|_| {
+                KernelSolveError::new(format!(
+                    "kernel packed execution definition {} call count exceeds u32",
+                    owner.0,
+                ))
+            })?;
+            if std::mem::replace(&mut call_by_expression[index], ordinal) != u32::MAX {
+                return Err(KernelSolveError::new(format!(
+                    "kernel packed execution repeats a call for expression {}:{}",
+                    owner.0, call.expression.0,
+                )));
+            }
+        }
+        for statement in &definition.statements {
+            if statement.children.is_empty() {
+                continue;
+            }
+            let Some(value) = statement.value else {
+                continue;
+            };
+            let expression =
+                definition_execution_value(owners, owner, value, "statement reverse index")?;
+            let index = definition_execution_expression_index(&expression_offsets, expression)?;
+            if statement_root_by_expression[index].is_none() {
+                statement_root_by_expression[index] = Some(PackedStatementRef {
+                    owner,
+                    statement: statement.id,
+                });
+            }
+        }
+        for binding in &definition.lexical_bindings {
+            let expression =
+                definition_execution_expression(owners, owner, binding.expression, "lexical read")?;
+            let expression_row = &definition.expression_artifacts[binding.expression.0 as usize];
+            if !expression_row
+                .inputs
+                .iter()
+                .any(|input| matches!(input.role, KernelOwnerEdgeRole::ReadProvider))
+            {
+                continue;
+            }
+            let index = definition_execution_expression_index(&expression_offsets, expression)?;
+            if read_provider_present[index] {
+                return Err(KernelSolveError::new(format!(
+                    "kernel packed execution repeats lexical callable authority for expression {}:{}",
+                    owner.0, binding.expression.0,
+                )));
+            }
+            read_provider_present[index] = true;
+            read_provider_callable[index] = match binding.target {
+                KernelLexicalBindingTarget::Declaration(reference) => {
+                    let declaration = definition_execution_declaration(
+                        owners,
+                        owner,
+                        reference,
+                        "lexical read target",
+                    )?;
+                    let target = &definition_execution_owner(
+                        owners,
+                        declaration.owner,
+                        "lexical read target",
+                    )?
+                    .declarations[declaration.declaration.0 as usize];
+                    if target.value.is_none() {
+                        None
+                    } else {
+                        let presentation = definition_execution_owner(
+                            owners,
+                            declaration.owner,
+                            "lexical read target",
+                        )?
+                        .presentation
+                        .declarations
+                        .get(declaration.declaration.0 as usize)
+                        .filter(|row| row.declaration == declaration.declaration)
+                        .ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "kernel packed execution declaration {}:{} has no presentation",
+                                declaration.owner.0, declaration.declaration.0,
+                            ))
+                        })?;
+                        definition_execution_scope_callable(
+                            owners,
+                            declaration.owner,
+                            presentation.scope,
+                            "lexical read callable",
+                        )?
+                    }
+                }
+                KernelLexicalBindingTarget::ContextFormal { .. }
+                | KernelLexicalBindingTarget::Value { .. }
+                | KernelLexicalBindingTarget::RuntimeContext => None,
+            };
+        }
+    }
+
+    let mut assigned_template = vec![None::<KernelOwnerId>; expression_count];
+    let mut visit_generations = vec![0_u32; expression_count];
+    let mut visit_states = vec![0_u8; expression_count];
+    let mut visit_generation = 0_u32;
+    let mut dependency_starts = vec![u32::MAX; expression_count];
+    let mut dependency_lengths = vec![0_u32; expression_count];
+    let mut packed_dependencies = Vec::with_capacity(dependency_capacity);
+    let mut dependency_scratch = Vec::new();
+    let mut pending = Vec::<(PackedExpressionRef, bool)>::new();
+    let mut node_order = Vec::<PackedExpressionRef>::new();
+    let mut calls = Vec::<PackedCallRef>::new();
+    let mut selector_arms = Vec::<PackedExpressionRef>::new();
+    let mut statement_generations = vec![0_u32; statement_count];
+    let mut statement_generation = 0_u32;
+    let mut statement_stack = Vec::<PackedStatementRef>::new();
+
+    for (owner_index, definition) in owners.iter().enumerate() {
+        let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+            KernelSolveError::new("kernel packed execution definition count exceeds u32")
+        })?);
+        let Some(root_statement) = definition.linkage.root_statement else {
+            continue;
+        };
+        let root_statement =
+            definition_execution_statement(owners, owner, root_statement, "template root")?;
+        if !matches!(root_statement.kind, KernelStatementKind::Function { .. }) {
+            continue;
+        }
+        let result = definition.linkage.result_expression.ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel packed callable definition {} has no result expression",
+                owner.0,
+            ))
+        })?;
+        let result = definition_execution_expression(owners, owner, result, "template result")?;
+        let public_declaration = definition.linkage.public_declaration.ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel packed callable definition {} has no public declaration",
+                owner.0,
+            ))
+        })?;
+        let template_callable = definition_execution_declaration(
+            owners,
+            owner,
+            public_declaration,
+            "template callable",
+        )?;
+
+        visit_generation = visit_generation.wrapping_add(1);
+        if visit_generation == 0 {
+            visit_generations.fill(0);
+            visit_generation = 1;
+        }
+        pending.clear();
+        node_order.clear();
+        pending.push((result, false));
+        while let Some((expression, exiting)) = pending.pop() {
+            let index = definition_execution_expression_index(&expression_offsets, expression)?;
+            if exiting {
+                if visit_generations[index] == visit_generation && visit_states[index] == 1 {
+                    visit_states[index] = 2;
+                    node_order.push(expression);
+                }
+                continue;
+            }
+            if let Some(previous) = assigned_template[index]
+                && previous != owner
+            {
+                return Err(KernelSolveError::new(format!(
+                    "kernel packed execution expression {}:{} belongs to callable definitions {} and {}",
+                    expression.owner().0,
+                    expression.expression().0,
+                    previous.0,
+                    owner.0,
+                )));
+            }
+            assigned_template[index] = Some(owner);
+            if visit_generations[index] == visit_generation {
+                continue;
+            }
+            visit_generations[index] = visit_generation;
+            visit_states[index] = 1;
+
+            if dependency_starts[index] == u32::MAX {
+                collect_definition_execution_dependencies(
+                    owners,
+                    abi,
+                    &expression_offsets,
+                    &statement_offsets,
+                    &call_by_expression,
+                    &statement_root_by_expression,
+                    &read_provider_present,
+                    &read_provider_callable,
+                    template_callable,
+                    expression,
+                    &mut statement_generations,
+                    &mut statement_generation,
+                    &mut statement_stack,
+                    &mut dependency_scratch,
+                )?;
+                let start = u32::try_from(packed_dependencies.len()).map_err(|_| {
+                    KernelSolveError::new("kernel packed execution dependency start exceeds u32")
+                })?;
+                let len = u32::try_from(dependency_scratch.len()).map_err(|_| {
+                    KernelSolveError::new("kernel packed execution dependency count exceeds u32")
+                })?;
+                packed_dependencies.extend(dependency_scratch.iter().copied());
+                dependency_starts[index] = start;
+                dependency_lengths[index] = len;
+            }
+            let start = dependency_starts[index] as usize;
+            let end = start
+                .checked_add(dependency_lengths[index] as usize)
+                .ok_or_else(|| {
+                    KernelSolveError::new("kernel packed execution dependency span overflows usize")
+                })?;
+            let dependencies = packed_dependencies.get(start..end).ok_or_else(|| {
+                KernelSolveError::new("kernel packed execution dependency span is out of range")
+            })?;
+            pending.push((expression, true));
+            pending.extend(
+                dependencies
+                    .iter()
+                    .rev()
+                    .copied()
+                    .map(|dependency| (dependency, false)),
+            );
+        }
+
+        calls.clear();
+        let token = builder.begin_execution_template(owner, result)?;
+        for expression in node_order.iter().copied() {
+            let index = definition_execution_expression_index(&expression_offsets, expression)?;
+            let start = dependency_starts[index] as usize;
+            let end = start
+                .checked_add(dependency_lengths[index] as usize)
+                .ok_or_else(|| {
+                    KernelSolveError::new("kernel packed execution dependency span overflows usize")
+                })?;
+            let dependencies = packed_dependencies.get(start..end).ok_or_else(|| {
+                KernelSolveError::new("kernel packed execution dependency span is out of range")
+            })?;
+            let call_ordinal = call_by_expression[index];
+            let call = (call_ordinal != u32::MAX)
+                .then(|| PackedCallRef::new(expression.owner(), call_ordinal));
+            if let Some(call) = call {
+                calls.push(call);
+            }
+            let selector =
+                collect_definition_execution_selector(owners, expression, &mut selector_arms)?;
+            builder.push_execution_node(
+                token,
+                expression,
+                dependencies,
+                call,
+                selector.map(|input| (input, selector_arms.as_slice())),
+            )?;
+        }
+        calls.sort_unstable();
+        calls.dedup();
+        builder.finish_execution_template(token, &calls)?;
+    }
+    Ok(())
 }
 
 fn import_post_solve_type(terms: &mut crate::TypeTermArena, ty: &Type) -> TypeTermId {

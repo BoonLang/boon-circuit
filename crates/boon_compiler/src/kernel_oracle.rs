@@ -17628,6 +17628,54 @@ mod tests {
     }
 
     #[test]
+    fn generic_abi_substitutions_match_the_checked_input_namespace() {
+        let source = concat!(
+            "FUNCTION append_item(list, item) {\n",
+            "    result:\n",
+            "        list\n",
+            "        |> List/append(item: item)\n",
+            "}\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse external generic ABI fixture");
+        let report = kernel_owner_oracle(&project);
+        assert!(
+            report.unsupported.is_empty(),
+            "external generic ABI fixture must compile: {:#?}",
+            report.unsupported,
+        );
+        let call = report
+            .checked_calls
+            .iter()
+            .find(|call| call.function == "List/append")
+            .expect("nested function field retains its List/append call");
+        let item = call
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                boon_checked::CheckedCallEntry::Input { name, value, .. } if name == "item" => {
+                    Some(*value)
+                }
+                boon_checked::CheckedCallEntry::Input { .. }
+                | boon_checked::CheckedCallEntry::FreshOut { .. }
+                | boon_checked::CheckedCallEntry::ForwardOut { .. } => None,
+            })
+            .expect("List/append retains its item input");
+        let [substitution] = call.type_substitutions.as_slice() else {
+            panic!("generic List/append publishes one substitution")
+        };
+        assert_eq!(
+            substitution.value, report.checked_expressions[item.0 as usize].flow_type.ty,
+            "a checked substitution value and its caller input use one alpha namespace",
+        );
+        assert_eq!(
+            call.result,
+            report.checked_expressions[call.expression.0 as usize].flow_type,
+        );
+    }
+
+    #[test]
     fn singleton_selectors_choose_one_compiled_match_arm() {
         let source = concat!(
             "FUNCTION choose(kind) {\n",

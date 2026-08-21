@@ -2799,6 +2799,7 @@ impl KernelProjectSolveSession {
         let public_formals = project_public_formals(&self.owners, &artifact);
         let (_, diagnostics) = project_call_facts_and_diagnostics(
             &self.owners,
+            &self.abi,
             &artifact,
             None,
             &public_results,
@@ -2822,12 +2823,13 @@ impl KernelProjectSolveSession {
         let finalize_started = Instant::now();
         let projected = ComponentOutputSnapshot::project_unsealed(
             &artifact,
-            &interface_output_demand(&self.owners),
+            &checked_output_demand(&self.owners),
         );
         let public_results = project_public_results(&self.owners, &projected);
         let public_formals = project_public_formals(&self.owners, &projected);
         let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
             &self.owners,
+            &self.abi,
             &projected,
             Some(&artifact),
             &public_results,
@@ -2848,7 +2850,7 @@ impl KernelProjectSolveSession {
             &self.owners,
             &mut artifact,
             &flush_terms,
-            &call_facts,
+            call_facts,
             &diagnostics,
             &resource_projection_facts,
         )?;
@@ -4931,7 +4933,7 @@ fn build_definition_code_builder(
     owners: &[KernelProjectOwnerOutputs],
     artifact: &mut UnsealedComponentArtifact,
     flush_terms: &ProjectExpressionFlushTerms,
-    call_facts: &[Box<[SolvedKernelCallFacts]>],
+    call_facts: Box<[Box<[SolvedKernelCallFacts]>]>,
     diagnostics: &[Box<[KernelDiagnosticArtifact]>],
     resource_projection_facts: &[DefinitionResourceProjectionFacts],
 ) -> Result<DefinitionCodeBuilder, KernelSolveError> {
@@ -4963,7 +4965,9 @@ fn build_definition_code_builder(
     let mut list_item_types = Vec::new();
     let mut packed_resource_projection_requirements = Vec::new();
     let mut proof_scratch = DefinitionTermProofScratch::default();
-    for (owner_index, owner) in owners.iter().enumerate() {
+    for (owner_index, (owner, owner_call_facts)) in
+        owners.iter().zip(call_facts.into_vec()).enumerate()
+    {
         let resource_projection_facts = &resource_projection_facts[owner_index];
         formal_roots.clear();
         formal_roots.extend(
@@ -5017,7 +5021,6 @@ fn build_definition_code_builder(
                 }
             }));
         }
-        let owner_call_facts = &call_facts[owner_index];
         if owner_call_facts.len() != owner.calls.len() {
             return Err(KernelSolveError::new(format!(
                 "kernel definition-code owner {owner_index} has {} calls and {} solved call rows",
@@ -5027,7 +5030,7 @@ fn build_definition_code_builder(
         }
         packed_calls.clear();
         packed_call_substitutions.clear();
-        for call in owner_call_facts {
+        for call in &owner_call_facts {
             let substitution_start =
                 u32::try_from(packed_call_substitutions.len()).map_err(|_| {
                     KernelSolveError::new(
@@ -6202,6 +6205,32 @@ fn interface_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputI
     outputs.into_boxed_slice()
 }
 
+/// Add the solved result of the collection mutators whose generic ABI result
+/// can be wider than every individual input. Checked-call substitutions must
+/// publish that result type even when the source ignores the call value, while
+/// the diagnostics-only interface demand deliberately remains smaller.
+fn checked_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputId]> {
+    let mut outputs = interface_output_demand(owners).into_vec();
+    for owner in owners {
+        for call in &owner.calls {
+            if matches!(
+                call.target,
+                KernelCallTarget::PureBuiltin {
+                    kind: KernelPureBuiltinKind::ListAppend
+                        | KernelPureBuiltinKind::MapUpsert
+                        | KernelPureBuiltinKind::SetAdd,
+                }
+            ) && let Some(output) = owner.expressions.get(call.expression.0 as usize)
+            {
+                outputs.push(*output);
+            }
+        }
+    }
+    outputs.sort_unstable();
+    outputs.dedup();
+    outputs.into_boxed_slice()
+}
+
 fn project_interface_snapshot(
     owners: &[KernelProjectOwnerOutputs],
     artifact: &ComponentOutputSnapshot,
@@ -6269,6 +6298,7 @@ fn project_interface_snapshot(
 /// computes nor roots those checked-only facts.
 fn project_call_facts_and_diagnostics(
     owners: &[KernelProjectOwnerOutputs],
+    abi: &crate::KernelAbiInput,
     artifact: &ComponentOutputSnapshot,
     packed_artifact: Option<&UnsealedComponentArtifact>,
     public_results: &[FlowType],
@@ -6387,6 +6417,16 @@ fn project_call_facts_and_diagnostics(
                     });
                 }
                 substitutions
+            } else if retain_call_facts {
+                project_abi_call_type_substitutions(
+                    owner_index,
+                    owner,
+                    call,
+                    owners,
+                    abi,
+                    artifact,
+                    public_results,
+                )
             } else {
                 Box::new([])
             };
@@ -6462,6 +6502,74 @@ fn project_call_facts_and_diagnostics(
         project_call_facts.into_boxed_slice(),
         project_diagnostics.into_boxed_slice(),
     )
+}
+
+/// Publish immutable-ABI substitutions while the caller's solver namespace is
+/// still authoritative. `DefinitionCodeBuilder` then imports these values as
+/// caller-owned packed roots and alpha-links them exactly once. Reconstructing
+/// the substitutions later from a provider's rich checked row loses that
+/// caller-frame ownership for cross-definition inputs.
+fn project_abi_call_type_substitutions(
+    owner_index: usize,
+    owner: &KernelProjectOwnerOutputs,
+    call: &PendingKernelCallArtifact,
+    owners: &[KernelProjectOwnerOutputs],
+    abi: &crate::KernelAbiInput,
+    artifact: &ComponentOutputSnapshot,
+    public_results: &[FlowType],
+) -> Box<[KernelCallTypeSubstitution]> {
+    let Ok(syntax) = owner
+        .call_syntax
+        .binary_search_by_key(&call.expression, |syntax| syntax.expression)
+        .map(|index| &owner.call_syntax[index])
+    else {
+        // Lower-level equation tests intentionally omit checked-image syntax.
+        // Production linking validates and requires the authored row.
+        return Box::new([]);
+    };
+    let Some(target) = abi.callable(&syntax.function) else {
+        // The same lower-level tests may install a builtin equation directly
+        // without the project ABI table. A production project cannot reach the
+        // checked linker with that incomplete contract.
+        return Box::new([]);
+    };
+    let actuals = call.inputs.iter().filter_map(|input| {
+        let KernelCallInputRole::Abi { name } = &input.role else {
+            return None;
+        };
+        let parameter = target
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name.as_ref() == name.as_ref())
+            .or_else(|| {
+                (name.as_ref() == "$pipe").then(|| {
+                    target.parameters.iter().find(|parameter| {
+                        parameter.kind == boon_checked::CheckedParameterKind::Value
+                    })
+                })?
+            })?;
+        project_call_value_type(owner_index, input.value, owners, artifact, public_results)
+            .map(|actual| (parameter.ordinal, actual))
+    });
+    let actual_result = matches!(
+        &call.target,
+        KernelCallTarget::PureBuiltin {
+            kind: KernelPureBuiltinKind::ListAppend
+                | KernelPureBuiltinKind::MapUpsert
+                | KernelPureBuiltinKind::SetAdd,
+        }
+    )
+    .then(|| {
+        project_call_value_type(
+            owner_index,
+            KernelValueReference::Local(call.expression),
+            owners,
+            artifact,
+            public_results,
+        )
+    })
+    .flatten();
+    derive_kernel_abi_call_type_substitutions_from_refs(target, actuals, actual_result)
 }
 
 fn project_call_value_type<'a>(
@@ -8824,6 +8932,45 @@ fn derive_kernel_call_type_substitutions_iter<'a>(
     actuals: impl IntoIterator<Item = (u32, &'a Type)>,
     actual_result: Option<&Type>,
 ) -> Box<[KernelCallTypeSubstitution]> {
+    derive_kernel_call_type_substitutions_from_lookup(
+        target_formals.iter(),
+        |ordinal| target_formals.get(ordinal as usize),
+        target_result,
+        actuals,
+        actual_result,
+    )
+}
+
+fn derive_kernel_abi_call_type_substitutions_from_refs<'a>(
+    target: &crate::KernelCallableAbiInput,
+    actuals: impl IntoIterator<Item = (u32, &'a Type)>,
+    actual_result: Option<&Type>,
+) -> Box<[KernelCallTypeSubstitution]> {
+    derive_kernel_call_type_substitutions_from_lookup(
+        target
+            .parameters
+            .iter()
+            .map(|parameter| &parameter.flow_type),
+        |ordinal| {
+            target
+                .parameters
+                .iter()
+                .find(|parameter| parameter.ordinal == ordinal)
+                .map(|parameter| &parameter.flow_type)
+        },
+        &target.result,
+        actuals,
+        actual_result,
+    )
+}
+
+fn derive_kernel_call_type_substitutions_from_lookup<'formal, 'actual>(
+    target_formals: impl IntoIterator<Item = &'formal FlowType>,
+    target_formal: impl Fn(u32) -> Option<&'formal FlowType>,
+    target_result: &FlowType,
+    actuals: impl IntoIterator<Item = (u32, &'actual Type)>,
+    actual_result: Option<&Type>,
+) -> Box<[KernelCallTypeSubstitution]> {
     let mut parameter_ids = BTreeMap::new();
     for formal in target_formals {
         collect_callable_type_parameters(&formal.ty, &mut parameter_ids);
@@ -8832,7 +8979,7 @@ fn derive_kernel_call_type_substitutions_iter<'a>(
 
     let mut substitutions = BTreeMap::new();
     for (ordinal, actual) in actuals {
-        let Some(pattern) = target_formals.get(ordinal as usize) else {
+        let Some(pattern) = target_formal(ordinal) else {
             continue;
         };
         match_call_type_pattern(&pattern.ty, actual, &mut substitutions);
@@ -22314,6 +22461,302 @@ mod tests {
             ))
         );
         assert!(artifact.work.activations < 16);
+    }
+
+    #[test]
+    fn external_generic_abi_substitutions_are_packed_in_the_caller_namespace() {
+        let input = KernelProjectProgramInput {
+            owners: vec![
+                KernelOwnerProgramInput {
+                    nodes: vec![KernelOwnerNode {
+                        kind: KernelOwnerNodeKind::FormalRead {
+                            formal: 0,
+                            fields: Box::new([]),
+                        },
+                        inputs: Box::new([]),
+                        mode: FlowMode::Continuous,
+                    }]
+                    .into_boxed_slice(),
+                    formal_count: 1,
+                    external_expressions: Box::new([]),
+                    result: KernelExpressionId(0),
+                },
+                KernelOwnerProgramInput {
+                    nodes: vec![KernelOwnerNode {
+                        kind: KernelOwnerNodeKind::PureBuiltin {
+                            kind: KernelPureBuiltinKind::ListLength,
+                        },
+                        inputs: vec![edge(
+                            KernelOwnerEdgeRole::AbiArgument {
+                                name: "$pipe".into(),
+                            },
+                            1,
+                        )]
+                        .into_boxed_slice(),
+                        mode: FlowMode::Continuous,
+                    }]
+                    .into_boxed_slice(),
+                    formal_count: 0,
+                    external_expressions: vec![KernelExternalExpression {
+                        owner: KernelOwnerId(0),
+                        target: KernelExternalTarget::Result,
+                    }]
+                    .into_boxed_slice(),
+                    result: KernelExpressionId(0),
+                },
+            ]
+            .into_boxed_slice(),
+        };
+        let occurrence = boon_syntax::StableOccurrenceKey {
+            source_unit_id: boon_syntax::SourceUnitId::from_path("external-abi.bn").unwrap(),
+            route: boon_syntax::StableOccurrenceRoute {
+                owner: None,
+                statement_route: Vec::new(),
+                expression_route: Vec::new(),
+            },
+        };
+        let facts = [
+            KernelDefinitionFactsInput::default(),
+            KernelDefinitionFactsInput {
+                call_syntax: vec![KernelCallSyntaxInput {
+                    expression: KernelExpressionId(0),
+                    occurrence,
+                    function: "List/length".into(),
+                    pipe_input: Some(KernelExpressionId(1)),
+                    arguments: Box::new([]),
+                    pass: None,
+                }]
+                .into_boxed_slice(),
+                ..KernelDefinitionFactsInput::default()
+            },
+        ];
+        let item = Type::Var(TypeVar(9));
+        let abi = crate::KernelAbiInput::new(
+            boon_checked::ProgramRole::Client,
+            [crate::KernelCallableAbiInput {
+                name: "List/length".into(),
+                kind: KernelCallableKind::Builtin,
+                intrinsic: None,
+                external_identity: None,
+                parameters: vec![crate::KernelAbiParameterInput {
+                    name: "list".into(),
+                    kind: boon_checked::CheckedParameterKind::Value,
+                    ordinal: 0,
+                    flow_type: FlowType {
+                        mode: FlowMode::Continuous,
+                        ty: Type::List(Type::shared(item)),
+                    },
+                    requirement: boon_checked::CheckedParameterRequirement::Required,
+                    evaluation_scope: KernelParameterEvaluationScope::Parent,
+                }]
+                .into_boxed_slice(),
+                contexts: Box::new([]),
+                result: FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: Type::Number,
+                },
+                result_specialization: crate::KernelAbiResultSpecialization::Fixed,
+                role: boon_checked::ProgramRole::Client,
+                effect: boon_checked::CheckedEffectSummary::default(),
+                contextual_operation: None,
+            }],
+        )
+        .unwrap();
+        let text = crate::text::build_project_text_snapshot(&input.owners, &facts, &abi).unwrap();
+        let snapshot = compile_project_program_with_definition_facts_abi_and_text(
+            &input,
+            &facts,
+            Arc::new(abi),
+            text,
+        )
+        .unwrap()
+        .solve()
+        .unwrap();
+        let provider = snapshot
+            .definition_code
+            .definition(KernelOwnerId(0))
+            .unwrap();
+        let caller = snapshot
+            .definition_code
+            .definition(KernelOwnerId(1))
+            .unwrap();
+        assert_eq!(provider.alpha_variable_count(), 1);
+        assert_eq!(caller.alpha_variable_count(), 1);
+        let mut cache = snapshot.definition_code.materialization_cache();
+        let mut linked = caller.linked_materializer(
+            &mut cache,
+            u32::try_from(provider.alpha_variable_count()).unwrap(),
+        );
+        let [substitution] = linked
+            .materialize_call_facts(0)
+            .expect("the ABI call owns packed substitutions")
+            .substitutions
+            .into_vec()
+            .try_into()
+            .expect("List/length has one type parameter");
+        assert_eq!(substitution.variable, KernelTypeParameterId(0));
+        assert_eq!(substitution.value, Type::Var(TypeVar(1)));
+    }
+
+    #[test]
+    fn ignored_mutating_abi_call_packs_its_widened_result_substitution() {
+        let input = KernelProjectProgramInput {
+            owners: vec![KernelOwnerProgramInput {
+                nodes: vec![
+                    KernelOwnerNode {
+                        kind: KernelOwnerNodeKind::Known(Type::List(Type::shared(Type::Number))),
+                        inputs: Box::new([]),
+                        mode: FlowMode::Continuous,
+                    },
+                    KernelOwnerNode {
+                        kind: KernelOwnerNodeKind::Known(Type::Text),
+                        inputs: Box::new([]),
+                        mode: FlowMode::Continuous,
+                    },
+                    KernelOwnerNode {
+                        kind: KernelOwnerNodeKind::PureBuiltin {
+                            kind: KernelPureBuiltinKind::ListAppend,
+                        },
+                        inputs: vec![
+                            edge(
+                                KernelOwnerEdgeRole::AbiArgument {
+                                    name: "$pipe".into(),
+                                },
+                                0,
+                            ),
+                            edge(
+                                KernelOwnerEdgeRole::AbiArgument {
+                                    name: "item".into(),
+                                },
+                                1,
+                            ),
+                        ]
+                        .into_boxed_slice(),
+                        mode: FlowMode::Continuous,
+                    },
+                    KernelOwnerNode {
+                        kind: KernelOwnerNodeKind::Number,
+                        inputs: Box::new([]),
+                        mode: FlowMode::Continuous,
+                    },
+                ]
+                .into_boxed_slice(),
+                formal_count: 0,
+                external_expressions: Box::new([]),
+                // The append is deliberately not the public result and has no
+                // consumer, so only the checked-call demand roots its output.
+                result: KernelExpressionId(3),
+            }]
+            .into_boxed_slice(),
+        };
+        let occurrence = boon_syntax::StableOccurrenceKey {
+            source_unit_id: boon_syntax::SourceUnitId::from_path("ignored-append.bn").unwrap(),
+            route: boon_syntax::StableOccurrenceRoute {
+                owner: None,
+                statement_route: Vec::new(),
+                expression_route: Vec::new(),
+            },
+        };
+        let facts = [KernelDefinitionFactsInput {
+            call_syntax: vec![KernelCallSyntaxInput {
+                expression: KernelExpressionId(2),
+                occurrence,
+                function: "List/append".into(),
+                pipe_input: Some(KernelExpressionId(0)),
+                arguments: vec![KernelCallSyntaxArgument {
+                    ordinal: 0,
+                    kind: KernelCallArgumentKind::Named,
+                    name: "item".into(),
+                    value: KernelExpressionId(1),
+                    span: KernelSourceSpan::default(),
+                }]
+                .into_boxed_slice(),
+                pass: None,
+            }]
+            .into_boxed_slice(),
+            ..KernelDefinitionFactsInput::default()
+        }];
+        let item = Type::Var(TypeVar(9));
+        let abi = crate::KernelAbiInput::new(
+            boon_checked::ProgramRole::Client,
+            [crate::KernelCallableAbiInput {
+                name: "List/append".into(),
+                kind: KernelCallableKind::Builtin,
+                intrinsic: None,
+                external_identity: None,
+                parameters: vec![
+                    crate::KernelAbiParameterInput {
+                        name: "list".into(),
+                        kind: boon_checked::CheckedParameterKind::Value,
+                        ordinal: 0,
+                        flow_type: FlowType {
+                            mode: FlowMode::Continuous,
+                            ty: Type::List(Type::shared(item.clone())),
+                        },
+                        requirement: boon_checked::CheckedParameterRequirement::Required,
+                        evaluation_scope: KernelParameterEvaluationScope::Parent,
+                    },
+                    crate::KernelAbiParameterInput {
+                        name: "item".into(),
+                        kind: boon_checked::CheckedParameterKind::Value,
+                        ordinal: 1,
+                        flow_type: FlowType {
+                            mode: FlowMode::Continuous,
+                            ty: item.clone(),
+                        },
+                        requirement: boon_checked::CheckedParameterRequirement::Required,
+                        evaluation_scope: KernelParameterEvaluationScope::Parent,
+                    },
+                ]
+                .into_boxed_slice(),
+                contexts: Box::new([]),
+                result: FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: Type::List(Type::shared(item)),
+                },
+                result_specialization: crate::KernelAbiResultSpecialization::Fixed,
+                role: boon_checked::ProgramRole::Client,
+                effect: boon_checked::CheckedEffectSummary::default(),
+                contextual_operation: None,
+            }],
+        )
+        .unwrap();
+        let text = crate::text::build_project_text_snapshot(&input.owners, &facts, &abi).unwrap();
+        let snapshot = compile_project_program_with_definition_facts_abi_and_text(
+            &input,
+            &facts,
+            Arc::new(abi),
+            text,
+        )
+        .unwrap()
+        .solve()
+        .unwrap();
+        let definition = snapshot
+            .definition_code
+            .definition(KernelOwnerId(0))
+            .unwrap();
+        let mut cache = snapshot.definition_code.materialization_cache();
+        let mut linked = definition.linked_materializer(&mut cache, 0);
+        let [substitution] = linked
+            .materialize_call_facts(0)
+            .expect("the ignored append retains packed call facts")
+            .substitutions
+            .into_vec()
+            .try_into()
+            .expect("List/append has one type parameter");
+        let result = linked
+            .materialize_expression(2)
+            .expect("the ignored append result remains packed");
+        let Type::List(result_item) = result.ty else {
+            panic!("List/append must produce a list")
+        };
+        assert_eq!(substitution.variable, KernelTypeParameterId(0));
+        assert_eq!(substitution.value, result_item.as_ref().clone());
+        assert_ne!(
+            substitution.value,
+            Type::Number,
+            "the packed substitution must include the appended Text widening",
+        );
     }
 
     #[test]

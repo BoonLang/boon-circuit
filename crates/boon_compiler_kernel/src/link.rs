@@ -2,8 +2,7 @@ use crate::{
     KernelAbiContextualOperation, KernelAbiInput, KernelCallArgumentKind, KernelCallInputRole,
     KernelCallTarget, KernelCheckedSnapshot, KernelDeclarationReference, KernelExternalTarget,
     KernelLexicalBindingTarget, KernelOwnerId, KernelProjectInput, KernelScopeReference,
-    KernelStatementChildReference, KernelStatementReference, KernelTypeParameterId,
-    KernelValueReference, derive_kernel_call_type_substitutions,
+    KernelStatementChildReference, KernelStatementReference, KernelValueReference,
 };
 use boon_checked::{
     CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1, CheckedBlockBinding, CheckedCall,
@@ -3363,7 +3362,10 @@ impl KernelCheckedLinkLayout {
                     owner.0
                 ))
             })?;
-            let mut materializer = code.materializer(&mut type_cache);
+            let mut materializer = code.linked_materializer(
+                &mut type_cache,
+                self.definition(owner)?.type_variables.start,
+            );
             let local_len = definition.expressions.len();
             if code.expressions().len() != local_len
                 || definition.presentation.expressions.len() != local_len
@@ -3483,22 +3485,15 @@ impl KernelCheckedLinkLayout {
                     id,
                     scope_id: self.scope(owner, presentation.scope)?,
                     declaration,
-                    flow_type: self.relocate_flow_type(
-                        owner,
-                        &materializer
-                            .materialize_published_expression(local_ordinal)
-                            .ok_or_else(|| {
-                                KernelCheckedLinkError::new(format!(
-                                    "kernel definition {} has no packed expression flow {}",
-                                    owner.0, local_ordinal
-                                ))
-                            })?,
-                    )?,
-                    flush_type: materializer
-                        .materialize_expression_flush(local_ordinal)
-                        .as_ref()
-                        .map(|ty| relocate_type(self.definition(owner)?.type_variables, ty))
-                        .transpose()?,
+                    flow_type: materializer
+                        .materialize_published_expression(local_ordinal)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition {} has no packed expression flow {}",
+                                owner.0, local_ordinal
+                            ))
+                        })?,
+                    flush_type: materializer.materialize_expression_flush(local_ordinal),
                     effect: CheckedEffectSummary {
                         reads_state: expression.effect.reads_state,
                         writes_state: expression.effect.writes_state,
@@ -3552,7 +3547,10 @@ impl KernelCheckedLinkLayout {
                     owner.0
                 ))
             })?;
-            let mut materializer = code.materializer(&mut type_cache);
+            let mut materializer = code.linked_materializer(
+                &mut type_cache,
+                self.definition(owner)?.type_variables.start,
+            );
             let root_statement = definition.linkage.root_statement.ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
                     "kernel definition {} has no root statement while linking callables",
@@ -3708,17 +3706,14 @@ impl KernelCheckedLinkLayout {
                         crate::KernelParameterKind::Out => CheckedParameterKind::Out,
                     },
                     ordinal: parameter.ordinal as usize,
-                    flow_type: self.relocate_flow_type(
-                        owner,
-                        &materializer
-                            .materialize_formal(parameter.ordinal as usize)
-                            .ok_or_else(|| {
-                                KernelCheckedLinkError::new(format!(
-                                    "kernel definition {} has no packed formal {}",
-                                    owner.0, parameter.ordinal
-                                ))
-                            })?,
-                    )?,
+                    flow_type: materializer
+                        .materialize_formal(parameter.ordinal as usize)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition {} has no packed formal {}",
+                                owner.0, parameter.ordinal
+                            ))
+                        })?,
                     requirement: CheckedParameterRequirement::Required,
                     evaluation_scope,
                     start: presentation.span.start,
@@ -3745,17 +3740,14 @@ impl KernelCheckedLinkLayout {
                             parameters.len(),
                         )));
                     }
-                    let flow_type = self.relocate_flow_type(
-                        owner,
-                        &materializer
-                            .materialize_formal(ordinal as usize)
-                            .ok_or_else(|| {
-                                KernelCheckedLinkError::new(format!(
-                                    "kernel definition {} has no packed context formal {}",
-                                    owner.0, ordinal
-                                ))
-                            })?,
-                    )?;
+                    let flow_type = materializer
+                        .materialize_formal(ordinal as usize)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition {} has no packed context formal {}",
+                                owner.0, ordinal
+                            ))
+                        })?;
                     let projections = boon_checked::context_scheme_projections(&flow_type.ty);
                     context_formals.push(CheckedContextFormal {
                         id,
@@ -3795,7 +3787,7 @@ impl KernelCheckedLinkLayout {
                 parameters: checked_parameters,
                 contexts: Vec::new(),
                 context_formal,
-                result: self.relocate_flow_type(owner, &materializer.materialize_result())?,
+                result: materializer.materialize_result(),
                 role,
                 effect,
                 body: Some(self.statement(owner, KernelStatementReference::Local(root_statement))?),
@@ -4050,7 +4042,8 @@ impl KernelCheckedLinkLayout {
                 ))
             })?;
             let (packed_calls, call_results) = {
-                let mut materializer = code.materializer(&mut type_cache);
+                let mut materializer =
+                    code.linked_materializer(&mut type_cache, local.type_variables.start);
                 let packed_calls = (0..definition.calls.len())
                     .map(|ordinal| {
                         materializer.materialize_call_facts(ordinal).ok_or_else(|| {
@@ -4365,40 +4358,51 @@ impl KernelCheckedLinkLayout {
                     CheckedContextBinding::None
                 };
 
-                let (raw_substitutions, target_variables, target_type_variables, context) =
-                    match call.target {
-                        KernelCallTarget::User { target, .. } => {
-                            let target_definition =
-                                snapshot.definitions.get(target.0 as usize).ok_or_else(|| {
-                                    KernelCheckedLinkError::new(format!(
-                                        "kernel call `{}` references missing target definition {}",
-                                        syntax.function, target.0,
-                                    ))
-                                })?;
-                            let target_code =
-                                snapshot.definition_code.definition(target).ok_or_else(|| {
-                                    KernelCheckedLinkError::new(format!(
-                                        "kernel call `{}` has no packed target definition {}",
-                                        syntax.function, target.0,
-                                    ))
-                                })?;
-                            let mut target_materializer = target_code.materializer(&mut type_cache);
-                            let target_formals = (0..target_code.formals().len())
-                                .map(|ordinal| {
-                                    target_materializer
-                                        .materialize_formal(ordinal)
-                                        .ok_or_else(|| {
-                                            KernelCheckedLinkError::new(format!(
-                                                "kernel callable `{}` has no packed formal {ordinal}",
-                                                syntax.function,
-                                            ))
-                                        })
-                                })
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let target_result = target_materializer.materialize_result();
-                            let variables =
-                                callable_type_parameter_variables(&target_formals, &target_result);
-                            let context = target_definition
+                let (
+                    raw_substitutions,
+                    target_variables,
+                    target_type_variables,
+                    target_variables_are_linked,
+                    context,
+                ) = match call.target {
+                    KernelCallTarget::User { target, .. } => {
+                        let target_definition =
+                            snapshot.definitions.get(target.0 as usize).ok_or_else(|| {
+                                KernelCheckedLinkError::new(format!(
+                                    "kernel call `{}` references missing target definition {}",
+                                    syntax.function, target.0,
+                                ))
+                            })?;
+                        let target_code =
+                            snapshot.definition_code.definition(target).ok_or_else(|| {
+                                KernelCheckedLinkError::new(format!(
+                                    "kernel call `{}` has no packed target definition {}",
+                                    syntax.function, target.0,
+                                ))
+                            })?;
+                        let target_layout = self.definition(target)?;
+                        let mut target_materializer = target_code.linked_materializer(
+                            &mut type_cache,
+                            target_layout.type_variables.start,
+                        );
+                        let target_formals = (0..target_code.formals().len())
+                            .map(|ordinal| {
+                                target_materializer
+                                    .materialize_formal(ordinal)
+                                    .ok_or_else(|| {
+                                        KernelCheckedLinkError::new(format!(
+                                            "kernel callable `{}` has no packed formal {ordinal}",
+                                            syntax.function,
+                                        ))
+                                    })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let target_result = target_materializer.materialize_result();
+                        let variables = callable_type_parameter_variables(
+                            target_formals.iter(),
+                            &target_result,
+                        );
+                        let context = target_definition
                                 .linkage
                                 .context_formal_ordinal
                                 .map(|ordinal| {
@@ -4425,77 +4429,41 @@ impl KernelCheckedLinkLayout {
                                     ))
                                 })
                                 .transpose()?;
-                            (
-                                packed_call.substitutions.into_vec(),
-                                variables,
-                                self.definition(target)?.type_variables,
-                                context,
-                            )
-                        }
-                        KernelCallTarget::RenderConstructor { .. }
-                        | KernelCallTarget::PureBuiltin { .. }
-                        | KernelCallTarget::FixedAbi
-                        | KernelCallTarget::HostEffect { .. }
-                        | KernelCallTarget::FieldProjection { .. } => {
-                            let contract =
-                                project.abi().callable(&syntax.function).ok_or_else(|| {
-                                    KernelCheckedLinkError::new(format!(
-                                        "kernel call `{}` has no immutable ABI contract",
-                                        syntax.function,
-                                    ))
-                                })?;
-                            let actuals = call
-                                .inputs
-                                .iter()
-                                .map(|input| {
-                                    let parameter = parameter_for_input(input)?;
-                                    let (_, actual) = value_flow_authority_cached(
-                                        snapshot,
-                                        owner,
-                                        input.value,
-                                        &mut type_cache,
-                                    )?;
-                                    Ok((parameter.ordinal as u32, actual.ty))
-                                })
-                                .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?;
-                            let formals = contract
-                                .parameters
-                                .iter()
-                                .map(|parameter| parameter.flow_type.clone())
-                                .collect::<Vec<_>>();
-                            let actual_result = matches!(
-                                &call.target,
-                                KernelCallTarget::PureBuiltin {
-                                    kind: crate::KernelPureBuiltinKind::ListAppend
-                                        | crate::KernelPureBuiltinKind::MapUpsert
-                                        | crate::KernelPureBuiltinKind::SetAdd,
-                                }
-                            )
-                            .then(|| {
-                                value_flow_authority_cached(
-                                    snapshot,
-                                    owner,
-                                    KernelValueReference::Local(call.expression),
-                                    &mut type_cache,
-                                )
-                                .map(|(_, result)| result)
-                            })
-                            .transpose()?;
-                            let substitutions = derive_kernel_call_type_substitutions(
-                                &formals,
+                        (
+                            packed_call.substitutions.into_vec(),
+                            variables,
+                            target_layout.type_variables,
+                            true,
+                            context,
+                        )
+                    }
+                    KernelCallTarget::RenderConstructor { .. }
+                    | KernelCallTarget::PureBuiltin { .. }
+                    | KernelCallTarget::FixedAbi
+                    | KernelCallTarget::HostEffect { .. }
+                    | KernelCallTarget::FieldProjection { .. } => {
+                        let contract =
+                            project.abi().callable(&syntax.function).ok_or_else(|| {
+                                KernelCheckedLinkError::new(format!(
+                                    "kernel call `{}` has no immutable ABI contract",
+                                    syntax.function,
+                                ))
+                            })?;
+                        (
+                            packed_call.substitutions.into_vec(),
+                            callable_type_parameter_variables(
+                                contract
+                                    .parameters
+                                    .iter()
+                                    .map(|parameter| &parameter.flow_type),
                                 &contract.result,
-                                &actuals,
-                                actual_result.as_ref().map(|result| &result.ty),
-                            )
-                            .into_vec();
-                            (
-                                substitutions,
-                                callable_type_parameter_variables(&formals, &contract.result),
-                                self.abi_callable(&syntax.function)?.type_variables,
-                                None,
-                            )
-                        }
-                    };
+                            ),
+                            self.abi_callable(&syntax.function)?.type_variables,
+                            false,
+                            None,
+                        )
+                    }
+                };
                 let mut type_substitutions = Vec::with_capacity(raw_substitutions.len());
                 let mut contextual_substitutions = Vec::new();
                 for substitution in raw_substitutions {
@@ -4508,26 +4476,27 @@ impl KernelCheckedLinkLayout {
                                 syntax.function, substitution.variable.0,
                             ))
                         })?;
-                    let variable = TypeVar(
-                        target_type_variables
-                            .resolve(raw_variable.0, "call target type variable")?,
-                    );
-                    let value = relocate_type(local.type_variables, &substitution.value)?;
-                    type_substitutions.push(CheckedTypeSubstitution {
-                        variable,
-                        value: value.clone(),
-                    });
+                    let variable = if target_variables_are_linked {
+                        raw_variable
+                    } else {
+                        TypeVar(
+                            target_type_variables
+                                .resolve(raw_variable.0, "call target type variable")?,
+                        )
+                    };
+                    let value = substitution.value;
                     if let Some((formal, context_variables)) = &context
                         && context_variables.contains(&raw_variable)
                     {
                         contextual_substitutions.push(CheckedContextTypeSubstitution {
                             formal: *formal,
                             variable,
-                            value,
+                            value: value.clone(),
                         });
                     }
+                    type_substitutions.push(CheckedTypeSubstitution { variable, value });
                 }
-                let result = self.relocate_flow_type(owner, &call_result)?;
+                let result = call_result;
                 let syntax_discriminated_result = packed_call.syntax_discriminated_result;
                 let presentation = expression_presentation(definition, call.expression)?;
                 let id = self.call(
@@ -4597,7 +4566,10 @@ impl KernelCheckedLinkLayout {
                     owner.0
                 ))
             })?;
-            let mut materializer = code.materializer(&mut type_cache);
+            let mut materializer = code.linked_materializer(
+                &mut type_cache,
+                self.definition(owner)?.type_variables.start,
+            );
             for (ordinal, source) in definition.sources.iter().enumerate() {
                 let id = self.source(owner, source.id.0)?;
                 if id.0 as usize != sources.len() {
@@ -4617,17 +4589,14 @@ impl KernelCheckedLinkLayout {
                     owner_scope: self.scope(owner, presentation.scope)?,
                     path: self.semantic_path(owner, &source.path)?,
                     interval_ms: source.interval_ms,
-                    payload_type: relocate_type(
-                        self.definition(owner)?.type_variables,
-                        &materializer
-                            .materialize_source_payload_type(ordinal)
-                            .ok_or_else(|| {
-                                KernelCheckedLinkError::new(format!(
-                                    "kernel definition {} has no packed SOURCE payload {}",
-                                    owner.0, ordinal
-                                ))
-                            })?,
-                    )?,
+                    payload_type: materializer
+                        .materialize_source_payload_type(ordinal)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition {} has no packed SOURCE payload {}",
+                                owner.0, ordinal
+                            ))
+                        })?,
                     span: checked_span(presentation.span),
                 });
             }
@@ -4653,7 +4622,10 @@ impl KernelCheckedLinkLayout {
                     owner.0
                 ))
             })?;
-            let mut materializer = code.materializer(&mut type_cache);
+            let mut materializer = code.linked_materializer(
+                &mut type_cache,
+                self.definition(owner)?.type_variables.start,
+            );
             for (ordinal, state) in definition.states.iter().enumerate() {
                 let id = self.state(owner, state.id.0)?;
                 if id.0 as usize != states.len() {
@@ -4693,17 +4665,14 @@ impl KernelCheckedLinkLayout {
                     owner_scope,
                     path: self.semantic_path(owner, &state.path)?,
                     kind: state.kind,
-                    flow_type: self.relocate_flow_type(
-                        owner,
-                        &materializer
-                            .materialize_state_flow(ordinal)
-                            .ok_or_else(|| {
-                                KernelCheckedLinkError::new(format!(
-                                    "kernel definition {} has no packed state flow {}",
-                                    owner.0, ordinal
-                                ))
-                            })?,
-                    )?,
+                    flow_type: materializer
+                        .materialize_state_flow(ordinal)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition {} has no packed state flow {}",
+                                owner.0, ordinal
+                            ))
+                        })?,
                     span,
                 });
             }
@@ -4729,7 +4698,10 @@ impl KernelCheckedLinkLayout {
                     owner.0
                 ))
             })?;
-            let mut materializer = code.materializer(&mut type_cache);
+            let mut materializer = code.linked_materializer(
+                &mut type_cache,
+                self.definition(owner)?.type_variables.start,
+            );
             for (ordinal, list) in definition.lists.iter().enumerate() {
                 let id = self.list(owner, list.id.0)?;
                 if id.0 as usize != lists.len() {
@@ -4747,17 +4719,14 @@ impl KernelCheckedLinkLayout {
                     producer: self.expression(owner, KernelValueReference::Local(list.producer))?,
                     owner_scope: self.scope(owner, presentation.scope)?,
                     path: self.semantic_path(owner, &list.path)?,
-                    item_type: relocate_type(
-                        self.definition(owner)?.type_variables,
-                        &materializer
-                            .materialize_list_item_type(ordinal)
-                            .ok_or_else(|| {
-                                KernelCheckedLinkError::new(format!(
-                                    "kernel definition {} has no packed LIST item {}",
-                                    owner.0, ordinal
-                                ))
-                            })?,
-                    )?,
+                    item_type: materializer
+                        .materialize_list_item_type(ordinal)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition {} has no packed LIST item {}",
+                                owner.0, ordinal
+                            ))
+                        })?,
                     capacity: list.capacity,
                     key_policy: list.key_policy,
                     span: checked_span(presentation.span),
@@ -4856,21 +4825,6 @@ impl KernelCheckedLinkLayout {
                     .resolve(declaration.0, "external declaration")?,
             )),
         }
-    }
-
-    /// Relocate one definition-local alpha-normalized flow into the global
-    /// checked type-variable namespace. This same mapping is reused by every
-    /// direct row family, so declarations and their later expression/call
-    /// consumers cannot accidentally diverge.
-    pub fn relocate_flow_type(
-        &self,
-        owner: KernelOwnerId,
-        flow_type: &FlowType,
-    ) -> Result<FlowType, KernelCheckedLinkError> {
-        Ok(FlowType {
-            mode: flow_type.mode,
-            ty: relocate_type(self.definition(owner)?.type_variables, &flow_type.ty)?,
-        })
     }
 
     pub fn statement(
@@ -6506,9 +6460,10 @@ fn declaration_flow_type(
             owner.0
         ))
     })?;
-    let mut materializer = code.materializer(cache);
+    let mut materializer =
+        code.linked_materializer(cache, layout.definition(owner)?.type_variables.start);
     if let Some(flow_type) = materializer.materialize_declaration_flow(declaration.id.0 as usize) {
-        return layout.relocate_flow_type(owner, &flow_type);
+        return Ok(flow_type);
     }
     if declaration.kind == crate::KernelDeclarationKind::Function {
         if definition.linkage.public_declaration
@@ -6546,29 +6501,24 @@ fn declaration_flow_type(
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        return layout.relocate_flow_type(
-            owner,
-            &FlowType {
-                mode: FlowMode::Continuous,
-                ty: Type::Function {
-                    args: arguments,
-                    result: Box::new(materializer.materialize_result()),
-                },
+        return Ok(FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::Function {
+                args: arguments,
+                result: Box::new(materializer.materialize_result()),
             },
-        );
+        });
     }
     if definition.linkage.public_declaration
         == Some(KernelDeclarationReference::Local(declaration.id))
     {
-        return layout.relocate_flow_type(owner, &materializer.materialize_result());
+        return Ok(materializer.materialize_result());
     }
     drop(materializer);
     match declaration.origin {
         crate::KernelDeclarationOrigin::Parameter { ordinal, .. } => code
-            .materializer(cache)
+            .linked_materializer(cache, layout.definition(owner)?.type_variables.start)
             .materialize_formal(ordinal as usize)
-            .map(|formal| layout.relocate_flow_type(owner, &formal))
-            .transpose()?
             .ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
                     "kernel definition {} parameter declaration {} has no solved formal {ordinal}",
@@ -6683,11 +6633,9 @@ fn fresh_out_flow_type(
         .definition_code
         .definition(owner)
         .ok_or_else(|| KernelCheckedLinkError::new("FreshOut packed definition is missing"))?;
-    let flow = code
-        .materializer(cache)
+    code.linked_materializer(cache, layout.definition(owner)?.type_variables.start)
         .materialize_expression(provider.0 as usize)
-        .ok_or_else(|| KernelCheckedLinkError::new("FreshOut packed flow is missing"))?;
-    layout.relocate_flow_type(owner, &flow)
+        .ok_or_else(|| KernelCheckedLinkError::new("FreshOut packed flow is missing"))
 }
 
 fn pattern_binding_flow_type(
@@ -6735,7 +6683,7 @@ fn pattern_binding_flow_type(
             owner.0, arm.0,
         )));
     }
-    let (selector_owner, selector) = value_flow_authority_cached(snapshot, owner, selector, cache)?;
+    let (_, selector) = value_flow_authority_cached(layout, snapshot, owner, selector, cache)?;
     let ty = match pattern {
         crate::KernelPattern::Binding { name } if name.as_ref() == declaration_name => {
             selector.ty.clone()
@@ -6768,13 +6716,10 @@ fn pattern_binding_flow_type(
         | crate::KernelPattern::Binding { .. }
         | crate::KernelPattern::Invalid => Type::Unknown,
     };
-    layout.relocate_flow_type(
-        selector_owner,
-        &FlowType {
-            mode: FlowMode::Continuous,
-            ty,
-        },
-    )
+    Ok(FlowType {
+        mode: FlowMode::Continuous,
+        ty,
+    })
 }
 
 fn relocated_value_flow_type(
@@ -6784,11 +6729,11 @@ fn relocated_value_flow_type(
     value: KernelValueReference,
     cache: &mut crate::DefinitionTypeMaterializationCache,
 ) -> Result<FlowType, KernelCheckedLinkError> {
-    let (authority, flow_type) = value_flow_authority_cached(snapshot, owner, value, cache)?;
-    layout.relocate_flow_type(authority, &flow_type)
+    value_flow_authority_cached(layout, snapshot, owner, value, cache).map(|(_, flow)| flow)
 }
 
 fn value_flow_authority_cached(
+    layout: &KernelCheckedLinkLayout,
     snapshot: &KernelCheckedSnapshot,
     owner: KernelOwnerId,
     value: KernelValueReference,
@@ -6810,7 +6755,8 @@ fn value_flow_authority_cached(
                 authority.0,
             ))
         })?;
-    let mut materializer = code.materializer(cache);
+    let mut materializer =
+        code.linked_materializer(cache, layout.definition(authority)?.type_variables.start);
     let flow = match expression {
         Some(expression) => materializer
             .materialize_expression(expression.0 as usize)
@@ -6825,30 +6771,26 @@ fn value_flow_authority_cached(
     Ok((authority, flow))
 }
 
-fn callable_type_parameter_variables(formals: &[FlowType], result: &FlowType) -> Vec<TypeVar> {
-    let mut parameters = BTreeMap::new();
+fn callable_type_parameter_variables<'a>(
+    formals: impl IntoIterator<Item = &'a FlowType>,
+    result: &FlowType,
+) -> Vec<TypeVar> {
+    let mut parameters = Vec::new();
     for formal in formals {
         collect_callable_type_parameter_variables(&formal.ty, &mut parameters);
     }
     collect_callable_type_parameter_variables(&result.ty, &mut parameters);
-    let mut variables = vec![TypeVar(u32::MAX); parameters.len()];
-    for (variable, parameter) in parameters {
-        variables[parameter.0 as usize] = variable;
-    }
-    variables
+    parameters
 }
 
-fn collect_callable_type_parameter_variables(
-    ty: &Type,
-    parameters: &mut BTreeMap<TypeVar, KernelTypeParameterId>,
-) {
+fn collect_callable_type_parameter_variables(ty: &Type, parameters: &mut Vec<TypeVar>) {
     match ty {
         Type::Var(variable) => {
-            let next = KernelTypeParameterId(
+            if !parameters.contains(variable) {
                 u32::try_from(parameters.len())
-                    .expect("kernel checked callable type-parameter count exceeds u32"),
-            );
-            parameters.entry(*variable).or_insert(next);
+                    .expect("kernel checked callable type-parameter count exceeds u32");
+                parameters.push(*variable);
+            }
         }
         Type::Object(shape) => {
             for field in shape.ordered_fields().into_iter().map(|(_, field)| field) {

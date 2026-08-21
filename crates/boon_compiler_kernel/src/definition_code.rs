@@ -561,27 +561,45 @@ impl<'a> DefinitionCodeRef<'a> {
             .map(|flow| flow.stable_digest)
     }
 
-    pub(crate) fn materializer<'cache>(
+    /// Create one compatibility materializer whose alpha variables already use
+    /// their final linked namespace.
+    ///
+    /// The old linker first materialized every recursive type with variables
+    /// numbered from zero and then recursively cloned any variable-bearing
+    /// object merely to add the definition's global base. Supplying that base
+    /// here makes the compatibility alpha-normalization map directly into the
+    /// final namespace, so the linker does not clone the type a second time.
+    /// Closed terms continue to share the project-wide export cache.
+    pub(crate) fn linked_materializer<'cache>(
         self,
         cache: &'cache mut DefinitionTypeMaterializationCache,
+        alpha_start: u32,
     ) -> DefinitionCodeMaterializer<'a, 'cache> {
         let mut variables = BTreeMap::new();
         for (ordinal, source) in self.alpha_variables().iter().copied().enumerate() {
+            let ordinal =
+                u32::try_from(ordinal).expect("sealed definition alpha-variable count exceeds u32");
             variables.insert(
                 TypeVar(source.0),
                 TypeVar(
-                    u32::try_from(ordinal)
-                        .expect("sealed definition alpha-variable count exceeds u32"),
+                    alpha_start
+                        .checked_add(ordinal)
+                        .expect("linked definition alpha-variable namespace overflows u32"),
                 ),
             );
         }
-        let next = u32::try_from(variables.len())
-            .expect("sealed definition alpha-variable count exceeds u32");
+        let next = alpha_start
+            .checked_add(
+                u32::try_from(variables.len())
+                    .expect("sealed definition alpha-variable count exceeds u32"),
+            )
+            .expect("linked definition alpha-variable namespace overflows u32");
         DefinitionCodeMaterializer {
             code: self,
             cache,
             variables,
             next,
+            alpha_end: next,
         }
     }
 
@@ -804,6 +822,7 @@ pub(crate) struct DefinitionCodeMaterializer<'code, 'cache> {
     cache: &'cache mut DefinitionTypeMaterializationCache,
     variables: BTreeMap<TypeVar, TypeVar>,
     next: u32,
+    alpha_end: u32,
 }
 
 impl DefinitionCodeMaterializer<'_, '_> {
@@ -957,8 +976,7 @@ impl DefinitionCodeMaterializer<'_, '_> {
         )
         .ty;
         assert_eq!(
-            self.next as usize,
-            self.code.alpha_variables().len(),
+            self.next, self.alpha_end,
             "sealed definition-code alpha map omitted a materialized variable"
         );
         normalized
@@ -1493,6 +1511,23 @@ mod tests {
             Some(FlowType {
                 mode: FlowMode::TickPresent,
                 ty: Type::Var(TypeVar(1)),
+            })
+        );
+
+        let mut cache = store.materialization_cache();
+        let mut linked = definition.linked_materializer(&mut cache, 17);
+        assert_eq!(
+            linked.materialize_declaration_flow(0),
+            Some(FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Var(TypeVar(17)),
+            })
+        );
+        assert_eq!(
+            linked.materialize_state_flow(0),
+            Some(FlowType {
+                mode: FlowMode::TickPresent,
+                ty: Type::Var(TypeVar(18)),
             })
         );
     }

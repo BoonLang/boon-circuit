@@ -1,13 +1,63 @@
 use boon_checked::{BytesType, FlowMode, FlowType, ObjectShape, Type, TypeVar, Variant};
+#[cfg(test)]
+use boon_contract::PackedTextCatalogBuilder;
+use boon_contract::{ProjectTextSnapshot, SymbolId};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+static NEXT_TYPE_STORE_AUTHORITY: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TypeStoreAuthorityId(u64);
+
+impl TypeStoreAuthorityId {
+    fn fresh() -> Self {
+        let authority = NEXT_TYPE_STORE_AUTHORITY.fetch_add(1, AtomicOrdering::Relaxed);
+        assert_ne!(
+            authority, 0,
+            "kernel type-store authority namespace exhausted"
+        );
+        Self(authority)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct NameId(pub u32);
+pub struct DiagnosticTextId(u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TypeTermId(pub u32);
+
+/// One type coordinate qualified by the exact project store that owns it.
+///
+/// The authority is process-local and deliberately has no serialization or
+/// stable-hash contract. Persistent identities use canonical type digests;
+/// this reference exists only to prevent an in-range term from a different
+/// revision/store being interpreted accidentally.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct KernelTypeRef {
+    authority: TypeStoreAuthorityId,
+    term: TypeTermId,
+}
+
+/// Compact flow type used by kernel rows. Rich checked `FlowType` values are
+/// projected only at an explicit compatibility/editor boundary.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct KernelFlowRef {
+    mode: FlowMode,
+    ty: KernelTypeRef,
+}
+
+impl KernelFlowRef {
+    pub const fn mode(self) -> FlowMode {
+        self.mode
+    }
+
+    pub(crate) const fn term(self) -> TypeTermId {
+        self.ty.term
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TypeVariableId(pub u32);
@@ -20,18 +70,18 @@ pub enum BytesTerm {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ObjectFieldTerm {
-    pub name: NameId,
+    pub name: SymbolId,
     pub ty: TypeTermId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum VariantTerm {
-    Tag(NameId),
-    Tagged { tag: NameId, fields: TypeTermId },
+    Tag(SymbolId),
+    Tagged { tag: SymbolId, fields: TypeTermId },
 }
 
 impl VariantTerm {
-    pub const fn tag(&self) -> NameId {
+    pub const fn tag(&self) -> SymbolId {
         match self {
             Self::Tag(tag) | Self::Tagged { tag, .. } => *tag,
         }
@@ -63,7 +113,7 @@ pub enum TypeTerm<'a> {
         result_mode: FlowMode,
         result: TypeTermId,
     },
-    UnresolvedShape(NameId),
+    UnresolvedShape(DiagnosticTextId),
     Variable(TypeVariableId),
     Unknown,
     Union(&'a [TypeTermId]),
@@ -233,7 +283,7 @@ struct ObjectShapeTermRow {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NameRow {
+struct DiagnosticTextRow {
     bytes: TermSpan,
     fingerprint: u64,
 }
@@ -257,7 +307,7 @@ pub(crate) enum TypeTermHead {
         result_mode: FlowMode,
         result: TypeTermId,
     },
-    UnresolvedShape(NameId),
+    UnresolvedShape(DiagnosticTextId),
     Variable(TypeVariableId),
     Unknown,
     Union(TermSpan),
@@ -273,11 +323,13 @@ pub(crate) enum TypeTermHead {
 ///
 /// Hash maps are lookup-only. Canonical output order is derived from the
 /// interned terms and source field order, never from hash-table iteration.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TypeTermArena {
-    name_bytes: Vec<u8>,
-    names: Vec<NameRow>,
-    name_slots: Vec<u32>,
+    authority: TypeStoreAuthorityId,
+    text_catalog: ProjectTextSnapshot,
+    diagnostic_text_bytes: Vec<u8>,
+    diagnostic_texts: Vec<DiagnosticTextRow>,
+    diagnostic_text_slots: Vec<u32>,
     headers: Vec<TypeTermHeader>,
     children: Vec<TypeTermId>,
     variants: Vec<VariantTerm>,
@@ -302,8 +354,8 @@ pub struct TypeTermArena {
 ///
 /// Construction-only interning tables, variable lookup rows, and structural
 /// widening caches are dropped when this store is created. All snapshots from
-/// one solved project share the remaining columns through one `Arc`. `NameId`
-/// remains local to this store; it is not the planned cross-phase `SymbolId`.
+/// one solved project share the remaining columns through one `Arc`. Symbol
+/// IDs resolve through the exact project text snapshot retained here.
 /// The store deliberately cannot be deep-cloned.
 #[derive(Debug)]
 pub struct FrozenTypeStore(TypeTermArena);
@@ -348,13 +400,29 @@ impl FrozenTypeStore {
         self.0.frozen_layout()
     }
 
+    /// Materialize a rich checked type only when the reference belongs to
+    /// this exact frozen store. Foreign revision/store references fail closed
+    /// even when their raw dense coordinates happen to be in range.
+    pub fn materialize_type(&self, reference: KernelTypeRef) -> Option<Type> {
+        self.0
+            .accepts(reference)
+            .then(|| self.0.export_checked_type(reference.term))
+    }
+
+    pub fn materialize_flow(&self, flow: KernelFlowRef) -> Option<FlowType> {
+        Some(FlowType {
+            mode: flow.mode,
+            ty: self.materialize_type(flow.ty)?,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn term(&self, id: TypeTermId) -> TypeTerm<'_> {
         self.0.term(id)
     }
 
     #[cfg(test)]
-    pub(crate) fn name(&self, id: NameId) -> &str {
+    pub(crate) fn name(&self, id: SymbolId) -> &str {
         self.0.name(id)
     }
 
@@ -369,7 +437,7 @@ impl FrozenTypeStore {
 
     #[cfg(test)]
     pub(crate) fn construction_storage_entries(&self) -> usize {
-        self.0.name_slots.len()
+        self.0.diagnostic_text_slots.len()
             + self.0.term_fingerprints.len()
             + self.0.term_slots.len()
             + self.0.variable_terms.len()
@@ -381,12 +449,13 @@ impl PartialEq for FrozenTypeStore {
     fn eq(&self, other: &Self) -> bool {
         let left = &self.0;
         let right = &other.0;
-        left.name_bytes == right.name_bytes
-            && left.names.len() == right.names.len()
+        left.text_catalog.same_authority(&right.text_catalog)
+            && left.diagnostic_text_bytes == right.diagnostic_text_bytes
+            && left.diagnostic_texts.len() == right.diagnostic_texts.len()
             && left
-                .names
+                .diagnostic_texts
                 .iter()
-                .zip(&right.names)
+                .zip(&right.diagnostic_texts)
                 .all(|(left, right)| left.bytes == right.bytes)
             && left.headers == right.headers
             && left.children == right.children
@@ -416,23 +485,73 @@ pub(crate) struct TypeTermArenaWork {
     pub structural_widen_hits: u64,
 }
 
-impl Default for TypeTermArena {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl TypeTermArena {
-    pub fn new() -> Self {
-        Self::with_lookup_fingerprint_mask(u64::MAX)
+    pub fn with_text(text_catalog: ProjectTextSnapshot) -> Self {
+        Self::with_lookup_fingerprint_mask(text_catalog, u64::MAX)
     }
 
-    fn with_lookup_fingerprint_mask(lookup_fingerprint_mask: u64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self::for_test_symbols([
+            "value",
+            "alpha",
+            "beta",
+            "missing",
+            "Pair",
+            "z",
+            "a",
+            "Zulu",
+            "Alpha",
+            "Item",
+            "Header",
+            "Empty",
+            "Label",
+            "NoElement",
+            "Row",
+            "Stack",
+            "name",
+            "kind",
+            "label",
+            "Opened",
+            "Cancelled",
+            "size",
+            "NotStarted",
+            "Idle",
+            "Ready",
+            "unused",
+        ])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_symbols<'a>(symbols: impl IntoIterator<Item = &'a str>) -> Self {
+        Self::for_test_symbols_with_lookup_mask(symbols, u64::MAX)
+    }
+
+    #[cfg(test)]
+    fn for_test_symbols_with_lookup_mask<'a>(
+        symbols: impl IntoIterator<Item = &'a str>,
+        lookup_fingerprint_mask: u64,
+    ) -> Self {
+        let mut builder = PackedTextCatalogBuilder::new();
+        for symbol in symbols {
+            builder
+                .intern_symbol(symbol)
+                .expect("test symbol catalog fits the packed namespace");
+        }
+        Self::with_lookup_fingerprint_mask(builder.freeze(), lookup_fingerprint_mask)
+    }
+
+    fn with_lookup_fingerprint_mask(
+        text_catalog: ProjectTextSnapshot,
+        lookup_fingerprint_mask: u64,
+    ) -> Self {
         let placeholder = TypeTermId(0);
         let mut arena = Self {
-            name_bytes: Vec::new(),
-            names: Vec::new(),
-            name_slots: vec![0; 8],
+            authority: TypeStoreAuthorityId::fresh(),
+            text_catalog,
+            diagnostic_text_bytes: Vec::new(),
+            diagnostic_texts: Vec::new(),
+            diagnostic_text_slots: vec![0; 8],
             headers: Vec::new(),
             children: Vec::new(),
             variants: Vec::new(),
@@ -466,8 +585,26 @@ impl TypeTermArena {
         self.headers.len()
     }
 
-    pub(crate) fn name_count(&self) -> usize {
-        self.names.len()
+    pub(crate) fn text_snapshot(&self) -> &ProjectTextSnapshot {
+        &self.text_catalog
+    }
+
+    pub(crate) const fn type_ref(&self, term: TypeTermId) -> KernelTypeRef {
+        KernelTypeRef {
+            authority: self.authority,
+            term,
+        }
+    }
+
+    pub(crate) const fn flow_ref(&self, term: TypeTermId, mode: FlowMode) -> KernelFlowRef {
+        KernelFlowRef {
+            mode,
+            ty: self.type_ref(term),
+        }
+    }
+
+    fn accepts(&self, reference: KernelTypeRef) -> bool {
+        reference.authority == self.authority && (reference.term.0 as usize) < self.headers.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -507,17 +644,23 @@ impl TypeTermArena {
     }
 
     fn frozen_layout(&self) -> FrozenTypeStoreLayout {
+        let symbol_rows = self.text_catalog.symbol_count();
+        let symbol_bytes = self.text_catalog.byte_len();
         let payload_len_bytes = column_bytes::<TypeTermHeader>(self.headers.len())
-            + column_bytes::<NameRow>(self.names.len())
-            + column_bytes::<u8>(self.name_bytes.len())
+            + column_bytes::<u64>(symbol_rows)
+            + column_bytes::<u8>(symbol_bytes)
+            + column_bytes::<DiagnosticTextRow>(self.diagnostic_texts.len())
+            + column_bytes::<u8>(self.diagnostic_text_bytes.len())
             + column_bytes::<TypeTermId>(self.children.len())
             + column_bytes::<VariantTerm>(self.variants.len())
             + column_bytes::<ObjectShapeTermRow>(self.object_shapes.len())
             + column_bytes::<ObjectFieldTerm>(self.object_fields.len())
             + column_bytes::<u32>(self.semantic_field_order.len());
         let payload_capacity_bytes = column_bytes::<TypeTermHeader>(self.headers.capacity())
-            + column_bytes::<NameRow>(self.names.capacity())
-            + column_bytes::<u8>(self.name_bytes.capacity())
+            + column_bytes::<u64>(symbol_rows)
+            + column_bytes::<u8>(symbol_bytes)
+            + column_bytes::<DiagnosticTextRow>(self.diagnostic_texts.capacity())
+            + column_bytes::<u8>(self.diagnostic_text_bytes.capacity())
             + column_bytes::<TypeTermId>(self.children.capacity())
             + column_bytes::<VariantTerm>(self.variants.capacity())
             + column_bytes::<ObjectShapeTermRow>(self.object_shapes.capacity())
@@ -526,10 +669,10 @@ impl TypeTermArena {
         FrozenTypeStoreLayout {
             term_rows: count_u64(self.headers.len()),
             term_capacity: count_u64(self.headers.capacity()),
-            name_rows: count_u64(self.names.len()),
-            name_capacity: count_u64(self.names.capacity()),
-            name_bytes: count_u64(self.name_bytes.len()),
-            name_byte_capacity: count_u64(self.name_bytes.capacity()),
+            name_rows: count_u64(symbol_rows),
+            name_capacity: count_u64(symbol_rows),
+            name_bytes: count_u64(symbol_bytes),
+            name_byte_capacity: count_u64(symbol_bytes),
             child_rows: count_u64(self.children.len()),
             child_capacity: count_u64(self.children.capacity()),
             variant_rows: count_u64(self.variants.len()),
@@ -548,7 +691,7 @@ impl TypeTermArena {
     /// Consume the mutable solver arena and retain only columns required to
     /// interpret packed type and symbol IDs.
     pub(crate) fn freeze(mut self) -> FrozenTypeStore {
-        self.name_slots = Vec::new();
+        self.diagnostic_text_slots = Vec::new();
         self.term_fingerprints = Vec::new();
         self.term_slots = Vec::new();
         self.variable_terms = Vec::new();
@@ -617,7 +760,7 @@ impl TypeTermArena {
                 result: TypeTermId(header.payload as u32),
             },
             TypeTermTag::UnresolvedShape => {
-                TypeTermHead::UnresolvedShape(NameId(header.payload as u32))
+                TypeTermHead::UnresolvedShape(DiagnosticTextId(header.payload as u32))
             }
             TypeTermTag::Variable => TypeTermHead::Variable(TypeVariableId(header.payload as u32)),
             TypeTermTag::Unknown => TypeTermHead::Unknown,
@@ -647,7 +790,7 @@ impl TypeTermArena {
         }
     }
 
-    pub(crate) fn lookup_object_field(&self, shape: u32, name: NameId) -> Option<TypeTermId> {
+    pub(crate) fn lookup_object_field(&self, shape: u32, name: SymbolId) -> Option<TypeTermId> {
         let shape = self.object_shapes[shape as usize];
         let fields = &self.object_fields[shape.canonical_fields.range()];
         fields
@@ -662,28 +805,49 @@ impl TypeTermArena {
         self.headers[id.0 as usize].has_variable()
     }
 
-    pub fn name(&self, id: NameId) -> &str {
-        let row = self.names[id.0 as usize];
-        std::str::from_utf8(&self.name_bytes[row.bytes.range()])
-            .expect("kernel names were interned from valid UTF-8")
+    pub fn name(&self, id: SymbolId) -> &str {
+        self.text_catalog
+            .symbol(id)
+            .expect("kernel symbol belongs to the retained text authority")
     }
 
-    pub fn intern_name(&mut self, name: impl AsRef<str>) -> NameId {
+    pub fn intern_name(&self, name: impl AsRef<str>) -> SymbolId {
         let name = name.as_ref();
+        self.text_catalog.lookup_symbol(name).unwrap_or_else(|| {
+            panic!("kernel symbol `{name}` was not declared before the text authority froze")
+        })
+    }
+
+    fn intern_diagnostic_text(&mut self, text: &str) -> DiagnosticTextId {
+        let name = text;
         let hash = lookup_hash(name) & self.lookup_fingerprint_mask;
-        if let Some(id) = self.find_name(hash, name.as_bytes()) {
+        if let Some(id) = self.find_diagnostic_text(hash, name.as_bytes()) {
             return id;
         }
-        let id = NameId(u32::try_from(self.names.len()).expect("kernel name count exceeds u32"));
-        self.ensure_name_slot_capacity();
-        let bytes = TermSpan::new(self.name_bytes.len(), name.len(), "name byte span");
-        self.name_bytes.extend_from_slice(name.as_bytes());
-        self.names.push(NameRow {
+        let id = DiagnosticTextId(
+            u32::try_from(self.diagnostic_texts.len())
+                .expect("kernel diagnostic text count exceeds u32"),
+        );
+        self.ensure_diagnostic_text_slot_capacity();
+        let bytes = TermSpan::new(
+            self.diagnostic_text_bytes.len(),
+            name.len(),
+            "diagnostic text byte span",
+        );
+        self.diagnostic_text_bytes
+            .extend_from_slice(name.as_bytes());
+        self.diagnostic_texts.push(DiagnosticTextRow {
             bytes,
             fingerprint: hash,
         });
-        self.insert_name_slot(id, hash);
+        self.insert_diagnostic_text_slot(id, hash);
         id
+    }
+
+    pub(crate) fn diagnostic_text(&self, id: DiagnosticTextId) -> &str {
+        let row = self.diagnostic_texts[id.0 as usize];
+        std::str::from_utf8(&self.diagnostic_text_bytes[row.bytes.range()])
+            .expect("kernel diagnostic text was interned from valid UTF-8")
     }
 
     pub fn variable(&mut self, variable: TypeVariableId) -> TypeTermId {
@@ -708,7 +872,7 @@ impl TypeTermArena {
     }
 
     pub fn unresolved_shape(&mut self, reason: impl AsRef<str>) -> TypeTermId {
-        let reason = self.intern_name(reason);
+        let reason = self.intern_diagnostic_text(reason.as_ref());
         self.intern_raw(TypeTerm::UnresolvedShape(reason))
     }
 
@@ -740,7 +904,7 @@ impl TypeTermArena {
 
     pub fn object(
         &mut self,
-        fields: impl IntoIterator<Item = (NameId, TypeTermId)>,
+        fields: impl IntoIterator<Item = (SymbolId, TypeTermId)>,
         open: bool,
     ) -> TypeTermId {
         let mut ordered = Vec::<ObjectFieldTerm>::new();
@@ -1083,16 +1247,14 @@ impl TypeTermArena {
         term: TypeTermId,
         variables: &[TypeVariableId],
         term_cache: &mut [Option<TypeTermId>],
-        name_cache: &mut [Option<NameId>],
     ) -> TypeTermId {
+        assert!(
+            self.text_catalog.same_authority(&source.text_catalog),
+            "residual type modules must share one text authority"
+        );
         if let Some(imported) = term_cache[term.0 as usize] {
             return imported;
         }
-        let import_name =
-            |target: &mut TypeTermArena, name: NameId, cache: &mut [Option<NameId>]| {
-                let slot = &mut cache[name.0 as usize];
-                *slot.get_or_insert_with(|| target.intern_name(source.name(name)))
-            };
         let imported = match source.term(term) {
             TypeTerm::Text => self.text(),
             TypeTerm::Number => self.number(),
@@ -1103,14 +1265,10 @@ impl TypeTermArena {
                     .to_vec()
                     .into_iter()
                     .map(|variant| match variant {
-                        VariantTerm::Tag(tag) => {
-                            VariantTerm::Tag(import_name(self, tag, name_cache))
-                        }
+                        VariantTerm::Tag(tag) => VariantTerm::Tag(tag),
                         VariantTerm::Tagged { tag, fields } => VariantTerm::Tagged {
-                            tag: import_name(self, tag, name_cache),
-                            fields: self.import_rebased_term(
-                                source, fields, variables, term_cache, name_cache,
-                            ),
+                            tag,
+                            fields: self.import_rebased_term(source, fields, variables, term_cache),
                         },
                     })
                     .collect::<Vec<_>>();
@@ -1122,10 +1280,8 @@ impl TypeTermArena {
                     .into_iter()
                     .map(|field| {
                         (
-                            import_name(self, field.name, name_cache),
-                            self.import_rebased_term(
-                                source, field.ty, variables, term_cache, name_cache,
-                            ),
+                            field.name,
+                            self.import_rebased_term(source, field.ty, variables, term_cache),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -1134,8 +1290,7 @@ impl TypeTermArena {
             TypeTerm::OpenObjectPlaceholder => self.open_object(),
             TypeTerm::RenderContract => self.render_contract(),
             TypeTerm::List(item) => {
-                let item =
-                    self.import_rebased_term(source, item, variables, term_cache, name_cache);
+                let item = self.import_rebased_term(source, item, variables, term_cache);
                 self.list(item)
             }
             TypeTerm::Function {
@@ -1146,17 +1301,14 @@ impl TypeTermArena {
                 let args = args
                     .iter()
                     .map(|argument| {
-                        self.import_rebased_term(
-                            source, *argument, variables, term_cache, name_cache,
-                        )
+                        self.import_rebased_term(source, *argument, variables, term_cache)
                     })
                     .collect::<Vec<_>>();
-                let result =
-                    self.import_rebased_term(source, result, variables, term_cache, name_cache);
+                let result = self.import_rebased_term(source, result, variables, term_cache);
                 self.function(args, result_mode, result)
             }
             TypeTerm::UnresolvedShape(reason) => {
-                let reason = source.name(reason).to_owned();
+                let reason = source.diagnostic_text(reason).to_owned();
                 self.unresolved_shape(reason)
             }
             TypeTerm::Variable(variable) => self.variable(
@@ -1168,21 +1320,17 @@ impl TypeTermArena {
             TypeTerm::Union(members) => {
                 let members = members
                     .iter()
-                    .map(|member| {
-                        self.import_rebased_term(source, *member, variables, term_cache, name_cache)
-                    })
+                    .map(|member| self.import_rebased_term(source, *member, variables, term_cache))
                     .collect::<Vec<_>>();
                 self.union(members)
             }
             TypeTerm::Map { key, value } => {
-                let key = self.import_rebased_term(source, key, variables, term_cache, name_cache);
-                let value =
-                    self.import_rebased_term(source, value, variables, term_cache, name_cache);
+                let key = self.import_rebased_term(source, key, variables, term_cache);
+                let value = self.import_rebased_term(source, value, variables, term_cache);
                 self.map(key, value)
             }
             TypeTerm::Set(item) => {
-                let item =
-                    self.import_rebased_term(source, item, variables, term_cache, name_cache);
+                let item = self.import_rebased_term(source, item, variables, term_cache);
                 self.set(item)
             }
             TypeTerm::Bits(width) => self.bits(width),
@@ -1245,7 +1393,7 @@ impl TypeTermArena {
                 }),
             },
             TypeTerm::UnresolvedShape(reason) => Type::UnresolvedShape {
-                reason: self.name(reason).to_owned(),
+                reason: self.diagnostic_text(reason).to_owned(),
             },
             TypeTerm::Variable(variable) => Type::Var(TypeVar(variable.0)),
             TypeTerm::Unknown => Type::Unknown,
@@ -1477,41 +1625,45 @@ impl TypeTermArena {
         )
     }
 
-    fn find_name(&self, fingerprint: u64, bytes: &[u8]) -> Option<NameId> {
-        let mut slot = fingerprint as usize & (self.name_slots.len() - 1);
+    fn find_diagnostic_text(&self, fingerprint: u64, bytes: &[u8]) -> Option<DiagnosticTextId> {
+        let mut slot = fingerprint as usize & (self.diagnostic_text_slots.len() - 1);
         loop {
-            let encoded = self.name_slots[slot];
+            let encoded = self.diagnostic_text_slots[slot];
             if encoded == 0 {
                 return None;
             }
-            let id = NameId(encoded - 1);
-            let row = self.names[id.0 as usize];
-            if row.fingerprint == fingerprint && &self.name_bytes[row.bytes.range()] == bytes {
+            let id = DiagnosticTextId(encoded - 1);
+            let row = self.diagnostic_texts[id.0 as usize];
+            if row.fingerprint == fingerprint
+                && &self.diagnostic_text_bytes[row.bytes.range()] == bytes
+            {
                 return Some(id);
             }
-            slot = (slot + 1) & (self.name_slots.len() - 1);
+            slot = (slot + 1) & (self.diagnostic_text_slots.len() - 1);
         }
     }
 
-    fn ensure_name_slot_capacity(&mut self) {
-        if (self.names.len() + 1) * 10 < self.name_slots.len() * 7 {
+    fn ensure_diagnostic_text_slot_capacity(&mut self) {
+        if (self.diagnostic_texts.len() + 1) * 10 < self.diagnostic_text_slots.len() * 7 {
             return;
         }
-        self.name_slots = vec![0; self.name_slots.len() * 2];
-        for index in 0..self.names.len() {
-            let id = NameId(u32::try_from(index).expect("kernel name count exceeds u32"));
-            self.insert_name_slot(id, self.names[index].fingerprint);
+        self.diagnostic_text_slots = vec![0; self.diagnostic_text_slots.len() * 2];
+        for index in 0..self.diagnostic_texts.len() {
+            let id = DiagnosticTextId(
+                u32::try_from(index).expect("kernel diagnostic text count exceeds u32"),
+            );
+            self.insert_diagnostic_text_slot(id, self.diagnostic_texts[index].fingerprint);
         }
     }
 
-    fn insert_name_slot(&mut self, id: NameId, fingerprint: u64) {
-        let mut slot = fingerprint as usize & (self.name_slots.len() - 1);
-        while self.name_slots[slot] != 0 {
-            slot = (slot + 1) & (self.name_slots.len() - 1);
+    fn insert_diagnostic_text_slot(&mut self, id: DiagnosticTextId, fingerprint: u64) {
+        let mut slot = fingerprint as usize & (self.diagnostic_text_slots.len() - 1);
+        while self.diagnostic_text_slots[slot] != 0 {
+            slot = (slot + 1) & (self.diagnostic_text_slots.len() - 1);
         }
-        self.name_slots[slot] =
+        self.diagnostic_text_slots[slot] =
             id.0.checked_add(1)
-                .expect("kernel name slots reserve u32::MAX");
+                .expect("kernel diagnostic text slots reserve u32::MAX");
     }
 
     fn find_term(&self, fingerprint: u64, candidate: TypeTerm<'_>) -> Option<TypeTermId> {
@@ -1573,7 +1725,7 @@ impl TypeTermArena {
                 (TypeTerm::Bits(left), TypeTerm::Bits(right)) => left.cmp(&right),
                 (TypeTerm::Variable(left), TypeTerm::Variable(right)) => left.cmp(&right),
                 (TypeTerm::UnresolvedShape(left), TypeTerm::UnresolvedShape(right)) => {
-                    self.name(left).cmp(self.name(right))
+                    self.diagnostic_text(left).cmp(self.diagnostic_text(right))
                 }
                 (TypeTerm::List(left), TypeTerm::List(right))
                 | (TypeTerm::Set(left), TypeTerm::Set(right)) => self.compare_terms(left, right),
@@ -1941,7 +2093,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<TypeTermHeader>(), 24);
         assert_eq!(std::mem::size_of::<ObjectFieldTerm>(), 8);
         assert_eq!(std::mem::size_of::<ObjectShapeTermRow>(), 16);
-        assert_eq!(std::mem::size_of::<NameRow>(), 16);
+        assert_eq!(std::mem::size_of::<DiagnosticTextRow>(), 16);
     }
 
     #[test]
@@ -1952,7 +2104,7 @@ mod tests {
         let record = arena.object([(value, variable)], true);
         let number = arena.number();
         let widened = arena.structural_widen(record, number);
-        assert!(!arena.name_slots.is_empty());
+        assert!(arena.text_snapshot().symbol_count() > 0);
         assert!(!arena.term_slots.is_empty());
         assert!(!arena.term_fingerprints.is_empty());
         assert!(!arena.variable_terms.is_empty());
@@ -1979,8 +2131,13 @@ mod tests {
 
     #[test]
     fn frozen_semantic_equality_ignores_construction_fingerprint_mask() {
+        let mut text = PackedTextCatalogBuilder::new();
+        for symbol in ["alpha", "beta"] {
+            text.intern_symbol(symbol).unwrap();
+        }
+        let text = text.freeze();
         let build = |mask| {
-            let mut arena = TypeTermArena::with_lookup_fingerprint_mask(mask);
+            let mut arena = TypeTermArena::with_lookup_fingerprint_mask(text.clone(), mask);
             let alpha = arena.intern_name("alpha");
             let beta = arena.intern_name("beta");
             let text = arena.text();
@@ -1993,8 +2150,21 @@ mod tests {
     }
 
     #[test]
+    fn frozen_store_rejects_foreign_in_range_type_references() {
+        let first = TypeTermArena::new();
+        let foreign_text = first.flow_ref(first.text(), FlowMode::Continuous);
+        let second = TypeTermArena::new().freeze();
+
+        assert!(second.len() > foreign_text.term().0 as usize);
+        assert_eq!(second.materialize_flow(foreign_text), None);
+    }
+
+    #[test]
     fn packed_production_indexes_are_collision_exact_and_hit_stable() {
-        let mut arena = TypeTermArena::with_lookup_fingerprint_mask(0);
+        let mut arena = TypeTermArena::for_test_symbols_with_lookup_mask(
+            ["alpha", "beta", "missing", "Pair"],
+            0,
+        );
         assert_ne!(arena.absent(), arena.unknown());
         assert_ne!(arena.text(), arena.number());
 
@@ -2002,17 +2172,6 @@ mod tests {
         let beta = arena.intern_name("beta");
         assert_ne!(alpha, beta);
         assert_eq!(arena.intern_name("alpha"), alpha);
-        let colliding_names = (0..48)
-            .map(|index| {
-                let name = format!("production_collision_name_{index}");
-                let id = arena.intern_name(&name);
-                (name, id)
-            })
-            .collect::<Vec<_>>();
-        for (name, id) in &colliding_names {
-            assert_eq!(arena.intern_name(name), *id);
-        }
-
         let number = arena.number();
         let text = arena.text();
         let first = arena.object([(alpha, number), (beta, text)], false);
@@ -2030,8 +2189,8 @@ mod tests {
         let variants = arena.variant_set([pair]);
         let union = arena.union([function, variants]);
         let storage_lengths = (
-            arena.name_bytes.len(),
-            arena.names.len(),
+            arena.text_snapshot().byte_len(),
+            arena.text_snapshot().symbol_count(),
             arena.headers.len(),
             arena.children.len(),
             arena.variants.len(),
@@ -2050,8 +2209,8 @@ mod tests {
         assert_eq!(arena.union([function, variants]), union);
         assert_eq!(
             (
-                arena.name_bytes.len(),
-                arena.names.len(),
+                arena.text_snapshot().byte_len(),
+                arena.text_snapshot().symbol_count(),
                 arena.headers.len(),
                 arena.children.len(),
                 arena.variants.len(),

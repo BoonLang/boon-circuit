@@ -1,4 +1,4 @@
-use crate::{FrozenTypeStore, FrozenTypeStoreLayout, OutputId, TypeTermArena, TypeTermId};
+use crate::{FrozenTypeStore, FrozenTypeStoreLayout, KernelFlowRef, OutputId, TypeTermArena};
 use boon_checked::FlowType;
 use std::sync::Arc;
 
@@ -48,11 +48,9 @@ pub struct KernelSolveWork {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactOutput {
     pub id: OutputId,
-    /// Resolved solver-arena term retained until definition finalization.
-    /// This ID is meaningful only together with `ComponentArtifact::terms`;
-    /// it is never a stable receipt identity.
-    pub(crate) term: TypeTermId,
-    pub flow_type: FlowType,
+    /// Resolved flow qualified by the exact frozen store retained by the
+    /// component artifact. No recursive checked type is allocated here.
+    pub flow: KernelFlowRef,
     /// Whether this exact runtime occurrence contains a value constructed by
     /// selecting one singleton, invocation-parameter-derived syntax branch.
     pub syntax_selected: bool,
@@ -65,6 +63,12 @@ pub struct ArtifactOutput {
     /// narrow authority for checked-call metadata; ordinary forwarded value
     /// provenance must not relabel a call site.
     pub call_syntax_selected: bool,
+}
+
+impl ArtifactOutput {
+    pub(crate) const fn term(&self) -> crate::TypeTermId {
+        self.flow.term()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -82,18 +86,58 @@ pub struct ComponentArtifact {
 /// are demanded. It intentionally owns no clone of the solved type arena.
 #[derive(Clone, Debug)]
 pub(crate) struct ComponentOutputSnapshot {
-    outputs: Box<[Option<ArtifactOutput>]>,
+    outputs: Box<[Option<ProjectedArtifactOutput>]>,
     pub work: KernelSolveWork,
 }
 
-pub(crate) trait ComponentOutputs {
-    fn output(&self, id: OutputId) -> Option<&ArtifactOutput>;
-    fn work(&self) -> KernelSolveWork;
+#[derive(Clone, Debug)]
+pub(crate) struct ProjectedArtifactOutput {
+    pub(crate) id: OutputId,
+    pub(crate) flow_type: Option<FlowType>,
+    pub(crate) syntax_selected_here: bool,
+    pub(crate) call_syntax_selected: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ArtifactOutputFlags {
+    pub(crate) syntax_selected_here: bool,
+    pub(crate) call_syntax_selected: bool,
 }
 
 impl ComponentOutputSnapshot {
-    pub(crate) fn new(outputs: Box<[Option<ArtifactOutput>]>, work: KernelSolveWork) -> Self {
+    pub(crate) fn new(
+        outputs: Box<[Option<ProjectedArtifactOutput>]>,
+        work: KernelSolveWork,
+    ) -> Self {
         Self { outputs, work }
+    }
+
+    /// Build one phase-local rich projection for the exact demanded outputs.
+    /// Each packed flow is expanded at most once; the table is dropped when
+    /// the compatibility/editor projection finishes.
+    pub(crate) fn project(artifact: &ComponentArtifact, demanded: &[OutputId]) -> Self {
+        let mut outputs = vec![None; artifact.outputs.len()];
+        let mut work = artifact.work;
+        for id in demanded.iter().copied() {
+            let index = id.0 as usize;
+            let Some(slot) = outputs.get_mut(index) else {
+                continue;
+            };
+            if slot.is_some() {
+                continue;
+            }
+            let Some(output) = artifact.output(id) else {
+                continue;
+            };
+            *slot = Some(ProjectedArtifactOutput {
+                id,
+                flow_type: Some(artifact.materialize_flow(output.flow)),
+                syntax_selected_here: output.syntax_selected_here,
+                call_syntax_selected: output.call_syntax_selected,
+            });
+            work.rich_output_flow_exports = work.rich_output_flow_exports.saturating_add(1);
+        }
+        Self::new(outputs.into_boxed_slice(), work)
     }
 
     #[cfg(test)]
@@ -103,27 +147,39 @@ impl ComponentOutputSnapshot {
             .filter(|output| output.is_some())
             .count()
     }
-}
 
-impl ComponentOutputs for ComponentOutputSnapshot {
-    fn output(&self, id: OutputId) -> Option<&ArtifactOutput> {
+    pub(crate) fn flow_type(&self, id: OutputId) -> Option<&FlowType> {
         self.outputs
             .get(id.0 as usize)
             .and_then(Option::as_ref)
             .filter(|output| output.id == id)
+            .and_then(|output| output.flow_type.as_ref())
     }
 
-    fn work(&self) -> KernelSolveWork {
-        self.work
-    }
-}
-
-impl ComponentOutputs for ComponentArtifact {
-    fn output(&self, id: OutputId) -> Option<&ArtifactOutput> {
-        Self::output(self, id)
+    pub(crate) fn take_flow_type(&mut self, id: OutputId) -> Option<FlowType> {
+        self.outputs
+            .get_mut(id.0 as usize)
+            .and_then(Option::as_mut)
+            .filter(|output| output.id == id)
+            .and_then(|output| output.flow_type.take())
     }
 
-    fn work(&self) -> KernelSolveWork {
+    pub(crate) const fn slot_count(&self) -> usize {
+        self.outputs.len()
+    }
+
+    pub(crate) fn output_flags(&self, id: OutputId) -> Option<ArtifactOutputFlags> {
+        self.outputs
+            .get(id.0 as usize)
+            .and_then(Option::as_ref)
+            .filter(|output| output.id == id)
+            .map(|output| ArtifactOutputFlags {
+                syntax_selected_here: output.syntax_selected_here,
+                call_syntax_selected: output.call_syntax_selected,
+            })
+    }
+
+    pub(crate) const fn work(&self) -> KernelSolveWork {
         self.work
     }
 }
@@ -153,6 +209,18 @@ impl ComponentArtifact {
             .get(index)
             .and_then(Option::as_ref)
             .filter(|output| output.id == id)
+    }
+
+    /// Explicit rich projection for compatibility consumers and tests.
+    pub fn output_flow(&self, id: OutputId) -> Option<FlowType> {
+        let output = self.output(id)?;
+        self.terms.materialize_flow(output.flow)
+    }
+
+    pub(crate) fn materialize_flow(&self, flow: KernelFlowRef) -> FlowType {
+        self.terms
+            .materialize_flow(flow)
+            .expect("kernel flow reference belongs to its component type store")
     }
 
     pub fn available_output_count(&self) -> usize {

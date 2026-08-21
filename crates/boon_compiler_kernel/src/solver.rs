@@ -3,11 +3,13 @@ use crate::{
     KERNEL_SUMMARY_DEFINITION_RANKING_LEN, KernelCollectionOperationKind,
     KernelCollectionProjectionKind, KernelOperationRef, KernelPattern, KernelRecordEntry,
     KernelSelectArm, KernelSolveWork, KernelSummaryCallInput, KernelSummaryDefinitionWork,
-    KernelSummaryNode, KernelSummaryProgram, KernelSummaryRecordEntry, NameId, OperationId,
-    PackedOperationTable, ProgramConsumer, ProgramOperationRef, PublishMode,
-    ResidualOperationFrame, TypeTerm, TypeTermHead, TypeTermId, TypeVariableId, VariantTerm,
+    KernelSummaryNode, KernelSummaryProgram, KernelSummaryRecordEntry, OperationId,
+    PackedOperationTable, ProgramConsumer, ProgramOperationRef, ProjectedArtifactOutput,
+    PublishMode, ResidualOperationFrame, TypeTerm, TypeTermHead, TypeTermId, TypeVariableId,
+    VariantTerm,
 };
 use boon_checked::FlowType;
+use boon_contract::SymbolId;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
@@ -650,14 +652,14 @@ impl ComponentSolver {
     }
 
     fn snapshot(&mut self) -> ComponentOutputSnapshot {
-        let outputs = self.materialize_outputs();
+        let outputs = self.materialize_projected_outputs();
         self.update_term_work();
         self.finish_summary_definition_ranking();
         ComponentOutputSnapshot::new(outputs, self.work)
     }
 
     fn finish(mut self) -> Result<ComponentArtifact, KernelSolveError> {
-        let outputs = self.materialize_outputs();
+        let outputs = self.materialize_packed_outputs();
         self.update_term_work();
         self.finish_summary_definition_ranking();
         Ok(ComponentArtifact::new(
@@ -667,28 +669,47 @@ impl ComponentSolver {
         ))
     }
 
-    fn materialize_outputs(&mut self) -> Box<[Option<ArtifactOutput>]> {
-        let output_specs = self.program.outputs.clone();
-        let mut outputs = Vec::with_capacity(output_specs.len());
-        for (index, output) in output_specs.iter().enumerate() {
-            if !self.program.available_outputs[index] {
+    fn resolve_output(&mut self, index: usize) -> Option<ArtifactOutput> {
+        if !self.program.available_outputs[index] {
+            return None;
+        }
+        let output = self.program.outputs[index];
+        let variable = self.program.terms.variable(output.variable);
+        let term = self.resolve_term(variable);
+        Some(ArtifactOutput {
+            id: output.id,
+            flow: self.program.terms.flow_ref(term, output.mode),
+            syntax_selected: self.variable_syntax_selected(output.variable),
+            syntax_selected_here: self.syntax_selected_here[output.variable.0 as usize],
+            call_syntax_selected: self.call_syntax_selected[output.variable.0 as usize],
+        })
+    }
+
+    fn materialize_packed_outputs(&mut self) -> Box<[Option<ArtifactOutput>]> {
+        let mut outputs = Vec::with_capacity(self.program.outputs.len());
+        for index in 0..self.program.outputs.len() {
+            outputs.push(self.resolve_output(index));
+        }
+        outputs.into_boxed_slice()
+    }
+
+    fn materialize_projected_outputs(&mut self) -> Box<[Option<ProjectedArtifactOutput>]> {
+        let mut outputs = Vec::with_capacity(self.program.outputs.len());
+        for index in 0..self.program.outputs.len() {
+            let Some(output) = self.resolve_output(index) else {
                 outputs.push(None);
                 continue;
-            }
-            let variable = self.program.terms.variable(output.variable);
-            let term = self.resolve_term(variable);
+            };
             self.work.rich_output_flow_exports =
                 self.work.rich_output_flow_exports.saturating_add(1);
-            outputs.push(Some(ArtifactOutput {
+            outputs.push(Some(ProjectedArtifactOutput {
                 id: output.id,
-                term,
-                flow_type: FlowType {
-                    mode: output.mode,
-                    ty: self.program.terms.export_checked_type(term),
-                },
-                syntax_selected: self.variable_syntax_selected(output.variable),
-                syntax_selected_here: self.syntax_selected_here[output.variable.0 as usize],
-                call_syntax_selected: self.call_syntax_selected[output.variable.0 as usize],
+                flow_type: Some(FlowType {
+                    mode: output.flow.mode(),
+                    ty: self.program.terms.export_checked_type(output.flow.term()),
+                }),
+                syntax_selected_here: output.syntax_selected_here,
+                call_syntax_selected: output.call_syntax_selected,
             }));
         }
         outputs.into_boxed_slice()
@@ -921,7 +942,6 @@ impl ComponentSolver {
                 field,
                 consumer,
             } => {
-                let field = field.map(|field| self.import_frame_name(frame_index, frame, field));
                 self.project(variable(provider), field, variable(consumer));
             }
             KernelOperationRef::PatternProjection {
@@ -930,11 +950,7 @@ impl ComponentSolver {
                 fields,
                 consumer,
             } => {
-                let fields = fields
-                    .iter()
-                    .map(|field| self.import_frame_name(frame_index, frame, *field))
-                    .collect::<Vec<_>>();
-                self.project_pattern(variable(provider), pattern, &fields, variable(consumer));
+                self.project_pattern(variable(provider), pattern, fields, variable(consumer));
             }
             KernelOperationRef::CollectionProjection {
                 provider,
@@ -1104,19 +1120,18 @@ impl ComponentSolver {
         frame_index: usize,
         frame: &ResidualOperationFrame,
         output: TypeVariableId,
-        tag: Option<NameId>,
+        tag: Option<SymbolId>,
         entries: &[KernelRecordEntry],
     ) -> Result<(), KernelSolveError> {
-        let mut fields = Vec::<(NameId, TypeTermId)>::new();
+        let mut fields = Vec::<(SymbolId, TypeTermId)>::new();
         let mut syntax_selected = false;
         for entry in entries {
             match entry {
                 KernelRecordEntry::Field { name, value } => {
-                    let name = self.import_frame_name(frame_index, frame, *name);
                     let value = self.import_frame_term(frame_index, frame, *value);
                     syntax_selected |= self.term_syntax_selected(value);
                     let value = self.resolve_term_head(value);
-                    insert_record_field(&mut fields, name, value);
+                    insert_record_field(&mut fields, *name, value);
                 }
                 KernelRecordEntry::Spread { value } => {
                     let value = self.import_frame_term(frame_index, frame, *value);
@@ -1128,7 +1143,6 @@ impl ComponentSolver {
         }
         let object = self.program.terms.object(fields, false);
         let provider = if let Some(tag) = tag {
-            let tag = self.import_frame_name(frame_index, frame, tag);
             let tag = self.program.terms.name(tag).to_owned();
             let variant = self.program.terms.tagged_variant(tag, object);
             self.program.terms.variant_set([variant])
@@ -1147,15 +1161,6 @@ impl ComponentSolver {
         term: TypeTermId,
     ) -> TypeTermId {
         frame.terms[term.0 as usize].expect("residual operation term was linked")
-    }
-
-    fn import_frame_name(
-        &mut self,
-        _frame_index: usize,
-        frame: &ResidualOperationFrame,
-        name: NameId,
-    ) -> NameId {
-        frame.names[name.0 as usize].expect("residual operation name was linked")
     }
 
     fn publish(
@@ -1280,7 +1285,7 @@ impl ComponentSolver {
     fn project(
         &mut self,
         provider: TypeVariableId,
-        field: Option<NameId>,
+        field: Option<SymbolId>,
         consumer: TypeVariableId,
     ) {
         let syntax_selected = self.variable_syntax_selected(provider);
@@ -1344,7 +1349,7 @@ impl ComponentSolver {
         &mut self,
         provider: TypeVariableId,
         pattern: &KernelPattern,
-        fields: &[NameId],
+        fields: &[SymbolId],
         consumer: TypeVariableId,
     ) {
         let syntax_selected = self.variable_syntax_selected(provider);
@@ -1441,7 +1446,7 @@ impl ComponentSolver {
     fn project_path_term(
         &mut self,
         mut provider: TypeTermId,
-        fields: &[NameId],
+        fields: &[SymbolId],
     ) -> Option<TypeTermId> {
         for field in fields {
             provider = self.project_field(provider, *field)?;
@@ -1452,7 +1457,7 @@ impl ComponentSolver {
     fn pattern_projection_scaffold(
         &mut self,
         pattern: &KernelPattern,
-        fields: &[NameId],
+        fields: &[SymbolId],
         consumer: TypeTermId,
     ) -> Option<TypeTermId> {
         let mut payload = consumer;
@@ -1610,10 +1615,10 @@ impl ComponentSolver {
     fn record(
         &mut self,
         output: TypeVariableId,
-        tag: Option<NameId>,
+        tag: Option<SymbolId>,
         entries: &[KernelRecordEntry],
     ) -> Result<(), KernelSolveError> {
-        let mut fields = Vec::<(NameId, TypeTermId)>::new();
+        let mut fields = Vec::<(SymbolId, TypeTermId)>::new();
         let mut syntax_selected = false;
         for entry in entries {
             match entry {
@@ -1985,7 +1990,7 @@ impl ComponentSolver {
                 })
             }
             KernelSummaryNode::Record { tag, entries } => {
-                let mut fields = Vec::<(NameId, TypeTermId)>::new();
+                let mut fields = Vec::<(SymbolId, TypeTermId)>::new();
                 let mut parameter_derived = false;
                 let mut syntax_selected = false;
                 for entry in entries {
@@ -2136,7 +2141,7 @@ impl ComponentSolver {
     fn merge_record_spread(
         &mut self,
         spread: TypeTermId,
-        fields: &mut Vec<(NameId, TypeTermId)>,
+        fields: &mut Vec<(SymbolId, TypeTermId)>,
     ) -> Result<(), KernelSolveError> {
         match self.program.terms.term_head(spread) {
             TypeTermHead::Object { shape, .. } => {
@@ -2172,7 +2177,7 @@ impl ComponentSolver {
         Ok(())
     }
 
-    fn project_field(&mut self, provider: TypeTermId, field: NameId) -> Option<TypeTermId> {
+    fn project_field(&mut self, provider: TypeTermId, field: SymbolId) -> Option<TypeTermId> {
         let provider = self.resolve_term_head(provider);
         match self.program.terms.term_head(provider) {
             TypeTermHead::Object { shape, .. } => {
@@ -2201,7 +2206,7 @@ impl ComponentSolver {
         }
     }
 
-    fn open_shape_may_contain_field(&mut self, provider: TypeTermId, field: NameId) -> bool {
+    fn open_shape_may_contain_field(&mut self, provider: TypeTermId, field: SymbolId) -> bool {
         let provider = self.resolve_term_head(provider);
         match self.program.terms.term_head(provider) {
             TypeTermHead::Object { shape, open } => {
@@ -3025,7 +3030,11 @@ fn collect_term_variables_dense(
     }
 }
 
-fn insert_record_field(fields: &mut Vec<(NameId, TypeTermId)>, name: NameId, value: TypeTermId) {
+fn insert_record_field(
+    fields: &mut Vec<(SymbolId, TypeTermId)>,
+    name: SymbolId,
+    value: TypeTermId,
+) {
     if let Some((_, current)) = fields.iter_mut().find(|(candidate, _)| *candidate == name) {
         *current = value;
     } else {
@@ -3036,7 +3045,6 @@ fn insert_record_field(fields: &mut Vec<(NameId, TypeTermId)>, name: NameId, val
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::artifact::ComponentOutputs;
     use crate::{ComponentProgramBuilder, KernelSummarySelectArm, PublishMode};
     use boon_checked::{FlowMode, ObjectShape, Type, Variant};
     use std::{collections::BTreeSet, sync::Arc};
@@ -3056,22 +3064,16 @@ mod tests {
         let mut session = ComponentSolveSession::new(builder.finish()).unwrap();
         let interface = session.solve_outputs(&[text_output]).unwrap();
         assert_eq!(interface.available_output_count(), 1);
-        assert_eq!(
-            interface.output(text_output).unwrap().flow_type.ty,
-            Type::Text
-        );
-        assert!(interface.output(number_output).is_none());
+        assert_eq!(interface.flow_type(text_output).unwrap().ty, Type::Text);
+        assert!(interface.flow_type(number_output).is_none());
         assert_eq!(interface.work.scheduled_work_items, 1);
         assert_eq!(interface.work.activations, 1);
 
         let complete = session.solve_all().unwrap();
         assert_eq!(complete.available_output_count(), 2);
+        assert_eq!(complete.output_flow(text_output).unwrap().ty, Type::Text);
         assert_eq!(
-            complete.output(text_output).unwrap().flow_type.ty,
-            Type::Text
-        );
-        assert_eq!(
-            complete.output(number_output).unwrap().flow_type.ty,
+            complete.output_flow(number_output).unwrap().ty,
             Type::Number
         );
         assert_eq!(complete.work.scheduled_work_items, 2);
@@ -3102,13 +3104,14 @@ mod tests {
         module.add_publish(late, [updated_type], PublishMode::Replace);
 
         let module = Arc::new(module.finish());
+        let text = module.terms().text_snapshot().clone();
         assert_eq!(
             module.acyclic_initial_operation_count(),
             module.operation_count() as u64,
             "the explicit alias remains a coarse acyclic frame"
         );
 
-        let mut builder = ComponentProgramBuilder::new();
+        let mut builder = ComponentProgramBuilder::with_text(text);
         let initial = builder.new_variable();
         let result = builder.new_variable();
         let alias = builder.new_variable();
@@ -3118,7 +3121,7 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).unwrap();
         assert_eq!(
-            artifact.output(output).unwrap().flow_type.ty,
+            artifact.output_flow(output).unwrap().ty,
             Type::VariantSet(
                 vec![
                     Variant::Tag("Initial".to_owned()),
@@ -3167,11 +3170,11 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).expect("contextual summaries solve");
         assert_eq!(
-            artifact.output(constrained_output).unwrap().flow_type.ty,
+            artifact.output_flow(constrained_output).unwrap().ty,
             Type::object(ObjectShape::new(Default::default(), true)),
         );
         assert_eq!(
-            artifact.output(unresolved_output).unwrap().flow_type.ty,
+            artifact.output_flow(unresolved_output).unwrap().ty,
             Type::Unknown,
         );
     }
@@ -3249,13 +3252,10 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).unwrap();
         assert!(matches!(
-            artifact.output(actual_output).unwrap().flow_type.ty,
+            artifact.output_flow(actual_output).unwrap().ty,
             Type::Var(_)
         ));
-        assert_eq!(
-            artifact.output(result_output).unwrap().flow_type.ty,
-            Type::Text
-        );
+        assert_eq!(artifact.output_flow(result_output).unwrap().ty, Type::Text);
         assert!(
             !artifact.output(result_output).unwrap().call_syntax_selected,
             "a concrete/context selector must not be reported as call-site syntax specialization"
@@ -3352,13 +3352,10 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).unwrap();
         assert!(matches!(
-            artifact.output(actual_output).unwrap().flow_type.ty,
+            artifact.output_flow(actual_output).unwrap().ty,
             Type::Var(_)
         ));
-        assert_eq!(
-            artifact.output(result_output).unwrap().flow_type.ty,
-            Type::Text
-        );
+        assert_eq!(artifact.output_flow(result_output).unwrap().ty, Type::Text);
         assert!(
             !artifact.output(result_output).unwrap().call_syntax_selected,
             "nested summary calls must preserve a non-parameter selector provenance"
@@ -3436,7 +3433,7 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).unwrap();
         let result = artifact.output(result_output).unwrap();
-        assert_eq!(result.flow_type.ty, Type::Text);
+        assert_eq!(artifact.output_flow(result_output).unwrap().ty, Type::Text);
         assert!(
             result.call_syntax_selected,
             "nested summary invocation must preserve the outer call parameter provenance"
@@ -3486,15 +3483,12 @@ mod tests {
         let result_output = builder.add_output(output, FlowMode::Continuous);
 
         let artifact = solve_component(builder.finish()).unwrap();
-        let Type::Object(actual) = &artifact.output(actual_output).unwrap().flow_type.ty else {
+        let Type::Object(actual) = &artifact.output_flow(actual_output).unwrap().ty else {
             panic!("selected projected requirement must shape the open formal")
         };
         assert!(actual.open);
         assert_eq!(actual.fields["value"], Type::Number);
-        assert_eq!(
-            artifact.output(result_output).unwrap().flow_type.ty,
-            Type::Text
-        );
+        assert_eq!(artifact.output_flow(result_output).unwrap().ty, Type::Text);
     }
 
     #[test]
@@ -3546,13 +3540,13 @@ mod tests {
         let result_output = builder.add_output(output, FlowMode::Continuous);
 
         let artifact = solve_component(builder.finish()).unwrap();
-        let Type::Object(actual) = &artifact.output(actual_output).unwrap().flow_type.ty else {
+        let Type::Object(actual) = &artifact.output_flow(actual_output).unwrap().ty else {
             panic!("nested summary requirement must shape the caller's private projection")
         };
         assert!(actual.open);
         assert_eq!(actual.fields["value"], Type::Number);
         assert_eq!(
-            artifact.output(result_output).unwrap().flow_type.ty,
+            artifact.output_flow(result_output).unwrap().ty,
             Type::Number
         );
     }
@@ -3583,12 +3577,9 @@ mod tests {
         let number_output = builder.add_output(number_output, FlowMode::Continuous);
 
         let artifact = solve_component(builder.finish()).unwrap();
+        assert_eq!(artifact.output_flow(text_output).unwrap().ty, Type::Text);
         assert_eq!(
-            artifact.output(text_output).unwrap().flow_type.ty,
-            Type::Text
-        );
-        assert_eq!(
-            artifact.output(number_output).unwrap().flow_type.ty,
+            artifact.output_flow(number_output).unwrap().ty,
             Type::Number
         );
     }
@@ -3664,7 +3655,7 @@ mod tests {
         let output = builder.add_output(output, FlowMode::Continuous);
 
         let artifact = solve_component(builder.finish()).unwrap();
-        let Type::List(item) = &artifact.output(output).unwrap().flow_type.ty else {
+        let Type::List(item) = &artifact.output_flow(output).unwrap().ty else {
             panic!("WHEN branch join must retain one list")
         };
         let Type::Object(shape) = item.as_ref() else {
@@ -3708,7 +3699,7 @@ mod tests {
         let output = builder.add_output(list, FlowMode::Continuous);
 
         let artifact = solve_component(builder.finish()).unwrap();
-        let Type::List(item) = &artifact.output(output).unwrap().flow_type.ty else {
+        let Type::List(item) = &artifact.output_flow(output).unwrap().ty else {
             panic!("collection output must be a list")
         };
         let Type::Object(shape) = item.as_ref() else {
@@ -3750,7 +3741,7 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).unwrap();
         assert_eq!(
-            artifact.output(output).unwrap().flow_type.ty,
+            artifact.output_flow(output).unwrap().ty,
             Type::Map {
                 key: Box::new(Type::VariantSet(
                     vec![
@@ -3810,7 +3801,7 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).unwrap();
         assert_eq!(
-            artifact.output(provider_output).unwrap().flow_type.ty,
+            artifact.output_flow(provider_output).unwrap().ty,
             Type::object(ObjectShape::from_ordered_fields(
                 [
                     ("family".to_owned(), Type::Text),
@@ -3820,7 +3811,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            artifact.output(overlay_output).unwrap().flow_type.ty,
+            artifact.output_flow(overlay_output).unwrap().ty,
             Type::object(ObjectShape::from_ordered_fields(
                 [
                     ("family".to_owned(), Type::Number),
@@ -3843,7 +3834,7 @@ mod tests {
 
         let error = solve_component(builder.finish()).expect_err("variant spread must be rejected");
         let message = error.to_string();
-        assert!(message.contains("found VariantSet([Tag(NameId("));
+        assert!(message.contains("found VariantSet([Tag(SymbolId("));
         assert!(!message.contains("TermSpan"));
     }
 
@@ -3882,14 +3873,8 @@ mod tests {
             ]
             .into(),
         );
-        assert_eq!(
-            artifact.output(selected_output).unwrap().flow_type.ty,
-            expected
-        );
-        assert_eq!(
-            artifact.output(available_output).unwrap().flow_type.ty,
-            expected
-        );
+        assert_eq!(artifact.output_flow(selected_output).unwrap().ty, expected);
+        assert_eq!(artifact.output_flow(available_output).unwrap().ty, expected);
         assert_eq!(artifact.work.operations, 2);
         assert!(artifact.work.activations < 10);
     }
@@ -3917,7 +3902,7 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).unwrap();
         assert_eq!(
-            artifact.output(output).unwrap().flow_type.ty,
+            artifact.output_flow(output).unwrap().ty,
             Type::object(ObjectShape::from_ordered_fields(
                 [
                     ("previous".to_owned(), Type::Number),
@@ -3942,14 +3927,8 @@ mod tests {
         let right_output = builder.add_output(right, FlowMode::Continuous);
 
         let artifact = solve_component(builder.finish()).unwrap();
-        assert_eq!(
-            artifact.output(left_output).unwrap().flow_type.ty,
-            Type::Text
-        );
-        assert_eq!(
-            artifact.output(right_output).unwrap().flow_type.ty,
-            Type::Text
-        );
+        assert_eq!(artifact.output_flow(left_output).unwrap().ty, Type::Text);
+        assert_eq!(artifact.output_flow(right_output).unwrap().ty, Type::Text);
         assert_eq!(artifact.work.operations, 2);
         assert!(artifact.work.activations < 10);
     }
@@ -3980,21 +3959,12 @@ mod tests {
         let artifact = solve_component(builder.finish()).unwrap();
         let expected = Type::Union(vec![Type::Text, Type::Var(boon_checked::TypeVar(0))].into());
         assert_eq!(
-            artifact.output(edited_block_output).unwrap().flow_type.ty,
+            artifact.output_flow(edited_block_output).unwrap().ty,
             expected
         );
-        assert_eq!(
-            artifact.output(update_output).unwrap().flow_type.ty,
-            expected
-        );
-        assert_eq!(
-            artifact.output(title_output).unwrap().flow_type.ty,
-            expected
-        );
-        assert_eq!(
-            artifact.output(edited_output).unwrap().flow_type.ty,
-            expected
-        );
+        assert_eq!(artifact.output_flow(update_output).unwrap().ty, expected);
+        assert_eq!(artifact.output_flow(title_output).unwrap().ty, expected);
+        assert_eq!(artifact.output_flow(edited_output).unwrap().ty, expected);
         assert!(artifact.work.activations < 20);
     }
 
@@ -4019,7 +3989,7 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).unwrap();
         assert_eq!(
-            artifact.output(output).unwrap().flow_type.ty,
+            artifact.output_flow(output).unwrap().ty,
             Type::VariantSet(
                 vec![
                     Variant::Tag("First".to_owned()),
@@ -4083,10 +4053,10 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).unwrap();
         assert_eq!(
-            artifact.output(first_output).unwrap().flow_type.ty,
-            artifact.output(second_output).unwrap().flow_type.ty,
+            artifact.output_flow(first_output).unwrap().ty,
+            artifact.output_flow(second_output).unwrap().ty,
         );
-        let Type::Object(record) = &artifact.output(record_output).unwrap().flow_type.ty else {
+        let Type::Object(record) = &artifact.output_flow(record_output).unwrap().ty else {
             panic!("projection record must remain an object")
         };
         assert_eq!(record.fields["first"], record.fields["second"]);
@@ -4095,7 +4065,7 @@ mod tests {
     fn requirement_test_projection(
         builder: &mut ComponentProgramBuilder,
         root: TypeVariableId,
-        path: &[crate::NameId],
+        path: &[SymbolId],
     ) -> TypeVariableId {
         let mut provider = root;
         for field in path {
@@ -4121,7 +4091,7 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).unwrap();
         assert!(matches!(
-            &artifact.output(output).unwrap().flow_type.ty,
+            &artifact.output_flow(output).unwrap().ty,
             Type::UnresolvedShape { reason } if reason.contains("missing")
         ));
     }
@@ -4140,7 +4110,7 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).unwrap();
         assert!(matches!(
-            &artifact.output(output).unwrap().flow_type.ty,
+            &artifact.output_flow(output).unwrap().ty,
             Type::Var(_)
         ));
     }
@@ -4158,7 +4128,7 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).unwrap();
         assert_eq!(
-            artifact.output(output).unwrap().flow_type.ty,
+            artifact.output_flow(output).unwrap().ty,
             Type::object(ObjectShape::from_ordered_fields(
                 [("name".to_owned(), Type::Text)],
                 true,
@@ -4187,7 +4157,7 @@ mod tests {
         let output = builder.add_output(requirement, FlowMode::Continuous);
 
         let artifact = solve_component(builder.finish()).unwrap();
-        let Type::Object(shape) = &artifact.output(output).unwrap().flow_type.ty else {
+        let Type::Object(shape) = &artifact.output_flow(output).unwrap().ty else {
             panic!("merged requirement must remain an open object")
         };
         assert!(shape.open);
@@ -4219,7 +4189,7 @@ mod tests {
 
         let artifact = solve_component(builder.finish()).unwrap();
         assert_eq!(
-            artifact.output(output).unwrap().flow_type.ty,
+            artifact.output_flow(output).unwrap().ty,
             Type::VariantSet(vec![Variant::Tag("Ready".to_owned())].into()),
             "a consumer indexed under the non-root variable must observe a root mutation"
         );
@@ -4241,7 +4211,7 @@ mod tests {
         let output = builder.add_output(projected, FlowMode::Continuous);
 
         let artifact = solve_component(builder.finish()).unwrap();
-        assert_eq!(artifact.output(output).unwrap().flow_type.ty, Type::Text);
+        assert_eq!(artifact.output_flow(output).unwrap().ty, Type::Text);
         assert_eq!(artifact.work.operations, 3);
         assert_eq!(artifact.work.activations, 3);
         assert_eq!(artifact.work.unify_activations, 1);

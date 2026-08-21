@@ -1,5 +1,6 @@
-use crate::{NameId, TypeTerm, TypeTermArena, TypeTermId, TypeVariableId};
+use crate::{TypeTerm, TypeTermArena, TypeTermId, TypeVariableId};
 use boon_checked::FlowMode;
+use boon_contract::{ProjectTextSnapshot, SymbolId};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -63,7 +64,7 @@ pub struct KernelSelectArm {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KernelRecordEntry {
-    Field { name: NameId, value: TypeTermId },
+    Field { name: SymbolId, value: TypeTermId },
     Spread { value: TypeTermId },
 }
 
@@ -73,7 +74,7 @@ pub struct KernelSummaryValueId(pub u32);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KernelSummaryRecordEntry {
     Field {
-        name: NameId,
+        name: SymbolId,
         value: KernelSummaryValueId,
     },
     Spread {
@@ -111,7 +112,7 @@ pub enum KernelSummaryNode {
     /// provider cell and are projected directly during summary evaluation.
     Projection {
         provider: KernelSummaryValueId,
-        fields: Box<[NameId]>,
+        fields: Box<[SymbolId]>,
     },
     Constrain {
         value: KernelSummaryValueId,
@@ -145,7 +146,7 @@ pub enum KernelSummaryNode {
         arms: Box<[KernelSummarySelectArm]>,
     },
     Record {
-        tag: Option<NameId>,
+        tag: Option<SymbolId>,
         entries: Box<[KernelSummaryRecordEntry]>,
     },
 }
@@ -158,7 +159,7 @@ pub struct KernelSummarySelectArm {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelSummaryProjectionStep {
-    pub field: Option<NameId>,
+    pub field: Option<SymbolId>,
     pub consumer: TypeVariableId,
 }
 
@@ -216,7 +217,7 @@ impl PackedRange {
 pub(crate) struct PackedOperationTable {
     rows: Box<[PackedOperation]>,
     terms: Box<[TypeTermId]>,
-    names: Box<[NameId]>,
+    names: Box<[SymbolId]>,
     patterns: Box<[KernelPattern]>,
     select_arms: Box<[KernelSelectArm]>,
     record_entries: Box<[KernelRecordEntry]>,
@@ -241,7 +242,7 @@ enum PackedOperation {
     },
     Projection {
         provider: TypeVariableId,
-        field: Option<NameId>,
+        field: Option<SymbolId>,
         consumer: TypeVariableId,
     },
     PatternProjection {
@@ -269,7 +270,7 @@ enum PackedOperation {
     },
     Record {
         output: TypeVariableId,
-        tag: Option<NameId>,
+        tag: Option<SymbolId>,
         entries: PackedRange,
     },
     SummaryCall {
@@ -296,13 +297,13 @@ pub(crate) enum KernelOperationRef<'a> {
     },
     Projection {
         provider: TypeVariableId,
-        field: Option<NameId>,
+        field: Option<SymbolId>,
         consumer: TypeVariableId,
     },
     PatternProjection {
         provider: TypeVariableId,
         pattern: &'a KernelPattern,
-        fields: &'a [NameId],
+        fields: &'a [SymbolId],
         consumer: TypeVariableId,
     },
     CollectionProjection {
@@ -324,7 +325,7 @@ pub(crate) enum KernelOperationRef<'a> {
     },
     Record {
         output: TypeVariableId,
-        tag: Option<NameId>,
+        tag: Option<SymbolId>,
         entries: &'a [KernelRecordEntry],
     },
     SummaryCall {
@@ -338,7 +339,7 @@ pub(crate) enum KernelOperationRef<'a> {
 struct PackedOperationBuilder {
     rows: Vec<PackedOperation>,
     terms: Vec<TypeTermId>,
-    names: Vec<NameId>,
+    names: Vec<SymbolId>,
     patterns: Vec<KernelPattern>,
     select_arms: Vec<KernelSelectArm>,
     record_entries: Vec<KernelRecordEntry>,
@@ -373,7 +374,7 @@ impl PackedOperationBuilder {
         append_column(&mut self.terms, values, "kernel operation term column")
     }
 
-    fn append_names(&mut self, values: impl IntoIterator<Item = NameId>) -> PackedRange {
+    fn append_names(&mut self, values: impl IntoIterator<Item = SymbolId>) -> PackedRange {
         append_column(&mut self.names, values, "kernel operation name column")
     }
 
@@ -466,7 +467,7 @@ impl PackedOperationTable {
 fn operation_ref<'a>(
     rows: &[PackedOperation],
     terms: &'a [TypeTermId],
-    names: &'a [NameId],
+    names: &'a [SymbolId],
     patterns: &'a [KernelPattern],
     select_arms: &'a [KernelSelectArm],
     record_entries: &'a [KernelRecordEntry],
@@ -584,7 +585,7 @@ pub struct ProgramOutput {
     pub mode: FlowMode,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ComponentProgram {
     pub(crate) terms: TypeTermArena,
     pub(crate) variables: Box<[VariableSpec]>,
@@ -634,7 +635,6 @@ pub(crate) struct ResidualOperationFrame {
     /// once keeps the hot solver loop to indexed reads while the immutable
     /// operation payload remains shared by every invocation frame.
     pub terms: Arc<[Option<TypeTermId>]>,
-    pub names: Arc<[Option<NameId>]>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -688,7 +688,7 @@ impl ComponentProgram {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComponentProgramBuilder {
     terms: TypeTermArena,
     variables: Vec<VariableSpec>,
@@ -699,8 +699,71 @@ pub struct ComponentProgramBuilder {
 }
 
 impl ComponentProgramBuilder {
+    pub fn with_text(text: ProjectTextSnapshot) -> Self {
+        Self {
+            terms: TypeTermArena::with_text(text),
+            variables: Vec::new(),
+            operations: PackedOperationBuilder::default(),
+            residual_frames: Vec::new(),
+            work_order: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn new() -> Self {
-        Self::default()
+        let terms = TypeTermArena::for_test_symbols([
+            "Initial",
+            "Updated",
+            "True",
+            "False",
+            "value",
+            "kind",
+            "Header",
+            "Empty",
+            "KeyA",
+            "KeyB",
+            "ValueA",
+            "ValueB",
+            "family",
+            "size",
+            "color",
+            "NotARecord",
+            "WorkspaceA",
+            "WorkspaceB",
+            "Repo",
+            "previous",
+            "current",
+            "a",
+            "b",
+            "First",
+            "Second",
+            "store",
+            "elements",
+            "distinct_first",
+            "repeated",
+            "distinct_third",
+            "first",
+            "second",
+            "missing",
+            "present",
+            "name",
+            "state",
+            "click_time",
+            "segments",
+            "fixed",
+            "label",
+            "Ready",
+            "Dark",
+        ]);
+        Self {
+            terms,
+            variables: Vec::new(),
+            operations: PackedOperationBuilder::default(),
+            residual_frames: Vec::new(),
+            work_order: Vec::new(),
+            outputs: Vec::new(),
+        }
     }
 
     pub fn terms(&self) -> &TypeTermArena {
@@ -792,7 +855,7 @@ impl ComponentProgramBuilder {
     pub fn add_projection(
         &mut self,
         provider: TypeVariableId,
-        path: impl IntoIterator<Item = NameId>,
+        path: impl IntoIterator<Item = SymbolId>,
     ) -> TypeVariableId {
         let consumer = self.new_variable();
         self.add_projection_into(provider, path, consumer);
@@ -805,7 +868,7 @@ impl ComponentProgramBuilder {
     pub fn add_projection_into(
         &mut self,
         provider: TypeVariableId,
-        path: impl IntoIterator<Item = NameId>,
+        path: impl IntoIterator<Item = SymbolId>,
         consumer: TypeVariableId,
     ) {
         let mut path = path.into_iter().peekable();
@@ -842,7 +905,7 @@ impl ComponentProgramBuilder {
         &mut self,
         provider: TypeVariableId,
         pattern: KernelPattern,
-        fields: impl IntoIterator<Item = NameId>,
+        fields: impl IntoIterator<Item = SymbolId>,
         consumer: TypeVariableId,
     ) -> OperationId {
         let pattern = self.operations.push_pattern(pattern);
@@ -941,7 +1004,7 @@ impl ComponentProgramBuilder {
     pub fn add_record(
         &mut self,
         output: TypeVariableId,
-        tag: Option<NameId>,
+        tag: Option<SymbolId>,
         entries: impl IntoIterator<Item = KernelRecordEntry>,
     ) -> OperationId {
         self.mark_authoritative(output);
@@ -1004,20 +1067,24 @@ impl ComponentProgramBuilder {
             module,
             variables: variables.into(),
             terms: Arc::from([]),
-            names: Arc::from([]),
         });
         self.work_order.push(BuilderWorkItem::Residual(frame));
         frame
     }
 
     pub fn finish(mut self) -> ComponentProgram {
-        // Link module-local immutable terms and names once. The previous lazy
-        // solver-side translation performed the same work in the activation
-        // loop and made shared modules slower than their flattened precursor.
+        // Link module-local immutable terms once. Symbols are already
+        // coordinates in the single project text authority, so residual
+        // frames need no parallel name-remapping allocation.
         let target_terms = &mut self.terms;
         for frame in &mut self.residual_frames {
+            assert!(
+                target_terms
+                    .text_snapshot()
+                    .same_authority(frame.module.terms.text_snapshot()),
+                "residual modules must share the owning component text authority"
+            );
             let mut term_cache = vec![None; frame.module.terms.len()];
-            let mut name_cache = vec![None; frame.module.terms.name_count()];
             for operation in frame.module.operations.iter() {
                 link_residual_operation_terms(
                     operation,
@@ -1025,11 +1092,9 @@ impl ComponentProgramBuilder {
                     target_terms,
                     &frame.variables,
                     &mut term_cache,
-                    &mut name_cache,
                 );
             }
             frame.terms = term_cache.into();
-            frame.names = name_cache.into();
         }
 
         // Size the topology first, then write each final column exactly once.
@@ -1432,57 +1497,37 @@ fn link_residual_operation_terms(
     target: &mut TypeTermArena,
     variables: &[TypeVariableId],
     term_cache: &mut [Option<TypeTermId>],
-    name_cache: &mut [Option<NameId>],
 ) {
     match operation {
         KernelOperationRef::Unify { left, right } => {
-            link_residual_term(left, source, target, variables, term_cache, name_cache);
-            link_residual_term(right, source, target, variables, term_cache, name_cache);
+            link_residual_term(left, source, target, variables, term_cache);
+            link_residual_term(right, source, target, variables, term_cache);
         }
         KernelOperationRef::Alias { .. } => {}
         KernelOperationRef::Publish { inputs, .. } => {
             for input in inputs {
-                link_residual_term(*input, source, target, variables, term_cache, name_cache);
+                link_residual_term(*input, source, target, variables, term_cache);
             }
         }
-        KernelOperationRef::Projection { field, .. } => {
-            if let Some(name) = field {
-                link_residual_name(name, source, target, name_cache);
-            }
-        }
-        KernelOperationRef::PatternProjection { fields, .. } => {
-            for field in fields {
-                link_residual_name(*field, source, target, name_cache);
-            }
-        }
+        KernelOperationRef::Projection { .. } | KernelOperationRef::PatternProjection { .. } => {}
         KernelOperationRef::CollectionProjection { .. } => {}
         KernelOperationRef::Collection { inputs, values, .. } => {
             for input in inputs.iter().chain(values.iter()) {
-                link_residual_term(*input, source, target, variables, term_cache, name_cache);
+                link_residual_term(*input, source, target, variables, term_cache);
             }
         }
         KernelOperationRef::Select { arms, .. } => {
             for arm in arms {
-                link_residual_term(
-                    arm.output, source, target, variables, term_cache, name_cache,
-                );
+                link_residual_term(arm.output, source, target, variables, term_cache);
             }
         }
-        KernelOperationRef::Record { tag, entries, .. } => {
-            if let Some(name) = tag {
-                link_residual_name(name, source, target, name_cache);
-            }
+        KernelOperationRef::Record { entries, .. } => {
             for entry in entries {
                 match entry {
-                    KernelRecordEntry::Field { name, value } => {
-                        link_residual_name(*name, source, target, name_cache);
-                        link_residual_term(
-                            *value, source, target, variables, term_cache, name_cache,
-                        );
+                    KernelRecordEntry::Field { value, .. }
+                    | KernelRecordEntry::Spread { value } => {
+                        link_residual_term(*value, source, target, variables, term_cache);
                     }
-                    KernelRecordEntry::Spread { value } => link_residual_term(
-                        *value, source, target, variables, term_cache, name_cache,
-                    ),
                 }
             }
         }
@@ -1498,19 +1543,8 @@ fn link_residual_term(
     target: &mut TypeTermArena,
     variables: &[TypeVariableId],
     term_cache: &mut [Option<TypeTermId>],
-    name_cache: &mut [Option<NameId>],
 ) {
-    target.import_rebased_term(source, term, variables, term_cache, name_cache);
-}
-
-fn link_residual_name(
-    name: NameId,
-    source: &TypeTermArena,
-    target: &mut TypeTermArena,
-    name_cache: &mut [Option<NameId>],
-) {
-    let slot = &mut name_cache[name.0 as usize];
-    slot.get_or_insert_with(|| target.intern_name(source.name(name)));
+    target.import_rebased_term(source, term, variables, term_cache);
 }
 
 fn collect_operation_variables(
@@ -1696,8 +1730,9 @@ mod tests {
         let text = module.terms().text();
         module.add_publish(module_constant, [text], PublishMode::Replace);
         let module = Arc::new(module.finish());
+        let text = module.terms().text_snapshot().clone();
 
-        let mut builder = ComponentProgramBuilder::new();
+        let mut builder = ComponentProgramBuilder::with_text(text);
         let input = builder.new_variable();
         let projection = builder.new_variable();
         let nested_projection = builder.new_variable();

@@ -1,5 +1,12 @@
 #![forbid(unsafe_code)]
 
+mod text_catalog;
+
+pub use text_catalog::{
+    PackedTextCatalog, PackedTextCatalogBuilder, PathId, ProjectTextSnapshot, QualifiedPathId,
+    QualifiedSymbolId, SymbolId, TextAuthorityId, TextCatalogError,
+};
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;

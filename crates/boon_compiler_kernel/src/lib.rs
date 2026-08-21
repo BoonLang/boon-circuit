@@ -15,6 +15,7 @@ mod receipt;
 mod session;
 mod solver;
 mod term;
+mod text;
 
 pub use abi::*;
 pub use artifact::*;

@@ -269,7 +269,7 @@ impl DefinitionTermProofScratch {
             TypeTerm::UnresolvedShape(reason) => {
                 stable.update([9]);
                 runtime.update([9]);
-                update_string_pair(&mut stable, &mut runtime, source.name(reason));
+                update_string_pair(&mut stable, &mut runtime, source.diagnostic_text(reason));
             }
             TypeTerm::Variable(variable) => {
                 let ordinal = self.variable_ordinal(variable)?;

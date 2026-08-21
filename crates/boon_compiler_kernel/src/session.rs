@@ -3,8 +3,9 @@ use crate::{
     KernelAbiInput, KernelCheckedSnapshot, KernelCompileWork, KernelDefinitionFactsInput,
     KernelDemandedDefinitionSnapshot, KernelInterfaceSnapshot, KernelOwnerBuildError,
     KernelOwnerId, KernelProjectProgramInput, KernelSolveError, KernelSolvedProject,
-    compile_project_program_with_definition_facts,
+    compile_project_program_with_definition_facts_and_text,
 };
+use boon_contract::ProjectTextSnapshot;
 use boon_syntax::{SourceUnitId, StableCheckOwnerKey};
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -16,14 +17,27 @@ use std::sync::Arc;
 /// Parser arenas and legacy owner DTOs do not cross this boundary. The dense
 /// owner programs are the normalized syntax product; their external owner IDs
 /// and the definition-fact tables are the resolved project-link overlay.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct KernelProjectInput {
     syntax_units: Box<[KernelSyntaxUnitInput]>,
     links: KernelResolvedProjectLinkOverlay,
     program: KernelProjectProgramInput,
     definition_facts: Box<[KernelDefinitionFactsInput]>,
     abi: Arc<KernelAbiInput>,
+    text: ProjectTextSnapshot,
 }
+
+impl PartialEq for KernelProjectInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.syntax_units == other.syntax_units
+            && self.links == other.links
+            && self.program == other.program
+            && self.definition_facts == other.definition_facts
+            && self.abi == other.abi
+    }
+}
+
+impl Eq for KernelProjectInput {}
 
 /// One immutable normalized syntax unit. Definitions retain their stable
 /// parser-owned identity while the dense IDs remain revision-local.
@@ -138,6 +152,8 @@ impl KernelProjectInput {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let text =
+            crate::text::build_project_text_snapshot(&program.owners, &definition_facts, &abi)?;
         Ok(Self {
             syntax_units,
             links: KernelResolvedProjectLinkOverlay {
@@ -147,6 +163,7 @@ impl KernelProjectInput {
             program,
             definition_facts,
             abi: Arc::new(abi),
+            text,
         })
     }
 
@@ -174,8 +191,16 @@ impl KernelProjectInput {
         self.abi.as_ref()
     }
 
+    pub fn text(&self) -> &ProjectTextSnapshot {
+        &self.text
+    }
+
     pub fn compile(&self) -> Result<crate::KernelProjectProgram, KernelOwnerBuildError> {
-        compile_project_program_with_definition_facts(self.program(), self.definition_facts())
+        compile_project_program_with_definition_facts_and_text(
+            self.program(),
+            self.definition_facts(),
+            self.text.clone(),
+        )
     }
 }
 

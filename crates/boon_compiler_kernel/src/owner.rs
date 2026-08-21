@@ -1,6 +1,6 @@
 use crate::solver::ComponentSolveSession;
 use crate::{
-    ComponentArtifact, ComponentOutputs, ComponentProgram, ComponentProgramBuilder,
+    ComponentArtifact, ComponentOutputSnapshot, ComponentProgram, ComponentProgramBuilder,
     DefinitionTermProofScratch, FrozenTypeStore, KernelCollectionOperationKind,
     KernelDefinitionFlowTermsV1, KernelPattern, KernelRecordEntry, KernelSelectArm,
     KernelSolveError, KernelSolveWork, KernelSummaryCallInput, KernelSummaryNode,
@@ -15,6 +15,7 @@ use boon_checked::{
     BytesType, CheckedListKeyPolicy, CheckedStateKind, FlowMode, FlowType, ObjectShape, Type,
     Variant, canonical_union_type, type_is_recursively_closed,
 };
+use boon_contract::{ProjectTextSnapshot, SymbolId};
 use boon_data::{Bits, ExactNumber, ExactNumberParseReason, ExactRoundingRule};
 use boon_effect_schema::{
     BarrierSpec, DeliveryCardinalitySpec, ReplaySpec, ResultPolicySpec, ValueType, host_effect_spec,
@@ -994,10 +995,6 @@ pub(crate) struct KernelProjectSolveSession {
 pub struct KernelSolvedProject {
     artifact: ComponentArtifact,
     owners: Box<[KernelProjectOwnerOutputs]>,
-    public_results: Box<[FlowType]>,
-    public_formals: Box<[Box<[FlowType]>]>,
-    call_facts: Box<[Box<[SolvedKernelCallFacts]>]>,
-    diagnostics: Box<[Box<[KernelDiagnosticArtifact]>]>,
 }
 
 pub const KERNEL_RESIDUAL_MODULE_RANKING_LEN: usize = 16;
@@ -2360,20 +2357,16 @@ impl KernelOwnerProgram {
         let basis_fingerprint_v14 = self.basis_fingerprint_v14;
         let artifact = solve_component(self.component)?;
         let mut result = artifact
-            .output(self.result_output)
-            .expect("owner result output belongs to its component")
-            .flow_type
-            .clone();
+            .output_flow(self.result_output)
+            .expect("owner result output belongs to its component");
         let expression_flows = self
             .expression_outputs
             .iter()
             .zip(self.expression_modes.iter().copied())
             .map(|(output, mode)| {
                 let mut flow = artifact
-                    .output(*output)
-                    .expect("owner expression output belongs to its component")
-                    .flow_type
-                    .clone();
+                    .output_flow(*output)
+                    .expect("owner expression output belongs to its component");
                 flow.mode = mode;
                 flow
             })
@@ -2397,7 +2390,7 @@ impl KernelOwnerProgram {
                         artifact
                             .output(*output)
                             .expect("owner formal output belongs to its component")
-                            .term,
+                            .term(),
                         mode,
                     )
                 })
@@ -2406,7 +2399,7 @@ impl KernelOwnerProgram {
                 artifact
                     .output(self.result_output)
                     .expect("owner result output belongs to its component")
-                    .term,
+                    .term(),
                 self.expression_modes[result_index],
             ),
             &self
@@ -2418,7 +2411,7 @@ impl KernelOwnerProgram {
                         artifact
                             .output(*output)
                             .expect("owner expression output belongs to its component")
-                            .term,
+                            .term(),
                         mode,
                     )
                 })
@@ -2431,10 +2424,8 @@ impl KernelOwnerProgram {
             .zip(self.formal_modes.iter().copied())
             .map(|(output, mode)| {
                 let mut flow = artifact
-                    .output(*output)
-                    .expect("owner formal output belongs to its component")
-                    .flow_type
-                    .clone();
+                    .output_flow(*output)
+                    .expect("owner formal output belongs to its component");
                 flow.mode = mode;
                 flow
             })
@@ -2531,22 +2522,9 @@ impl KernelProjectProgram {
         demanded: &[KernelOwnerId],
     ) -> Result<KernelDemandedDefinitionSnapshot, KernelSolveError> {
         let artifact = solve_component(self.component)?;
-        let public_results = project_public_results(&self.owners, &artifact);
-        let public_formals = project_public_formals(&self.owners, &artifact);
-        let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
-            &self.owners,
-            &artifact,
-            &public_results,
-            &public_formals,
-            true,
-        );
         KernelSolvedProject {
             artifact,
             owners: self.owners,
-            public_results,
-            public_formals,
-            call_facts,
-            diagnostics,
         }
         .into_demanded_definitions(demanded)
     }
@@ -2606,43 +2584,37 @@ impl KernelProjectSolveSession {
         let solve_started = Instant::now();
         let artifact = self.component.solve_all()?;
         let solve_us = solve_started.elapsed().as_micros();
-        let public_results_started = Instant::now();
-        let public_results = project_public_results(&self.owners, &artifact);
-        let public_formals = project_public_formals(&self.owners, &artifact);
-        let public_results_us = public_results_started.elapsed().as_micros();
-        let call_facts_started = Instant::now();
-        let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
-            &self.owners,
-            &artifact,
-            &public_results,
-            &public_formals,
-            true,
-        );
         if trace {
-            eprintln!(
-                "kernel-solve-detail component_us={solve_us} public_interfaces_us={public_results_us} call_facts_us={}",
-                call_facts_started.elapsed().as_micros(),
-            );
+            eprintln!("kernel-solve-detail component_us={solve_us}");
         }
         Ok(KernelSolvedProject {
             artifact,
             owners: self.owners,
-            public_results,
-            public_formals,
-            call_facts,
-            diagnostics,
         })
     }
 }
 
 impl KernelSolvedProject {
     pub fn interface_snapshot(&self) -> KernelInterfaceSnapshot {
+        let projected = ComponentOutputSnapshot::project(
+            &self.artifact,
+            &interface_output_demand(&self.owners),
+        );
+        let public_results = project_public_results(&self.owners, &projected);
+        let public_formals = project_public_formals(&self.owners, &projected);
+        let (_, diagnostics) = project_call_facts_and_diagnostics(
+            &self.owners,
+            &projected,
+            &public_results,
+            &public_formals,
+            false,
+        );
         project_interface_snapshot(
             &self.owners,
-            &self.artifact,
-            &self.public_results,
-            &self.public_formals,
-            &self.diagnostics,
+            &projected,
+            &public_results,
+            &public_formals,
+            &diagnostics,
         )
     }
 
@@ -2655,14 +2627,32 @@ impl KernelSolvedProject {
         let total_started = Instant::now();
         let type_store = self.artifact.type_store();
         let interface_started = Instant::now();
-        let diagnostic_values = self.interface_snapshot().diagnostic_values;
+        let mut projected =
+            ComponentOutputSnapshot::project(&self.artifact, &checked_output_demand(&self.owners));
+        let public_results = project_public_results(&self.owners, &projected);
+        let public_formals = project_public_formals(&self.owners, &projected);
+        let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
+            &self.owners,
+            &projected,
+            &public_results,
+            &public_formals,
+            true,
+        );
+        let diagnostic_values = project_interface_snapshot(
+            &self.owners,
+            &projected,
+            &public_results,
+            &public_formals,
+            &diagnostics,
+        )
+        .diagnostic_values;
         let interface_us = interface_started.elapsed().as_micros();
         let effects_started = Instant::now();
         let owner_effects = project_owner_effect_summaries(&self.owners);
         let effects_us = effects_started.elapsed().as_micros();
         let flush_started = Instant::now();
         let expression_flush_types =
-            project_expression_flush_types(&self.owners, &self.artifact, &self.public_results);
+            project_expression_flush_types(&self.owners, &projected, &public_results);
         let flush_us = flush_started.elapsed().as_micros();
         let preparation_started = Instant::now();
         let basis_fingerprints = self
@@ -2678,8 +2668,8 @@ impl KernelSolvedProject {
             .enumerate()
             .zip(synthetic_state_ordinals.into_vec())
             .zip(expression_flush_types.into_vec())
-            .zip(self.call_facts.into_vec())
-            .zip(self.diagnostics.into_vec())
+            .zip(call_facts.into_vec())
+            .zip(diagnostics.into_vec())
             .map(
                 |(
                     (
@@ -2702,8 +2692,9 @@ impl KernelSolvedProject {
         let definitions = materialize_project_definitions(
             materializations,
             &self.artifact,
-            &self.public_results,
-            &self.public_formals,
+            &mut projected,
+            &public_results,
+            &public_formals,
             &owner_effects,
         )?;
         let definitions_us = definitions_started.elapsed().as_micros();
@@ -2723,7 +2714,7 @@ impl KernelSolvedProject {
             diagnostic_values,
             dependencies,
             currentness,
-            work: self.artifact.work,
+            work: projected.work,
         })
     }
 
@@ -2739,6 +2730,17 @@ impl KernelSolvedProject {
         demanded: &[KernelOwnerId],
     ) -> Result<KernelDemandedDefinitionSnapshot, KernelSolveError> {
         let type_store = self.artifact.type_store();
+        let mut projected =
+            ComponentOutputSnapshot::project(&self.artifact, &checked_output_demand(&self.owners));
+        let public_results = project_public_results(&self.owners, &projected);
+        let public_formals = project_public_formals(&self.owners, &projected);
+        let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
+            &self.owners,
+            &projected,
+            &public_results,
+            &public_formals,
+            true,
+        );
         let mut demanded = demanded.to_vec();
         demanded.sort_unstable();
         demanded.dedup();
@@ -2754,7 +2756,20 @@ impl KernelSolvedProject {
         let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(&self.owners);
         let owner_effects = project_owner_effect_summaries(&self.owners);
         let expression_flush_types =
-            project_expression_flush_types(&self.owners, &self.artifact, &self.public_results);
+            project_expression_flush_types(&self.owners, &projected, &public_results);
+        let projected_work = projected.work;
+        let mut remaining = vec![0u32; projected.slot_count()];
+        for owner in demanded.iter().copied() {
+            for output in self.owners[owner.0 as usize].expressions.iter().copied() {
+                remaining[output.0 as usize] = remaining[output.0 as usize]
+                    .checked_add(1)
+                    .expect("demanded expression flow occurrence count exceeds u32");
+            }
+        }
+        let mut flow_projection = RichFlowProjection::Consuming {
+            outputs: &mut projected,
+            remaining: &mut remaining,
+        };
         let mut demanded_iter = demanded.into_iter().peekable();
         let mut definitions = Vec::with_capacity(demanded_iter.len());
         let mut term_proof_scratch = DefinitionTermProofScratch::default();
@@ -2771,8 +2786,8 @@ impl KernelSolvedProject {
             .enumerate()
             .zip(synthetic_state_ordinals.into_vec())
             .zip(expression_flush_types.into_vec())
-            .zip(self.call_facts.into_vec())
-            .zip(self.diagnostics.into_vec())
+            .zip(call_facts.into_vec())
+            .zip(diagnostics.into_vec())
         {
             let dense_owner = KernelOwnerId(
                 u32::try_from(owner_index)
@@ -2786,8 +2801,9 @@ impl KernelSolvedProject {
                 owner_index,
                 owner,
                 &self.artifact,
-                &self.public_results,
-                &self.public_formals,
+                &mut flow_projection,
+                &public_results,
+                &public_formals,
                 call_facts,
                 diagnostics,
                 &synthetic_state_ordinals,
@@ -2805,14 +2821,68 @@ impl KernelSolvedProject {
         Ok(KernelDemandedDefinitionSnapshot {
             definitions: definitions.into_boxed_slice(),
             type_store,
-            work: self.artifact.work,
+            work: projected_work,
         })
     }
+}
+
+enum RichFlowProjection<'a> {
+    Borrowed(&'a ComponentOutputSnapshot),
+    Consuming {
+        outputs: &'a mut ComponentOutputSnapshot,
+        remaining: &'a mut [u32],
+    },
+}
+
+impl RichFlowProjection<'_> {
+    fn materialize(&mut self, output: OutputId) -> FlowType {
+        match self {
+            Self::Borrowed(outputs) => outputs
+                .flow_type(output)
+                .expect("project owner expression belongs to its rich projection")
+                .clone(),
+            Self::Consuming { outputs, remaining } => {
+                let uses = remaining
+                    .get_mut(output.0 as usize)
+                    .expect("project expression output belongs to its rich projection");
+                *uses = uses
+                    .checked_sub(1)
+                    .expect("project expression flow use count underflowed");
+                if *uses == 0 {
+                    outputs
+                        .take_flow_type(output)
+                        .expect("last project expression use owns its rich flow")
+                } else {
+                    outputs
+                        .flow_type(output)
+                        .expect("shared project expression owns its rich flow")
+                        .clone()
+                }
+            }
+        }
+    }
+}
+
+fn expression_flow_use_counts(
+    materializations: &[ProjectDefinitionMaterialization],
+    output_count: usize,
+) -> Vec<u32> {
+    let mut remaining = vec![0u32; output_count];
+    for output in materializations
+        .iter()
+        .flat_map(|materialization| materialization.owner.expressions.iter().copied())
+    {
+        remaining[output.0 as usize] = remaining[output.0 as usize]
+            .checked_add(1)
+            .expect("project expression flow occurrence count exceeds u32");
+    }
+    remaining
 }
 
 fn materialize_project_definitions(
     mut materializations: Vec<ProjectDefinitionMaterialization>,
     artifact: &ComponentArtifact,
+    rich_outputs: &mut ComponentOutputSnapshot,
     public_results: &[FlowType],
     public_formals: &[Box<[FlowType]>],
     owner_effects: &[KernelEffectSummary],
@@ -2828,19 +2898,25 @@ fn materialize_project_definitions(
         && std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() >= 2)
     {
         let right = materializations.split_off(materializations.len() / 2);
+        let shared_outputs: &ComponentOutputSnapshot = rich_outputs;
         return std::thread::scope(|scope| {
+            let right_outputs = shared_outputs;
             let right_worker = scope.spawn(move || {
+                let mut projection = RichFlowProjection::Borrowed(right_outputs);
                 materialize_project_definition_batch(
                     right,
                     artifact,
+                    &mut projection,
                     public_results,
                     public_formals,
                     owner_effects,
                 )
             });
+            let mut projection = RichFlowProjection::Borrowed(shared_outputs);
             let left = materialize_project_definition_batch(
                 materializations,
                 artifact,
+                &mut projection,
                 public_results,
                 public_formals,
                 owner_effects,
@@ -2854,9 +2930,15 @@ fn materialize_project_definitions(
         });
     }
 
+    let mut remaining = expression_flow_use_counts(&materializations, rich_outputs.slot_count());
+    let mut projection = RichFlowProjection::Consuming {
+        outputs: rich_outputs,
+        remaining: &mut remaining,
+    };
     materialize_project_definition_batch(
         materializations,
         artifact,
+        &mut projection,
         public_results,
         public_formals,
         owner_effects,
@@ -2867,6 +2949,7 @@ fn materialize_project_definitions(
 fn materialize_project_definition_batch(
     materializations: Vec<ProjectDefinitionMaterialization>,
     artifact: &ComponentArtifact,
+    flow_projection: &mut RichFlowProjection<'_>,
     public_results: &[FlowType],
     public_formals: &[Box<[FlowType]>],
     owner_effects: &[KernelEffectSummary],
@@ -2879,6 +2962,7 @@ fn materialize_project_definition_batch(
                 materialization.owner_index,
                 materialization.owner,
                 artifact,
+                flow_projection,
                 public_results,
                 public_formals,
                 materialization.call_facts,
@@ -2894,17 +2978,16 @@ fn materialize_project_definition_batch(
         .collect()
 }
 
-fn project_public_results<A: ComponentOutputs + ?Sized>(
+fn project_public_results(
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &A,
+    artifact: &ComponentOutputSnapshot,
 ) -> Box<[FlowType]> {
     owners
         .iter()
         .map(|owner| {
             let mut result = artifact
-                .output(owner.result)
+                .flow_type(owner.result)
                 .expect("project owner result belongs to its component")
-                .flow_type
                 .clone();
             let result_index = owner
                 .expressions
@@ -2924,7 +3007,7 @@ fn project_public_results<A: ComponentOutputs + ?Sized>(
 /// both public interfaces and runtime value types.
 fn project_expression_flush_types(
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &ComponentArtifact,
+    artifact: &ComponentOutputSnapshot,
     public_results: &[FlowType],
 ) -> Box<[Box<[Option<Type>]>]> {
     let mut offsets = Vec::with_capacity(owners.len() + 1);
@@ -3003,7 +3086,7 @@ fn project_expression_flush_types(
                         artifact,
                         public_results,
                     ) {
-                        bases[index].push(payload);
+                        bases[index].push(payload.clone());
                     }
                 }
             }
@@ -3067,9 +3150,9 @@ fn solve_flush_graph(bases: Vec<Vec<Type>>, dependencies: Vec<Vec<usize>>) -> Ve
     values
 }
 
-fn project_public_formals<A: ComponentOutputs + ?Sized>(
+fn project_public_formals(
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &A,
+    artifact: &ComponentOutputSnapshot,
 ) -> Box<[Box<[FlowType]>]> {
     owners
         .iter()
@@ -3080,9 +3163,8 @@ fn project_public_formals<A: ComponentOutputs + ?Sized>(
                 .zip(owner.formal_modes.iter().copied())
                 .map(|(output, mode)| {
                     let mut flow = artifact
-                        .output(*output)
+                        .flow_type(*output)
                         .expect("project owner formal belongs to its component")
-                        .flow_type
                         .clone();
                     flow.mode = mode;
                     flow
@@ -3215,7 +3297,7 @@ fn direct_expression_effect(
 
 fn interface_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputId]> {
     fn insert_value(
-        outputs: &mut BTreeSet<OutputId>,
+        outputs: &mut Vec<OutputId>,
         owners: &[KernelProjectOwnerOutputs],
         caller: usize,
         value: KernelValueReference,
@@ -3236,14 +3318,20 @@ fn interface_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputI
                 .and_then(|owner| owner.expressions.get(expression.0 as usize)),
         };
         if let Some(output) = output {
-            outputs.insert(*output);
+            outputs.push(*output);
         }
     }
 
-    let mut outputs = BTreeSet::new();
+    let estimated = owners
+        .iter()
+        .map(|owner| {
+            owner.formals.len() + owner.calls.len() * 2 + owner.diagnostic_values.len() + 1
+        })
+        .sum();
+    let mut outputs = Vec::with_capacity(estimated);
     for (owner_index, owner) in owners.iter().enumerate() {
-        outputs.insert(owner.result);
-        outputs.extend(owner.formals.iter().copied());
+        outputs.push(owner.result);
+        outputs.extend_from_slice(&owner.formals);
         for call in owner.calls.iter() {
             for input in call.inputs.iter() {
                 insert_value(&mut outputs, owners, owner_index, input.value);
@@ -3253,12 +3341,35 @@ fn interface_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputI
             insert_value(&mut outputs, owners, owner_index, value);
         }
     }
-    outputs.into_iter().collect::<Vec<_>>().into_boxed_slice()
+    outputs.sort_unstable();
+    outputs.dedup();
+    outputs.into_boxed_slice()
 }
 
-fn project_interface_snapshot<A: ComponentOutputs + ?Sized>(
+fn checked_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputId]> {
+    let capacity = owners
+        .iter()
+        .map(|owner| owner.expressions.len() + owner.formals.len() + owner.calls.len())
+        .sum();
+    let mut outputs = Vec::with_capacity(capacity);
+    for owner in owners {
+        outputs.extend_from_slice(&owner.expressions);
+        outputs.extend_from_slice(&owner.formals);
+        outputs.extend(
+            owner
+                .calls
+                .iter()
+                .filter_map(|call| call.syntax_discriminated_root_output),
+        );
+    }
+    outputs.sort_unstable();
+    outputs.dedup();
+    outputs.into_boxed_slice()
+}
+
+fn project_interface_snapshot(
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &A,
+    artifact: &ComponentOutputSnapshot,
     solved_results: &[FlowType],
     solved_formals: &[Box<[FlowType]>],
     solved_diagnostics: &[Box<[KernelDiagnosticArtifact]>],
@@ -3274,6 +3385,7 @@ fn project_interface_snapshot<A: ComponentOutputs + ?Sized>(
             .map(|value| {
                 project_call_value_type(owner, *value, owners, artifact, solved_results)
                     .expect("validated diagnostic value has a solved provider")
+                    .clone()
             })
             .collect::<Vec<_>>();
         let (formals, result, owner_diagnostics, owner_value_types) =
@@ -3320,9 +3432,9 @@ fn project_interface_snapshot<A: ComponentOutputs + ?Sized>(
 /// interfaces. Complete checked demand additionally retains substitutions and
 /// exact call-result syntax receipts; diagnostics demand deliberately neither
 /// computes nor roots those checked-only facts.
-fn project_call_facts_and_diagnostics<A: ComponentOutputs + ?Sized>(
+fn project_call_facts_and_diagnostics(
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &A,
+    artifact: &ComponentOutputSnapshot,
     public_results: &[FlowType],
     public_formals: &[Box<[FlowType]>],
     retain_call_facts: bool,
@@ -3373,9 +3485,9 @@ fn project_call_facts_and_diagnostics<A: ComponentOutputs + ?Sized>(
                         .get(owner_index)
                         .and_then(|formals| formals.get(inherited.caller_ordinal as usize))
                 {
-                    actuals.push((inherited.target_ordinal, actual.ty.clone()));
+                    actuals.push((inherited.target_ordinal, &actual.ty));
                 }
-                let substitutions = derive_kernel_call_type_substitutions(
+                let substitutions = derive_kernel_call_type_substitutions_from_refs(
                     target_formals,
                     target_result,
                     &actuals,
@@ -3419,9 +3531,10 @@ fn project_call_facts_and_diagnostics<A: ComponentOutputs + ?Sized>(
                         target_result,
                         &substitutions,
                     );
-                    if kernel_type_is_assignable_to(&actual, &expected) {
+                    if kernel_type_is_assignable_to(actual, &expected) {
                         continue;
                     }
+                    let mismatch = kernel_type_mismatch(actual, &expected);
                     diagnostics.push(KernelDiagnosticArtifact {
                         owner: owner_id,
                         severity: KernelDiagnosticSeverity::Error,
@@ -3431,8 +3544,8 @@ fn project_call_facts_and_diagnostics<A: ComponentOutputs + ?Sized>(
                             formal_ordinal: ordinal,
                         },
                         kind: KernelDiagnosticKind::CallInputType {
-                            mismatch: kernel_type_mismatch(&actual, &expected),
-                            actual,
+                            mismatch,
+                            actual: actual.clone(),
                             expected,
                         },
                     });
@@ -3444,12 +3557,17 @@ fn project_call_facts_and_diagnostics<A: ComponentOutputs + ?Sized>(
             if !retain_call_facts {
                 continue;
             }
-            let result_output = owner
+            let result_flow = owner
                 .expressions
                 .get(call.expression.0 as usize)
-                .and_then(|output| artifact.output(*output));
-            let result_is_concrete = result_output
-                .is_some_and(|output| type_has_concrete_outer_shape(&output.flow_type.ty));
+                .and_then(|output| artifact.flow_type(*output));
+            let result_flags = owner
+                .expressions
+                .get(call.expression.0 as usize)
+                .and_then(|output| artifact.output_flags(*output));
+            let result_is_concrete = result_flow
+                .as_ref()
+                .is_some_and(|output| type_has_concrete_outer_shape(&output.ty));
             let exact_structural_constructor = matches!(
                 &call.target,
                 KernelCallTarget::RenderConstructor { .. }
@@ -3468,11 +3586,11 @@ fn project_call_facts_and_diagnostics<A: ComponentOutputs + ?Sized>(
                 syntax_discriminated_result: (exact_structural_constructor
                     || call.syntax_discriminated_candidate
                     || (matches!(&call.target, KernelCallTarget::User { .. })
-                        && result_output.is_some_and(|output| {
+                        && result_flags.is_some_and(|output| {
                             output.call_syntax_selected
                                 || call
                                     .syntax_discriminated_root_output
-                                    .and_then(|output| artifact.output(output))
+                                    .and_then(|output| artifact.output_flags(output))
                                     .is_some_and(|output| output.syntax_selected_here)
                         })))
                     && result_is_concrete,
@@ -3488,26 +3606,26 @@ fn project_call_facts_and_diagnostics<A: ComponentOutputs + ?Sized>(
     )
 }
 
-fn project_call_value_type<A: ComponentOutputs + ?Sized>(
+fn project_call_value_type<'a>(
     caller: usize,
     value: KernelValueReference,
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &A,
-    public_results: &[FlowType],
-) -> Option<Type> {
+    artifact: &'a ComponentOutputSnapshot,
+    public_results: &'a [FlowType],
+) -> Option<&'a Type> {
     match value {
         KernelValueReference::Local(expression) => owners
             .get(caller)?
             .expressions
             .get(expression.0 as usize)
-            .and_then(|output| artifact.output(*output))
-            .map(|output| output.flow_type.ty.clone()),
+            .and_then(|output| artifact.flow_type(*output))
+            .map(|output| &output.ty),
         KernelValueReference::External(KernelExternalExpression {
             owner,
             target: KernelExternalTarget::Result,
         }) => public_results
             .get(owner.0 as usize)
-            .map(|result| result.ty.clone()),
+            .map(|result| &result.ty),
         KernelValueReference::External(KernelExternalExpression {
             owner,
             target: KernelExternalTarget::Expression(expression),
@@ -3515,8 +3633,8 @@ fn project_call_value_type<A: ComponentOutputs + ?Sized>(
             .get(owner.0 as usize)?
             .expressions
             .get(expression.0 as usize)
-            .and_then(|output| artifact.output(*output))
-            .map(|output| output.flow_type.ty.clone()),
+            .and_then(|output| artifact.flow_type(*output))
+            .map(|output| &output.ty),
     }
 }
 
@@ -3799,6 +3917,7 @@ fn materialize_project_definition(
     owner_index: usize,
     owner: KernelProjectOwnerOutputs,
     artifact: &ComponentArtifact,
+    flow_projection: &mut RichFlowProjection<'_>,
     public_results: &[FlowType],
     public_formals: &[Box<[FlowType]>],
     call_facts: Box<[SolvedKernelCallFacts]>,
@@ -3820,7 +3939,7 @@ fn materialize_project_definition(
                     artifact
                         .output(*output)
                         .expect("project owner formal belongs to its component")
-                        .term,
+                        .term(),
                     mode,
                 )
             })
@@ -3829,7 +3948,7 @@ fn materialize_project_definition(
             artifact
                 .output(owner.result)
                 .expect("project owner result belongs to its component")
-                .term,
+                .term(),
             result.mode,
         ),
         &owner
@@ -3841,7 +3960,7 @@ fn materialize_project_definition(
                     artifact
                         .output(*output)
                         .expect("project owner expression belongs to its component")
-                        .term,
+                        .term(),
                     mode,
                 )
             })
@@ -3853,11 +3972,7 @@ fn materialize_project_definition(
         .iter()
         .zip(owner.expression_modes.iter().copied())
         .map(|(output, mode)| {
-            let mut flow = artifact
-                .output(*output)
-                .expect("project owner expression belongs to its component")
-                .flow_type
-                .clone();
+            let mut flow = flow_projection.materialize(*output);
             flow.mode = mode;
             flow
         })
@@ -4783,6 +4898,19 @@ pub fn compile_owner_program_with_definition_facts(
     input: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
+    let text = crate::text::build_project_text_snapshot(
+        std::slice::from_ref(input),
+        std::slice::from_ref(facts),
+        &crate::KernelAbiInput::default(),
+    )?;
+    compile_owner_program_with_definition_facts_and_text(input, facts, text)
+}
+
+fn compile_owner_program_with_definition_facts_and_text(
+    input: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+    text: ProjectTextSnapshot,
+) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
     validate_definition_linker_facts(input, facts, None)?;
     let basis_fingerprint_v14 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
@@ -4841,7 +4969,7 @@ pub fn compile_owner_program_with_definition_facts(
         ));
     }
     let result = checked_expression_index(input.result, input.nodes.len(), "owner result")?;
-    let mut builder = ComponentProgramBuilder::new();
+    let mut builder = ComponentProgramBuilder::with_text(text.clone());
     let mut mode_builder = ModeProgramBuilder::default();
     let formal_static_variants = vec![None; input.formal_count as usize];
     let formal_dependent_expressions = [owner_expressions_depend_on_formals(input)];
@@ -4884,6 +5012,7 @@ pub fn compile_owner_program_with_definition_facts(
         transparent_type_providers: vec![None; input.nodes.len()].into_boxed_slice(),
     };
     let module = compile_residual_type_module(
+        &text,
         KernelOwnerId(0),
         input,
         None,
@@ -5913,17 +6042,17 @@ fn materialize_user_call_type_substitutions(
         let Some(actual) = call_value_flow(input.value, expressions, public_results) else {
             continue;
         };
-        actuals.push((ordinal, actual.ty.clone()));
+        actuals.push((ordinal, &actual.ty));
     }
     if let Some(inherited) = inherited_formal
         && let Some(actual) = public_formals
             .get(owner.0 as usize)
             .and_then(|formals| formals.get(inherited.caller_ordinal as usize))
     {
-        actuals.push((inherited.target_ordinal, actual.ty.clone()));
+        actuals.push((inherited.target_ordinal, &actual.ty));
     }
 
-    derive_kernel_call_type_substitutions(target_formals, target_result, &actuals, None)
+    derive_kernel_call_type_substitutions_from_refs(target_formals, target_result, &actuals, None)
 }
 
 /// Derive the canonical substitution environment for one callable
@@ -5936,6 +6065,34 @@ pub fn derive_kernel_call_type_substitutions(
     actuals: &[(u32, Type)],
     actual_result: Option<&Type>,
 ) -> Box<[KernelCallTypeSubstitution]> {
+    derive_kernel_call_type_substitutions_iter(
+        target_formals,
+        target_result,
+        actuals.iter().map(|(ordinal, actual)| (*ordinal, actual)),
+        actual_result,
+    )
+}
+
+fn derive_kernel_call_type_substitutions_from_refs(
+    target_formals: &[FlowType],
+    target_result: &FlowType,
+    actuals: &[(u32, &Type)],
+    actual_result: Option<&Type>,
+) -> Box<[KernelCallTypeSubstitution]> {
+    derive_kernel_call_type_substitutions_iter(
+        target_formals,
+        target_result,
+        actuals.iter().map(|(ordinal, actual)| (*ordinal, *actual)),
+        actual_result,
+    )
+}
+
+fn derive_kernel_call_type_substitutions_iter<'a>(
+    target_formals: &[FlowType],
+    target_result: &FlowType,
+    actuals: impl IntoIterator<Item = (u32, &'a Type)>,
+    actual_result: Option<&Type>,
+) -> Box<[KernelCallTypeSubstitution]> {
     let mut parameter_ids = BTreeMap::new();
     for formal in target_formals {
         collect_callable_type_parameters(&formal.ty, &mut parameter_ids);
@@ -5944,7 +6101,7 @@ pub fn derive_kernel_call_type_substitutions(
 
     let mut substitutions = BTreeMap::new();
     for (ordinal, actual) in actuals {
-        let Some(pattern) = target_formals.get(*ordinal as usize) else {
+        let Some(pattern) = target_formals.get(ordinal as usize) else {
             continue;
         };
         match_call_type_pattern(&pattern.ty, actual, &mut substitutions);
@@ -6687,6 +6844,26 @@ pub fn compile_project_program_with_definition_facts(
             facts.len()
         )));
     }
+    let text = crate::text::build_project_text_snapshot(
+        &input.owners,
+        facts,
+        &crate::KernelAbiInput::default(),
+    )?;
+    compile_project_program_with_definition_facts_and_text(input, facts, text)
+}
+
+pub(crate) fn compile_project_program_with_definition_facts_and_text(
+    input: &KernelProjectProgramInput,
+    facts: &[KernelDefinitionFactsInput],
+    text: ProjectTextSnapshot,
+) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
+    if facts.len() != input.owners.len() {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel project has {} owners but {} definition-fact tables",
+            input.owners.len(),
+            facts.len()
+        )));
+    }
     let validate_project_declaration = |reference: KernelDeclarationReference,
                                         definition: usize,
                                         context: &str|
@@ -6776,7 +6953,7 @@ pub fn compile_project_program_with_definition_facts(
             validate_resource_statement_owner(list.statement, "LIST statement")?;
         }
     }
-    let mut builder = ComponentProgramBuilder::new();
+    let mut builder = ComponentProgramBuilder::with_text(text.clone());
     let mut mode_builder = ModeProgramBuilder::default();
     let mut invocations = HashMap::new();
     let mut specializations = HashMap::new();
@@ -6913,6 +7090,7 @@ pub fn compile_project_program_with_definition_facts(
             transparent_type_providers: vec![None; owner.nodes.len()].into_boxed_slice(),
         };
         let module = compile_residual_type_module(
+            &text,
             owner_id,
             owner,
             Some(input),
@@ -7987,6 +8165,7 @@ fn owner_expressions_depend_on_formals(owner: &KernelOwnerProgramInput) -> Box<[
 }
 
 fn compile_residual_type_module(
+    text: &ProjectTextSnapshot,
     owner_id: KernelOwnerId,
     owner: &KernelOwnerProgramInput,
     project: Option<&KernelProjectProgramInput>,
@@ -7998,7 +8177,7 @@ fn compile_residual_type_module(
     invocation_dependencies: Option<&[bool]>,
     initial_state_surface: bool,
 ) -> Result<Arc<ResidualTypeModule>, KernelOwnerBuildError> {
-    let mut builder = ComponentProgramBuilder::new();
+    let mut builder = ComponentProgramBuilder::with_text(text.clone());
     let mut mode_builder = ModeProgramBuilder::default();
     let residual_transparent_type_providers = invocation_dependencies.map(|dependencies| {
         specialization
@@ -8406,6 +8585,7 @@ fn instantiate_owner(
         Arc::clone(module)
     } else {
         let module = compile_residual_type_module(
+            builder.terms().text_snapshot(),
             target,
             owner,
             Some(project),
@@ -8735,7 +8915,7 @@ const SHARED_SUMMARY_MIN_NODES: usize = 128;
 enum DirectSummaryInput {
     FormalProjection {
         formal: u32,
-        fields: Box<[crate::NameId]>,
+        fields: Box<[SymbolId]>,
         parameter_derived: bool,
     },
     External {
@@ -8786,8 +8966,7 @@ struct DirectSummaryPlanCompiler<'a> {
     summaries: &'a [Option<Arc<CompiledDirectSummary>>],
     nodes: Vec<KernelSummaryNode>,
     inputs: Vec<DirectSummaryInput>,
-    formal_projection_inputs:
-        HashMap<(u32, Box<[crate::NameId]>, bool), (u32, KernelSummaryValueId)>,
+    formal_projection_inputs: HashMap<(u32, Box<[SymbolId]>, bool), (u32, KernelSummaryValueId)>,
 }
 
 impl DirectSummaryPlanCompiler<'_> {
@@ -8814,7 +8993,7 @@ impl DirectSummaryPlanCompiler<'_> {
     fn push_formal_projection(
         &mut self,
         formal: u32,
-        fields: Box<[crate::NameId]>,
+        fields: Box<[SymbolId]>,
         parameter_derived: bool,
     ) -> PlannedSummaryValue {
         let key = (formal, fields.clone(), parameter_derived);
@@ -8884,7 +9063,7 @@ impl DirectSummaryPlanCompiler<'_> {
     fn project_interned_formal_value(
         &mut self,
         value: PlannedSummaryValue,
-        fields: &[crate::NameId],
+        fields: &[SymbolId],
     ) -> Option<PlannedSummaryValue> {
         if fields.is_empty() {
             return Some(value);
@@ -9830,7 +10009,7 @@ fn fold_constant_summary_nodes(
 /// singleton selector now performs one decision instead of one per field.
 fn fuse_constant_summary_record_selectors(
     builder: &mut ComponentProgramBuilder,
-    tag: Option<crate::NameId>,
+    tag: Option<SymbolId>,
     entries: &[KernelSummaryRecordEntry],
     nodes: &[KernelSummaryNode],
     constants: &[Option<TypeTermId>],
@@ -10443,7 +10622,7 @@ fn summary_constant(
 fn constant_summary_projection(
     builder: &mut ComponentProgramBuilder,
     provider: KernelSummaryValueId,
-    fields: &[crate::NameId],
+    fields: &[SymbolId],
     constants: &[Option<TypeTermId>],
 ) -> Option<TypeTermId> {
     let mut provider = summary_constant(constants, provider)?;
@@ -10461,7 +10640,7 @@ fn constant_summary_projection(
 fn constant_summary_project_field(
     builder: &mut ComponentProgramBuilder,
     provider: TypeTermId,
-    field: crate::NameId,
+    field: SymbolId,
 ) -> Option<TypeTermId> {
     match builder.terms().term_head(provider) {
         TypeTermHead::Object { shape, .. } => builder.terms().lookup_object_field(shape, field),
@@ -10593,11 +10772,11 @@ fn constant_summary_pattern_accepts(
 
 fn constant_summary_record(
     builder: &mut ComponentProgramBuilder,
-    tag: Option<crate::NameId>,
+    tag: Option<SymbolId>,
     entries: &[KernelSummaryRecordEntry],
     constants: &[Option<TypeTermId>],
 ) -> Option<TypeTermId> {
-    let mut fields = Vec::<(crate::NameId, TypeTermId)>::new();
+    let mut fields = Vec::<(SymbolId, TypeTermId)>::new();
     for entry in entries {
         match entry {
             KernelSummaryRecordEntry::Field { name, value } => {
@@ -10617,8 +10796,8 @@ fn constant_summary_record(
 
 fn intern_constant_summary_record(
     builder: &mut ComponentProgramBuilder,
-    tag: Option<crate::NameId>,
-    fields: Vec<(crate::NameId, TypeTermId)>,
+    tag: Option<SymbolId>,
+    fields: Vec<(SymbolId, TypeTermId)>,
 ) -> TypeTermId {
     let object = builder.terms_mut().object(fields, false);
     if let Some(tag) = tag {
@@ -10633,7 +10812,7 @@ fn intern_constant_summary_record(
 fn merge_constant_summary_spread(
     builder: &mut ComponentProgramBuilder,
     spread: TypeTermId,
-    fields: &mut Vec<(crate::NameId, TypeTermId)>,
+    fields: &mut Vec<(SymbolId, TypeTermId)>,
 ) -> bool {
     match builder.terms().term_head(spread) {
         TypeTermHead::Object { shape, .. } => {
@@ -10664,8 +10843,8 @@ fn merge_constant_summary_spread(
 }
 
 fn insert_constant_summary_field(
-    fields: &mut Vec<(crate::NameId, TypeTermId)>,
-    name: crate::NameId,
+    fields: &mut Vec<(SymbolId, TypeTermId)>,
+    name: SymbolId,
     value: TypeTermId,
 ) {
     if let Some((_, current)) = fields.iter_mut().find(|(candidate, _)| *candidate == name) {
@@ -12247,7 +12426,7 @@ fn publish_selected_edges(
 fn requirement_projection(
     builder: &mut ComponentProgramBuilder,
     root: TypeVariableId,
-    fields: &[crate::NameId],
+    fields: &[SymbolId],
 ) -> TypeVariableId {
     let mut provider = root;
     for field in fields {
@@ -14497,8 +14676,7 @@ mod tests {
         let output = builder.add_output(item, FlowMode::Continuous);
 
         let artifact = solve_component(builder.finish()).unwrap();
-        let Type::Object(requirement_shape) =
-            &artifact.output(requirement_output).unwrap().flow_type.ty
+        let Type::Object(requirement_shape) = &artifact.output_flow(requirement_output).unwrap().ty
         else {
             panic!("callback requirement must produce an open object")
         };
@@ -14510,7 +14688,7 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["click_time".to_owned(), "state".to_owned()])
         );
-        let Type::Object(shape) = &artifact.output(output).unwrap().flow_type.ty else {
+        let Type::Object(shape) = &artifact.output_flow(output).unwrap().ty else {
             panic!("callback item requirement must produce an open object")
         };
         assert!(shape.open);
@@ -18640,7 +18818,7 @@ mod tests {
         let result = builder.add_output(output, FlowMode::Continuous);
         let artifact = solve_component(builder.finish()).expect("fused summary solves");
         assert_eq!(
-            artifact.output(result).unwrap().flow_type.ty,
+            artifact.output_flow(result).unwrap().ty,
             Type::object(ObjectShape::from_ordered_fields(
                 [
                     ("value".to_owned(), Type::Number),

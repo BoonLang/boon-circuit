@@ -16,7 +16,7 @@ use crate::{
     ProducerConfiguration, compiler_allocation_counters, reset_compiler_allocation_counters,
 };
 
-const FORMAT_VERSION: u16 = 8;
+const FORMAT_VERSION: u16 = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -269,6 +269,12 @@ struct AllocationSample {
     allocated_bytes: u64,
     deallocation_calls: u64,
     deallocated_bytes: u64,
+    /// Index zero is size <= 1; index N is size <= 2^N bytes.
+    allocation_calls_by_ceil_log2_size: [u64; crate::allocator::ALLOCATION_SIZE_CLASS_COUNT],
+    /// Same buckets as `allocation_calls_by_ceil_log2_size`, summing requested
+    /// bytes rather than calls.
+    allocated_bytes_by_ceil_log2_size: [u64; crate::allocator::ALLOCATION_SIZE_CLASS_COUNT],
+    largest_allocation_sizes: [u64; 32],
 }
 
 impl From<CompilerAllocationCounters> for AllocationSample {
@@ -278,6 +284,9 @@ impl From<CompilerAllocationCounters> for AllocationSample {
             allocated_bytes: value.allocated_bytes,
             deallocation_calls: value.deallocation_calls,
             deallocated_bytes: value.deallocated_bytes,
+            allocation_calls_by_ceil_log2_size: value.allocation_calls_by_ceil_log2_size,
+            allocated_bytes_by_ceil_log2_size: value.allocated_bytes_by_ceil_log2_size,
+            largest_allocation_sizes: value.largest_allocation_sizes,
         }
     }
 }

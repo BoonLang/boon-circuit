@@ -6,7 +6,8 @@ use crate::{
     KernelRecordEntry, KernelSelectArm, KernelSolveError, KernelSolveWork, KernelSummaryCallInput,
     KernelSummaryNode, KernelSummaryProgram, KernelSummaryProjectionStep, KernelSummaryRecordEntry,
     KernelSummarySelectArm, KernelSummaryValueId, OutputId, PackedCallFactsInput,
-    PackedCallTypeSubstitution, PackedDiagnosticTypes, PackedFlow, PublishMode, TypeTerm,
+    PackedCallTypeSubstitution, PackedDiagnosticTypes, PackedFlow,
+    PackedResourceProjectionRequirementInput, PackedSourceReadInput, PublishMode, TypeTerm,
     TypeTermHead, TypeTermId, TypeVariableId, UnsealedComponentArtifact, VariantTerm,
     alpha_normalize_callable_interface_and_diagnostics, build_packed_snapshot_receipts,
     build_snapshot_receipts, definition_basis_fingerprint,
@@ -976,6 +977,10 @@ pub struct KernelOwnerProgram {
 pub struct KernelProjectProgram {
     component: ComponentProgram,
     owners: Box<[KernelProjectOwnerOutputs]>,
+    /// Exact immutable ABI metadata needed by post-solve packed publication.
+    /// Type equations have already consumed the ABI; retaining this shared
+    /// table avoids reconstructing contextual call behavior from checked DTOs.
+    abi: Arc<crate::KernelAbiInput>,
     compile_work: KernelCompileWork,
 }
 
@@ -985,6 +990,7 @@ pub struct KernelProjectProgram {
 pub(crate) struct KernelProjectSolveSession {
     component: ComponentSolveSession,
     owners: Box<[KernelProjectOwnerOutputs]>,
+    abi: Arc<crate::KernelAbiInput>,
     compile_work: KernelCompileWork,
 }
 
@@ -2535,7 +2541,7 @@ impl KernelCheckedSnapshot {
     ) -> Option<FlowType> {
         self.definition_code
             .definition(owner)?
-            .materialize_expression(expression.0 as usize)
+            .materialize_published_expression(expression.0 as usize)
     }
 
     pub fn call_facts(
@@ -2767,6 +2773,7 @@ impl KernelProjectProgram {
         Ok(KernelProjectSolveSession {
             component: ComponentSolveSession::new(self.component)?,
             owners: self.owners,
+            abi: self.abi,
             compile_work: self.compile_work,
         })
     }
@@ -2835,12 +2842,15 @@ impl KernelProjectSolveSession {
             &diagnostics,
         ));
         let flush_terms = project_expression_flush_terms(&self.owners, &mut artifact)?;
+        let resource_projection_facts =
+            project_resource_projection_facts(&self.owners, &self.abi, &mut artifact)?;
         let definition_code = build_definition_code_builder(
             &self.owners,
             &mut artifact,
             &flush_terms,
             &call_facts,
             &diagnostics,
+            &resource_projection_facts,
         )?;
         let artifact = artifact.seal();
         let definition_code = Arc::new(definition_code.finish(artifact.type_store())?);
@@ -2979,14 +2989,1956 @@ impl KernelSolvedProject {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ResourceDeclarationKey {
+    owner: KernelOwnerId,
+    declaration: KernelDeclarationId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ResourceExpressionKey {
+    owner: KernelOwnerId,
+    expression: KernelExpressionId,
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ResourceProjectionId(u32);
+
+impl ResourceProjectionId {
+    const ROOT: Self = Self(0);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResourceProjectionRow {
+    head: SymbolId,
+    tail: ResourceProjectionId,
+    depth: u32,
+}
+
+/// Phase-local authority for SOURCE projections.
+///
+/// A projection owns no strings and allocates no per-path object. Each unique
+/// `(head, tail)` cons cell is one packed row, so recursive provenance queries
+/// carry a four-byte ID rather than cloning `Vec<SymbolId>` at every step.
+#[derive(Default)]
+struct ResourceProjectionArena {
+    rows: Vec<ResourceProjectionRow>,
+    conses: HashMap<(SymbolId, ResourceProjectionId), ResourceProjectionId>,
+}
+
+impl ResourceProjectionArena {
+    fn with_capacity(edges: usize) -> Self {
+        Self {
+            rows: Vec::with_capacity(edges),
+            conses: HashMap::with_capacity(edges),
+        }
+    }
+
+    fn cons(&mut self, head: SymbolId, tail: ResourceProjectionId) -> ResourceProjectionId {
+        if let Some(existing) = self.conses.get(&(head, tail)) {
+            return *existing;
+        }
+        let id = ResourceProjectionId(
+            u32::try_from(self.rows.len())
+                .expect("kernel resource projection count exceeds u32")
+                .checked_add(1)
+                .expect("kernel resource projection namespace exhausted"),
+        );
+        let depth = self
+            .depth(tail)
+            .checked_add(1)
+            .expect("kernel resource projection depth exceeds u32");
+        self.rows.push(ResourceProjectionRow { head, tail, depth });
+        self.conses.insert((head, tail), id);
+        id
+    }
+
+    fn row(&self, id: ResourceProjectionId) -> Option<ResourceProjectionRow> {
+        id.0.checked_sub(1)
+            .and_then(|ordinal| self.rows.get(ordinal as usize))
+            .copied()
+    }
+
+    fn depth(&self, id: ResourceProjectionId) -> u32 {
+        self.row(id).map_or(0, |row| row.depth)
+    }
+
+    fn append(
+        &mut self,
+        prefix: ResourceProjectionId,
+        suffix: ResourceProjectionId,
+        symbols: &mut Vec<SymbolId>,
+    ) -> ResourceProjectionId {
+        symbols.clear();
+        self.extend_symbols(prefix, symbols);
+        let mut combined = suffix;
+        for symbol in symbols.drain(..).rev() {
+            combined = self.cons(symbol, combined);
+        }
+        combined
+    }
+
+    fn has_prefix(&self, mut path: ResourceProjectionId, mut prefix: ResourceProjectionId) -> bool {
+        while prefix != ResourceProjectionId::ROOT {
+            let Some(path_row) = self.row(path) else {
+                return false;
+            };
+            let prefix_row = self
+                .row(prefix)
+                .expect("non-root resource projection has a row");
+            if path_row.head != prefix_row.head {
+                return false;
+            }
+            path = path_row.tail;
+            prefix = prefix_row.tail;
+        }
+        true
+    }
+
+    fn suffix_after(
+        &self,
+        mut path: ResourceProjectionId,
+        mut prefix: ResourceProjectionId,
+    ) -> Option<ResourceProjectionId> {
+        while prefix != ResourceProjectionId::ROOT {
+            let path_row = self.row(path)?;
+            let prefix_row = self.row(prefix)?;
+            if path_row.head != prefix_row.head {
+                return None;
+            }
+            path = path_row.tail;
+            prefix = prefix_row.tail;
+        }
+        Some(path)
+    }
+
+    fn extend_symbols(&self, mut path: ResourceProjectionId, output: &mut Vec<SymbolId>) {
+        while let Some(row) = self.row(path) {
+            output.push(row.head);
+            path = row.tail;
+        }
+    }
+
+    fn segment_at(&self, mut path: ResourceProjectionId, ordinal: u32) -> Option<SymbolId> {
+        for _ in 0..ordinal {
+            path = self.row(path)?.tail;
+        }
+        self.row(path).map(|row| row.head)
+    }
+
+    fn compare(
+        &self,
+        text: &ProjectTextSnapshot,
+        left: ResourceProjectionId,
+        right: ResourceProjectionId,
+    ) -> std::cmp::Ordering {
+        let left_depth = self.depth(left);
+        let right_depth = self.depth(right);
+        for ordinal in 0..left_depth.min(right_depth) {
+            let left = self
+                .segment_at(left, ordinal)
+                .expect("resource projection segment is in range");
+            let right = self
+                .segment_at(right, ordinal)
+                .expect("resource projection segment is in range");
+            let order = text
+                .compare_symbols(left, right)
+                .unwrap_or_else(|_| left.as_u32().cmp(&right.as_u32()));
+            if order != std::cmp::Ordering::Equal {
+                return order;
+            }
+        }
+        left_depth.cmp(&right_depth)
+    }
+}
+
+fn intern_resource_projection_path(
+    text: &ProjectTextSnapshot,
+    paths: &mut ResourceProjectionArena,
+    path: &[Box<str>],
+) -> Result<ResourceProjectionId, KernelSolveError> {
+    let mut projection = ResourceProjectionId::ROOT;
+    for segment in path.iter().rev() {
+        let symbol = text.lookup_symbol(segment).ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel resource provenance symbol `{segment}` is absent from the project text authority"
+            ))
+        })?;
+        projection = paths.cons(symbol, projection);
+    }
+    Ok(projection)
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ResourceSourceRead {
+    owner: KernelOwnerId,
+    source: KernelSourceId,
+    payload_projection: ResourceProjectionId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ResourceResolution {
+    Declaration(ResourceDeclarationKey, ResourceProjectionId),
+    Expression(ResourceExpressionKey, ResourceProjectionId),
+    ListItem(ResourceExpressionKey, ResourceProjectionId),
+    Output(ResourceDeclarationKey, ResourceProjectionId),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResourceLexicalIndex {
+    ordinal: u32,
+    projection: ResourceProjectionId,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResourceSourceSpan {
+    start: u32,
+    len: u32,
+}
+
+#[derive(Default)]
+struct ResourceTraversalScratch {
+    explored: HashSet<ResourceResolution>,
+    active: HashSet<ResourceResolutionNode>,
+    resolved: Vec<ResourceSourceRead>,
+    symbols: Vec<SymbolId>,
+}
+
+impl ResourceTraversalScratch {
+    fn reset(&mut self) {
+        self.explored.clear();
+        self.active.clear();
+        self.resolved.clear();
+        self.symbols.clear();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ResourceResolutionNode {
+    Declaration(ResourceDeclarationKey),
+    Expression(ResourceExpressionKey),
+    ListItem(ResourceExpressionKey),
+    Output(ResourceDeclarationKey),
+}
+
+impl ResourceResolution {
+    const fn node(&self) -> ResourceResolutionNode {
+        match self {
+            Self::Declaration(declaration, _) => ResourceResolutionNode::Declaration(*declaration),
+            Self::Expression(expression, _) => ResourceResolutionNode::Expression(*expression),
+            Self::ListItem(expression, _) => ResourceResolutionNode::ListItem(*expression),
+            Self::Output(declaration, _) => ResourceResolutionNode::Output(*declaration),
+        }
+    }
+}
+
+#[derive(Default)]
+struct DefinitionResourceProjectionFacts {
+    requirements: Vec<ResourceProjectionRequirementFact>,
+    origins: Vec<PackedSourceReadInput>,
+    symbols: Vec<SymbolId>,
+}
+
+#[derive(Clone, Copy)]
+struct ResourceProjectionRequirementFact {
+    expression: KernelExpressionId,
+    target: KernelDeclarationReference,
+    projection_start: u32,
+    projection_len: u32,
+    origin_start: u32,
+    origin_len: u32,
+    required_term: TypeTermId,
+    publishes_required_type: bool,
+}
+
+struct ResourceProjectionResolver<'a> {
+    owners: &'a [KernelProjectOwnerOutputs],
+    abi: &'a crate::KernelAbiInput,
+    text: ProjectTextSnapshot,
+    lexical_by_expression: Box<[Box<[Option<ResourceLexicalIndex>]>]>,
+    call_by_expression: Box<[Box<[Option<usize>]>]>,
+    shape_by_expression: Box<[Box<[Option<usize>]>]>,
+    paths: ResourceProjectionArena,
+    source_paths: HashMap<ResourceDeclarationKey, Vec<(ResourceProjectionId, ResourceSourceRead)>>,
+    source_expressions: HashMap<ResourceExpressionKey, Vec<ResourceSourceRead>>,
+    actual_inputs_by_formal: HashMap<ResourceDeclarationKey, Vec<ResourceExpressionKey>>,
+    contextual_lists_by_output: HashMap<ResourceDeclarationKey, Vec<ResourceExpressionKey>>,
+    forwarded_outputs_by_formal: HashMap<ResourceDeclarationKey, Vec<ResourceDeclarationKey>>,
+    declaration_cache: HashMap<(ResourceDeclarationKey, ResourceProjectionId), ResourceSourceSpan>,
+    cached_sources: Vec<ResourceSourceRead>,
+    scratch: ResourceTraversalScratch,
+}
+
+impl<'a> ResourceProjectionResolver<'a> {
+    fn new(
+        owners: &'a [KernelProjectOwnerOutputs],
+        abi: &'a crate::KernelAbiInput,
+        text: ProjectTextSnapshot,
+    ) -> Result<Self, KernelSolveError> {
+        let authored_projection_edges = owners
+            .iter()
+            .map(|owner| {
+                owner
+                    .lexical_bindings
+                    .iter()
+                    .map(|binding| binding.projection.len())
+                    .sum::<usize>()
+                    + owner
+                        .resources
+                        .sources
+                        .iter()
+                        .map(|source| source.path.projection.len())
+                        .sum::<usize>()
+            })
+            .sum();
+        let mut paths = ResourceProjectionArena::with_capacity(authored_projection_edges);
+        let lexical_by_expression = owners
+            .iter()
+            .enumerate()
+            .map(|(owner_index, owner)| {
+                let mut index = vec![None; owner.expressions.len()];
+                for (ordinal, binding) in owner.lexical_bindings.iter().enumerate() {
+                    let projection =
+                        intern_resource_projection_path(&text, &mut paths, &binding.projection)?;
+                    let slot = index
+                        .get_mut(binding.expression.0 as usize)
+                        .ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "kernel resource provenance owner {owner_index} lexical expression {} is out of range",
+                                binding.expression.0
+                            ))
+                        })?;
+                    let ordinal = u32::try_from(ordinal).map_err(|_| {
+                        KernelSolveError::new(
+                            "kernel resource provenance lexical binding count exceeds u32",
+                        )
+                    })?;
+                    if slot
+                        .replace(ResourceLexicalIndex {
+                            ordinal,
+                            projection,
+                        })
+                        .is_some()
+                    {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel resource provenance owner {owner_index} repeats lexical expression {}",
+                            binding.expression.0
+                        )));
+                    }
+                }
+                Ok(index.into_boxed_slice())
+            })
+            .collect::<Result<Vec<_>, KernelSolveError>>()?
+            .into_boxed_slice();
+        let call_by_expression = owners
+            .iter()
+            .enumerate()
+            .map(|(owner_index, owner)| {
+                let mut index = vec![None; owner.expressions.len()];
+                for (ordinal, call) in owner.calls.iter().enumerate() {
+                    let slot = index
+                        .get_mut(call.expression.0 as usize)
+                        .ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "kernel resource provenance owner {owner_index} call expression {} is out of range",
+                                call.expression.0
+                            ))
+                        })?;
+                    if slot.replace(ordinal).is_some() {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel resource provenance owner {owner_index} repeats call expression {}",
+                            call.expression.0
+                        )));
+                    }
+                }
+                Ok(index.into_boxed_slice())
+            })
+            .collect::<Result<Vec<_>, KernelSolveError>>()?
+            .into_boxed_slice();
+        let shape_by_expression = owners
+            .iter()
+            .enumerate()
+            .map(|(owner_index, owner)| {
+                let mut index = vec![None; owner.expressions.len()];
+                for (ordinal, shape) in owner.execution_shapes.iter().enumerate() {
+                    let slot = index
+                        .get_mut(shape.expression().0 as usize)
+                        .ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "kernel resource provenance owner {owner_index} execution shape {} is out of range",
+                                shape.expression().0
+                            ))
+                        })?;
+                    if slot.replace(ordinal).is_some() {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel resource provenance owner {owner_index} repeats execution shape {}",
+                            shape.expression().0
+                        )));
+                    }
+                }
+                Ok(index.into_boxed_slice())
+            })
+            .collect::<Result<Vec<_>, KernelSolveError>>()?
+            .into_boxed_slice();
+
+        let mut resolver = Self {
+            owners,
+            abi,
+            text,
+            lexical_by_expression,
+            call_by_expression,
+            shape_by_expression,
+            paths,
+            source_paths: HashMap::new(),
+            source_expressions: HashMap::new(),
+            actual_inputs_by_formal: HashMap::new(),
+            contextual_lists_by_output: HashMap::new(),
+            forwarded_outputs_by_formal: HashMap::new(),
+            declaration_cache: HashMap::new(),
+            cached_sources: Vec::new(),
+            scratch: ResourceTraversalScratch::default(),
+        };
+        resolver.index_sources()?;
+        resolver.index_calls()?;
+        Ok(resolver)
+    }
+
+    fn symbol(&self, value: &str) -> Result<SymbolId, KernelSolveError> {
+        self.text.lookup_symbol(value).ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel resource provenance symbol `{value}` is absent from the project text authority"
+            ))
+        })
+    }
+
+    fn owner(&self, owner: KernelOwnerId) -> Option<&'a KernelProjectOwnerOutputs> {
+        self.owners.get(owner.0 as usize)
+    }
+
+    fn declaration_key(
+        &self,
+        owner: KernelOwnerId,
+        reference: KernelDeclarationReference,
+    ) -> Option<ResourceDeclarationKey> {
+        let mut owner = owner;
+        let mut reference = reference;
+        let mut remaining = self.owners.len().saturating_add(1);
+        loop {
+            if remaining == 0 {
+                return None;
+            }
+            remaining -= 1;
+            match reference {
+                KernelDeclarationReference::Local(declaration) => {
+                    return Some(ResourceDeclarationKey { owner, declaration });
+                }
+                KernelDeclarationReference::OwnerDeclaration {
+                    owner: target,
+                    declaration,
+                } => {
+                    return Some(ResourceDeclarationKey {
+                        owner: target,
+                        declaration,
+                    });
+                }
+                KernelDeclarationReference::OwnerPublic(target) => {
+                    owner = target;
+                    reference = self.owner(target)?.linkage.public_declaration?;
+                }
+            }
+        }
+    }
+
+    fn declaration(
+        &self,
+        key: ResourceDeclarationKey,
+    ) -> Option<&'a RichKernelDeclarationArtifact> {
+        self.owner(key.owner)?
+            .declarations
+            .get(key.declaration.0 as usize)
+            .filter(|declaration| declaration.id == key.declaration)
+    }
+
+    fn expression_key(
+        &self,
+        owner: KernelOwnerId,
+        value: KernelValueReference,
+    ) -> Option<ResourceExpressionKey> {
+        match value {
+            KernelValueReference::Local(expression) => {
+                Some(ResourceExpressionKey { owner, expression })
+            }
+            KernelValueReference::External(external) => match external.target {
+                KernelExternalTarget::Expression(expression) => Some(ResourceExpressionKey {
+                    owner: external.owner,
+                    expression,
+                }),
+                KernelExternalTarget::Result => Some(ResourceExpressionKey {
+                    owner: external.owner,
+                    expression: self.owner(external.owner)?.linkage.result_expression?,
+                }),
+            },
+        }
+    }
+
+    fn expression(
+        &self,
+        key: ResourceExpressionKey,
+    ) -> Option<&'a PendingKernelExpressionArtifact> {
+        self.owner(key.owner)?
+            .expression_artifacts
+            .get(key.expression.0 as usize)
+            .filter(|expression| expression.id == key.expression)
+    }
+
+    fn lexical_index(&self, key: ResourceExpressionKey) -> Option<ResourceLexicalIndex> {
+        self.lexical_by_expression
+            .get(key.owner.0 as usize)?
+            .get(key.expression.0 as usize)?
+            .as_ref()
+            .copied()
+    }
+
+    fn lexical(&self, key: ResourceExpressionKey) -> Option<&'a KernelLexicalBindingArtifact> {
+        let index = self.lexical_index(key)?;
+        self.owner(key.owner)?
+            .lexical_bindings
+            .get(index.ordinal as usize)
+    }
+
+    fn lexical_projection(&self, key: ResourceExpressionKey) -> Option<ResourceProjectionId> {
+        self.lexical_index(key).map(|index| index.projection)
+    }
+
+    fn call(&self, key: ResourceExpressionKey) -> Option<&'a PendingKernelCallArtifact> {
+        let ordinal = self
+            .call_by_expression
+            .get(key.owner.0 as usize)?
+            .get(key.expression.0 as usize)?
+            .as_ref()
+            .copied()?;
+        self.owner(key.owner)?.calls.get(ordinal)
+    }
+
+    fn call_syntax(&self, key: ResourceExpressionKey) -> Option<&'a KernelCallSyntaxArtifact> {
+        self.owner(key.owner)?
+            .call_syntax
+            .iter()
+            .find(|call| call.expression == key.expression)
+    }
+
+    fn shape(&self, key: ResourceExpressionKey) -> Option<&'a KernelExecutionShapeArtifact> {
+        let ordinal = self
+            .shape_by_expression
+            .get(key.owner.0 as usize)?
+            .get(key.expression.0 as usize)?
+            .as_ref()
+            .copied()?;
+        self.owner(key.owner)?.execution_shapes.get(ordinal)
+    }
+
+    fn inputs(&self, key: ResourceExpressionKey) -> &'a [KernelExpressionInputArtifact] {
+        self.expression(key)
+            .map_or(&[], |expression| expression.inputs.as_ref())
+    }
+
+    fn first_input(
+        &self,
+        key: ResourceExpressionKey,
+        matches: impl Fn(&KernelOwnerEdgeRole) -> bool,
+    ) -> Option<ResourceExpressionKey> {
+        self.expression(key)?
+            .inputs
+            .iter()
+            .find(|input| matches(&input.role))
+            .and_then(|input| self.expression_key(key.owner, input.value))
+    }
+
+    fn parameter_declaration(
+        &self,
+        owner: KernelOwnerId,
+        ordinal: u32,
+    ) -> Option<ResourceDeclarationKey> {
+        let declaration = self.owner(owner)?.declarations.iter().find(|declaration| {
+            matches!(
+                declaration.origin,
+                KernelDeclarationOrigin::Parameter {
+                    ordinal: candidate,
+                    ..
+                } if candidate == ordinal
+            )
+        })?;
+        Some(ResourceDeclarationKey {
+            owner,
+            declaration: declaration.id,
+        })
+    }
+
+    fn callback_declaration(
+        &self,
+        owner: KernelOwnerId,
+        call: KernelExpressionId,
+        ordinal: u32,
+    ) -> Option<ResourceDeclarationKey> {
+        let declaration = self.owner(owner)?.declarations.iter().find(|declaration| {
+            declaration.origin == KernelDeclarationOrigin::CallbackBinding { call, ordinal }
+        })?;
+        Some(ResourceDeclarationKey {
+            owner,
+            declaration: declaration.id,
+        })
+    }
+
+    fn abi_parameter<'b>(
+        &'b self,
+        key: ResourceExpressionKey,
+        input: &KernelCallInputArtifact,
+    ) -> Option<&'b crate::KernelAbiParameterInput> {
+        let callable = self.abi.callable(&self.call_syntax(key)?.function)?;
+        match &input.role {
+            KernelCallInputRole::Abi { name } => callable
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name.as_ref() == name.as_ref())
+                .or_else(|| {
+                    (name.as_ref() == "$pipe").then(|| {
+                        callable.parameters.iter().find(|parameter| {
+                            parameter.kind == boon_checked::CheckedParameterKind::Value
+                        })
+                    })?
+                }),
+            KernelCallInputRole::Formal { .. } => None,
+        }
+    }
+
+    fn call_input_for_abi_parameter(
+        &self,
+        key: ResourceExpressionKey,
+        ordinal: u32,
+    ) -> Option<ResourceExpressionKey> {
+        self.call(key)?
+            .inputs
+            .iter()
+            .find(|input| {
+                self.abi_parameter(key, input)
+                    .is_some_and(|parameter| parameter.ordinal == ordinal)
+            })
+            .and_then(|input| self.expression_key(key.owner, input.value))
+    }
+
+    fn call_input_named(
+        &self,
+        key: ResourceExpressionKey,
+        name: &str,
+    ) -> Option<ResourceExpressionKey> {
+        self.call(key)?
+            .inputs
+            .iter()
+            .find(|input| {
+                self.abi_parameter(key, input)
+                    .is_some_and(|parameter| parameter.name.as_ref() == name)
+            })
+            .and_then(|input| self.expression_key(key.owner, input.value))
+    }
+
+    fn output_declaration_for_input(
+        &self,
+        key: ResourceExpressionKey,
+        call: &PendingKernelCallArtifact,
+        input: &KernelCallInputArtifact,
+        ordinal: u32,
+        name: &str,
+    ) -> Option<ResourceDeclarationKey> {
+        let syntax = self.call_syntax(key)?;
+        let argument = syntax
+            .arguments
+            .iter()
+            .find(|argument| argument.value == input.value && argument.name.as_ref() == name)?;
+        match argument.kind {
+            KernelCallArgumentKind::BareBinding => {
+                self.callback_declaration(key.owner, call.expression, ordinal)
+            }
+            KernelCallArgumentKind::Named => {
+                let KernelValueReference::Local(expression) = input.value else {
+                    return None;
+                };
+                let binding = self
+                    .owner(key.owner)?
+                    .lexical_bindings
+                    .iter()
+                    .find(|binding| {
+                        binding.expression == expression && binding.projection.is_empty()
+                    })?;
+                let KernelLexicalBindingTarget::Declaration(target) = binding.target else {
+                    return None;
+                };
+                self.declaration_key(key.owner, target)
+            }
+        }
+    }
+
+    fn index_calls(&mut self) -> Result<(), KernelSolveError> {
+        for (owner_index, owner) in self.owners.iter().enumerate() {
+            let owner_id = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+                KernelSolveError::new("kernel resource provenance owner count exceeds u32")
+            })?);
+            for call in &owner.calls {
+                let key = ResourceExpressionKey {
+                    owner: owner_id,
+                    expression: call.expression,
+                };
+                match call.target {
+                    KernelCallTarget::User { target, .. } => {
+                        for (input_index, input) in call.inputs.iter().enumerate() {
+                            let KernelCallInputRole::Formal { ordinal } = &input.role else {
+                                continue;
+                            };
+                            let ordinal = *ordinal;
+                            if !user_call_input_is_first_for_formal(
+                                &call.inputs,
+                                input_index,
+                                ordinal,
+                            ) {
+                                continue;
+                            }
+                            // Solver-only unit programs may intentionally omit
+                            // presentation declarations. Such calls cannot
+                            // participate in SOURCE provenance, so leave them
+                            // outside this auxiliary reverse index. A concrete
+                            // resource projection still fails closed later if
+                            // its own declaration authority is absent.
+                            let Some(formal) = self.parameter_declaration(target, ordinal) else {
+                                continue;
+                            };
+                            let Some(declaration) = self.declaration(formal) else {
+                                continue;
+                            };
+                            match declaration.kind {
+                                KernelDeclarationKind::ValueParameter => {
+                                    if let Some(actual) = self.expression_key(owner_id, input.value)
+                                    {
+                                        self.actual_inputs_by_formal
+                                            .entry(formal)
+                                            .or_default()
+                                            .push(actual);
+                                    }
+                                }
+                                KernelDeclarationKind::OutParameter => {
+                                    if let Some(output) = self.output_declaration_for_input(
+                                        key,
+                                        call,
+                                        input,
+                                        ordinal,
+                                        &declaration.name,
+                                    ) {
+                                        self.forwarded_outputs_by_formal
+                                            .entry(formal)
+                                            .or_default()
+                                            .push(output);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    KernelCallTarget::RenderConstructor { .. }
+                    | KernelCallTarget::PureBuiltin { .. }
+                    | KernelCallTarget::FixedAbi
+                    | KernelCallTarget::HostEffect { .. }
+                    | KernelCallTarget::FieldProjection { .. } => {
+                        let Some(contract) = self
+                            .call_syntax(key)
+                            .and_then(|syntax| self.abi.callable(&syntax.function))
+                        else {
+                            continue;
+                        };
+                        let Some(operation) = contract.contextual_operation else {
+                            continue;
+                        };
+                        let (list_ordinal, row_ordinal, _) =
+                            contextual_operation_formals(operation);
+                        let Some(list) = self.call_input_for_abi_parameter(key, list_ordinal)
+                        else {
+                            continue;
+                        };
+                        for input in &call.inputs {
+                            let Some(parameter) = self.abi_parameter(key, input) else {
+                                continue;
+                            };
+                            if parameter.ordinal != row_ordinal
+                                || parameter.kind != boon_checked::CheckedParameterKind::Out
+                            {
+                                continue;
+                            }
+                            if let Some(output) = self.output_declaration_for_input(
+                                key,
+                                call,
+                                input,
+                                parameter.ordinal,
+                                &parameter.name,
+                            ) {
+                                self.contextual_lists_by_output
+                                    .entry(output)
+                                    .or_default()
+                                    .push(list);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn lexical_declaration_for_scope(
+        &self,
+        mut owner: KernelOwnerId,
+        mut scope: KernelScopeReference,
+    ) -> Option<ResourceDeclarationKey> {
+        let mut remaining = self
+            .owners
+            .iter()
+            .map(|owner| owner.presentation.scopes.len())
+            .sum::<usize>()
+            .saturating_add(self.owners.len())
+            .saturating_add(1);
+        loop {
+            if remaining == 0 {
+                return None;
+            }
+            remaining -= 1;
+            match scope {
+                KernelScopeReference::ProjectRoot => return None,
+                KernelScopeReference::Containing => {
+                    scope = self.owner(owner)?.presentation.containing_scope;
+                }
+                KernelScopeReference::Owner {
+                    owner: provider,
+                    scope: provider_scope,
+                } => {
+                    owner = provider;
+                    scope = KernelScopeReference::Local(provider_scope);
+                }
+                KernelScopeReference::Local(local) => {
+                    let row = self
+                        .owner(owner)?
+                        .presentation
+                        .scopes
+                        .get(local.0 as usize)?;
+                    if let Some(declaration) = row.owner {
+                        return self.declaration_key(owner, declaration);
+                    }
+                    scope = row.parent;
+                }
+            }
+        }
+    }
+
+    fn declaration_presentation(
+        &self,
+        key: ResourceDeclarationKey,
+    ) -> Option<&'a KernelDeclarationPresentation> {
+        self.owner(key.owner)?
+            .presentation
+            .declarations
+            .iter()
+            .find(|presentation| presentation.declaration == key.declaration)
+    }
+
+    fn index_sources(&mut self) -> Result<(), KernelSolveError> {
+        let mut seen = Vec::new();
+        for (owner_index, owner) in self.owners.iter().enumerate() {
+            let owner_id = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+                KernelSolveError::new("kernel resource provenance owner count exceeds u32")
+            })?);
+            for source in &owner.resources.sources {
+                let read = ResourceSourceRead {
+                    owner: owner_id,
+                    source: source.id,
+                    payload_projection: ResourceProjectionId::ROOT,
+                };
+                self.source_expressions
+                    .entry(ResourceExpressionKey {
+                        owner: owner_id,
+                        expression: source.expression,
+                    })
+                    .or_default()
+                    .push(read.clone());
+                let path = intern_resource_projection_path(
+                    &self.text,
+                    &mut self.paths,
+                    &source.path.projection,
+                )?;
+                let anchor = self
+                    .declaration_key(owner_id, source.path.anchor)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel resource provenance SOURCE {} has no path anchor",
+                            source.id.0
+                        ))
+                    })?;
+                self.source_paths
+                    .entry(anchor)
+                    .or_default()
+                    .push((path, read));
+
+                let declaration = self
+                    .declaration_key(owner_id, source.declaration)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel resource provenance SOURCE {} has no declaration",
+                            source.id.0
+                        ))
+                    })?;
+                let declaration_row = self.declaration(declaration).ok_or_else(|| {
+                    KernelSolveError::new(
+                        "kernel resource provenance SOURCE declaration is missing",
+                    )
+                })?;
+                let presentation = self.declaration_presentation(declaration).ok_or_else(|| {
+                    KernelSolveError::new(
+                        "kernel resource provenance SOURCE declaration has no presentation",
+                    )
+                })?;
+                let declaration_name = self.symbol(&declaration_row.name)?;
+                let mut alias = self.paths.cons(declaration_name, path);
+                let mut scope_owner = declaration.owner;
+                let mut scope = presentation.scope;
+                seen.clear();
+                while let Some(parent) = self.lexical_declaration_for_scope(scope_owner, scope) {
+                    if seen.contains(&parent) || parent == declaration {
+                        break;
+                    }
+                    seen.push(parent);
+                    self.source_paths
+                        .entry(parent)
+                        .or_default()
+                        .push((alias, read));
+                    let Some(parent_row) = self.declaration(parent) else {
+                        break;
+                    };
+                    let Some(parent_presentation) = self.declaration_presentation(parent) else {
+                        break;
+                    };
+                    let parent_name = self.symbol(&parent_row.name)?;
+                    alias = self.paths.cons(parent_name, alias);
+                    scope_owner = parent.owner;
+                    scope = parent_presentation.scope;
+                }
+            }
+        }
+        let projection_paths = &self.paths;
+        for paths in self.source_paths.values_mut() {
+            paths.sort_by(|(left_path, left), (right_path, right)| {
+                projection_paths
+                    .depth(*right_path)
+                    .cmp(&projection_paths.depth(*left_path))
+                    .then_with(|| left.owner.0.cmp(&right.owner.0))
+                    .then_with(|| left.source.0.cmp(&right.source.0))
+            });
+        }
+        Ok(())
+    }
+
+    fn exact_source_match(
+        &self,
+        paths: &ResourceProjectionArena,
+        target: ResourceDeclarationKey,
+        projection: ResourceProjectionId,
+    ) -> Option<(ResourceProjectionId, ResourceSourceRead)> {
+        let mut matches = self
+            .source_paths
+            .get(&target)?
+            .iter()
+            .filter(|(path, _)| paths.has_prefix(projection, *path));
+        let (path, source) = matches.next().copied()?;
+        let length = paths.depth(path);
+        if matches
+            .next()
+            .is_some_and(|(candidate, _)| paths.depth(*candidate) == length)
+        {
+            return None;
+        }
+        Some((path, source))
+    }
+
+    fn exact_source_read(
+        &self,
+        paths: &ResourceProjectionArena,
+        target: ResourceDeclarationKey,
+        projection: ResourceProjectionId,
+    ) -> Option<ResourceSourceRead> {
+        let (source_path, mut source) = self.exact_source_match(paths, target, projection)?;
+        let payload = paths.suffix_after(projection, source_path)?;
+        source.payload_projection =
+            canonical_resource_payload_projection_id(&self.text, paths, payload);
+        Some(source)
+    }
+
+    fn has_exact_source_read(
+        &self,
+        target: ResourceDeclarationKey,
+        projection: ResourceProjectionId,
+    ) -> bool {
+        self.exact_source_match(&self.paths, target, projection)
+            .is_some()
+    }
+
+    fn sort_and_dedup_sources(
+        &self,
+        paths: &ResourceProjectionArena,
+        sources: &mut Vec<ResourceSourceRead>,
+    ) {
+        sources.sort_by(|left, right| {
+            left.owner
+                .0
+                .cmp(&right.owner.0)
+                .then_with(|| left.source.0.cmp(&right.source.0))
+                .then_with(|| {
+                    paths.compare(
+                        &self.text,
+                        left.payload_projection,
+                        right.payload_projection,
+                    )
+                })
+        });
+        sources.dedup();
+    }
+
+    fn sources_for_declaration(
+        &mut self,
+        target: ResourceDeclarationKey,
+        projection: ResourceProjectionId,
+    ) -> ResourceSourceSpan {
+        let key = (target, projection);
+        if let Some(cached) = self.declaration_cache.get(&key) {
+            return *cached;
+        }
+        let mut paths = std::mem::take(&mut self.paths);
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.reset();
+        self.declaration_sources(&mut paths, target, projection, &mut scratch);
+        self.sort_and_dedup_sources(&paths, &mut scratch.resolved);
+        let span = ResourceSourceSpan {
+            start: u32::try_from(self.cached_sources.len())
+                .expect("kernel resource source cache exceeds u32"),
+            len: u32::try_from(scratch.resolved.len())
+                .expect("kernel resource source answer exceeds u32"),
+        };
+        self.cached_sources.extend_from_slice(&scratch.resolved);
+        scratch.reset();
+        self.paths = paths;
+        self.scratch = scratch;
+        self.declaration_cache.insert(key, span);
+        span
+    }
+
+    fn cached_source_reads(&self, span: ResourceSourceSpan) -> &[ResourceSourceRead] {
+        let start = span.start as usize;
+        &self.cached_sources[start..start + span.len as usize]
+    }
+
+    fn declaration_sources(
+        &self,
+        paths: &mut ResourceProjectionArena,
+        target: ResourceDeclarationKey,
+        projection: ResourceProjectionId,
+        scratch: &mut ResourceTraversalScratch,
+    ) {
+        let key = ResourceResolution::Declaration(target, projection);
+        let node = key.node();
+        if scratch.active.contains(&node) || !scratch.explored.insert(key) {
+            return;
+        }
+        scratch.active.insert(node);
+        if let Some(source) = self.exact_source_read(paths, target, projection) {
+            scratch.resolved.push(source);
+        }
+        let Some(declaration) = self.declaration(target) else {
+            scratch.active.remove(&node);
+            return;
+        };
+        if declaration.kind == KernelDeclarationKind::ValueParameter {
+            for actual in self
+                .actual_inputs_by_formal
+                .get(&target)
+                .into_iter()
+                .flatten()
+            {
+                self.expression_sources(paths, *actual, projection, scratch);
+            }
+        }
+        if matches!(
+            declaration.kind,
+            KernelDeclarationKind::FreshOut | KernelDeclarationKind::OutParameter
+        ) {
+            self.output_sources(paths, target, projection, scratch);
+        }
+        if let Some(value) = declaration
+            .value
+            .and_then(|value| self.expression_key(target.owner, value))
+        {
+            self.expression_sources(paths, value, projection, scratch);
+        }
+        if declaration.kind == KernelDeclarationKind::Function
+            && let Some(result) = self
+                .owner(target.owner)
+                .and_then(|owner| owner.linkage.result_expression)
+        {
+            self.expression_sources(
+                paths,
+                ResourceExpressionKey {
+                    owner: target.owner,
+                    expression: result,
+                },
+                projection,
+                scratch,
+            );
+        }
+        scratch.active.remove(&node);
+    }
+
+    fn expression_sources(
+        &self,
+        paths: &mut ResourceProjectionArena,
+        expression: ResourceExpressionKey,
+        projection: ResourceProjectionId,
+        scratch: &mut ResourceTraversalScratch,
+    ) {
+        let key = ResourceResolution::Expression(expression, projection);
+        let node = key.node();
+        if scratch.active.contains(&node) || !scratch.explored.insert(key) {
+            return;
+        }
+        scratch.active.insert(node);
+        if let Some(sources) = self.source_expressions.get(&expression) {
+            let payload = canonical_resource_payload_projection_id(&self.text, paths, projection);
+            scratch.resolved.extend(sources.iter().map(|source| {
+                let mut source = *source;
+                source.payload_projection = payload;
+                source
+            }));
+            scratch.active.remove(&node);
+            return;
+        }
+        let Some(row) = self.expression(expression) else {
+            scratch.active.remove(&node);
+            return;
+        };
+        if let Some(binding) = self.lexical(expression)
+            && let KernelLexicalBindingTarget::Declaration(target) = binding.target
+            && let Some(target) = self.declaration_key(expression.owner, target)
+        {
+            let prefix = self
+                .lexical_projection(expression)
+                .expect("indexed lexical binding has a projection");
+            let combined = paths.append(prefix, projection, &mut scratch.symbols);
+            self.declaration_sources(paths, target, combined, scratch);
+            scratch.active.remove(&node);
+            return;
+        }
+        match &row.kind {
+            KernelOwnerNodeKind::Record { .. } => {
+                if let Some(projection) = paths.row(projection)
+                    && let Some(KernelExecutionShapeArtifact::Record { fields, .. }) =
+                        self.shape(expression)
+                {
+                    for candidate in fields.iter().filter(|candidate| {
+                        self.text.lookup_symbol(&candidate.name) == Some(projection.head)
+                    }) {
+                        if let Some(value) = self.expression_key(expression.owner, candidate.value)
+                        {
+                            self.expression_sources(paths, value, projection.tail, scratch);
+                        }
+                    }
+                }
+            }
+            KernelOwnerNodeKind::UserCall { .. }
+            | KernelOwnerNodeKind::RenderConstructor { .. }
+            | KernelOwnerNodeKind::PureBuiltin { .. }
+            | KernelOwnerNodeKind::FixedAbiCall { .. }
+            | KernelOwnerNodeKind::HostEffect { .. }
+            | KernelOwnerNodeKind::FieldProjection { .. } => {
+                if let Some(call) = self.call(expression) {
+                    match call.target {
+                        KernelCallTarget::User { target, .. } => {
+                            if let Some(result) = self
+                                .owner(target)
+                                .and_then(|owner| owner.linkage.result_expression)
+                            {
+                                self.expression_sources(
+                                    paths,
+                                    ResourceExpressionKey {
+                                        owner: target,
+                                        expression: result,
+                                    },
+                                    projection,
+                                    scratch,
+                                );
+                            }
+                        }
+                        _ => {
+                            let function = self
+                                .call_syntax(expression)
+                                .map(|call| call.function.as_ref());
+                            let contextual_find = self
+                                .call_syntax(expression)
+                                .and_then(|syntax| self.abi.callable(&syntax.function))
+                                .and_then(|callable| callable.contextual_operation)
+                                .is_some_and(|operation| {
+                                    matches!(
+                                        operation,
+                                        crate::KernelAbiContextualOperation::Find { .. }
+                                    )
+                                });
+                            if contextual_find
+                                || matches!(
+                                    function,
+                                    Some("List/get" | "List/latest" | "List/find")
+                                )
+                            {
+                                let list = self
+                                    .call_syntax(expression)
+                                    .and_then(|syntax| self.abi.callable(&syntax.function))
+                                    .and_then(|callable| callable.contextual_operation)
+                                    .and_then(|operation| {
+                                        let (list, _, _) = contextual_operation_formals(operation);
+                                        self.call_input_for_abi_parameter(expression, list)
+                                    })
+                                    .or_else(|| self.call_input_named(expression, "list"));
+                                if let Some(list) = list {
+                                    self.list_item_sources(paths, list, projection, scratch);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            KernelOwnerNodeKind::Draining => {
+                if let Some(input) = self.first_input(expression, |role| {
+                    matches!(role, KernelOwnerEdgeRole::DrainingInput)
+                }) {
+                    self.expression_sources(paths, input, projection, scratch);
+                }
+            }
+            KernelOwnerNodeKind::Hold => {
+                if let Some(input) = self.first_input(expression, |role| {
+                    matches!(role, KernelOwnerEdgeRole::HoldInitial)
+                }) {
+                    self.expression_sources(paths, input, projection, scratch);
+                }
+            }
+            KernelOwnerNodeKind::Flush => {
+                if let Some(input) = self.first_input(expression, |role| {
+                    matches!(role, KernelOwnerEdgeRole::FlushPayload)
+                }) {
+                    self.expression_sources(paths, input, projection, scratch);
+                }
+            }
+            KernelOwnerNodeKind::Latest => {
+                for input in self.inputs(expression) {
+                    if matches!(input.role, KernelOwnerEdgeRole::LatestBranch)
+                        && let Some(branch) = self.expression_key(expression.owner, input.value)
+                    {
+                        self.expression_sources(paths, branch, projection, scratch);
+                    }
+                }
+            }
+            KernelOwnerNodeKind::When => {
+                for input in self.inputs(expression) {
+                    if matches!(input.role, KernelOwnerEdgeRole::WhenArm)
+                        && let Some(arm) = self.expression_key(expression.owner, input.value)
+                    {
+                        self.expression_sources(paths, arm, projection, scratch);
+                    }
+                }
+            }
+            KernelOwnerNodeKind::Then => {
+                if let Some(output) = self.first_input(expression, |role| {
+                    matches!(role, KernelOwnerEdgeRole::ThenOutput)
+                }) {
+                    self.expression_sources(paths, output, projection, scratch);
+                }
+            }
+            KernelOwnerNodeKind::MatchArm { .. } => {
+                if let Some(output) = self.first_input(expression, |role| {
+                    matches!(role, KernelOwnerEdgeRole::MatchOutput)
+                }) {
+                    self.expression_sources(paths, output, projection, scratch);
+                }
+            }
+            KernelOwnerNodeKind::Block => {
+                if let Some(KernelExecutionShapeArtifact::Block {
+                    result: Some(result),
+                    ..
+                }) = self.shape(expression)
+                    && let Some(result) = self.expression_key(expression.owner, *result)
+                {
+                    self.expression_sources(paths, result, projection, scratch);
+                }
+            }
+            KernelOwnerNodeKind::MapEntry => {
+                if let Some(key) = self.first_input(expression, |role| {
+                    matches!(role, KernelOwnerEdgeRole::MapKey)
+                }) {
+                    self.expression_sources(paths, key, ResourceProjectionId::ROOT, scratch);
+                }
+                if let Some(value) = self.first_input(expression, |role| {
+                    matches!(role, KernelOwnerEdgeRole::MapValue)
+                }) {
+                    self.expression_sources(paths, value, projection, scratch);
+                }
+            }
+            KernelOwnerNodeKind::Collection {
+                kind: KernelCollectionKind::Map,
+                ..
+            } => {
+                for input in self.inputs(expression) {
+                    if matches!(input.role, KernelOwnerEdgeRole::MapEntry)
+                        && let Some(entry) = self.expression_key(expression.owner, input.value)
+                    {
+                        self.expression_sources(paths, entry, projection, scratch);
+                    }
+                }
+            }
+            KernelOwnerNodeKind::Collection {
+                kind: KernelCollectionKind::Set,
+                ..
+            } => {
+                for input in self.inputs(expression) {
+                    if matches!(input.role, KernelOwnerEdgeRole::CollectionItem)
+                        && let Some(item) = self.expression_key(expression.owner, input.value)
+                    {
+                        self.expression_sources(paths, item, projection, scratch);
+                    }
+                }
+            }
+            _ => {}
+        }
+        scratch.active.remove(&node);
+    }
+
+    fn list_item_sources(
+        &self,
+        paths: &mut ResourceProjectionArena,
+        expression: ResourceExpressionKey,
+        projection: ResourceProjectionId,
+        scratch: &mut ResourceTraversalScratch,
+    ) {
+        let key = ResourceResolution::ListItem(expression, projection);
+        let node = key.node();
+        if scratch.active.contains(&node) || !scratch.explored.insert(key) {
+            return;
+        }
+        scratch.active.insert(node);
+        let Some(row) = self.expression(expression) else {
+            scratch.active.remove(&node);
+            return;
+        };
+        match &row.kind {
+            KernelOwnerNodeKind::Collection {
+                kind: KernelCollectionKind::List,
+                ..
+            } => {
+                for input in self.inputs(expression) {
+                    if matches!(&input.role, KernelOwnerEdgeRole::CollectionItem)
+                        && let Some(item) = self.expression_key(expression.owner, input.value)
+                    {
+                        self.expression_sources(paths, item, projection, scratch);
+                    }
+                }
+            }
+            _ if self.lexical(expression).is_some_and(|binding| {
+                binding.access == KernelLexicalAccess::Read
+                    && self.lexical_projection(expression) == Some(ResourceProjectionId::ROOT)
+            }) =>
+            {
+                let binding = self.lexical(expression).expect("checked lexical binding");
+                if let KernelLexicalBindingTarget::Declaration(target) = binding.target
+                    && let Some(target) = self.declaration_key(expression.owner, target)
+                    && let Some(declaration) = self.declaration(target)
+                {
+                    if declaration.kind == KernelDeclarationKind::ValueParameter {
+                        for actual in self
+                            .actual_inputs_by_formal
+                            .get(&target)
+                            .into_iter()
+                            .flatten()
+                        {
+                            self.list_item_sources(paths, *actual, projection, scratch);
+                        }
+                    }
+                    if let Some(value) = declaration
+                        .value
+                        .and_then(|value| self.expression_key(target.owner, value))
+                    {
+                        self.list_item_sources(paths, value, projection, scratch);
+                    }
+                }
+            }
+            KernelOwnerNodeKind::UserCall { .. }
+            | KernelOwnerNodeKind::RenderConstructor { .. }
+            | KernelOwnerNodeKind::PureBuiltin { .. }
+            | KernelOwnerNodeKind::FixedAbiCall { .. }
+            | KernelOwnerNodeKind::HostEffect { .. }
+            | KernelOwnerNodeKind::FieldProjection { .. } => {
+                if let Some(call) = self.call(expression) {
+                    match call.target {
+                        KernelCallTarget::User { target, .. } => {
+                            if let Some(result) = self
+                                .owner(target)
+                                .and_then(|owner| owner.linkage.result_expression)
+                            {
+                                self.list_item_sources(
+                                    paths,
+                                    ResourceExpressionKey {
+                                        owner: target,
+                                        expression: result,
+                                    },
+                                    projection,
+                                    scratch,
+                                );
+                            }
+                        }
+                        _ => {
+                            let operation = self
+                                .call_syntax(expression)
+                                .and_then(|syntax| self.abi.callable(&syntax.function))
+                                .and_then(|callable| callable.contextual_operation);
+                            match operation {
+                                Some(crate::KernelAbiContextualOperation::Map { body, .. }) => {
+                                    if let Some(body) =
+                                        self.call_input_for_abi_parameter(expression, body)
+                                    {
+                                        self.expression_sources(paths, body, projection, scratch);
+                                    }
+                                }
+                                Some(
+                                    crate::KernelAbiContextualOperation::Filter { list, .. }
+                                    | crate::KernelAbiContextualOperation::Retain { list, .. }
+                                    | crate::KernelAbiContextualOperation::Remove { list, .. }
+                                    | crate::KernelAbiContextualOperation::SortBy { list, .. }
+                                    | crate::KernelAbiContextualOperation::ThenBy { list, .. },
+                                ) => {
+                                    if let Some(list) =
+                                        self.call_input_for_abi_parameter(expression, list)
+                                    {
+                                        self.list_item_sources(paths, list, projection, scratch);
+                                    }
+                                }
+                                Some(
+                                    crate::KernelAbiContextualOperation::Every { .. }
+                                    | crate::KernelAbiContextualOperation::Any { .. }
+                                    | crate::KernelAbiContextualOperation::Find { .. },
+                                )
+                                | None => {
+                                    if self.call_syntax(expression).is_some_and(|syntax| {
+                                        matches!(
+                                            syntax.function.as_ref(),
+                                            "List/take" | "List/page"
+                                        )
+                                    }) && let Some(list) =
+                                        self.call_input_named(expression, "list")
+                                    {
+                                        self.list_item_sources(paths, list, projection, scratch);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            KernelOwnerNodeKind::Draining => {
+                if let Some(input) = self.first_input(expression, |role| {
+                    matches!(role, KernelOwnerEdgeRole::DrainingInput)
+                }) {
+                    self.list_item_sources(paths, input, projection, scratch);
+                }
+            }
+            KernelOwnerNodeKind::Hold => {
+                if let Some(input) = self.first_input(expression, |role| {
+                    matches!(role, KernelOwnerEdgeRole::HoldInitial)
+                }) {
+                    self.list_item_sources(paths, input, projection, scratch);
+                }
+            }
+            KernelOwnerNodeKind::Latest => {
+                for input in self.inputs(expression) {
+                    if matches!(&input.role, KernelOwnerEdgeRole::LatestBranch)
+                        && let Some(branch) = self.expression_key(expression.owner, input.value)
+                    {
+                        self.list_item_sources(paths, branch, projection, scratch);
+                    }
+                }
+            }
+            KernelOwnerNodeKind::When => {
+                for input in self.inputs(expression) {
+                    if matches!(&input.role, KernelOwnerEdgeRole::WhenArm)
+                        && let Some(arm) = self.expression_key(expression.owner, input.value)
+                    {
+                        self.list_item_sources(paths, arm, projection, scratch);
+                    }
+                }
+            }
+            KernelOwnerNodeKind::Then => {
+                if let Some(output) = self.first_input(expression, |role| {
+                    matches!(role, KernelOwnerEdgeRole::ThenOutput)
+                }) {
+                    self.list_item_sources(paths, output, projection, scratch);
+                }
+            }
+            KernelOwnerNodeKind::MatchArm { .. } => {
+                if let Some(output) = self.first_input(expression, |role| {
+                    matches!(role, KernelOwnerEdgeRole::MatchOutput)
+                }) {
+                    self.list_item_sources(paths, output, projection, scratch);
+                }
+            }
+            KernelOwnerNodeKind::Block => {
+                if let Some(KernelExecutionShapeArtifact::Block {
+                    result: Some(result),
+                    ..
+                }) = self.shape(expression)
+                    && let Some(result) = self.expression_key(expression.owner, *result)
+                {
+                    self.list_item_sources(paths, result, projection, scratch);
+                }
+            }
+            _ => {}
+        }
+        scratch.active.remove(&node);
+    }
+
+    fn output_sources(
+        &self,
+        paths: &mut ResourceProjectionArena,
+        target: ResourceDeclarationKey,
+        projection: ResourceProjectionId,
+        scratch: &mut ResourceTraversalScratch,
+    ) {
+        let key = ResourceResolution::Output(target, projection);
+        let node = key.node();
+        if scratch.active.contains(&node) || !scratch.explored.insert(key) {
+            return;
+        }
+        scratch.active.insert(node);
+        for list in self
+            .contextual_lists_by_output
+            .get(&target)
+            .into_iter()
+            .flatten()
+        {
+            self.list_item_sources(paths, *list, projection, scratch);
+        }
+        for output in self
+            .forwarded_outputs_by_formal
+            .get(&target)
+            .into_iter()
+            .flatten()
+        {
+            self.output_sources(paths, *output, projection, scratch);
+        }
+        scratch.active.remove(&node);
+    }
+}
+
+fn user_call_input_is_first_for_formal(
+    inputs: &[KernelCallInputArtifact],
+    input_index: usize,
+    ordinal: u32,
+) -> bool {
+    !inputs[..input_index].iter().any(|earlier| {
+        matches!(
+            &earlier.role,
+            KernelCallInputRole::Formal {
+                ordinal: earlier_ordinal,
+            } if *earlier_ordinal == ordinal
+        )
+    })
+}
+
+fn canonical_resource_payload_projection_id(
+    text: &ProjectTextSnapshot,
+    paths: &ResourceProjectionArena,
+    projection: ResourceProjectionId,
+) -> ResourceProjectionId {
+    let name = |symbol: SymbolId| text.symbol(symbol).unwrap_or("");
+    let mut stripped = projection;
+    if paths.depth(stripped) >= 2
+        && let Some(first) = paths.row(stripped)
+        && matches!(name(first.head), "event" | "events")
+    {
+        stripped = first.tail;
+    }
+    let Some(first) = paths.row(stripped) else {
+        return stripped;
+    };
+    let Some(second) = paths.row(first.tail) else {
+        return stripped;
+    };
+    if second.tail != ResourceProjectionId::ROOT {
+        return stripped;
+    }
+    if (name(first.head) == "change" && matches!(name(second.head), "text" | "bytes"))
+        || (name(first.head) == "key_down" && name(second.head) == "key")
+    {
+        first.tail
+    } else {
+        stripped
+    }
+}
+
+#[cfg(test)]
+fn canonical_resource_payload_projection(
+    text: &ProjectTextSnapshot,
+    projection: &[SymbolId],
+) -> Vec<SymbolId> {
+    if projection.is_empty() {
+        return Vec::new();
+    }
+    let name = |symbol: SymbolId| text.symbol(symbol).unwrap_or("");
+    let stripped = if projection.len() >= 2
+        && projection
+            .first()
+            .is_some_and(|symbol| matches!(name(*symbol), "event" | "events"))
+    {
+        &projection[1..]
+    } else {
+        projection
+    };
+    match stripped {
+        [first, second] if name(*first) == "change" && name(*second) == "text" => vec![*second],
+        [first, second] if name(*first) == "change" && name(*second) == "bytes" => vec![*second],
+        [first, second] if name(*first) == "key_down" && name(*second) == "key" => vec![*second],
+        _ => stripped.to_vec(),
+    }
+}
+
+const fn contextual_operation_formals(
+    operation: crate::KernelAbiContextualOperation,
+) -> (u32, u32, u32) {
+    match operation {
+        crate::KernelAbiContextualOperation::Map { list, row, body }
+        | crate::KernelAbiContextualOperation::Filter {
+            list,
+            row,
+            predicate: body,
+        }
+        | crate::KernelAbiContextualOperation::Retain {
+            list,
+            row,
+            predicate: body,
+        }
+        | crate::KernelAbiContextualOperation::Remove {
+            list,
+            row,
+            predicate: body,
+        }
+        | crate::KernelAbiContextualOperation::Every {
+            list,
+            row,
+            predicate: body,
+        }
+        | crate::KernelAbiContextualOperation::Any {
+            list,
+            row,
+            predicate: body,
+        }
+        | crate::KernelAbiContextualOperation::Find {
+            list,
+            row,
+            predicate: body,
+        }
+        | crate::KernelAbiContextualOperation::SortBy {
+            list,
+            row,
+            key: body,
+            ..
+        }
+        | crate::KernelAbiContextualOperation::ThenBy {
+            list,
+            row,
+            key: body,
+            ..
+        } => (list, row, body),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResourceNonspecificType {
+    Absent,
+    Unknown,
+    Variable(TypeVariableId),
+    UnresolvedShape(TypeTermId),
+    OpenObject,
+    ListOfOpenObject,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResourceTypeSpecificity {
+    Specific,
+    Nonspecific(ResourceNonspecificType),
+}
+
+fn packed_resource_projection_type_specificity(
+    terms: &crate::TypeTermArena,
+    term: TypeTermId,
+) -> ResourceTypeSpecificity {
+    match terms.term(term) {
+        TypeTerm::Absent => ResourceTypeSpecificity::Nonspecific(ResourceNonspecificType::Absent),
+        TypeTerm::UnresolvedShape(_) => {
+            ResourceTypeSpecificity::Nonspecific(ResourceNonspecificType::UnresolvedShape(term))
+        }
+        TypeTerm::Unknown => ResourceTypeSpecificity::Nonspecific(ResourceNonspecificType::Unknown),
+        TypeTerm::Variable(variable) => {
+            ResourceTypeSpecificity::Nonspecific(ResourceNonspecificType::Variable(variable))
+        }
+        TypeTerm::OpenObjectPlaceholder => {
+            ResourceTypeSpecificity::Nonspecific(ResourceNonspecificType::OpenObject)
+        }
+        TypeTerm::Object { fields, open } if open && fields.is_empty() => {
+            ResourceTypeSpecificity::Nonspecific(ResourceNonspecificType::OpenObject)
+        }
+        TypeTerm::List(item) => match packed_resource_projection_type_specificity(terms, item) {
+            ResourceTypeSpecificity::Nonspecific(ResourceNonspecificType::OpenObject) => {
+                ResourceTypeSpecificity::Nonspecific(ResourceNonspecificType::ListOfOpenObject)
+            }
+            ResourceTypeSpecificity::Specific | ResourceTypeSpecificity::Nonspecific(_) => {
+                ResourceTypeSpecificity::Specific
+            }
+        },
+        TypeTerm::Union(members) => {
+            let mut canonical = None;
+            for member in members {
+                match packed_resource_projection_type_specificity(terms, *member) {
+                    ResourceTypeSpecificity::Specific => {
+                        return ResourceTypeSpecificity::Specific;
+                    }
+                    ResourceTypeSpecificity::Nonspecific(ResourceNonspecificType::Absent) => {}
+                    ResourceTypeSpecificity::Nonspecific(member) => match canonical {
+                        None => canonical = Some(member),
+                        Some(existing) if existing == member => {}
+                        Some(_) => return ResourceTypeSpecificity::Specific,
+                    },
+                }
+            }
+            ResourceTypeSpecificity::Nonspecific(
+                canonical.unwrap_or(ResourceNonspecificType::Absent),
+            )
+        }
+        _ => ResourceTypeSpecificity::Specific,
+    }
+}
+
+fn packed_resource_projection_type_is_specific(
+    terms: &crate::TypeTermArena,
+    term: TypeTermId,
+) -> bool {
+    matches!(
+        packed_resource_projection_type_specificity(terms, term),
+        ResourceTypeSpecificity::Specific
+    )
+}
+
+fn project_resource_projection_facts(
+    owners: &[KernelProjectOwnerOutputs],
+    abi: &crate::KernelAbiInput,
+    artifact: &mut UnsealedComponentArtifact,
+) -> Result<Box<[DefinitionResourceProjectionFacts]>, KernelSolveError> {
+    let mut resolver =
+        ResourceProjectionResolver::new(owners, abi, artifact.terms().text_snapshot().clone())?;
+    let mut facts = owners
+        .iter()
+        .map(|_| DefinitionResourceProjectionFacts::default())
+        .collect::<Vec<_>>();
+    for (owner_index, owner) in owners.iter().enumerate() {
+        let owner_id = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+            KernelSolveError::new("kernel resource-projection owner count exceeds u32")
+        })?);
+        for expression_ordinal in 0..owner.expressions.len() {
+            let expression =
+                KernelExpressionId(u32::try_from(expression_ordinal).map_err(|_| {
+                    KernelSolveError::new("kernel resource-projection expression count exceeds u32")
+                })?);
+            let Some(binding) = resolver.lexical(ResourceExpressionKey {
+                owner: owner_id,
+                expression,
+            }) else {
+                continue;
+            };
+            let KernelLexicalBindingTarget::Declaration(target_reference) = binding.target else {
+                continue;
+            };
+            let expression_key = ResourceExpressionKey {
+                owner: owner_id,
+                expression,
+            };
+            let projection = resolver
+                .lexical_projection(expression_key)
+                .expect("indexed lexical binding has a projection");
+            if projection == ResourceProjectionId::ROOT {
+                continue;
+            }
+            let target = resolver
+                .declaration_key(owner_id, target_reference)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel resource projection {} has no declaration authority",
+                        binding.expression.0
+                    ))
+                })?;
+            if binding.access == KernelLexicalAccess::Read
+                && resolver.has_exact_source_read(target, projection)
+            {
+                continue;
+            }
+            let output = owner
+                .expressions
+                .get(binding.expression.0 as usize)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel resource projection expression {} is out of range",
+                        binding.expression.0
+                    ))
+                })?;
+            let base_term = artifact
+                .output(*output)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel resource projection expression {} has no solved output",
+                        binding.expression.0
+                    ))
+                })?
+                .term();
+            let required_term =
+                if packed_resource_projection_type_is_specific(artifact.terms(), base_term) {
+                    base_term
+                } else {
+                    let field = resolver
+                        .paths
+                        .depth(projection)
+                        .checked_sub(1)
+                        .and_then(|ordinal| resolver.paths.segment_at(projection, ordinal))
+                        .and_then(|field| resolver.text.symbol(field));
+                    match field {
+                        Some(
+                            "press" | "click" | "double_click" | "blur" | "change" | "key_down",
+                        ) => artifact.terms_mut().object([], false),
+                        Some("bytes") => artifact.terms_mut().bytes(crate::BytesTerm::Dynamic),
+                        Some(_) => artifact.terms().text(),
+                        None => artifact.terms().unknown(),
+                    }
+                };
+            let origins = resolver.sources_for_declaration(target, projection);
+            let definition = &mut facts[owner_index];
+            let projection_start = u32::try_from(definition.symbols.len()).map_err(|_| {
+                KernelSolveError::new("kernel resource-projection symbol count exceeds u32")
+            })?;
+            resolver
+                .paths
+                .extend_symbols(projection, &mut definition.symbols);
+            let projection_len = resolver.paths.depth(projection);
+            let origin_start = u32::try_from(definition.origins.len()).map_err(|_| {
+                KernelSolveError::new("kernel resource-projection origin count exceeds u32")
+            })?;
+            for origin in resolver.cached_source_reads(origins) {
+                let payload_projection_start =
+                    u32::try_from(definition.symbols.len()).map_err(|_| {
+                        KernelSolveError::new("kernel resource-projection symbol count exceeds u32")
+                    })?;
+                resolver
+                    .paths
+                    .extend_symbols(origin.payload_projection, &mut definition.symbols);
+                definition.origins.push(PackedSourceReadInput {
+                    owner: origin.owner,
+                    source: origin.source,
+                    payload_projection_start,
+                    payload_projection_len: resolver.paths.depth(origin.payload_projection),
+                });
+            }
+            let publishes_required_type = origins.len != 0
+                && packed_resource_projection_type_is_specific(artifact.terms(), required_term)
+                && !packed_resource_projection_type_is_specific(artifact.terms(), base_term);
+            definition
+                .requirements
+                .push(ResourceProjectionRequirementFact {
+                    expression: binding.expression,
+                    target: target_reference,
+                    projection_start,
+                    projection_len,
+                    origin_start,
+                    origin_len: origins.len,
+                    required_term,
+                    publishes_required_type,
+                });
+        }
+    }
+    if std::env::var_os("BOON_KERNEL_TRACE").is_some() {
+        let lexical_slots = resolver
+            .lexical_by_expression
+            .iter()
+            .map(|rows| rows.len())
+            .sum::<usize>();
+        let fact_requirements = facts
+            .iter()
+            .map(|definition| definition.requirements.len())
+            .sum::<usize>();
+        let fact_origins = facts
+            .iter()
+            .map(|definition| definition.origins.len())
+            .sum::<usize>();
+        let fact_symbols = facts
+            .iter()
+            .map(|definition| definition.symbols.len())
+            .sum::<usize>();
+        let fact_requirement_capacity = facts
+            .iter()
+            .map(|definition| definition.requirements.capacity())
+            .sum::<usize>();
+        let fact_origin_capacity = facts
+            .iter()
+            .map(|definition| definition.origins.capacity())
+            .sum::<usize>();
+        let fact_symbol_capacity = facts
+            .iter()
+            .map(|definition| definition.symbols.capacity())
+            .sum::<usize>();
+        eprintln!(
+            "kernel-resource-detail lexical_slots={lexical_slots} projection_rows={} projection_row_capacity={} projection_conses={} projection_cons_capacity={} source_path_keys={} source_expression_keys={} actual_formal_keys={} contextual_output_keys={} forwarded_output_keys={} cache_entries={} cache_capacity={} cached_sources={} cached_source_capacity={} scratch_explored_capacity={} scratch_active_capacity={} scratch_result_capacity={} requirements={fact_requirements} requirement_capacity={fact_requirement_capacity} origins={fact_origins} origin_capacity={fact_origin_capacity} symbols={fact_symbols} symbol_capacity={fact_symbol_capacity}",
+            resolver.paths.rows.len(),
+            resolver.paths.rows.capacity(),
+            resolver.paths.conses.len(),
+            resolver.paths.conses.capacity(),
+            resolver.source_paths.len(),
+            resolver.source_expressions.len(),
+            resolver.actual_inputs_by_formal.len(),
+            resolver.contextual_lists_by_output.len(),
+            resolver.forwarded_outputs_by_formal.len(),
+            resolver.declaration_cache.len(),
+            resolver.declaration_cache.capacity(),
+            resolver.cached_sources.len(),
+            resolver.cached_sources.capacity(),
+            resolver.scratch.explored.capacity(),
+            resolver.scratch.active.capacity(),
+            resolver.scratch.resolved.capacity(),
+        );
+    }
+    Ok(facts.into_boxed_slice())
+}
+
 fn build_definition_code_builder(
     owners: &[KernelProjectOwnerOutputs],
     artifact: &mut UnsealedComponentArtifact,
     flush_terms: &ProjectExpressionFlushTerms,
     call_facts: &[Box<[SolvedKernelCallFacts]>],
     diagnostics: &[Box<[KernelDiagnosticArtifact]>],
+    resource_projection_facts: &[DefinitionResourceProjectionFacts],
 ) -> Result<DefinitionCodeBuilder, KernelSolveError> {
-    if call_facts.len() != owners.len() || diagnostics.len() != owners.len() {
+    if call_facts.len() != owners.len()
+        || diagnostics.len() != owners.len()
+        || resource_projection_facts.len() != owners.len()
+    {
         return Err(KernelSolveError::new(
             "kernel definition-code finalization received incomplete derived owner rows",
         ));
@@ -3009,8 +4961,10 @@ fn build_definition_code_builder(
     let mut source_payload_types = Vec::new();
     let mut state_flows = Vec::new();
     let mut list_item_types = Vec::new();
+    let mut packed_resource_projection_requirements = Vec::new();
     let mut proof_scratch = DefinitionTermProofScratch::default();
     for (owner_index, owner) in owners.iter().enumerate() {
+        let resource_projection_facts = &resource_projection_facts[owner_index];
         formal_roots.clear();
         formal_roots.extend(
             owner
@@ -3219,6 +5173,9 @@ fn build_definition_code_builder(
             proof_scratch.visit_alpha_root(artifact.terms(), diagnostic.actual)?;
             proof_scratch.visit_alpha_root(artifact.terms(), diagnostic.expected)?;
         }
+        for requirement in &resource_projection_facts.requirements {
+            proof_scratch.visit_alpha_root(artifact.terms(), requirement.required_term)?;
+        }
         let stable_digest = definition_code_types_stable_digest(
             artifact.terms(),
             &mut proof_scratch,
@@ -3234,6 +5191,9 @@ fn build_definition_code_builder(
             &source_payload_types,
             &state_flows,
             &list_item_types,
+            &resource_projection_facts.requirements,
+            &resource_projection_facts.origins,
+            &resource_projection_facts.symbols,
         )?;
         packed_formal_flows.clear();
         for (term, mode) in &formal_roots {
@@ -3256,6 +5216,40 @@ fn build_definition_code_builder(
                 *mode,
             )?);
         }
+        packed_resource_projection_requirements.clear();
+        for requirement in &resource_projection_facts.requirements {
+            let mode = *owner
+                .expression_modes
+                .get(requirement.expression.0 as usize)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner_index} resource projection references missing expression {}",
+                        requirement.expression.0,
+                    ))
+                })?;
+            let published_expression = requirement
+                .publishes_required_type
+                .then(|| {
+                    proof_scratch.materialize_alpha_flow_root(
+                        artifact.terms(),
+                        requirement.required_term,
+                        mode,
+                    )
+                })
+                .transpose()?;
+            packed_resource_projection_requirements.push(
+                PackedResourceProjectionRequirementInput {
+                    expression: requirement.expression,
+                    target: requirement.target,
+                    projection_start: requirement.projection_start,
+                    projection_len: requirement.projection_len,
+                    origin_start: requirement.origin_start,
+                    origin_len: requirement.origin_len,
+                    required_term: requirement.required_term,
+                    published_expression,
+                },
+            );
+        }
         builder.push(
             KernelOwnerId(
                 u32::try_from(owner_index)
@@ -3274,6 +5268,9 @@ fn build_definition_code_builder(
                 source_payload_types: &source_payload_types,
                 state_flows: &state_flows,
                 list_item_types: &list_item_types,
+                resource_projection_requirements: &packed_resource_projection_requirements,
+                resource_projection_origins: &resource_projection_facts.origins,
+                resource_projection_symbols: &resource_projection_facts.symbols,
                 alpha_variables: proof_scratch.alpha_variable_sources(),
                 stable_digest,
             },
@@ -3286,7 +5283,7 @@ fn import_post_solve_type(terms: &mut crate::TypeTermArena, ty: &Type) -> TypeTe
     terms.import_checked_type(ty, &mut |variable| TypeVariableId(variable.0))
 }
 
-const DEFINITION_CODE_TYPES_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.definition-code-types.v1\0";
+const DEFINITION_CODE_DOMAIN_V4: &[u8] = b"boon.compiler-kernel.definition-code.v4\0";
 
 fn update_definition_code_len(digest: &mut Sha256, len: usize) {
     digest.update(u64::try_from(len).unwrap_or(u64::MAX).to_be_bytes());
@@ -3328,6 +5325,64 @@ fn update_definition_code_optional_type(
     Ok(())
 }
 
+fn update_definition_code_u32(digest: &mut Sha256, value: u32) {
+    digest.update(value.to_be_bytes());
+}
+
+fn update_definition_code_text(digest: &mut Sha256, value: &str) {
+    update_definition_code_len(digest, value.len());
+    digest.update(value.as_bytes());
+}
+
+fn update_definition_code_resource_path(
+    digest: &mut Sha256,
+    text: &ProjectTextSnapshot,
+    symbols: &[SymbolId],
+    start: u32,
+    len: u32,
+    context: &str,
+) -> Result<(), KernelSolveError> {
+    let start = start as usize;
+    let end = start
+        .checked_add(len as usize)
+        .ok_or_else(|| KernelSolveError::new(format!("{context} span overflows usize")))?;
+    let path = symbols
+        .get(start..end)
+        .ok_or_else(|| KernelSolveError::new(format!("{context} is outside its definition")))?;
+    update_definition_code_len(digest, path.len());
+    for symbol in path {
+        let value = text.symbol(*symbol).ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "{context} symbol {} is outside the frozen text authority",
+                symbol.as_u32()
+            ))
+        })?;
+        update_definition_code_text(digest, value);
+    }
+    Ok(())
+}
+
+fn update_definition_code_declaration_reference(
+    digest: &mut Sha256,
+    target: KernelDeclarationReference,
+) {
+    match target {
+        KernelDeclarationReference::Local(declaration) => {
+            digest.update([0]);
+            update_definition_code_u32(digest, declaration.0);
+        }
+        KernelDeclarationReference::OwnerPublic(owner) => {
+            digest.update([1]);
+            update_definition_code_u32(digest, owner.0);
+        }
+        KernelDeclarationReference::OwnerDeclaration { owner, declaration } => {
+            digest.update([2]);
+            update_definition_code_u32(digest, owner.0);
+            update_definition_code_u32(digest, declaration.0);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn definition_code_types_stable_digest(
     source: &crate::TypeTermArena,
@@ -3344,9 +5399,12 @@ fn definition_code_types_stable_digest(
     sources: &[TypeTermId],
     states: &[PackedFlow],
     lists: &[TypeTermId],
+    resource_projection_requirements: &[ResourceProjectionRequirementFact],
+    resource_projection_origins: &[PackedSourceReadInput],
+    resource_projection_symbols: &[SymbolId],
 ) -> Result<[u8; 32], KernelSolveError> {
     let mut digest = Sha256::new();
-    digest.update(DEFINITION_CODE_TYPES_DOMAIN_V1);
+    digest.update(DEFINITION_CODE_DOMAIN_V4);
     update_definition_code_flow(&mut digest, source, scratch, result.0, result.1)?;
     update_definition_code_len(&mut digest, formals.len());
     for (term, mode) in formals.iter().copied() {
@@ -3410,6 +5468,50 @@ fn definition_code_types_stable_digest(
     update_definition_code_len(&mut digest, lists.len());
     for term in lists.iter().copied() {
         update_definition_code_type(&mut digest, source, scratch, term)?;
+    }
+    update_definition_code_len(&mut digest, resource_projection_requirements.len());
+    let text = source.text_snapshot();
+    for requirement in resource_projection_requirements {
+        update_definition_code_u32(&mut digest, requirement.expression.0);
+        update_definition_code_declaration_reference(&mut digest, requirement.target);
+        digest.update([u8::from(requirement.publishes_required_type)]);
+        update_definition_code_resource_path(
+            &mut digest,
+            text,
+            resource_projection_symbols,
+            requirement.projection_start,
+            requirement.projection_len,
+            "kernel definition-code resource requirement path",
+        )?;
+        let origin_start = requirement.origin_start as usize;
+        let origin_end = origin_start
+            .checked_add(requirement.origin_len as usize)
+            .ok_or_else(|| {
+                KernelSolveError::new(
+                    "kernel definition-code resource requirement origin span overflows usize",
+                )
+            })?;
+        let origins = resource_projection_origins
+            .get(origin_start..origin_end)
+            .ok_or_else(|| {
+                KernelSolveError::new(
+                    "kernel definition-code resource requirement origins are outside its definition",
+                )
+            })?;
+        update_definition_code_len(&mut digest, origins.len());
+        for origin in origins {
+            update_definition_code_u32(&mut digest, origin.owner.0);
+            update_definition_code_u32(&mut digest, origin.source.0);
+            update_definition_code_resource_path(
+                &mut digest,
+                text,
+                resource_projection_symbols,
+                origin.payload_projection_start,
+                origin.payload_projection_len,
+                "kernel definition-code resource origin path",
+            )?;
+        }
+        update_definition_code_type(&mut digest, source, scratch, requirement.required_term)?;
     }
     Ok(digest.finalize().into())
 }
@@ -7478,12 +9580,18 @@ pub fn compile_project_program_with_definition_facts(
         facts,
         &crate::KernelAbiInput::default(),
     )?;
-    compile_project_program_with_definition_facts_and_text(input, facts, text)
+    compile_project_program_with_definition_facts_abi_and_text(
+        input,
+        facts,
+        Arc::new(crate::KernelAbiInput::default()),
+        text,
+    )
 }
 
-pub(crate) fn compile_project_program_with_definition_facts_and_text(
+pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
     input: &KernelProjectProgramInput,
     facts: &[KernelDefinitionFactsInput],
+    abi: Arc<crate::KernelAbiInput>,
     text: ProjectTextSnapshot,
 ) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
     if facts.len() != input.owners.len() {
@@ -7909,6 +10017,7 @@ pub(crate) fn compile_project_program_with_definition_facts_and_text(
     Ok(KernelProjectProgram {
         component,
         owners: owners.into_boxed_slice(),
+        abi,
         compile_work,
     })
 }
@@ -15264,6 +17373,117 @@ mod tests {
             .position(|call| call.expression == KernelExpressionId(expression))
             .expect("project call occurrence is present");
         project_call(snapshot, owner, ordinal)
+    }
+
+    #[test]
+    fn resource_specificity_matches_collapsed_checked_unions() {
+        let mut terms = crate::TypeTermArena::new();
+        let placeholder = terms.open_object();
+        let open_empty = terms.object([], true);
+        let collapsed_open = terms.union([placeholder, open_empty]);
+        assert!(matches!(terms.term(collapsed_open), TypeTerm::Union(_)));
+        assert!(!packed_resource_projection_type_is_specific(
+            &terms,
+            collapsed_open,
+        ));
+
+        let collapsed_list = terms.list(collapsed_open);
+        assert!(!packed_resource_projection_type_is_specific(
+            &terms,
+            collapsed_list,
+        ));
+
+        let unknown = terms.unknown();
+        let distinct_union = terms.union([unknown, placeholder]);
+        assert!(packed_resource_projection_type_is_specific(
+            &terms,
+            distinct_union,
+        ));
+    }
+
+    #[test]
+    fn resource_payload_projection_preserves_exact_event_segments() {
+        let mut builder = boon_contract::PackedTextCatalogBuilder::new();
+        for symbol in ["event", "events", "change", "text", "key_down", "key"] {
+            builder.intern_symbol(symbol).unwrap();
+        }
+        let text = builder.freeze();
+        let symbol = |value: &str| text.lookup_symbol(value).unwrap();
+        let event = symbol("event");
+        let events = symbol("events");
+        let change = symbol("change");
+        let text_field = symbol("text");
+        let key_down = symbol("key_down");
+        let key = symbol("key");
+
+        assert_eq!(
+            canonical_resource_payload_projection(&text, &[event]),
+            vec![event]
+        );
+        assert_eq!(
+            canonical_resource_payload_projection(&text, &[events]),
+            vec![events]
+        );
+        assert_eq!(
+            canonical_resource_payload_projection(&text, &[event, change, text_field]),
+            vec![text_field]
+        );
+        assert_eq!(
+            canonical_resource_payload_projection(&text, &[events, key_down, key]),
+            vec![key]
+        );
+
+        let intern = |paths: &mut ResourceProjectionArena, symbols: &[SymbolId]| {
+            symbols
+                .iter()
+                .rev()
+                .fold(ResourceProjectionId::ROOT, |tail, symbol| {
+                    paths.cons(*symbol, tail)
+                })
+        };
+        let mut paths = ResourceProjectionArena::default();
+        for (input, expected) in [
+            (vec![event], vec![event]),
+            (vec![events], vec![events]),
+            (vec![event, change, text_field], vec![text_field]),
+            (vec![events, key_down, key], vec![key]),
+        ] {
+            let input = intern(&mut paths, &input);
+            let expected = intern(&mut paths, &expected);
+            assert_eq!(
+                canonical_resource_payload_projection_id(&text, &paths, input),
+                expected
+            );
+        }
+
+        let prefix = intern(&mut paths, &[event, change]);
+        let suffix = intern(&mut paths, &[text_field, key]);
+        let mut scratch = Vec::new();
+        let combined = paths.append(prefix, suffix, &mut scratch);
+        let expected = intern(&mut paths, &[event, change, text_field, key]);
+        assert_eq!(combined, expected);
+        assert_eq!(paths.suffix_after(combined, prefix), Some(suffix));
+    }
+
+    #[test]
+    fn resource_call_provenance_indexes_only_the_first_input_per_formal() {
+        let inputs = [
+            KernelCallInputArtifact {
+                role: KernelCallInputRole::Formal { ordinal: 0 },
+                value: KernelValueReference::Local(KernelExpressionId(1)),
+            },
+            KernelCallInputArtifact {
+                role: KernelCallInputRole::Formal { ordinal: 0 },
+                value: KernelValueReference::Local(KernelExpressionId(2)),
+            },
+            KernelCallInputArtifact {
+                role: KernelCallInputRole::Formal { ordinal: 1 },
+                value: KernelValueReference::Local(KernelExpressionId(3)),
+            },
+        ];
+        assert!(user_call_input_is_first_for_formal(&inputs, 0, 0));
+        assert!(!user_call_input_is_first_for_formal(&inputs, 1, 0));
+        assert!(user_call_input_is_first_for_formal(&inputs, 2, 1));
     }
 
     #[test]

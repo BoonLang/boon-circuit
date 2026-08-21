@@ -3,7 +3,7 @@ use crate::{
     KernelAbiInput, KernelCheckedSnapshot, KernelCompileWork, KernelDefinitionFactsInput,
     KernelDemandedDefinitionSnapshot, KernelInterfaceSnapshot, KernelOwnerBuildError,
     KernelOwnerId, KernelProjectProgramInput, KernelSolveError, KernelSolvedProject,
-    compile_project_program_with_definition_facts_and_text,
+    compile_project_program_with_definition_facts_abi_and_text,
 };
 use boon_contract::ProjectTextSnapshot;
 use boon_syntax::{SourceUnitId, StableCheckOwnerKey};
@@ -196,9 +196,10 @@ impl KernelProjectInput {
     }
 
     pub fn compile(&self) -> Result<crate::KernelProjectProgram, KernelOwnerBuildError> {
-        compile_project_program_with_definition_facts_and_text(
+        compile_project_program_with_definition_facts_abi_and_text(
             self.program(),
             self.definition_facts(),
+            Arc::clone(&self.abi),
             self.text.clone(),
         )
     }

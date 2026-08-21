@@ -1180,7 +1180,7 @@ impl KernelCheckedLinkLayout {
             ))
         };
         #[cfg(not(target_family = "wasm"))]
-        let (base, (mut expressions, mut runtime_flow_terms)) =
+        let (base, (expressions, runtime_flow_terms)) =
             if crate::experimental_parallel_projection_enabled()
                 && self.totals.expressions >= 4096
                 && std::thread::available_parallelism()
@@ -1203,7 +1203,7 @@ impl KernelCheckedLinkLayout {
                 )
             };
         #[cfg(target_family = "wasm")]
-        let (base, (mut expressions, mut runtime_flow_terms)) = (
+        let (base, (expressions, runtime_flow_terms)) = (
             self.materialize_base_rows(project, snapshot, role)?,
             materialize_expression_rows()?,
         );
@@ -1222,24 +1222,8 @@ impl KernelCheckedLinkLayout {
         let call_result_paths =
             self.materialize_call_result_paths(&declarations, &callables, &expressions, &calls)?;
         let pattern_bindings = self.materialize_pattern_bindings(snapshot)?;
-        let resource_projection_requirements = checked_resource_projection_requirements(
-            &declarations,
-            &callables,
-            &calls,
-            &expressions,
-            &sources,
-        );
-        let corrected_resource_projection_flows = apply_checked_resource_projection_types(
-            &mut expressions,
-            &resource_projection_requirements,
-        );
-        runtime_flow_terms
-            .apply_expression_flow_overrides(
-                corrected_resource_projection_flows
-                    .iter()
-                    .map(|expression| (*expression, &expressions[expression.0 as usize].flow_type)),
-            )
-            .map_err(KernelCheckedLinkError::new)?;
+        let resource_projection_requirements =
+            self.materialize_resource_projection_requirements(snapshot, &expressions)?;
         #[cfg(test)]
         {
             let replay =
@@ -1360,7 +1344,12 @@ impl KernelCheckedLinkLayout {
                     definition.expressions.len()
                 )));
             }
-            for (local, flow) in code.expressions().iter().enumerate() {
+            for (local, _) in code.expressions().iter().enumerate() {
+                let flow = code.published_expression(local).ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel definition {owner_index} has no published expression term {local}"
+                    ))
+                })?;
                 let local = u32::try_from(local).map_err(|_| {
                     KernelCheckedLinkError::new(
                         "kernel definition expression term count exceeds u32",
@@ -1394,6 +1383,73 @@ impl KernelCheckedLinkLayout {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(CheckedRuntimeFlowTermProjectionV1::from_runtime_flow_digests(digests))
+    }
+
+    fn materialize_resource_projection_requirements(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        expressions: &[CheckedExpression],
+    ) -> Result<Box<[CheckedResourceProjectionRequirement]>, KernelCheckedLinkError> {
+        self.validate_snapshot_definition_count(snapshot, "resource-projection handoff")?;
+        let mut requirements = Vec::new();
+        for owner_index in 0..snapshot.definitions.len() {
+            let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
+                KernelCheckedLinkError::new(
+                    "kernel resource-projection definition count exceeds u32",
+                )
+            })?);
+            let code = snapshot.definition_code.definition(owner).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel resource-projection handoff omits definition {owner_index}"
+                ))
+            })?;
+            let type_variables = self.definition(owner)?.type_variables;
+            for ordinal in 0..code.resource_projection_requirement_count() {
+                let requirement = code
+                    .materialize_resource_projection_requirement(ordinal)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {owner_index} omits resource projection {ordinal}"
+                        ))
+                    })?;
+                let source_origins = requirement
+                    .origins
+                    .into_vec()
+                    .into_iter()
+                    .map(|origin| {
+                        Ok(CheckedSourceRead {
+                            source: self.source(origin.owner, origin.source.0)?,
+                            payload_projection: origin.payload_projection,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?;
+                let expression =
+                    self.expression(owner, KernelValueReference::Local(requirement.expression))?;
+                let required_type = match requirement.required_type {
+                    Some(required_type) => relocate_type(type_variables, &required_type)?,
+                    None => expressions
+                        .get(expression.0 as usize)
+                        .filter(|row| row.id == expression)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel resource projection references missing checked expression {}",
+                                expression.0
+                            ))
+                        })?
+                        .flow_type
+                        .ty
+                        .clone(),
+                };
+                requirements.push(CheckedResourceProjectionRequirement {
+                    expression,
+                    target: self.declaration(owner, requirement.target)?,
+                    projection: requirement.projection.into_vec(),
+                    source_origins,
+                    required_type,
+                });
+            }
+        }
+        Ok(requirements.into_boxed_slice())
     }
 
     /// Publish one dependency-first execution template directly from the
@@ -2782,7 +2838,7 @@ impl KernelCheckedLinkLayout {
                     flow_type: self.relocate_flow_type(
                         owner,
                         &materializer
-                            .materialize_expression(local_ordinal)
+                            .materialize_published_expression(local_ordinal)
                             .ok_or_else(|| {
                                 KernelCheckedLinkError::new(format!(
                                     "kernel definition {} has no packed expression flow {}",
@@ -5700,768 +5756,6 @@ fn checked_projection_to_expression(
     }
 
     visit(expressions, calls, root, target, &mut BTreeSet::new())
-}
-
-fn checked_resource_projection_requirements(
-    declarations: &[CheckedDeclaration],
-    callables: &[CheckedCallableSignature],
-    calls: &[CheckedCall],
-    expressions: &[CheckedExpression],
-    sources: &[CheckedSource],
-) -> Box<[CheckedResourceProjectionRequirement]> {
-    let mut resolver =
-        CheckedSourceProvenanceResolver::new(declarations, callables, calls, expressions, sources);
-    expressions
-        .iter()
-        .filter_map(|expression| {
-            let (target, projection) = match &expression.kind {
-                CheckedExpressionKind::Read {
-                    target,
-                    projection,
-                    source: None,
-                }
-                | CheckedExpressionKind::Drain { target, projection } => (*target, projection),
-                _ => return None,
-            };
-            if projection.is_empty() {
-                return None;
-            }
-            let required_type = if checked_type_is_specific(&expression.flow_type.ty) {
-                expression.flow_type.ty.clone()
-            } else {
-                projection.last().map_or(Type::Unknown, |field| {
-                    checked_source_payload_field_type(field)
-                })
-            };
-            Some(CheckedResourceProjectionRequirement {
-                expression: expression.id,
-                target,
-                projection: projection.clone(),
-                source_origins: resolver.sources_for_declaration(target, projection),
-                required_type,
-            })
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
-}
-
-fn apply_checked_resource_projection_types(
-    expressions: &mut [CheckedExpression],
-    requirements: &[CheckedResourceProjectionRequirement],
-) -> Box<[CheckedExprId]> {
-    let mut corrected = Vec::new();
-    for requirement in requirements {
-        if requirement.source_origins.is_empty()
-            || !checked_type_is_specific(&requirement.required_type)
-        {
-            continue;
-        }
-        let Some(expression) = expressions
-            .get_mut(requirement.expression.0 as usize)
-            .filter(|expression| expression.id == requirement.expression)
-        else {
-            continue;
-        };
-        if !checked_type_is_specific(&expression.flow_type.ty) {
-            expression.flow_type.ty = requirement.required_type.clone();
-            corrected.push(expression.id);
-        }
-    }
-    corrected.into_boxed_slice()
-}
-
-fn checked_type_is_specific(ty: &Type) -> bool {
-    match ty {
-        Type::Absent | Type::UnresolvedShape { .. } | Type::Unknown | Type::Var(_) => false,
-        Type::Object(shape) if shape.open && shape.fields.is_empty() => false,
-        Type::List(item) if matches!(item.as_ref(), Type::Object(shape) if shape.open && shape.fields.is_empty()) => {
-            false
-        }
-        _ => true,
-    }
-}
-
-fn checked_source_payload_field_type(field: &str) -> Type {
-    match field {
-        "press" | "click" | "double_click" | "blur" | "change" | "key_down" => {
-            Type::object(ObjectShape::new(BTreeMap::new(), false))
-        }
-        "bytes" => Type::Bytes(boon_checked::BytesType::Dynamic),
-        _ => Type::Text,
-    }
-}
-
-struct CheckedSourcePathIndex<'a> {
-    by_anchor: BTreeMap<DeclId, Vec<&'a CheckedSource>>,
-}
-
-impl<'a> CheckedSourcePathIndex<'a> {
-    fn new(sources: &'a [CheckedSource]) -> Self {
-        let mut by_anchor = BTreeMap::<DeclId, Vec<&CheckedSource>>::new();
-        for source in sources {
-            by_anchor
-                .entry(source.path.anchor)
-                .or_default()
-                .push(source);
-        }
-        for candidates in by_anchor.values_mut() {
-            candidates.sort_by_key(|source| std::cmp::Reverse(source.path.projection.len()));
-        }
-        Self { by_anchor }
-    }
-
-    fn exact_read(&self, target: DeclId, projection: &[String]) -> Option<CheckedSourceRead> {
-        let mut matches = self.by_anchor.get(&target)?.iter().filter_map(|source| {
-            projection
-                .strip_prefix(source.path.projection.as_slice())
-                .map(|payload| (*source, payload))
-        });
-        let (source, payload) = matches.next()?;
-        if matches.next().is_some_and(|(candidate, _)| {
-            candidate.path.projection.len() == source.path.projection.len()
-        }) {
-            return None;
-        }
-        Some(CheckedSourceRead {
-            source: source.id,
-            payload_projection: canonical_checked_source_payload_projection(payload),
-        })
-    }
-}
-
-fn canonical_checked_source_payload_projection(projection: &[String]) -> Vec<String> {
-    if projection.is_empty() {
-        return Vec::new();
-    }
-    let suffix = projection.join(".");
-    let suffix = suffix
-        .strip_prefix("event.")
-        .or_else(|| suffix.strip_prefix("events."))
-        .unwrap_or(&suffix);
-    match suffix {
-        "change.text" => vec!["text".to_owned()],
-        "change.bytes" => vec!["bytes".to_owned()],
-        "key_down.key" => vec!["key".to_owned()],
-        "press" | "click" | "double_click" | "blur" | "change" | "key_down" => {
-            vec![suffix.to_owned()]
-        }
-        field if !field.contains('.') => vec![field.to_owned()],
-        _ => projection
-            .strip_prefix(&["event".to_owned()])
-            .or_else(|| projection.strip_prefix(&["events".to_owned()]))
-            .unwrap_or(projection)
-            .to_vec(),
-    }
-}
-
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum CheckedSourceResolution {
-    Declaration(DeclId, Vec<String>),
-    Expression(CheckedExprId, Vec<String>),
-    ListItem(CheckedExprId, Vec<String>),
-    Output(DeclId, Vec<String>),
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum CheckedSourceResolutionNode {
-    Declaration(DeclId),
-    Expression(CheckedExprId),
-    ListItem(CheckedExprId),
-    Output(DeclId),
-}
-
-impl CheckedSourceResolution {
-    const fn node(&self) -> CheckedSourceResolutionNode {
-        match self {
-            Self::Declaration(declaration, _) => {
-                CheckedSourceResolutionNode::Declaration(*declaration)
-            }
-            Self::Expression(expression, _) => CheckedSourceResolutionNode::Expression(*expression),
-            Self::ListItem(expression, _) => CheckedSourceResolutionNode::ListItem(*expression),
-            Self::Output(declaration, _) => CheckedSourceResolutionNode::Output(*declaration),
-        }
-    }
-}
-
-struct CheckedSourceProvenanceResolver<'a> {
-    declarations: BTreeMap<DeclId, &'a CheckedDeclaration>,
-    callables: BTreeMap<DeclId, &'a CheckedCallableSignature>,
-    calls: BTreeMap<CheckedCallId, &'a CheckedCall>,
-    expressions: BTreeMap<CheckedExprId, &'a CheckedExpression>,
-    source_paths: CheckedSourcePathIndex<'a>,
-    source_expressions: BTreeMap<CheckedExprId, Vec<CheckedSourceId>>,
-    actual_inputs_by_formal: BTreeMap<DeclId, Vec<CheckedExprId>>,
-    contextual_lists_by_output: BTreeMap<DeclId, Vec<CheckedExprId>>,
-    forwarded_outputs_by_formal: BTreeMap<DeclId, Vec<DeclId>>,
-    declaration_cache: BTreeMap<(DeclId, Vec<String>), Vec<CheckedSourceRead>>,
-}
-
-impl<'a> CheckedSourceProvenanceResolver<'a> {
-    fn new(
-        declarations: &'a [CheckedDeclaration],
-        callables: &'a [CheckedCallableSignature],
-        calls: &'a [CheckedCall],
-        expressions: &'a [CheckedExpression],
-        sources: &'a [CheckedSource],
-    ) -> Self {
-        let callable_index = callables
-            .iter()
-            .map(|callable| (callable.decl_id, callable))
-            .collect::<BTreeMap<_, _>>();
-        let mut source_expressions = BTreeMap::<CheckedExprId, Vec<CheckedSourceId>>::new();
-        for source in sources {
-            source_expressions
-                .entry(source.expression)
-                .or_default()
-                .push(source.id);
-        }
-        let mut actual_inputs_by_formal = BTreeMap::<DeclId, Vec<CheckedExprId>>::new();
-        let mut contextual_lists_by_output = BTreeMap::<DeclId, Vec<CheckedExprId>>::new();
-        let mut forwarded_outputs_by_formal = BTreeMap::<DeclId, Vec<DeclId>>::new();
-        for call in calls {
-            let mut indexed_input_formals = BTreeSet::new();
-            for entry in &call.entries {
-                match entry {
-                    CheckedCallEntry::Input { formal, value, .. } => {
-                        if indexed_input_formals.insert(*formal) {
-                            actual_inputs_by_formal
-                                .entry(*formal)
-                                .or_default()
-                                .push(*value);
-                        }
-                    }
-                    CheckedCallEntry::FreshOut { formal, output, .. }
-                    | CheckedCallEntry::ForwardOut {
-                        formal,
-                        target: output,
-                        ..
-                    } => {
-                        forwarded_outputs_by_formal
-                            .entry(*formal)
-                            .or_default()
-                            .push(*output);
-                    }
-                }
-            }
-            let Some(operation) = callable_index
-                .get(&call.callable)
-                .and_then(|callable| callable.contextual_operation)
-            else {
-                continue;
-            };
-            let (list_formal, row_formal, _) = checked_contextual_operation_formals(operation);
-            let Some(list) = checked_call_formal_input(call, list_formal) else {
-                continue;
-            };
-            for entry in &call.entries {
-                let output = match entry {
-                    CheckedCallEntry::FreshOut { formal, output, .. } if *formal == row_formal => {
-                        Some(*output)
-                    }
-                    CheckedCallEntry::ForwardOut {
-                        formal,
-                        target: output,
-                        ..
-                    } if *formal == row_formal => Some(*output),
-                    _ => None,
-                };
-                if let Some(output) = output {
-                    contextual_lists_by_output
-                        .entry(output)
-                        .or_default()
-                        .push(list);
-                }
-            }
-        }
-        Self {
-            declarations: declarations
-                .iter()
-                .map(|declaration| (declaration.id, declaration))
-                .collect(),
-            callables: callable_index,
-            calls: calls.iter().map(|call| (call.id, call)).collect(),
-            expressions: expressions
-                .iter()
-                .map(|expression| (expression.id, expression))
-                .collect(),
-            source_paths: CheckedSourcePathIndex::new(sources),
-            source_expressions,
-            actual_inputs_by_formal,
-            contextual_lists_by_output,
-            forwarded_outputs_by_formal,
-            declaration_cache: BTreeMap::new(),
-        }
-    }
-
-    fn sources_for_declaration(
-        &mut self,
-        target: DeclId,
-        projection: &[String],
-    ) -> Vec<CheckedSourceRead> {
-        let key = (target, projection.to_vec());
-        if let Some(cached) = self.declaration_cache.get(&key) {
-            return cached.clone();
-        }
-        let mut explored = BTreeSet::new();
-        let mut active = BTreeSet::new();
-        let resolved = self
-            .declaration_sources(target, projection, &mut explored, &mut active)
-            .into_iter()
-            .collect::<Vec<_>>();
-        self.declaration_cache.insert(key, resolved.clone());
-        resolved
-    }
-
-    fn declaration_sources(
-        &self,
-        target: DeclId,
-        projection: &[String],
-        explored: &mut BTreeSet<CheckedSourceResolution>,
-        active: &mut BTreeSet<CheckedSourceResolutionNode>,
-    ) -> BTreeSet<CheckedSourceRead> {
-        let key = CheckedSourceResolution::Declaration(target, projection.to_vec());
-        let node = key.node();
-        if active.contains(&node) || !explored.insert(key) {
-            return BTreeSet::new();
-        }
-        active.insert(node);
-        let mut resolved = BTreeSet::new();
-        if let Some(source) = self.source_paths.exact_read(target, projection) {
-            resolved.insert(source);
-        }
-        let Some(declaration) = self.declarations.get(&target).copied() else {
-            active.remove(&node);
-            return resolved;
-        };
-        if declaration.kind == CheckedDeclarationKind::ValueParameter {
-            for actual in self
-                .actual_inputs_by_formal
-                .get(&target)
-                .into_iter()
-                .flatten()
-            {
-                resolved.extend(self.expression_sources(*actual, projection, explored, active));
-            }
-        }
-        if matches!(
-            declaration.kind,
-            CheckedDeclarationKind::FreshOut | CheckedDeclarationKind::OutParameter
-        ) {
-            resolved.extend(self.output_sources(target, projection, explored, active));
-        }
-        if let Some(value) = declaration.value {
-            resolved.extend(self.expression_sources(value, projection, explored, active));
-        }
-        if let Some(result) = self
-            .callables
-            .get(&target)
-            .and_then(|callable| callable.result_expression)
-        {
-            resolved.extend(self.expression_sources(result, projection, explored, active));
-        }
-        active.remove(&node);
-        resolved
-    }
-
-    fn expression_sources(
-        &self,
-        expression_id: CheckedExprId,
-        projection: &[String],
-        explored: &mut BTreeSet<CheckedSourceResolution>,
-        active: &mut BTreeSet<CheckedSourceResolutionNode>,
-    ) -> BTreeSet<CheckedSourceRead> {
-        let key = CheckedSourceResolution::Expression(expression_id, projection.to_vec());
-        let node = key.node();
-        if active.contains(&node) || !explored.insert(key) {
-            return BTreeSet::new();
-        }
-        active.insert(node);
-        let mut resolved = BTreeSet::new();
-        if let Some(sources) = self.source_expressions.get(&expression_id) {
-            resolved.extend(sources.iter().map(|source| CheckedSourceRead {
-                source: *source,
-                payload_projection: canonical_checked_source_payload_projection(projection),
-            }));
-            active.remove(&node);
-            return resolved;
-        }
-        let Some(expression) = self.expressions.get(&expression_id).copied() else {
-            active.remove(&node);
-            return resolved;
-        };
-        match &expression.kind {
-            CheckedExpressionKind::Read {
-                target,
-                projection: read_projection,
-                ..
-            }
-            | CheckedExpressionKind::Drain {
-                target,
-                projection: read_projection,
-            } => {
-                let mut combined = read_projection.clone();
-                combined.extend_from_slice(projection);
-                resolved.extend(self.declaration_sources(*target, &combined, explored, active));
-            }
-            CheckedExpressionKind::TaggedObject { fields, .. }
-            | CheckedExpressionKind::Object { fields } => {
-                if let Some((field, rest)) = projection.split_first() {
-                    for candidate in fields.iter().filter(|candidate| candidate.name == *field) {
-                        resolved.extend(self.expression_sources(
-                            candidate.value,
-                            rest,
-                            explored,
-                            active,
-                        ));
-                    }
-                }
-            }
-            CheckedExpressionKind::Call { call } => {
-                if let Some(call) = self.calls.get(call).copied()
-                    && let Some(callable) = self.callables.get(&call.callable).copied()
-                {
-                    if callable.kind == CheckedCallableKind::User {
-                        if let Some(result) = callable.result_expression {
-                            resolved.extend(
-                                self.expression_sources(result, projection, explored, active),
-                            );
-                        }
-                    } else if (matches!(
-                        callable.contextual_operation,
-                        Some(CheckedContextualOperation::Find { .. })
-                    ) || matches!(
-                        call.function.as_str(),
-                        "List/get" | "List/latest" | "List/find"
-                    )) && let Some(list) = checked_call_input(call, "list")
-                    {
-                        resolved.extend(self.list_item_sources(list, projection, explored, active));
-                    }
-                }
-            }
-            CheckedExpressionKind::Draining { input }
-            | CheckedExpressionKind::Hold { initial: input, .. } => {
-                resolved.extend(self.expression_sources(*input, projection, explored, active));
-            }
-            CheckedExpressionKind::Flush { payload } => {
-                resolved.extend(self.expression_sources(*payload, projection, explored, active));
-            }
-            CheckedExpressionKind::Latest { branches } => {
-                for branch in branches {
-                    resolved.extend(self.expression_sources(*branch, projection, explored, active));
-                }
-            }
-            CheckedExpressionKind::When { arms, .. }
-            | CheckedExpressionKind::While { arms, .. } => {
-                for arm in arms {
-                    resolved.extend(self.expression_sources(*arm, projection, explored, active));
-                }
-            }
-            CheckedExpressionKind::Then { output, .. }
-            | CheckedExpressionKind::MatchArm { output, .. } => {
-                if let Some(output) = output {
-                    resolved.extend(self.expression_sources(*output, projection, explored, active));
-                }
-            }
-            CheckedExpressionKind::Block { result, .. } => {
-                if let Some(result) = result {
-                    resolved.extend(self.expression_sources(*result, projection, explored, active));
-                }
-            }
-            CheckedExpressionKind::MapEntry { key, value } => {
-                resolved.extend(self.expression_sources(*key, &[], explored, active));
-                resolved.extend(self.expression_sources(*value, projection, explored, active));
-            }
-            CheckedExpressionKind::Map { entries } => {
-                for entry in entries {
-                    resolved.extend(self.expression_sources(*entry, projection, explored, active));
-                }
-            }
-            CheckedExpressionKind::Set { items } => {
-                for item in items {
-                    resolved.extend(self.expression_sources(*item, projection, explored, active));
-                }
-            }
-            CheckedExpressionKind::List { .. }
-            | CheckedExpressionKind::Passed { .. }
-            | CheckedExpressionKind::ExternalRead { .. }
-            | CheckedExpressionKind::Text { .. }
-            | CheckedExpressionKind::TextTemplate { .. }
-            | CheckedExpressionKind::Number { .. }
-            | CheckedExpressionKind::Bits { .. }
-            | CheckedExpressionKind::BytesByte { .. }
-            | CheckedExpressionKind::Absent
-            | CheckedExpressionKind::Tag { .. }
-            | CheckedExpressionKind::Source
-            | CheckedExpressionKind::Infix { .. }
-            | CheckedExpressionKind::Bytes { .. }
-            | CheckedExpressionKind::Delimiter
-            | CheckedExpressionKind::Invalid { .. } => {}
-        }
-        active.remove(&node);
-        resolved
-    }
-
-    fn list_item_sources(
-        &self,
-        expression_id: CheckedExprId,
-        projection: &[String],
-        explored: &mut BTreeSet<CheckedSourceResolution>,
-        active: &mut BTreeSet<CheckedSourceResolutionNode>,
-    ) -> BTreeSet<CheckedSourceRead> {
-        let key = CheckedSourceResolution::ListItem(expression_id, projection.to_vec());
-        let node = key.node();
-        if active.contains(&node) || !explored.insert(key) {
-            return BTreeSet::new();
-        }
-        active.insert(node);
-        let mut resolved = BTreeSet::new();
-        let Some(expression) = self.expressions.get(&expression_id).copied() else {
-            active.remove(&node);
-            return resolved;
-        };
-        match &expression.kind {
-            CheckedExpressionKind::List { items, .. } => {
-                for item in items {
-                    resolved.extend(self.expression_sources(*item, projection, explored, active));
-                }
-            }
-            CheckedExpressionKind::Read {
-                target,
-                projection: list_projection,
-                ..
-            } => {
-                if list_projection.is_empty()
-                    && let Some(declaration) = self.declarations.get(target).copied()
-                {
-                    if declaration.kind == CheckedDeclarationKind::ValueParameter {
-                        for actual in self
-                            .actual_inputs_by_formal
-                            .get(target)
-                            .into_iter()
-                            .flatten()
-                        {
-                            resolved.extend(
-                                self.list_item_sources(*actual, projection, explored, active),
-                            );
-                        }
-                    }
-                    if let Some(value) = declaration.value {
-                        resolved
-                            .extend(self.list_item_sources(value, projection, explored, active));
-                    }
-                }
-            }
-            CheckedExpressionKind::Call { call } => {
-                if let Some(call) = self.calls.get(call).copied()
-                    && let Some(callable) = self.callables.get(&call.callable).copied()
-                {
-                    if callable.kind == CheckedCallableKind::User {
-                        if let Some(result) = callable.result_expression {
-                            resolved.extend(
-                                self.list_item_sources(result, projection, explored, active),
-                            );
-                        }
-                    } else {
-                        match callable.contextual_operation {
-                            Some(CheckedContextualOperation::Map { body, .. }) => {
-                                if let Some(body) = checked_call_formal_input(call, body) {
-                                    resolved.extend(
-                                        self.expression_sources(body, projection, explored, active),
-                                    );
-                                }
-                            }
-                            Some(
-                                CheckedContextualOperation::Filter { list, .. }
-                                | CheckedContextualOperation::Retain { list, .. }
-                                | CheckedContextualOperation::Remove { list, .. }
-                                | CheckedContextualOperation::SortBy { list, .. }
-                                | CheckedContextualOperation::ThenBy { list, .. },
-                            ) => {
-                                if let Some(list) = checked_call_formal_input(call, list) {
-                                    resolved.extend(
-                                        self.list_item_sources(list, projection, explored, active),
-                                    );
-                                }
-                            }
-                            Some(
-                                CheckedContextualOperation::Every { .. }
-                                | CheckedContextualOperation::Any { .. }
-                                | CheckedContextualOperation::Find { .. },
-                            )
-                            | None => {
-                                if matches!(call.function.as_str(), "List/take" | "List/page")
-                                    && let Some(list) = checked_call_input(call, "list")
-                                {
-                                    resolved.extend(
-                                        self.list_item_sources(list, projection, explored, active),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            CheckedExpressionKind::Draining { input }
-            | CheckedExpressionKind::Hold { initial: input, .. } => {
-                resolved.extend(self.list_item_sources(*input, projection, explored, active));
-            }
-            CheckedExpressionKind::Latest { branches } => {
-                for branch in branches {
-                    resolved.extend(self.list_item_sources(*branch, projection, explored, active));
-                }
-            }
-            CheckedExpressionKind::When { arms, .. }
-            | CheckedExpressionKind::While { arms, .. } => {
-                for arm in arms {
-                    resolved.extend(self.list_item_sources(*arm, projection, explored, active));
-                }
-            }
-            CheckedExpressionKind::Then { output, .. }
-            | CheckedExpressionKind::MatchArm { output, .. } => {
-                if let Some(output) = output {
-                    resolved.extend(self.list_item_sources(*output, projection, explored, active));
-                }
-            }
-            CheckedExpressionKind::Block { result, .. } => {
-                if let Some(result) = result {
-                    resolved.extend(self.list_item_sources(*result, projection, explored, active));
-                }
-            }
-            CheckedExpressionKind::TaggedObject { .. }
-            | CheckedExpressionKind::Object { .. }
-            | CheckedExpressionKind::MapEntry { .. }
-            | CheckedExpressionKind::Map { .. }
-            | CheckedExpressionKind::Set { .. }
-            | CheckedExpressionKind::Passed { .. }
-            | CheckedExpressionKind::ExternalRead { .. }
-            | CheckedExpressionKind::Drain { .. }
-            | CheckedExpressionKind::Text { .. }
-            | CheckedExpressionKind::TextTemplate { .. }
-            | CheckedExpressionKind::Number { .. }
-            | CheckedExpressionKind::Bits { .. }
-            | CheckedExpressionKind::BytesByte { .. }
-            | CheckedExpressionKind::Absent
-            | CheckedExpressionKind::Flush { .. }
-            | CheckedExpressionKind::Tag { .. }
-            | CheckedExpressionKind::Source
-            | CheckedExpressionKind::Infix { .. }
-            | CheckedExpressionKind::Bytes { .. }
-            | CheckedExpressionKind::Delimiter
-            | CheckedExpressionKind::Invalid { .. } => {}
-        }
-        active.remove(&node);
-        resolved
-    }
-
-    fn output_sources(
-        &self,
-        target: DeclId,
-        projection: &[String],
-        explored: &mut BTreeSet<CheckedSourceResolution>,
-        active: &mut BTreeSet<CheckedSourceResolutionNode>,
-    ) -> BTreeSet<CheckedSourceRead> {
-        let key = CheckedSourceResolution::Output(target, projection.to_vec());
-        let node = key.node();
-        if active.contains(&node) || !explored.insert(key) {
-            return BTreeSet::new();
-        }
-        active.insert(node);
-        let mut resolved = BTreeSet::new();
-        for list in self
-            .contextual_lists_by_output
-            .get(&target)
-            .into_iter()
-            .flatten()
-        {
-            resolved.extend(self.list_item_sources(*list, projection, explored, active));
-        }
-        for output in self
-            .forwarded_outputs_by_formal
-            .get(&target)
-            .into_iter()
-            .flatten()
-        {
-            resolved.extend(self.output_sources(*output, projection, explored, active));
-        }
-        active.remove(&node);
-        resolved
-    }
-}
-
-fn checked_call_formal_input(call: &CheckedCall, formal: DeclId) -> Option<CheckedExprId> {
-    call.entries.iter().find_map(|entry| match entry {
-        CheckedCallEntry::Input {
-            formal: candidate,
-            value,
-            ..
-        } if *candidate == formal => Some(*value),
-        CheckedCallEntry::Input { .. }
-        | CheckedCallEntry::FreshOut { .. }
-        | CheckedCallEntry::ForwardOut { .. } => None,
-    })
-}
-
-fn checked_call_input(call: &CheckedCall, name: &str) -> Option<CheckedExprId> {
-    call.entries.iter().find_map(|entry| match entry {
-        CheckedCallEntry::Input {
-            name: candidate,
-            value,
-            ..
-        } if candidate == name => Some(*value),
-        CheckedCallEntry::Input { .. }
-        | CheckedCallEntry::FreshOut { .. }
-        | CheckedCallEntry::ForwardOut { .. } => None,
-    })
-}
-
-const fn checked_contextual_operation_formals(
-    operation: CheckedContextualOperation,
-) -> (DeclId, DeclId, DeclId) {
-    match operation {
-        CheckedContextualOperation::Map { list, row, body }
-        | CheckedContextualOperation::Filter {
-            list,
-            row,
-            predicate: body,
-        }
-        | CheckedContextualOperation::Retain {
-            list,
-            row,
-            predicate: body,
-        }
-        | CheckedContextualOperation::Remove {
-            list,
-            row,
-            predicate: body,
-        }
-        | CheckedContextualOperation::Every {
-            list,
-            row,
-            predicate: body,
-        }
-        | CheckedContextualOperation::Any {
-            list,
-            row,
-            predicate: body,
-        }
-        | CheckedContextualOperation::Find {
-            list,
-            row,
-            predicate: body,
-        }
-        | CheckedContextualOperation::SortBy {
-            list,
-            row,
-            key: body,
-            ..
-        }
-        | CheckedContextualOperation::ThenBy {
-            list,
-            row,
-            key: body,
-            ..
-        } => (list, row, body),
-    }
 }
 
 fn lexical_payload_path(payload: &crate::KernelExpressionSemanticPayload) -> Option<String> {

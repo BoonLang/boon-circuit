@@ -5,6 +5,7 @@ use crate::{
     TypeVariableId, alpha_normalize_flow_type,
 };
 use boon_checked::{FlowMode, FlowType, Type, TypeVar};
+use boon_contract::SymbolId;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -67,6 +68,7 @@ struct DefinitionCode {
     source_payload_types: Span32,
     state_flows: Span32,
     list_item_types: Span32,
+    resource_projection_requirements: Span32,
     alpha_variables: Span32,
     stable_digest: [u8; 32],
 }
@@ -91,6 +93,9 @@ pub struct DefinitionCodeStore {
     source_payload_types: Box<[crate::TypeTermId]>,
     state_flows: Box<[PackedFlow]>,
     list_item_types: Box<[crate::TypeTermId]>,
+    resource_projection_requirements: Box<[PackedResourceProjectionRequirement]>,
+    resource_projection_origins: Box<[PackedSourceRead]>,
+    resource_projection_symbols: Box<[SymbolId]>,
     alpha_variables: Box<[TypeVariableId]>,
 }
 
@@ -115,7 +120,11 @@ impl DefinitionCodeStore {
 
     pub(crate) fn materialization_cache(&self) -> DefinitionTypeMaterializationCache {
         DefinitionTypeMaterializationCache {
-            types: vec![None; self.types.as_arena().len()],
+            // Most compatibility projections already own the exact rich type
+            // they need. Allocate the dense recursive cache only on the first
+            // actual packed-type export, not merely because a linker phase
+            // may need one exceptional type.
+            types: Vec::new(),
         }
     }
 
@@ -183,6 +192,11 @@ impl DefinitionCodeStore {
                     definition.list_item_types,
                     self.list_item_types.len(),
                 ),
+                (
+                    "resource-projection",
+                    definition.resource_projection_requirements,
+                    self.resource_projection_requirements.len(),
+                ),
             ] {
                 let start = span.start as usize;
                 let end = start.checked_add(span.len as usize).ok_or_else(|| {
@@ -208,6 +222,36 @@ impl DefinitionCodeStore {
                             "kernel definition-code owner {owner} has an invalid call-substitution span"
                         ))
                     })?;
+            }
+            for requirement in definition
+                .resource_projection_requirements
+                .get(&self.resource_projection_requirements)
+                .expect("validated resource-projection span")
+            {
+                requirement
+                    .projection
+                    .get(&self.resource_projection_symbols)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel definition-code owner {owner} has an invalid resource-projection path"
+                        ))
+                    })?;
+                for origin in requirement.origins.get(&self.resource_projection_origins).ok_or_else(
+                    || {
+                        KernelSolveError::new(format!(
+                            "kernel definition-code owner {owner} has an invalid resource-projection origin span"
+                        ))
+                    },
+                )? {
+                    origin
+                        .payload_projection
+                        .get(&self.resource_projection_symbols)
+                        .ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "kernel definition-code owner {owner} has an invalid resource-origin path"
+                            ))
+                        })?;
+                }
             }
             let alpha_variables = definition
                 .alpha_variables
@@ -257,6 +301,14 @@ impl DefinitionCodeStore {
                     .iter()
                     .flatten()
                     .copied(),
+            );
+            stack.extend(
+                definition
+                    .resource_projection_requirements
+                    .get(&self.resource_projection_requirements)
+                    .expect("validated resource-projection span")
+                    .iter()
+                    .map(|requirement| requirement.required_term),
             );
             stack.extend(
                 definition
@@ -408,6 +460,42 @@ impl<'a> DefinitionCodeRef<'a> {
             .expect("sealed definition-code expression span is valid")
     }
 
+    pub(crate) fn published_expression(self, ordinal: usize) -> Option<KernelArtifactFlowTermV1> {
+        let base = self.expressions().get(ordinal).copied()?;
+        let expression = crate::KernelExpressionId(u32::try_from(ordinal).ok()?);
+        let requirement = self
+            .resource_projection_requirements()
+            .binary_search_by_key(&expression, |requirement| requirement.expression)
+            .ok()
+            .and_then(|index| self.resource_projection_requirements().get(index));
+        requirement
+            .and_then(|requirement| requirement.published_expression)
+            .or(Some(base))
+    }
+
+    pub(crate) fn resource_projection_requirement_count(self) -> usize {
+        self.code.resource_projection_requirements.len as usize
+    }
+
+    pub(crate) fn resource_projection_requirements(
+        self,
+    ) -> &'a [PackedResourceProjectionRequirement] {
+        self.code
+            .resource_projection_requirements
+            .get(&self.store.resource_projection_requirements)
+            .expect("sealed definition-code resource-projection span is valid")
+    }
+
+    pub(crate) fn resource_projection_origins(
+        self,
+        requirement: &PackedResourceProjectionRequirement,
+    ) -> &'a [PackedSourceRead] {
+        requirement
+            .origins
+            .get(&self.store.resource_projection_origins)
+            .expect("sealed definition-code resource-projection origin span is valid")
+    }
+
     pub(crate) fn alpha_variables(self) -> &'a [TypeVariableId] {
         self.code
             .alpha_variables
@@ -424,8 +512,7 @@ impl<'a> DefinitionCodeRef<'a> {
     }
 
     pub(crate) fn expression_surface_digest(self, ordinal: usize) -> Option<[u8; 32]> {
-        self.expressions()
-            .get(ordinal)
+        self.published_expression(ordinal)
             .map(|flow| flow.stable_digest)
     }
 
@@ -469,6 +556,52 @@ impl<'a> DefinitionCodeRef<'a> {
             .get(ordinal)
             .copied()
             .map(|flow| self.materialize_flow(flow))
+    }
+
+    pub fn materialize_published_expression(self, ordinal: usize) -> Option<FlowType> {
+        self.published_expression(ordinal)
+            .map(|flow| self.materialize_flow(flow))
+    }
+
+    pub(crate) fn materialize_resource_projection_requirement(
+        self,
+        ordinal: usize,
+    ) -> Option<MaterializedResourceProjectionRequirement> {
+        let requirement = *self.resource_projection_requirements().get(ordinal)?;
+        let text = self.store.types.as_arena().text_snapshot();
+        let materialize_path = |span: Span32| {
+            span.get(&self.store.resource_projection_symbols)
+                .expect("sealed resource-projection symbol span is valid")
+                .iter()
+                .map(|symbol| {
+                    text.symbol(*symbol)
+                        .expect("resource-projection symbol belongs to the text authority")
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        let origins = self
+            .resource_projection_origins(&requirement)
+            .iter()
+            .map(|origin| MaterializedSourceRead {
+                owner: origin.owner,
+                source: origin.source,
+                payload_projection: materialize_path(origin.payload_projection),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let required_type = self
+            .published_expression(requirement.expression.0 as usize)
+            .filter(|published| published.term == requirement.required_term)
+            .is_none()
+            .then(|| self.materialize_type(requirement.required_term));
+        Some(MaterializedResourceProjectionRequirement {
+            expression: requirement.expression,
+            target: requirement.target,
+            projection: materialize_path(requirement.projection).into_boxed_slice(),
+            origins,
+            required_type,
+        })
     }
 
     pub fn materialize_expression_flush(self, ordinal: usize) -> Option<Type> {
@@ -649,6 +782,12 @@ impl DefinitionCodeMaterializer<'_, '_> {
             .map(|flow| self.materialize_flow(flow))
     }
 
+    pub(crate) fn materialize_published_expression(&mut self, ordinal: usize) -> Option<FlowType> {
+        self.code
+            .published_expression(ordinal)
+            .map(|flow| self.materialize_flow(flow))
+    }
+
     pub(crate) fn materialize_declaration_flow(&mut self, ordinal: usize) -> Option<FlowType> {
         let flow = self
             .code
@@ -756,6 +895,9 @@ impl DefinitionCodeMaterializer<'_, '_> {
 
     fn materialize_type(&mut self, term: TypeTermId) -> Type {
         let arena = self.code.store.types.as_arena();
+        if self.cache.types.len() != arena.len() {
+            self.cache.types.resize(arena.len(), None);
+        }
         let raw = arena.export_checked_type_cached(term, &mut self.cache.types);
         if !arena.has_variable(term) {
             return raw;
@@ -782,6 +924,68 @@ impl DefinitionCodeMaterializer<'_, '_> {
 pub(crate) struct PackedFlow {
     pub(crate) mode: FlowMode,
     pub(crate) term: crate::TypeTermId,
+}
+
+/// One source payload origin retained in definition-local coordinates.
+///
+/// The payload path span addresses the definition-local symbol input while
+/// building and the store-global symbol column after sealing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PackedSourceReadInput {
+    pub(crate) owner: KernelOwnerId,
+    pub(crate) source: crate::KernelSourceId,
+    pub(crate) payload_projection_start: u32,
+    pub(crate) payload_projection_len: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PackedSourceRead {
+    owner: KernelOwnerId,
+    source: crate::KernelSourceId,
+    payload_projection: Span32,
+}
+
+impl PackedSourceRead {
+    pub(crate) const fn owner(self) -> KernelOwnerId {
+        self.owner
+    }
+
+    pub(crate) const fn source(self) -> crate::KernelSourceId {
+        self.source
+    }
+}
+
+/// Definition-local input for one exact SOURCE/resource projection fact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PackedResourceProjectionRequirementInput {
+    pub(crate) expression: crate::KernelExpressionId,
+    pub(crate) target: crate::KernelDeclarationReference,
+    pub(crate) projection_start: u32,
+    pub(crate) projection_len: u32,
+    pub(crate) origin_start: u32,
+    pub(crate) origin_len: u32,
+    pub(crate) required_term: TypeTermId,
+    pub(crate) published_expression: Option<KernelArtifactFlowTermV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PackedResourceProjectionRequirement {
+    expression: crate::KernelExpressionId,
+    target: crate::KernelDeclarationReference,
+    projection: Span32,
+    origins: Span32,
+    required_term: TypeTermId,
+    published_expression: Option<KernelArtifactFlowTermV1>,
+}
+
+impl PackedResourceProjectionRequirement {
+    pub(crate) const fn expression(self) -> crate::KernelExpressionId {
+        self.expression
+    }
+
+    pub(crate) const fn target(self) -> crate::KernelDeclarationReference {
+        self.target
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -814,6 +1018,23 @@ pub struct MaterializedCallFacts {
     pub syntax_discriminated_result: bool,
 }
 
+pub(crate) struct MaterializedSourceRead {
+    pub(crate) owner: KernelOwnerId,
+    pub(crate) source: crate::KernelSourceId,
+    pub(crate) payload_projection: Vec<String>,
+}
+
+pub(crate) struct MaterializedResourceProjectionRequirement {
+    pub(crate) expression: crate::KernelExpressionId,
+    pub(crate) target: crate::KernelDeclarationReference,
+    pub(crate) projection: Box<[String]>,
+    pub(crate) origins: Box<[MaterializedSourceRead]>,
+    /// `None` means the already-materialized published expression owns this
+    /// exact rich type. Exceptional no-origin requirements retain a distinct
+    /// packed fallback and materialize only that term.
+    pub(crate) required_type: Option<Type>,
+}
+
 pub(crate) struct DefinitionAdditionalTypeRoots<'a> {
     pub(crate) expression_flush_types: &'a [Option<crate::TypeTermId>],
     pub(crate) expression_kind_types: &'a [Option<crate::TypeTermId>],
@@ -824,6 +1045,9 @@ pub(crate) struct DefinitionAdditionalTypeRoots<'a> {
     pub(crate) source_payload_types: &'a [crate::TypeTermId],
     pub(crate) state_flows: &'a [PackedFlow],
     pub(crate) list_item_types: &'a [crate::TypeTermId],
+    pub(crate) resource_projection_requirements: &'a [PackedResourceProjectionRequirementInput],
+    pub(crate) resource_projection_origins: &'a [PackedSourceReadInput],
+    pub(crate) resource_projection_symbols: &'a [SymbolId],
     pub(crate) alpha_variables: &'a [TypeVariableId],
     pub(crate) stable_digest: [u8; 32],
 }
@@ -841,6 +1065,9 @@ pub(crate) struct DefinitionCodeBuilder {
     source_payload_types: Vec<crate::TypeTermId>,
     state_flows: Vec<PackedFlow>,
     list_item_types: Vec<crate::TypeTermId>,
+    resource_projection_requirements: Vec<PackedResourceProjectionRequirement>,
+    resource_projection_origins: Vec<PackedSourceRead>,
+    resource_projection_symbols: Vec<SymbolId>,
     alpha_variables: Vec<TypeVariableId>,
 }
 
@@ -858,6 +1085,9 @@ impl DefinitionCodeBuilder {
             source_payload_types: Vec::new(),
             state_flows: Vec::new(),
             list_item_types: Vec::new(),
+            resource_projection_requirements: Vec::new(),
+            resource_projection_origins: Vec::new(),
+            resource_projection_symbols: Vec::new(),
             alpha_variables: Vec::with_capacity(alpha_variables),
         }
     }
@@ -888,6 +1118,16 @@ impl DefinitionCodeBuilder {
                 expressions.len,
                 additional.expression_flush_types.len(),
                 additional.expression_kind_types.len(),
+            )));
+        }
+        if additional
+            .resource_projection_requirements
+            .windows(2)
+            .any(|rows| rows[0].expression >= rows[1].expression)
+        {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition-code owner {} resource projections are not in unique dense-expression order",
+                owner.0,
             )));
         }
         let expression_flush_types = Span32::append(
@@ -956,6 +1196,124 @@ impl DefinitionCodeBuilder {
             &mut self.list_item_types,
             additional.list_item_types.iter().copied(),
         )?;
+        let symbol_base = u32::try_from(self.resource_projection_symbols.len()).map_err(|_| {
+            KernelSolveError::new(
+                "kernel definition-code resource-projection symbol start exceeds u32",
+            )
+        })?;
+        let _resource_projection_symbols = Span32::append(
+            &mut self.resource_projection_symbols,
+            additional.resource_projection_symbols.iter().copied(),
+        )?;
+        let origin_base = u32::try_from(self.resource_projection_origins.len()).map_err(|_| {
+            KernelSolveError::new(
+                "kernel definition-code resource-projection origin start exceeds u32",
+            )
+        })?;
+        let mut packed_origins = Vec::with_capacity(additional.resource_projection_origins.len());
+        for origin in additional.resource_projection_origins {
+            let local_end = origin
+                .payload_projection_start
+                .checked_add(origin.payload_projection_len)
+                .ok_or_else(|| {
+                    KernelSolveError::new(
+                        "kernel definition-code resource-origin path span overflows u32",
+                    )
+                })?;
+            if local_end as usize > additional.resource_projection_symbols.len() {
+                return Err(KernelSolveError::new(
+                    "kernel definition-code resource-origin path is outside its definition",
+                ));
+            }
+            packed_origins.push(PackedSourceRead {
+                owner: origin.owner,
+                source: origin.source,
+                payload_projection: Span32 {
+                    start: symbol_base
+                        .checked_add(origin.payload_projection_start)
+                        .ok_or_else(|| {
+                            KernelSolveError::new(
+                                "kernel definition-code resource-origin path start overflows u32",
+                            )
+                        })?,
+                    len: origin.payload_projection_len,
+                },
+            });
+        }
+        let _resource_projection_origins =
+            Span32::append(&mut self.resource_projection_origins, packed_origins)?;
+        let mut packed_requirements =
+            Vec::with_capacity(additional.resource_projection_requirements.len());
+        for requirement in additional.resource_projection_requirements {
+            if let Some(published) = requirement.published_expression {
+                let base = expression_flows
+                    .get(requirement.expression.0 as usize)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(
+                            "kernel definition-code published resource projection references a missing expression",
+                        )
+                    })?;
+                if published.term != requirement.required_term || published.mode != base.mode {
+                    return Err(KernelSolveError::new(
+                        "kernel definition-code published resource projection disagrees with its required term or expression mode",
+                    ));
+                }
+            }
+            let projection_end = requirement
+                .projection_start
+                .checked_add(requirement.projection_len)
+                .ok_or_else(|| {
+                    KernelSolveError::new(
+                        "kernel definition-code resource-requirement path span overflows u32",
+                    )
+                })?;
+            if projection_end as usize > additional.resource_projection_symbols.len() {
+                return Err(KernelSolveError::new(
+                    "kernel definition-code resource-requirement path is outside its definition",
+                ));
+            }
+            let origin_end = requirement
+                .origin_start
+                .checked_add(requirement.origin_len)
+                .ok_or_else(|| {
+                    KernelSolveError::new(
+                        "kernel definition-code resource-requirement origin span overflows u32",
+                    )
+                })?;
+            if origin_end as usize > additional.resource_projection_origins.len() {
+                return Err(KernelSolveError::new(
+                    "kernel definition-code resource-requirement origins are outside its definition",
+                ));
+            }
+            packed_requirements.push(PackedResourceProjectionRequirement {
+                expression: requirement.expression,
+                target: requirement.target,
+                projection: Span32 {
+                    start: symbol_base.checked_add(requirement.projection_start).ok_or_else(
+                        || {
+                            KernelSolveError::new(
+                                "kernel definition-code resource-requirement path start overflows u32",
+                            )
+                        },
+                    )?,
+                    len: requirement.projection_len,
+                },
+                origins: Span32 {
+                    start: origin_base.checked_add(requirement.origin_start).ok_or_else(|| {
+                        KernelSolveError::new(
+                            "kernel definition-code resource-requirement origin start overflows u32",
+                        )
+                    })?,
+                    len: requirement.origin_len,
+                },
+                required_term: requirement.required_term,
+                published_expression: requirement.published_expression,
+            });
+        }
+        let resource_projection_requirements = Span32::append(
+            &mut self.resource_projection_requirements,
+            packed_requirements,
+        )?;
         let alpha_variables = Span32::append(
             &mut self.alpha_variables,
             additional.alpha_variables.iter().copied(),
@@ -972,6 +1330,7 @@ impl DefinitionCodeBuilder {
             source_payload_types,
             state_flows,
             list_item_types,
+            resource_projection_requirements,
             alpha_variables,
             stable_digest: additional.stable_digest,
         });
@@ -995,6 +1354,11 @@ impl DefinitionCodeBuilder {
             source_payload_types: self.source_payload_types.into_boxed_slice(),
             state_flows: self.state_flows.into_boxed_slice(),
             list_item_types: self.list_item_types.into_boxed_slice(),
+            resource_projection_requirements: self
+                .resource_projection_requirements
+                .into_boxed_slice(),
+            resource_projection_origins: self.resource_projection_origins.into_boxed_slice(),
+            resource_projection_symbols: self.resource_projection_symbols.into_boxed_slice(),
             alpha_variables: self.alpha_variables.into_boxed_slice(),
         };
         #[cfg(debug_assertions)]
@@ -1062,6 +1426,9 @@ mod tests {
                     source_payload_types: &[],
                     state_flows: &states,
                     list_item_types: &[],
+                    resource_projection_requirements: &[],
+                    resource_projection_origins: &[],
+                    resource_projection_symbols: &[],
                     alpha_variables: &alpha,
                     stable_digest: [3; 32],
                 },
@@ -1083,5 +1450,65 @@ mod tests {
                 ty: Type::Var(TypeVar(1)),
             })
         );
+    }
+
+    #[test]
+    fn resource_projection_rows_require_dense_expression_order() {
+        let arena = TypeTermArena::new();
+        let unknown = arena.unknown();
+        let flow = KernelArtifactFlowTermV1 {
+            mode: FlowMode::Continuous,
+            term: unknown,
+            stable_digest: [0; 32],
+            runtime_erased_digest: [0; 32],
+        };
+        let requirements = [
+            PackedResourceProjectionRequirementInput {
+                expression: crate::KernelExpressionId(1),
+                target: crate::KernelDeclarationReference::Local(crate::KernelDeclarationId(0)),
+                projection_start: 0,
+                projection_len: 0,
+                origin_start: 0,
+                origin_len: 0,
+                required_term: unknown,
+                published_expression: None,
+            },
+            PackedResourceProjectionRequirementInput {
+                expression: crate::KernelExpressionId(0),
+                target: crate::KernelDeclarationReference::Local(crate::KernelDeclarationId(0)),
+                projection_start: 0,
+                projection_len: 0,
+                origin_start: 0,
+                origin_len: 0,
+                required_term: unknown,
+                published_expression: None,
+            },
+        ];
+        let mut builder = DefinitionCodeBuilder::with_capacity(1, 2, 0);
+        let error = builder
+            .push(
+                KernelOwnerId(0),
+                flow,
+                &[],
+                &[flow, flow],
+                DefinitionAdditionalTypeRoots {
+                    expression_flush_types: &[None, None],
+                    expression_kind_types: &[None, None],
+                    declaration_flows: &[],
+                    calls: &[],
+                    call_substitutions: &[],
+                    diagnostic_types: &[],
+                    source_payload_types: &[],
+                    state_flows: &[],
+                    list_item_types: &[],
+                    resource_projection_requirements: &requirements,
+                    resource_projection_origins: &[],
+                    resource_projection_symbols: &[],
+                    alpha_variables: &[],
+                    stable_digest: [0; 32],
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("unique dense-expression order"));
     }
 }

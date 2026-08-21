@@ -16,7 +16,7 @@ use crate::report_v2::{
 };
 
 const FORMAT_VERSION: u16 = 3;
-const PRODUCER_FORMAT_VERSION: u16 = 8;
+const PRODUCER_FORMAT_VERSION: u16 = 9;
 const CONTRACT: &str = "boon-compiler-allocator-tournament-v3";
 const DEFAULT_REPORT: &str = "target/reports/compiler-performance/compiler-allocator.json";
 const SYSTEM_PATH: &str = "target/release/boon_cli_system";
@@ -190,6 +190,23 @@ struct RawAllocations {
     allocated_bytes: u64,
     deallocation_calls: u64,
     deallocated_bytes: u64,
+    allocation_calls_by_ceil_log2_size: [u64; 32],
+    allocated_bytes_by_ceil_log2_size: [u64; 32],
+    largest_allocation_sizes: [u64; 32],
+}
+
+impl RawAllocations {
+    fn size_class_totals_match(self) -> bool {
+        self.allocation_calls_by_ceil_log2_size
+            .iter()
+            .try_fold(0_u64, |sum, value| sum.checked_add(*value))
+            == Some(self.allocation_calls)
+            && self
+                .allocated_bytes_by_ceil_log2_size
+                .iter()
+                .try_fold(0_u64, |sum, value| sum.checked_add(*value))
+                == Some(self.allocated_bytes)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -525,6 +542,9 @@ fn execute(
         .into_iter()
         .next()
         .expect("one sample checked");
+    if !raw.allocations.size_class_totals_match() {
+        return Err("allocator tournament size-class counters are inconsistent".into());
+    }
     let process_to_artifact_ms =
         raw.compiler_artifact_ready_unix_us
             .checked_sub(started_unix_us)

@@ -14,10 +14,10 @@ use crate::report_v2::{
     unix_time_ms,
 };
 
-const FORMAT_VERSION: u16 = 7;
-const PRODUCER_FORMAT_VERSION: u16 = 8;
+const FORMAT_VERSION: u16 = 8;
+const PRODUCER_FORMAT_VERSION: u16 = 9;
 const BUDGET_FORMAT_VERSION: u16 = 3;
-const REPORT_CONTRACT: &str = "boon-compiler-interactions-v6";
+const REPORT_CONTRACT: &str = "boon-compiler-interactions-v7";
 const DEFAULT_BUDGET: &str = "budgets/compiler.toml";
 const MAX_BUDGET_BYTES: u64 = 64 * 1024;
 const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;
@@ -424,6 +424,23 @@ struct AllocationSample {
     allocated_bytes: u64,
     deallocation_calls: u64,
     deallocated_bytes: u64,
+    allocation_calls_by_ceil_log2_size: [u64; 32],
+    allocated_bytes_by_ceil_log2_size: [u64; 32],
+    largest_allocation_sizes: [u64; 32],
+}
+
+impl AllocationSample {
+    fn size_class_totals_match(self) -> bool {
+        self.allocation_calls_by_ceil_log2_size
+            .iter()
+            .try_fold(0_u64, |sum, value| sum.checked_add(*value))
+            == Some(self.allocation_calls)
+            && self
+                .allocated_bytes_by_ceil_log2_size
+                .iter()
+                .try_fold(0_u64, |sum, value| sum.checked_add(*value))
+                == Some(self.allocated_bytes)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -768,6 +785,8 @@ fn validate_warm_product_evidence_parity(
             || evidence.diagnostics_allocations.allocated_bytes == 0
             || evidence.preview_allocations.allocation_calls == 0
             || evidence.preview_allocations.allocated_bytes == 0
+            || !evidence.diagnostics_allocations.size_class_totals_match()
+            || !evidence.preview_allocations.size_class_totals_match()
         {
             return Err("warm product/evidence allocation lanes are invalid".into());
         }
@@ -843,6 +862,7 @@ fn validate_scaling_product_evidence_parity(
     if product.allocations != AllocationSample::default()
         || evidence.allocations.allocation_calls == 0
         || evidence.allocations.allocated_bytes == 0
+        || !evidence.allocations.size_class_totals_match()
     {
         return Err("scaling product/evidence allocation lanes are invalid".into());
     }

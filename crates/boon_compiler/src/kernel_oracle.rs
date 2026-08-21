@@ -530,8 +530,8 @@ pub struct KernelOwnerOracleCurrentness {
     pub basis_fingerprint_v14: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
     pub artifact_fingerprint_v17: [u8; 32],
-    pub dependency_fingerprint_v2: [u8; 32],
-    pub fingerprint_v17: [u8; 32],
+    pub dependency_fingerprint_v3: [u8; 32],
+    pub fingerprint_v18: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1393,8 +1393,8 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     basis_fingerprint_v14: receipt.basis_fingerprint_v14,
                     public_result_fingerprint_v1: receipt.public_result_fingerprint_v1,
                     artifact_fingerprint_v17: receipt.artifact_fingerprint_v17,
-                    dependency_fingerprint_v2: receipt.dependency_fingerprint_v2,
-                    fingerprint_v17: receipt.fingerprint_v17,
+                    dependency_fingerprint_v3: receipt.dependency_fingerprint_v3,
+                    fingerprint_v18: receipt.fingerprint_v18,
                 })
                 .collect::<Vec<_>>();
             let definition_code = Arc::clone(&artifact.definition_code);
@@ -2652,7 +2652,7 @@ pub(crate) fn checked_construction_from_kernel(
         checked_image_definition_seals.push(CheckedImageDefinitionAuthoritySealV1 {
             root_scope,
             definition_key_digest,
-            fingerprint: currentness.fingerprint_v17,
+            fingerprint: currentness.fingerprint_v18,
         });
         let source = project
             .source_layouts()
@@ -19386,6 +19386,91 @@ FUNCTION selectable_row(row) {
     }
 
     #[test]
+    fn caller_source_switch_changes_exact_function_currentness() {
+        let compile = |argument: &str| {
+            let source = format!(
+                r#"
+a: [control: SOURCE]
+b: [control: SOURCE]
+result: address(row: {argument})
+
+FUNCTION address(row) {{
+    row.control.address
+}}
+"#,
+            );
+            let project = parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source)])
+                .expect("parse caller SOURCE switch fixture");
+            let payloads = boon_typecheck::project_source_payload_abi_types(&project)
+                .expect("project caller SOURCE switch payload ABI");
+            kernel_owner_oracle_with_source_payloads(&project, &payloads)
+        };
+        let from_a = compile("a");
+        let from_b = compile("b");
+        assert!(from_a.unsupported.is_empty(), "{:#?}", from_a.unsupported);
+        assert!(from_b.unsupported.is_empty(), "{:#?}", from_b.unsupported);
+
+        let requirement = |report: &KernelOwnerOracleReport| {
+            report
+                .checked_resource_projection_requirements
+                .iter()
+                .find(|requirement| {
+                    requirement.projection == ["control", "address"]
+                        && requirement.source_origins.len() == 1
+                })
+                .cloned()
+                .expect("function address read has one exact SOURCE origin")
+        };
+        let requirement_a = requirement(&from_a);
+        let requirement_b = requirement(&from_b);
+        assert_eq!(requirement_a.expression, requirement_b.expression);
+        assert_eq!(requirement_a.target, requirement_b.target);
+        assert_eq!(requirement_a.projection, requirement_b.projection);
+        assert_eq!(requirement_a.required_type, requirement_b.required_type);
+        assert_ne!(
+            requirement_a.source_origins[0].source, requirement_b.source_origins[0].source,
+            "changing only the caller input must change the callee's exact provenance",
+        );
+
+        let currentness = |report: &KernelOwnerOracleReport| {
+            report
+                .currentness
+                .iter()
+                .find(|receipt| {
+                    matches!(
+                        &receipt.owner,
+                        StableCheckOwnerKey::Item(key)
+                            if key.item_route.segments().last().is_some_and(|segment| {
+                                segment.kind == UnitItemKind::Function
+                                    && segment.names == ["address"]
+                            })
+                    )
+                })
+                .cloned()
+                .expect("address function has an exact currentness receipt")
+        };
+        let currentness_a = currentness(&from_a);
+        let currentness_b = currentness(&from_b);
+        assert_eq!(
+            currentness_a.basis_fingerprint_v14, currentness_b.basis_fingerprint_v14,
+            "caller provenance is not part of the function's immutable syntax basis",
+        );
+        assert_eq!(
+            currentness_a.public_result_fingerprint_v1, currentness_b.public_result_fingerprint_v1,
+            "the caller switch preserves the function's public type",
+        );
+        assert_ne!(
+            currentness_a.artifact_fingerprint_v17, currentness_b.artifact_fingerprint_v17,
+            "the complete packed provenance fact is exact artifact authority",
+        );
+        assert_ne!(
+            currentness_a.dependency_fingerprint_v3, currentness_b.dependency_fingerprint_v3,
+            "the exact dependency edge must follow the selected SOURCE owner",
+        );
+        assert_ne!(currentness_a.fingerprint_v18, currentness_b.fingerprint_v18,);
+    }
+
+    #[test]
     fn hold_capability_reaches_nested_pipe_callback_arguments() {
         let source = concat!(
             "FUNCTION preserve(rows) {\n",
@@ -20061,7 +20146,7 @@ FUNCTION selectable_row(row) {
                     .iter()
                     .zip(&first.supported)
                     .all(|(receipt, owner)| receipt.owner == owner.owner
-                        && receipt.fingerprint_v17 != [0; 32]),
+                        && receipt.fingerprint_v18 != [0; 32]),
                 "receipt order and ownership must match the dense definition table"
             );
             assert!(

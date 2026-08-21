@@ -15,10 +15,10 @@ use crate::report_v2::{
     unix_time_ms,
 };
 
-const REPORT_FORMAT_VERSION: u16 = 9;
-const PRODUCER_FORMAT_VERSION: u16 = 8;
+const REPORT_FORMAT_VERSION: u16 = 10;
+const PRODUCER_FORMAT_VERSION: u16 = 9;
 const BUDGET_FORMAT_VERSION: u16 = 3;
-const REPORT_CONTRACT: &str = "boon-compiler-performance-v8";
+const REPORT_CONTRACT: &str = "boon-compiler-performance-v9";
 const DEFAULT_BUDGET: &str = "budgets/compiler.toml";
 const MAX_BUDGET_BYTES: u64 = 64 * 1024;
 const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;
@@ -347,6 +347,23 @@ struct AllocationSample {
     allocated_bytes: u64,
     deallocation_calls: u64,
     deallocated_bytes: u64,
+    allocation_calls_by_ceil_log2_size: [u64; 32],
+    allocated_bytes_by_ceil_log2_size: [u64; 32],
+    largest_allocation_sizes: [u64; 32],
+}
+
+impl AllocationSample {
+    fn size_class_totals_match(self) -> bool {
+        self.allocation_calls_by_ceil_log2_size
+            .iter()
+            .try_fold(0_u64, |sum, value| sum.checked_add(*value))
+            == Some(self.allocation_calls)
+            && self
+                .allocated_bytes_by_ceil_log2_size
+                .iter()
+                .try_fold(0_u64, |sum, value| sum.checked_add(*value))
+                == Some(self.allocated_bytes)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -1212,8 +1229,13 @@ fn validate_sample_shape(
         return Err("compiler sample peak RSS is unavailable or zero".into());
     }
     if allocation_instrumented {
-        if sample.allocations.allocation_calls == 0 || sample.allocations.allocated_bytes == 0 {
-            return Err("instrumented compiler allocation counters are unavailable or zero".into());
+        if sample.allocations.allocation_calls == 0
+            || sample.allocations.allocated_bytes == 0
+            || !sample.allocations.size_class_totals_match()
+        {
+            return Err(
+                "instrumented compiler allocation counters are unavailable or inconsistent".into(),
+            );
         }
     } else if sample.allocations != AllocationSample::default() {
         return Err("uninstrumented product compiler emitted allocation counters".into());

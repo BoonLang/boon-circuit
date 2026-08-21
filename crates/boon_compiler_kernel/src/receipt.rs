@@ -1,9 +1,9 @@
 use crate::{
-    DefinitionArtifact, DefinitionCodeStore, KernelCallTarget, KernelDeclarationReference,
-    KernelDefinitionFactsInput, KernelDiagnosticArtifact, KernelDiagnosticKind, KernelExpressionId,
-    KernelExternalExpression, KernelExternalTarget, KernelInterfaceSnapshot,
-    KernelLexicalBindingTarget, KernelOwnerBuildError, KernelOwnerId, KernelOwnerNodeKind,
-    KernelOwnerProgramInput, KernelSolveError, KernelStatementChildReference,
+    DefinitionArtifact, DefinitionCodeRef, DefinitionCodeStore, KernelCallTarget,
+    KernelDeclarationReference, KernelDefinitionFactsInput, KernelDiagnosticArtifact,
+    KernelDiagnosticKind, KernelExpressionId, KernelExternalExpression, KernelExternalTarget,
+    KernelInterfaceSnapshot, KernelLexicalBindingTarget, KernelOwnerBuildError, KernelOwnerId,
+    KernelOwnerNodeKind, KernelOwnerProgramInput, KernelSolveError, KernelStatementChildReference,
     KernelStatementReference, KernelValueReference, RichDefinitionArtifact,
 };
 use boon_checked::{FlowType, ObjectShape, SharedObjectShape, Type, TypeVar, Variant};
@@ -19,14 +19,16 @@ const KERNEL_EXPRESSION_SURFACE_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.expres
 const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V16: &[u8] =
     b"boon.compiler-kernel.definition-artifact.v16\0";
 const KERNEL_DEPENDENCY_IMPORTS_DOMAIN_V2: &[u8] = b"boon.compiler-kernel.dependency-imports.v2\0";
+const KERNEL_PACKED_DEPENDENCY_IMPORTS_DOMAIN_V3: &[u8] =
+    b"boon.compiler-kernel.dependency-imports.v3.packed-resource-facts\0";
 const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V16: &[u8] =
     b"boon.compiler-kernel.definition-currentness.v16\0";
 const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V17: &[u8] =
     b"boon.compiler-kernel.definition-artifact.v17.packed\0";
 const KERNEL_EXPRESSION_SURFACE_DOMAIN_V2: &[u8] =
     b"boon.compiler-kernel.expression-surface.v2.packed\0";
-const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V17: &[u8] =
-    b"boon.compiler-kernel.definition-currentness.v17.packed\0";
+const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V18: &[u8] =
+    b"boon.compiler-kernel.definition-currentness.v18.packed-resource-facts\0";
 const PARALLEL_DEFINITION_THRESHOLD: usize = 64;
 
 struct DefinitionFingerprints {
@@ -102,6 +104,13 @@ pub enum KernelDependencySource {
     ListPathAnchor {
         list: crate::KernelListId,
     },
+    ResourceProjectionTarget {
+        expression: KernelExpressionId,
+    },
+    ResourceProjectionOrigin {
+        expression: KernelExpressionId,
+        origin: u32,
+    },
 }
 
 /// Exact authority imported from another dense definition.
@@ -118,6 +127,10 @@ pub enum KernelDependencyTarget {
         owner: KernelOwnerId,
         expression: KernelExpressionId,
     },
+    Source {
+        owner: KernelOwnerId,
+        source: crate::KernelSourceId,
+    },
     Result(KernelOwnerId),
 }
 
@@ -128,6 +141,7 @@ impl KernelDependencyTarget {
             | Self::PublicDeclaration(owner)
             | Self::PublicStatement(owner)
             | Self::Expression { owner, .. }
+            | Self::Source { owner, .. }
             | Self::Result(owner) => owner,
             Self::Declaration { owner, .. } => owner,
         }
@@ -224,8 +238,8 @@ pub struct KernelPackedDefinitionCurrentnessReceipt {
     pub basis_fingerprint_v14: [u8; 32],
     pub public_result_fingerprint_v1: [u8; 32],
     pub artifact_fingerprint_v17: [u8; 32],
-    pub dependency_fingerprint_v2: [u8; 32],
-    pub fingerprint_v17: [u8; 32],
+    pub dependency_fingerprint_v3: [u8; 32],
+    pub fingerprint_v18: [u8; 32],
 }
 
 pub(crate) fn definition_basis_fingerprint(
@@ -490,9 +504,8 @@ fn packed_currentness_receipt_range(
                                 expression.0, provider
                             ))
                         }),
-                    KernelDependencyTarget::Declaration { .. } => {
-                        Ok(fingerprints[provider].artifact)
-                    }
+                    KernelDependencyTarget::Declaration { .. }
+                    | KernelDependencyTarget::Source { .. } => Ok(fingerprints[provider].artifact),
                     KernelDependencyTarget::Definition(_)
                     | KernelDependencyTarget::PublicDeclaration(_)
                     | KernelDependencyTarget::PublicStatement(_)
@@ -500,20 +513,20 @@ fn packed_currentness_receipt_range(
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let dependency_fingerprint_v2 = stable_fingerprint(
-            KERNEL_DEPENDENCY_IMPORTS_DOMAIN_V2,
+        let dependency_fingerprint_v3 = stable_fingerprint(
+            KERNEL_PACKED_DEPENDENCY_IMPORTS_DOMAIN_V3,
             &(dependencies, imported_authorities),
             &mut hash_scratch,
         );
         let basis_fingerprint_v14 = basis_fingerprints[definition_index];
         let public_result_fingerprint_v1 = fingerprints[definition_index].public_result;
         let artifact_fingerprint_v17 = fingerprints[definition_index].artifact;
-        let fingerprint_v17 = stable_fingerprint(
-            KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V17,
+        let fingerprint_v18 = stable_fingerprint(
+            KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V18,
             &(
                 basis_fingerprint_v14,
                 artifact_fingerprint_v17,
-                dependency_fingerprint_v2,
+                dependency_fingerprint_v3,
             ),
             &mut hash_scratch,
         );
@@ -521,8 +534,8 @@ fn packed_currentness_receipt_range(
             basis_fingerprint_v14,
             public_result_fingerprint_v1,
             artifact_fingerprint_v17,
-            dependency_fingerprint_v2,
-            fingerprint_v17,
+            dependency_fingerprint_v3,
+            fingerprint_v18,
         });
     }
     Ok(receipts)
@@ -629,9 +642,8 @@ fn currentness_receipt_range(
                                 expression.0, provider
                             ))
                         }),
-                    KernelDependencyTarget::Declaration { .. } => {
-                        Ok(fingerprints[provider].artifact)
-                    }
+                    KernelDependencyTarget::Declaration { .. }
+                    | KernelDependencyTarget::Source { .. } => Ok(fingerprints[provider].artifact),
                     KernelDependencyTarget::Definition(_)
                     | KernelDependencyTarget::PublicDeclaration(_)
                     | KernelDependencyTarget::PublicStatement(_)
@@ -745,7 +757,16 @@ fn build_packed_dependency_graph(
             definition_index,
             definition,
         )?;
-        let mut local = packed_definition_dependencies(definition);
+        let owner = KernelOwnerId(
+            u32::try_from(definition_index)
+                .expect("kernel definition count exceeds the dense u32 namespace"),
+        );
+        let definition_code = code.definition(owner).ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel definition code omits owner {definition_index}"
+            ))
+        })?;
+        let mut local = packed_definition_dependencies(owner, definition, definition_code);
         local.sort_unstable();
         local.dedup();
         for dependency in &local {
@@ -860,7 +881,9 @@ fn validate_packed_definition_diagnostics(
 }
 
 fn packed_definition_dependencies(
+    owner: KernelOwnerId,
     definition: &DefinitionArtifact,
+    code: DefinitionCodeRef<'_>,
 ) -> Vec<KernelDefinitionDependency> {
     let mut dependencies = Vec::new();
     for expression in &definition.expressions {
@@ -1009,6 +1032,35 @@ fn packed_definition_dependencies(
             list.path.anchor,
         );
     }
+    for requirement in code.resource_projection_requirements() {
+        push_declaration_dependency(
+            &mut dependencies,
+            KernelDependencySource::ResourceProjectionTarget {
+                expression: requirement.expression(),
+            },
+            requirement.target(),
+        );
+        for (origin, source) in code
+            .resource_projection_origins(requirement)
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            if source.owner() == owner {
+                continue;
+            }
+            dependencies.push(KernelDefinitionDependency {
+                source: KernelDependencySource::ResourceProjectionOrigin {
+                    expression: requirement.expression(),
+                    origin: dense_index(origin),
+                },
+                target: KernelDependencyTarget::Source {
+                    owner: source.owner(),
+                    source: source.source(),
+                },
+            });
+        }
+    }
     dependencies
 }
 
@@ -1023,16 +1075,30 @@ fn validate_packed_dependency_target(
             "kernel definition {consumer} depends on missing definition {provider}"
         )));
     };
-    if let KernelDependencyTarget::Expression { expression, .. } = target
-        && definition
-            .expressions
-            .get(expression.0 as usize)
-            .is_none_or(|candidate| candidate.id != expression)
-    {
-        return Err(KernelSolveError::new(format!(
-            "kernel definition {consumer} depends on missing expression {} in definition {provider}",
-            expression.0
-        )));
+    match target {
+        KernelDependencyTarget::Expression { expression, .. }
+            if definition
+                .expressions
+                .get(expression.0 as usize)
+                .is_none_or(|candidate| candidate.id != expression) =>
+        {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition {consumer} depends on missing expression {} in definition {provider}",
+                expression.0
+            )));
+        }
+        KernelDependencyTarget::Source { source, .. }
+            if definition
+                .sources
+                .get(source.0 as usize)
+                .is_none_or(|candidate| candidate.id != source) =>
+        {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition {consumer} depends on missing SOURCE {} in definition {provider}",
+                source.0
+            )));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1727,12 +1793,14 @@ fn stable_fingerprint<T: Hash + ?Sized>(
 mod tests {
     use super::*;
     use crate::{
+        DefinitionAdditionalTypeRoots, DefinitionCodeBuilder, KernelArtifactFlowTermV1,
         KernelDefinitionFactsInput, KernelDiagnosticInput, KernelDiagnosticSeverity,
         KernelDiagnosticSite, KernelOwnerEdgeRole, KernelOwnerInputEdge, KernelOwnerNode,
-        KernelProjectProgramInput, compile_owner_program_with_definition_facts,
-        compile_project_program_with_definition_facts,
+        KernelProjectProgramInput, PackedResourceProjectionRequirementInput, TypeTermArena,
+        compile_owner_program_with_definition_facts, compile_project_program_with_definition_facts,
     };
     use boon_checked::FlowMode;
+    use std::sync::Arc;
 
     #[test]
     fn alpha_normalization_shares_closed_immutable_subtrees() {
@@ -1799,6 +1867,28 @@ mod tests {
             external_expressions: Box::new([KernelExternalExpression {
                 owner: KernelOwnerId(provider),
                 target: KernelExternalTarget::Result,
+            }]),
+            result: KernelExpressionId(0),
+        }
+    }
+
+    fn external_expression_owner(provider: u32) -> KernelOwnerProgramInput {
+        KernelOwnerProgramInput {
+            nodes: Box::new([KernelOwnerNode {
+                kind: KernelOwnerNodeKind::ValueRead {
+                    fields: Box::new([]),
+                    mode_narrowing: None,
+                },
+                inputs: Box::new([KernelOwnerInputEdge {
+                    role: KernelOwnerEdgeRole::ReadProvider,
+                    expression: KernelExpressionId(1),
+                }]),
+                mode: FlowMode::Continuous,
+            }]),
+            formal_count: 0,
+            external_expressions: Box::new([KernelExternalExpression {
+                owner: KernelOwnerId(provider),
+                target: KernelExternalTarget::Expression(KernelExpressionId(0)),
             }]),
             result: KernelExpressionId(0),
         }
@@ -1898,12 +1988,113 @@ mod tests {
             second.currentness[0].artifact_fingerprint_v17
         );
         assert_ne!(
-            first.currentness[0].fingerprint_v17, second.currentness[0].fingerprint_v17,
+            first.currentness[0].fingerprint_v18, second.currentness[0].fingerprint_v18,
             "the edited definition must not claim the old exact evaluation receipt"
         );
         assert_eq!(
             first.currentness[1], second.currentness[1],
             "a dependent definition can backdate when its imported public authority is unchanged"
+        );
+    }
+
+    #[test]
+    fn external_expression_currentness_uses_sparse_published_flow() {
+        let snapshot = solve_project(vec![
+            value_owner(vec![KernelOwnerNode {
+                kind: KernelOwnerNodeKind::Unknown,
+                inputs: Box::new([]),
+                mode: FlowMode::Continuous,
+            }]),
+            external_expression_owner(0),
+        ]);
+        let build_code = |publish_text: bool| {
+            let arena = TypeTermArena::new();
+            let unknown = arena.unknown();
+            let required = if publish_text {
+                arena.text()
+            } else {
+                arena.number()
+            };
+            let base = KernelArtifactFlowTermV1 {
+                mode: FlowMode::Continuous,
+                term: unknown,
+                stable_digest: [11; 32],
+                runtime_erased_digest: [12; 32],
+            };
+            let published = KernelArtifactFlowTermV1 {
+                mode: FlowMode::Continuous,
+                term: required,
+                stable_digest: if publish_text { [21; 32] } else { [22; 32] },
+                runtime_erased_digest: [23; 32],
+            };
+            let requirement = [PackedResourceProjectionRequirementInput {
+                expression: KernelExpressionId(0),
+                target: KernelDeclarationReference::Local(crate::KernelDeclarationId(0)),
+                projection_start: 0,
+                projection_len: 0,
+                origin_start: 0,
+                origin_len: 0,
+                required_term: required,
+                published_expression: Some(published),
+            }];
+            let empty_roots = |stable_digest| DefinitionAdditionalTypeRoots {
+                expression_flush_types: &[None],
+                expression_kind_types: &[None],
+                declaration_flows: &[],
+                calls: &[],
+                call_substitutions: &[],
+                diagnostic_types: &[],
+                source_payload_types: &[],
+                state_flows: &[],
+                list_item_types: &[],
+                resource_projection_requirements: &[],
+                resource_projection_origins: &[],
+                resource_projection_symbols: &[],
+                alpha_variables: &[],
+                stable_digest,
+            };
+            let mut builder = DefinitionCodeBuilder::with_capacity(2, 2, 0);
+            let mut provider_roots = empty_roots([31; 32]);
+            provider_roots.resource_projection_requirements = &requirement;
+            builder
+                .push(KernelOwnerId(0), base, &[], &[base], provider_roots)
+                .unwrap();
+            builder
+                .push(KernelOwnerId(1), base, &[], &[base], empty_roots([32; 32]))
+                .unwrap();
+            builder.finish(Arc::new(arena.freeze())).unwrap()
+        };
+
+        let number_code = build_code(false);
+        let text_code = build_code(true);
+        let basis = [[41; 32], [42; 32]];
+        let (_, number_receipts) = build_packed_snapshot_receipts(
+            &snapshot.definitions,
+            &number_code,
+            &snapshot.interface,
+            &basis,
+        )
+        .unwrap();
+        let (_, text_receipts) = build_packed_snapshot_receipts(
+            &snapshot.definitions,
+            &text_code,
+            &snapshot.interface,
+            &basis,
+        )
+        .unwrap();
+
+        assert_eq!(
+            number_receipts[1].artifact_fingerprint_v17, text_receipts[1].artifact_fingerprint_v17,
+            "the consumer's own packed artifact is unchanged",
+        );
+        assert_ne!(
+            number_receipts[1].dependency_fingerprint_v3,
+            text_receipts[1].dependency_fingerprint_v3,
+            "the imported expression authority must use the corrected published flow",
+        );
+        assert_ne!(
+            number_receipts[1].fingerprint_v18,
+            text_receipts[1].fingerprint_v18,
         );
     }
 
@@ -2028,8 +2219,8 @@ mod tests {
             diagnosed.currentness[0].artifact_fingerprint_v17
         );
         assert_ne!(
-            clean.currentness[0].fingerprint_v17,
-            diagnosed.currentness[0].fingerprint_v17
+            clean.currentness[0].fingerprint_v18,
+            diagnosed.currentness[0].fingerprint_v18
         );
     }
 

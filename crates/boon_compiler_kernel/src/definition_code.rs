@@ -235,7 +235,6 @@ impl DefinitionCodeStore {
             })
     }
 
-    #[cfg(test)]
     pub(crate) fn execution_node(
         &self,
         expression: PackedExpressionRef,
@@ -932,6 +931,26 @@ impl<'a> DefinitionCodeRef<'a> {
             .expect("sealed definition-code expression span is valid")
     }
 
+    pub(crate) fn expression_count(self) -> usize {
+        self.code.expressions.len as usize
+    }
+
+    pub(crate) fn call_count(self) -> usize {
+        self.code.calls.len as usize
+    }
+
+    pub(crate) fn source_count(self) -> usize {
+        self.code.source_payload_types.len as usize
+    }
+
+    pub(crate) fn state_count(self) -> usize {
+        self.code.state_flows.len as usize
+    }
+
+    pub(crate) fn list_count(self) -> usize {
+        self.code.list_item_types.len as usize
+    }
+
     pub(crate) fn published_expression(self, ordinal: usize) -> Option<KernelArtifactFlowTermV1> {
         let base = self.expressions().get(ordinal).copied()?;
         let expression = crate::KernelExpressionId(u32::try_from(ordinal).ok()?);
@@ -1276,7 +1295,6 @@ impl<'a> DefinitionCodeRef<'a> {
 }
 
 impl<'a> PackedDefinitionExecutionRef<'a> {
-    #[cfg(test)]
     pub(crate) const fn owner(self) -> KernelOwnerId {
         self.code.owner
     }

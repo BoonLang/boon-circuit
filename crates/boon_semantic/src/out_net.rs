@@ -1249,17 +1249,13 @@ where
                 if node_expressions.len() != template.node_count()
                     || template.nodes().any(|node| {
                         node.dependencies()
-                            .iter()
-                            .any(|dependency| !node_expressions.contains(dependency))
+                            .any(|dependency| !node_expressions.contains(&dependency))
                             || node.selector().is_some_and(|selector| {
                                 !node_expressions.contains(&selector.input())
-                                    || selector
-                                        .arms()
-                                        .iter()
-                                        .any(|arm| !node_expressions.contains(arm))
+                                    || selector.arms().any(|arm| !node_expressions.contains(&arm))
                             })
                     })
-                    || node_calls != template.calls().iter().copied().collect::<BTreeSet<_>>()
+                    || node_calls != template.calls().collect::<BTreeSet<_>>()
                     || node_calls.len() != template.calls().len()
                 {
                     diagnostics.push(OutNetDiagnostic::InvalidDefinitionTemplate {
@@ -1287,7 +1283,7 @@ where
                 }
             }
             for call in template.calls() {
-                match call_index_by_id.get(call).copied() {
+                match call_index_by_id.get(&call).copied() {
                     Some(index) if program.calls[index].owner_callable == Some(callable) => {}
                     None => diagnostics.push(OutNetDiagnostic::InvalidDefinitionTemplate {
                         callable,
@@ -1490,10 +1486,10 @@ where
                     if let Some(selected) = selected {
                         pending.push(selected);
                     } else {
-                        pending.extend(selector.arms().iter().copied());
+                        pending.extend(selector.arms());
                     }
                 } else {
-                    pending.extend(node.dependencies().iter().copied());
+                    pending.extend(node.dependencies());
                 }
                 continue;
             }
@@ -1542,7 +1538,9 @@ where
                             Vec::new(),
                             &mut BTreeSet::new(),
                         )
-                        .and_then(|selector| self.selected_checked_arm(&selector, arms));
+                        .and_then(|selector| {
+                            self.selected_checked_arm(&selector, arms.iter().copied())
+                        });
                     if let Some(selected) = selected {
                         pending.push(selected);
                     } else {
@@ -1615,8 +1613,8 @@ where
         let mut demanded = match owner_callable {
             Some(owner) => definition_execution_template(self.program, self.kernel_input, owner)
                 .into_iter()
-                .flat_map(|template| template.calls().iter())
-                .filter_map(|call| self.call_index_by_id.get(call).copied())
+                .flat_map(|template| template.calls())
+                .filter_map(|call| self.call_index_by_id.get(&call).copied())
                 .filter(|call| reachable.contains(call))
                 .collect::<Vec<_>>(),
             None => self
@@ -1715,7 +1713,9 @@ where
                             Vec::new(),
                             &mut BTreeSet::new(),
                         )
-                        .and_then(|selector| self.selected_checked_arm(&selector, arms));
+                        .and_then(|selector| {
+                            self.selected_checked_arm(&selector, arms.iter().copied())
+                        });
                     if let Some(selected) = selected {
                         pending.push(selected);
                     } else {
@@ -1811,9 +1811,9 @@ where
     fn selected_checked_arm(
         &self,
         selector: &CheckedStaticSelectorValue,
-        arms: &[CheckedExprId],
+        arms: impl IntoIterator<Item = CheckedExprId>,
     ) -> Option<CheckedExprId> {
-        arms.iter().copied().find(|arm| {
+        arms.into_iter().find(|arm| {
             self.program
                 .expressions
                 .get(arm.0 as usize)
@@ -1963,7 +1963,7 @@ where
             CheckedExpressionKind::When { input, arms } if projection.is_empty() => {
                 let selector =
                     self.static_checked_selector_value(*input, frame, Vec::new(), visited)?;
-                let selected = self.selected_checked_arm(&selector, arms)?;
+                let selected = self.selected_checked_arm(&selector, arms.iter().copied())?;
                 let output = self
                     .program
                     .expressions

@@ -5943,8 +5943,7 @@ fn ordinary_callable_body_dependencies(
     if expression_ids.len() != template.node_count()
         || template.nodes().any(|node| {
             node.dependencies()
-                .iter()
-                .any(|dependency| !expression_ids.contains(dependency))
+                .any(|dependency| !expression_ids.contains(&dependency))
         })
     {
         return None;
@@ -6098,7 +6097,7 @@ fn ordinary_callable_body_dependencies(
         match (&expression.kind, selector) {
             (CheckedExpressionKind::When { input, arms }, Some(selector))
                 if selector.input() == *input
-                    && selector.arms() == arms.as_slice()
+                    && selector.arms().eq(arms.iter().copied())
                     && node.call().is_none() => {}
             (CheckedExpressionKind::Call { call }, None) if node.call() == Some(*call) => {}
             (CheckedExpressionKind::When { .. }, _) | (_, Some(_)) => return None,
@@ -6106,9 +6105,7 @@ fn ordinary_callable_body_dependencies(
             _ => {}
         }
     }
-    if calls != template.calls().iter().copied().collect::<BTreeSet<_>>()
-        || calls.len() != template.calls().len()
-    {
+    if calls != template.calls().collect::<BTreeSet<_>>() || calls.len() != template.calls().len() {
         return None;
     }
     Some(dependencies)
@@ -6329,7 +6326,7 @@ fn definition_resource_expression_indexes(
             let definition = program
                 .sources
                 .get(source.0 as usize)
-                .filter(|candidate| candidate.id == *source)
+                .filter(|candidate| candidate.id == source)
                 .ok_or_else(|| {
                     ExpansionError::InvalidLocalBindings(format!(
                         "callable {} template references missing source {}",
@@ -6356,7 +6353,7 @@ fn definition_resource_expression_indexes(
             let definition = program
                 .states
                 .get(state.0 as usize)
-                .filter(|candidate| candidate.id == *state)
+                .filter(|candidate| candidate.id == state)
                 .ok_or_else(|| {
                     ExpansionError::InvalidLocalBindings(format!(
                         "callable {} template references missing state {}",
@@ -6383,7 +6380,7 @@ fn definition_resource_expression_indexes(
             let definition = program
                 .lists
                 .get(list.0 as usize)
-                .filter(|candidate| candidate.id == *list)
+                .filter(|candidate| candidate.id == list)
                 .ok_or_else(|| {
                     ExpansionError::InvalidLocalBindings(format!(
                         "callable {} template references missing list {}",

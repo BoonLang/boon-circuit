@@ -78,6 +78,61 @@ impl<'a> Iterator for DefinitionExecutionTemplateIter<'a> {
 
 impl ExactSizeIterator for DefinitionExecutionTemplateIter<'_> {}
 
+macro_rules! definition_value_iter {
+    ($name:ident, $item:ty, $kernel:ty) => {
+        pub(crate) enum $name<'a> {
+            Rich(std::iter::Copied<std::slice::Iter<'a, $item>>),
+            Kernel($kernel),
+        }
+
+        impl<'a> Iterator for $name<'a> {
+            type Item = $item;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                match self {
+                    Self::Rich(rows) => rows.next(),
+                    Self::Kernel(rows) => rows.next(),
+                }
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                match self {
+                    Self::Rich(rows) => rows.size_hint(),
+                    Self::Kernel(rows) => rows.size_hint(),
+                }
+            }
+        }
+
+        impl ExactSizeIterator for $name<'_> {}
+    };
+}
+
+definition_value_iter!(
+    DefinitionExecutionExpressionIter,
+    CheckedExprId,
+    boon_compiler_kernel::KernelSemanticDefinitionExpressionIter<'a>
+);
+definition_value_iter!(
+    DefinitionExecutionCallIter,
+    CheckedCallId,
+    boon_compiler_kernel::KernelSemanticDefinitionCallIter<'a>
+);
+definition_value_iter!(
+    DefinitionExecutionSourceIter,
+    CheckedSourceId,
+    boon_compiler_kernel::KernelSemanticDefinitionSourceIter<'a>
+);
+definition_value_iter!(
+    DefinitionExecutionStateIter,
+    CheckedStateId,
+    boon_compiler_kernel::KernelSemanticDefinitionStateIter<'a>
+);
+definition_value_iter!(
+    DefinitionExecutionListIter,
+    CheckedListId,
+    boon_compiler_kernel::KernelSemanticDefinitionListIter<'a>
+);
+
 pub(crate) fn definition_execution_templates<'a>(
     program: &'a boon_checked::CheckedProgramFields,
     kernel_input: Option<&'a boon_compiler_kernel::KernelSemanticInputV1>,
@@ -147,31 +202,39 @@ impl<'a> DefinitionExecutionTemplateRef<'a> {
         }
     }
 
-    pub(crate) fn calls(self) -> &'a [CheckedCallId] {
+    pub(crate) fn calls(self) -> DefinitionExecutionCallIter<'a> {
         match self {
-            Self::Rich(template) => &template.calls,
-            Self::Kernel(template) => template.calls(),
+            Self::Rich(template) => {
+                DefinitionExecutionCallIter::Rich(template.calls.iter().copied())
+            }
+            Self::Kernel(template) => DefinitionExecutionCallIter::Kernel(template.calls()),
         }
     }
 
-    pub(crate) fn sources(self) -> &'a [CheckedSourceId] {
+    pub(crate) fn sources(self) -> DefinitionExecutionSourceIter<'a> {
         match self {
-            Self::Rich(template) => &template.sources,
-            Self::Kernel(template) => template.sources(),
+            Self::Rich(template) => {
+                DefinitionExecutionSourceIter::Rich(template.sources.iter().copied())
+            }
+            Self::Kernel(template) => DefinitionExecutionSourceIter::Kernel(template.sources()),
         }
     }
 
-    pub(crate) fn states(self) -> &'a [CheckedStateId] {
+    pub(crate) fn states(self) -> DefinitionExecutionStateIter<'a> {
         match self {
-            Self::Rich(template) => &template.states,
-            Self::Kernel(template) => template.states(),
+            Self::Rich(template) => {
+                DefinitionExecutionStateIter::Rich(template.states.iter().copied())
+            }
+            Self::Kernel(template) => DefinitionExecutionStateIter::Kernel(template.states()),
         }
     }
 
-    pub(crate) fn lists(self) -> &'a [CheckedListId] {
+    pub(crate) fn lists(self) -> DefinitionExecutionListIter<'a> {
         match self {
-            Self::Rich(template) => &template.lists,
-            Self::Kernel(template) => template.lists(),
+            Self::Rich(template) => {
+                DefinitionExecutionListIter::Rich(template.lists.iter().copied())
+            }
+            Self::Kernel(template) => DefinitionExecutionListIter::Kernel(template.lists()),
         }
     }
 }
@@ -184,10 +247,12 @@ impl<'a> DefinitionExecutionNodeRef<'a> {
         }
     }
 
-    pub(crate) fn dependencies(self) -> &'a [CheckedExprId] {
+    pub(crate) fn dependencies(self) -> DefinitionExecutionExpressionIter<'a> {
         match self {
-            Self::Rich(node) => &node.dependencies,
-            Self::Kernel(node) => node.dependencies(),
+            Self::Rich(node) => {
+                DefinitionExecutionExpressionIter::Rich(node.dependencies.iter().copied())
+            }
+            Self::Kernel(node) => DefinitionExecutionExpressionIter::Kernel(node.dependencies()),
         }
     }
 
@@ -214,10 +279,12 @@ impl<'a> DefinitionSelectorRef<'a> {
         }
     }
 
-    pub(crate) fn arms(self) -> &'a [CheckedExprId] {
+    pub(crate) fn arms(self) -> DefinitionExecutionExpressionIter<'a> {
         match self {
-            Self::Rich(selector) => &selector.arms,
-            Self::Kernel(selector) => selector.arms(),
+            Self::Rich(selector) => {
+                DefinitionExecutionExpressionIter::Rich(selector.arms.iter().copied())
+            }
+            Self::Kernel(selector) => DefinitionExecutionExpressionIter::Kernel(selector.arms()),
         }
     }
 }

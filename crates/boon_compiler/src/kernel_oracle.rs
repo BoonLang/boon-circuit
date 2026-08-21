@@ -19871,7 +19871,7 @@ FUNCTION address(row) {{
     }
 
     #[test]
-    fn runtime_definition_execution_uses_the_flat_kernel_authority() {
+    fn runtime_definition_execution_borrows_the_packed_kernel_authority() {
         let source = concat!(
             "FUNCTION double(input) {\n",
             "    input + input\n",
@@ -19922,10 +19922,10 @@ FUNCTION address(row) {{
         let packed = checked
             .semantic_input
             .seal(&program, &pairing)
-            .expect("bind flat definition-execution authority");
+            .expect("bind packed definition-execution authority");
         packed
             .validate_rich_definition_execution_templates(&rich)
-            .expect("editor projection must match its flat authority");
+            .expect("editor projection must match its packed authority");
         packed
             .validate_rich_definition_execution_templates(&[])
             .expect("runtime path deliberately supplies no rich templates");
@@ -19935,34 +19935,70 @@ FUNCTION address(row) {{
         for rich_template in &rich {
             let packed_template = packed_templates
                 .next()
-                .expect("flat authority has every rich template");
+                .expect("packed authority has every rich template");
             assert_eq!(packed_template.callable(), rich_template.callable);
             assert_eq!(packed_template.result(), rich_template.result);
-            assert_eq!(packed_template.calls(), rich_template.calls.as_slice());
-            assert_eq!(packed_template.sources(), rich_template.sources.as_slice());
-            assert_eq!(packed_template.states(), rich_template.states.as_slice());
-            assert_eq!(packed_template.lists(), rich_template.lists.as_slice());
+            assert!(
+                packed_template
+                    .calls()
+                    .eq(rich_template.calls.iter().copied())
+            );
+            assert!(
+                packed_template
+                    .sources()
+                    .eq(rich_template.sources.iter().copied())
+            );
+            assert!(
+                packed_template
+                    .states()
+                    .eq(rich_template.states.iter().copied())
+            );
+            assert!(
+                packed_template
+                    .lists()
+                    .eq(rich_template.lists.iter().copied())
+            );
 
             let mut packed_nodes = packed_template.nodes();
             assert_eq!(packed_nodes.len(), rich_template.nodes.len());
             for rich_node in &rich_template.nodes {
                 let packed_node = packed_nodes
                     .next()
-                    .expect("flat authority has every rich execution node");
+                    .expect("packed authority has every rich execution node");
                 assert_eq!(packed_node.expression(), rich_node.expression);
-                assert_eq!(
-                    packed_node.dependencies(),
-                    rich_node.dependencies.as_slice(),
+                let (lookup_callable, lookup_node) = packed
+                    .definition_execution_node(rich_node.expression)
+                    .expect("packed authority looks up every execution node");
+                assert_eq!(lookup_callable, rich_template.callable);
+                assert_eq!(lookup_node.expression(), packed_node.expression());
+                assert_eq!(lookup_node.call(), packed_node.call());
+                assert!(lookup_node.dependencies().eq(packed_node.dependencies()));
+                match (lookup_node.selector(), packed_node.selector()) {
+                    (None, None) => {}
+                    (Some(lookup), Some(expected)) => {
+                        assert_eq!(lookup.input(), expected.input());
+                        assert!(lookup.arms().eq(expected.arms()));
+                    }
+                    _ => panic!("packed node lookup changed selector presence"),
+                }
+                assert!(
+                    packed_node
+                        .dependencies()
+                        .eq(rich_node.dependencies.iter().copied())
                 );
                 assert_eq!(packed_node.call(), rich_node.call);
                 match (packed_node.selector(), &rich_node.selector) {
                     (None, None) => {}
                     (Some(packed_selector), Some(rich_selector)) => {
                         assert_eq!(packed_selector.input(), rich_selector.input);
-                        assert_eq!(packed_selector.arms(), rich_selector.arms.as_slice());
+                        assert!(
+                            packed_selector
+                                .arms()
+                                .eq(rich_selector.arms.iter().copied())
+                        );
                     }
                     (packed_selector, rich_selector) => panic!(
-                        "flat/rich selector presence differs: packed={} rich={}",
+                        "packed/rich selector presence differs: packed={} rich={}",
                         packed_selector.is_some(),
                         rich_selector.is_some(),
                     ),

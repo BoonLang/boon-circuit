@@ -341,100 +341,20 @@ struct KernelSemanticResourceProjectionLocatorV1 {
     target: DeclId,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct KernelSemanticSpan32 {
-    start: u32,
-    len: u32,
-}
-
-impl KernelSemanticSpan32 {
-    fn from_bounds(start: usize, end: usize, label: &str) -> Result<Self, KernelCheckedLinkError> {
-        let start = u32::try_from(start).map_err(|_| {
-            KernelCheckedLinkError::new(format!("kernel semantic {label} column start exceeds u32"))
-        })?;
-        let end = u32::try_from(end).map_err(|_| {
-            KernelCheckedLinkError::new(format!("kernel semantic {label} column end exceeds u32"))
-        })?;
-        Ok(Self {
-            start,
-            len: end.checked_sub(start).ok_or_else(|| {
-                KernelCheckedLinkError::new(format!(
-                    "kernel semantic {label} column is not monotonic"
-                ))
-            })?,
-        })
-    }
-
-    #[cfg(test)]
-    fn append<T>(
-        column: &mut Vec<T>,
-        rows: impl IntoIterator<Item = T>,
-        label: &str,
-    ) -> Result<Self, KernelCheckedLinkError> {
-        let start = u32::try_from(column.len()).map_err(|_| {
-            KernelCheckedLinkError::new(format!("kernel semantic {label} column start exceeds u32"))
-        })?;
-        column.extend(rows);
-        let end = u32::try_from(column.len()).map_err(|_| {
-            KernelCheckedLinkError::new(format!("kernel semantic {label} column end exceeds u32"))
-        })?;
-        Ok(Self {
-            start,
-            len: end - start,
-        })
-    }
-
-    fn get<'a, T>(self, column: &'a [T]) -> &'a [T] {
-        let start = self.start as usize;
-        let end = start
-            .checked_add(self.len as usize)
-            .expect("sealed kernel semantic span does not overflow usize");
-        column
-            .get(start..end)
-            .expect("sealed kernel semantic span belongs to its column")
-    }
-}
-
+/// Immutable relocation from one definition-local code module into the
+/// checked image bound to this semantic input.
+///
+/// Execution rows remain in `DefinitionCodeStore`; this compact row is the
+/// only project-specific overlay semantic consumers need in order to borrow
+/// them. No checked-ID copy of the execution graph is retained.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct KernelSemanticDefinitionExecutionTemplateV1 {
+struct KernelSemanticDefinitionRelocationV1 {
     callable: DeclId,
-    result: CheckedExprId,
-    nodes: KernelSemanticSpan32,
-    calls: KernelSemanticSpan32,
-    sources: KernelSemanticSpan32,
-    states: KernelSemanticSpan32,
-    lists: KernelSemanticSpan32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct KernelSemanticDefinitionExecutionNodeV1 {
-    callable: DeclId,
-    expression: CheckedExprId,
-    dependencies: KernelSemanticSpan32,
-    call: Option<CheckedCallId>,
-    selector: Option<KernelSemanticDefinitionSelectorV1>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct KernelSemanticDefinitionSelectorV1 {
-    input: CheckedExprId,
-    arms: KernelSemanticSpan32,
-}
-
-/// Flat definition-execution authority transported directly into semantic
-/// elaboration. Nested checked DTO vectors are editor/oracle projections only.
-#[derive(Debug, Default, Eq, PartialEq)]
-struct KernelSemanticDefinitionExecutionStoreV1 {
-    templates: Box<[KernelSemanticDefinitionExecutionTemplateV1]>,
-    template_by_callable: Box<[u32]>,
-    nodes: Box<[KernelSemanticDefinitionExecutionNodeV1]>,
-    node_by_expression: Box<[u32]>,
-    dependencies: Box<[CheckedExprId]>,
-    selector_arms: Box<[CheckedExprId]>,
-    calls: Box<[CheckedCallId]>,
-    sources: Box<[CheckedSourceId]>,
-    states: Box<[CheckedStateId]>,
-    lists: Box<[CheckedListId]>,
+    expressions: KernelCheckedRowRange,
+    calls: KernelCheckedRowRange,
+    sources: KernelCheckedRowRange,
+    states: KernelCheckedRowRange,
+    lists: KernelCheckedRowRange,
 }
 
 /// Move-only construction authority transported beside the compatibility
@@ -455,8 +375,9 @@ pub struct KernelSemanticInputConstructionV1 {
     expression_count: u32,
     declaration_count: u32,
     source_count: u32,
-    source_ranges: Box<[KernelCheckedRowRange]>,
-    definition_execution: KernelSemanticDefinitionExecutionStoreV1,
+    definition_relocations: Box<[KernelSemanticDefinitionRelocationV1]>,
+    /// Owners with execution templates, ordered by final callable ID.
+    definition_execution_owners: Box<[KernelOwnerId]>,
     resource_projections: Box<[KernelSemanticResourceProjectionLocatorV1]>,
     resource_projection_by_expression: Box<[u32]>,
     rich_editor_projection_expected: bool,
@@ -477,7 +398,7 @@ pub struct KernelSemanticInputV1 {
 #[derive(Clone, Copy)]
 pub struct KernelSemanticDefinitionExecutionTemplateRef<'a> {
     input: &'a KernelSemanticInputV1,
-    template: &'a KernelSemanticDefinitionExecutionTemplateV1,
+    template: crate::PackedDefinitionExecutionRef<'a>,
 }
 
 pub struct KernelSemanticDefinitionExecutionTemplateIter<'a> {
@@ -487,20 +408,50 @@ pub struct KernelSemanticDefinitionExecutionTemplateIter<'a> {
 
 #[derive(Clone, Copy)]
 pub struct KernelSemanticDefinitionExecutionNodeRef<'a> {
-    store: &'a KernelSemanticDefinitionExecutionStoreV1,
-    node: &'a KernelSemanticDefinitionExecutionNodeV1,
+    input: &'a KernelSemanticInputV1,
+    node: crate::PackedExecutionNodeRef<'a>,
 }
 
 pub struct KernelSemanticDefinitionExecutionNodeIter<'a> {
-    store: &'a KernelSemanticDefinitionExecutionStoreV1,
-    nodes: &'a [KernelSemanticDefinitionExecutionNodeV1],
-    next: usize,
+    input: &'a KernelSemanticInputV1,
+    nodes: crate::PackedExecutionNodeIter<'a>,
 }
 
 #[derive(Clone, Copy)]
 pub struct KernelSemanticDefinitionSelectorRef<'a> {
-    store: &'a KernelSemanticDefinitionExecutionStoreV1,
-    selector: KernelSemanticDefinitionSelectorV1,
+    input: &'a KernelSemanticInputV1,
+    selector: crate::PackedExecutionSelectorRef<'a>,
+}
+
+pub struct KernelSemanticDefinitionExpressionIter<'a> {
+    input: &'a KernelSemanticInputV1,
+    rows: std::slice::Iter<'a, crate::PackedExpressionRef>,
+}
+
+pub struct KernelSemanticDefinitionCallIter<'a> {
+    input: &'a KernelSemanticInputV1,
+    rows: std::slice::Iter<'a, crate::PackedCallRef>,
+}
+
+pub struct KernelSemanticDefinitionSourceIter<'a> {
+    input: &'a KernelSemanticInputV1,
+    owner: KernelOwnerId,
+    next: u32,
+    len: u32,
+}
+
+pub struct KernelSemanticDefinitionStateIter<'a> {
+    input: &'a KernelSemanticInputV1,
+    owner: KernelOwnerId,
+    next: u32,
+    len: u32,
+}
+
+pub struct KernelSemanticDefinitionListIter<'a> {
+    input: &'a KernelSemanticInputV1,
+    owner: KernelOwnerId,
+    next: u32,
+    len: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -526,110 +477,24 @@ pub struct KernelSemanticResourceOriginRef<'a> {
     payload_projection: &'a [boon_contract::SymbolId],
 }
 
-impl KernelSemanticDefinitionExecutionStoreV1 {
-    fn materialize_rich(&self) -> Box<[CheckedDefinitionExecutionTemplateV1]> {
-        self.templates
-            .iter()
-            .map(|template| CheckedDefinitionExecutionTemplateV1 {
-                schema: CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1.to_owned(),
-                callable: template.callable,
-                result: template.result,
-                nodes: template
-                    .nodes
-                    .get(&self.nodes)
-                    .iter()
-                    .map(|node| CheckedDefinitionExecutionNodeV1 {
-                        expression: node.expression,
-                        dependencies: node.dependencies.get(&self.dependencies).to_vec(),
-                        call: node.call,
-                        selector: node.selector.map(|selector| CheckedDefinitionSelectorV1 {
-                            input: selector.input,
-                            arms: selector.arms.get(&self.selector_arms).to_vec(),
-                        }),
-                    })
-                    .collect(),
-                calls: template.calls.get(&self.calls).to_vec(),
-                sources: template.sources.get(&self.sources).to_vec(),
-                states: template.states.get(&self.states).to_vec(),
-                lists: template.lists.get(&self.lists).to_vec(),
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
-    }
-
-    fn validate_rich(
-        &self,
-        rich: &[CheckedDefinitionExecutionTemplateV1],
-        allow_missing_runtime_projection: bool,
-    ) -> Result<(), KernelCheckedLinkError> {
-        // RuntimePacked deliberately carries no compatibility DTOs. An
-        // EditorRich construction records that omission is not permitted.
-        if rich.is_empty() && allow_missing_runtime_projection {
-            return Ok(());
-        }
-        if rich.len() != self.templates.len() {
-            return Err(KernelCheckedLinkError::new(format!(
-                "checked editor image has {} rich definition templates but packed authority has {}",
-                rich.len(),
-                self.templates.len(),
-            )));
-        }
-        for (ordinal, (rich, packed)) in rich.iter().zip(&self.templates).enumerate() {
-            if rich.schema != CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1
-                || rich.callable != packed.callable
-                || rich.result != packed.result
-                || rich.calls.as_slice() != packed.calls.get(&self.calls)
-                || rich.sources.as_slice() != packed.sources.get(&self.sources)
-                || rich.states.as_slice() != packed.states.get(&self.states)
-                || rich.lists.as_slice() != packed.lists.get(&self.lists)
-            {
-                return Err(KernelCheckedLinkError::new(format!(
-                    "checked editor definition template {ordinal} differs from packed header authority",
-                )));
-            }
-            let packed_nodes = packed.nodes.get(&self.nodes);
-            if rich.nodes.len() != packed_nodes.len() {
-                return Err(KernelCheckedLinkError::new(format!(
-                    "checked editor definition template {ordinal} has {} nodes but packed authority has {}",
-                    rich.nodes.len(),
-                    packed_nodes.len(),
-                )));
-            }
-            for (node_ordinal, (rich, packed)) in rich.nodes.iter().zip(packed_nodes).enumerate() {
-                let selector_matches = match (&rich.selector, packed.selector) {
-                    (None, None) => true,
-                    (Some(rich), Some(packed)) => {
-                        rich.input == packed.input
-                            && rich.arms.as_slice() == packed.arms.get(&self.selector_arms)
-                    }
-                    (None, Some(_)) | (Some(_), None) => false,
-                };
-                if rich.expression != packed.expression
-                    || rich.dependencies.as_slice() != packed.dependencies.get(&self.dependencies)
-                    || rich.call != packed.call
-                    || !selector_matches
-                {
-                    return Err(KernelCheckedLinkError::new(format!(
-                        "checked editor definition template {ordinal} node {node_ordinal} differs from packed authority",
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 impl<'a> Iterator for KernelSemanticDefinitionExecutionTemplateIter<'a> {
     type Item = KernelSemanticDefinitionExecutionTemplateRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let owner = *self
+            .input
+            .construction
+            .definition_execution_owners
+            .get(self.next)?;
+        self.next += 1;
         let template = self
             .input
             .construction
-            .definition_execution
-            .templates
-            .get(self.next)?;
-        self.next += 1;
+            .definition_code
+            .definition(owner)
+            .expect("sealed kernel semantic execution owner has definition code")
+            .execution_template()
+            .expect("sealed kernel semantic execution owner has a template");
         Some(KernelSemanticDefinitionExecutionTemplateRef {
             input: self.input,
             template,
@@ -640,8 +505,7 @@ impl<'a> Iterator for KernelSemanticDefinitionExecutionTemplateIter<'a> {
         let remaining = self
             .input
             .construction
-            .definition_execution
-            .templates
+            .definition_execution_owners
             .len()
             .saturating_sub(self.next);
         (remaining, Some(remaining))
@@ -651,45 +515,61 @@ impl<'a> Iterator for KernelSemanticDefinitionExecutionTemplateIter<'a> {
 impl ExactSizeIterator for KernelSemanticDefinitionExecutionTemplateIter<'_> {}
 
 impl<'a> KernelSemanticDefinitionExecutionTemplateRef<'a> {
-    pub const fn callable(self) -> DeclId {
-        self.template.callable
+    pub fn callable(self) -> DeclId {
+        self.input
+            .definition_relocation(self.template.owner())
+            .expect("sealed kernel semantic execution owner has a relocation")
+            .callable
     }
 
-    pub const fn result(self) -> CheckedExprId {
-        self.template.result
+    pub fn result(self) -> CheckedExprId {
+        self.input
+            .relocate_expression(self.template.result())
+            .expect("sealed kernel semantic execution result relocates")
     }
 
     pub fn nodes(self) -> KernelSemanticDefinitionExecutionNodeIter<'a> {
-        let store = &self.input.construction.definition_execution;
         KernelSemanticDefinitionExecutionNodeIter {
-            store,
-            nodes: self.template.nodes.get(&store.nodes),
-            next: 0,
+            input: self.input,
+            nodes: self.template.nodes(),
         }
     }
 
-    pub fn calls(self) -> &'a [CheckedCallId] {
-        self.template
-            .calls
-            .get(&self.input.construction.definition_execution.calls)
+    pub fn calls(self) -> KernelSemanticDefinitionCallIter<'a> {
+        KernelSemanticDefinitionCallIter {
+            input: self.input,
+            rows: self.template.calls().iter(),
+        }
     }
 
-    pub fn sources(self) -> &'a [CheckedSourceId] {
-        self.template
-            .sources
-            .get(&self.input.construction.definition_execution.sources)
+    pub fn sources(self) -> KernelSemanticDefinitionSourceIter<'a> {
+        KernelSemanticDefinitionSourceIter {
+            input: self.input,
+            owner: self.template.owner(),
+            next: 0,
+            len: u32::try_from(self.template.source_count())
+                .expect("sealed kernel semantic SOURCE count fits u32"),
+        }
     }
 
-    pub fn states(self) -> &'a [CheckedStateId] {
-        self.template
-            .states
-            .get(&self.input.construction.definition_execution.states)
+    pub fn states(self) -> KernelSemanticDefinitionStateIter<'a> {
+        KernelSemanticDefinitionStateIter {
+            input: self.input,
+            owner: self.template.owner(),
+            next: 0,
+            len: u32::try_from(self.template.state_count())
+                .expect("sealed kernel semantic state count fits u32"),
+        }
     }
 
-    pub fn lists(self) -> &'a [CheckedListId] {
-        self.template
-            .lists
-            .get(&self.input.construction.definition_execution.lists)
+    pub fn lists(self) -> KernelSemanticDefinitionListIter<'a> {
+        KernelSemanticDefinitionListIter {
+            input: self.input,
+            owner: self.template.owner(),
+            next: 0,
+            len: u32::try_from(self.template.list_count())
+                .expect("sealed kernel semantic LIST count fits u32"),
+        }
     }
 }
 
@@ -697,56 +577,457 @@ impl<'a> Iterator for KernelSemanticDefinitionExecutionNodeIter<'a> {
     type Item = KernelSemanticDefinitionExecutionNodeRef<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let node = self.nodes.get(self.next)?;
-        self.next += 1;
+        let node = self.nodes.next()?;
         Some(KernelSemanticDefinitionExecutionNodeRef {
-            store: self.store,
+            input: self.input,
             node,
         })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.nodes.len().saturating_sub(self.next);
-        (remaining, Some(remaining))
+        self.nodes.size_hint()
     }
 }
 
 impl ExactSizeIterator for KernelSemanticDefinitionExecutionNodeIter<'_> {}
 
 impl<'a> KernelSemanticDefinitionExecutionNodeRef<'a> {
-    pub const fn expression(self) -> CheckedExprId {
-        self.node.expression
+    pub fn expression(self) -> CheckedExprId {
+        self.input
+            .relocate_expression(self.node.expression())
+            .expect("sealed kernel semantic execution node relocates")
     }
 
-    pub fn dependencies(self) -> &'a [CheckedExprId] {
-        self.node.dependencies.get(&self.store.dependencies)
+    pub fn dependencies(self) -> KernelSemanticDefinitionExpressionIter<'a> {
+        KernelSemanticDefinitionExpressionIter {
+            input: self.input,
+            rows: self.node.dependencies().iter(),
+        }
     }
 
-    pub const fn call(self) -> Option<CheckedCallId> {
-        self.node.call
+    pub fn call(self) -> Option<CheckedCallId> {
+        self.node.call().map(|call| {
+            self.input
+                .relocate_call(call)
+                .expect("sealed kernel semantic execution call relocates")
+        })
     }
 
     pub fn selector(self) -> Option<KernelSemanticDefinitionSelectorRef<'a>> {
         self.node
-            .selector
+            .selector()
             .map(|selector| KernelSemanticDefinitionSelectorRef {
-                store: self.store,
+                input: self.input,
                 selector,
             })
     }
 }
 
 impl<'a> KernelSemanticDefinitionSelectorRef<'a> {
-    pub const fn input(self) -> CheckedExprId {
-        self.selector.input
+    pub fn input(self) -> CheckedExprId {
+        self.input
+            .relocate_expression(self.selector.input())
+            .expect("sealed kernel semantic selector input relocates")
     }
 
-    pub fn arms(self) -> &'a [CheckedExprId] {
-        self.selector.arms.get(&self.store.selector_arms)
+    pub fn arms(self) -> KernelSemanticDefinitionExpressionIter<'a> {
+        KernelSemanticDefinitionExpressionIter {
+            input: self.input,
+            rows: self.selector.arms().iter(),
+        }
     }
 }
 
+impl<'a> Iterator for KernelSemanticDefinitionExpressionIter<'a> {
+    type Item = CheckedExprId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rows.next().map(|expression| {
+            self.input
+                .relocate_expression(*expression)
+                .expect("sealed kernel semantic expression relocates")
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.rows.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for KernelSemanticDefinitionExpressionIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.rows.next_back().map(|expression| {
+            self.input
+                .relocate_expression(*expression)
+                .expect("sealed kernel semantic expression relocates")
+        })
+    }
+}
+
+impl ExactSizeIterator for KernelSemanticDefinitionExpressionIter<'_> {}
+
+impl<'a> Iterator for KernelSemanticDefinitionCallIter<'a> {
+    type Item = CheckedCallId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rows.next().map(|call| {
+            self.input
+                .relocate_call(*call)
+                .expect("sealed kernel semantic call relocates")
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.rows.size_hint()
+    }
+}
+
+impl ExactSizeIterator for KernelSemanticDefinitionCallIter<'_> {}
+
+impl<'a> Iterator for KernelSemanticDefinitionSourceIter<'a> {
+    type Item = CheckedSourceId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.len {
+            return None;
+        }
+        let ordinal = self.next;
+        self.next += 1;
+        Some(
+            self.input
+                .relocate_source(self.owner, ordinal)
+                .expect("sealed kernel semantic SOURCE relocates"),
+        )
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len.saturating_sub(self.next) as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for KernelSemanticDefinitionSourceIter<'_> {}
+
+impl<'a> Iterator for KernelSemanticDefinitionStateIter<'a> {
+    type Item = CheckedStateId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.len {
+            return None;
+        }
+        let ordinal = self.next;
+        self.next += 1;
+        Some(
+            self.input
+                .relocate_state(self.owner, ordinal)
+                .expect("sealed kernel semantic state relocates"),
+        )
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len.saturating_sub(self.next) as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for KernelSemanticDefinitionStateIter<'_> {}
+
+impl<'a> Iterator for KernelSemanticDefinitionListIter<'a> {
+    type Item = CheckedListId;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.len {
+            return None;
+        }
+        let ordinal = self.next;
+        self.next += 1;
+        Some(
+            self.input
+                .relocate_list(self.owner, ordinal)
+                .expect("sealed kernel semantic LIST relocates"),
+        )
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len.saturating_sub(self.next) as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for KernelSemanticDefinitionListIter<'_> {}
+
 impl KernelSemanticInputConstructionV1 {
+    fn definition_relocation(
+        &self,
+        owner: KernelOwnerId,
+    ) -> Option<&KernelSemanticDefinitionRelocationV1> {
+        self.definition_relocations.get(owner.0 as usize)
+    }
+
+    fn relocate_expression(&self, expression: crate::PackedExpressionRef) -> Option<CheckedExprId> {
+        let range = self.definition_relocation(expression.owner())?.expressions;
+        range
+            .resolve(expression.expression().0, "semantic expression")
+            .ok()
+            .map(CheckedExprId)
+    }
+
+    fn relocate_call(&self, call: crate::PackedCallRef) -> Option<CheckedCallId> {
+        let range = self.definition_relocation(call.owner())?.calls;
+        range
+            .resolve(call.ordinal(), "semantic call")
+            .ok()
+            .map(CheckedCallId)
+    }
+
+    fn relocate_source(&self, owner: KernelOwnerId, ordinal: u32) -> Option<CheckedSourceId> {
+        self.definition_relocation(owner)?
+            .sources
+            .resolve(ordinal, "semantic SOURCE")
+            .ok()
+            .map(CheckedSourceId)
+    }
+
+    fn relocate_state(&self, owner: KernelOwnerId, ordinal: u32) -> Option<CheckedStateId> {
+        self.definition_relocation(owner)?
+            .states
+            .resolve(ordinal, "semantic state")
+            .ok()
+            .map(CheckedStateId)
+    }
+
+    fn relocate_list(&self, owner: KernelOwnerId, ordinal: u32) -> Option<CheckedListId> {
+        self.definition_relocation(owner)?
+            .lists
+            .resolve(ordinal, "semantic LIST")
+            .ok()
+            .map(CheckedListId)
+    }
+
+    fn local_expression(&self, expression: CheckedExprId) -> Option<crate::PackedExpressionRef> {
+        let owner = self
+            .definition_relocations
+            .partition_point(|relocation| relocation.expressions.start <= expression.0)
+            .checked_sub(1)?;
+        let range = self.definition_relocations.get(owner)?.expressions;
+        let local = expression.0.checked_sub(range.start)?;
+        if local >= range.len {
+            return None;
+        }
+        Some(crate::PackedExpressionRef::new(
+            KernelOwnerId(u32::try_from(owner).ok()?),
+            crate::KernelExpressionId(local),
+        ))
+    }
+
+    fn materialize_rich_definition_execution(&self) -> Box<[CheckedDefinitionExecutionTemplateV1]> {
+        self.definition_execution_owners
+            .iter()
+            .copied()
+            .map(|owner| {
+                let template = self
+                    .definition_code
+                    .definition(owner)
+                    .and_then(|code| code.execution_template())
+                    .expect("sealed semantic execution owner has a packed template");
+                let relocation = self
+                    .definition_relocation(owner)
+                    .expect("sealed semantic execution owner has a relocation");
+                CheckedDefinitionExecutionTemplateV1 {
+                    schema: CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1.to_owned(),
+                    callable: relocation.callable,
+                    result: self
+                        .relocate_expression(template.result())
+                        .expect("sealed semantic execution result relocates"),
+                    nodes: template
+                        .nodes()
+                        .map(|node| CheckedDefinitionExecutionNodeV1 {
+                            expression: self
+                                .relocate_expression(node.expression())
+                                .expect("sealed semantic execution node relocates"),
+                            dependencies: node
+                                .dependencies()
+                                .iter()
+                                .map(|dependency| {
+                                    self.relocate_expression(*dependency)
+                                        .expect("sealed semantic execution dependency relocates")
+                                })
+                                .collect(),
+                            call: node.call().map(|call| {
+                                self.relocate_call(call)
+                                    .expect("sealed semantic execution call relocates")
+                            }),
+                            selector: node.selector().map(|selector| CheckedDefinitionSelectorV1 {
+                                input: self
+                                    .relocate_expression(selector.input())
+                                    .expect("sealed semantic selector input relocates"),
+                                arms: selector
+                                    .arms()
+                                    .iter()
+                                    .map(|arm| {
+                                        self.relocate_expression(*arm)
+                                            .expect("sealed semantic selector arm relocates")
+                                    })
+                                    .collect(),
+                            }),
+                        })
+                        .collect(),
+                    calls: template
+                        .calls()
+                        .iter()
+                        .map(|call| {
+                            self.relocate_call(*call)
+                                .expect("sealed semantic template call relocates")
+                        })
+                        .collect(),
+                    sources: (0..template.source_count())
+                        .map(|ordinal| {
+                            self.relocate_source(owner, ordinal as u32)
+                                .expect("sealed semantic template SOURCE relocates")
+                        })
+                        .collect(),
+                    states: (0..template.state_count())
+                        .map(|ordinal| {
+                            self.relocate_state(owner, ordinal as u32)
+                                .expect("sealed semantic template state relocates")
+                        })
+                        .collect(),
+                    lists: (0..template.list_count())
+                        .map(|ordinal| {
+                            self.relocate_list(owner, ordinal as u32)
+                                .expect("sealed semantic template LIST relocates")
+                        })
+                        .collect(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    fn validate_rich_definition_execution(
+        &self,
+        rich: &[CheckedDefinitionExecutionTemplateV1],
+        allow_missing_runtime_projection: bool,
+    ) -> Result<(), KernelCheckedLinkError> {
+        if rich.is_empty() && allow_missing_runtime_projection {
+            return Ok(());
+        }
+        if rich.len() != self.definition_execution_owners.len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "checked editor image has {} rich definition templates but packed authority has {}",
+                rich.len(),
+                self.definition_execution_owners.len(),
+            )));
+        }
+        for (ordinal, (rich, owner)) in rich
+            .iter()
+            .zip(self.definition_execution_owners.iter().copied())
+            .enumerate()
+        {
+            let template = self
+                .definition_code
+                .definition(owner)
+                .and_then(|code| code.execution_template())
+                .expect("sealed semantic execution owner has a packed template");
+            let relocation = self
+                .definition_relocation(owner)
+                .expect("sealed semantic execution owner has a relocation");
+            if rich.schema != CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1
+                || rich.callable != relocation.callable
+                || Some(rich.result) != self.relocate_expression(template.result())
+                || rich.calls.len() != template.calls().len()
+                || !rich
+                    .calls
+                    .iter()
+                    .copied()
+                    .eq(template.calls().iter().map(|call| {
+                        self.relocate_call(*call)
+                            .expect("sealed semantic template call relocates")
+                    }))
+                || rich.sources.len() != template.source_count()
+                || !rich
+                    .sources
+                    .iter()
+                    .copied()
+                    .eq((0..template.source_count()).map(|index| {
+                        self.relocate_source(owner, index as u32)
+                            .expect("sealed semantic template SOURCE relocates")
+                    }))
+                || rich.states.len() != template.state_count()
+                || !rich
+                    .states
+                    .iter()
+                    .copied()
+                    .eq((0..template.state_count()).map(|index| {
+                        self.relocate_state(owner, index as u32)
+                            .expect("sealed semantic template state relocates")
+                    }))
+                || rich.lists.len() != template.list_count()
+                || !rich
+                    .lists
+                    .iter()
+                    .copied()
+                    .eq((0..template.list_count()).map(|index| {
+                        self.relocate_list(owner, index as u32)
+                            .expect("sealed semantic template LIST relocates")
+                    }))
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "checked editor definition template {ordinal} differs from packed header authority",
+                )));
+            }
+            if rich.nodes.len() != template.nodes().len() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "checked editor definition template {ordinal} has {} nodes but packed authority has {}",
+                    rich.nodes.len(),
+                    template.nodes().len(),
+                )));
+            }
+            for (node_ordinal, (rich, packed)) in
+                rich.nodes.iter().zip(template.nodes()).enumerate()
+            {
+                let selector_matches = match (&rich.selector, packed.selector()) {
+                    (None, None) => true,
+                    (Some(rich), Some(packed)) => {
+                        Some(rich.input) == self.relocate_expression(packed.input())
+                            && rich.arms.len() == packed.arms().len()
+                            && rich
+                                .arms
+                                .iter()
+                                .copied()
+                                .eq(packed.arms().iter().map(|arm| {
+                                    self.relocate_expression(*arm)
+                                        .expect("sealed semantic selector arm relocates")
+                                }))
+                    }
+                    (None, Some(_)) | (Some(_), None) => false,
+                };
+                if Some(rich.expression) != self.relocate_expression(packed.expression())
+                    || rich.dependencies.len() != packed.dependencies().len()
+                    || !rich
+                        .dependencies
+                        .iter()
+                        .copied()
+                        .eq(packed.dependencies().iter().map(|dependency| {
+                            self.relocate_expression(*dependency)
+                                .expect("sealed semantic execution dependency relocates")
+                        }))
+                    || rich.call
+                        != packed.call().map(|call| {
+                            self.relocate_call(call)
+                                .expect("sealed semantic execution call relocates")
+                        })
+                    || !selector_matches
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "checked editor definition template {ordinal} node {node_ordinal} differs from packed authority",
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn expect_rich_editor_projection(&mut self) {
         self.rich_editor_projection_expected = true;
@@ -756,7 +1037,7 @@ impl KernelSemanticInputConstructionV1 {
     pub fn materialize_rich_definition_execution_templates(
         &self,
     ) -> Box<[CheckedDefinitionExecutionTemplateV1]> {
-        self.definition_execution.materialize_rich()
+        self.materialize_rich_definition_execution()
     }
 
     pub fn resource_projection_count(&self) -> usize {
@@ -768,7 +1049,6 @@ impl KernelSemanticInputConstructionV1 {
         role: ProgramRole,
         snapshot: &KernelCheckedSnapshot,
         layout: &KernelCheckedLinkLayout,
-        definition_execution: KernelSemanticDefinitionExecutionStoreV1,
         resource_projections: Box<[KernelSemanticResourceProjectionLocatorV1]>,
         checked_image_pairing: Arc<boon_checked::CheckedImageKernelPairingV1>,
     ) -> Result<Self, KernelCheckedLinkError> {
@@ -782,6 +1062,67 @@ impl KernelSemanticInputConstructionV1 {
         if !Arc::ptr_eq(&snapshot.type_store, snapshot.definition_code.type_store()) {
             return Err(KernelCheckedLinkError::new(
                 "kernel semantic input detached its packed type authority",
+            ));
+        }
+        let mut definition_relocations = Vec::with_capacity(layout.definitions.len());
+        let mut definition_execution_owners = Vec::new();
+        for definition in &layout.definitions {
+            let code = snapshot
+                .definition_code
+                .definition(definition.owner)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel semantic input has no packed definition {}",
+                        definition.owner.0,
+                    ))
+                })?;
+            for (label, packed, linked) in [
+                (
+                    "expression",
+                    code.expression_count(),
+                    definition.expressions.len,
+                ),
+                ("call", code.call_count(), definition.calls.len),
+                ("SOURCE", code.source_count(), definition.sources.len),
+                ("state", code.state_count(), definition.states.len),
+                ("LIST", code.list_count(), definition.lists.len),
+            ] {
+                if packed != linked as usize {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel semantic definition {} has {packed} packed {label} rows but {linked} linked rows",
+                        definition.owner.0,
+                    )));
+                }
+            }
+            if let Some(template) = code.execution_template() {
+                if template.source_count() != definition.sources.len as usize
+                    || template.state_count() != definition.states.len as usize
+                    || template.list_count() != definition.lists.len as usize
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel semantic execution template {} resource ranges disagree with its relocation",
+                        definition.owner.0,
+                    )));
+                }
+                definition_execution_owners.push(definition.owner);
+            }
+            definition_relocations.push(KernelSemanticDefinitionRelocationV1 {
+                callable: definition.public_declaration,
+                expressions: definition.expressions,
+                calls: definition.calls,
+                sources: definition.sources,
+                states: definition.states,
+                lists: definition.lists,
+            });
+        }
+        definition_execution_owners
+            .sort_unstable_by_key(|owner| definition_relocations[owner.0 as usize].callable.0);
+        if definition_execution_owners.windows(2).any(|owners| {
+            definition_relocations[owners[0].0 as usize].callable
+                == definition_relocations[owners[1].0 as usize].callable
+        }) {
+            return Err(KernelCheckedLinkError::new(
+                "kernel semantic execution templates repeat a callable relocation",
             ));
         }
         let mut resource_projection_by_expression =
@@ -815,13 +1156,8 @@ impl KernelSemanticInputConstructionV1 {
             expression_count: layout.totals.expressions,
             declaration_count: layout.totals.declarations.saturating_sub(1),
             source_count: layout.totals.sources,
-            source_ranges: layout
-                .definitions
-                .iter()
-                .map(|definition| definition.sources)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            definition_execution,
+            definition_relocations: definition_relocations.into_boxed_slice(),
+            definition_execution_owners: definition_execution_owners.into_boxed_slice(),
             resource_projections,
             resource_projection_by_expression: resource_projection_by_expression.into_boxed_slice(),
             rich_editor_projection_expected: false,
@@ -958,6 +1294,33 @@ impl KernelSemanticInputConstructionV1 {
 }
 
 impl KernelSemanticInputV1 {
+    fn definition_relocation(
+        &self,
+        owner: KernelOwnerId,
+    ) -> Option<&KernelSemanticDefinitionRelocationV1> {
+        self.construction.definition_relocation(owner)
+    }
+
+    fn relocate_expression(&self, expression: crate::PackedExpressionRef) -> Option<CheckedExprId> {
+        self.construction.relocate_expression(expression)
+    }
+
+    fn relocate_call(&self, call: crate::PackedCallRef) -> Option<CheckedCallId> {
+        self.construction.relocate_call(call)
+    }
+
+    fn relocate_source(&self, owner: KernelOwnerId, ordinal: u32) -> Option<CheckedSourceId> {
+        self.construction.relocate_source(owner, ordinal)
+    }
+
+    fn relocate_state(&self, owner: KernelOwnerId, ordinal: u32) -> Option<CheckedStateId> {
+        self.construction.relocate_state(owner, ordinal)
+    }
+
+    fn relocate_list(&self, owner: KernelOwnerId, ordinal: u32) -> Option<CheckedListId> {
+        self.construction.relocate_list(owner, ordinal)
+    }
+
     pub fn validate_checked_authority(
         &self,
         source_bundle_digest_v1: SourceBundleDigestV1,
@@ -999,14 +1362,23 @@ impl KernelSemanticInputV1 {
         &self,
         callable: DeclId,
     ) -> Option<KernelSemanticDefinitionExecutionTemplateRef<'_>> {
-        let index = *self
+        let owners = &self.construction.definition_execution_owners;
+        let index = owners
+            .binary_search_by_key(&callable.0, |owner| {
+                self.construction.definition_relocations[owner.0 as usize]
+                    .callable
+                    .0
+            })
+            .ok()?;
+        let owner = owners[index];
+        let template = self
             .construction
-            .definition_execution
-            .template_by_callable
-            .get(callable.0 as usize)?;
-        (index != u32::MAX).then(|| KernelSemanticDefinitionExecutionTemplateRef {
+            .definition_code
+            .definition(owner)?
+            .execution_template()?;
+        Some(KernelSemanticDefinitionExecutionTemplateRef {
             input: self,
-            template: &self.construction.definition_execution.templates[index as usize],
+            template,
         })
     }
 
@@ -1014,15 +1386,12 @@ impl KernelSemanticInputV1 {
         &self,
         expression: CheckedExprId,
     ) -> Option<(DeclId, KernelSemanticDefinitionExecutionNodeRef<'_>)> {
-        let store = &self.construction.definition_execution;
-        let index = *store.node_by_expression.get(expression.0 as usize)?;
-        if index == u32::MAX {
-            return None;
-        }
-        let node = &store.nodes[index as usize];
+        let local = self.construction.local_expression(expression)?;
+        let node = self.construction.definition_code.execution_node(local)?;
+        let callable = self.definition_relocation(node.template_owner())?.callable;
         Some((
-            node.callable,
-            KernelSemanticDefinitionExecutionNodeRef { store, node },
+            callable,
+            KernelSemanticDefinitionExecutionNodeRef { input: self, node },
         ))
     }
 
@@ -1030,9 +1399,10 @@ impl KernelSemanticInputV1 {
         &self,
         rich: &[CheckedDefinitionExecutionTemplateV1],
     ) -> Result<(), KernelCheckedLinkError> {
-        self.construction
-            .definition_execution
-            .validate_rich(rich, !self.construction.rich_editor_projection_expected)
+        self.construction.validate_rich_definition_execution(
+            rich,
+            !self.construction.rich_editor_projection_expected,
+        )
     }
 
     pub fn resource_projection_count(&self) -> usize {
@@ -1255,10 +1625,10 @@ impl<'a> KernelSemanticResourceOriginRef<'a> {
         let range = self
             .input
             .construction
-            .source_ranges
+            .definition_relocations
             .get(self.source_owner.0 as usize)
-            .copied()
-            .expect("sealed kernel semantic resource origin owner exists");
+            .expect("sealed kernel semantic resource origin owner exists")
+            .sources;
         CheckedSourceId(
             range
                 .resolve(self.source.0, "semantic source")
@@ -2187,23 +2557,15 @@ impl KernelCheckedLinkLayout {
         }
         let (occurrences, occurrence_ranges) =
             self.materialize_occurrences(snapshot, &declarations, &expressions, &calls)?;
-        let definition_execution =
-            self.build_semantic_definition_execution_store_from_code(snapshot)?;
         #[cfg(test)]
-        {
-            let rich_oracle = self.build_semantic_definition_execution_store_rich_oracle(
+        let rich_definition_execution_oracle = self
+            .build_semantic_definition_execution_store_rich_oracle(
                 snapshot,
                 &scopes,
                 &declarations,
                 &statements,
                 &calls,
             )?;
-            if definition_execution != rich_oracle {
-                return Err(KernelCheckedLinkError::new(
-                    "direct packed definition execution differs from the independent rich oracle",
-                ));
-            }
-        }
         let checked_image_publication = checked_image_publication_v1(
             source_bundle_digest_v1,
             role,
@@ -2228,10 +2590,17 @@ impl KernelCheckedLinkLayout {
             role,
             snapshot,
             self,
-            definition_execution,
             semantic_resource_projections,
             checked_image_publication.__kernel_pairing(),
         )?;
+        #[cfg(test)]
+        if semantic_input.materialize_rich_definition_execution_templates()
+            != rich_definition_execution_oracle
+        {
+            return Err(KernelCheckedLinkError::new(
+                "borrowed packed definition execution differs from the independent rich oracle",
+            ));
+        }
         Ok(KernelCheckedRows {
             scopes,
             declarations: declarations.into_boxed_slice(),
@@ -2528,292 +2897,6 @@ impl KernelCheckedLinkLayout {
         Ok(requirements.into_boxed_slice())
     }
 
-    /// Relocate the permanent definition-local execution code directly into
-    /// the transitional checked-ID semantic store.
-    ///
-    /// This pass borrows flat spans from `DefinitionCodeStore`; it performs no
-    /// graph discovery and owns no string, path, type, map, set, or per-node
-    /// vector. The checked-ID store remains only until semantic consumers can
-    /// read the definition-local code through the immutable relocation layout.
-    fn build_semantic_definition_execution_store_from_code(
-        &self,
-        snapshot: &KernelCheckedSnapshot,
-    ) -> Result<KernelSemanticDefinitionExecutionStoreV1, KernelCheckedLinkError> {
-        self.validate_snapshot_definition_count(snapshot, "packed definition execution")?;
-
-        let mut template_capacity = 0usize;
-        let mut node_capacity = 0usize;
-        let mut dependency_capacity = 0usize;
-        let mut selector_arm_capacity = 0usize;
-        let mut call_capacity = 0usize;
-        let mut source_capacity = 0usize;
-        let mut state_capacity = 0usize;
-        let mut list_capacity = 0usize;
-        let add = |total: &mut usize, value: usize, label: &str| {
-            *total = total.checked_add(value).ok_or_else(|| {
-                KernelCheckedLinkError::new(format!(
-                    "kernel packed definition-execution {label} count exceeds usize"
-                ))
-            })?;
-            Ok::<_, KernelCheckedLinkError>(())
-        };
-        for owner_index in 0..snapshot.definition_code.definition_count() {
-            let owner = checked_owner_id(owner_index, "packed definition execution capacity")?;
-            let code = snapshot.definition_code.definition(owner).ok_or_else(|| {
-                KernelCheckedLinkError::new(format!(
-                    "kernel packed definition execution has no definition {}",
-                    owner.0,
-                ))
-            })?;
-            let Some(template) = code.execution_template() else {
-                continue;
-            };
-            add(&mut template_capacity, 1, "template")?;
-            add(&mut node_capacity, template.nodes().len(), "node")?;
-            add(
-                &mut dependency_capacity,
-                template.nodes().map(|node| node.dependencies().len()).sum(),
-                "dependency",
-            )?;
-            add(
-                &mut selector_arm_capacity,
-                template
-                    .nodes()
-                    .filter_map(|node| node.selector())
-                    .map(|selector| selector.arms().len())
-                    .sum(),
-                "selector arm",
-            )?;
-            add(&mut call_capacity, template.calls().len(), "call")?;
-            add(&mut source_capacity, template.source_count(), "SOURCE")?;
-            add(&mut state_capacity, template.state_count(), "HOLD state")?;
-            add(&mut list_capacity, template.list_count(), "LIST")?;
-        }
-
-        let mut packed_templates = Vec::with_capacity(template_capacity);
-        let mut packed_nodes = Vec::with_capacity(node_capacity);
-        let mut packed_dependencies = Vec::with_capacity(dependency_capacity);
-        let mut packed_selector_arms = Vec::with_capacity(selector_arm_capacity);
-        let mut packed_calls = Vec::with_capacity(call_capacity);
-        let mut packed_sources = Vec::with_capacity(source_capacity);
-        let mut packed_states = Vec::with_capacity(state_capacity);
-        let mut packed_lists = Vec::with_capacity(list_capacity);
-
-        for owner_index in 0..snapshot.definition_code.definition_count() {
-            let owner = checked_owner_id(owner_index, "packed definition execution")?;
-            let code = snapshot.definition_code.definition(owner).ok_or_else(|| {
-                KernelCheckedLinkError::new(format!(
-                    "kernel packed definition execution has no definition {}",
-                    owner.0,
-                ))
-            })?;
-            let Some(template) = code.execution_template() else {
-                continue;
-            };
-            let callable = self.definition(owner)?.public_declaration;
-            let node_start = packed_nodes.len();
-            for node in template.nodes() {
-                if node.template_owner() != owner {
-                    return Err(KernelCheckedLinkError::new(format!(
-                        "kernel packed execution node belongs to template {} instead of {}",
-                        node.template_owner().0,
-                        owner.0,
-                    )));
-                }
-                let dependency_start = packed_dependencies.len();
-                for dependency in node.dependencies() {
-                    packed_dependencies.push(self.expression(
-                        dependency.owner(),
-                        KernelValueReference::Local(dependency.expression()),
-                    )?);
-                }
-                let dependencies = KernelSemanticSpan32::from_bounds(
-                    dependency_start,
-                    packed_dependencies.len(),
-                    "definition-template dependency",
-                )?;
-                let selector = node
-                    .selector()
-                    .map(|selector| {
-                        let arm_start = packed_selector_arms.len();
-                        for arm in selector.arms() {
-                            packed_selector_arms.push(self.expression(
-                                arm.owner(),
-                                KernelValueReference::Local(arm.expression()),
-                            )?);
-                        }
-                        Ok::<_, KernelCheckedLinkError>(KernelSemanticDefinitionSelectorV1 {
-                            input: self.expression(
-                                selector.input().owner(),
-                                KernelValueReference::Local(selector.input().expression()),
-                            )?,
-                            arms: KernelSemanticSpan32::from_bounds(
-                                arm_start,
-                                packed_selector_arms.len(),
-                                "definition-template selector arm",
-                            )?,
-                        })
-                    })
-                    .transpose()?;
-                let expression = node.expression();
-                packed_nodes.push(KernelSemanticDefinitionExecutionNodeV1 {
-                    callable,
-                    expression: self.expression(
-                        expression.owner(),
-                        KernelValueReference::Local(expression.expression()),
-                    )?,
-                    dependencies,
-                    call: node
-                        .call()
-                        .map(|call| self.call(call.owner(), call.ordinal()))
-                        .transpose()?,
-                    selector,
-                });
-            }
-            let nodes = KernelSemanticSpan32::from_bounds(
-                node_start,
-                packed_nodes.len(),
-                "definition-template node",
-            )?;
-
-            let call_start = packed_calls.len();
-            for call in template.calls() {
-                packed_calls.push(self.call(call.owner(), call.ordinal())?);
-            }
-            let calls = KernelSemanticSpan32::from_bounds(
-                call_start,
-                packed_calls.len(),
-                "definition-template call",
-            )?;
-
-            let source_start = packed_sources.len();
-            for ordinal in 0..template.source_count() {
-                packed_sources.push(self.source(
-                    owner,
-                    u32::try_from(ordinal).map_err(|_| {
-                        KernelCheckedLinkError::new(
-                            "kernel packed definition SOURCE count exceeds u32",
-                        )
-                    })?,
-                )?);
-            }
-            let sources = KernelSemanticSpan32::from_bounds(
-                source_start,
-                packed_sources.len(),
-                "definition-template source",
-            )?;
-
-            let state_start = packed_states.len();
-            for ordinal in 0..template.state_count() {
-                packed_states.push(self.state(
-                    owner,
-                    u32::try_from(ordinal).map_err(|_| {
-                        KernelCheckedLinkError::new(
-                            "kernel packed definition HOLD-state count exceeds u32",
-                        )
-                    })?,
-                )?);
-            }
-            let states = KernelSemanticSpan32::from_bounds(
-                state_start,
-                packed_states.len(),
-                "definition-template state",
-            )?;
-
-            let list_start = packed_lists.len();
-            for ordinal in 0..template.list_count() {
-                packed_lists.push(self.list(
-                    owner,
-                    u32::try_from(ordinal).map_err(|_| {
-                        KernelCheckedLinkError::new(
-                            "kernel packed definition LIST count exceeds u32",
-                        )
-                    })?,
-                )?);
-            }
-            let lists = KernelSemanticSpan32::from_bounds(
-                list_start,
-                packed_lists.len(),
-                "definition-template list",
-            )?;
-
-            let result = template.result();
-            packed_templates.push(KernelSemanticDefinitionExecutionTemplateV1 {
-                callable,
-                result: self.expression(
-                    result.owner(),
-                    KernelValueReference::Local(result.expression()),
-                )?,
-                nodes,
-                calls,
-                sources,
-                states,
-                lists,
-            });
-        }
-
-        packed_templates.sort_unstable_by_key(|template| template.callable.0);
-        let mut template_by_callable = vec![
-            u32::MAX;
-            (self.totals.declarations as usize)
-                .checked_add(1)
-                .ok_or_else(|| KernelCheckedLinkError::new(
-                    "kernel definition-template callable index exceeds usize",
-                ))?
-        ];
-        for (index, template) in packed_templates.iter().enumerate() {
-            let index = u32::try_from(index).map_err(|_| {
-                KernelCheckedLinkError::new("kernel definition-template count exceeds u32")
-            })?;
-            let slot = template_by_callable
-                .get_mut(template.callable.0 as usize)
-                .ok_or_else(|| {
-                    KernelCheckedLinkError::new(format!(
-                        "kernel definition template references out-of-range callable {}",
-                        template.callable.0,
-                    ))
-                })?;
-            if std::mem::replace(slot, index) != u32::MAX {
-                return Err(KernelCheckedLinkError::new(format!(
-                    "kernel definition templates repeat callable {}",
-                    template.callable.0,
-                )));
-            }
-        }
-        let mut node_by_expression = vec![u32::MAX; self.totals.expressions as usize];
-        for (index, node) in packed_nodes.iter().enumerate() {
-            let index = u32::try_from(index).map_err(|_| {
-                KernelCheckedLinkError::new("kernel definition-template node count exceeds u32")
-            })?;
-            let slot = node_by_expression
-                .get_mut(node.expression.0 as usize)
-                .ok_or_else(|| {
-                    KernelCheckedLinkError::new(format!(
-                        "kernel definition template references out-of-range expression {}",
-                        node.expression.0,
-                    ))
-                })?;
-            if std::mem::replace(slot, index) != u32::MAX {
-                return Err(KernelCheckedLinkError::new(format!(
-                    "kernel definition templates repeat expression {}",
-                    node.expression.0,
-                )));
-            }
-        }
-        Ok(KernelSemanticDefinitionExecutionStoreV1 {
-            templates: packed_templates.into_boxed_slice(),
-            template_by_callable: template_by_callable.into_boxed_slice(),
-            nodes: packed_nodes.into_boxed_slice(),
-            node_by_expression: node_by_expression.into_boxed_slice(),
-            dependencies: packed_dependencies.into_boxed_slice(),
-            selector_arms: packed_selector_arms.into_boxed_slice(),
-            calls: packed_calls.into_boxed_slice(),
-            sources: packed_sources.into_boxed_slice(),
-            states: packed_states.into_boxed_slice(),
-            lists: packed_lists.into_boxed_slice(),
-        })
-    }
-
     /// Publish one dependency-first execution template directly from the
     /// definition artifacts and this layout's final checked relocations.
     ///
@@ -2831,17 +2914,10 @@ impl KernelCheckedLinkLayout {
         linked_declarations: &[CheckedDeclaration],
         linked_statements: &[CheckedStatement],
         linked_calls: &[CheckedCall],
-    ) -> Result<KernelSemanticDefinitionExecutionStoreV1, KernelCheckedLinkError> {
+    ) -> Result<Box<[CheckedDefinitionExecutionTemplateV1]>, KernelCheckedLinkError> {
         self.validate_snapshot_definition_count(snapshot, "definition execution template")?;
 
-        let mut packed_templates = Vec::new();
-        let mut packed_nodes = Vec::new();
-        let mut packed_dependencies = Vec::new();
-        let mut packed_selector_arms = Vec::new();
-        let mut packed_calls = Vec::new();
-        let mut packed_sources = Vec::new();
-        let mut packed_states = Vec::new();
-        let mut packed_lists = Vec::new();
+        let mut rich_templates = Vec::new();
 
         let mut call_by_expression = BTreeMap::new();
         for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
@@ -2962,7 +3038,7 @@ impl KernelCheckedLinkLayout {
                 (KernelOwnerId, crate::KernelExpressionId),
                 Vec<(KernelOwnerId, crate::KernelExpressionId)>,
             >::new();
-            let node_start = packed_nodes.len();
+            let mut nodes = Vec::new();
             let mut calls = Vec::new();
             let mut pending = vec![(root, false)];
             while let Some((key @ (node_owner, expression_id), exiting)) = pending.pop() {
@@ -3014,31 +3090,12 @@ impl KernelCheckedLinkLayout {
                     if let Some(call) = call {
                         calls.push(call);
                     }
-                    let dependencies = KernelSemanticSpan32::append(
-                        &mut packed_dependencies,
-                        checked_dependencies,
-                        "definition-template dependency",
-                    )?;
                     let selector =
-                        definition_template_selector(snapshot, node_owner, expression, self)?
-                            .map(|selector| {
-                                Ok::<_, KernelCheckedLinkError>(
-                                    KernelSemanticDefinitionSelectorV1 {
-                                        input: selector.input,
-                                        arms: KernelSemanticSpan32::append(
-                                            &mut packed_selector_arms,
-                                            selector.arms,
-                                            "definition-template selector arm",
-                                        )?,
-                                    },
-                                )
-                            })
-                            .transpose()?;
-                    packed_nodes.push(KernelSemanticDefinitionExecutionNodeV1 {
-                        callable,
+                        definition_template_selector(snapshot, node_owner, expression, self)?;
+                    nodes.push(CheckedDefinitionExecutionNodeV1 {
                         expression: self
                             .expression(node_owner, KernelValueReference::Local(expression_id))?,
-                        dependencies,
+                        dependencies: checked_dependencies,
                         call,
                         selector,
                     });
@@ -3082,110 +3139,51 @@ impl KernelCheckedLinkLayout {
             }
             calls.sort_unstable_by_key(|call| call.0);
             calls.dedup();
-            let nodes = KernelSemanticSpan32::from_bounds(
-                node_start,
-                packed_nodes.len(),
-                "definition-template node",
-            )?;
-            let calls =
-                KernelSemanticSpan32::append(&mut packed_calls, calls, "definition-template call")?;
-            let sources = KernelSemanticSpan32::append(
-                &mut packed_sources,
-                definition
-                    .sources
-                    .iter()
-                    .map(|source| self.source(owner, source.id.0))
-                    .collect::<Result<Vec<_>, _>>()?,
-                "definition-template source",
-            )?;
-            let states = KernelSemanticSpan32::append(
-                &mut packed_states,
-                definition
-                    .states
-                    .iter()
-                    .map(|state| self.state(owner, state.id.0))
-                    .collect::<Result<Vec<_>, _>>()?,
-                "definition-template state",
-            )?;
-            let lists = KernelSemanticSpan32::append(
-                &mut packed_lists,
-                definition
-                    .lists
-                    .iter()
-                    .map(|list| self.list(owner, list.id.0))
-                    .collect::<Result<Vec<_>, _>>()?,
-                "definition-template list",
-            )?;
-            packed_templates.push(KernelSemanticDefinitionExecutionTemplateV1 {
+            rich_templates.push(CheckedDefinitionExecutionTemplateV1 {
+                schema: CHECKED_DEFINITION_EXECUTION_TEMPLATE_SCHEMA_V1.to_owned(),
                 callable,
                 result: self.expression(owner, KernelValueReference::Local(result))?,
                 nodes,
                 calls,
-                sources,
-                states,
-                lists,
+                sources: definition
+                    .sources
+                    .iter()
+                    .map(|source| self.source(owner, source.id.0))
+                    .collect::<Result<Vec<_>, _>>()?,
+                states: definition
+                    .states
+                    .iter()
+                    .map(|state| self.state(owner, state.id.0))
+                    .collect::<Result<Vec<_>, _>>()?,
+                lists: definition
+                    .lists
+                    .iter()
+                    .map(|list| self.list(owner, list.id.0))
+                    .collect::<Result<Vec<_>, _>>()?,
             });
         }
-        packed_templates.sort_unstable_by_key(|template| template.callable.0);
-        let mut template_by_callable = vec![
-            u32::MAX;
-            (self.totals.declarations as usize)
-                .checked_add(1)
-                .ok_or_else(|| KernelCheckedLinkError::new(
-                    "kernel definition-template callable index exceeds usize",
-                ))?
-        ];
-        for (index, template) in packed_templates.iter().enumerate() {
-            let index = u32::try_from(index).map_err(|_| {
-                KernelCheckedLinkError::new("kernel definition-template count exceeds u32")
-            })?;
-            let slot = template_by_callable
-                .get_mut(template.callable.0 as usize)
-                .ok_or_else(|| {
-                    KernelCheckedLinkError::new(format!(
-                        "kernel definition template references out-of-range callable {}",
-                        template.callable.0,
-                    ))
-                })?;
-            if std::mem::replace(slot, index) != u32::MAX {
-                return Err(KernelCheckedLinkError::new(format!(
-                    "kernel definition templates repeat callable {}",
-                    template.callable.0,
-                )));
-            }
+        rich_templates.sort_unstable_by_key(|template| template.callable.0);
+        if let Some(repeated) = rich_templates
+            .windows(2)
+            .find(|templates| templates[0].callable == templates[1].callable)
+        {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel definition templates repeat callable {}",
+                repeated[0].callable.0,
+            )));
         }
-        let mut node_by_expression = vec![u32::MAX; self.totals.expressions as usize];
-        for (index, node) in packed_nodes.iter().enumerate() {
-            let index = u32::try_from(index).map_err(|_| {
-                KernelCheckedLinkError::new("kernel definition-template node count exceeds u32")
-            })?;
-            let slot = node_by_expression
-                .get_mut(node.expression.0 as usize)
-                .ok_or_else(|| {
-                    KernelCheckedLinkError::new(format!(
-                        "kernel definition template references out-of-range expression {}",
+        let mut expressions = BTreeSet::new();
+        for template in &rich_templates {
+            for node in &template.nodes {
+                if !expressions.insert(node.expression) {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition templates repeat expression {}",
                         node.expression.0,
-                    ))
-                })?;
-            if std::mem::replace(slot, index) != u32::MAX {
-                return Err(KernelCheckedLinkError::new(format!(
-                    "kernel definition templates repeat expression {}",
-                    node.expression.0,
-                )));
+                    )));
+                }
             }
         }
-        Ok(KernelSemanticDefinitionExecutionStoreV1 {
-            templates: packed_templates.into_boxed_slice(),
-            template_by_callable: template_by_callable.into_boxed_slice(),
-            nodes: packed_nodes.into_boxed_slice(),
-            node_by_expression: node_by_expression.into_boxed_slice(),
-            dependencies: packed_dependencies.into_boxed_slice(),
-            selector_arms: packed_selector_arms.into_boxed_slice(),
-            calls: packed_calls.into_boxed_slice(),
-            sources: packed_sources.into_boxed_slice(),
-            states: packed_states.into_boxed_slice(),
-            lists: packed_lists.into_boxed_slice(),
-        })
+        Ok(rich_templates.into_boxed_slice())
     }
 
     /// Link pattern-binding declaration authority directly from the exact

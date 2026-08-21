@@ -1237,6 +1237,103 @@ impl TypeTermArena {
         self.export_checked_type_inner(term)
     }
 
+    /// Export an immutable term DAG while sharing every already-exported
+    /// subtree through one phase-local dense cache.
+    ///
+    /// The caller owns the cache lifetime. Production checked linking keeps
+    /// it only while constructing the compatibility rows, so the frozen
+    /// kernel store never acquires a retained rich-type sidecar.
+    pub(crate) fn export_checked_type_cached(
+        &self,
+        term: TypeTermId,
+        cache: &mut [Option<Type>],
+    ) -> Type {
+        let index = term.0 as usize;
+        if let Some(ty) = cache
+            .get(index)
+            .unwrap_or_else(|| panic!("kernel type term {} is outside export cache", term.0))
+        {
+            return ty.clone();
+        }
+        let ty = match self.term(term) {
+            TypeTerm::Text => Type::Text,
+            TypeTerm::Number => Type::Number,
+            TypeTerm::Bytes(BytesTerm::Dynamic) => Type::Bytes(BytesType::Dynamic),
+            TypeTerm::Bytes(BytesTerm::Fixed(size)) => Type::Bytes(BytesType::Fixed(size)),
+            TypeTerm::Absent => Type::Absent,
+            TypeTerm::VariantSet(variants) => Type::VariantSet(
+                variants
+                    .iter()
+                    .map(|variant| match variant {
+                        VariantTerm::Tag(tag) => Variant::Tag(self.name(*tag).to_owned()),
+                        VariantTerm::Tagged { tag, fields } => {
+                            let Type::Object(fields) =
+                                self.export_checked_type_cached(*fields, cache)
+                            else {
+                                unreachable!("kernel tagged payload is always an object")
+                            };
+                            Variant::Tagged {
+                                tag: self.name(*tag).to_owned(),
+                                fields,
+                            }
+                        }
+                    })
+                    .collect(),
+            ),
+            TypeTerm::Object { fields, open } => Type::object(ObjectShape::from_ordered_fields(
+                fields.iter().map(|field| {
+                    (
+                        self.name(field.name).to_owned(),
+                        self.export_checked_type_cached(field.ty, cache),
+                    )
+                }),
+                open,
+            )),
+            TypeTerm::OpenObjectPlaceholder => {
+                Type::object(ObjectShape::new(std::collections::BTreeMap::new(), true))
+            }
+            TypeTerm::RenderContract => Type::RenderContract,
+            TypeTerm::List(item) => {
+                Type::List(Type::shared(self.export_checked_type_cached(item, cache)))
+            }
+            TypeTerm::Function {
+                args,
+                result_mode,
+                result,
+            } => Type::Function {
+                args: args
+                    .iter()
+                    .map(|argument| self.export_checked_type_cached(*argument, cache))
+                    .collect(),
+                result: Box::new(FlowType {
+                    mode: result_mode,
+                    ty: self.export_checked_type_cached(result, cache),
+                }),
+            },
+            TypeTerm::UnresolvedShape(reason) => Type::UnresolvedShape {
+                reason: self.diagnostic_text(reason).to_owned(),
+            },
+            TypeTerm::Variable(variable) => Type::Var(TypeVar(variable.0)),
+            TypeTerm::Unknown => Type::Unknown,
+            TypeTerm::Union(members) => boon_checked::canonical_union_type(
+                members
+                    .iter()
+                    .map(|member| self.export_checked_type_cached(*member, cache))
+                    .collect(),
+            ),
+            TypeTerm::Map { key, value } => Type::Map {
+                key: Box::new(self.export_checked_type_cached(key, cache)),
+                value: Box::new(self.export_checked_type_cached(value, cache)),
+            },
+            TypeTerm::Set(item) => {
+                Type::Set(Type::shared(self.export_checked_type_cached(item, cache)))
+            }
+            TypeTerm::Bits(width) => Type::Bits { width },
+        };
+        cache[index] = Some(ty.clone());
+        ty
+    }
+
     /// Import an immutable term DAG from another kernel arena while rebasing
     /// its variable slots. This is the linker primitive for compiled residual
     /// modules: semantic operations stay shared, while each invocation owns

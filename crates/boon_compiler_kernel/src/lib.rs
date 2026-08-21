@@ -8,6 +8,7 @@
 mod abi;
 mod artifact;
 mod artifact_terms;
+mod definition_code;
 mod link;
 mod owner;
 mod program;
@@ -20,6 +21,7 @@ mod text;
 pub use abi::*;
 pub use artifact::*;
 pub(crate) use artifact_terms::*;
+pub use definition_code::*;
 pub use link::*;
 pub use owner::*;
 pub use program::*;

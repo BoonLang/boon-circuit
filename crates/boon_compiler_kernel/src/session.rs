@@ -247,7 +247,9 @@ pub struct KernelDemandedCheckArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelDemandedCheckSnapshot {
     pub definitions: Box<[KernelDemandedCheckArtifact]>,
+    pub definition_code: Arc<crate::DefinitionCodeStore>,
     pub type_store: Arc<crate::FrozenTypeStore>,
+    pub interface: Arc<KernelInterfaceSnapshot>,
     pub work: crate::KernelSolveWork,
 }
 
@@ -542,31 +544,7 @@ impl KernelSession {
         let product = match demand {
             CheckDemand::CheckedImage => return Ok(None),
             CheckDemand::Diagnostics => {
-                let public_results = snapshot
-                    .definitions
-                    .iter()
-                    .map(|definition| definition.result.clone())
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
-                let callable_formals = snapshot
-                    .definitions
-                    .iter()
-                    .map(|definition| definition.formals.clone())
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
-                let diagnostics = snapshot
-                    .definitions
-                    .iter()
-                    .flat_map(|definition| definition.diagnostics.iter().cloned())
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice();
-                KernelCheckProduct::Diagnostics(Arc::new(KernelInterfaceSnapshot {
-                    public_results,
-                    callable_formals,
-                    diagnostics,
-                    diagnostic_values: snapshot.diagnostic_values.clone(),
-                    work: snapshot.work,
-                }))
+                KernelCheckProduct::Diagnostics(Arc::clone(&snapshot.interface))
             }
             CheckDemand::Definitions(definitions) => {
                 let definitions = definitions
@@ -587,7 +565,9 @@ impl KernelSession {
                     .into_boxed_slice();
                 KernelCheckProduct::Definitions(Arc::new(KernelDemandedCheckSnapshot {
                     definitions,
+                    definition_code: Arc::clone(&snapshot.definition_code),
                     type_store: Arc::clone(&snapshot.type_store),
+                    interface: Arc::clone(&snapshot.interface),
                     work: snapshot.work,
                 }))
             }
@@ -603,6 +583,8 @@ impl KernelSession {
         demanded: KernelDemandedDefinitionSnapshot,
     ) -> Result<KernelDemandedCheckSnapshot, KernelCheckError> {
         let type_store = Arc::clone(&demanded.type_store);
+        let definition_code = Arc::clone(&demanded.definition_code);
+        let interface = Arc::clone(&demanded.interface);
         let mut definitions = demanded
             .definitions
             .into_vec()
@@ -629,7 +611,9 @@ impl KernelSession {
         definitions.sort_by(|left, right| left.owner.cmp(&right.owner));
         Ok(KernelDemandedCheckSnapshot {
             definitions: definitions.into_boxed_slice(),
+            definition_code,
             type_store,
+            interface,
             work: demanded.work,
         })
     }
@@ -868,22 +852,12 @@ mod tests {
         };
         assert_eq!(
             snapshot.public_results.as_ref(),
-            checked_snapshot
-                .definitions
-                .iter()
-                .map(|definition| definition.result.clone())
-                .collect::<Vec<_>>()
-                .as_slice(),
+            checked_snapshot.interface.public_results.as_ref(),
             "diagnostics and checked-image demands must share one public interface authority"
         );
         assert_eq!(
             snapshot.callable_formals.as_ref(),
-            checked_snapshot
-                .definitions
-                .iter()
-                .map(|definition| definition.formals.clone())
-                .collect::<Vec<_>>()
-                .as_slice(),
+            checked_snapshot.interface.callable_formals.as_ref(),
             "diagnostics and checked-image demands must share callable formal authorities"
         );
 
@@ -933,7 +907,7 @@ mod tests {
             panic!("checked demand returned another product")
         };
         assert_eq!(
-            checked.definitions[1].diagnostics.as_ref(),
+            checked.interface.diagnostics.as_ref(),
             diagnostics.diagnostics.as_ref(),
             "one graph evaluation owns both diagnostics-only and checked-image facts"
         );
@@ -961,12 +935,9 @@ mod tests {
             vec![KernelOwnerId(1), KernelOwnerId(2)]
         );
         assert_eq!(snapshot.definitions[0].owner, first);
-        assert!(
-            snapshot
-                .definitions
-                .iter()
-                .all(|definition| definition.definition.result.ty == Type::Text)
-        );
+        assert!(snapshot.definitions.iter().all(|definition| {
+            snapshot.interface.public_results[definition.dense_owner.0 as usize].ty == Type::Text
+        }));
         assert_eq!(result.product.materialized_definition_count(), 2);
         assert_eq!(result.product.sealed_definition_count(), 0);
     }

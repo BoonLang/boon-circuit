@@ -82,6 +82,19 @@ pub struct ComponentArtifact {
     pub work: KernelSolveWork,
 }
 
+/// Quiescent solved component whose construction indexes remain available for
+/// definition finalization.
+///
+/// FLUSH, call-substitution, resource, and diagnostic roots must be interned
+/// here before the one permanent type-store freeze. This value is never
+/// shared or retained by a compiler session.
+#[derive(Debug)]
+pub(crate) struct UnsealedComponentArtifact {
+    outputs: Box<[Option<ArtifactOutput>]>,
+    terms: TypeTermArena,
+    work: KernelSolveWork,
+}
+
 /// Lean output-only view used by diagnostics before checked definition terms
 /// are demanded. It intentionally owns no clone of the solved type arena.
 #[derive(Clone, Debug)]
@@ -112,10 +125,14 @@ impl ComponentOutputSnapshot {
         Self { outputs, work }
     }
 
-    /// Build one phase-local rich projection for the exact demanded outputs.
-    /// Each packed flow is expanded at most once; the table is dropped when
-    /// the compatibility/editor projection finishes.
-    pub(crate) fn project(artifact: &ComponentArtifact, demanded: &[OutputId]) -> Self {
+    /// Temporary rich compatibility projection while the packed arena is
+    /// still mutable. This lets every derived type root be interned before the
+    /// one permanent freeze. The projection is phase-local and is dropped
+    /// before the sealed project is published.
+    pub(crate) fn project_unsealed(
+        artifact: &UnsealedComponentArtifact,
+        demanded: &[OutputId],
+    ) -> Self {
         let mut outputs = vec![None; artifact.outputs.len()];
         let mut work = artifact.work;
         for id in demanded.iter().copied() {
@@ -131,7 +148,10 @@ impl ComponentOutputSnapshot {
             };
             *slot = Some(ProjectedArtifactOutput {
                 id,
-                flow_type: Some(artifact.materialize_flow(output.flow)),
+                flow_type: Some(FlowType {
+                    mode: output.flow.mode(),
+                    ty: artifact.terms.export_checked_type(output.term()),
+                }),
                 syntax_selected_here: output.syntax_selected_here,
                 call_syntax_selected: output.call_syntax_selected,
             });
@@ -156,18 +176,6 @@ impl ComponentOutputSnapshot {
             .and_then(|output| output.flow_type.as_ref())
     }
 
-    pub(crate) fn take_flow_type(&mut self, id: OutputId) -> Option<FlowType> {
-        self.outputs
-            .get_mut(id.0 as usize)
-            .and_then(Option::as_mut)
-            .filter(|output| output.id == id)
-            .and_then(|output| output.flow_type.take())
-    }
-
-    pub(crate) const fn slot_count(&self) -> usize {
-        self.outputs.len()
-    }
-
     pub(crate) fn output_flags(&self, id: OutputId) -> Option<ArtifactOutputFlags> {
         self.outputs
             .get(id.0 as usize)
@@ -185,20 +193,6 @@ impl ComponentOutputSnapshot {
 }
 
 impl ComponentArtifact {
-    pub(crate) fn new(
-        outputs: Box<[Option<ArtifactOutput>]>,
-        terms: TypeTermArena,
-        mut work: KernelSolveWork,
-    ) -> Self {
-        let terms = Arc::new(terms.freeze());
-        work.frozen_type_store = terms.layout();
-        Self {
-            outputs,
-            terms,
-            work,
-        }
-    }
-
     pub fn outputs(&self) -> impl Iterator<Item = &ArtifactOutput> {
         self.outputs.iter().filter_map(Option::as_ref)
     }
@@ -217,12 +211,6 @@ impl ComponentArtifact {
         self.terms.materialize_flow(output.flow)
     }
 
-    pub(crate) fn materialize_flow(&self, flow: KernelFlowRef) -> FlowType {
-        self.terms
-            .materialize_flow(flow)
-            .expect("kernel flow reference belongs to its component type store")
-    }
-
     pub fn available_output_count(&self) -> usize {
         self.outputs
             .iter()
@@ -230,13 +218,48 @@ impl ComponentArtifact {
             .count()
     }
 
-    pub(crate) fn terms(&self) -> &TypeTermArena {
-        self.terms.as_arena()
-    }
-
     /// Share the one immutable type/symbol store retained by this solved
     /// component. Snapshot publication clones only this `Arc`.
     pub(crate) fn type_store(&self) -> Arc<FrozenTypeStore> {
         Arc::clone(&self.terms)
+    }
+}
+
+impl UnsealedComponentArtifact {
+    pub(crate) fn new(
+        outputs: Box<[Option<ArtifactOutput>]>,
+        terms: TypeTermArena,
+        work: KernelSolveWork,
+    ) -> Self {
+        Self {
+            outputs,
+            terms,
+            work,
+        }
+    }
+
+    pub(crate) fn output(&self, id: OutputId) -> Option<&ArtifactOutput> {
+        self.outputs
+            .get(id.0 as usize)
+            .and_then(Option::as_ref)
+            .filter(|output| output.id == id)
+    }
+
+    pub(crate) fn terms(&self) -> &TypeTermArena {
+        &self.terms
+    }
+
+    pub(crate) fn terms_mut(&mut self) -> &mut TypeTermArena {
+        &mut self.terms
+    }
+
+    pub(crate) fn seal(mut self) -> ComponentArtifact {
+        let terms = Arc::new(self.terms.freeze());
+        self.work.frozen_type_store = terms.layout();
+        ComponentArtifact {
+            outputs: self.outputs,
+            terms,
+            work: self.work,
+        }
     }
 }

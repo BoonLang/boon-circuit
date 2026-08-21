@@ -1,9 +1,10 @@
 use crate::{
-    DefinitionArtifact, KernelCallTarget, KernelDeclarationReference, KernelDefinitionFactsInput,
-    KernelDiagnosticArtifact, KernelDiagnosticKind, KernelExpressionId, KernelExternalExpression,
-    KernelExternalTarget, KernelLexicalBindingTarget, KernelOwnerBuildError, KernelOwnerId,
-    KernelOwnerNodeKind, KernelOwnerProgramInput, KernelSolveError, KernelStatementChildReference,
-    KernelStatementReference, KernelValueReference,
+    DefinitionArtifact, DefinitionCodeStore, KernelCallTarget, KernelDeclarationReference,
+    KernelDefinitionFactsInput, KernelDiagnosticArtifact, KernelDiagnosticKind, KernelExpressionId,
+    KernelExternalExpression, KernelExternalTarget, KernelInterfaceSnapshot,
+    KernelLexicalBindingTarget, KernelOwnerBuildError, KernelOwnerId, KernelOwnerNodeKind,
+    KernelOwnerProgramInput, KernelSolveError, KernelStatementChildReference,
+    KernelStatementReference, KernelValueReference, RichDefinitionArtifact,
 };
 use boon_checked::{FlowType, ObjectShape, SharedObjectShape, Type, TypeVar, Variant};
 use serde::Serialize;
@@ -20,6 +21,12 @@ const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V16: &[u8] =
 const KERNEL_DEPENDENCY_IMPORTS_DOMAIN_V2: &[u8] = b"boon.compiler-kernel.dependency-imports.v2\0";
 const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V16: &[u8] =
     b"boon.compiler-kernel.definition-currentness.v16\0";
+const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V17: &[u8] =
+    b"boon.compiler-kernel.definition-artifact.v17.packed\0";
+const KERNEL_EXPRESSION_SURFACE_DOMAIN_V2: &[u8] =
+    b"boon.compiler-kernel.expression-surface.v2.packed\0";
+const KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V17: &[u8] =
+    b"boon.compiler-kernel.definition-currentness.v17.packed\0";
 const PARALLEL_DEFINITION_THRESHOLD: usize = 64;
 
 struct DefinitionFingerprints {
@@ -209,6 +216,18 @@ pub struct KernelDefinitionCurrentnessReceipt {
     pub fingerprint_v16: [u8; 32],
 }
 
+/// Exact currentness receipt for the structural definition plus its sealed
+/// packed type code. The version differs deliberately from the retired rich
+/// V16 hash domain; no field silently changes meaning.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelPackedDefinitionCurrentnessReceipt {
+    pub basis_fingerprint_v14: [u8; 32],
+    pub public_result_fingerprint_v1: [u8; 32],
+    pub artifact_fingerprint_v17: [u8; 32],
+    pub dependency_fingerprint_v2: [u8; 32],
+    pub fingerprint_v17: [u8; 32],
+}
+
 pub(crate) fn definition_basis_fingerprint(
     input: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
@@ -229,7 +248,7 @@ pub(crate) fn definition_basis_fingerprint_with_buffer(
 }
 
 pub(crate) fn build_snapshot_receipts(
-    definitions: &mut [DefinitionArtifact],
+    definitions: &mut [RichDefinitionArtifact],
     basis_fingerprints: &[[u8; 32]],
 ) -> Result<
     (
@@ -247,7 +266,7 @@ pub(crate) fn build_snapshot_receipts(
 /// Seal a project whose definition artifacts have already been normalized in
 /// their independent materialization workers.
 pub(crate) fn build_normalized_snapshot_receipts(
-    definitions: &[DefinitionArtifact],
+    definitions: &[RichDefinitionArtifact],
     basis_fingerprints: &[[u8; 32]],
 ) -> Result<
     (
@@ -279,6 +298,236 @@ pub(crate) fn build_normalized_snapshot_receipts(
     Ok((dependency_graph, receipts.into_boxed_slice()))
 }
 
+pub(crate) fn build_packed_snapshot_receipts(
+    definitions: &[DefinitionArtifact],
+    code: &DefinitionCodeStore,
+    interface: &KernelInterfaceSnapshot,
+    basis_fingerprints: &[[u8; 32]],
+) -> Result<
+    (
+        KernelDefinitionDependencyGraph,
+        Box<[KernelPackedDefinitionCurrentnessReceipt]>,
+    ),
+    KernelSolveError,
+> {
+    if definitions.len() != basis_fingerprints.len()
+        || definitions.len() != code.definition_count()
+        || definitions.len() != interface.public_results.len()
+        || definitions.len() != interface.callable_formals.len()
+    {
+        return Err(KernelSolveError::new(format!(
+            "kernel packed snapshot has {} definitions, {} code rows, {} results, {} formal rows, and {} basis fingerprints",
+            definitions.len(),
+            code.definition_count(),
+            interface.public_results.len(),
+            interface.callable_formals.len(),
+            basis_fingerprints.len(),
+        )));
+    }
+    let diagnostic_offsets = packed_diagnostic_offsets(code, interface)?;
+    let dependency_graph =
+        build_packed_dependency_graph(definitions, code, interface, &diagnostic_offsets)?;
+    let mut imported_expressions = vec![BTreeSet::new(); definitions.len()];
+    for dependency in dependency_graph.dependencies.iter() {
+        if let KernelDependencyTarget::Expression { owner, expression } = dependency.target {
+            imported_expressions[owner.0 as usize].insert(expression);
+        }
+    }
+    let fingerprints = collect_definition_ranges(definitions.len(), |range| {
+        fingerprint_packed_definition_range(
+            range,
+            definitions,
+            code,
+            interface,
+            &diagnostic_offsets,
+            &imported_expressions,
+        )
+    })?;
+    let receipts = collect_definition_ranges(definitions.len(), |range| {
+        packed_currentness_receipt_range(
+            range,
+            &dependency_graph,
+            basis_fingerprints,
+            &fingerprints,
+        )
+    })?;
+    Ok((dependency_graph, receipts.into_boxed_slice()))
+}
+
+fn packed_diagnostic_offsets(
+    code: &DefinitionCodeStore,
+    interface: &KernelInterfaceSnapshot,
+) -> Result<Box<[u32]>, KernelSolveError> {
+    let mut offsets = Vec::with_capacity(code.definition_count() + 1);
+    offsets.push(0);
+    let mut cursor = 0usize;
+    for owner in 0..code.definition_count() {
+        let owner_id = KernelOwnerId(
+            u32::try_from(owner).expect("kernel definition count exceeds dense u32 namespace"),
+        );
+        let definition = code.definition(owner_id).ok_or_else(|| {
+            KernelSolveError::new(format!("kernel definition code omits owner {owner}"))
+        })?;
+        let end = cursor
+            .checked_add(definition.diagnostic_count())
+            .ok_or_else(|| KernelSolveError::new("kernel diagnostic offset overflowed usize"))?;
+        let rows = interface.diagnostics.get(cursor..end).ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel definition {owner} diagnostic code exceeds its interface rows"
+            ))
+        })?;
+        if rows.iter().any(|diagnostic| diagnostic.owner != owner_id) {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition {owner} diagnostic rows are not owner-contiguous"
+            )));
+        }
+        cursor = end;
+        offsets.push(checked_u32(cursor, "kernel diagnostic row count")?);
+    }
+    if cursor != interface.diagnostics.len() {
+        return Err(KernelSolveError::new(format!(
+            "kernel definition code covers {cursor} of {} interface diagnostics",
+            interface.diagnostics.len()
+        )));
+    }
+    Ok(offsets.into_boxed_slice())
+}
+
+fn fingerprint_packed_definition_range(
+    range: Range<usize>,
+    definitions: &[DefinitionArtifact],
+    code: &DefinitionCodeStore,
+    interface: &KernelInterfaceSnapshot,
+    diagnostic_offsets: &[u32],
+    imported_expressions: &[BTreeSet<KernelExpressionId>],
+) -> Result<Vec<DefinitionFingerprints>, KernelSolveError> {
+    let mut fingerprints = Vec::with_capacity(range.len());
+    let mut hash_scratch = Vec::new();
+    for definition_index in range {
+        let owner = KernelOwnerId(
+            u32::try_from(definition_index)
+                .expect("kernel definition count exceeds dense u32 namespace"),
+        );
+        let definition = &definitions[definition_index];
+        let code = code.definition(owner).ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel definition code omits owner {definition_index}"
+            ))
+        })?;
+        let public_result = hash_normalized_flow_type(
+            KERNEL_PUBLIC_RESULT_DOMAIN_V1,
+            &interface.public_results[definition_index],
+            &mut hash_scratch,
+        )?;
+        let diagnostic_start = diagnostic_offsets[definition_index] as usize;
+        let diagnostic_end = diagnostic_offsets[definition_index + 1] as usize;
+        let artifact = stable_fingerprint(
+            KERNEL_DEFINITION_ARTIFACT_DOMAIN_V17,
+            &(
+                definition,
+                code.stable_digest(),
+                &interface.diagnostics[diagnostic_start..diagnostic_end],
+            ),
+            &mut hash_scratch,
+        );
+        let mut expressions = BTreeMap::new();
+        for expression in imported_expressions[definition_index].iter().copied() {
+            let digest = code
+                .expression_surface_digest(expression.0 as usize)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition {definition_index} omits imported expression {}",
+                        expression.0
+                    ))
+                })?;
+            expressions.insert(
+                expression,
+                stable_fingerprint(
+                    KERNEL_EXPRESSION_SURFACE_DOMAIN_V2,
+                    &digest,
+                    &mut hash_scratch,
+                ),
+            );
+        }
+        fingerprints.push(DefinitionFingerprints {
+            public_result,
+            artifact,
+            expressions,
+        });
+    }
+    Ok(fingerprints)
+}
+
+fn packed_currentness_receipt_range(
+    range: Range<usize>,
+    dependency_graph: &KernelDefinitionDependencyGraph,
+    basis_fingerprints: &[[u8; 32]],
+    fingerprints: &[DefinitionFingerprints],
+) -> Result<Vec<KernelPackedDefinitionCurrentnessReceipt>, KernelSolveError> {
+    let mut receipts = Vec::with_capacity(range.len());
+    let mut hash_scratch = Vec::new();
+    for definition_index in range {
+        let owner = KernelOwnerId(
+            u32::try_from(definition_index)
+                .expect("kernel definition count exceeds dense u32 namespace"),
+        );
+        let dependencies = dependency_graph
+            .dependencies(owner)
+            .expect("kernel dependency graph contains every definition");
+        let imported_authorities = dependencies
+            .iter()
+            .map(|dependency| {
+                let target = dependency.target;
+                let provider = target.owner().0 as usize;
+                match target {
+                    KernelDependencyTarget::Expression { expression, .. } => fingerprints[provider]
+                        .expressions
+                        .get(&expression)
+                        .copied()
+                        .ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "kernel dependency targets missing expression {} in definition {}",
+                                expression.0, provider
+                            ))
+                        }),
+                    KernelDependencyTarget::Declaration { .. } => {
+                        Ok(fingerprints[provider].artifact)
+                    }
+                    KernelDependencyTarget::Definition(_)
+                    | KernelDependencyTarget::PublicDeclaration(_)
+                    | KernelDependencyTarget::PublicStatement(_)
+                    | KernelDependencyTarget::Result(_) => Ok(fingerprints[provider].public_result),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let dependency_fingerprint_v2 = stable_fingerprint(
+            KERNEL_DEPENDENCY_IMPORTS_DOMAIN_V2,
+            &(dependencies, imported_authorities),
+            &mut hash_scratch,
+        );
+        let basis_fingerprint_v14 = basis_fingerprints[definition_index];
+        let public_result_fingerprint_v1 = fingerprints[definition_index].public_result;
+        let artifact_fingerprint_v17 = fingerprints[definition_index].artifact;
+        let fingerprint_v17 = stable_fingerprint(
+            KERNEL_DEFINITION_CURRENTNESS_DOMAIN_V17,
+            &(
+                basis_fingerprint_v14,
+                artifact_fingerprint_v17,
+                dependency_fingerprint_v2,
+            ),
+            &mut hash_scratch,
+        );
+        receipts.push(KernelPackedDefinitionCurrentnessReceipt {
+            basis_fingerprint_v14,
+            public_result_fingerprint_v1,
+            artifact_fingerprint_v17,
+            dependency_fingerprint_v2,
+            fingerprint_v17,
+        });
+    }
+    Ok(receipts)
+}
+
 fn collect_definition_ranges<T, F>(len: usize, build: F) -> Result<Vec<T>, KernelSolveError>
 where
     T: Send,
@@ -307,7 +556,7 @@ where
 
 fn fingerprint_definition_range(
     range: Range<usize>,
-    definitions: &[DefinitionArtifact],
+    definitions: &[RichDefinitionArtifact],
     imported_expressions: &[BTreeSet<KernelExpressionId>],
 ) -> Result<Vec<DefinitionFingerprints>, KernelSolveError> {
     let mut fingerprints = Vec::with_capacity(range.len());
@@ -419,11 +668,9 @@ fn currentness_receipt_range(
 }
 
 fn build_dependency_graph(
-    definitions: &[DefinitionArtifact],
+    definitions: &[RichDefinitionArtifact],
 ) -> Result<KernelDefinitionDependencyGraph, KernelSolveError> {
-    let mut dependency_offsets = Vec::with_capacity(definitions.len() + 1);
-    let mut dependencies = Vec::new();
-    dependency_offsets.push(0);
+    let mut rows = Vec::with_capacity(definitions.len());
     for (definition_index, definition) in definitions.iter().enumerate() {
         validate_definition_diagnostics(definitions, definition_index, definition)?;
         let mut local = definition_dependencies(definition);
@@ -432,6 +679,18 @@ fn build_dependency_graph(
         for dependency in &local {
             validate_dependency_target(definitions, definition_index, dependency.target)?;
         }
+        rows.push(local);
+    }
+    seal_dependency_graph(rows)
+}
+
+fn seal_dependency_graph(
+    rows: Vec<Vec<KernelDefinitionDependency>>,
+) -> Result<KernelDefinitionDependencyGraph, KernelSolveError> {
+    let mut dependency_offsets = Vec::with_capacity(rows.len() + 1);
+    let mut dependencies = Vec::new();
+    dependency_offsets.push(0);
+    for local in rows {
         dependencies.extend(local);
         dependency_offsets.push(checked_u32(
             dependencies.len(),
@@ -439,7 +698,7 @@ fn build_dependency_graph(
         )?);
     }
 
-    let mut reverse = vec![BTreeSet::new(); definitions.len()];
+    let mut reverse = vec![BTreeSet::new(); dependency_offsets.len().saturating_sub(1)];
     for (consumer_index, range) in dependency_offsets.windows(2).enumerate() {
         let consumer = KernelOwnerId(
             u32::try_from(consumer_index)
@@ -452,7 +711,7 @@ fn build_dependency_graph(
             }
         }
     }
-    let mut consumer_offsets = Vec::with_capacity(definitions.len() + 1);
+    let mut consumer_offsets = Vec::with_capacity(dependency_offsets.len());
     let mut consumers = Vec::new();
     consumer_offsets.push(0);
     for provider_consumers in reverse {
@@ -470,10 +729,318 @@ fn build_dependency_graph(
     })
 }
 
-fn validate_definition_diagnostics(
+fn build_packed_dependency_graph(
     definitions: &[DefinitionArtifact],
+    code: &DefinitionCodeStore,
+    interface: &KernelInterfaceSnapshot,
+    diagnostic_offsets: &[u32],
+) -> Result<KernelDefinitionDependencyGraph, KernelSolveError> {
+    let mut rows = Vec::with_capacity(definitions.len());
+    for (definition_index, definition) in definitions.iter().enumerate() {
+        validate_packed_definition_diagnostics(
+            definitions,
+            code,
+            interface,
+            diagnostic_offsets,
+            definition_index,
+            definition,
+        )?;
+        let mut local = packed_definition_dependencies(definition);
+        local.sort_unstable();
+        local.dedup();
+        for dependency in &local {
+            validate_packed_dependency_target(definitions, definition_index, dependency.target)?;
+        }
+        rows.push(local);
+    }
+    seal_dependency_graph(rows)
+}
+
+fn validate_packed_definition_diagnostics(
+    definitions: &[DefinitionArtifact],
+    code: &DefinitionCodeStore,
+    interface: &KernelInterfaceSnapshot,
+    diagnostic_offsets: &[u32],
     owner_index: usize,
     definition: &DefinitionArtifact,
+) -> Result<(), KernelSolveError> {
+    let owner = KernelOwnerId(
+        u32::try_from(owner_index)
+            .expect("kernel definition count exceeds the dense u32 namespace"),
+    );
+    let start = diagnostic_offsets[owner_index] as usize;
+    let end = diagnostic_offsets[owner_index + 1] as usize;
+    for diagnostic in &interface.diagnostics[start..end] {
+        match diagnostic.site {
+            crate::KernelDiagnosticSite::Expression { expression } => {
+                if definition
+                    .expressions
+                    .get(expression.0 as usize)
+                    .is_none_or(|candidate| candidate.id != expression)
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition {owner_index} diagnostic references missing expression {}",
+                        expression.0
+                    )));
+                }
+            }
+            crate::KernelDiagnosticSite::CallArgument { call, .. }
+            | crate::KernelDiagnosticSite::CallPass { call, .. } => {
+                if definition
+                    .expressions
+                    .get(call.0 as usize)
+                    .is_none_or(|candidate| candidate.id != call)
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition {owner_index} diagnostic references missing call expression {}",
+                        call.0
+                    )));
+                }
+            }
+            crate::KernelDiagnosticSite::CallInput {
+                call,
+                target,
+                formal_ordinal,
+            } => {
+                if definitions.get(target.0 as usize).is_none() {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition {owner_index} diagnostic targets missing definition {}",
+                        target.0
+                    )));
+                }
+                let target_code = code.definition(target).ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition {owner_index} diagnostic target {} has no code",
+                        target.0
+                    ))
+                })?;
+                if target_code.formals().get(formal_ordinal as usize).is_none() {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition {owner_index} diagnostic targets missing formal {formal_ordinal} in definition {}",
+                        target.0
+                    )));
+                }
+                let call_matches = definition.calls.iter().any(|candidate| {
+                    candidate.expression == call
+                        && matches!(
+                            candidate.target,
+                            KernelCallTarget::User {
+                                target: candidate_target,
+                                ..
+                            } if candidate_target == target
+                        )
+                        && candidate.inputs.iter().any(|input| {
+                            matches!(
+                                input.role,
+                                crate::KernelCallInputRole::Formal { ordinal }
+                                    if ordinal == formal_ordinal
+                            )
+                        })
+                });
+                if !call_matches {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition {owner_index} diagnostic references missing call input {} formal {formal_ordinal} targeting definition {}",
+                        call.0, target.0
+                    )));
+                }
+            }
+        }
+    }
+    if diagnostic_offsets[owner_index + 1] - diagnostic_offsets[owner_index]
+        != code
+            .definition(owner)
+            .expect("validated packed definition code exists")
+            .diagnostic_count() as u32
+    {
+        return Err(KernelSolveError::new(format!(
+            "kernel definition {owner_index} diagnostic metadata and type rows differ"
+        )));
+    }
+    Ok(())
+}
+
+fn packed_definition_dependencies(
+    definition: &DefinitionArtifact,
+) -> Vec<KernelDefinitionDependency> {
+    let mut dependencies = Vec::new();
+    for expression in &definition.expressions {
+        for (input, edge) in expression.inputs.iter().enumerate() {
+            push_value_dependency(
+                &mut dependencies,
+                KernelDependencySource::ExpressionInput {
+                    expression: expression.id,
+                    input: dense_index(input),
+                },
+                edge.value,
+            );
+        }
+    }
+    for statement in &definition.statements {
+        if let Some(value) = statement.value {
+            push_value_dependency(
+                &mut dependencies,
+                KernelDependencySource::StatementValue {
+                    statement: statement.id,
+                },
+                value,
+            );
+        }
+        for (child, reference) in statement.children.iter().enumerate() {
+            if let KernelStatementChildReference::Owner(owner) = reference {
+                dependencies.push(KernelDefinitionDependency {
+                    source: KernelDependencySource::StatementChild {
+                        statement: statement.id,
+                        child: dense_index(child),
+                    },
+                    target: KernelDependencyTarget::Definition(*owner),
+                });
+            }
+        }
+    }
+    for declaration in &definition.declarations {
+        if let Some(value) = declaration.value {
+            push_value_dependency(
+                &mut dependencies,
+                KernelDependencySource::DeclarationValue {
+                    declaration: declaration.id,
+                },
+                value,
+            );
+        }
+    }
+    for binding in &definition.lexical_bindings {
+        match binding.target {
+            KernelLexicalBindingTarget::Declaration(reference) => push_declaration_dependency(
+                &mut dependencies,
+                KernelDependencySource::LexicalDeclaration {
+                    expression: binding.expression,
+                },
+                reference,
+            ),
+            KernelLexicalBindingTarget::Value { provider } => push_value_dependency(
+                &mut dependencies,
+                KernelDependencySource::LexicalValue {
+                    expression: binding.expression,
+                },
+                provider,
+            ),
+            KernelLexicalBindingTarget::ContextFormal { .. }
+            | KernelLexicalBindingTarget::RuntimeContext => {}
+        }
+    }
+    for call in &definition.calls {
+        if let KernelCallTarget::User { target, .. } = call.target {
+            dependencies.push(KernelDefinitionDependency {
+                source: KernelDependencySource::CallTarget {
+                    expression: call.expression,
+                },
+                target: KernelDependencyTarget::Definition(target),
+            });
+        }
+        for (input, argument) in call.inputs.iter().enumerate() {
+            push_value_dependency(
+                &mut dependencies,
+                KernelDependencySource::CallInput {
+                    expression: call.expression,
+                    input: dense_index(input),
+                },
+                argument.value,
+            );
+        }
+    }
+    for source in &definition.sources {
+        push_declaration_dependency(
+            &mut dependencies,
+            KernelDependencySource::SourceDeclaration { source: source.id },
+            source.declaration,
+        );
+        push_statement_dependency(
+            &mut dependencies,
+            KernelDependencySource::SourceStatement { source: source.id },
+            source.statement,
+        );
+        push_declaration_dependency(
+            &mut dependencies,
+            KernelDependencySource::SourcePathAnchor { source: source.id },
+            source.path.anchor,
+        );
+    }
+    for state in &definition.states {
+        push_declaration_dependency(
+            &mut dependencies,
+            KernelDependencySource::StateBindingDeclaration { state: state.id },
+            state.binding_declaration,
+        );
+        push_declaration_dependency(
+            &mut dependencies,
+            KernelDependencySource::StateDeclaration { state: state.id },
+            state.declaration,
+        );
+        push_statement_dependency(
+            &mut dependencies,
+            KernelDependencySource::StateStatement { state: state.id },
+            state.statement,
+        );
+        push_value_dependency(
+            &mut dependencies,
+            KernelDependencySource::StateInitial { state: state.id },
+            state.initial,
+        );
+        push_declaration_dependency(
+            &mut dependencies,
+            KernelDependencySource::StatePathAnchor { state: state.id },
+            state.path.anchor,
+        );
+    }
+    for list in &definition.lists {
+        push_declaration_dependency(
+            &mut dependencies,
+            KernelDependencySource::ListDeclaration { list: list.id },
+            list.declaration,
+        );
+        push_statement_dependency(
+            &mut dependencies,
+            KernelDependencySource::ListStatement { list: list.id },
+            list.statement,
+        );
+        push_declaration_dependency(
+            &mut dependencies,
+            KernelDependencySource::ListPathAnchor { list: list.id },
+            list.path.anchor,
+        );
+    }
+    dependencies
+}
+
+fn validate_packed_dependency_target(
+    definitions: &[DefinitionArtifact],
+    consumer: usize,
+    target: KernelDependencyTarget,
+) -> Result<(), KernelSolveError> {
+    let provider = target.owner().0 as usize;
+    let Some(definition) = definitions.get(provider) else {
+        return Err(KernelSolveError::new(format!(
+            "kernel definition {consumer} depends on missing definition {provider}"
+        )));
+    };
+    if let KernelDependencyTarget::Expression { expression, .. } = target
+        && definition
+            .expressions
+            .get(expression.0 as usize)
+            .is_none_or(|candidate| candidate.id != expression)
+    {
+        return Err(KernelSolveError::new(format!(
+            "kernel definition {consumer} depends on missing expression {} in definition {provider}",
+            expression.0
+        )));
+    }
+    Ok(())
+}
+
+fn validate_definition_diagnostics(
+    definitions: &[RichDefinitionArtifact],
+    owner_index: usize,
+    definition: &RichDefinitionArtifact,
 ) -> Result<(), KernelSolveError> {
     let owner = KernelOwnerId(
         u32::try_from(owner_index)
@@ -562,7 +1129,7 @@ fn validate_definition_diagnostics(
     Ok(())
 }
 
-fn definition_dependencies(definition: &DefinitionArtifact) -> Vec<KernelDefinitionDependency> {
+fn definition_dependencies(definition: &RichDefinitionArtifact) -> Vec<KernelDefinitionDependency> {
     let mut dependencies = Vec::new();
     for expression in &definition.expressions {
         for (input, edge) in expression.inputs.iter().enumerate() {
@@ -773,7 +1340,7 @@ fn push_statement_dependency(
 }
 
 fn validate_dependency_target(
-    definitions: &[DefinitionArtifact],
+    definitions: &[RichDefinitionArtifact],
     consumer: usize,
     target: KernelDependencyTarget,
 ) -> Result<(), KernelSolveError> {
@@ -797,7 +1364,7 @@ fn validate_dependency_target(
     Ok(())
 }
 
-pub(crate) fn alpha_normalize_definition(normalized: &mut DefinitionArtifact) {
+pub(crate) fn alpha_normalize_definition(normalized: &mut RichDefinitionArtifact) {
     let mut variables = BTreeMap::new();
     let mut next = 0;
     for formal in &mut normalized.formals {
@@ -1327,11 +1894,11 @@ mod tests {
             "an unused implementation edit must preserve the public type identity"
         );
         assert_ne!(
-            first.currentness[0].artifact_fingerprint_v16,
-            second.currentness[0].artifact_fingerprint_v16
+            first.currentness[0].artifact_fingerprint_v17,
+            second.currentness[0].artifact_fingerprint_v17
         );
         assert_ne!(
-            first.currentness[0].fingerprint_v16, second.currentness[0].fingerprint_v16,
+            first.currentness[0].fingerprint_v17, second.currentness[0].fingerprint_v17,
             "the edited definition must not claim the old exact evaluation receipt"
         );
         assert_eq!(
@@ -1347,7 +1914,7 @@ mod tests {
                 mode: FlowMode::Continuous,
                 ty: Type::Var(TypeVar(variable)),
             };
-            let expression = crate::KernelExpressionArtifact {
+            let expression = crate::RichKernelExpressionArtifact {
                 id: KernelExpressionId(0),
                 kind: KernelOwnerNodeKind::FormalRead {
                     formal: 0,
@@ -1361,15 +1928,9 @@ mod tests {
                 flush_type: None,
                 effect: crate::KernelEffectSummary::default(),
             };
-            let flow_terms = crate::materialize_checked_definition_flow_terms_for_test_v1(
-                &[],
-                &result,
-                std::slice::from_ref(&expression.flow_type),
-            );
-            DefinitionArtifact {
+            RichDefinitionArtifact {
                 result,
                 formals: Box::new([]),
-                flow_terms,
                 linkage: crate::KernelDefinitionLinkage::default(),
                 relocations: crate::KernelDefinitionRelocations::default(),
                 presentation: crate::KernelDefinitionPresentation::default(),
@@ -1420,79 +1981,55 @@ mod tests {
 
     #[test]
     fn diagnostic_facts_change_exact_artifact_currentness_but_not_public_interfaces() {
-        let callee = KernelOwnerProgramInput {
-            nodes: vec![
-                KernelOwnerNode {
-                    kind: KernelOwnerNodeKind::FormalRead {
-                        formal: 0,
-                        fields: Box::new([]),
-                    },
-                    inputs: Box::new([]),
-                    mode: FlowMode::Continuous,
-                },
-                KernelOwnerNode {
-                    kind: KernelOwnerNodeKind::PureBuiltin {
-                        kind: crate::KernelPureBuiltinKind::TextLength,
-                    },
-                    inputs: Box::new([KernelOwnerInputEdge {
-                        role: KernelOwnerEdgeRole::AbiArgument {
-                            name: "$pipe".into(),
-                        },
-                        expression: KernelExpressionId(0),
-                    }]),
-                    mode: FlowMode::Continuous,
-                },
-            ]
-            .into_boxed_slice(),
-            formal_count: 1,
-            external_expressions: Box::new([]),
-            result: KernelExpressionId(1),
+        let project = KernelProjectProgramInput {
+            owners: Box::new([value_owner(vec![KernelOwnerNode {
+                kind: KernelOwnerNodeKind::Number,
+                inputs: Box::new([]),
+                mode: FlowMode::Continuous,
+            }])]),
         };
-        let caller = KernelOwnerProgramInput {
-            nodes: vec![
-                KernelOwnerNode {
-                    kind: KernelOwnerNodeKind::Number,
-                    inputs: Box::new([]),
-                    mode: FlowMode::Continuous,
-                },
-                KernelOwnerNode {
-                    kind: KernelOwnerNodeKind::UserCall {
-                        target: KernelOwnerId(0),
-                        inherited_formal: None,
-                    },
-                    inputs: Box::new([KernelOwnerInputEdge {
-                        role: KernelOwnerEdgeRole::CallArgument { ordinal: 0 },
+        let clean = compile_project_program_with_definition_facts(
+            &project,
+            &[KernelDefinitionFactsInput::default()],
+        )
+        .unwrap()
+        .solve()
+        .unwrap();
+        let diagnosed = compile_project_program_with_definition_facts(
+            &project,
+            &[KernelDefinitionFactsInput {
+                diagnostics: Box::new([KernelDiagnosticInput {
+                    severity: KernelDiagnosticSeverity::Error,
+                    site: KernelDiagnosticSite::Expression {
                         expression: KernelExpressionId(0),
-                    }]),
-                    mode: FlowMode::Continuous,
-                },
-            ]
-            .into_boxed_slice(),
-            formal_count: 0,
-            external_expressions: Box::new([]),
-            result: KernelExpressionId(1),
-        };
-        let mut diagnosed = solve_project(vec![callee, caller]);
-        assert_eq!(diagnosed.definitions[1].diagnostics.len(), 1);
-        let mut clean = diagnosed.clone();
-        clean.definitions[1].diagnostics = Box::new([]);
-        let basis = [[9; 32]; 2];
-        let (_, clean_currentness) =
-            build_snapshot_receipts(&mut clean.definitions, &basis).unwrap();
-        let (_, diagnosed_currentness) =
-            build_snapshot_receipts(&mut diagnosed.definitions, &basis).unwrap();
+                    },
+                    kind: KernelDiagnosticKind::UnresolvedCallable {
+                        function: "missing".into(),
+                    },
+                }]),
+                ..KernelDefinitionFactsInput::default()
+            }],
+        )
+        .unwrap()
+        .solve()
+        .unwrap();
+        assert!(clean.diagnostics_for(KernelOwnerId(0)).unwrap().is_empty());
+        assert_eq!(
+            diagnosed.diagnostics_for(KernelOwnerId(0)).unwrap().len(),
+            1
+        );
 
         assert_eq!(
-            clean_currentness[1].public_result_fingerprint_v1,
-            diagnosed_currentness[1].public_result_fingerprint_v1
+            clean.currentness[0].public_result_fingerprint_v1,
+            diagnosed.currentness[0].public_result_fingerprint_v1
         );
         assert_ne!(
-            clean_currentness[1].artifact_fingerprint_v16,
-            diagnosed_currentness[1].artifact_fingerprint_v16
+            clean.currentness[0].artifact_fingerprint_v17,
+            diagnosed.currentness[0].artifact_fingerprint_v17
         );
         assert_ne!(
-            clean_currentness[1].fingerprint_v16,
-            diagnosed_currentness[1].fingerprint_v16
+            clean.currentness[0].fingerprint_v17,
+            diagnosed.currentness[0].fingerprint_v17
         );
     }
 

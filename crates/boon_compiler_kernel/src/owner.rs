@@ -1,15 +1,16 @@
 use crate::solver::ComponentSolveSession;
 use crate::{
     ComponentArtifact, ComponentOutputSnapshot, ComponentProgram, ComponentProgramBuilder,
-    DefinitionTermProofScratch, FrozenTypeStore, KernelCollectionOperationKind,
-    KernelDefinitionFlowTermsV1, KernelPattern, KernelRecordEntry, KernelSelectArm,
-    KernelSolveError, KernelSolveWork, KernelSummaryCallInput, KernelSummaryNode,
-    KernelSummaryProgram, KernelSummaryProjectionStep, KernelSummaryRecordEntry,
-    KernelSummarySelectArm, KernelSummaryValueId, OutputId, PublishMode, TypeTerm, TypeTermHead,
-    TypeTermId, TypeVariableId, VariantTerm, alpha_normalize_callable_interface_and_diagnostics,
-    alpha_normalize_definition, build_normalized_snapshot_receipts, build_snapshot_receipts,
-    definition_basis_fingerprint, definition_basis_fingerprint_with_buffer,
-    materialize_definition_flow_terms_v1, solve_component,
+    DefinitionAdditionalTypeRoots, DefinitionCodeBuilder, DefinitionCodeStore,
+    DefinitionTermProofScratch, FrozenTypeStore, KernelCollectionOperationKind, KernelPattern,
+    KernelRecordEntry, KernelSelectArm, KernelSolveError, KernelSolveWork, KernelSummaryCallInput,
+    KernelSummaryNode, KernelSummaryProgram, KernelSummaryProjectionStep, KernelSummaryRecordEntry,
+    KernelSummarySelectArm, KernelSummaryValueId, OutputId, PackedCallFactsInput,
+    PackedCallTypeSubstitution, PackedDiagnosticTypes, PackedFlow, PublishMode, TypeTerm,
+    TypeTermHead, TypeTermId, TypeVariableId, UnsealedComponentArtifact, VariantTerm,
+    alpha_normalize_callable_interface_and_diagnostics, build_packed_snapshot_receipts,
+    build_snapshot_receipts, definition_basis_fingerprint,
+    definition_basis_fingerprint_with_buffer, solve_component,
 };
 use boon_checked::{
     BytesType, CheckedListKeyPolicy, CheckedStateKind, FlowMode, FlowType, ObjectShape, Type,
@@ -26,6 +27,7 @@ use boon_syntax::{
 };
 use serde::Serialize;
 use serde::ser::SerializeStruct;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -961,7 +963,7 @@ pub struct KernelOwnerProgram {
     call_syntax: Box<[KernelCallSyntaxArtifact]>,
     execution_shapes: Box<[KernelExecutionShapeArtifact]>,
     statements: Box<[KernelStatementArtifact]>,
-    declarations: Box<[KernelDeclarationArtifact]>,
+    declarations: Box<[RichKernelDeclarationArtifact]>,
     lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
     resources: PendingKernelResources,
     calls: Box<[PendingKernelCallArtifact]>,
@@ -994,7 +996,14 @@ pub(crate) struct KernelProjectSolveSession {
 #[derive(Clone, Debug)]
 pub struct KernelSolvedProject {
     artifact: ComponentArtifact,
+    definition_code: Arc<DefinitionCodeStore>,
     owners: Box<[KernelProjectOwnerOutputs]>,
+    derived: Arc<KernelSolvedDerived>,
+}
+
+#[derive(Clone, Debug)]
+struct KernelSolvedDerived {
+    interface: Arc<KernelInterfaceSnapshot>,
 }
 
 pub const KERNEL_RESIDUAL_MODULE_RANKING_LEN: usize = 16;
@@ -1069,7 +1078,7 @@ struct KernelProjectOwnerOutputs {
     call_syntax: Box<[KernelCallSyntaxArtifact]>,
     execution_shapes: Box<[KernelExecutionShapeArtifact]>,
     statements: Box<[KernelStatementArtifact]>,
-    declarations: Box<[KernelDeclarationArtifact]>,
+    declarations: Box<[RichKernelDeclarationArtifact]>,
     lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
     resources: PendingKernelResources,
     calls: Box<[PendingKernelCallArtifact]>,
@@ -1081,15 +1090,6 @@ struct KernelProjectOwnerOutputs {
     /// sound direct assignability contract for call diagnostics.
     syntax_discriminated_formals: Box<[u32]>,
     basis_fingerprint_v14: [u8; 32],
-}
-
-struct ProjectDefinitionMaterialization {
-    owner_index: usize,
-    owner: KernelProjectOwnerOutputs,
-    synthetic_state_ordinals: Box<[Option<u32>]>,
-    expression_flush_types: Box<[Option<Type>]>,
-    call_facts: Box<[SolvedKernelCallFacts]>,
-    diagnostics: Box<[KernelDiagnosticArtifact]>,
 }
 
 #[derive(Clone, Debug)]
@@ -1292,7 +1292,7 @@ pub struct KernelExpressionInputArtifact {
 /// kind and typed input edges survive solving, so downstream stages consume
 /// immutable definition facts instead of reconstructing source graphs.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
-pub struct KernelExpressionArtifact {
+pub struct RichKernelExpressionArtifact {
     pub id: KernelExpressionId,
     pub kind: KernelOwnerNodeKind,
     pub inputs: Box<[KernelExpressionInputArtifact]>,
@@ -1319,7 +1319,7 @@ pub struct KernelStatementArtifact {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
-pub struct KernelDeclarationArtifact {
+pub struct RichKernelDeclarationArtifact {
     pub id: KernelDeclarationId,
     pub origin: KernelDeclarationOrigin,
     pub name: Box<str>,
@@ -1348,7 +1348,7 @@ pub struct KernelLexicalBindingArtifact {
 /// result. Downstream consumers no longer need to rediscover call structure by
 /// walking the owner expression graph.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
-pub struct KernelCallArtifact {
+pub struct RichKernelCallArtifact {
     pub expression: KernelExpressionId,
     pub target: KernelCallTarget,
     pub inputs: Box<[KernelCallInputArtifact]>,
@@ -2169,7 +2169,7 @@ impl Hash for KernelHostEffectArtifact {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
-pub struct KernelSourceArtifact {
+pub struct RichKernelSourceArtifact {
     pub id: KernelSourceId,
     pub declaration: KernelDeclarationReference,
     pub statement: KernelStatementReference,
@@ -2180,7 +2180,7 @@ pub struct KernelSourceArtifact {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
-pub struct KernelStateArtifact {
+pub struct RichKernelStateArtifact {
     pub id: KernelStateId,
     pub binding_declaration: KernelDeclarationReference,
     pub declaration: KernelDeclarationReference,
@@ -2193,7 +2193,7 @@ pub struct KernelStateArtifact {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
-pub struct KernelListArtifact {
+pub struct RichKernelListArtifact {
     pub id: KernelListId,
     pub declaration: KernelDeclarationReference,
     pub statement: KernelStatementReference,
@@ -2204,32 +2204,217 @@ pub struct KernelListArtifact {
     pub key_policy: CheckedListKeyPolicy,
 }
 
-/// Immutable checked result surface for one definition.
+/// Type-free opcode retained by the production checked snapshot.
 ///
-/// This is deliberately free of solver cells, operation IDs, and work
-/// counters. Later checked rows (calls, effects, state, lists, diagnostics)
-/// extend this single artifact instead of creating parallel owner products.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// Closed input/result types live in the store-qualified `DefinitionCodeStore`;
+/// keeping them out of this enum prevents the structural inventory from
+/// retaining a second recursive `Type` graph.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub enum KernelExpressionArtifactKind {
+    Known,
+    Source,
+    Absent,
+    Text,
+    TextTemplate,
+    Number,
+    Byte,
+    Bits(u32),
+    Tag(Box<str>),
+    Record {
+        tag: Option<Box<str>>,
+    },
+    Block,
+    Collection {
+        kind: KernelCollectionKind,
+        capacity: Option<usize>,
+    },
+    MapEntry,
+    FormalRead {
+        formal: u32,
+        fields: Box<[Box<str>]>,
+    },
+    ContextRead {
+        formal: u32,
+        fields: Box<[Box<str>]>,
+    },
+    LexicalRead {
+        fields: Box<[Box<str>]>,
+    },
+    ValueRead {
+        fields: Box<[Box<str>]>,
+        mode_narrowing: Option<KernelExpressionId>,
+    },
+    DerivedRead {
+        fields: Box<[Box<str>]>,
+    },
+    PatternRead {
+        pattern: KernelPattern,
+        fields: Box<[Box<str>]>,
+    },
+    CollectionItemRead,
+    FreshOut,
+    UserCall {
+        target: KernelOwnerId,
+        inherited_formal: Option<KernelInheritedFormal>,
+    },
+    RenderConstructor {
+        kind: KernelRenderConstructorKind,
+    },
+    PureBuiltin {
+        kind: KernelPureBuiltinKind,
+    },
+    FixedAbiCall,
+    HostEffect {
+        operation: Box<str>,
+    },
+    Latest,
+    When,
+    Then,
+    Infix {
+        operation: Box<str>,
+    },
+    Draining,
+    Hold,
+    MatchArm {
+        pattern: KernelPattern,
+    },
+    Arrow,
+    Delimiter,
+    Unknown,
+    Flush,
+    FieldProjection {
+        field: Box<str>,
+    },
+}
+
+impl From<KernelOwnerNodeKind> for KernelExpressionArtifactKind {
+    fn from(kind: KernelOwnerNodeKind) -> Self {
+        match kind {
+            KernelOwnerNodeKind::Known(_) => Self::Known,
+            KernelOwnerNodeKind::Source(_) => Self::Source,
+            KernelOwnerNodeKind::Absent => Self::Absent,
+            KernelOwnerNodeKind::Text => Self::Text,
+            KernelOwnerNodeKind::TextTemplate => Self::TextTemplate,
+            KernelOwnerNodeKind::Number => Self::Number,
+            KernelOwnerNodeKind::Byte => Self::Byte,
+            KernelOwnerNodeKind::Bits(width) => Self::Bits(width),
+            KernelOwnerNodeKind::Tag(tag) => Self::Tag(tag),
+            KernelOwnerNodeKind::Record { tag } => Self::Record { tag },
+            KernelOwnerNodeKind::Block => Self::Block,
+            KernelOwnerNodeKind::Collection { kind, capacity } => {
+                Self::Collection { kind, capacity }
+            }
+            KernelOwnerNodeKind::MapEntry => Self::MapEntry,
+            KernelOwnerNodeKind::FormalRead { formal, fields } => {
+                Self::FormalRead { formal, fields }
+            }
+            KernelOwnerNodeKind::ContextRead { formal, fields } => {
+                Self::ContextRead { formal, fields }
+            }
+            KernelOwnerNodeKind::LexicalRead { fields } => Self::LexicalRead { fields },
+            KernelOwnerNodeKind::ValueRead {
+                fields,
+                mode_narrowing,
+            } => Self::ValueRead {
+                fields,
+                mode_narrowing,
+            },
+            KernelOwnerNodeKind::DerivedRead { fields } => Self::DerivedRead { fields },
+            KernelOwnerNodeKind::PatternRead { pattern, fields } => {
+                Self::PatternRead { pattern, fields }
+            }
+            KernelOwnerNodeKind::CollectionItemRead => Self::CollectionItemRead,
+            KernelOwnerNodeKind::FreshOut => Self::FreshOut,
+            KernelOwnerNodeKind::UserCall {
+                target,
+                inherited_formal,
+            } => Self::UserCall {
+                target,
+                inherited_formal,
+            },
+            KernelOwnerNodeKind::RenderConstructor { kind } => Self::RenderConstructor { kind },
+            KernelOwnerNodeKind::PureBuiltin { kind } => Self::PureBuiltin { kind },
+            KernelOwnerNodeKind::FixedAbiCall { .. } => Self::FixedAbiCall,
+            KernelOwnerNodeKind::HostEffect { operation } => Self::HostEffect { operation },
+            KernelOwnerNodeKind::Latest => Self::Latest,
+            KernelOwnerNodeKind::When => Self::When,
+            KernelOwnerNodeKind::Then => Self::Then,
+            KernelOwnerNodeKind::Infix { operation } => Self::Infix { operation },
+            KernelOwnerNodeKind::Draining => Self::Draining,
+            KernelOwnerNodeKind::Hold => Self::Hold,
+            KernelOwnerNodeKind::MatchArm { pattern } => Self::MatchArm { pattern },
+            KernelOwnerNodeKind::Arrow => Self::Arrow,
+            KernelOwnerNodeKind::Delimiter => Self::Delimiter,
+            KernelOwnerNodeKind::Unknown => Self::Unknown,
+            KernelOwnerNodeKind::Flush => Self::Flush,
+            KernelOwnerNodeKind::FieldProjection { field } => Self::FieldProjection { field },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelExpressionArtifact {
+    pub id: KernelExpressionId,
+    pub kind: KernelExpressionArtifactKind,
+    pub inputs: Box<[KernelExpressionInputArtifact]>,
+    pub effect: KernelEffectSummary,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelDeclarationArtifact {
+    pub id: KernelDeclarationId,
+    pub origin: KernelDeclarationOrigin,
+    pub name: Box<str>,
+    pub kind: KernelDeclarationKind,
+    pub value: Option<KernelValueReference>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelCallArtifact {
+    pub expression: KernelExpressionId,
+    pub target: KernelCallTarget,
+    pub inputs: Box<[KernelCallInputArtifact]>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelSourceArtifact {
+    pub id: KernelSourceId,
+    pub declaration: KernelDeclarationReference,
+    pub statement: KernelStatementReference,
+    pub expression: KernelExpressionId,
+    pub path: KernelSemanticPath,
+    pub interval_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelStateArtifact {
+    pub id: KernelStateId,
+    pub binding_declaration: KernelDeclarationReference,
+    pub declaration: KernelDeclarationReference,
+    pub statement: KernelStatementReference,
+    pub expression: KernelExpressionId,
+    pub initial: KernelValueReference,
+    pub path: KernelSemanticPath,
+    pub kind: CheckedStateKind,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct KernelListArtifact {
+    pub id: KernelListId,
+    pub declaration: KernelDeclarationReference,
+    pub statement: KernelStatementReference,
+    pub producer: KernelExpressionId,
+    pub path: KernelSemanticPath,
+    pub capacity: Option<usize>,
+    pub key_policy: CheckedListKeyPolicy,
+}
+
+/// Type-free structural rows for one production definition. All type-bearing
+/// columns are addressed through the sibling `DefinitionCodeStore` entry.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct DefinitionArtifact {
-    pub result: FlowType,
-    /// Principal callable formal surfaces in dense declaration order. This is
-    /// empty for non-callable definitions.
-    pub formals: Box<[FlowType]>,
-    /// Internal solved-DAG proof sidecar for the result, formals, and
-    /// expression flows. Rich `FlowType` fields remain the production
-    /// compatibility authority until the store-qualified packed consumer
-    /// lands. This derived sidecar is deliberately absent
-    /// from the rich V16 artifact serialization/currentness contract while the
-    /// semantic V5 consumer is landing; its own structural digest is the only
-    /// stable identity.
-    #[serde(skip)]
-    pub(crate) flow_terms: KernelDefinitionFlowTermsV1,
     pub linkage: KernelDefinitionLinkage,
-    /// Exact stable source identities retained for direct checked/semantic
-    /// linking. Dense IDs remain definition-local and revision-local.
     pub relocations: KernelDefinitionRelocations,
-    /// Compact lexical scopes, source spans, and row ownership required by the
-    /// direct checked-image materializer.
     pub presentation: KernelDefinitionPresentation,
     pub expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     pub call_syntax: Box<[KernelCallSyntaxArtifact]>,
@@ -2243,16 +2428,42 @@ pub struct DefinitionArtifact {
     pub sources: Box<[KernelSourceArtifact]>,
     pub states: Box<[KernelStateArtifact]>,
     pub lists: Box<[KernelListArtifact]>,
+}
+
+/// Immutable checked result surface for one definition.
+///
+/// This is deliberately free of solver cells, operation IDs, and work
+/// counters. Later checked rows (calls, effects, state, lists, diagnostics)
+/// extend this single artifact instead of creating parallel owner products.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RichDefinitionArtifact {
+    pub result: FlowType,
+    /// Principal callable formal surfaces in dense declaration order. This is
+    /// empty for non-callable definitions.
+    pub formals: Box<[FlowType]>,
+    pub linkage: KernelDefinitionLinkage,
+    /// Exact stable source identities retained for direct checked/semantic
+    /// linking. Dense IDs remain definition-local and revision-local.
+    pub relocations: KernelDefinitionRelocations,
+    /// Compact lexical scopes, source spans, and row ownership required by the
+    /// direct checked-image materializer.
+    pub presentation: KernelDefinitionPresentation,
+    pub expression_payloads: Box<[KernelExpressionSemanticPayload]>,
+    pub call_syntax: Box<[KernelCallSyntaxArtifact]>,
+    pub execution_shapes: Box<[KernelExecutionShapeArtifact]>,
+    pub expressions: Box<[RichKernelExpressionArtifact]>,
+    pub statements: Box<[KernelStatementArtifact]>,
+    pub declarations: Box<[RichKernelDeclarationArtifact]>,
+    pub lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
+    pub calls: Box<[RichKernelCallArtifact]>,
+    pub effects: Box<[KernelHostEffectArtifact]>,
+    pub sources: Box<[RichKernelSourceArtifact]>,
+    pub states: Box<[RichKernelStateArtifact]>,
+    pub lists: Box<[RichKernelListArtifact]>,
     pub diagnostics: Box<[KernelDiagnosticArtifact]>,
 }
 
-impl DefinitionArtifact {
-    pub(crate) fn flow_terms(&self) -> &KernelDefinitionFlowTermsV1 {
-        &self.flow_terms
-    }
-}
-
-impl Hash for DefinitionArtifact {
+impl Hash for RichDefinitionArtifact {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Preserve the exact V16 rich-artifact byte contract while the solved
         // term DAG is a derived sidecar. The semantic V5 cut gives the term
@@ -2281,7 +2492,7 @@ impl Hash for DefinitionArtifact {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelDefinitionSnapshot {
-    pub definition: DefinitionArtifact,
+    pub definition: RichDefinitionArtifact,
     pub type_store: Arc<FrozenTypeStore>,
     pub dependencies: crate::KernelDefinitionDependencyGraph,
     pub currentness: crate::KernelDefinitionCurrentnessReceipt,
@@ -2292,11 +2503,71 @@ pub struct KernelDefinitionSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCheckedSnapshot {
     pub definitions: Box<[DefinitionArtifact]>,
+    /// One packed, store-qualified authority for all solver-owned definition
+    /// flow roots. The checked linker consumes this directly; rich artifacts
+    /// no longer retain one boxed flow sidecar per definition.
+    pub definition_code: Arc<DefinitionCodeStore>,
     pub type_store: Arc<FrozenTypeStore>,
-    pub diagnostic_values: Box<[KernelDiagnosticValueArtifact]>,
+    /// The only retained rich type surface: public callable interfaces and
+    /// user-facing diagnostics. Definition bodies remain packed.
+    pub interface: Arc<KernelInterfaceSnapshot>,
     pub dependencies: crate::KernelDefinitionDependencyGraph,
-    pub currentness: Box<[crate::KernelDefinitionCurrentnessReceipt]>,
+    pub currentness: Box<[crate::KernelPackedDefinitionCurrentnessReceipt]>,
     pub work: KernelSolveWork,
+}
+
+impl KernelCheckedSnapshot {
+    pub fn result_flow(&self, owner: KernelOwnerId) -> Option<&FlowType> {
+        self.interface.public_results.get(owner.0 as usize)
+    }
+
+    pub fn formal_flows(&self, owner: KernelOwnerId) -> Option<&[FlowType]> {
+        self.interface
+            .callable_formals
+            .get(owner.0 as usize)
+            .map(Box::as_ref)
+    }
+
+    pub fn expression_flow(
+        &self,
+        owner: KernelOwnerId,
+        expression: KernelExpressionId,
+    ) -> Option<FlowType> {
+        self.definition_code
+            .definition(owner)?
+            .materialize_expression(expression.0 as usize)
+    }
+
+    pub fn call_facts(
+        &self,
+        owner: KernelOwnerId,
+        ordinal: usize,
+    ) -> Option<crate::MaterializedCallFacts> {
+        self.definition_code
+            .definition(owner)?
+            .materialize_call_facts(ordinal)
+    }
+
+    pub fn diagnostics_for(&self, owner: KernelOwnerId) -> Option<&[KernelDiagnosticArtifact]> {
+        let owner = owner.0 as usize;
+        self.definitions.get(owner)?;
+        let start = (0..owner).try_fold(0usize, |start, index| {
+            Some(
+                start
+                    + self
+                        .definition_code
+                        .definition(KernelOwnerId(index as u32))?
+                        .diagnostic_count(),
+            )
+        })?;
+        let len = self
+            .definition_code
+            .definition(KernelOwnerId(owner as u32))?
+            .diagnostic_count();
+        self.interface
+            .diagnostics
+            .get(start..start.checked_add(len)?)
+    }
 }
 
 /// The complete public type surface needed by diagnostics and link planning.
@@ -2334,7 +2605,9 @@ pub struct KernelDemandedDefinitionArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelDemandedDefinitionSnapshot {
     pub definitions: Box<[KernelDemandedDefinitionArtifact]>,
+    pub definition_code: Arc<DefinitionCodeStore>,
     pub type_store: Arc<FrozenTypeStore>,
+    pub interface: Arc<KernelInterfaceSnapshot>,
     pub work: KernelSolveWork,
 }
 
@@ -2378,46 +2651,6 @@ impl KernelOwnerProgram {
             .position(|output| *output == self.result_output)
             .expect("owner result belongs to its expression outputs");
         result.mode = self.expression_modes[result_index];
-        let mut term_proof_scratch = DefinitionTermProofScratch::default();
-        let flow_terms = materialize_definition_flow_terms_v1(
-            artifact.terms(),
-            &self
-                .formal_outputs
-                .iter()
-                .zip(self.formal_modes.iter().copied())
-                .map(|(output, mode)| {
-                    (
-                        artifact
-                            .output(*output)
-                            .expect("owner formal output belongs to its component")
-                            .term(),
-                        mode,
-                    )
-                })
-                .collect::<Vec<_>>(),
-            (
-                artifact
-                    .output(self.result_output)
-                    .expect("owner result output belongs to its component")
-                    .term(),
-                self.expression_modes[result_index],
-            ),
-            &self
-                .expression_outputs
-                .iter()
-                .zip(self.expression_modes.iter().copied())
-                .map(|(output, mode)| {
-                    (
-                        artifact
-                            .output(*output)
-                            .expect("owner expression output belongs to its component")
-                            .term(),
-                        mode,
-                    )
-                })
-                .collect::<Vec<_>>(),
-            &mut term_proof_scratch,
-        )?;
         let formal_flows = self
             .formal_outputs
             .iter()
@@ -2456,10 +2689,9 @@ impl KernelOwnerProgram {
             expression_flows,
             &[],
         );
-        let mut definition = DefinitionArtifact {
+        let mut definition = RichDefinitionArtifact {
             result,
             formals: formal_flows,
-            flow_terms,
             linkage: self.linkage,
             relocations: self.relocations,
             presentation: self.presentation,
@@ -2521,12 +2753,7 @@ impl KernelProjectProgram {
         self,
         demanded: &[KernelOwnerId],
     ) -> Result<KernelDemandedDefinitionSnapshot, KernelSolveError> {
-        let artifact = solve_component(self.component)?;
-        KernelSolvedProject {
-            artifact,
-            owners: self.owners,
-        }
-        .into_demanded_definitions(demanded)
+        self.solve_graph()?.into_demanded_definitions(demanded)
     }
 
     /// Solve all type equations once without publishing any optional checked
@@ -2566,6 +2793,7 @@ impl KernelProjectSolveSession {
         let (_, diagnostics) = project_call_facts_and_diagnostics(
             &self.owners,
             &artifact,
+            None,
             &public_results,
             &public_formals,
             false,
@@ -2582,40 +2810,58 @@ impl KernelProjectSolveSession {
     pub(crate) fn finish_graph(self) -> Result<KernelSolvedProject, KernelSolveError> {
         let trace = std::env::var_os("BOON_KERNEL_TRACE").is_some();
         let solve_started = Instant::now();
-        let artifact = self.component.solve_all()?;
+        let mut artifact = self.component.solve_all_unsealed()?;
         let solve_us = solve_started.elapsed().as_micros();
+        let finalize_started = Instant::now();
+        let projected = ComponentOutputSnapshot::project_unsealed(
+            &artifact,
+            &interface_output_demand(&self.owners),
+        );
+        let public_results = project_public_results(&self.owners, &projected);
+        let public_formals = project_public_formals(&self.owners, &projected);
+        let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
+            &self.owners,
+            &projected,
+            Some(&artifact),
+            &public_results,
+            &public_formals,
+            true,
+        );
+        let interface = Arc::new(project_interface_snapshot(
+            &self.owners,
+            &projected,
+            &public_results,
+            &public_formals,
+            &diagnostics,
+        ));
+        let flush_terms = project_expression_flush_terms(&self.owners, &mut artifact)?;
+        let definition_code = build_definition_code_builder(
+            &self.owners,
+            &mut artifact,
+            &flush_terms,
+            &call_facts,
+            &diagnostics,
+        )?;
+        let artifact = artifact.seal();
+        let definition_code = Arc::new(definition_code.finish(artifact.type_store())?);
+        let finalize_us = finalize_started.elapsed().as_micros();
         if trace {
-            eprintln!("kernel-solve-detail component_us={solve_us}");
+            eprintln!(
+                "kernel-solve-detail component_us={solve_us} packed_finalize_us={finalize_us}"
+            );
         }
         Ok(KernelSolvedProject {
             artifact,
+            definition_code,
             owners: self.owners,
+            derived: Arc::new(KernelSolvedDerived { interface }),
         })
     }
 }
 
 impl KernelSolvedProject {
     pub fn interface_snapshot(&self) -> KernelInterfaceSnapshot {
-        let projected = ComponentOutputSnapshot::project(
-            &self.artifact,
-            &interface_output_demand(&self.owners),
-        );
-        let public_results = project_public_results(&self.owners, &projected);
-        let public_formals = project_public_formals(&self.owners, &projected);
-        let (_, diagnostics) = project_call_facts_and_diagnostics(
-            &self.owners,
-            &projected,
-            &public_results,
-            &public_formals,
-            false,
-        );
-        project_interface_snapshot(
-            &self.owners,
-            &projected,
-            &public_results,
-            &public_formals,
-            &diagnostics,
-        )
+        self.derived.interface.as_ref().clone()
     }
 
     pub fn checked_snapshot(&self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
@@ -2626,34 +2872,13 @@ impl KernelSolvedProject {
         let trace = std::env::var_os("BOON_KERNEL_TRACE").is_some();
         let total_started = Instant::now();
         let type_store = self.artifact.type_store();
+        let definition_code = Arc::clone(&self.definition_code);
         let interface_started = Instant::now();
-        let mut projected =
-            ComponentOutputSnapshot::project(&self.artifact, &checked_output_demand(&self.owners));
-        let public_results = project_public_results(&self.owners, &projected);
-        let public_formals = project_public_formals(&self.owners, &projected);
-        let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
-            &self.owners,
-            &projected,
-            &public_results,
-            &public_formals,
-            true,
-        );
-        let diagnostic_values = project_interface_snapshot(
-            &self.owners,
-            &projected,
-            &public_results,
-            &public_formals,
-            &diagnostics,
-        )
-        .diagnostic_values;
+        let interface = Arc::clone(&self.derived.interface);
         let interface_us = interface_started.elapsed().as_micros();
         let effects_started = Instant::now();
         let owner_effects = project_owner_effect_summaries(&self.owners);
         let effects_us = effects_started.elapsed().as_micros();
-        let flush_started = Instant::now();
-        let expression_flush_types =
-            project_expression_flush_types(&self.owners, &projected, &public_results);
-        let flush_us = flush_started.elapsed().as_micros();
         let preparation_started = Instant::now();
         let basis_fingerprints = self
             .owners
@@ -2661,60 +2886,36 @@ impl KernelSolvedProject {
             .map(|owner| owner.basis_fingerprint_v14)
             .collect::<Vec<_>>();
         let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(&self.owners);
-        let materializations = self
-            .owners
-            .into_vec()
-            .into_iter()
-            .enumerate()
-            .zip(synthetic_state_ordinals.into_vec())
-            .zip(expression_flush_types.into_vec())
-            .zip(call_facts.into_vec())
-            .zip(diagnostics.into_vec())
-            .map(
-                |(
-                    (
-                        (((owner_index, owner), synthetic_state_ordinals), expression_flush_types),
-                        call_facts,
-                    ),
-                    diagnostics,
-                )| ProjectDefinitionMaterialization {
-                    owner_index,
-                    owner,
-                    synthetic_state_ordinals,
-                    expression_flush_types,
-                    call_facts,
-                    diagnostics,
-                },
-            )
-            .collect::<Vec<_>>();
         let preparation_us = preparation_started.elapsed().as_micros();
         let definitions_started = Instant::now();
-        let definitions = materialize_project_definitions(
-            materializations,
-            &self.artifact,
-            &mut projected,
-            &public_results,
-            &public_formals,
+        let definitions = materialize_project_definition_structures(
+            self.owners,
+            synthetic_state_ordinals,
             &owner_effects,
         )?;
         let definitions_us = definitions_started.elapsed().as_micros();
         let receipts_started = Instant::now();
-        let (dependencies, currentness) =
-            build_normalized_snapshot_receipts(&definitions, &basis_fingerprints)?;
+        let (dependencies, currentness) = build_packed_snapshot_receipts(
+            &definitions,
+            &definition_code,
+            &interface,
+            &basis_fingerprints,
+        )?;
         let receipts_us = receipts_started.elapsed().as_micros();
         if trace {
             eprintln!(
-                "kernel-checked-detail interface_us={interface_us} effects_us={effects_us} flush_us={flush_us} preparation_us={preparation_us} definitions_us={definitions_us} receipts_us={receipts_us} total_us={}",
+                "kernel-checked-detail interface_us={interface_us} effects_us={effects_us} preparation_us={preparation_us} definitions_us={definitions_us} receipts_us={receipts_us} total_us={}",
                 total_started.elapsed().as_micros(),
             );
         }
         Ok(KernelCheckedSnapshot {
             definitions,
+            definition_code,
             type_store,
-            diagnostic_values,
+            interface,
             dependencies,
             currentness,
-            work: projected.work,
+            work: self.artifact.work,
         })
     }
 
@@ -2730,17 +2931,8 @@ impl KernelSolvedProject {
         demanded: &[KernelOwnerId],
     ) -> Result<KernelDemandedDefinitionSnapshot, KernelSolveError> {
         let type_store = self.artifact.type_store();
-        let mut projected =
-            ComponentOutputSnapshot::project(&self.artifact, &checked_output_demand(&self.owners));
-        let public_results = project_public_results(&self.owners, &projected);
-        let public_formals = project_public_formals(&self.owners, &projected);
-        let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
-            &self.owners,
-            &projected,
-            &public_results,
-            &public_formals,
-            true,
-        );
+        let interface = Arc::clone(&self.derived.interface);
+        let definition_code = Arc::clone(&self.definition_code);
         let mut demanded = demanded.to_vec();
         demanded.sort_unstable();
         demanded.dedup();
@@ -2755,40 +2947,14 @@ impl KernelSolvedProject {
         }
         let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(&self.owners);
         let owner_effects = project_owner_effect_summaries(&self.owners);
-        let expression_flush_types =
-            project_expression_flush_types(&self.owners, &projected, &public_results);
-        let projected_work = projected.work;
-        let mut remaining = vec![0u32; projected.slot_count()];
-        for owner in demanded.iter().copied() {
-            for output in self.owners[owner.0 as usize].expressions.iter().copied() {
-                remaining[output.0 as usize] = remaining[output.0 as usize]
-                    .checked_add(1)
-                    .expect("demanded expression flow occurrence count exceeds u32");
-            }
-        }
-        let mut flow_projection = RichFlowProjection::Consuming {
-            outputs: &mut projected,
-            remaining: &mut remaining,
-        };
+        let all_definitions = materialize_project_definition_structures(
+            self.owners,
+            synthetic_state_ordinals,
+            &owner_effects,
+        )?;
+        let mut definitions = Vec::with_capacity(demanded.len());
         let mut demanded_iter = demanded.into_iter().peekable();
-        let mut definitions = Vec::with_capacity(demanded_iter.len());
-        let mut term_proof_scratch = DefinitionTermProofScratch::default();
-        for (
-            (
-                (((owner_index, owner), synthetic_state_ordinals), expression_flush_types),
-                call_facts,
-            ),
-            diagnostics,
-        ) in self
-            .owners
-            .into_vec()
-            .into_iter()
-            .enumerate()
-            .zip(synthetic_state_ordinals.into_vec())
-            .zip(expression_flush_types.into_vec())
-            .zip(call_facts.into_vec())
-            .zip(diagnostics.into_vec())
-        {
+        for (owner_index, definition) in all_definitions.into_vec().into_iter().enumerate() {
             let dense_owner = KernelOwnerId(
                 u32::try_from(owner_index)
                     .expect("kernel definition count exceeds the dense u32 namespace"),
@@ -2797,21 +2963,6 @@ impl KernelSolvedProject {
                 continue;
             }
             demanded_iter.next();
-            let mut definition = materialize_project_definition(
-                owner_index,
-                owner,
-                &self.artifact,
-                &mut flow_projection,
-                &public_results,
-                &public_formals,
-                call_facts,
-                diagnostics,
-                &synthetic_state_ordinals,
-                expression_flush_types,
-                &owner_effects,
-                &mut term_proof_scratch,
-            )?;
-            alpha_normalize_definition(&mut definition);
             definitions.push(KernelDemandedDefinitionArtifact {
                 owner: dense_owner,
                 definition,
@@ -2820,162 +2971,595 @@ impl KernelSolvedProject {
         debug_assert!(demanded_iter.next().is_none());
         Ok(KernelDemandedDefinitionSnapshot {
             definitions: definitions.into_boxed_slice(),
+            definition_code,
             type_store,
-            work: projected_work,
+            interface,
+            work: self.artifact.work,
         })
     }
 }
 
-enum RichFlowProjection<'a> {
-    Borrowed(&'a ComponentOutputSnapshot),
-    Consuming {
-        outputs: &'a mut ComponentOutputSnapshot,
-        remaining: &'a mut [u32],
-    },
-}
-
-impl RichFlowProjection<'_> {
-    fn materialize(&mut self, output: OutputId) -> FlowType {
-        match self {
-            Self::Borrowed(outputs) => outputs
-                .flow_type(output)
-                .expect("project owner expression belongs to its rich projection")
-                .clone(),
-            Self::Consuming { outputs, remaining } => {
-                let uses = remaining
-                    .get_mut(output.0 as usize)
-                    .expect("project expression output belongs to its rich projection");
-                *uses = uses
-                    .checked_sub(1)
-                    .expect("project expression flow use count underflowed");
-                if *uses == 0 {
-                    outputs
-                        .take_flow_type(output)
-                        .expect("last project expression use owns its rich flow")
-                } else {
-                    outputs
-                        .flow_type(output)
-                        .expect("shared project expression owns its rich flow")
-                        .clone()
+fn build_definition_code_builder(
+    owners: &[KernelProjectOwnerOutputs],
+    artifact: &mut UnsealedComponentArtifact,
+    flush_terms: &ProjectExpressionFlushTerms,
+    call_facts: &[Box<[SolvedKernelCallFacts]>],
+    diagnostics: &[Box<[KernelDiagnosticArtifact]>],
+) -> Result<DefinitionCodeBuilder, KernelSolveError> {
+    if call_facts.len() != owners.len() || diagnostics.len() != owners.len() {
+        return Err(KernelSolveError::new(
+            "kernel definition-code finalization received incomplete derived owner rows",
+        ));
+    }
+    let flow_capacity = owners
+        .iter()
+        .map(|owner| owner.formals.len().saturating_add(owner.expressions.len()))
+        .sum();
+    let mut builder =
+        DefinitionCodeBuilder::with_capacity(owners.len(), flow_capacity, flow_capacity);
+    let mut formal_roots = Vec::new();
+    let mut expression_roots = Vec::new();
+    let mut packed_formal_flows = Vec::new();
+    let mut packed_expression_flows = Vec::new();
+    let mut expression_kind_types = Vec::new();
+    let mut declaration_flows = Vec::new();
+    let mut packed_calls = Vec::new();
+    let mut packed_call_substitutions = Vec::new();
+    let mut packed_diagnostic_types = Vec::new();
+    let mut source_payload_types = Vec::new();
+    let mut state_flows = Vec::new();
+    let mut list_item_types = Vec::new();
+    let mut proof_scratch = DefinitionTermProofScratch::default();
+    for (owner_index, owner) in owners.iter().enumerate() {
+        formal_roots.clear();
+        formal_roots.extend(
+            owner
+                .formals
+                .iter()
+                .zip(owner.formal_modes.iter().copied())
+                .map(|(output, mode)| {
+                    (
+                        artifact
+                            .output(*output)
+                            .expect("project owner formal belongs to its component")
+                            .term(),
+                        mode,
+                    )
+                }),
+        );
+        expression_roots.clear();
+        expression_roots.extend(
+            owner
+                .expressions
+                .iter()
+                .zip(owner.expression_modes.iter().copied())
+                .map(|(output, mode)| {
+                    (
+                        artifact
+                            .output(*output)
+                            .expect("project owner expression belongs to its component")
+                            .term(),
+                        mode,
+                    )
+                }),
+        );
+        expression_kind_types.clear();
+        for expression in &owner.expression_artifacts {
+            let ty = match &expression.kind {
+                KernelOwnerNodeKind::Known(ty)
+                | KernelOwnerNodeKind::Source(ty)
+                | KernelOwnerNodeKind::FixedAbiCall { result: ty } => Some(ty),
+                _ => None,
+            };
+            expression_kind_types
+                .push(ty.map(|ty| import_post_solve_type(artifact.terms_mut(), ty)));
+        }
+        declaration_flows.clear();
+        for declaration in &owner.declarations {
+            declaration_flows.push(declaration.declared_flow_type.as_ref().map(|flow| {
+                PackedFlow {
+                    mode: flow.mode,
+                    term: import_post_solve_type(artifact.terms_mut(), &flow.ty),
                 }
+            }));
+        }
+        let owner_call_facts = &call_facts[owner_index];
+        if owner_call_facts.len() != owner.calls.len() {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition-code owner {owner_index} has {} calls and {} solved call rows",
+                owner.calls.len(),
+                owner_call_facts.len()
+            )));
+        }
+        packed_calls.clear();
+        packed_call_substitutions.clear();
+        for call in owner_call_facts {
+            let substitution_start =
+                u32::try_from(packed_call_substitutions.len()).map_err(|_| {
+                    KernelSolveError::new(
+                        "kernel definition-code local call-substitution start exceeds u32",
+                    )
+                })?;
+            for substitution in &call.type_substitutions {
+                packed_call_substitutions.push(PackedCallTypeSubstitution {
+                    variable: substitution.variable,
+                    term: import_post_solve_type(artifact.terms_mut(), &substitution.value),
+                });
+            }
+            let substitution_end =
+                u32::try_from(packed_call_substitutions.len()).map_err(|_| {
+                    KernelSolveError::new(
+                        "kernel definition-code local call-substitution end exceeds u32",
+                    )
+                })?;
+            packed_calls.push(PackedCallFactsInput {
+                substitution_start,
+                substitution_len: substitution_end - substitution_start,
+                syntax_discriminated_result: call.syntax_discriminated_result,
+            });
+        }
+        packed_diagnostic_types.clear();
+        for diagnostic in &diagnostics[owner_index] {
+            packed_diagnostic_types.push(match &diagnostic.kind {
+                KernelDiagnosticKind::CallInputType {
+                    actual, expected, ..
+                } => Some(PackedDiagnosticTypes {
+                    actual: import_post_solve_type(artifact.terms_mut(), actual),
+                    expected: import_post_solve_type(artifact.terms_mut(), expected),
+                }),
+                _ => None,
+            });
+        }
+        source_payload_types.clear();
+        for source in &owner.resources.sources {
+            let output = owner.expressions[source.expression.0 as usize];
+            source_payload_types.push(
+                artifact
+                    .output(output)
+                    .expect("kernel SOURCE expression belongs to its solved component")
+                    .term(),
+            );
+        }
+        state_flows.clear();
+        for state in owner
+            .resources
+            .states
+            .iter()
+            .filter(|state| state_candidate_survives(state, &owner.expression_modes))
+        {
+            let expression = state.expression.0 as usize;
+            let output = owner.expressions[expression];
+            state_flows.push(PackedFlow {
+                mode: owner.expression_modes[expression],
+                term: artifact
+                    .output(output)
+                    .expect("kernel state expression belongs to its solved component")
+                    .term(),
+            });
+        }
+        list_item_types.clear();
+        for list in &owner.resources.lists {
+            let producer = owner.expressions[list.producer.0 as usize];
+            let producer = artifact
+                .output(producer)
+                .expect("kernel LIST producer belongs to its solved component")
+                .term();
+            let authority = match list.declaration {
+                KernelDeclarationReference::OwnerPublic(target) => {
+                    let target = owners
+                        .get(target.0 as usize)
+                        .and_then(|target| artifact.output(target.result))
+                        .map(|output| output.term());
+                    target
+                        .filter(|term| {
+                            matches!(artifact.terms().term_head(*term), TypeTermHead::List(_))
+                        })
+                        .unwrap_or(producer)
+                }
+                KernelDeclarationReference::Local(_)
+                | KernelDeclarationReference::OwnerDeclaration { .. } => producer,
+            };
+            let TypeTermHead::List(item) = artifact.terms().term_head(authority) else {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition {owner_index} LIST {} has non-list type authority",
+                    list.id.0
+                )));
+            };
+            list_item_types.push(item);
+        }
+        let result_mode = owner
+            .expressions
+            .iter()
+            .position(|output| *output == owner.result)
+            .map(|index| owner.expression_modes[index])
+            .expect("project owner result belongs to its expression outputs");
+        let expression_flush_types = flush_terms.definition(owner_index).ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel definition-code owner {owner_index} has no packed FLUSH rows"
+            ))
+        })?;
+        proof_scratch.begin_alpha_variables(artifact.terms());
+        for (term, _) in &formal_roots {
+            proof_scratch.visit_alpha_root(artifact.terms(), *term)?;
+        }
+        let result_term = artifact
+            .output(owner.result)
+            .expect("project owner result belongs to its component")
+            .term();
+        proof_scratch.visit_alpha_root(artifact.terms(), result_term)?;
+        for (ordinal, (term, _)) in expression_roots.iter().enumerate() {
+            proof_scratch.visit_alpha_root(artifact.terms(), *term)?;
+            if let Some(term) = expression_flush_types[ordinal] {
+                proof_scratch.visit_alpha_root(artifact.terms(), term)?;
+            }
+            if let Some(term) = expression_kind_types[ordinal] {
+                proof_scratch.visit_alpha_root(artifact.terms(), term)?;
             }
         }
+        for flow in declaration_flows.iter().flatten() {
+            proof_scratch.visit_alpha_root(artifact.terms(), flow.term)?;
+        }
+        for facts in &packed_calls {
+            let start = facts.substitution_start as usize;
+            let end = start + facts.substitution_len as usize;
+            for substitution in &packed_call_substitutions[start..end] {
+                proof_scratch.visit_alpha_root(artifact.terms(), substitution.term)?;
+            }
+        }
+        for term in source_payload_types.iter().copied() {
+            proof_scratch.visit_alpha_root(artifact.terms(), term)?;
+        }
+        for flow in &state_flows {
+            proof_scratch.visit_alpha_root(artifact.terms(), flow.term)?;
+        }
+        for term in list_item_types.iter().copied() {
+            proof_scratch.visit_alpha_root(artifact.terms(), term)?;
+        }
+        for diagnostic in packed_diagnostic_types.iter().flatten() {
+            proof_scratch.visit_alpha_root(artifact.terms(), diagnostic.actual)?;
+            proof_scratch.visit_alpha_root(artifact.terms(), diagnostic.expected)?;
+        }
+        let stable_digest = definition_code_types_stable_digest(
+            artifact.terms(),
+            &mut proof_scratch,
+            (result_term, result_mode),
+            &formal_roots,
+            &expression_roots,
+            expression_flush_types,
+            &expression_kind_types,
+            &declaration_flows,
+            &packed_calls,
+            &packed_call_substitutions,
+            &packed_diagnostic_types,
+            &source_payload_types,
+            &state_flows,
+            &list_item_types,
+        )?;
+        packed_formal_flows.clear();
+        for (term, mode) in &formal_roots {
+            packed_formal_flows.push(proof_scratch.materialize_alpha_flow_root(
+                artifact.terms(),
+                *term,
+                *mode,
+            )?);
+        }
+        let result_flow = proof_scratch.materialize_alpha_flow_root(
+            artifact.terms(),
+            result_term,
+            result_mode,
+        )?;
+        packed_expression_flows.clear();
+        for (term, mode) in &expression_roots {
+            packed_expression_flows.push(proof_scratch.materialize_alpha_flow_root(
+                artifact.terms(),
+                *term,
+                *mode,
+            )?);
+        }
+        builder.push(
+            KernelOwnerId(
+                u32::try_from(owner_index)
+                    .expect("kernel definition count exceeds the dense u32 namespace"),
+            ),
+            result_flow,
+            &packed_formal_flows,
+            &packed_expression_flows,
+            DefinitionAdditionalTypeRoots {
+                expression_flush_types,
+                expression_kind_types: &expression_kind_types,
+                declaration_flows: &declaration_flows,
+                calls: &packed_calls,
+                call_substitutions: &packed_call_substitutions,
+                diagnostic_types: &packed_diagnostic_types,
+                source_payload_types: &source_payload_types,
+                state_flows: &state_flows,
+                list_item_types: &list_item_types,
+                alpha_variables: proof_scratch.alpha_variable_sources(),
+                stable_digest,
+            },
+        )?;
     }
+    Ok(builder)
 }
 
-fn expression_flow_use_counts(
-    materializations: &[ProjectDefinitionMaterialization],
-    output_count: usize,
-) -> Vec<u32> {
-    let mut remaining = vec![0u32; output_count];
-    for output in materializations
-        .iter()
-        .flat_map(|materialization| materialization.owner.expressions.iter().copied())
-    {
-        remaining[output.0 as usize] = remaining[output.0 as usize]
-            .checked_add(1)
-            .expect("project expression flow occurrence count exceeds u32");
-    }
-    remaining
+fn import_post_solve_type(terms: &mut crate::TypeTermArena, ty: &Type) -> TypeTermId {
+    terms.import_checked_type(ty, &mut |variable| TypeVariableId(variable.0))
 }
 
-fn materialize_project_definitions(
-    mut materializations: Vec<ProjectDefinitionMaterialization>,
-    artifact: &ComponentArtifact,
-    rich_outputs: &mut ComponentOutputSnapshot,
-    public_results: &[FlowType],
-    public_formals: &[Box<[FlowType]>],
+const DEFINITION_CODE_TYPES_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.definition-code-types.v1\0";
+
+fn update_definition_code_len(digest: &mut Sha256, len: usize) {
+    digest.update(u64::try_from(len).unwrap_or(u64::MAX).to_be_bytes());
+}
+
+fn update_definition_code_type(
+    digest: &mut Sha256,
+    source: &crate::TypeTermArena,
+    scratch: &mut DefinitionTermProofScratch,
+    term: TypeTermId,
+) -> Result<(), KernelSolveError> {
+    digest.update(scratch.visit_alpha_root(source, term)?);
+    Ok(())
+}
+
+fn update_definition_code_flow(
+    digest: &mut Sha256,
+    source: &crate::TypeTermArena,
+    scratch: &mut DefinitionTermProofScratch,
+    term: TypeTermId,
+    mode: FlowMode,
+) -> Result<(), KernelSolveError> {
+    digest.update(scratch.visit_alpha_flow_root(source, term, mode)?);
+    Ok(())
+}
+
+fn update_definition_code_optional_type(
+    digest: &mut Sha256,
+    source: &crate::TypeTermArena,
+    scratch: &mut DefinitionTermProofScratch,
+    term: Option<TypeTermId>,
+) -> Result<(), KernelSolveError> {
+    if let Some(term) = term {
+        digest.update([1]);
+        update_definition_code_type(digest, source, scratch, term)?;
+    } else {
+        digest.update([0]);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn definition_code_types_stable_digest(
+    source: &crate::TypeTermArena,
+    scratch: &mut DefinitionTermProofScratch,
+    result: (TypeTermId, FlowMode),
+    formals: &[(TypeTermId, FlowMode)],
+    expressions: &[(TypeTermId, FlowMode)],
+    flushes: &[Option<TypeTermId>],
+    kinds: &[Option<TypeTermId>],
+    declarations: &[Option<PackedFlow>],
+    calls: &[PackedCallFactsInput],
+    substitutions: &[PackedCallTypeSubstitution],
+    diagnostics: &[Option<PackedDiagnosticTypes>],
+    sources: &[TypeTermId],
+    states: &[PackedFlow],
+    lists: &[TypeTermId],
+) -> Result<[u8; 32], KernelSolveError> {
+    let mut digest = Sha256::new();
+    digest.update(DEFINITION_CODE_TYPES_DOMAIN_V1);
+    update_definition_code_flow(&mut digest, source, scratch, result.0, result.1)?;
+    update_definition_code_len(&mut digest, formals.len());
+    for (term, mode) in formals.iter().copied() {
+        update_definition_code_flow(&mut digest, source, scratch, term, mode)?;
+    }
+    update_definition_code_len(&mut digest, expressions.len());
+    for (term, mode) in expressions.iter().copied() {
+        update_definition_code_flow(&mut digest, source, scratch, term, mode)?;
+    }
+    update_definition_code_len(&mut digest, flushes.len());
+    for term in flushes.iter().copied() {
+        update_definition_code_optional_type(&mut digest, source, scratch, term)?;
+    }
+    update_definition_code_len(&mut digest, kinds.len());
+    for term in kinds.iter().copied() {
+        update_definition_code_optional_type(&mut digest, source, scratch, term)?;
+    }
+    update_definition_code_len(&mut digest, declarations.len());
+    for flow in declarations.iter().copied() {
+        if let Some(flow) = flow {
+            digest.update([1]);
+            update_definition_code_flow(&mut digest, source, scratch, flow.term, flow.mode)?;
+        } else {
+            digest.update([0]);
+        }
+    }
+    update_definition_code_len(&mut digest, calls.len());
+    for call in calls {
+        digest.update([u8::from(call.syntax_discriminated_result)]);
+        let start = call.substitution_start as usize;
+        let end = start
+            .checked_add(call.substitution_len as usize)
+            .ok_or_else(|| KernelSolveError::new("kernel call proof span overflows usize"))?;
+        let substitutions = substitutions.get(start..end).ok_or_else(|| {
+            KernelSolveError::new("kernel call proof span is outside its definition")
+        })?;
+        update_definition_code_len(&mut digest, substitutions.len());
+        for substitution in substitutions {
+            digest.update(substitution.variable.0.to_be_bytes());
+            update_definition_code_type(&mut digest, source, scratch, substitution.term)?;
+        }
+    }
+    update_definition_code_len(&mut digest, diagnostics.len());
+    for diagnostic in diagnostics.iter().copied() {
+        if let Some(diagnostic) = diagnostic {
+            digest.update([1]);
+            update_definition_code_type(&mut digest, source, scratch, diagnostic.actual)?;
+            update_definition_code_type(&mut digest, source, scratch, diagnostic.expected)?;
+        } else {
+            digest.update([0]);
+        }
+    }
+    update_definition_code_len(&mut digest, sources.len());
+    for term in sources.iter().copied() {
+        update_definition_code_type(&mut digest, source, scratch, term)?;
+    }
+    update_definition_code_len(&mut digest, states.len());
+    for flow in states.iter().copied() {
+        update_definition_code_flow(&mut digest, source, scratch, flow.term, flow.mode)?;
+    }
+    update_definition_code_len(&mut digest, lists.len());
+    for term in lists.iter().copied() {
+        update_definition_code_type(&mut digest, source, scratch, term)?;
+    }
+    Ok(digest.finalize().into())
+}
+
+fn materialize_project_definition_structures(
+    owners: Box<[KernelProjectOwnerOutputs]>,
+    synthetic_state_ordinals: Box<[Box<[Option<u32>]>]>,
     owner_effects: &[KernelEffectSummary],
 ) -> Result<Box<[DefinitionArtifact]>, KernelSolveError> {
-    // A complete checked image contains independent, definition-owned rows
-    // after the project graph has converged. Use exactly two contiguous
-    // workers for a large image, then restore the original dense owner order
-    // before dependency/currentness sealing. Small projects stay serial so a
-    // thread launch cannot dominate interactive checks.
-    #[cfg(not(target_family = "wasm"))]
-    if crate::experimental_parallel_projection_enabled()
-        && materializations.len() >= 64
-        && std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() >= 2)
-    {
-        let right = materializations.split_off(materializations.len() / 2);
-        let shared_outputs: &ComponentOutputSnapshot = rich_outputs;
-        return std::thread::scope(|scope| {
-            let right_outputs = shared_outputs;
-            let right_worker = scope.spawn(move || {
-                let mut projection = RichFlowProjection::Borrowed(right_outputs);
-                materialize_project_definition_batch(
-                    right,
-                    artifact,
-                    &mut projection,
-                    public_results,
-                    public_formals,
-                    owner_effects,
-                )
-            });
-            let mut projection = RichFlowProjection::Borrowed(shared_outputs);
-            let left = materialize_project_definition_batch(
-                materializations,
-                artifact,
-                &mut projection,
-                public_results,
-                public_formals,
-                owner_effects,
-            );
-            let right = right_worker.join();
-            let mut definitions = left?;
-            definitions.extend(right.map_err(|_| {
-                KernelSolveError::new("kernel definition materialization worker panicked")
-            })??);
-            Ok(definitions.into_boxed_slice())
-        });
+    if owners.len() != synthetic_state_ordinals.len() {
+        return Err(KernelSolveError::new(
+            "kernel structural definition rows and synthetic state paths differ in length",
+        ));
     }
-
-    let mut remaining = expression_flow_use_counts(&materializations, rich_outputs.slot_count());
-    let mut projection = RichFlowProjection::Consuming {
-        outputs: rich_outputs,
-        remaining: &mut remaining,
-    };
-    materialize_project_definition_batch(
-        materializations,
-        artifact,
-        &mut projection,
-        public_results,
-        public_formals,
-        owner_effects,
-    )
-    .map(Vec::into_boxed_slice)
-}
-
-fn materialize_project_definition_batch(
-    materializations: Vec<ProjectDefinitionMaterialization>,
-    artifact: &ComponentArtifact,
-    flow_projection: &mut RichFlowProjection<'_>,
-    public_results: &[FlowType],
-    public_formals: &[Box<[FlowType]>],
-    owner_effects: &[KernelEffectSummary],
-) -> Result<Vec<DefinitionArtifact>, KernelSolveError> {
-    let mut term_proof_scratch = DefinitionTermProofScratch::default();
-    materializations
+    owners
+        .into_vec()
         .into_iter()
-        .map(|materialization| {
-            let mut definition = materialize_project_definition(
-                materialization.owner_index,
-                materialization.owner,
-                artifact,
-                flow_projection,
-                public_results,
-                public_formals,
-                materialization.call_facts,
-                materialization.diagnostics,
-                &materialization.synthetic_state_ordinals,
-                materialization.expression_flush_types,
-                owner_effects,
-                &mut term_proof_scratch,
-            )?;
-            alpha_normalize_definition(&mut definition);
-            Ok(definition)
+        .zip(synthetic_state_ordinals.into_vec())
+        .map(|(owner, synthetic_state_ordinals)| {
+            if owner.resources.states.len() != synthetic_state_ordinals.len() {
+                return Err(KernelSolveError::new(
+                    "kernel structural state rows and synthetic paths differ in length",
+                ));
+            }
+            let expressions = owner
+                .expression_artifacts
+                .into_vec()
+                .into_iter()
+                .map(|expression| {
+                    let effect = direct_expression_effect(&expression.kind, owner_effects);
+                    KernelExpressionArtifact {
+                        id: expression.id,
+                        kind: expression.kind.into(),
+                        inputs: expression.inputs,
+                        effect,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let declarations = owner
+                .declarations
+                .into_vec()
+                .into_iter()
+                .map(|declaration| KernelDeclarationArtifact {
+                    id: declaration.id,
+                    origin: declaration.origin,
+                    name: declaration.name,
+                    kind: declaration.kind,
+                    value: declaration.value,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let calls = owner
+                .calls
+                .into_vec()
+                .into_iter()
+                .map(|call| KernelCallArtifact {
+                    expression: call.expression,
+                    target: call.target,
+                    inputs: call.inputs,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let sources = owner
+                .resources
+                .sources
+                .into_vec()
+                .into_iter()
+                .map(|source| KernelSourceArtifact {
+                    id: source.id,
+                    declaration: source.declaration,
+                    statement: source.statement,
+                    expression: source.expression,
+                    path: source.path,
+                    interval_ms: source.interval_ms,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let states = owner
+                .resources
+                .states
+                .into_vec()
+                .into_iter()
+                .zip(synthetic_state_ordinals)
+                .filter(|(state, _)| state_candidate_survives(state, &owner.expression_modes))
+                .enumerate()
+                .map(|(index, (state, synthetic_ordinal))| {
+                    let mut path = state.path;
+                    if state.synthetic_path {
+                        let ordinal = synthetic_ordinal.expect(
+                            "surviving synthetic state candidate has no allocated path ordinal",
+                        );
+                        debug_assert!(path.projection.is_empty());
+                        path.projection =
+                            vec![format!("state_{ordinal}").into_boxed_str()].into_boxed_slice();
+                    } else {
+                        debug_assert!(synthetic_ordinal.is_none());
+                    }
+                    KernelStateArtifact {
+                        id: KernelStateId(
+                            u32::try_from(index)
+                                .expect("kernel materialized state count exceeds u32"),
+                        ),
+                        binding_declaration: state.binding_declaration,
+                        declaration: state.declaration,
+                        statement: state.statement,
+                        expression: state.expression,
+                        initial: state.initial,
+                        path,
+                        kind: state.kind,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let lists = owner
+                .resources
+                .lists
+                .into_vec()
+                .into_iter()
+                .map(|list| KernelListArtifact {
+                    id: list.id,
+                    declaration: list.declaration,
+                    statement: list.statement,
+                    producer: list.producer,
+                    path: list.path,
+                    capacity: list.capacity,
+                    key_policy: list.key_policy,
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            Ok(DefinitionArtifact {
+                linkage: owner.linkage,
+                relocations: owner.relocations,
+                presentation: owner.presentation,
+                expression_payloads: owner.expression_payloads,
+                call_syntax: owner.call_syntax,
+                execution_shapes: owner.execution_shapes,
+                expressions,
+                statements: owner.statements,
+                declarations,
+                lexical_bindings: owner.lexical_bindings,
+                calls,
+                effects: owner.effects,
+                sources,
+                states,
+                lists,
+            })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
 }
 
 fn project_public_results(
@@ -3005,16 +3589,38 @@ fn project_public_results(
 /// graph. This is deliberately a separate dense work queue: FLUSH is control
 /// flow, so forcing its payload into ordinary value unification would pollute
 /// both public interfaces and runtime value types.
-fn project_expression_flush_types(
-    owners: &[KernelProjectOwnerOutputs],
-    artifact: &ComponentOutputSnapshot,
-    public_results: &[FlowType],
-) -> Box<[Box<[Option<Type>]>]> {
-    let mut offsets = Vec::with_capacity(owners.len() + 1);
-    offsets.push(0usize);
-    for owner in owners {
-        offsets.push(offsets.last().copied().unwrap_or_default() + owner.expressions.len());
+#[derive(Clone, Debug)]
+struct ProjectExpressionFlushTerms {
+    definition_offsets: Box<[u32]>,
+    terms: Box<[Option<TypeTermId>]>,
+}
+
+impl ProjectExpressionFlushTerms {
+    fn definition(&self, owner: usize) -> Option<&[Option<TypeTermId>]> {
+        let start = *self.definition_offsets.get(owner)? as usize;
+        let end = *self.definition_offsets.get(owner + 1)? as usize;
+        self.terms.get(start..end)
     }
+}
+
+fn project_expression_flush_terms(
+    owners: &[KernelProjectOwnerOutputs],
+    artifact: &mut UnsealedComponentArtifact,
+) -> Result<ProjectExpressionFlushTerms, KernelSolveError> {
+    let mut definition_offsets = Vec::with_capacity(owners.len() + 1);
+    definition_offsets.push(0_u32);
+    for owner in owners {
+        let len = u32::try_from(owner.expressions.len())
+            .map_err(|_| KernelSolveError::new("kernel definition expression count exceeds u32"))?;
+        let end = definition_offsets
+            .last()
+            .copied()
+            .expect("kernel FLUSH offsets have a root")
+            .checked_add(len)
+            .ok_or_else(|| KernelSolveError::new("kernel project expression count exceeds u32"))?;
+        definition_offsets.push(end);
+    }
+    let total = definition_offsets.last().copied().unwrap_or_default() as usize;
     let result_expressions = owners
         .iter()
         .enumerate()
@@ -3024,18 +3630,15 @@ fn project_expression_flush_types(
                 .iter()
                 .position(|output| *output == owner.result)
                 .expect("owner result belongs to its expression outputs");
-            offsets[owner_index] + local
+            definition_offsets[owner_index] as usize + local
         })
         .collect::<Vec<_>>();
-    let total = offsets.last().copied().unwrap_or_default();
-    let mut bases = vec![Vec::<Type>::new(); total];
-    let mut dependencies = vec![Vec::<usize>::new(); total];
 
     let value_index = |caller: usize, value: KernelValueReference| -> Option<usize> {
         match value {
             KernelValueReference::Local(expression) => ((expression.0 as usize)
                 < owners.get(caller)?.expressions.len())
-            .then_some(offsets[caller] + expression.0 as usize),
+            .then_some(definition_offsets[caller] as usize + expression.0 as usize),
             KernelValueReference::External(KernelExternalExpression {
                 owner,
                 target: KernelExternalTarget::Result,
@@ -3046,14 +3649,41 @@ fn project_expression_flush_types(
             }) => {
                 let owner = owner.0 as usize;
                 ((expression.0 as usize) < owners.get(owner)?.expressions.len())
-                    .then_some(offsets[owner] + expression.0 as usize)
+                    .then_some(definition_offsets[owner] as usize + expression.0 as usize)
             }
         }
     };
+    let value_term = |caller: usize,
+                      value: KernelValueReference,
+                      artifact: &UnsealedComponentArtifact|
+     -> Option<TypeTermId> {
+        let output = match value {
+            KernelValueReference::Local(expression) => owners
+                .get(caller)?
+                .expressions
+                .get(expression.0 as usize)
+                .copied()?,
+            KernelValueReference::External(KernelExternalExpression {
+                owner,
+                target: KernelExternalTarget::Result,
+            }) => owners.get(owner.0 as usize)?.result,
+            KernelValueReference::External(KernelExternalExpression {
+                owner,
+                target: KernelExternalTarget::Expression(expression),
+            }) => owners
+                .get(owner.0 as usize)?
+                .expressions
+                .get(expression.0 as usize)
+                .copied()?,
+        };
+        artifact.output(output).map(|output| output.term())
+    };
 
+    let mut dependency_counts = vec![0_u32; total];
+    let mut base_counts = vec![0_u32; total];
     for (owner_index, owner) in owners.iter().enumerate() {
         for (local, expression) in owner.expression_artifacts.iter().enumerate() {
-            let index = offsets[owner_index] + local;
+            let index = definition_offsets[owner_index] as usize + local;
             let carries_input_flush = |role: &KernelOwnerEdgeRole| match &expression.kind {
                 KernelOwnerNodeKind::Record { .. } | KernelOwnerNodeKind::Block => false,
                 KernelOwnerNodeKind::Hold => matches!(role, KernelOwnerEdgeRole::HoldUpdate),
@@ -3064,14 +3694,20 @@ fn project_expression_flush_types(
                 .iter()
                 .filter(|input| carries_input_flush(&input.role))
             {
-                if let Some(dependency) = value_index(owner_index, input.value) {
-                    dependencies[index].push(dependency);
+                if value_index(owner_index, input.value).is_some() {
+                    dependency_counts[index] =
+                        dependency_counts[index].checked_add(1).ok_or_else(|| {
+                            KernelSolveError::new("kernel FLUSH dependency count exceeds u32")
+                        })?;
                 }
             }
-            if let KernelOwnerNodeKind::UserCall { target, .. } = expression.kind
-                && let Some(result) = result_expressions.get(target.0 as usize)
+            if let KernelOwnerNodeKind::UserCall { target, .. } = &expression.kind
+                && result_expressions.get(target.0 as usize).is_some()
             {
-                dependencies[index].push(*result);
+                dependency_counts[index] =
+                    dependency_counts[index].checked_add(1).ok_or_else(|| {
+                        KernelSolveError::new("kernel FLUSH dependency count exceeds u32")
+                    })?;
             }
             if matches!(expression.kind, KernelOwnerNodeKind::Flush) {
                 for payload in expression
@@ -3079,33 +3715,148 @@ fn project_expression_flush_types(
                     .iter()
                     .filter(|input| matches!(input.role, KernelOwnerEdgeRole::FlushPayload))
                 {
-                    if let Some(payload) = project_call_value_type(
-                        owner_index,
-                        payload.value,
-                        owners,
-                        artifact,
-                        public_results,
-                    ) {
-                        bases[index].push(payload.clone());
+                    if value_term(owner_index, payload.value, artifact).is_some() {
+                        base_counts[index] =
+                            base_counts[index].checked_add(1).ok_or_else(|| {
+                                KernelSolveError::new("kernel FLUSH base count exceeds u32")
+                            })?;
                     }
                 }
             }
-            dependencies[index].sort_unstable();
-            dependencies[index].dedup();
         }
     }
 
-    let solved = solve_flush_graph(bases, dependencies);
-    owners
-        .iter()
-        .enumerate()
-        .map(|(owner, _)| {
-            solved[offsets[owner]..offsets[owner + 1]]
-                .to_vec()
-                .into_boxed_slice()
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
+    fn counted_offsets(counts: &[u32], label: &str) -> Result<(Vec<u32>, usize), KernelSolveError> {
+        let mut offsets = Vec::with_capacity(counts.len() + 1);
+        offsets.push(0_u32);
+        for count in counts {
+            let end = offsets
+                .last()
+                .copied()
+                .expect("kernel counted offsets have a root")
+                .checked_add(*count)
+                .ok_or_else(|| KernelSolveError::new(format!("kernel {label} rows exceed u32")))?;
+            offsets.push(end);
+        }
+        let len = offsets.last().copied().unwrap_or_default() as usize;
+        Ok((offsets, len))
+    }
+
+    let (dependency_offsets, dependency_len) =
+        counted_offsets(&dependency_counts, "FLUSH dependency")?;
+    let (base_offsets, base_len) = counted_offsets(&base_counts, "FLUSH base")?;
+    let mut dependencies = vec![0_usize; dependency_len];
+    let mut bases = vec![artifact.terms().absent(); base_len];
+    let mut dependency_cursors = dependency_offsets[..total].to_vec();
+    let mut base_cursors = base_offsets[..total].to_vec();
+    for (owner_index, owner) in owners.iter().enumerate() {
+        for (local, expression) in owner.expression_artifacts.iter().enumerate() {
+            let index = definition_offsets[owner_index] as usize + local;
+            let carries_input_flush = |role: &KernelOwnerEdgeRole| match &expression.kind {
+                KernelOwnerNodeKind::Record { .. } | KernelOwnerNodeKind::Block => false,
+                KernelOwnerNodeKind::Hold => matches!(role, KernelOwnerEdgeRole::HoldUpdate),
+                _ => true,
+            };
+            for input in expression
+                .inputs
+                .iter()
+                .filter(|input| carries_input_flush(&input.role))
+            {
+                if let Some(provider) = value_index(owner_index, input.value) {
+                    let cursor = &mut dependency_cursors[index];
+                    dependencies[*cursor as usize] = provider;
+                    *cursor += 1;
+                }
+            }
+            if let KernelOwnerNodeKind::UserCall { target, .. } = &expression.kind
+                && let Some(provider) = result_expressions.get(target.0 as usize)
+            {
+                let cursor = &mut dependency_cursors[index];
+                dependencies[*cursor as usize] = *provider;
+                *cursor += 1;
+            }
+            if matches!(expression.kind, KernelOwnerNodeKind::Flush) {
+                for payload in expression
+                    .inputs
+                    .iter()
+                    .filter(|input| matches!(input.role, KernelOwnerEdgeRole::FlushPayload))
+                {
+                    if let Some(term) = value_term(owner_index, payload.value, artifact) {
+                        let cursor = &mut base_cursors[index];
+                        bases[*cursor as usize] = term;
+                        *cursor += 1;
+                    }
+                }
+            }
+        }
+    }
+    debug_assert_eq!(dependency_cursors, dependency_offsets[1..]);
+    debug_assert_eq!(base_cursors, base_offsets[1..]);
+
+    let mut consumer_counts = vec![0_u32; total];
+    for provider in &dependencies {
+        consumer_counts[*provider] = consumer_counts[*provider]
+            .checked_add(1)
+            .ok_or_else(|| KernelSolveError::new("kernel FLUSH consumer count exceeds u32"))?;
+    }
+    let (consumer_offsets, consumer_len) = counted_offsets(&consumer_counts, "FLUSH consumer")?;
+    let mut consumers = vec![0_usize; consumer_len];
+    let mut consumer_cursors = consumer_offsets[..total].to_vec();
+    for consumer in 0..total {
+        for provider in &dependencies
+            [dependency_offsets[consumer] as usize..dependency_offsets[consumer + 1] as usize]
+        {
+            let cursor = &mut consumer_cursors[*provider];
+            consumers[*cursor as usize] = consumer;
+            *cursor += 1;
+        }
+    }
+    debug_assert_eq!(consumer_cursors, consumer_offsets[1..]);
+
+    let mut values = vec![None; total];
+    let mut queued = vec![true; total];
+    let mut queue = (0..total).collect::<VecDeque<_>>();
+    let mut candidates = Vec::new();
+    while let Some(index) = queue.pop_front() {
+        queued[index] = false;
+        candidates.clear();
+        candidates.extend_from_slice(
+            &bases[base_offsets[index] as usize..base_offsets[index + 1] as usize],
+        );
+        candidates.extend(
+            dependencies
+                [dependency_offsets[index] as usize..dependency_offsets[index + 1] as usize]
+                .iter()
+                .filter_map(|provider| values[*provider]),
+        );
+        let next = if candidates.is_empty() {
+            None
+        } else {
+            let term = artifact.terms_mut().union(candidates.iter().copied());
+            match artifact.terms().term_head(term) {
+                TypeTermHead::Absent | TypeTermHead::Unknown | TypeTermHead::UnresolvedShape(_) => {
+                    None
+                }
+                _ => Some(term),
+            }
+        };
+        if values[index] == next {
+            continue;
+        }
+        values[index] = next;
+        for consumer in
+            &consumers[consumer_offsets[index] as usize..consumer_offsets[index + 1] as usize]
+        {
+            if !queued[*consumer] {
+                queued[*consumer] = true;
+                queue.push_back(*consumer);
+            }
+        }
+    }
+    Ok(ProjectExpressionFlushTerms {
+        definition_offsets: definition_offsets.into_boxed_slice(),
+        terms: values.into_boxed_slice(),
+    })
 }
 
 fn solve_flush_graph(bases: Vec<Vec<Type>>, dependencies: Vec<Vec<usize>>) -> Vec<Option<Type>> {
@@ -3336,31 +4087,13 @@ fn interface_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputI
             for input in call.inputs.iter() {
                 insert_value(&mut outputs, owners, owner_index, input.value);
             }
+            if let Some(output) = call.syntax_discriminated_root_output {
+                outputs.push(output);
+            }
         }
         for value in owner.diagnostic_values.iter().copied() {
             insert_value(&mut outputs, owners, owner_index, value);
         }
-    }
-    outputs.sort_unstable();
-    outputs.dedup();
-    outputs.into_boxed_slice()
-}
-
-fn checked_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputId]> {
-    let capacity = owners
-        .iter()
-        .map(|owner| owner.expressions.len() + owner.formals.len() + owner.calls.len())
-        .sum();
-    let mut outputs = Vec::with_capacity(capacity);
-    for owner in owners {
-        outputs.extend_from_slice(&owner.expressions);
-        outputs.extend_from_slice(&owner.formals);
-        outputs.extend(
-            owner
-                .calls
-                .iter()
-                .filter_map(|call| call.syntax_discriminated_root_output),
-        );
     }
     outputs.sort_unstable();
     outputs.dedup();
@@ -3435,6 +4168,7 @@ fn project_interface_snapshot(
 fn project_call_facts_and_diagnostics(
     owners: &[KernelProjectOwnerOutputs],
     artifact: &ComponentOutputSnapshot,
+    packed_artifact: Option<&UnsealedComponentArtifact>,
     public_results: &[FlowType],
     public_formals: &[Box<[FlowType]>],
     retain_call_facts: bool,
@@ -3557,17 +4291,31 @@ fn project_call_facts_and_diagnostics(
             if !retain_call_facts {
                 continue;
             }
-            let result_flow = owner
-                .expressions
-                .get(call.expression.0 as usize)
-                .and_then(|output| artifact.flow_type(*output));
-            let result_flags = owner
-                .expressions
-                .get(call.expression.0 as usize)
-                .and_then(|output| artifact.output_flags(*output));
-            let result_is_concrete = result_flow
-                .as_ref()
-                .is_some_and(|output| type_has_concrete_outer_shape(&output.ty));
+            let result_output = owner.expressions.get(call.expression.0 as usize).copied();
+            let result_is_concrete = result_output.is_some_and(|output| {
+                packed_artifact.map_or_else(
+                    || {
+                        artifact
+                            .flow_type(output)
+                            .is_some_and(|flow| type_has_concrete_outer_shape(&flow.ty))
+                    },
+                    |packed| packed_output_has_concrete_outer_shape(packed, output),
+                )
+            });
+            let call_syntax_selected = result_output.is_some_and(|output| {
+                packed_artifact.map_or_else(
+                    || {
+                        artifact
+                            .output_flags(output)
+                            .is_some_and(|flags| flags.call_syntax_selected)
+                    },
+                    |packed| {
+                        packed
+                            .output(output)
+                            .is_some_and(|output| output.call_syntax_selected)
+                    },
+                )
+            });
             let exact_structural_constructor = matches!(
                 &call.target,
                 KernelCallTarget::RenderConstructor { .. }
@@ -3586,13 +4334,21 @@ fn project_call_facts_and_diagnostics(
                 syntax_discriminated_result: (exact_structural_constructor
                     || call.syntax_discriminated_candidate
                     || (matches!(&call.target, KernelCallTarget::User { .. })
-                        && result_flags.is_some_and(|output| {
-                            output.call_syntax_selected
-                                || call
-                                    .syntax_discriminated_root_output
-                                    .and_then(|output| artifact.output_flags(output))
-                                    .is_some_and(|output| output.syntax_selected_here)
-                        })))
+                        && (call_syntax_selected
+                            || call.syntax_discriminated_root_output.is_some_and(|output| {
+                                packed_artifact.map_or_else(
+                                    || {
+                                        artifact
+                                            .output_flags(output)
+                                            .is_some_and(|flags| flags.syntax_selected_here)
+                                    },
+                                    |packed| {
+                                        packed
+                                            .output(output)
+                                            .is_some_and(|output| output.syntax_selected_here)
+                                    },
+                                )
+                            }))))
                     && result_is_concrete,
             });
         }
@@ -3910,107 +4666,6 @@ fn kernel_incompatible_field_name(actual: &Type, expected: &Type) -> Option<Stri
             return Some(format!("{name}.{nested}"));
         }
         (!kernel_type_is_assignable_to(actual_field, expected_field)).then(|| name.clone())
-    })
-}
-
-fn materialize_project_definition(
-    owner_index: usize,
-    owner: KernelProjectOwnerOutputs,
-    artifact: &ComponentArtifact,
-    flow_projection: &mut RichFlowProjection<'_>,
-    public_results: &[FlowType],
-    public_formals: &[Box<[FlowType]>],
-    call_facts: Box<[SolvedKernelCallFacts]>,
-    diagnostics: Box<[KernelDiagnosticArtifact]>,
-    synthetic_state_ordinals: &[Option<u32>],
-    expression_flush_types: Box<[Option<Type>]>,
-    owner_effects: &[KernelEffectSummary],
-    term_proof_scratch: &mut DefinitionTermProofScratch,
-) -> Result<DefinitionArtifact, KernelSolveError> {
-    let result = public_results[owner_index].clone();
-    let flow_terms = materialize_definition_flow_terms_v1(
-        artifact.terms(),
-        &owner
-            .formals
-            .iter()
-            .zip(owner.formal_modes.iter().copied())
-            .map(|(output, mode)| {
-                (
-                    artifact
-                        .output(*output)
-                        .expect("project owner formal belongs to its component")
-                        .term(),
-                    mode,
-                )
-            })
-            .collect::<Vec<_>>(),
-        (
-            artifact
-                .output(owner.result)
-                .expect("project owner result belongs to its component")
-                .term(),
-            result.mode,
-        ),
-        &owner
-            .expressions
-            .iter()
-            .zip(owner.expression_modes.iter().copied())
-            .map(|(output, mode)| {
-                (
-                    artifact
-                        .output(*output)
-                        .expect("project owner expression belongs to its component")
-                        .term(),
-                    mode,
-                )
-            })
-            .collect::<Vec<_>>(),
-        term_proof_scratch,
-    )?;
-    let expression_flows = owner
-        .expressions
-        .iter()
-        .zip(owner.expression_modes.iter().copied())
-        .map(|(output, mode)| {
-            let mut flow = flow_projection.materialize(*output);
-            flow.mode = mode;
-            flow
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    let calls = materialize_project_call_artifacts(owner.calls, call_facts, &expression_flows);
-    let (sources, states, lists) = materialize_resource_artifacts(
-        owner.resources,
-        &expression_flows,
-        Some(public_results),
-        synthetic_state_ordinals,
-    );
-    let expressions = materialize_expression_artifacts(
-        owner.expression_artifacts,
-        expression_flows,
-        expression_flush_types,
-        owner_effects,
-    );
-    Ok(DefinitionArtifact {
-        result,
-        formals: public_formals[owner_index].clone(),
-        flow_terms,
-        linkage: owner.linkage,
-        relocations: owner.relocations,
-        presentation: owner.presentation,
-        expression_payloads: owner.expression_payloads,
-        call_syntax: owner.call_syntax,
-        execution_shapes: owner.execution_shapes,
-        expressions,
-        statements: owner.statements,
-        declarations: owner.declarations,
-        lexical_bindings: owner.lexical_bindings,
-        calls,
-        effects: owner.effects,
-        sources,
-        states,
-        lists,
-        diagnostics,
     })
 }
 
@@ -5098,7 +5753,7 @@ fn materialize_expression_artifacts_with_local_flushes(
     pending: Box<[PendingKernelExpressionArtifact]>,
     flows: Box<[FlowType]>,
     owner_effects: &[KernelEffectSummary],
-) -> Box<[KernelExpressionArtifact]> {
+) -> Box<[RichKernelExpressionArtifact]> {
     assert_eq!(pending.len(), flows.len());
     let mut bases = vec![Vec::<Type>::new(); pending.len()];
     let mut dependencies = vec![Vec::<usize>::new(); pending.len()];
@@ -5144,7 +5799,7 @@ fn materialize_expression_artifacts(
     flows: Box<[FlowType]>,
     flush_types: Box<[Option<Type>]>,
     owner_effects: &[KernelEffectSummary],
-) -> Box<[KernelExpressionArtifact]> {
+) -> Box<[RichKernelExpressionArtifact]> {
     assert_eq!(
         pending.len(),
         flows.len(),
@@ -5161,7 +5816,7 @@ fn materialize_expression_artifacts(
         .zip(flows)
         .zip(flush_types)
         .map(
-            |((expression, flow_type), flush_type)| KernelExpressionArtifact {
+            |((expression, flow_type), flush_type)| RichKernelExpressionArtifact {
                 effect: direct_expression_effect(&expression.kind, owner_effects),
                 id: expression.id,
                 kind: expression.kind,
@@ -5284,7 +5939,7 @@ fn collect_statement_artifacts(
 fn collect_declaration_artifacts(
     owner: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
-) -> Result<Box<[KernelDeclarationArtifact]>, KernelOwnerBuildError> {
+) -> Result<Box<[RichKernelDeclarationArtifact]>, KernelOwnerBuildError> {
     let mut origins = BTreeSet::new();
     facts
         .declarations
@@ -5304,7 +5959,7 @@ fn collect_declaration_artifacts(
                 )));
             }
             validate_declaration_origin(owner, facts, declaration)?;
-            Ok(KernelDeclarationArtifact {
+            Ok(RichKernelDeclarationArtifact {
                 id: declaration.id,
                 origin: declaration.origin.clone(),
                 name: declaration.name.clone(),
@@ -5843,9 +6498,9 @@ fn materialize_resource_artifacts(
     public_results: Option<&[FlowType]>,
     synthetic_state_ordinals: &[Option<u32>],
 ) -> (
-    Box<[KernelSourceArtifact]>,
-    Box<[KernelStateArtifact]>,
-    Box<[KernelListArtifact]>,
+    Box<[RichKernelSourceArtifact]>,
+    Box<[RichKernelStateArtifact]>,
+    Box<[RichKernelListArtifact]>,
 ) {
     assert_eq!(
         pending.states.len(),
@@ -5856,7 +6511,7 @@ fn materialize_resource_artifacts(
         .sources
         .into_vec()
         .into_iter()
-        .map(|source| KernelSourceArtifact {
+        .map(|source| RichKernelSourceArtifact {
             id: source.id,
             declaration: source.declaration,
             statement: source.statement,
@@ -5905,7 +6560,7 @@ fn materialize_resource_artifacts(
                     "structural state path unexpectedly received a synthetic ordinal",
                 );
             }
-            KernelStateArtifact {
+            RichKernelStateArtifact {
                 id: KernelStateId(
                     u32::try_from(index).expect("kernel materialized state count exceeds u32"),
                 ),
@@ -5938,7 +6593,7 @@ fn materialize_resource_artifacts(
             let Type::List(item_type) = &authority.ty else {
                 unreachable!("a solved LIST literal must retain a List type")
             };
-            KernelListArtifact {
+            RichKernelListArtifact {
                 id: list.id,
                 declaration: list.declaration,
                 statement: list.statement,
@@ -5960,7 +6615,7 @@ fn materialize_call_artifacts(
     expressions: &[FlowType],
     public_formals: &[Box<[FlowType]>],
     public_results: &[FlowType],
-) -> Box<[KernelCallArtifact]> {
+) -> Box<[RichKernelCallArtifact]> {
     pending
         .into_vec()
         .into_iter()
@@ -5972,7 +6627,7 @@ fn materialize_call_artifacts(
                 public_formals,
                 public_results,
             );
-            KernelCallArtifact {
+            RichKernelCallArtifact {
                 expression: call.expression,
                 target: call.target,
                 inputs: call.inputs,
@@ -5981,32 +6636,6 @@ fn materialize_call_artifacts(
                     && type_has_concrete_outer_shape(&expressions[call.expression.0 as usize].ty),
                 result: expressions[call.expression.0 as usize].clone(),
             }
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
-}
-
-fn materialize_project_call_artifacts(
-    pending: Box<[PendingKernelCallArtifact]>,
-    facts: Box<[SolvedKernelCallFacts]>,
-    expressions: &[FlowType],
-) -> Box<[KernelCallArtifact]> {
-    assert_eq!(
-        pending.len(),
-        facts.len(),
-        "solved kernel call facts must align with compact call rows"
-    );
-    pending
-        .into_vec()
-        .into_iter()
-        .zip(facts)
-        .map(|(call, facts)| KernelCallArtifact {
-            expression: call.expression,
-            target: call.target,
-            inputs: call.inputs,
-            type_substitutions: facts.type_substitutions,
-            syntax_discriminated_result: facts.syntax_discriminated_result,
-            result: expressions[call.expression.0 as usize].clone(),
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -7871,6 +8500,33 @@ fn type_has_concrete_outer_shape(ty: &Type) -> bool {
         | Type::Set(_)
         | Type::Function { .. }
         | Type::RenderContract => true,
+    }
+}
+
+fn packed_output_has_concrete_outer_shape(
+    artifact: &UnsealedComponentArtifact,
+    output: OutputId,
+) -> bool {
+    let Some(output) = artifact.output(output) else {
+        return false;
+    };
+    match artifact.terms().term_head(output.term()) {
+        TypeTermHead::VariantSet(variants) | TypeTermHead::Union(variants) => variants.len() != 0,
+        TypeTermHead::OpenObjectPlaceholder
+        | TypeTermHead::UnresolvedShape(_)
+        | TypeTermHead::Variable(_)
+        | TypeTermHead::Unknown => false,
+        TypeTermHead::Text
+        | TypeTermHead::Number
+        | TypeTermHead::Bytes(_)
+        | TypeTermHead::Absent
+        | TypeTermHead::Object { .. }
+        | TypeTermHead::RenderContract
+        | TypeTermHead::List(_)
+        | TypeTermHead::Function { .. }
+        | TypeTermHead::Map { .. }
+        | TypeTermHead::Set(_)
+        | TypeTermHead::Bits(_) => true,
     }
 }
 
@@ -14565,6 +15221,51 @@ mod tests {
         }
     }
 
+    fn project_result(snapshot: &KernelCheckedSnapshot, owner: u32) -> &FlowType {
+        snapshot
+            .result_flow(KernelOwnerId(owner))
+            .expect("project result is present")
+    }
+
+    fn project_formals(snapshot: &KernelCheckedSnapshot, owner: u32) -> &[FlowType] {
+        snapshot
+            .formal_flows(KernelOwnerId(owner))
+            .expect("project formals are present")
+    }
+
+    fn project_expression(
+        snapshot: &KernelCheckedSnapshot,
+        owner: u32,
+        expression: u32,
+    ) -> FlowType {
+        snapshot
+            .expression_flow(KernelOwnerId(owner), KernelExpressionId(expression))
+            .expect("project expression is present")
+    }
+
+    fn project_call(
+        snapshot: &KernelCheckedSnapshot,
+        owner: u32,
+        ordinal: usize,
+    ) -> crate::MaterializedCallFacts {
+        snapshot
+            .call_facts(KernelOwnerId(owner), ordinal)
+            .expect("project call facts are present")
+    }
+
+    fn project_call_for_expression(
+        snapshot: &KernelCheckedSnapshot,
+        owner: u32,
+        expression: u32,
+    ) -> crate::MaterializedCallFacts {
+        let ordinal = snapshot.definitions[owner as usize]
+            .calls
+            .iter()
+            .position(|call| call.expression == KernelExpressionId(expression))
+            .expect("project call occurrence is present");
+        project_call(snapshot, owner, ordinal)
+    }
+
     #[test]
     fn residual_module_ranking_breaks_equal_work_ties_by_owner() {
         let owner_1086 = KernelResidualModuleWork {
@@ -14817,7 +15518,12 @@ mod tests {
         let checked = solved
             .checked_snapshot()
             .expect("source diagnostics seal into checked image");
-        assert_eq!(checked.definitions[0].diagnostics, interfaces.diagnostics);
+        assert_eq!(
+            checked
+                .diagnostics_for(KernelOwnerId(0))
+                .expect("owner diagnostics are present"),
+            interfaces.diagnostics.as_ref()
+        );
         assert!(checked.definitions[0].statements.is_empty());
     }
 
@@ -16285,12 +16991,12 @@ mod tests {
         let artifact = compile_project_program(&input).unwrap().solve().unwrap();
 
         assert_eq!(
-            artifact.definitions[1].expressions[1].flow_type.mode,
+            project_expression(&artifact, 1, 1).mode,
             FlowMode::Continuous,
             "the builtin's ordinary checked surface remains fixed"
         );
         assert_eq!(
-            artifact.definitions[1].result.mode,
+            project_result(&artifact, 1).mode,
             FlowMode::PresentOrAbsent,
             "the user-call frame follows the builtin's eventful actual"
         );
@@ -16335,16 +17041,12 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.definitions.len(), DEFINITION_COUNT);
-        for (owner, definition) in first.definitions.iter().enumerate() {
-            assert_eq!(definition.result.ty, owner_type(owner));
-            let mut standalone = [definition.clone()];
-            let (_, serial_receipt) = build_snapshot_receipts(
-                &mut standalone,
-                &[first.currentness[owner].basis_fingerprint_v14],
-            )
-            .expect("single definition seals serially");
-            assert_eq!(standalone[0], *definition);
-            assert_eq!(serial_receipt[0], first.currentness[owner]);
+        for owner in 0..DEFINITION_COUNT {
+            assert_eq!(project_result(&first, owner as u32).ty, owner_type(owner));
+            assert_eq!(
+                first.currentness[owner], second.currentness[owner],
+                "packed currentness is deterministic for owner {owner}",
+            );
         }
     }
 
@@ -16416,12 +17118,12 @@ mod tests {
         let artifact = compile_project_program(&input).unwrap().solve().unwrap();
 
         assert_eq!(
-            artifact.definitions[0].result.mode,
+            project_result(&artifact, 0).mode,
             FlowMode::Continuous,
             "the public record remains continuous",
         );
         assert_eq!(
-            artifact.definitions[1].result.mode,
+            project_result(&artifact, 1).mode,
             FlowMode::PresentOrAbsent,
             "the nested read follows the event field through the public result",
         );
@@ -16831,10 +17533,8 @@ mod tests {
                         && program.nodes.iter().all(|node| !matches!(node, KernelSummaryNode::Invoke { .. }))
             )
         }), "the tiny selector callee should remain inline below the sharing threshold");
-        assert_eq!(
-            program.solve().unwrap().definitions[2].result.ty,
-            Type::Number
-        );
+        let artifact = program.solve().unwrap();
+        assert_eq!(project_result(&artifact, 2).ty, Type::Number);
     }
 
     #[test]
@@ -17239,15 +17939,15 @@ mod tests {
 
         let artifact = compile_project_program(&input).unwrap().solve().unwrap();
         assert_eq!(
-            artifact.definitions[0].formals.as_ref(),
+            project_formals(&artifact, 0),
             [FlowType {
                 mode: FlowMode::Continuous,
                 ty: Type::Text,
             }]
         );
         assert_eq!(
-            artifact.definitions[0].result,
-            FlowType {
+            project_result(&artifact, 0),
+            &FlowType {
                 mode: FlowMode::Continuous,
                 ty: Type::Number,
             }
@@ -17321,14 +18021,11 @@ mod tests {
             mode: FlowMode::Continuous,
             ty: Type::Text,
         };
+        assert_eq!(project_formals(&artifact, 0), [text_formal.clone()]);
+        assert_eq!(project_formals(&artifact, 1), [text_formal]);
         assert_eq!(
-            artifact.definitions[0].formals.as_ref(),
-            [text_formal.clone()]
-        );
-        assert_eq!(artifact.definitions[1].formals.as_ref(), [text_formal]);
-        assert_eq!(
-            artifact.definitions[1].result,
-            FlowType {
+            project_result(&artifact, 1),
+            &FlowType {
                 mode: FlowMode::Continuous,
                 ty: Type::Number,
             }
@@ -17422,9 +18119,14 @@ mod tests {
         );
 
         let checked = solved.checked_snapshot().unwrap();
-        assert!(checked.definitions[0].diagnostics.is_empty());
+        assert!(
+            checked
+                .diagnostics_for(KernelOwnerId(0))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
-            checked.definitions[1].diagnostics.as_ref(),
+            checked.diagnostics_for(KernelOwnerId(1)).unwrap(),
             [diagnostic.clone()]
         );
     }
@@ -17698,7 +18400,10 @@ mod tests {
         assert!(interfaces.diagnostics.is_empty());
 
         let checked = solved.checked_snapshot().unwrap();
-        assert_eq!(checked.diagnostic_values.as_ref(), [value.clone()]);
+        assert_eq!(
+            checked.interface.diagnostic_values.as_ref(),
+            [value.clone()]
+        );
         assert_eq!(checked.definitions.len(), 1);
     }
 
@@ -17838,12 +18543,14 @@ mod tests {
         .unwrap()
         .solve()
         .unwrap();
-        assert!(matches!(
-            artifact.definitions[0].formals[0].ty,
-            Type::Var(_)
-        ));
-        assert_eq!(artifact.definitions[1].result.ty, Type::Text);
-        assert!(artifact.definitions[1].diagnostics.is_empty());
+        assert!(matches!(project_formals(&artifact, 0)[0].ty, Type::Var(_)));
+        assert_eq!(project_result(&artifact, 1).ty, Type::Text);
+        assert!(
+            artifact
+                .diagnostics_for(KernelOwnerId(1))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -17988,7 +18695,7 @@ mod tests {
         .unwrap()
         .solve()
         .unwrap();
-        let Type::VariantSet(formal) = &artifact.definitions[0].formals[0].ty else {
+        let Type::VariantSet(formal) = &project_formals(&artifact, 0)[0].ty else {
             panic!("closed WHEN formal must be a variant set")
         };
         assert!(
@@ -17997,12 +18704,17 @@ mod tests {
                 .any(|variant| matches!(variant, Variant::Tag(tag) if tag == "Lights"))
         );
         assert!(formal.iter().any(|variant| matches!(variant, Variant::Tagged { tag, fields } if tag == "Material" && fields.fields.contains_key("of"))));
-        let Type::Object(result) = &artifact.definitions[1].result.ty else {
+        let Type::Object(result) = &project_result(&artifact, 1).ty else {
             panic!("caller result must be an object")
         };
         assert_eq!(result.fields["material"], Type::Text);
         assert_eq!(result.fields["lights"], Type::Number);
-        assert!(artifact.definitions[1].diagnostics.is_empty());
+        assert!(
+            artifact
+                .diagnostics_for(KernelOwnerId(1))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -18206,7 +18918,7 @@ mod tests {
         );
         let artifact = program.solve().unwrap();
         assert_eq!(
-            artifact.definitions[1].result.ty,
+            project_result(&artifact, 1).ty,
             Type::object(ObjectShape::from_ordered_fields(
                 [
                     ("number".to_owned(), Type::Number),
@@ -18216,14 +18928,8 @@ mod tests {
             )),
             "repeated calls must not share or specialize one formal frame"
         );
-        assert_eq!(
-            artifact.definitions[1].expressions[2].flow_type.ty,
-            Type::Number
-        );
-        assert_eq!(
-            artifact.definitions[1].expressions[3].flow_type.ty,
-            Type::Text
-        );
+        assert_eq!(project_expression(&artifact, 1, 2).ty, Type::Number);
+        assert_eq!(project_expression(&artifact, 1, 3).ty, Type::Text);
         let [number_call, text_call] = artifact.definitions[1].calls.as_ref() else {
             panic!("caller definition must publish both call occurrences")
         };
@@ -18243,32 +18949,33 @@ mod tests {
                 value: KernelCallValueReference::Local(KernelExpressionId(0)),
             }]
         );
-        assert_eq!(number_call.result.ty, Type::Number);
-        assert_eq!(text_call.result.ty, Type::Text);
+        let number_flow = project_expression(&artifact, 1, 2);
+        let text_flow = project_expression(&artifact, 1, 3);
+        let number_facts = project_call(&artifact, 1, 0);
+        let text_facts = project_call(&artifact, 1, 1);
+        assert_eq!(number_flow.ty, Type::Number);
+        assert_eq!(text_flow.ty, Type::Text);
         assert_eq!(
-            number_call.type_substitutions.as_ref(),
+            number_facts.substitutions.as_ref(),
             [KernelCallTypeSubstitution {
                 variable: KernelTypeParameterId(0),
                 value: Type::Number,
             }]
         );
         assert_eq!(
-            text_call.type_substitutions.as_ref(),
+            text_facts.substitutions.as_ref(),
             [KernelCallTypeSubstitution {
                 variable: KernelTypeParameterId(0),
                 value: Type::Text,
             }]
         );
-        assert_eq!(artifact.definitions[0].formals.len(), 1);
-        assert!(matches!(
-            artifact.definitions[0].formals[0].ty,
-            Type::Var(_)
-        ));
+        assert_eq!(project_formals(&artifact, 0).len(), 1);
+        assert!(matches!(project_formals(&artifact, 0)[0].ty, Type::Var(_)));
         let number_expression = &artifact.definitions[1].expressions[2];
         assert_eq!(number_expression.id, KernelExpressionId(2));
         assert_eq!(
             number_expression.kind,
-            KernelOwnerNodeKind::UserCall {
+            KernelExpressionArtifactKind::UserCall {
                 target: KernelOwnerId(0),
                 inherited_formal: None,
             }
@@ -18280,7 +18987,7 @@ mod tests {
                 value: KernelValueReference::Local(KernelExpressionId(0)),
             }]
         );
-        assert_eq!(number_expression.flow_type, number_call.result);
+        assert_eq!(number_flow, project_expression(&artifact, 1, 2));
         assert!(artifact.definitions[0].calls.is_empty());
     }
 
@@ -18429,7 +19136,7 @@ mod tests {
             "a one-node identity summary must stay inline",
         );
         let artifact = program.solve().unwrap();
-        let Type::Object(result) = &artifact.definitions[2].result.ty else {
+        let Type::Object(result) = &project_result(&artifact, 2).ty else {
             panic!("caller result must be a record")
         };
         let Type::Object(number) = &result.fields["number"] else {
@@ -18546,7 +19253,7 @@ mod tests {
         }
 
         let artifact = program.solve().unwrap();
-        let Type::Object(result) = &artifact.definitions[1].result.ty else {
+        let Type::Object(result) = &project_result(&artifact, 1).ty else {
             panic!("caller result must be a record")
         };
         assert_eq!(result.fields["left"], Type::Number);
@@ -18629,7 +19336,7 @@ mod tests {
         );
 
         let artifact = program.solve().unwrap();
-        let Type::Object(result) = &artifact.definitions[2].result.ty else {
+        let Type::Object(result) = &project_result(&artifact, 2).ty else {
             panic!("caller result must be the shared record")
         };
         assert_eq!(result.fields.len(), field_count);
@@ -18942,10 +19649,8 @@ mod tests {
             program.compile_work().summary_pruned_inputs >= 1,
             "summary compaction must report removing the redundant formal input"
         );
-        assert_eq!(
-            program.solve().unwrap().definitions[2].result.ty,
-            Type::Number
-        );
+        let artifact = program.solve().unwrap();
+        assert_eq!(project_result(&artifact, 2).ty, Type::Number);
     }
 
     #[test]
@@ -19022,10 +19727,8 @@ mod tests {
                     })
             )
         }));
-        assert_eq!(
-            program.solve().unwrap().definitions[1].result.ty,
-            Type::Number
-        );
+        let artifact = program.solve().unwrap();
+        assert_eq!(project_result(&artifact, 1).ty, Type::Number);
     }
 
     #[test]
@@ -19097,7 +19800,7 @@ mod tests {
         );
         let artifact = program.solve().unwrap();
         assert_eq!(
-            artifact.definitions[1].result.ty,
+            project_result(&artifact, 1).ty,
             Type::List(Type::shared(Type::Number))
         );
     }
@@ -19217,7 +19920,7 @@ mod tests {
             program.component().operation_count(),
         );
         let artifact = program.solve().unwrap();
-        let Type::Object(result) = &artifact.definitions[1].result.ty else {
+        let Type::Object(result) = &project_result(&artifact, 1).ty else {
             panic!("caller result must be a record")
         };
         let Type::Object(number) = &result.fields["number"] else {
@@ -19334,7 +20037,7 @@ mod tests {
             )
         }));
         let artifact = program.solve().unwrap();
-        assert_eq!(artifact.definitions[1].result.ty, Type::Text);
+        assert_eq!(project_result(&artifact, 1).ty, Type::Text);
     }
 
     #[test]
@@ -19381,7 +20084,7 @@ mod tests {
         let artifact = compile_project_program(&input).unwrap().solve().unwrap();
         assert_eq!(artifact.definitions.len(), 2);
         assert_eq!(
-            artifact.definitions[1].result.ty,
+            project_result(&artifact, 1).ty,
             Type::object(ObjectShape::from_ordered_fields(
                 [(
                     "status".to_owned(),
@@ -19534,9 +20237,11 @@ mod tests {
         assert_eq!(program.compile_work().invocation_frames, 2);
         assert_eq!(program.compile_work().reused_invocation_frames, 0);
         let artifact = program.solve().unwrap();
-        let definition = &artifact.definitions[0].result.ty;
-        let first_call = &artifact.definitions[1].expressions[0].flow_type.ty;
-        let second_call = &artifact.definitions[1].expressions[1].flow_type.ty;
+        let definition = &project_result(&artifact, 0).ty;
+        let first_call_flow = project_expression(&artifact, 1, 0);
+        let second_call_flow = project_expression(&artifact, 1, 1);
+        let first_call = &first_call_flow.ty;
+        let second_call = &second_call_flow.ty;
         let state_type = |ty: &Type| {
             let Type::Object(shape) = ty else {
                 panic!("stateful call result is not an object: {ty:?}");
@@ -19750,44 +20455,26 @@ mod tests {
             ]
             .into(),
         );
-        assert_eq!(state_type(&artifact.definitions[0].result.ty), full);
-        assert_eq!(
-            state_type(&artifact.definitions[1].expressions[1].flow_type.ty),
-            full
-        );
+        assert_eq!(state_type(&project_result(&artifact, 0).ty), full);
+        let wrapper_flow = project_expression(&artifact, 1, 1);
+        assert_eq!(state_type(&wrapper_flow.ty), full);
         assert!(
-            artifact.definitions[1]
-                .calls
-                .iter()
-                .find(|call| call.expression == KernelExpressionId(1))
-                .expect("wrapper has the call authored inside its selected arm")
-                .syntax_discriminated_result,
+            project_call_for_expression(&artifact, 1, 1).syntax_discriminated_result,
             "a call authored inside a formal-derived WHEN arm must retain exact occurrence authority",
         );
+        let selected_flow = project_expression(&artifact, 2, 2);
         assert_eq!(
-            state_type(&artifact.definitions[2].expressions[2].flow_type.ty),
+            state_type(&selected_flow.ty),
             Type::VariantSet(vec![Variant::Tag("Closed".to_owned())].into()),
         );
-        assert_eq!(
-            state_type(&artifact.definitions[2].expressions[3].flow_type.ty),
-            full
-        );
+        let direct_flow = project_expression(&artifact, 2, 3);
+        assert_eq!(state_type(&direct_flow.ty), full);
         assert!(
-            artifact.definitions[2]
-                .calls
-                .iter()
-                .find(|call| call.expression == KernelExpressionId(2))
-                .expect("caller has the selected wrapper call")
-                .syntax_discriminated_result,
+            project_call_for_expression(&artifact, 2, 2).syntax_discriminated_result,
             "the solved root SELECT must publish an exact call receipt",
         );
         assert!(
-            !artifact.definitions[2]
-                .calls
-                .iter()
-                .find(|call| call.expression == KernelExpressionId(3))
-                .expect("caller has the direct stateful call")
-                .syntax_discriminated_result,
+            !project_call_for_expression(&artifact, 2, 3).syntax_discriminated_result,
             "a forwarded state value must not inherit the wrapper's receipt",
         );
     }
@@ -19873,9 +20560,10 @@ mod tests {
             ]
             .into(),
         );
-        assert_eq!(artifact.definitions[1].result.ty, expected);
+        assert_eq!(project_result(&artifact, 1).ty, expected);
         assert_eq!(
-            artifact.definitions[0].result.ty, expected,
+            project_result(&artifact, 0).ty,
+            expected,
             "a cross-owner result alias must observe the child's final epoch"
         );
     }
@@ -19976,23 +20664,21 @@ mod tests {
         };
 
         let artifact = compile_project_program(&input).unwrap().solve().unwrap();
-        assert_eq!(artifact.definitions[1].result.mode, FlowMode::Continuous);
+        assert_eq!(project_result(&artifact, 1).mode, FlowMode::Continuous);
+        let public_read = project_expression(&artifact, 2, 0);
+        assert_eq!(public_read.ty, Type::Text,);
         assert_eq!(
-            artifact.definitions[2].expressions[0].flow_type.ty,
-            Type::Text
-        );
-        assert_eq!(
-            artifact.definitions[2].expressions[0].flow_type.mode,
+            public_read.mode,
             FlowMode::PresentOrAbsent,
             "a public-result read preserves the nested event field mode"
         );
         assert_eq!(
-            artifact.definitions[2].result.mode,
+            project_result(&artifact, 2).mode,
             FlowMode::PresentOrAbsent,
             "contextual call inference follows the eventful projected actual"
         );
         assert_eq!(
-            artifact.definitions[3].result.mode,
+            project_result(&artifact, 3).mode,
             FlowMode::PresentOrAbsent,
             "an exact external expression boundary retains structural mode projection"
         );

@@ -6,7 +6,7 @@ use crate::{
     KernelSummaryNode, KernelSummaryProgram, KernelSummaryRecordEntry, OperationId,
     PackedOperationTable, ProgramConsumer, ProgramOperationRef, ProjectedArtifactOutput,
     PublishMode, ResidualOperationFrame, TypeTerm, TypeTermHead, TypeTermId, TypeVariableId,
-    VariantTerm,
+    UnsealedComponentArtifact, VariantTerm,
 };
 use boon_checked::FlowType;
 use boon_contract::SymbolId;
@@ -116,11 +116,17 @@ impl ComponentSolveSession {
         Ok(self.solver.snapshot())
     }
 
-    pub(crate) fn solve_all(mut self) -> Result<ComponentArtifact, KernelSolveError> {
+    pub(crate) fn solve_all(self) -> Result<ComponentArtifact, KernelSolveError> {
+        Ok(self.solve_all_unsealed()?.seal())
+    }
+
+    pub(crate) fn solve_all_unsealed(
+        mut self,
+    ) -> Result<UnsealedComponentArtifact, KernelSolveError> {
         let enabled = vec![true; self.execution.work_items.len()];
         self.solver.enable(&self.execution, &enabled)?;
         self.solver.mark_all_outputs_available();
-        self.solver.finish()
+        self.solver.finish_unsealed()
     }
 
     fn demanded_work_items(
@@ -658,11 +664,11 @@ impl ComponentSolver {
         ComponentOutputSnapshot::new(outputs, self.work)
     }
 
-    fn finish(mut self) -> Result<ComponentArtifact, KernelSolveError> {
+    fn finish_unsealed(mut self) -> Result<UnsealedComponentArtifact, KernelSolveError> {
         let outputs = self.materialize_packed_outputs();
         self.update_term_work();
         self.finish_summary_definition_ranking();
-        Ok(ComponentArtifact::new(
+        Ok(UnsealedComponentArtifact::new(
             outputs,
             self.program.terms,
             self.work,

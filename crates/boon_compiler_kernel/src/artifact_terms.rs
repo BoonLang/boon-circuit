@@ -5,12 +5,15 @@ use boon_checked::{ArtifactFlowTermV1, ArtifactTypeModuleBuilderV1};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::collections::BTreeMap;
+#[cfg(test)]
 use std::hash::{Hash, Hasher};
 
+#[cfg(test)]
 const KERNEL_DEFINITION_FLOW_TERMS_DOMAIN_V1: &[u8] =
     b"boon.compiler-kernel.definition-flow-terms.v1\0";
 const ARTIFACT_TYPE_TERM_DOMAIN_V1: &[u8] = b"boon.artifact-type-term.v1\0";
 const ARTIFACT_FLOW_TERM_DOMAIN_V1: &[u8] = b"boon.artifact-flow-term.v1\0";
+#[cfg(test)]
 const ARTIFACT_TYPE_MODULE_DOMAIN_V1: &[u8] = b"boon.artifact-type-module.v1\0";
 
 /// One definition-local flow root in the solved component type arena.
@@ -34,6 +37,7 @@ pub(crate) struct KernelArtifactFlowTermV1 {
 /// component namespace. The permanent packed API will expose a store- and
 /// definition-qualified reference after every type-bearing definition row has
 /// moved to the shared authority.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct KernelDefinitionFlowTermsV1 {
     pub(crate) module_stable_digest: [u8; 32],
@@ -48,6 +52,7 @@ pub(crate) struct KernelDefinitionFlowTermsV1 {
     pub(crate) stable_digest: [u8; 32],
 }
 
+#[cfg(test)]
 impl Hash for KernelDefinitionFlowTermsV1 {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Bind the structural module and ordered roots once. Hashing its rich
@@ -56,6 +61,7 @@ impl Hash for KernelDefinitionFlowTermsV1 {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn materialize_definition_flow_terms_v1(
     source: &TypeTermArena,
     formal_roots: &[(TypeTermId, FlowMode)],
@@ -129,6 +135,47 @@ impl DefinitionTermProofScratch {
         // ArtifactTypeModuleBuilderV1 always installs Unknown before importing
         // roots, so preserve that exact stable module proof contract.
         self.module_term_digests.push(scalar_term_digest(11));
+    }
+
+    /// Begin one definition-wide alpha-order traversal.
+    ///
+    /// Unlike the flow-proof import above, callers visit every type-bearing
+    /// definition row in compatibility order. Reusing this scratch keeps the
+    /// traversal generation-stamped and allocation-free after its first
+    /// component-sized growth.
+    pub(crate) fn begin_alpha_variables(&mut self, source: &TypeTermArena) {
+        self.begin(source.len());
+    }
+
+    pub(crate) fn visit_alpha_root(
+        &mut self,
+        source: &TypeTermArena,
+        term: TypeTermId,
+    ) -> Result<[u8; 32], KernelSolveError> {
+        self.import(source, term).map(|proof| proof.stable)
+    }
+
+    pub(crate) fn visit_alpha_flow_root(
+        &mut self,
+        source: &TypeTermArena,
+        term: TypeTermId,
+        mode: FlowMode,
+    ) -> Result<[u8; 32], KernelSolveError> {
+        self.import(source, term)
+            .map(|proof| flow_digest(mode, proof.stable))
+    }
+
+    pub(crate) fn materialize_alpha_flow_root(
+        &mut self,
+        source: &TypeTermArena,
+        term: TypeTermId,
+        mode: FlowMode,
+    ) -> Result<KernelArtifactFlowTermV1, KernelSolveError> {
+        self.import_flow(source, term, mode)
+    }
+
+    pub(crate) fn alpha_variable_sources(&self) -> &[TypeVariableId] {
+        &self.variable_sources_by_ordinal
     }
 
     fn import_flow(
@@ -346,6 +393,7 @@ impl DefinitionTermProofScratch {
         Ok(ordinal)
     }
 
+    #[cfg(test)]
     fn module_digest(&mut self) -> [u8; 32] {
         self.module_term_digests.sort_unstable();
         self.module_term_digests.dedup();
@@ -382,6 +430,7 @@ fn legacy_checked_union_order(source: &TypeTermArena, members: &[TypeTermId]) ->
     keyed.into_iter().map(|(_, _, member)| member).collect()
 }
 
+#[cfg(test)]
 fn definition_flow_terms_digest(
     module_stable_digest: [u8; 32],
     result: KernelArtifactFlowTermV1,
@@ -397,6 +446,7 @@ fn definition_flow_terms_digest(
     hasher.finalize().into()
 }
 
+#[cfg(test)]
 fn update_flow_roots(hasher: &mut Sha256, roots: &[KernelArtifactFlowTermV1]) {
     hasher.update(
         u64::try_from(roots.len())
@@ -456,6 +506,7 @@ fn update_string_pair(stable: &mut Sha256, runtime: &mut Sha256, value: &str) {
     runtime.update(value.as_bytes());
 }
 
+#[cfg(test)]
 fn update_len(hasher: &mut Sha256, value: usize) {
     hasher.update(
         u64::try_from(value)

@@ -364,6 +364,7 @@ pub struct KernelSemanticInputConstructionV1 {
     source_ranges: Box<[KernelCheckedRowRange]>,
     resource_projections: Box<[KernelSemanticResourceProjectionLocatorV1]>,
     resource_projection_by_expression: Box<[u32]>,
+    checked_image_pairing: Arc<boon_checked::CheckedImageKernelPairingV1>,
 }
 
 /// Checked-image-bound packed input accepted by the kernel semantic route.
@@ -411,6 +412,7 @@ impl KernelSemanticInputConstructionV1 {
         snapshot: &KernelCheckedSnapshot,
         layout: &KernelCheckedLinkLayout,
         resource_projections: Box<[KernelSemanticResourceProjectionLocatorV1]>,
+        checked_image_pairing: Arc<boon_checked::CheckedImageKernelPairingV1>,
     ) -> Result<Self, KernelCheckedLinkError> {
         if snapshot.definitions.len() != layout.definitions.len()
             || snapshot.definition_code.definition_count() != layout.definitions.len()
@@ -463,12 +465,14 @@ impl KernelSemanticInputConstructionV1 {
                 .into_boxed_slice(),
             resource_projections,
             resource_projection_by_expression: resource_projection_by_expression.into_boxed_slice(),
+            checked_image_pairing,
         })
     }
 
     pub fn seal(
         self,
         checked: &CheckedProgram,
+        pairing_receipt: &boon_checked::CheckedImageKernelPairingReceiptV1,
     ) -> Result<KernelSemanticInputV1, KernelCheckedLinkError> {
         self.validate_checked_shape(
             checked.source_bundle_digest_v1,
@@ -478,6 +482,9 @@ impl KernelSemanticInputConstructionV1 {
             checked.sources.len(),
         )?;
         let handoff = checked.image_handoff();
+        pairing_receipt
+            .__kernel_validate(&self.checked_image_pairing, handoff)
+            .map_err(KernelCheckedLinkError::new)?;
         let routed_resources = handoff
             .entity_routes
             .iter()
@@ -1794,6 +1801,7 @@ impl KernelCheckedLinkLayout {
             snapshot,
             self,
             semantic_resource_projections,
+            checked_image_publication.__kernel_pairing(),
         )?;
         Ok(KernelCheckedRows {
             scopes,

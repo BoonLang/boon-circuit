@@ -10,6 +10,7 @@ mod owner_shard;
 mod type_terms;
 #[doc(hidden)]
 pub use checked_image_publication::{
+    CheckedImageKernelPairingReceiptV1, CheckedImageKernelPairingV1,
     CheckedImageKernelProjectionIdV1, CheckedImageKernelPublicationV1,
 };
 pub use owner_shard::*;

@@ -297,6 +297,11 @@ fn construction_owned_checked_image_publication(workspace: &Path) -> Result<Stri
         ),
         (
             "checked model",
+            &checked_publication,
+            "pub struct CheckedImageKernelPairingReceiptV1",
+        ),
+        (
+            "checked model",
             &checked,
             "pub use checked_image_publication::{",
         ),
@@ -325,7 +330,7 @@ fn construction_owned_checked_image_publication(workspace: &Path) -> Result<Stri
     }
 
     let mut direct = ProductionIdentifierReferenceCollector::new(
-        "seal_project_checked_program_construction_with_kernel_publication",
+        "seal_project_checked_program_construction_with_kernel_publication_and_pairing",
     );
     direct.visit_file(&compiler_syntax);
     if direct.references.len() != 1 {
@@ -346,7 +351,7 @@ fn construction_owned_checked_image_publication(workspace: &Path) -> Result<Stri
     }
 
     Ok(
-        "dense checked rows publish one compact V4 topology; production verified sealing consumes it by value and rich checked replay is test-only"
+        "dense checked rows publish one compact V4 topology; production verified sealing consumes it by value with an exact construction-pairing receipt and rich checked replay is test-only"
             .to_owned(),
     )
 }

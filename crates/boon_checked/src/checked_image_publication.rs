@@ -5,9 +5,72 @@
 //! project metadata rows, and the typechecker consumes it exactly once.
 
 use crate::{
-    CheckedImageRowDomainV2, CheckedShardProjectionKeyV2, ProgramRole, SourceBundleDigestV1,
+    CheckedImageHandoffV4, CheckedImageRowDomainV2, CheckedShardProjectionKeyV2, ProgramRole,
+    SourceBundleDigestV1,
 };
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+/// Process-local construction identity shared by exactly one packed semantic
+/// input and one checked-image publication.
+///
+/// Equality of checked artifacts is deterministic and content-based, but a
+/// construction token must not be paired with an independently produced
+/// image that merely has the same source and row counts. Pointer identity is
+/// therefore intentional here; this value is never serialized or published.
+#[doc(hidden)]
+#[derive(Debug, Eq, PartialEq)]
+pub struct CheckedImageKernelPairingV1(());
+
+/// Proof that the typechecker consumed the exact publication created beside a
+/// packed semantic input and bound it to one completed checked image.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct CheckedImageKernelPairingReceiptV1 {
+    pairing: Arc<CheckedImageKernelPairingV1>,
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    role: ProgramRole,
+    checked_image_digest: [u8; 32],
+}
+
+impl CheckedImageKernelPairingReceiptV1 {
+    #[doc(hidden)]
+    pub fn __typechecker_new(
+        pairing: Arc<CheckedImageKernelPairingV1>,
+        handoff: &CheckedImageHandoffV4,
+    ) -> Self {
+        Self {
+            pairing,
+            source_bundle_digest_v1: handoff.source_bundle_digest_v1,
+            role: handoff.role,
+            checked_image_digest: handoff.local_image_digest,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn __kernel_validate(
+        &self,
+        pairing: &Arc<CheckedImageKernelPairingV1>,
+        handoff: &CheckedImageHandoffV4,
+    ) -> Result<(), String> {
+        if !Arc::ptr_eq(&self.pairing, pairing) {
+            return Err(
+                "kernel semantic input and checked image have different construction identities"
+                    .to_owned(),
+            );
+        }
+        if self.source_bundle_digest_v1 != handoff.source_bundle_digest_v1
+            || self.role != handoff.role
+            || self.checked_image_digest != handoff.local_image_digest
+        {
+            return Err(
+                "kernel checked-image pairing receipt is stale for the supplied checked image"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
 
 /// Dense, move-only checked-image publication assembled by the kernel linker.
 ///
@@ -22,6 +85,7 @@ pub struct CheckedImageKernelPublicationV1 {
     projection_ids: BTreeMap<CheckedShardProjectionKeyV2, CheckedImageKernelProjectionIdV1>,
     projections: Vec<CheckedImageKernelProjectionV1>,
     routes: HashMap<(CheckedImageRowDomainV2, u32), CheckedImageKernelProjectionIdV1>,
+    pairing: Arc<CheckedImageKernelPairingV1>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -50,7 +114,13 @@ impl CheckedImageKernelPublicationV1 {
             projection_ids: BTreeMap::new(),
             projections: Vec::new(),
             routes: HashMap::new(),
+            pairing: Arc::new(CheckedImageKernelPairingV1(())),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn __kernel_pairing(&self) -> Arc<CheckedImageKernelPairingV1> {
+        Arc::clone(&self.pairing)
     }
 
     #[doc(hidden)]
@@ -197,6 +267,7 @@ impl CheckedImageKernelPublicationV1 {
             Vec<CheckedImageKernelProjectionIdV1>,
         )>,
         HashMap<(CheckedImageRowDomainV2, u32), CheckedImageKernelProjectionIdV1>,
+        Arc<CheckedImageKernelPairingV1>,
     ) {
         (
             self.source_bundle_digest_v1,
@@ -213,6 +284,7 @@ impl CheckedImageKernelPublicationV1 {
                 })
                 .collect(),
             self.routes,
+            self.pairing,
         )
     }
 }

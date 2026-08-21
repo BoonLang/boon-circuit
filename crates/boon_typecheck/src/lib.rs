@@ -16706,7 +16706,13 @@ fn checked_image_handoff_from_kernel_publication(
     program: &CheckedProgramFields,
     authority: &CheckedImageKernelAuthorityV1,
     publication: boon_checked::CheckedImageKernelPublicationV1,
-) -> Result<CheckedImageHandoffV4, String> {
+) -> Result<
+    (
+        CheckedImageHandoffV4,
+        std::sync::Arc<boon_checked::CheckedImageKernelPairingV1>,
+    ),
+    String,
+> {
     let callable_owners = program
         .callables
         .iter()
@@ -16718,7 +16724,7 @@ fn checked_image_handoff_from_kernel_publication(
         .map(|scope| checked_owner_for_scope(program, &callable_owners, scope.id))
         .collect::<Result<Vec<_>, _>>()?;
     let authority = checked_image_kernel_authority_context(program, &scope_owners, authority)?;
-    let (source_bundle_digest_v1, role, projections, routes) =
+    let (source_bundle_digest_v1, role, projections, routes, pairing) =
         publication.__typechecker_into_parts();
     if source_bundle_digest_v1 != program.source_bundle_digest_v1 || role != program.role {
         return Err(
@@ -16766,7 +16772,9 @@ fn checked_image_handoff_from_kernel_publication(
             .entity_routes
             .push((domain, dense_index, projection));
     }
-    builder.finish(source_bundle_digest_v1, role)
+    builder
+        .finish(source_bundle_digest_v1, role)
+        .map(|handoff| (handoff, pairing))
 }
 
 /// Consume a completed diagnostics construction and grant the runtime checked
@@ -16847,6 +16855,56 @@ pub fn seal_project_checked_program_construction_with_kernel_publication(
     authority: &CheckedImageKernelAuthorityV1,
     publication: boon_checked::CheckedImageKernelPublicationV1,
 ) -> Result<CheckedProgram, String> {
+    seal_project_checked_program_construction_with_kernel_publication_inner(
+        parsed,
+        construction,
+        call_occurrences,
+        authority,
+        publication,
+    )
+    .map(|(program, _)| program)
+}
+
+/// Seal the dense checked image and return the process-local receipt required
+/// to bind its sibling packed semantic input. Keeping the receipt coupled to
+/// this consuming operation prevents same-shaped independent constructions
+/// from being cross-paired later.
+#[doc(hidden)]
+pub fn seal_project_checked_program_construction_with_kernel_publication_and_pairing(
+    parsed: &ProjectSyntaxSnapshot,
+    construction: CheckedProgramConstruction,
+    call_occurrences: &[StableOccurrenceKey],
+    authority: &CheckedImageKernelAuthorityV1,
+    publication: boon_checked::CheckedImageKernelPublicationV1,
+) -> Result<
+    (
+        CheckedProgram,
+        boon_checked::CheckedImageKernelPairingReceiptV1,
+    ),
+    String,
+> {
+    seal_project_checked_program_construction_with_kernel_publication_inner(
+        parsed,
+        construction,
+        call_occurrences,
+        authority,
+        publication,
+    )
+}
+
+fn seal_project_checked_program_construction_with_kernel_publication_inner(
+    parsed: &ProjectSyntaxSnapshot,
+    construction: CheckedProgramConstruction,
+    call_occurrences: &[StableOccurrenceKey],
+    authority: &CheckedImageKernelAuthorityV1,
+    publication: boon_checked::CheckedImageKernelPublicationV1,
+) -> Result<
+    (
+        CheckedProgram,
+        boon_checked::CheckedImageKernelPairingReceiptV1,
+    ),
+    String,
+> {
     let fields = construction.__typechecker_into_fields();
     if fields.source_bundle_digest_v1 != parsed.source_bundle_digest_v1() {
         return Err(format!(
@@ -16862,7 +16920,7 @@ pub fn seal_project_checked_program_construction_with_kernel_publication(
             fields.calls.len(),
         ));
     }
-    let image_handoff =
+    let (image_handoff, pairing) =
         checked_image_handoff_from_kernel_publication(&fields, authority, publication)?;
     #[cfg(test)]
     {
@@ -16968,7 +17026,12 @@ pub fn seal_project_checked_program_construction_with_kernel_publication(
             }
         }
     }
-    seal_kernel_checked_program_fields(fields, image_handoff, Some(authority))
+    let pairing_receipt = boon_checked::CheckedImageKernelPairingReceiptV1::__typechecker_new(
+        pairing,
+        &image_handoff,
+    );
+    let program = seal_kernel_checked_program_fields(fields, image_handoff, Some(authority))?;
+    Ok((program, pairing_receipt))
 }
 
 fn seal_project_checked_program_construction_with_authority(

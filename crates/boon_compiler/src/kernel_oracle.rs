@@ -19908,8 +19908,8 @@ FUNCTION address(row) {{
                 replay_fields,
             )
         };
-        let direct =
-            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication(
+        let (direct, direct_pairing) =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication_and_pairing(
                 &project,
                 direct_construction,
                 &checked.call_occurrences,
@@ -19927,7 +19927,7 @@ FUNCTION address(row) {{
             .expect("seal rich semantic checked replay");
         let packed_input = checked
             .semantic_input
-            .seal(&direct)
+            .seal(&direct, &direct_pairing)
             .expect("bind packed semantic authority to checked image");
         let packed = boon_semantic::elaborate_kernel(direct, packed_input, &[])
             .expect("packed resource semantics elaborate");
@@ -19968,6 +19968,44 @@ FUNCTION address(row) {{
                 compact.checked_image_publication,
             )
             .expect("seal runtime-packed checked image");
+
+        let independent = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::RuntimePacked,
+        )
+        .expect("build independent same-shaped packed fixture");
+        // SAFETY: this is a separately completed dense construction used to
+        // prove that content equality cannot substitute for provenance.
+        let independent_construction = unsafe {
+            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                independent.fields,
+            )
+        };
+        let (independent_program, independent_pairing) =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication_and_pairing(
+                &project,
+                independent_construction,
+                &independent.call_occurrences,
+                &independent.checked_image_authority,
+                independent.checked_image_publication,
+            )
+            .expect("seal independent same-shaped checked image");
+        assert_eq!(
+            compact_program.image_handoff().local_image_digest,
+            independent_program.image_handoff().local_image_digest,
+            "fixture must prove provenance rather than content mismatch",
+        );
+        let mismatch = compact
+            .semantic_input
+            .seal(&independent_program, &independent_pairing)
+            .expect_err("same-shaped independent constructions must not cross-pair");
+        assert!(
+            mismatch
+                .to_string()
+                .contains("different construction identities"),
+            "unexpected cross-pair error: {mismatch}",
+        );
         let error = boon_semantic::elaborate(compact_program, &[])
             .expect_err("compact resource rows without packed authority must fail closed");
         assert!(

@@ -764,7 +764,7 @@ pub fn compile_artifact_oracle_pair(
         &parsed,
         &external_types,
     );
-    let checked = checked_program_from_output(
+    let (checked, _) = checked_program_from_output(
         CheckedSyntaxRef::Assembled(&parsed),
         check_output,
         None,
@@ -1156,15 +1156,18 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         CheckedSourceSyntax::Assembled(program) => CheckedSyntaxRef::Assembled(program),
         CheckedSourceSyntax::UnitNative(program) => CheckedSyntaxRef::UnitNative(program),
     };
-    let checked = checked_program_from_output(
+    let (checked, kernel_pairing_receipt) = checked_program_from_output(
         syntax,
         output,
         checked_call_occurrences,
         checked_image_kernel_authority,
         checked_image_kernel_publication,
     )?;
+    let kernel_pairing_receipt = kernel_pairing_receipt.ok_or_else(|| {
+        PlanError::new("kernel checked construction produced no semantic pairing receipt")
+    })?;
     let kernel_semantic_input = kernel_semantic_input
-        .seal(&checked)
+        .seal(&checked, &kernel_pairing_receipt)
         .map_err(|error| PlanError::new(error.to_string()))?;
     if deferred_runtime_handoff {
         let runtime_handoff_ms = elapsed_ms(runtime_handoff_started);
@@ -1329,7 +1332,10 @@ fn checked_program_from_output(
     checked_call_occurrences: Option<Box<[boon_syntax::StableOccurrenceKey]>>,
     checked_image_kernel_authority: Option<Box<boon_checked::CheckedImageKernelAuthorityV1>>,
     checked_image_kernel_publication: Option<Box<boon_checked::CheckedImageKernelPublicationV1>>,
-) -> CompilerResult<boon_checked::CheckedProgram> {
+) -> CompilerResult<(
+    boon_checked::CheckedProgram,
+    Option<boon_checked::CheckedImageKernelPairingReceiptV1>,
+)> {
     if output.report.has_errors() {
         let diagnostics = output
             .report
@@ -1369,7 +1375,7 @@ fn checked_program_from_output(
         .into());
     }
     match (output.program, output.construction) {
-        (Some(program), None) => Ok(program),
+        (Some(program), None) => Ok((program, None)),
         (None, Some(construction)) => match syntax {
             CheckedSyntaxRef::Assembled(program)
                 if checked_call_occurrences.is_none()
@@ -1377,6 +1383,7 @@ fn checked_program_from_output(
                     && checked_image_kernel_publication.is_none() =>
             {
                 boon_typecheck::seal_checked_program_construction(program, construction)
+                    .map(|program| (program, None))
                     .map_err(|error| PlanError::new(error).into())
             }
             CheckedSyntaxRef::Assembled(_) => Err(PlanError::new(
@@ -1389,14 +1396,15 @@ fn checked_program_from_output(
                 checked_image_kernel_publication,
             ) {
                 (Some(call_occurrences), Some(authority), Some(publication)) => {
-                    boon_typecheck::seal_project_checked_program_construction_with_kernel_publication(
-                        program,
-                        construction,
-                        &call_occurrences,
-                        &authority,
-                        *publication,
-                    )
-                    .map_err(|error| PlanError::new(error).into())
+                    boon_typecheck::seal_project_checked_program_construction_with_kernel_publication_and_pairing(
+                            program,
+                            construction,
+                            &call_occurrences,
+                            &authority,
+                            *publication,
+                        )
+                        .map(|(program, receipt)| (program, Some(receipt)))
+                        .map_err(|error| PlanError::new(error).into())
                 }
                 (Some(_), Some(_), None) => Err(PlanError::new(
                     "kernel checked authority has no construction-owned image publication",
@@ -1408,6 +1416,7 @@ fn checked_program_from_output(
                         construction,
                         &call_occurrences,
                     )
+                    .map(|program| (program, None))
                     .map_err(|error| PlanError::new(error).into())
                 }
                 (None, None, None) => {
@@ -1415,6 +1424,7 @@ fn checked_program_from_output(
                         program,
                         construction,
                     )
+                    .map(|program| (program, None))
                     .map_err(|error| PlanError::new(error).into())
                 }
                 _ => Err(PlanError::new(

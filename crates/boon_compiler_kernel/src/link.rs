@@ -2238,6 +2238,13 @@ impl KernelCheckedLinkLayout {
                 snapshot.definitions.len(),
             )));
         }
+        if snapshot.definition_facts.len() != snapshot.definitions.len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel checked linker received {} immutable fact rows and {} solved artifacts",
+                snapshot.definition_facts.len(),
+                snapshot.definitions.len(),
+            )));
+        }
         if snapshot.definition_code.definition_count() != snapshot.definitions.len() {
             return Err(KernelCheckedLinkError::new(format!(
                 "kernel checked linker received {} rich definitions and {} packed definitions",
@@ -2259,6 +2266,7 @@ impl KernelCheckedLinkLayout {
         let mut definitions = Vec::with_capacity(snapshot.definitions.len());
         let mut public_declaration_authorities = Vec::with_capacity(snapshot.definitions.len());
         for (index, definition) in snapshot.definitions.iter().enumerate() {
+            let facts = &snapshot.definition_facts[index];
             let owner = KernelOwnerId(u32::try_from(index).map_err(|_| {
                 KernelCheckedLinkError::new("kernel checked linker definition count exceeds u32")
             })?);
@@ -2268,11 +2276,7 @@ impl KernelCheckedLinkLayout {
                     owner.0
                 ))
             })?;
-            let scopes = take_range(
-                &mut totals.scopes,
-                definition.presentation.scopes.len(),
-                "scope",
-            )?;
+            let scopes = take_range(&mut totals.scopes, facts.presentation.scopes.len(), "scope")?;
             let expressions = take_range(
                 &mut totals.expressions,
                 definition.expressions.len(),
@@ -2439,8 +2443,9 @@ impl KernelCheckedLinkLayout {
                 KernelCheckedLinkError::new("kernel checked linker callable namespace exceeds u32")
             })?;
         }
-        for (index, definition) in snapshot.definitions.iter().enumerate() {
-            definitions[index].containing_scope = match definition.presentation.containing_scope {
+        for (index, _definition) in snapshot.definitions.iter().enumerate() {
+            let facts = &snapshot.definition_facts[index];
+            definitions[index].containing_scope = match facts.presentation.containing_scope {
                 KernelScopeReference::ProjectRoot => LexicalScopeId(0),
                 KernelScopeReference::Owner { owner, scope } => LexicalScopeId(
                     definitions
@@ -3674,9 +3679,9 @@ impl KernelCheckedLinkLayout {
         let mut owner = owner;
         let mut scope = scope;
         let mut remaining = snapshot
-            .definitions
+            .definition_facts
             .iter()
-            .map(|definition| definition.presentation.scopes.len())
+            .map(|facts| facts.presentation.scopes.len())
             .sum::<usize>()
             .saturating_add(snapshot.definitions.len())
             .saturating_add(1);
@@ -3690,13 +3695,13 @@ impl KernelCheckedLinkLayout {
             match scope {
                 KernelScopeReference::ProjectRoot => return Ok(None),
                 KernelScopeReference::Containing => {
-                    let definition = snapshot.definitions.get(owner.0 as usize).ok_or_else(|| {
+                    let facts = snapshot.definition_facts.get(owner.0 as usize).ok_or_else(|| {
                         KernelCheckedLinkError::new(format!(
                             "kernel lexical declaration lookup references missing definition {}",
                             owner.0,
                         ))
                     })?;
-                    scope = definition.presentation.containing_scope;
+                    scope = facts.presentation.containing_scope;
                 }
                 KernelScopeReference::Owner {
                     owner: provider,
@@ -3706,13 +3711,13 @@ impl KernelCheckedLinkLayout {
                     scope = KernelScopeReference::Local(provider_scope);
                 }
                 KernelScopeReference::Local(local) => {
-                    let definition = snapshot.definitions.get(owner.0 as usize).ok_or_else(|| {
+                    let facts = snapshot.definition_facts.get(owner.0 as usize).ok_or_else(|| {
                         KernelCheckedLinkError::new(format!(
                             "kernel lexical declaration lookup references missing definition {}",
                             owner.0,
                         ))
                     })?;
-                    let row = definition
+                    let row = facts
                         .presentation
                         .scopes
                         .get(local.0 as usize)
@@ -3752,14 +3757,15 @@ impl KernelCheckedLinkLayout {
             kind: CheckedScopeKind::Root,
             span: CheckedSpan::default(),
         });
-        for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+        for (owner_index, _definition) in snapshot.definitions.iter().enumerate() {
+            let facts = &snapshot.definition_facts[owner_index];
             let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
                 KernelCheckedLinkError::new(
                     "kernel checked scope materializer definition count exceeds u32",
                 )
             })?);
             let layout = self.definition(owner)?;
-            for scope in &definition.presentation.scopes {
+            for scope in &facts.presentation.scopes {
                 let id = LexicalScopeId(layout.scopes.resolve(scope.id.0, "scope row")?);
                 if id.0 as usize != scopes.len() {
                     return Err(KernelCheckedLinkError::new(format!(
@@ -3821,23 +3827,24 @@ impl KernelCheckedLinkLayout {
         );
         let mut type_cache = snapshot.definition_code.materialization_cache();
         for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let facts = &snapshot.definition_facts[owner_index];
             let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
                 KernelCheckedLinkError::new(
                     "kernel checked declaration materializer definition count exceeds u32",
                 )
             })?);
-            if definition.declarations.len() != definition.presentation.declarations.len() {
+            if definition.declarations.len() != facts.presentation.declarations.len() {
                 return Err(KernelCheckedLinkError::new(format!(
                     "kernel definition {} has {} declaration artifacts but {} declaration presentations",
                     owner.0,
                     definition.declarations.len(),
-                    definition.presentation.declarations.len(),
+                    facts.presentation.declarations.len(),
                 )));
             }
             for (declaration, presentation) in definition
                 .declarations
                 .iter()
-                .zip(definition.presentation.declarations.iter())
+                .zip(facts.presentation.declarations.iter())
             {
                 if declaration.id != presentation.declaration {
                     return Err(KernelCheckedLinkError::new(format!(
@@ -3967,23 +3974,24 @@ impl KernelCheckedLinkLayout {
 
         let mut statements = Vec::with_capacity(self.totals.statements as usize);
         for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let facts = &snapshot.definition_facts[owner_index];
             let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
                 KernelCheckedLinkError::new(
                     "kernel checked statement materializer definition count exceeds u32",
                 )
             })?);
-            if definition.statements.len() != definition.presentation.statements.len() {
+            if definition.statements.len() != facts.presentation.statements.len() {
                 return Err(KernelCheckedLinkError::new(format!(
                     "kernel definition {} has {} statement artifacts but {} statement presentations",
                     owner.0,
                     definition.statements.len(),
-                    definition.presentation.statements.len(),
+                    facts.presentation.statements.len(),
                 )));
             }
             for (statement, presentation) in definition
                 .statements
                 .iter()
-                .zip(definition.presentation.statements.iter())
+                .zip(facts.presentation.statements.iter())
             {
                 if statement.id != presentation.statement {
                     return Err(KernelCheckedLinkError::new(format!(
@@ -4074,6 +4082,7 @@ impl KernelCheckedLinkLayout {
         let mut declaration_metadata =
             BTreeMap::<DeclId, (KernelOwnerId, KernelScopeReference, Box<str>)>::new();
         for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let facts = &snapshot.definition_facts[owner_index];
             let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
                 KernelCheckedLinkError::new(
                     "kernel checked expression materializer definition count exceeds u32",
@@ -4082,7 +4091,7 @@ impl KernelCheckedLinkLayout {
             for (declaration, presentation) in definition
                 .declarations
                 .iter()
-                .zip(definition.presentation.declarations.iter())
+                .zip(facts.presentation.declarations.iter())
             {
                 let linked =
                     self.declaration(owner, KernelDeclarationReference::Local(declaration.id))?;
@@ -4168,6 +4177,7 @@ impl KernelCheckedLinkLayout {
         let mut expressions = Vec::with_capacity(self.totals.expressions as usize);
         let mut type_cache = snapshot.definition_code.materialization_cache();
         for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let facts = &snapshot.definition_facts[owner_index];
             let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
                 KernelCheckedLinkError::new(
                     "kernel checked expression materializer definition count exceeds u32",
@@ -4185,16 +4195,16 @@ impl KernelCheckedLinkLayout {
             );
             let local_len = definition.expressions.len();
             if code.expressions().len() != local_len
-                || definition.presentation.expressions.len() != local_len
-                || definition.expression_payloads.len() != local_len
+                || facts.presentation.expressions.len() != local_len
+                || facts.expression_payloads.len() != local_len
             {
                 return Err(KernelCheckedLinkError::new(format!(
                     "kernel definition {} packed flows, expression artifacts, presentation, and payload tables differ: {} / {} / {} / {}",
                     owner.0,
                     code.expressions().len(),
                     local_len,
-                    definition.presentation.expressions.len(),
-                    definition.expression_payloads.len(),
+                    facts.presentation.expressions.len(),
+                    facts.expression_payloads.len(),
                 )));
             }
             let mut shapes = vec![None; local_len];
@@ -4257,8 +4267,8 @@ impl KernelCheckedLinkLayout {
             for (((expression, presentation), payload), local_ordinal) in definition
                 .expressions
                 .iter()
-                .zip(definition.presentation.expressions.iter())
-                .zip(definition.expression_payloads.iter())
+                .zip(facts.presentation.expressions.iter())
+                .zip(facts.expression_payloads.iter())
                 .zip(0..)
             {
                 if expression.id != presentation.expression
@@ -4289,6 +4299,7 @@ impl KernelCheckedLinkLayout {
                     self,
                     owner,
                     definition,
+                    facts,
                     expression,
                     presentation.span.line,
                     declaration,
@@ -4357,6 +4368,7 @@ impl KernelCheckedLinkLayout {
         let mut context_formals = Vec::with_capacity(self.totals.context_formals as usize);
         let mut type_cache = snapshot.definition_code.materialization_cache();
         for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let facts = &snapshot.definition_facts[owner_index];
             let owner = checked_owner_id(owner_index, "user callable")?;
             let code = snapshot.definition_code.definition(owner).ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
@@ -4415,14 +4427,14 @@ impl KernelCheckedLinkLayout {
                         owner.0, public_declaration.0,
                     ))
                 })?;
-            let public_presentation = declaration_presentation(definition, public_declaration)?;
+            let public_presentation = declaration_presentation(facts, public_declaration)?;
             let body_scope = public_presentation.body_scope.ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
                     "kernel callable definition {} has no body scope",
                     owner.0,
                 ))
             })?;
-            let root_presentation = statement_presentation(definition, root_statement)?;
+            let root_presentation = statement_presentation(facts, root_statement)?;
             if root_presentation.body_scope != Some(body_scope) {
                 return Err(KernelCheckedLinkError::new(format!(
                     "kernel callable definition {} function declaration and statement disagree on body scope",
@@ -4482,7 +4494,7 @@ impl KernelCheckedLinkLayout {
                         owner.0, parameter.ordinal,
                     )));
                 }
-                let presentation = declaration_presentation(definition, declaration.id)?;
+                let presentation = declaration_presentation(facts, declaration.id)?;
                 let evaluation_scope = match parameter.evaluation_scope {
                     crate::KernelParameterEvaluationScope::Parent => CheckedEvaluationScope::Parent,
                     crate::KernelParameterEvaluationScope::Output { parameter_ordinal } => {
@@ -4850,6 +4862,7 @@ impl KernelCheckedLinkLayout {
         let mut call_occurrences = Vec::with_capacity(self.totals.calls as usize);
         let mut type_cache = snapshot.definition_code.materialization_cache();
         for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let facts = &snapshot.definition_facts[owner_index];
             let owner = checked_owner_id(owner_index, "call")?;
             let local = self.definition(owner)?;
             let code = snapshot.definition_code.definition(owner).ok_or_else(|| {
@@ -5041,7 +5054,7 @@ impl KernelCheckedLinkLayout {
                                         "FreshOut",
                                     )?;
                                     let presentation =
-                                        declaration_presentation(definition, declaration.id)?;
+                                        declaration_presentation(facts, declaration.id)?;
                                     let scope = presentation.body_scope.ok_or_else(|| {
                                         KernelCheckedLinkError::new(format!(
                                             "kernel definition {} FreshOut `{}` has no output scope",
@@ -5136,7 +5149,7 @@ impl KernelCheckedLinkLayout {
                             context.name,
                         )));
                     }
-                    let presentation = declaration_presentation(definition, declaration.id)?;
+                    let presentation = declaration_presentation(facts, declaration.id)?;
                     contexts.push(boon_checked::CheckedCallContext {
                         declaration: self.declaration(
                             owner,
@@ -5315,7 +5328,7 @@ impl KernelCheckedLinkLayout {
                 }
                 let result = call_result;
                 let syntax_discriminated_result = packed_call.syntax_discriminated_result;
-                let presentation = expression_presentation(definition, call.expression)?;
+                let presentation = expression_presentation(facts, call.expression)?;
                 let id = self.call(
                     owner,
                     u32::try_from(ordinal).map_err(|_| {
@@ -5376,6 +5389,7 @@ impl KernelCheckedLinkLayout {
         let mut sources = Vec::with_capacity(self.totals.sources as usize);
         let mut type_cache = snapshot.definition_code.materialization_cache();
         for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let facts = &snapshot.definition_facts[owner_index];
             let owner = checked_owner_id(owner_index, "SOURCE")?;
             let code = snapshot.definition_code.definition(owner).ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
@@ -5396,7 +5410,7 @@ impl KernelCheckedLinkLayout {
                         id.0,
                     )));
                 }
-                let presentation = expression_presentation(definition, source.expression)?;
+                let presentation = expression_presentation(facts, source.expression)?;
                 sources.push(CheckedSource {
                     id,
                     declaration: self.declaration(owner, source.declaration)?,
@@ -5432,6 +5446,7 @@ impl KernelCheckedLinkLayout {
         let mut states = Vec::with_capacity(self.totals.states as usize);
         let mut type_cache = snapshot.definition_code.materialization_cache();
         for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let facts = &snapshot.definition_facts[owner_index];
             let owner = checked_owner_id(owner_index, "state")?;
             let code = snapshot.definition_code.definition(owner).ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
@@ -5457,7 +5472,7 @@ impl KernelCheckedLinkLayout {
                         let (statement_owner, statement) =
                             self.local_statement_reference(snapshot, owner, state.statement)?;
                         let presentation = statement_presentation(
-                            &snapshot.definitions[statement_owner.0 as usize],
+                            &snapshot.definition_facts[statement_owner.0 as usize],
                             statement,
                         )?;
                         (
@@ -5465,7 +5480,7 @@ impl KernelCheckedLinkLayout {
                             checked_span(presentation.span),
                         )
                     } else {
-                        let presentation = expression_presentation(definition, state.expression)?;
+                        let presentation = expression_presentation(facts, state.expression)?;
                         (
                             self.scope(owner, presentation.scope)?,
                             checked_span(presentation.span),
@@ -5508,6 +5523,7 @@ impl KernelCheckedLinkLayout {
         let mut lists = Vec::with_capacity(self.totals.lists as usize);
         let mut type_cache = snapshot.definition_code.materialization_cache();
         for (owner_index, definition) in snapshot.definitions.iter().enumerate() {
+            let facts = &snapshot.definition_facts[owner_index];
             let owner = checked_owner_id(owner_index, "LIST")?;
             let code = snapshot.definition_code.definition(owner).ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
@@ -5528,7 +5544,7 @@ impl KernelCheckedLinkLayout {
                         id.0,
                     )));
                 }
-                let presentation = expression_presentation(definition, list.producer)?;
+                let presentation = expression_presentation(facts, list.producer)?;
                 lists.push(CheckedList {
                     id,
                     declaration: self.declaration(owner, list.declaration)?,
@@ -5707,10 +5723,11 @@ impl KernelCheckedLinkLayout {
     ) -> Result<(), KernelCheckedLinkError> {
         let mut resolved = 0_u64;
         for (index, definition) in snapshot.definitions.iter().enumerate() {
+            let facts = &snapshot.definition_facts[index];
             let owner = KernelOwnerId(u32::try_from(index).expect("definition index fits u32"));
             let local = self.definition(owner)?.clone();
-            let _ = self.scope(owner, definition.presentation.containing_scope)?;
-            for scope in &definition.presentation.scopes {
+            let _ = self.scope(owner, facts.presentation.containing_scope)?;
+            for scope in &facts.presentation.scopes {
                 let _ = local.scopes.resolve(scope.id.0, "scope presentation")?;
                 let _ = self.scope(owner, scope.parent)?;
                 if let Some(declaration) = scope.owner {
@@ -5719,7 +5736,7 @@ impl KernelCheckedLinkLayout {
                 }
                 resolved = resolved.saturating_add(1);
             }
-            for expression in &definition.presentation.expressions {
+            for expression in &facts.presentation.expressions {
                 let _ = local
                     .expressions
                     .resolve(expression.expression.0, "expression presentation")?;
@@ -5730,7 +5747,7 @@ impl KernelCheckedLinkLayout {
                 }
                 resolved = resolved.saturating_add(1);
             }
-            for statement in &definition.presentation.statements {
+            for statement in &facts.presentation.statements {
                 let _ = local
                     .statements
                     .resolve(statement.statement.0, "statement presentation")?;
@@ -5741,7 +5758,7 @@ impl KernelCheckedLinkLayout {
                 }
                 resolved = resolved.saturating_add(1);
             }
-            for declaration in &definition.presentation.declarations {
+            for declaration in &facts.presentation.declarations {
                 let _ = local
                     .declarations
                     .resolve(declaration.declaration.0, "declaration presentation")?;
@@ -5996,11 +6013,20 @@ fn definition_template_dependencies(
 ) -> Result<Vec<(KernelOwnerId, crate::KernelExpressionId)>, KernelCheckedLinkError> {
     let definition = snapshot.definitions.get(owner.0 as usize).ok_or_else(|| {
         KernelCheckedLinkError::new(format!(
-            "kernel definition template references missing owner {}",
+            "kernel definition template references missing solved owner {}",
             owner.0,
         ))
     })?;
-    let payload = definition
+    let facts = snapshot
+        .definition_facts
+        .get(owner.0 as usize)
+        .ok_or_else(|| {
+            KernelCheckedLinkError::new(format!(
+                "kernel definition template references missing owner {}",
+                owner.0,
+            ))
+        })?;
+    let payload = facts
         .expression_payloads
         .get(expression.id.0 as usize)
         .ok_or_else(|| {
@@ -6401,10 +6427,10 @@ fn definition_template_selector(
 }
 
 fn expression_presentation(
-    definition: &crate::DefinitionArtifact,
+    facts: &crate::KernelDefinitionFactsInput,
     expression: crate::KernelExpressionId,
 ) -> Result<&crate::KernelExpressionPresentation, KernelCheckedLinkError> {
-    definition
+    facts
         .presentation
         .expressions
         .get(expression.0 as usize)
@@ -6418,10 +6444,10 @@ fn expression_presentation(
 }
 
 fn statement_presentation(
-    definition: &crate::DefinitionArtifact,
+    facts: &crate::KernelDefinitionFactsInput,
     statement: crate::KernelStatementId,
 ) -> Result<&crate::KernelStatementPresentation, KernelCheckedLinkError> {
-    definition
+    facts
         .presentation
         .statements
         .get(statement.0 as usize)
@@ -6435,10 +6461,10 @@ fn statement_presentation(
 }
 
 fn declaration_presentation(
-    definition: &crate::DefinitionArtifact,
+    facts: &crate::KernelDefinitionFactsInput,
     declaration: crate::KernelDeclarationId,
 ) -> Result<&crate::KernelDeclarationPresentation, KernelCheckedLinkError> {
-    definition
+    facts
         .presentation
         .declarations
         .get(declaration.0 as usize)
@@ -6644,6 +6670,7 @@ fn checked_expression_kind(
     layout: &KernelCheckedLinkLayout,
     owner: KernelOwnerId,
     definition: &crate::DefinitionArtifact,
+    facts: &crate::KernelDefinitionFactsInput,
     expression: &crate::KernelExpressionArtifact,
     container_line: usize,
     container_declaration: Option<DeclId>,
@@ -6998,11 +7025,8 @@ fn checked_expression_kind(
         | crate::KernelExpressionArtifactKind::PatternRead { .. }
         | crate::KernelExpressionArtifactKind::CollectionItemRead
         | crate::KernelExpressionArtifactKind::FreshOut => {
-            let stable = definition
-                .relocations
-                .expressions
-                .get(expression.id.0 as usize);
-            let span = definition
+            let stable = facts.relocations.expressions.get(expression.id.0 as usize);
+            let span = facts
                 .presentation
                 .expressions
                 .get(expression.id.0 as usize)
@@ -8438,7 +8462,9 @@ mod tests {
         );
 
         let mut scoped = (*snapshot).clone();
-        scoped.definitions[0].presentation.scopes = vec![crate::KernelScopePresentation {
+        Arc::make_mut(&mut scoped.definition_facts)[0]
+            .presentation
+            .scopes = vec![crate::KernelScopePresentation {
             id: crate::KernelScopeId(0),
             parent: KernelScopeReference::Containing,
             owner: Some(KernelDeclarationReference::Local(KernelDeclarationId(0))),
@@ -8453,7 +8479,9 @@ mod tests {
             },
         }]
         .into_boxed_slice();
-        scoped.definitions[1].presentation.containing_scope = KernelScopeReference::Owner {
+        Arc::make_mut(&mut scoped.definition_facts)[1]
+            .presentation
+            .containing_scope = KernelScopeReference::Owner {
             owner: KernelOwnerId(0),
             scope: crate::KernelScopeId(0),
         };
@@ -8527,7 +8555,9 @@ mod tests {
         assert_eq!(materialized_statements[1].children, [CheckedStatementId(0)]);
 
         let mut missing_scope = scoped.clone();
-        missing_scope.definitions[1].presentation.containing_scope = KernelScopeReference::Owner {
+        Arc::make_mut(&mut missing_scope.definition_facts)[1]
+            .presentation
+            .containing_scope = KernelScopeReference::Owner {
             owner: KernelOwnerId(0),
             scope: crate::KernelScopeId(99),
         };

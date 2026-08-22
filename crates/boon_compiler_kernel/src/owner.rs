@@ -977,6 +977,7 @@ pub struct KernelOwnerProgram {
 pub struct KernelProjectProgram {
     component: ComponentProgram,
     owners: Box<[KernelProjectOwnerOutputs]>,
+    definition_facts: Arc<[KernelDefinitionFactsInput]>,
     /// Exact immutable ABI metadata needed by post-solve packed publication.
     /// Type equations have already consumed the ABI; retaining this shared
     /// table avoids reconstructing contextual call behavior from checked DTOs.
@@ -990,6 +991,7 @@ pub struct KernelProjectProgram {
 pub(crate) struct KernelProjectSolveSession {
     component: ComponentSolveSession,
     owners: Box<[KernelProjectOwnerOutputs]>,
+    definition_facts: Arc<[KernelDefinitionFactsInput]>,
     abi: Arc<crate::KernelAbiInput>,
     compile_work: KernelCompileWork,
 }
@@ -1004,6 +1006,7 @@ pub struct KernelSolvedProject {
     artifact: ComponentArtifact,
     definition_code: Arc<DefinitionCodeStore>,
     owners: Box<[KernelProjectOwnerOutputs]>,
+    definition_facts: Arc<[KernelDefinitionFactsInput]>,
     derived: Arc<KernelSolvedDerived>,
 }
 
@@ -1078,9 +1081,6 @@ struct KernelProjectOwnerOutputs {
     expression_modes: Box<[FlowMode]>,
     expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
     linkage: KernelDefinitionLinkage,
-    relocations: KernelDefinitionRelocations,
-    presentation: KernelDefinitionPresentation,
-    expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     call_syntax: Box<[KernelCallSyntaxArtifact]>,
     execution_shapes: Box<[KernelExecutionShapeArtifact]>,
     statements: Box<[KernelStatementArtifact]>,
@@ -2417,12 +2417,9 @@ pub struct KernelListArtifact {
 
 /// Type-free structural rows for one production definition. All type-bearing
 /// columns are addressed through the sibling `DefinitionCodeStore` entry.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DefinitionArtifact {
     pub linkage: KernelDefinitionLinkage,
-    pub relocations: KernelDefinitionRelocations,
-    pub presentation: KernelDefinitionPresentation,
-    pub expression_payloads: Box<[KernelExpressionSemanticPayload]>,
     pub call_syntax: Box<[KernelCallSyntaxArtifact]>,
     pub execution_shapes: Box<[KernelExecutionShapeArtifact]>,
     pub expressions: Box<[KernelExpressionArtifact]>,
@@ -2509,6 +2506,10 @@ pub struct KernelDefinitionSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCheckedSnapshot {
     pub definitions: Box<[DefinitionArtifact]>,
+    /// Shared immutable syntax/link facts for every dense definition. These
+    /// rows are owned once by `KernelProjectInput`; checked publication keeps
+    /// the same allocation instead of cloning rich paths and literal values.
+    pub definition_facts: Arc<[KernelDefinitionFactsInput]>,
     /// One packed, store-qualified authority for all solver-owned definition
     /// flow roots. The checked linker consumes this directly; rich artifacts
     /// no longer retain one boxed flow sidecar per definition.
@@ -2611,6 +2612,7 @@ pub struct KernelDemandedDefinitionArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelDemandedDefinitionSnapshot {
     pub definitions: Box<[KernelDemandedDefinitionArtifact]>,
+    pub definition_facts: Arc<[KernelDefinitionFactsInput]>,
     pub definition_code: Arc<DefinitionCodeStore>,
     pub type_store: Arc<FrozenTypeStore>,
     pub interface: Arc<KernelInterfaceSnapshot>,
@@ -2773,6 +2775,7 @@ impl KernelProjectProgram {
         Ok(KernelProjectSolveSession {
             component: ComponentSolveSession::new(self.component)?,
             owners: self.owners,
+            definition_facts: self.definition_facts,
             abi: self.abi,
             compile_work: self.compile_work,
         })
@@ -2844,10 +2847,15 @@ impl KernelProjectSolveSession {
             &diagnostics,
         ));
         let flush_terms = project_expression_flush_terms(&self.owners, &mut artifact)?;
-        let resource_projection_facts =
-            project_resource_projection_facts(&self.owners, &self.abi, &mut artifact)?;
+        let resource_projection_facts = project_resource_projection_facts(
+            &self.owners,
+            &self.definition_facts,
+            &self.abi,
+            &mut artifact,
+        )?;
         let definition_code = build_definition_code_builder(
             &self.owners,
+            &self.definition_facts,
             &self.abi,
             &mut artifact,
             &flush_terms,
@@ -2867,6 +2875,7 @@ impl KernelProjectSolveSession {
             artifact,
             definition_code,
             owners: self.owners,
+            definition_facts: self.definition_facts,
             derived: Arc::new(KernelSolvedDerived { interface }),
         })
     }
@@ -2910,6 +2919,7 @@ impl KernelSolvedProject {
         let receipts_started = Instant::now();
         let (dependencies, currentness) = build_packed_snapshot_receipts(
             &definitions,
+            &self.definition_facts,
             &definition_code,
             &interface,
             &basis_fingerprints,
@@ -2923,6 +2933,7 @@ impl KernelSolvedProject {
         }
         Ok(KernelCheckedSnapshot {
             definitions,
+            definition_facts: self.definition_facts,
             definition_code,
             type_store,
             interface,
@@ -2984,6 +2995,7 @@ impl KernelSolvedProject {
         debug_assert!(demanded_iter.next().is_none());
         Ok(KernelDemandedDefinitionSnapshot {
             definitions: definitions.into_boxed_slice(),
+            definition_facts: self.definition_facts,
             definition_code,
             type_store,
             interface,
@@ -3257,6 +3269,7 @@ struct ResourceProjectionRequirementFact {
 
 struct ResourceProjectionResolver<'a> {
     owners: &'a [KernelProjectOwnerOutputs],
+    definition_facts: &'a [KernelDefinitionFactsInput],
     abi: &'a crate::KernelAbiInput,
     text: ProjectTextSnapshot,
     lexical_by_expression: Box<[Box<[Option<ResourceLexicalIndex>]>]>,
@@ -3276,6 +3289,7 @@ struct ResourceProjectionResolver<'a> {
 impl<'a> ResourceProjectionResolver<'a> {
     fn new(
         owners: &'a [KernelProjectOwnerOutputs],
+        definition_facts: &'a [KernelDefinitionFactsInput],
         abi: &'a crate::KernelAbiInput,
         text: ProjectTextSnapshot,
     ) -> Result<Self, KernelSolveError> {
@@ -3387,6 +3401,7 @@ impl<'a> ResourceProjectionResolver<'a> {
 
         let mut resolver = Self {
             owners,
+            definition_facts,
             abi,
             text,
             lexical_by_expression,
@@ -3417,6 +3432,10 @@ impl<'a> ResourceProjectionResolver<'a> {
 
     fn owner(&self, owner: KernelOwnerId) -> Option<&'a KernelProjectOwnerOutputs> {
         self.owners.get(owner.0 as usize)
+    }
+
+    fn facts(&self, owner: KernelOwnerId) -> Option<&'a KernelDefinitionFactsInput> {
+        self.definition_facts.get(owner.0 as usize)
     }
 
     fn declaration_key(
@@ -3800,9 +3819,9 @@ impl<'a> ResourceProjectionResolver<'a> {
         mut scope: KernelScopeReference,
     ) -> Option<ResourceDeclarationKey> {
         let mut remaining = self
-            .owners
+            .definition_facts
             .iter()
-            .map(|owner| owner.presentation.scopes.len())
+            .map(|facts| facts.presentation.scopes.len())
             .sum::<usize>()
             .saturating_add(self.owners.len())
             .saturating_add(1);
@@ -3814,7 +3833,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             match scope {
                 KernelScopeReference::ProjectRoot => return None,
                 KernelScopeReference::Containing => {
-                    scope = self.owner(owner)?.presentation.containing_scope;
+                    scope = self.facts(owner)?.presentation.containing_scope;
                 }
                 KernelScopeReference::Owner {
                     owner: provider,
@@ -3825,7 +3844,7 @@ impl<'a> ResourceProjectionResolver<'a> {
                 }
                 KernelScopeReference::Local(local) => {
                     let row = self
-                        .owner(owner)?
+                        .facts(owner)?
                         .presentation
                         .scopes
                         .get(local.0 as usize)?;
@@ -3842,7 +3861,7 @@ impl<'a> ResourceProjectionResolver<'a> {
         &self,
         key: ResourceDeclarationKey,
     ) -> Option<&'a KernelDeclarationPresentation> {
-        self.owner(key.owner)?
+        self.facts(key.owner)?
             .presentation
             .declarations
             .iter()
@@ -4746,11 +4765,16 @@ fn packed_resource_projection_type_is_specific(
 
 fn project_resource_projection_facts(
     owners: &[KernelProjectOwnerOutputs],
+    definition_facts: &[KernelDefinitionFactsInput],
     abi: &crate::KernelAbiInput,
     artifact: &mut UnsealedComponentArtifact,
 ) -> Result<Box<[DefinitionResourceProjectionFacts]>, KernelSolveError> {
-    let mut resolver =
-        ResourceProjectionResolver::new(owners, abi, artifact.terms().text_snapshot().clone())?;
+    let mut resolver = ResourceProjectionResolver::new(
+        owners,
+        definition_facts,
+        abi,
+        artifact.terms().text_snapshot().clone(),
+    )?;
     let mut facts = owners
         .iter()
         .map(|_| DefinitionResourceProjectionFacts::default())
@@ -4932,6 +4956,7 @@ fn project_resource_projection_facts(
 
 fn build_definition_code_builder(
     owners: &[KernelProjectOwnerOutputs],
+    definition_facts: &[KernelDefinitionFactsInput],
     abi: &crate::KernelAbiInput,
     artifact: &mut UnsealedComponentArtifact,
     flush_terms: &ProjectExpressionFlushTerms,
@@ -5281,7 +5306,7 @@ fn build_definition_code_builder(
             },
         )?;
     }
-    build_definition_execution_code(owners, abi, &mut builder)?;
+    build_definition_execution_code(owners, definition_facts, abi, &mut builder)?;
     Ok(builder)
 }
 
@@ -5408,13 +5433,14 @@ fn definition_execution_declaration(
 
 fn definition_execution_scope_callable(
     owners: &[KernelProjectOwnerOutputs],
+    definition_facts: &[KernelDefinitionFactsInput],
     mut owner: KernelOwnerId,
     mut scope: KernelScopeReference,
     context: &str,
 ) -> Result<Option<PackedDeclarationKey>, KernelSolveError> {
-    let scope_limit = owners
+    let scope_limit = definition_facts
         .iter()
-        .map(|owner| owner.presentation.scopes.len())
+        .map(|facts| facts.presentation.scopes.len())
         .sum::<usize>()
         .saturating_add(owners.len())
         .saturating_add(1);
@@ -5422,7 +5448,14 @@ fn definition_execution_scope_callable(
         match scope {
             KernelScopeReference::ProjectRoot => return Ok(None),
             KernelScopeReference::Containing => {
-                scope = definition_execution_owner(owners, owner, context)?
+                scope = definition_facts
+                    .get(owner.0 as usize)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel packed execution {context} references missing definition facts {}",
+                            owner.0,
+                        ))
+                    })?
                     .presentation
                     .containing_scope;
             }
@@ -5434,8 +5467,13 @@ fn definition_execution_scope_callable(
                 scope = KernelScopeReference::Local(target_scope);
             }
             KernelScopeReference::Local(scope_id) => {
-                let definition = definition_execution_owner(owners, owner, context)?;
-                let row = definition
+                let facts = definition_facts.get(owner.0 as usize).ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel packed execution {context} references missing definition facts {}",
+                        owner.0,
+                    ))
+                })?;
+                let row = facts
                     .presentation
                     .scopes
                     .get(scope_id.0 as usize)
@@ -5741,6 +5779,7 @@ fn definition_execution_block_shape<'a>(
 #[allow(clippy::too_many_arguments)]
 fn collect_definition_execution_dependencies(
     owners: &[KernelProjectOwnerOutputs],
+    definition_facts: &[KernelDefinitionFactsInput],
     abi: &crate::KernelAbiInput,
     expression_offsets: &[u32],
     statement_offsets: &[u32],
@@ -5769,7 +5808,14 @@ fn collect_definition_execution_dependencies(
                 expression.expression().0,
             ))
         })?;
-    let payload = definition
+    let payload = definition_facts
+        .get(owner.0 as usize)
+        .ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel packed execution references missing definition facts {}",
+                owner.0,
+            ))
+        })?
         .expression_payloads
         .get(expression.expression().0 as usize)
         .ok_or_else(|| {
@@ -6009,6 +6055,7 @@ fn collect_definition_execution_selector(
 
 fn build_definition_execution_code(
     owners: &[KernelProjectOwnerOutputs],
+    definition_facts: &[KernelDefinitionFactsInput],
     abi: &crate::KernelAbiInput,
     builder: &mut DefinitionCodeBuilder,
 ) -> Result<(), KernelSolveError> {
@@ -6151,11 +6198,14 @@ fn build_definition_execution_code(
                     if target.value.is_none() {
                         None
                     } else {
-                        let presentation = definition_execution_owner(
-                            owners,
-                            declaration.owner,
-                            "lexical read target",
-                        )?
+                        let presentation = definition_facts
+                        .get(declaration.owner.0 as usize)
+                        .ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "kernel packed execution lexical read target references missing definition facts {}",
+                                declaration.owner.0,
+                            ))
+                        })?
                         .presentation
                         .declarations
                         .get(declaration.declaration.0 as usize)
@@ -6168,6 +6218,7 @@ fn build_definition_execution_code(
                         })?;
                         definition_execution_scope_callable(
                             owners,
+                            definition_facts,
                             declaration.owner,
                             presentation.scope,
                             "lexical read callable",
@@ -6267,6 +6318,7 @@ fn build_definition_execution_code(
             if dependency_starts[index] == u32::MAX {
                 collect_definition_execution_dependencies(
                     owners,
+                    definition_facts,
                     abi,
                     &expression_offsets,
                     &statement_offsets,
@@ -6711,9 +6763,6 @@ fn materialize_project_definition_structures(
                 .into_boxed_slice();
             Ok(DefinitionArtifact {
                 linkage: owner.linkage,
-                relocations: owner.relocations,
-                presentation: owner.presentation,
-                expression_payloads: owner.expression_payloads,
                 call_syntax: owner.call_syntax,
                 execution_shapes: owner.execution_shapes,
                 expressions,
@@ -10793,7 +10842,7 @@ pub fn compile_project_program_with_definition_facts(
     )?;
     compile_project_program_with_definition_facts_abi_and_text(
         input,
-        facts,
+        Arc::from(facts.to_vec()),
         Arc::new(crate::KernelAbiInput::default()),
         text,
     )
@@ -10801,7 +10850,7 @@ pub fn compile_project_program_with_definition_facts(
 
 pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
     input: &KernelProjectProgramInput,
-    facts: &[KernelDefinitionFactsInput],
+    facts: Arc<[KernelDefinitionFactsInput]>,
     abi: Arc<crate::KernelAbiInput>,
     text: ProjectTextSnapshot,
 ) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
@@ -11133,9 +11182,6 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
                     .into_boxed_slice(),
                 expression_artifacts: collect_expression_artifacts(owner)?,
                 linkage: facts[owner_index].linkage,
-                relocations: facts[owner_index].relocations.clone(),
-                presentation: facts[owner_index].presentation.clone(),
-                expression_payloads: facts[owner_index].expression_payloads.clone(),
                 call_syntax: collect_call_syntax_artifacts(owner, &facts[owner_index])?,
                 execution_shapes: collect_execution_shape_artifacts(owner, &facts[owner_index])?,
                 statements,
@@ -11228,6 +11274,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
     Ok(KernelProjectProgram {
         component,
         owners: owners.into_boxed_slice(),
+        definition_facts: facts,
         abi,
         compile_work,
     })
@@ -23629,7 +23676,7 @@ mod tests {
         let text = crate::text::build_project_text_snapshot(&input.owners, &facts, &abi).unwrap();
         let snapshot = compile_project_program_with_definition_facts_abi_and_text(
             &input,
-            &facts,
+            Arc::from(facts.to_vec()),
             Arc::new(abi),
             text,
         )
@@ -23788,7 +23835,7 @@ mod tests {
         let text = crate::text::build_project_text_snapshot(&input.owners, &facts, &abi).unwrap();
         let snapshot = compile_project_program_with_definition_facts_abi_and_text(
             &input,
-            &facts,
+            Arc::from(facts.to_vec()),
             Arc::new(abi),
             text,
         )

@@ -22,7 +22,10 @@ pub struct KernelProjectInput {
     syntax_units: Box<[KernelSyntaxUnitInput]>,
     links: KernelResolvedProjectLinkOverlay,
     program: KernelProjectProgramInput,
-    definition_facts: Box<[KernelDefinitionFactsInput]>,
+    /// One coarse immutable authority for parser/linker facts. The solve and
+    /// checked products retain this same allocation instead of cloning every
+    /// relocation, presentation row, and literal payload into owner outputs.
+    definition_facts: Arc<[KernelDefinitionFactsInput]>,
     abi: Arc<KernelAbiInput>,
     text: ProjectTextSnapshot,
 }
@@ -161,7 +164,7 @@ impl KernelProjectInput {
                 definition_by_key,
             },
             program,
-            definition_facts,
+            definition_facts: Arc::from(definition_facts),
             abi: Arc::new(abi),
             text,
         })
@@ -198,7 +201,7 @@ impl KernelProjectInput {
     pub fn compile(&self) -> Result<crate::KernelProjectProgram, KernelOwnerBuildError> {
         compile_project_program_with_definition_facts_abi_and_text(
             self.program(),
-            self.definition_facts(),
+            Arc::clone(&self.definition_facts),
             Arc::clone(&self.abi),
             self.text.clone(),
         )
@@ -248,6 +251,7 @@ pub struct KernelDemandedCheckArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelDemandedCheckSnapshot {
     pub definitions: Box<[KernelDemandedCheckArtifact]>,
+    pub definition_facts: Arc<[KernelDefinitionFactsInput]>,
     pub definition_code: Arc<crate::DefinitionCodeStore>,
     pub type_store: Arc<crate::FrozenTypeStore>,
     pub interface: Arc<KernelInterfaceSnapshot>,
@@ -566,6 +570,7 @@ impl KernelSession {
                     .into_boxed_slice();
                 KernelCheckProduct::Definitions(Arc::new(KernelDemandedCheckSnapshot {
                     definitions,
+                    definition_facts: Arc::clone(&snapshot.definition_facts),
                     definition_code: Arc::clone(&snapshot.definition_code),
                     type_store: Arc::clone(&snapshot.type_store),
                     interface: Arc::clone(&snapshot.interface),
@@ -584,6 +589,7 @@ impl KernelSession {
         demanded: KernelDemandedDefinitionSnapshot,
     ) -> Result<KernelDemandedCheckSnapshot, KernelCheckError> {
         let type_store = Arc::clone(&demanded.type_store);
+        let definition_facts = Arc::clone(&demanded.definition_facts);
         let definition_code = Arc::clone(&demanded.definition_code);
         let interface = Arc::clone(&demanded.interface);
         let mut definitions = demanded
@@ -612,6 +618,7 @@ impl KernelSession {
         definitions.sort_by(|left, right| left.owner.cmp(&right.owner));
         Ok(KernelDemandedCheckSnapshot {
             definitions: definitions.into_boxed_slice(),
+            definition_facts,
             definition_code,
             type_store,
             interface,
@@ -952,6 +959,13 @@ mod tests {
         assert_eq!(checked.product.materialized_definition_count(), 3);
         assert_eq!(checked.product.sealed_definition_count(), 3);
         assert!(!checked.reused);
+        let KernelCheckProduct::CheckedImage(checked_snapshot) = &checked.product else {
+            panic!("checked demand returned another product")
+        };
+        assert!(Arc::ptr_eq(
+            &checked_snapshot.definition_facts,
+            &session.project.definition_facts,
+        ));
 
         let demanded = session.project().links().definitions()[1].clone();
         let sparse = session
@@ -962,6 +976,10 @@ mod tests {
         let KernelCheckProduct::Definitions(sparse_snapshot) = &sparse.product else {
             panic!("sparse demand returned another product")
         };
+        assert!(Arc::ptr_eq(
+            &sparse_snapshot.definition_facts,
+            &session.project.definition_facts,
+        ));
         assert_eq!(sparse_snapshot.definitions[0].owner, demanded);
         assert_eq!(sparse_snapshot.definitions[0].dense_owner, KernelOwnerId(1));
 

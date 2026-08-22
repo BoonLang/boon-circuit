@@ -314,6 +314,7 @@ pub(crate) fn build_normalized_snapshot_receipts(
 
 pub(crate) fn build_packed_snapshot_receipts(
     definitions: &[DefinitionArtifact],
+    definition_facts: &[KernelDefinitionFactsInput],
     code: &DefinitionCodeStore,
     interface: &KernelInterfaceSnapshot,
     basis_fingerprints: &[[u8; 32]],
@@ -324,14 +325,16 @@ pub(crate) fn build_packed_snapshot_receipts(
     ),
     KernelSolveError,
 > {
-    if definitions.len() != basis_fingerprints.len()
+    if definitions.len() != definition_facts.len()
+        || definitions.len() != basis_fingerprints.len()
         || definitions.len() != code.definition_count()
         || definitions.len() != interface.public_results.len()
         || definitions.len() != interface.callable_formals.len()
     {
         return Err(KernelSolveError::new(format!(
-            "kernel packed snapshot has {} definitions, {} code rows, {} results, {} formal rows, and {} basis fingerprints",
+            "kernel packed snapshot has {} definitions, {} fact rows, {} code rows, {} results, {} formal rows, and {} basis fingerprints",
             definitions.len(),
+            definition_facts.len(),
             code.definition_count(),
             interface.public_results.len(),
             interface.callable_formals.len(),
@@ -351,6 +354,7 @@ pub(crate) fn build_packed_snapshot_receipts(
         fingerprint_packed_definition_range(
             range,
             definitions,
+            definition_facts,
             code,
             interface,
             &diagnostic_offsets,
@@ -410,6 +414,7 @@ fn packed_diagnostic_offsets(
 fn fingerprint_packed_definition_range(
     range: Range<usize>,
     definitions: &[DefinitionArtifact],
+    definition_facts: &[KernelDefinitionFactsInput],
     code: &DefinitionCodeStore,
     interface: &KernelInterfaceSnapshot,
     diagnostic_offsets: &[u32],
@@ -423,6 +428,7 @@ fn fingerprint_packed_definition_range(
                 .expect("kernel definition count exceeds dense u32 namespace"),
         );
         let definition = &definitions[definition_index];
+        let facts = &definition_facts[definition_index];
         let code = code.definition(owner).ok_or_else(|| {
             KernelSolveError::new(format!(
                 "kernel definition code omits owner {definition_index}"
@@ -438,7 +444,7 @@ fn fingerprint_packed_definition_range(
         let artifact = stable_fingerprint(
             KERNEL_DEFINITION_ARTIFACT_DOMAIN_V17,
             &(
-                definition,
+                PackedDefinitionHash { definition, facts },
                 code.stable_digest(),
                 &interface.diagnostics[diagnostic_start..diagnostic_end],
             ),
@@ -470,6 +476,35 @@ fn fingerprint_packed_definition_range(
         });
     }
     Ok(fingerprints)
+}
+
+/// Hashes the shared immutable facts and solve-derived rows in the exact field
+/// order of the former monolithic `DefinitionArtifact`. This preserves the V17
+/// fingerprint contract while deleting its deep relocation/presentation/
+/// literal clones.
+struct PackedDefinitionHash<'a> {
+    definition: &'a DefinitionArtifact,
+    facts: &'a KernelDefinitionFactsInput,
+}
+
+impl Hash for PackedDefinitionHash<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.definition.linkage.hash(state);
+        self.facts.relocations.hash(state);
+        self.facts.presentation.hash(state);
+        self.facts.expression_payloads.hash(state);
+        self.definition.call_syntax.hash(state);
+        self.definition.execution_shapes.hash(state);
+        self.definition.expressions.hash(state);
+        self.definition.statements.hash(state);
+        self.definition.declarations.hash(state);
+        self.definition.lexical_bindings.hash(state);
+        self.definition.calls.hash(state);
+        self.definition.effects.hash(state);
+        self.definition.sources.hash(state);
+        self.definition.states.hash(state);
+        self.definition.lists.hash(state);
+    }
 }
 
 fn packed_currentness_receipt_range(
@@ -2070,6 +2105,7 @@ mod tests {
         let basis = [[41; 32], [42; 32]];
         let (_, number_receipts) = build_packed_snapshot_receipts(
             &snapshot.definitions,
+            &snapshot.definition_facts,
             &number_code,
             &snapshot.interface,
             &basis,
@@ -2077,6 +2113,7 @@ mod tests {
         .unwrap();
         let (_, text_receipts) = build_packed_snapshot_receipts(
             &snapshot.definitions,
+            &snapshot.definition_facts,
             &text_code,
             &snapshot.interface,
             &basis,

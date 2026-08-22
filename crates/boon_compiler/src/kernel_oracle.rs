@@ -1377,10 +1377,10 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     checked_declarations = materialized_declarations;
                     checked_expressions = materialized_expressions;
                     checked_expression_keys = checked
-                        .definitions
+                        .definition_facts
                         .iter()
-                        .flat_map(|definition| {
-                            definition.relocations.expressions.iter().map(|relocation| {
+                        .flat_map(|facts| {
+                            facts.relocations.expressions.iter().map(|relocation| {
                                 match relocation {
                                     KernelExpressionRelocation::Authored(key) => Some(key.clone()),
                                     KernelExpressionRelocation::SyntheticDefinitionResult => None,
@@ -1398,9 +1398,9 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     }
                     checked_statements = materialized_statements;
                     checked_statement_keys = checked
-                        .definitions
+                        .definition_facts
                         .iter()
-                        .flat_map(|definition| definition.relocations.statements.iter().cloned())
+                        .flat_map(|facts| facts.relocations.statements.iter().cloned())
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
                     if checked_statement_keys.len() != checked_statements.len() {
@@ -1475,6 +1475,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                 .collect::<Vec<_>>();
             let definition_code = Arc::clone(&artifact.definition_code);
             let interface = Arc::clone(&artifact.interface);
+            let definition_facts = Arc::clone(&artifact.definition_facts);
             let definitions = artifact.definitions;
             let result_by_owner = active
                 .iter()
@@ -1495,8 +1496,9 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
             let supported = active
                 .iter()
                 .zip(definitions)
+                .zip(definition_facts.iter())
                 .enumerate()
-                .map(|(dense_index, (prepared_index, artifact))| {
+                .map(|(dense_index, ((prepared_index, artifact), facts))| {
                     let dense_owner = KernelOwnerId(
                         u32::try_from(dense_index)
                             .expect("kernel definition count exceeds u32"),
@@ -1506,40 +1508,40 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                         .expect("kernel structural definition owns one packed code row");
                     let owner = &prepared[*prepared_index];
                     assert_eq!(
-                        artifact.relocations.expressions,
+                        facts.relocations.expressions,
                         owner.payload().definition_facts.relocations.expressions,
-                        "kernel definition artifacts retain every stable expression relocation"
+                        "kernel snapshot shares every stable expression relocation"
                     );
                     assert_eq!(
-                        artifact.relocations.statements,
+                        facts.relocations.statements,
                         owner.payload().definition_facts.relocations.statements,
-                        "kernel definition artifacts retain every stable statement relocation"
+                        "kernel snapshot shares every stable statement relocation"
                     );
                     assert_eq!(
-                        artifact.presentation.scopes,
+                        facts.presentation.scopes,
                         owner.payload().definition_facts.presentation.scopes,
-                        "kernel definition artifacts retain every compact scope row"
+                        "kernel snapshot shares every compact scope row"
                     );
                     assert_eq!(
-                        artifact.presentation.expressions,
+                        facts.presentation.expressions,
                         owner.payload().definition_facts.presentation.expressions,
-                        "kernel definition artifacts retain every checked-expression presentation row"
+                        "kernel snapshot shares every checked-expression presentation row"
                     );
                     assert_eq!(
-                        artifact.presentation.statements,
+                        facts.presentation.statements,
                         owner.payload().definition_facts.presentation.statements,
-                        "kernel definition artifacts retain every checked-statement presentation row"
+                        "kernel snapshot shares every checked-statement presentation row"
                     );
                     assert_eq!(
-                        artifact.presentation.declarations,
+                        facts.presentation.declarations,
                         owner.payload().definition_facts.presentation.declarations,
-                        "kernel definition artifacts retain every checked-declaration presentation row"
+                        "kernel snapshot shares every checked-declaration presentation row"
                     );
-                    let presentation_scope_count = artifact.presentation.scopes.len();
+                    let presentation_scope_count = facts.presentation.scopes.len();
                     assert_eq!(
-                        artifact.expression_payloads,
+                        facts.expression_payloads,
                         owner.payload().definition_facts.expression_payloads,
-                        "kernel definition artifacts retain every exact expression semantic payload"
+                        "kernel snapshot shares every exact expression semantic payload"
                     );
                     assert_eq!(
                         artifact.call_syntax.len(),

@@ -24,6 +24,7 @@ use boon_compiler_kernel::{
     KernelCallShapeInput, KernelCallShapeParameter, KernelCallShapeResolution,
     KernelCallSyntaxArgument, KernelCallSyntaxInput, KernelCallableAbiInput, KernelCallableKind,
     KernelCheckProduct, KernelCheckedCallableTypeParameterLayout, KernelCheckedLinkLayout,
+    KernelCheckedOrderDiagnostic, KernelCheckedOrderDiagnosticKind,
     KernelCheckedRowProjectionDemand, KernelCollectionKind, KernelCompileWork,
     KernelConditionalKind, KernelDeclarationId, KernelDeclarationInput, KernelDeclarationKind,
     KernelDeclarationOrigin, KernelDeclarationPresentation, KernelDeclarationReference,
@@ -2556,6 +2557,7 @@ pub(crate) struct KernelCheckedConstruction {
     pub fields: CheckedProgramFields,
     pub semantic_input: boon_compiler_kernel::KernelSemanticInputConstructionV1,
     pub call_occurrences: Box<[StableOccurrenceKey]>,
+    projection_demand: KernelCheckedProjectionDemand,
     pub checked_image_authority: CheckedImageKernelAuthorityV1,
     pub checked_image_publication: CheckedImageKernelPublicationV1,
     pub diagnostics: Box<[TypeDiagnostic]>,
@@ -2568,6 +2570,45 @@ pub(crate) struct KernelCheckedConstruction {
 enum KernelCheckedProjectionDemand {
     RuntimePacked,
     EditorRich,
+}
+
+fn present_kernel_checked_order_diagnostics(
+    diagnostics: &[KernelCheckedOrderDiagnostic],
+) -> Vec<TypeDiagnostic> {
+    diagnostics
+        .iter()
+        .map(|diagnostic| TypeDiagnostic {
+            severity: DiagnosticSeverity::Error,
+            line: diagnostic.span.line,
+            start: diagnostic.span.start,
+            end: diagnostic.span.end,
+            message: match &diagnostic.kind {
+                KernelCheckedOrderDiagnosticKind::MissingPrecedingSort =>
+                    "`List/then_by` requires a compatible preceding `List/sort_by` order chain"
+                        .to_owned(),
+                KernelCheckedOrderDiagnosticKind::UnsupportedKeyType { key_type } => format!(
+                    "list order key has unsupported type\nexpected: finite NUMBER, TEXT, or closed fieldless tags such as `True | False`\nfound: {}",
+                    boon_typecheck::boon_facing_type_label(key_type),
+                ),
+                KernelCheckedOrderDiagnosticKind::ImpureKey =>
+                    "list order key must be a continuous pure expression".to_owned(),
+                KernelCheckedOrderDiagnosticKind::PartialKey =>
+                    "list order key must be total and cannot use an error-capable conversion or partial operation"
+                        .to_owned(),
+            },
+        })
+        .collect()
+}
+
+fn canonicalize_type_diagnostics(diagnostics: &mut Vec<TypeDiagnostic>) {
+    diagnostics.sort_by(|left, right| {
+        left.line
+            .cmp(&right.line)
+            .then_with(|| left.start.cmp(&right.start))
+            .then_with(|| left.end.cmp(&right.end))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    diagnostics.dedup();
 }
 
 const KERNEL_CHECKED_DEFINITION_KEY_SEAL_DOMAIN_V1: &[u8] =
@@ -2883,6 +2924,11 @@ fn checked_construction_from_kernel(
     }
     let seals_and_rebase_us = elapsed_us(phase_started.elapsed());
 
+    let packed_order = rows
+        .derive_packed_order_chains(&layout, &snapshot)
+        .map_err(|error| format!("cannot derive packed checked order chains: {error}"))?;
+    let mut order_diagnostics = present_kernel_checked_order_diagnostics(&packed_order.diagnostics);
+
     let phase_started = Instant::now();
     let resource_projection_requirements = match projection_demand {
         KernelCheckedProjectionDemand::RuntimePacked => Box::new([]),
@@ -2915,7 +2961,7 @@ fn checked_construction_from_kernel(
         context_formals: rows.context_formals.into_vec(),
         calls: rows.calls.into_vec(),
         call_result_paths: rows.call_result_paths.into_vec(),
-        order_chains: Vec::new(),
+        order_chains: packed_order.chains.into_vec(),
         pattern_bindings: rows.pattern_bindings.into_vec(),
         resource_projection_requirements: resource_projection_requirements.into_vec(),
         sources: rows.sources.into_vec(),
@@ -2924,17 +2970,20 @@ fn checked_construction_from_kernel(
         occurrences: rows.occurrences.into_vec(),
         definition_execution_templates: definition_execution_templates.into_vec(),
     };
-    let (order_chains, order_diagnostics) = boon_typecheck::derive_checked_order_chains(&fields);
-    fields.order_chains = order_chains;
+    if projection_demand == KernelCheckedProjectionDemand::EditorRich {
+        let (rich_order_chains, mut rich_order_diagnostics) =
+            boon_typecheck::derive_checked_order_chains(&fields);
+        canonicalize_type_diagnostics(&mut rich_order_diagnostics);
+        canonicalize_type_diagnostics(&mut order_diagnostics);
+        if rich_order_chains != fields.order_chains || rich_order_diagnostics != order_diagnostics {
+            return Err(format!(
+                "packed order derivation differs from EditorRich oracle:\npacked chains={:#?}\nrich chains={rich_order_chains:#?}\npacked diagnostics={order_diagnostics:#?}\nrich diagnostics={rich_order_diagnostics:#?}",
+                fields.order_chains,
+            ));
+        }
+    }
     diagnostics.extend(order_diagnostics);
-    diagnostics.sort_by(|left, right| {
-        left.line
-            .cmp(&right.line)
-            .then_with(|| left.start.cmp(&right.start))
-            .then_with(|| left.end.cmp(&right.end))
-            .then_with(|| left.message.cmp(&right.message))
-    });
-    diagnostics.dedup();
+    canonicalize_type_diagnostics(&mut diagnostics);
     fields.lowering_metadata =
         boon_typecheck::derive_project_checked_lowering_metadata(project, &fields, &diagnostics)
             .map_err(|error| format!("cannot finalize dense kernel checked metadata: {error}"))?;
@@ -2973,6 +3022,7 @@ fn checked_construction_from_kernel(
         fields,
         semantic_input,
         call_occurrences,
+        projection_demand,
         checked_image_authority,
         checked_image_publication,
         diagnostics: diagnostics.into_boxed_slice(),
@@ -3034,6 +3084,7 @@ fn checked_source_from_kernel_construction(
     checked: KernelCheckedConstruction,
     report_demand: crate::CheckedReportDemand,
 ) -> Result<crate::CheckedSourceFromSource, String> {
+    let packed_call_count = checked.semantic_input.call_count();
     let owner_work = crate::CompilerOwnerWork {
         statements: u64::try_from(checked.fields.statements.len()).unwrap_or(u64::MAX),
         expressions: u64::try_from(checked.fields.expressions.len()).unwrap_or(u64::MAX),
@@ -3045,10 +3096,20 @@ fn checked_source_from_kernel_construction(
         interface_plan_result_transfers: 0,
         interface_plan_transfer_nodes: checked.compile_work.summary_definition_nodes,
         interface_plan_transfer_edges: checked.compile_work.summary_invoke_nodes,
-        calls: u64::try_from(checked.fields.calls.len()).unwrap_or(u64::MAX),
+        calls: u64::try_from(packed_call_count).unwrap_or(u64::MAX),
         unification_steps: checked.solve_work.activations,
     };
     let typecheck_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let checked_call_seal_authority = match checked.projection_demand {
+        KernelCheckedProjectionDemand::RuntimePacked => {
+            crate::CheckedCallSealAuthority::RuntimePacked {
+                call_count: packed_call_count,
+            }
+        }
+        KernelCheckedProjectionDemand::EditorRich => {
+            crate::CheckedCallSealAuthority::EditorRich(checked.call_occurrences)
+        }
+    };
     Ok(crate::checked_source_from_checked_fields(
         project,
         checked.fields,
@@ -3061,7 +3122,7 @@ fn checked_source_from_kernel_construction(
         checked.compile_work,
         checked.solve_work,
         typecheck_ms,
-        Some(checked.call_occurrences),
+        Some(checked_call_seal_authority),
         Some(Box::new(checked.checked_image_authority)),
         Some(Box::new(checked.checked_image_publication)),
         report_demand,
@@ -21239,6 +21300,174 @@ FUNCTION address(row) {{
     }
 
     #[test]
+    fn runtime_packed_order_chains_and_failures_match_editor_rich() {
+        let source = r#"
+rows: LIST { [rank: 1] }
+ordered:
+    rows
+    |> List/sort_by(item, key: item.rank, direction: Ascending)
+    |> List/then_by(item, key: item.rank, direction: Descending)
+missing: rows |> List/then_by(item, key: item.rank, direction: Ascending)
+object_key: rows |> List/sort_by(item, key: [rank: item.rank], direction: Ascending)
+text_rows: LIST { [rank: TEXT { 1 }] }
+partial_key: text_rows |> List/sort_by(item, key: item.rank |> Text/to_number())
+"#;
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse packed order-chain parity fixture");
+        let packed = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::RuntimePacked,
+        )
+        .expect("derive RuntimePacked order-chain fixture");
+        let rich = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("derive EditorRich order-chain oracle fixture");
+
+        assert!(packed.fields.calls.is_empty());
+        assert!(!rich.fields.calls.is_empty());
+        assert_eq!(packed.fields.order_chains, rich.fields.order_chains);
+        assert_eq!(packed.diagnostics, rich.diagnostics);
+        for expected in [
+            "requires a compatible preceding `List/sort_by` order chain",
+            "list order key has unsupported type",
+            "list order key must be total",
+        ] {
+            assert!(
+                packed
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains(expected)),
+                "packed order fixture omitted `{expected}`: {:#?}",
+                packed.diagnostics,
+            );
+        }
+    }
+
+    #[test]
+    fn packed_order_frames_do_not_capture_caller_alphas_with_equal_ordinals() {
+        let source = r#"
+FUNCTION reorder(rows, other_rows, final_rows) {
+    other_probe: other_rows |> List/map(item, new: item)
+    final_probe: final_rows |> List/map(item, new: item)
+    recursive: reorder(
+        rows: other_rows
+        other_rows: final_rows
+        final_rows: final_rows
+    )
+    rows |> List/sort_by(item, key: rows, direction: Ascending)
+}
+
+result: reorder(
+    rows: LIST { TEXT { x } }
+    other_rows: LIST { True }
+    final_rows: LIST { 1 }
+)
+"#;
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse cross-namespace packed order fixture");
+        let packed = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::RuntimePacked,
+        )
+        .expect("derive RuntimePacked cross-namespace order fixture");
+        let rich = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("derive EditorRich cross-namespace order oracle");
+        assert_eq!(packed.diagnostics, rich.diagnostics);
+        assert!(
+            rich.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("unsupported type")),
+            "fixture deliberately keeps a generic list as its order key: {:#?}",
+            rich.diagnostics,
+        );
+        assert_eq!(packed.fields.order_chains, rich.fields.order_chains);
+
+        let reorder = rich
+            .fields
+            .callables
+            .iter()
+            .find(|callable| callable.name == "reorder")
+            .expect("fixture retains reorder signature");
+        let inner_sort = rich
+            .fields
+            .calls
+            .iter()
+            .find(|call| {
+                call.function == "List/sort_by" && call.owner_callable == Some(reorder.decl_id)
+            })
+            .expect("fixture retains the inner sort call");
+        let recursive = rich
+            .fields
+            .calls
+            .iter()
+            .find(|call| call.function == "reorder" && call.owner_callable == Some(reorder.decl_id))
+            .expect("fixture retains the recursive reorder call");
+        let root = rich
+            .fields
+            .calls
+            .iter()
+            .find(|call| call.function == "reorder" && call.owner_callable.is_none())
+            .expect("fixture retains the root reorder call");
+        let chain = |call| {
+            rich.fields
+                .order_chains
+                .iter()
+                .find(|chain| chain.call == call)
+                .unwrap_or_else(|| panic!("fixture retains order chain for call {}", call.0))
+        };
+
+        let direct = chain(inner_sort.id);
+        assert_eq!(direct.chain.keys[0].call_path, vec![inner_sort.id]);
+        let direct_key_type = direct.chain.keys[0].key_type.clone();
+
+        let recursive_chain = chain(recursive.id);
+        assert_eq!(
+            recursive_chain.chain.keys[0].call_path,
+            vec![recursive.id, inner_sort.id],
+        );
+        let expected_recursive = boon_checked::apply_checked_type_substitutions_once(
+            &direct_key_type,
+            &recursive.type_substitutions,
+        );
+        let incorrectly_transitive = boon_checked::apply_checked_type_substitutions(
+            &direct_key_type,
+            &recursive.type_substitutions,
+        );
+        assert_ne!(
+            expected_recursive, incorrectly_transitive,
+            "fixture must distinguish a caller-owned alpha from a same-ordinal callee alpha",
+        );
+        assert_eq!(
+            recursive_chain.chain.keys[0].key_type, expected_recursive,
+            "one call frame must not reinterpret the caller-owned alpha as another callee key",
+        );
+
+        let root_chain = chain(root.id);
+        assert_eq!(
+            root_chain.chain.keys[0].call_path,
+            vec![root.id, inner_sort.id],
+        );
+        assert_eq!(
+            root_chain.chain.keys[0].key_type,
+            boon_checked::apply_checked_type_substitutions_once(
+                &direct_key_type,
+                &root.type_substitutions,
+            ),
+        );
+    }
+
+    #[test]
     fn dense_kernel_builds_and_seals_a_complete_checked_construction() {
         let source = concat!(
             "FUNCTION double(input) {\n",
@@ -21351,11 +21580,18 @@ FUNCTION address(row) {{
         let rich = checked
             .semantic_input
             .materialize_rich_definition_execution_templates();
+        let oracle = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("build independent EditorRich definition-execution oracle");
         let derived =
-            boon_checked::derive_checked_definition_execution_templates_v1(&checked.fields)
+            boon_checked::derive_checked_definition_execution_templates_v1(&oracle.fields)
                 .expect("derive independent rich definition-execution oracle");
         assert!(!rich.is_empty(), "fixture must contain a callable template");
         assert_eq!(rich.as_ref(), derived.as_slice());
+        let packed_call_count = checked.semantic_input.call_count();
 
         // SAFETY: the runtime fields and publication come from the same
         // completed dense construction; this test binds the moved packed
@@ -21366,10 +21602,10 @@ FUNCTION address(row) {{
             )
         };
         let (program, pairing) =
-            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication_and_pairing(
+            boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
                 &project,
                 construction,
-                &checked.call_occurrences,
+                packed_call_count,
                 &checked.checked_image_authority,
                 checked.checked_image_publication,
             )
@@ -21636,6 +21872,10 @@ FUNCTION address(row) {{
             .expect("packed resource semantics elaborate");
         let rich = boon_semantic::elaborate(replay, &[])
             .expect("rich resource replay semantics elaborate");
+        #[cfg(feature = "test-packed-call-oracle")]
+        packed
+            .validate_packed_call_oracle()
+            .expect("packed resource semantics pass the deep packed-call oracle");
         assert_eq!(packed.digest(), rich.digest());
         let packed_ir = boon_ir::erase_and_lower(
             boon_verify::verify_explicit_contracts(packed)
@@ -21655,6 +21895,7 @@ FUNCTION address(row) {{
         )
         .expect("build runtime-packed semantic fixture");
         assert!(compact.fields.resource_projection_requirements.is_empty());
+        let compact_call_count = compact.semantic_input.call_count();
         // SAFETY: this is the completed dense runtime construction. The test
         // intentionally withholds its packed semantic token afterward.
         let compact_construction = unsafe {
@@ -21662,11 +21903,11 @@ FUNCTION address(row) {{
                 compact.fields,
             )
         };
-        let compact_program =
-            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication(
+        let (compact_program, _compact_pairing) =
+            boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
                 &project,
                 compact_construction,
-                &compact.call_occurrences,
+                compact_call_count,
                 &compact.checked_image_authority,
                 compact.checked_image_publication,
             )
@@ -21678,6 +21919,7 @@ FUNCTION address(row) {{
             KernelCheckedProjectionDemand::RuntimePacked,
         )
         .expect("build independent same-shaped packed fixture");
+        let independent_call_count = independent.semantic_input.call_count();
         // SAFETY: this is a separately completed dense construction used to
         // prove that content equality cannot substitute for provenance.
         let independent_construction = unsafe {
@@ -21686,10 +21928,10 @@ FUNCTION address(row) {{
             )
         };
         let (independent_program, independent_pairing) =
-            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication_and_pairing(
+            boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
                 &project,
                 independent_construction,
-                &independent.call_occurrences,
+                independent_call_count,
                 &independent.checked_image_authority,
                 independent.checked_image_publication,
             )
@@ -21768,16 +22010,17 @@ FUNCTION stateful_row(row) {
         .expect("build RuntimePacked definition-template fixture");
         assert!(packed.diagnostics.is_empty(), "{:#?}", packed.diagnostics);
         assert!(packed.fields.definition_execution_templates.is_empty());
+        let packed_call_count = packed.semantic_input.call_count();
         let packed_construction = unsafe {
             boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
                 packed.fields,
             )
         };
         let (packed_program, packed_pairing) =
-            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication_and_pairing(
+            boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
                 &project,
                 packed_construction,
-                &packed.call_occurrences,
+                packed_call_count,
                 &packed.checked_image_authority,
                 packed.checked_image_publication,
             )
@@ -22143,6 +22386,10 @@ FUNCTION stateful_row(row) {
             .expect("RuntimePacked definition templates elaborate");
         let rich_semantic = boon_semantic::elaborate(rich_program, &[])
             .expect("EditorRich definition templates elaborate");
+        #[cfg(feature = "test-packed-call-oracle")]
+        packed_semantic
+            .validate_packed_call_oracle()
+            .expect("RuntimePacked semantics pass the deep packed-call oracle");
         macro_rules! assert_execution_column {
             ($column:ident) => {{
                 let packed = &packed_semantic.execution_graph().$column;
@@ -22599,6 +22846,10 @@ FUNCTION stateful_row(row) {
     #[test]
     #[ignore = "directional NovyWave kernel timing probe"]
     fn novywave_kernel_timing_probe() {
+        assert!(
+            !cfg!(feature = "test-packed-call-oracle"),
+            "NovyWave timing must use the production feature set without retained differential-oracle owners",
+        );
         let source_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave/RUN.bn");
         let bundle_started = Instant::now();
@@ -22673,7 +22924,7 @@ FUNCTION stateful_row(row) {
                 checked.diagnostics
             );
             let expression_rows = checked.fields.expressions.len();
-            let call_rows = checked.fields.calls.len();
+            let call_rows = checked.semantic_input.call_count();
             let definition_rows = checked.fields.declarations.len();
             let replay_fields = replay_parity.then(|| checked.fields.clone());
             let seal_started = Instant::now();
@@ -22684,7 +22935,7 @@ FUNCTION stateful_row(row) {
                     checked.fields,
                 )
             };
-            let sealed =
+            let sealed = if replay_parity {
                 boon_typecheck::seal_project_checked_program_construction_with_kernel_publication(
                     &project,
                     construction,
@@ -22692,7 +22943,18 @@ FUNCTION stateful_row(row) {
                     &checked.checked_image_authority,
                     checked.checked_image_publication,
                 )
-                .expect("seal NovyWave dense checked image");
+                .expect("seal NovyWave EditorRich checked image")
+            } else {
+                boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
+                    &project,
+                    construction,
+                    call_rows,
+                    &checked.checked_image_authority,
+                    checked.checked_image_publication,
+                )
+                .map(|(program, _)| program)
+                .expect("seal NovyWave RuntimePacked checked image")
+            };
             let seal_us = elapsed_us(seal_started.elapsed());
             if let Some(replay_fields) = replay_fields {
                 // SAFETY: this is an opt-in differential oracle over the same

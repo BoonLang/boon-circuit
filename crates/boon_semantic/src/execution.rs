@@ -660,8 +660,11 @@ impl SemanticExpressionKind {
     /// `Materialize` is deliberately a leaf here because its expression roots
     /// belong to the referenced materialization rather than to the expression
     /// node itself. Passes that traverse through materializations use
-    /// [`SemanticExecutionImageColumnsV1::expression_children`] instead.
-    pub(crate) fn direct_children(&self) -> Vec<SemanticExprId> {
+    /// [`SemanticExecutionImageColumnsV1::for_each_expression_child`] instead.
+    pub(crate) fn try_for_each_direct_child<E>(
+        &self,
+        mut visit: impl FnMut(SemanticExprId) -> Result<(), E>,
+    ) -> Result<(), E> {
         match self {
             Self::CanonicalRead { .. }
             | Self::LocalRead { .. }
@@ -678,54 +681,100 @@ impl SemanticExpressionKind {
             | Self::Materialize { .. }
             | Self::Delimiter
             | Self::MaterializationLocal { .. }
-            | Self::FunctionParameter { .. } => Vec::new(),
-            Self::TextTemplate { segments } => segments
-                .iter()
-                .filter_map(|segment| match segment {
-                    SemanticTextSegment::Static { .. } => None,
-                    SemanticTextSegment::Dynamic { value } => Some(*value),
-                })
-                .collect(),
+            | Self::FunctionParameter { .. } => {}
+            Self::TextTemplate { segments } => {
+                for segment in segments {
+                    if let SemanticTextSegment::Dynamic { value } = segment {
+                        visit(*value)?;
+                    }
+                }
+            }
             Self::TaggedObject { fields, .. } | Self::Object(fields) => {
-                fields.iter().map(|field| field.value).collect()
+                for field in fields {
+                    visit(field.value)?;
+                }
             }
             Self::Call {
                 arguments,
                 context_argument,
                 ..
-            } => arguments
-                .iter()
-                .map(|argument| argument.value)
-                .chain(context_argument.iter().map(|argument| argument.value))
-                .collect(),
+            } => {
+                for argument in arguments {
+                    visit(argument.value)?;
+                }
+                if let Some(argument) = context_argument {
+                    visit(argument.value)?;
+                }
+            }
             Self::Flush { payload: input }
             | Self::FlushBoundary { input }
             | Self::Draining { input }
-            | Self::Project { input, .. } => vec![*input],
+            | Self::Project { input, .. } => visit(*input)?,
             Self::Hold {
                 initial, updates, ..
-            } => std::iter::once(*initial)
-                .chain(updates.iter().copied())
-                .collect(),
-            Self::Latest { branches } => branches.clone(),
-            Self::When { input, arms, .. } => std::iter::once(*input)
-                .chain(arms.iter().map(|arm| arm.output))
-                .collect(),
-            Self::Then { input, output } => std::iter::once(*input)
-                .chain(output.iter().copied())
-                .collect(),
-            Self::Infix { left, right, .. } => vec![*left, *right],
-            Self::MapEntry { key, value } => vec![*key, *value],
-            Self::MatchArm { output, .. } => output.iter().copied().collect(),
-            Self::Block { bindings, result } => bindings
-                .iter()
-                .map(|binding| binding.value)
-                .chain(std::iter::once(*result))
-                .collect(),
+            } => {
+                visit(*initial)?;
+                for update in updates {
+                    visit(*update)?;
+                }
+            }
+            Self::Latest { branches } => {
+                for branch in branches {
+                    visit(*branch)?;
+                }
+            }
+            Self::When { input, arms, .. } => {
+                visit(*input)?;
+                for arm in arms {
+                    visit(arm.output)?;
+                }
+            }
+            Self::Then { input, output } => {
+                visit(*input)?;
+                if let Some(output) = output {
+                    visit(*output)?;
+                }
+            }
+            Self::Infix { left, right, .. } => {
+                visit(*left)?;
+                visit(*right)?;
+            }
+            Self::MapEntry { key, value } => {
+                visit(*key)?;
+                visit(*value)?;
+            }
+            Self::MatchArm { output, .. } => {
+                if let Some(output) = output {
+                    visit(*output)?;
+                }
+            }
+            Self::Block { bindings, result } => {
+                for binding in bindings {
+                    visit(binding.value)?;
+                }
+                visit(*result)?;
+            }
             Self::List { items, .. }
             | Self::Bytes { items, .. }
             | Self::Map { entries: items }
-            | Self::Set { items } => items.clone(),
+            | Self::Set { items } => {
+                for item in items {
+                    visit(*item)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn for_each_direct_child(&self, mut visit: impl FnMut(SemanticExprId)) {
+        let result: Result<(), std::convert::Infallible> =
+            self.try_for_each_direct_child(|child| {
+                visit(child);
+                Ok(())
+            });
+        match result {
+            Ok(()) => {}
+            Err(never) => match never {},
         }
     }
 }
@@ -784,7 +833,9 @@ impl SemanticExecutionImageColumnsV1 {
                 continue;
             }
             let expression = self.expression(id)?;
-            pending.extend(expression.kind.direct_children());
+            expression
+                .kind
+                .for_each_direct_child(|child| pending.push(child));
         }
         Ok(retained)
     }
@@ -955,17 +1006,34 @@ impl SemanticExecutionImageColumnsV1 {
     /// `None` means a `Materialize` expression references a missing or
     /// non-canonical dense materialization ID. Callers retain ownership of
     /// their phase-specific diagnostic.
-    pub(crate) fn expression_children(
+    pub(crate) fn try_for_each_expression_child<E>(
         &self,
         kind: &SemanticExpressionKind,
-    ) -> Option<Vec<SemanticExprId>> {
+        visit: impl FnMut(SemanticExprId) -> Result<(), E>,
+    ) -> Option<Result<(), E>> {
         match kind {
             SemanticExpressionKind::Materialize { materialization } => self
                 .materializations
                 .get(materialization.as_usize())
                 .filter(|candidate| candidate.id == *materialization)
-                .map(SemanticContextualMaterialization::expression_roots),
-            _ => Some(kind.direct_children()),
+                .map(|materialization| materialization.try_for_each_expression_root(visit)),
+            _ => Some(kind.try_for_each_direct_child(visit)),
+        }
+    }
+
+    pub(crate) fn for_each_expression_child(
+        &self,
+        kind: &SemanticExpressionKind,
+        mut visit: impl FnMut(SemanticExprId),
+    ) -> Option<()> {
+        let result: Result<(), std::convert::Infallible> =
+            self.try_for_each_expression_child(kind, |child| {
+                visit(child);
+                Ok(())
+            })?;
+        match result {
+            Ok(()) => Some(()),
+            Err(never) => match never {},
         }
     }
 }
@@ -1051,7 +1119,7 @@ impl SemanticStateLifetimeDeriverV1 {
     pub(crate) fn new(expressions: &[SemanticExpression]) -> Result<Self, String> {
         let mut parents = vec![Vec::new(); expressions.len()];
         for expression in expressions {
-            for child in expression.kind.direct_children() {
+            expression.kind.try_for_each_direct_child(|child| {
                 let Some(child_index) = expressions
                     .get(child.as_usize())
                     .filter(|candidate| candidate.id == child)
@@ -1071,7 +1139,8 @@ impl SemanticStateLifetimeDeriverV1 {
                         && !semantic_expression_is_producer_invocation_source(expressions, *input)
                 );
                 parents[child_index].push((expression.id, then_output));
-            }
+                Ok::<(), String>(())
+            })?;
         }
         for entries in &mut parents {
             entries.sort();
@@ -1557,15 +1626,39 @@ pub struct SemanticContextualOrderKey {
 }
 
 impl SemanticContextualMaterialization {
-    pub fn expression_roots(&self) -> Vec<SemanticExprId> {
-        let mut roots = Vec::with_capacity(3 + self.inherited_order.len() * 2);
-        roots.push(self.source);
-        roots.push(self.body);
-        roots.extend(self.direction);
-        for key in &self.inherited_order {
-            roots.push(key.body);
-            roots.push(key.direction);
+    pub(crate) fn try_for_each_expression_root<E>(
+        &self,
+        mut visit: impl FnMut(SemanticExprId) -> Result<(), E>,
+    ) -> Result<(), E> {
+        visit(self.source)?;
+        visit(self.body)?;
+        if let Some(direction) = self.direction {
+            visit(direction)?;
         }
+        for key in &self.inherited_order {
+            visit(key.body)?;
+            visit(key.direction)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn for_each_expression_root(&self, mut visit: impl FnMut(SemanticExprId)) {
+        let result: Result<(), std::convert::Infallible> =
+            self.try_for_each_expression_root(|root| {
+                visit(root);
+                Ok(())
+            });
+        match result {
+            Ok(()) => {}
+            Err(never) => match never {},
+        }
+    }
+
+    pub fn expression_roots(&self) -> Vec<SemanticExprId> {
+        let mut roots = Vec::with_capacity(
+            2 + usize::from(self.direction.is_some()) + self.inherited_order.len() * 2,
+        );
+        self.for_each_expression_root(|root| roots.push(root));
         roots
     }
 }
@@ -2801,12 +2894,13 @@ impl SemanticExecutionImageColumnsV1 {
                 materialization_locals,
                 format!("materialization {}", materialization.id),
             )?;
-            for expression in materialization.expression_roots() {
+            materialization.try_for_each_expression_root(|expression| {
                 self.require_expression(
                     expression,
                     format!("materialization {} expression", materialization.id),
                 )?;
-            }
+                Ok::<(), String>(())
+            })?;
         }
         Ok(())
     }

@@ -6315,11 +6315,9 @@ fn executable_parameter_for_occurrence(
         if candidate == expression.id {
             return ids.parameter(parameter);
         }
-        pending.extend(
-            semantic_expression(graph, candidate)?
-                .kind
-                .direct_children(),
-        );
+        semantic_expression(graph, candidate)?
+            .kind
+            .for_each_direct_child(|child| pending.push(child));
     }
     Err(format!(
         "semantic function-parameter expression {} is outside ordinary callable {} root {}",

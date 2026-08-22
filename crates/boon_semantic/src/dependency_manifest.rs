@@ -3089,7 +3089,7 @@ impl DependencyCollector {
             subjects: HashSet::with_capacity(coverage_capacity),
             dependencies_by_entity: HashMap::with_capacity(record_capacity / 2),
             hash_scratch: Vec::new(),
-            flow_type_digests: HashMap::with_capacity(checked.calls.len().saturating_mul(2)),
+            flow_type_digests: HashMap::with_capacity(execution.calls.len().saturating_mul(2)),
             #[cfg(test)]
             retain_exhaustive,
         }
@@ -10937,6 +10937,10 @@ fn inventory_execution(
             SemanticDependencyEntityDomainV1::SemanticMaterialization,
             materialization.id.as_usize(),
         );
+        let mut expression_dependencies = Vec::new();
+        materialization.for_each_expression_root(|expression| {
+            expression_dependencies.push(dependency_entity(expression_entity(expression)));
+        });
         collect_dependency!(
             collector,
             owner,
@@ -10956,12 +10960,7 @@ fn inventory_execution(
                 ..SemanticDependencySemanticsV1::default()
             },
             materialization,
-            materialization
-                .expression_roots()
-                .into_iter()
-                .map(expression_entity)
-                .map(dependency_entity)
-                .collect(),
+            expression_dependencies,
         )?;
     }
 

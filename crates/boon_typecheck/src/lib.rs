@@ -14953,11 +14953,13 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             .get(key.0 as usize)
             .map(|expression| expression.flow_type.ty.clone())
             .unwrap_or(Type::Unknown);
-        key_type = apply_checked_type_substitutions(&key_type, &call.type_substitutions);
+        key_type = apply_checked_type_substitutions_once(&key_type, &call.type_substitutions);
         for frame in frames.iter().rev() {
             if let Some(frame_call) = self.call(frame.call) {
-                key_type =
-                    apply_checked_type_substitutions(&key_type, &frame_call.type_substitutions);
+                key_type = apply_checked_type_substitutions_once(
+                    &key_type,
+                    &frame_call.type_substitutions,
+                );
             }
         }
         let (direction, semantic_direction) = self.order_direction(call, frames);
@@ -16890,6 +16892,109 @@ pub fn seal_project_checked_program_construction_with_kernel_publication_and_pai
         authority,
         publication,
     )
+}
+
+/// Seal a RuntimePacked checked construction without materializing rich call
+/// rows or parser-owned structural occurrence routes.
+///
+/// The sibling packed semantic input owns the authoritative call facts. Its
+/// dense call count is therefore required explicitly, while the move-only
+/// kernel publication supplies the checked-image invocation projections and
+/// their authored-site identities. The publication pairing is returned only
+/// after source, role, authority, and exact dense Call-route coverage have all
+/// been validated against this construction.
+#[doc(hidden)]
+pub fn seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
+    parsed: &ProjectSyntaxSnapshot,
+    construction: CheckedProgramConstruction,
+    packed_call_count: usize,
+    authority: &CheckedImageKernelAuthorityV1,
+    publication: boon_checked::CheckedImageKernelPublicationV1,
+) -> Result<
+    (
+        CheckedProgram,
+        boon_checked::CheckedImageKernelPairingReceiptV1,
+    ),
+    String,
+> {
+    let fields = construction.__typechecker_into_fields();
+    if !fields.calls.is_empty() {
+        return Err(format!(
+            "RuntimePacked checked construction retains {} rich call rows",
+            fields.calls.len(),
+        ));
+    }
+    if fields.source_bundle_digest_v1 != parsed.source_bundle_digest_v1() {
+        return Err(format!(
+            "checked construction source digest {} differs from parsed source digest {}",
+            fields.source_bundle_digest_v1,
+            parsed.source_bundle_digest_v1()
+        ));
+    }
+    let (image_handoff, pairing) =
+        checked_image_handoff_from_kernel_publication(&fields, authority, publication)?;
+    validate_runtime_packed_call_routes(&image_handoff, packed_call_count)?;
+    let pairing_receipt = boon_checked::CheckedImageKernelPairingReceiptV1::__typechecker_new(
+        pairing,
+        &image_handoff,
+    );
+    let program = seal_kernel_checked_program_fields(fields, image_handoff, Some(authority))?;
+    Ok((program, pairing_receipt))
+}
+
+fn validate_runtime_packed_call_routes(
+    image_handoff: &CheckedImageHandoffV4,
+    packed_call_count: usize,
+) -> Result<(), String> {
+    let packed_call_count = u32::try_from(packed_call_count)
+        .map_err(|_| "RuntimePacked call count exceeds u32".to_owned())?;
+    let mut expected_dense_index = 0u32;
+    for route in image_handoff
+        .entity_routes
+        .iter()
+        .filter(|route| route.domain == CheckedImageRowDomainV2::Call)
+    {
+        if route.dense_index >= packed_call_count {
+            return Err(format!(
+                "RuntimePacked checked image Call route {} is outside authoritative packed call count {}",
+                route.dense_index, packed_call_count,
+            ));
+        }
+        if route.dense_index != expected_dense_index {
+            if route.dense_index < expected_dense_index {
+                return Err(format!(
+                    "RuntimePacked checked image repeats Call route {}",
+                    route.dense_index,
+                ));
+            }
+            return Err(format!(
+                "RuntimePacked checked image is missing dense Call route {} before route {}",
+                expected_dense_index, route.dense_index,
+            ));
+        }
+        let projection = image_handoff.projection(route.projection).ok_or_else(|| {
+            format!(
+                "RuntimePacked checked image Call route {} references missing projection {}",
+                route.dense_index, route.projection.0,
+            )
+        })?;
+        if !matches!(
+            &projection.stable_key.region,
+            CheckedShardRegionV2::Invocation { .. }
+        ) {
+            return Err(format!(
+                "RuntimePacked checked image Call route {} does not target an invocation projection",
+                route.dense_index,
+            ));
+        }
+        expected_dense_index += 1;
+    }
+    if expected_dense_index != packed_call_count {
+        return Err(format!(
+            "RuntimePacked checked image has {expected_dense_index} dense Call routes for {packed_call_count} authoritative packed calls",
+        ));
+    }
+    Ok(())
 }
 
 fn seal_project_checked_program_construction_with_kernel_publication_inner(

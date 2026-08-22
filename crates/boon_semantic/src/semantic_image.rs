@@ -4090,17 +4090,26 @@ fn execution_expression_proof_plans_v2(
     ),
     String,
 > {
-    let user_callables = checked
+    // Semantic calls are the durable normalized call inventory at this
+    // boundary. RuntimePacked deliberately owns no rich checked-call rows, so
+    // proof planning must classify expansion from the semantic callable/call
+    // tables it is about to prove rather than resurrecting a compatibility
+    // projection.
+    let user_callables = execution
         .callables
         .iter()
         .filter_map(|callable| {
-            (callable.kind == boon_checked::CheckedCallableKind::User).then_some(callable.decl_id)
+            (callable.kind == boon_checked::CheckedCallableKind::User).then_some(callable.id)
         })
         .collect::<BTreeSet<_>>();
-    let expandable_user_calls = checked
+    let expandable_user_calls = execution
         .calls
         .iter()
-        .filter_map(|call| user_callables.contains(&call.callable).then_some(call.id))
+        .filter_map(|call| {
+            user_callables
+                .contains(&call.callable)
+                .then_some(call.checked_call)
+        })
         .collect::<BTreeSet<_>>();
     if checked_handoff.source_bundle_digest_v1 != checked.source_bundle_digest_v1
         || checked_handoff.role != checked.role
@@ -5014,17 +5023,18 @@ impl<'a> ExecutionReceiptPublisherV5<'a> {
         executable: &crate::program_core::ExecutableExpression,
     ) -> Result<(), String> {
         let projection = self.expression_projection(semantic.id)?;
-        let mut relocations = execution
-            .expression_children(&semantic.kind)
+        let mut relocations = Vec::new();
+        execution
+            .try_for_each_expression_child(&semantic.kind, |expression| {
+                relocations.push(self.expression_projection(expression)?);
+                Ok::<(), String>(())
+            })
             .ok_or_else(|| {
                 format!(
                     "execution expression {} has a missing materialization child",
                     semantic.id
                 )
-            })?
-            .into_iter()
-            .map(|expression| self.expression_projection(expression))
-            .collect::<Result<Vec<_>, _>>()?;
+            })??;
         if let crate::SemanticExpressionKind::Call { callable, .. } = semantic.kind {
             let callable = execution
                 .callables
@@ -5307,11 +5317,11 @@ impl<'a> ExecutionReceiptPublisherV5<'a> {
             .get(semantic.owner.as_usize())
             .copied()
             .unwrap_or(self.expression_projection(semantic.source)?);
-        let relocations = semantic
-            .expression_roots()
-            .into_iter()
-            .map(|expression| self.expression_projection(expression))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut relocations = Vec::new();
+        semantic.try_for_each_expression_root(|expression| {
+            relocations.push(self.expression_projection(expression)?);
+            Ok::<(), String>(())
+        })?;
         self.builder.push(
             projection,
             ExecutionImageRowDomainV3::Materialization,
@@ -5478,17 +5488,18 @@ fn execution_image_handoff_v5(
             ));
         }
         let projection = expression_projection(semantic.id)?;
-        let mut relocations = execution
-            .expression_children(&semantic.kind)
+        let mut relocations = Vec::new();
+        execution
+            .try_for_each_expression_child(&semantic.kind, |child| {
+                relocations.push(expression_projection(child)?);
+                Ok::<(), String>(())
+            })
             .ok_or_else(|| {
                 format!(
                     "execution expression {} has a missing materialization child",
                     semantic.id
                 )
-            })?
-            .into_iter()
-            .map(expression_projection)
-            .collect::<Result<Vec<_>, _>>()?;
+            })??;
         if let crate::SemanticExpressionKind::Call { callable, .. } = semantic.kind {
             let callable = execution
                 .callables
@@ -5776,11 +5787,11 @@ fn execution_image_handoff_v5(
             .get(semantic.owner.as_usize())
             .copied()
             .unwrap_or(expression_projection(semantic.source)?);
-        let relocations = semantic
-            .expression_roots()
-            .into_iter()
-            .map(expression_projection)
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut relocations = Vec::new();
+        semantic.try_for_each_expression_root(|expression| {
+            relocations.push(expression_projection(expression)?);
+            Ok::<(), String>(())
+        })?;
         let payload_digest = execution_payload_seal_v3(
             &payload_seals.materializations,
             ExecutionImageRowDomainV3::Materialization,
@@ -6150,17 +6161,18 @@ fn execution_image_handoff_v2_oracle(
     trace_execution_handoff_phase(trace_handoff, "scope_rows", &mut trace_started);
     for expression in &execution.expressions {
         let projection = expression_projection(expression.id)?;
-        let mut relocations = execution
-            .expression_children(&expression.kind)
+        let mut relocations = Vec::new();
+        execution
+            .try_for_each_expression_child(&expression.kind, |child| {
+                relocations.push(expression_projection(child)?);
+                Ok::<(), String>(())
+            })
             .ok_or_else(|| {
                 format!(
                     "execution expression {} has a missing materialization child",
                     expression.id
                 )
-            })?
-            .into_iter()
-            .map(expression_projection)
-            .collect::<Result<Vec<_>, _>>()?;
+            })??;
         if let crate::SemanticExpressionKind::Call { callable, .. } = expression.kind {
             let callable = execution
                 .callables
@@ -6436,11 +6448,11 @@ fn execution_image_handoff_v2_oracle(
             .get(materialization.owner.as_usize())
             .copied()
             .unwrap_or(expression_projection(materialization.source)?);
-        let relocations = materialization
-            .expression_roots()
-            .into_iter()
-            .map(expression_projection)
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut relocations = Vec::new();
+        materialization.try_for_each_expression_root(|expression| {
+            relocations.push(expression_projection(expression)?);
+            Ok::<(), String>(())
+        })?;
         builder.push(
             projection,
             ExecutionImageRowDomainV2::Materialization,

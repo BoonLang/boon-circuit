@@ -750,6 +750,7 @@ fn expression_structural_route(
         return Ok(Vec::new());
     }
     let mut pending = vec![(root, Vec::<String>::new(), BTreeSet::new())];
+    let mut children = Vec::new();
     let mut routes = Vec::new();
     let mut visits = 0_usize;
     let visit_limit = execution.expressions.len().saturating_mul(8).max(64);
@@ -766,11 +767,8 @@ fn expression_structural_route(
             )));
         }
         let expression = require_expression(execution, expression_id)?;
-        for (index, child) in expression_children(execution, &expression.kind)?
-            .into_iter()
-            .enumerate()
-            .rev()
-        {
+        collect_expression_children(execution, &expression.kind, &mut children)?;
+        for (index, child) in children.iter().copied().enumerate().rev() {
             let mut child_route = route.clone();
             child_route.push(expression_child_route_segment(expression, index));
             if child == target {
@@ -1076,7 +1074,10 @@ fn reachable_semantic_expressions(
                 continue;
             }
             let expression = require_expression(execution, expression)?;
-            pending.extend(expression_children(execution, &expression.kind)?);
+            try_for_each_expression_child(execution, &expression.kind, |child| {
+                pending.push(child);
+                Ok(())
+            })?;
         }
         let reverse_markers = execution
             .expressions
@@ -1309,18 +1310,39 @@ fn require_checked_expression(
         })
 }
 
-fn expression_children(
+fn collect_expression_children(
     execution: &SemanticExecutionImageColumnsV1,
     kind: &SemanticExpressionKind,
-) -> Result<Vec<SemanticExprId>, SemanticMemoryError> {
-    execution.expression_children(kind).ok_or_else(|| {
-        let SemanticExpressionKind::Materialize { materialization } = kind else {
-            unreachable!("only invalid materialization references lack expression children");
-        };
-        SemanticMemoryError::new(format!(
-            "semantic expression references missing materialization {materialization}"
-        ))
-    })
+    children: &mut Vec<SemanticExprId>,
+) -> Result<(), SemanticMemoryError> {
+    children.clear();
+    execution
+        .for_each_expression_child(kind, |child| children.push(child))
+        .ok_or_else(|| {
+            let SemanticExpressionKind::Materialize { materialization } = kind else {
+                unreachable!("only invalid materialization references lack expression children");
+            };
+            SemanticMemoryError::new(format!(
+                "semantic expression references missing materialization {materialization}"
+            ))
+        })
+}
+
+fn try_for_each_expression_child(
+    execution: &SemanticExecutionImageColumnsV1,
+    kind: &SemanticExpressionKind,
+    visit: impl FnMut(SemanticExprId) -> Result<(), SemanticMemoryError>,
+) -> Result<(), SemanticMemoryError> {
+    execution
+        .try_for_each_expression_child(kind, visit)
+        .ok_or_else(|| {
+            let SemanticExpressionKind::Materialize { materialization } = kind else {
+                unreachable!("only invalid materialization references lack expression children");
+            };
+            SemanticMemoryError::new(format!(
+                "semantic expression references missing materialization {materialization}"
+            ))
+        })?
 }
 
 fn expression_reaches(
@@ -1338,7 +1360,10 @@ fn expression_reaches(
             return Ok(true);
         }
         let expression = require_expression(execution, expression)?;
-        pending.extend(expression_children(execution, &expression.kind)?);
+        try_for_each_expression_child(execution, &expression.kind, |child| {
+            pending.push(child);
+            Ok(())
+        })?;
     }
     Ok(false)
 }
@@ -1354,7 +1379,10 @@ fn expression_subtree(
             continue;
         }
         let expression = require_expression(execution, expression)?;
-        pending.extend(expression_children(execution, &expression.kind)?);
+        try_for_each_expression_child(execution, &expression.kind, |child| {
+            pending.push(child);
+            Ok(())
+        })?;
     }
     Ok(visited)
 }

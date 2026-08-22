@@ -1422,6 +1422,8 @@ mod tests {
             ApplicationIdentity::compiler_default(),
         ))
         .unwrap();
+        assert_eq!(unit_native.profile.checked_call_count, 1);
+        assert_eq!(assembled.profile.checked_call_count, 1);
         let assembled_artifact = (
             assembled.source_bundle_digest_v1,
             assembled.plan.plan().clone(),

@@ -898,15 +898,15 @@ impl ReactiveReachabilityIndex {
                     expression.id
                 )));
             }
-            let structural_children =
-                semantic_expression_children(&expression.kind, builder.execution)?;
-            Self::insert_reverse_edges(
-                builder.execution,
-                &mut structural_parents,
-                expression.id,
-                structural_children.iter().copied(),
-                "structural",
-            )?;
+            try_for_each_semantic_expression_child(&expression.kind, builder.execution, |child| {
+                Self::insert_reverse_edges(
+                    builder.execution,
+                    &mut structural_parents,
+                    expression.id,
+                    std::iter::once(child),
+                    "structural",
+                )
+            })?;
 
             match &expression.kind {
                 SemanticExpressionKind::CanonicalRead {
@@ -1008,12 +1008,18 @@ impl ReactiveReachabilityIndex {
                         // value edge until a contextual occurrence exists.
                     }
                 }
-                _ => Self::insert_reverse_edges(
+                _ => try_for_each_semantic_expression_child(
+                    &expression.kind,
                     builder.execution,
-                    &mut value_parents,
-                    expression.id,
-                    structural_children.into_iter(),
-                    "value",
+                    |child| {
+                        Self::insert_reverse_edges(
+                            builder.execution,
+                            &mut value_parents,
+                            expression.id,
+                            std::iter::once(child),
+                            "value",
+                        )
+                    },
                 )?,
             }
         }
@@ -1131,7 +1137,10 @@ fn reachable_reactive_expressions(
                         "reactive reachability references missing expression {expression_id}"
                     ))
                 })?;
-            pending.extend(semantic_expression_children(&expression.kind, execution)?);
+            try_for_each_semantic_expression_child(&expression.kind, execution, |child| {
+                pending.push(child);
+                Ok(())
+            })?;
         }
         let reverse_markers = execution
             .expressions
@@ -1231,7 +1240,10 @@ impl<'a> ReactiveBuilder<'a> {
                         )));
                     }
                 }
-                pending.extend(semantic_expression_children(&expression.kind, execution)?);
+                try_for_each_semantic_expression_child(&expression.kind, execution, |child| {
+                    pending.push(child);
+                    Ok(())
+                })?;
             }
         }
         let mut states_by_expression = BTreeMap::new();
@@ -1316,9 +1328,10 @@ impl<'a> ReactiveBuilder<'a> {
 
         let mut parents = BTreeMap::<SemanticExprId, BTreeSet<SemanticExprId>>::new();
         for expression in &self.execution.expressions {
-            for child in semantic_expression_children(&expression.kind, self.execution)? {
+            try_for_each_semantic_expression_child(&expression.kind, self.execution, |child| {
                 parents.entry(child).or_default().insert(expression.id);
-            }
+                Ok(())
+            })?;
         }
 
         for state in &self.resources.states {
@@ -1388,9 +1401,10 @@ impl<'a> ReactiveBuilder<'a> {
                 }
                 continue;
             }
-            for child in semantic_expression_children(&expression.kind, self.execution)? {
+            try_for_each_semantic_expression_child(&expression.kind, self.execution, |child| {
                 pending.push((child, start));
-            }
+                Ok(())
+            })?;
         }
         Ok(transitions.into_iter().collect())
     }
@@ -1469,10 +1483,10 @@ impl<'a> ReactiveBuilder<'a> {
             if matches!(&expression.kind, SemanticExpressionKind::Flush { .. }) {
                 flushes.insert(expression.id);
             }
-            pending.extend(semantic_expression_children(
-                &expression.kind,
-                self.execution,
-            )?);
+            try_for_each_semantic_expression_child(&expression.kind, self.execution, |child| {
+                pending.push(child);
+                Ok(())
+            })?;
         }
         Ok(flushes.into_iter().collect())
     }
@@ -4329,10 +4343,10 @@ impl<'a> ReactiveBuilder<'a> {
                 continue;
             }
             let expression = self.execution.expression(expression)?;
-            pending.extend(semantic_expression_children(
-                &expression.kind,
-                self.execution,
-            )?);
+            try_for_each_semantic_expression_child(&expression.kind, self.execution, |child| {
+                pending.push(child);
+                Ok(())
+            })?;
         }
         Ok(result)
     }
@@ -4818,9 +4832,10 @@ impl<'a> TriggerResolver<'a> {
                 }
             }
             _ => {
-                for child in semantic_expression_children(&expression.kind, self.execution)? {
-                    self.collect_event_causes(child, terminal, visited, causes)?;
-                }
+                let execution = self.execution;
+                try_for_each_semantic_expression_child(&expression.kind, execution, |child| {
+                    self.collect_event_causes(child, terminal, visited, causes)
+                })?;
             }
         }
         Ok(())
@@ -5279,9 +5294,10 @@ impl<'a> TriggerResolver<'a> {
                 }
             }
             _ => {
-                for child in semantic_expression_children(&expression.kind, self.execution)? {
-                    self.collect_trigger_arms(child, terminal, visited, arms)?;
-                }
+                let execution = self.execution;
+                try_for_each_semantic_expression_child(&expression.kind, execution, |child| {
+                    self.collect_trigger_arms(child, terminal, visited, arms)
+                })?;
             }
         }
         Ok(())
@@ -5424,18 +5440,21 @@ impl<'a> TriggerResolver<'a> {
     }
 }
 
-fn semantic_expression_children(
+fn try_for_each_semantic_expression_child(
     kind: &SemanticExpressionKind,
     execution: &SemanticExecutionImageColumnsV1,
-) -> Result<Vec<SemanticExprId>, SemanticReactiveError> {
-    execution.expression_children(kind).ok_or_else(|| {
-        let SemanticExpressionKind::Materialize { materialization } = kind else {
-            unreachable!("only invalid materialization references lack expression children");
-        };
-        SemanticReactiveError::new(format!(
-            "expression references missing semantic materialization {materialization}"
-        ))
-    })
+    visit: impl FnMut(SemanticExprId) -> Result<(), SemanticReactiveError>,
+) -> Result<(), SemanticReactiveError> {
+    execution
+        .try_for_each_expression_child(kind, visit)
+        .ok_or_else(|| {
+            let SemanticExpressionKind::Materialize { materialization } = kind else {
+                unreachable!("only invalid materialization references lack expression children");
+            };
+            SemanticReactiveError::new(format!(
+                "expression references missing semantic materialization {materialization}"
+            ))
+        })?
 }
 
 fn exact_call_argument_at_ordinal(

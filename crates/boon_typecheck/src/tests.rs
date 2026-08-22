@@ -276,6 +276,291 @@ fn kernel_checked_image_seals_preserve_topology_and_definition_currentness() {
     );
 }
 
+struct RuntimePackedPublicationFixture {
+    project: ProjectSyntaxSnapshot,
+    rich_construction: CheckedProgramConstruction,
+    packed_construction: CheckedProgramConstruction,
+    authority: CheckedImageKernelAuthorityV1,
+    authority_handoff: CheckedImageHandoffV4,
+    call_count: usize,
+}
+
+fn runtime_packed_publication_fixture() -> RuntimePackedPublicationFixture {
+    let project = boon_parser::parse_project_syntax(
+        "app/RUN.bn",
+        [(
+            "app/RUN.bn".to_owned(),
+            concat!(
+                "FUNCTION double(input) {\n",
+                "    input + input\n",
+                "}\n",
+                "value: double(input: 2)\n",
+            )
+            .to_owned(),
+        )],
+    )
+    .expect("RuntimePacked publication fixture parses");
+    let output = check_project_diagnostics_program_profiled_with_external_types(
+        &project,
+        &ExternalTypeEnvironment::default(),
+    )
+    .0;
+    assert!(
+        !output.report.has_errors(),
+        "{:#?}",
+        output.report.diagnostics
+    );
+    let rich_construction = output
+        .construction
+        .expect("RuntimePacked publication fixture retains a construction");
+    let rich_fields = rich_construction.clone().__typechecker_into_fields();
+    let call_count = rich_fields.calls.len();
+    assert_eq!(call_count, 1, "fixture must have one dense call");
+    let syntax = TypecheckSyntaxProgram::UnitNative(project.clone());
+    let occurrences = checked_call_occurrences_from_syntax(&rich_fields, &syntax)
+        .expect("fixture derives parser-owned call identities");
+    let mut definitions = vec![CheckedImageDefinitionAuthoritySealV1 {
+        root_scope: rich_fields.root_scope,
+        definition_key_digest: [1; 32],
+        fingerprint: [11; 32],
+    }];
+    for (index, callable) in rich_fields
+        .callables
+        .iter()
+        .filter(|callable| callable.kind == CheckedCallableKind::User)
+        .enumerate()
+    {
+        definitions.push(CheckedImageDefinitionAuthoritySealV1 {
+            root_scope: callable.scope_id,
+            definition_key_digest: [u8::try_from(index + 2).unwrap(); 32],
+            fingerprint: [u8::try_from(index + 22).unwrap(); 32],
+        });
+    }
+    let authority = CheckedImageKernelAuthorityV1 {
+        schema: CHECKED_IMAGE_KERNEL_AUTHORITY_SCHEMA_V1.to_owned(),
+        source_bundle_digest_v1: rich_fields.source_bundle_digest_v1,
+        role: rich_fields.role,
+        program_metadata_fingerprint: [44; 32],
+        referenced_abi_fingerprint: [55; 32],
+        definitions,
+        runtime_flow_terms:
+            boon_checked::CheckedRuntimeFlowTermProjectionV1::derive_from_checked_expressions(
+                &rich_fields.expressions,
+            )
+            .expect("fixture runtime flow terms"),
+    };
+    let authority_handoff =
+        checked_image_handoff_with_call_occurrences(&rich_fields, &occurrences, Some(&authority))
+            .expect("fixture derives its authority-backed checked image");
+    let mut packed_fields = rich_fields;
+    packed_fields.calls.clear();
+    let packed_construction =
+        unsafe { CheckedProgramConstruction::from_typechecker_fields_unchecked(packed_fields) };
+    RuntimePackedPublicationFixture {
+        project,
+        rich_construction,
+        packed_construction,
+        authority,
+        authority_handoff,
+        call_count,
+    }
+}
+
+fn runtime_packed_publication_with_call_routes(
+    handoff: &CheckedImageHandoffV4,
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    role: ProgramRole,
+    call_routes: &[usize],
+) -> Result<boon_checked::CheckedImageKernelPublicationV1, String> {
+    let mut publication =
+        boon_checked::CheckedImageKernelPublicationV1::__kernel_new(source_bundle_digest_v1, role);
+    let projection_ids = handoff
+        .projections
+        .iter()
+        .map(|projection| publication.__kernel_intern_projection(projection.stable_key.clone()))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (ordinal, projection) in handoff.projections.iter().enumerate() {
+        let projection_id = projection_ids[ordinal];
+        let independent_rows = projection
+            .row_count
+            .checked_sub(projection.dependency_row_count)
+            .ok_or_else(|| "fixture dependency rows exceed total rows".to_owned())?;
+        publication.__kernel_publish_rows(projection_id, independent_rows)?;
+        let handoff_id = CheckedImageProjectionIdV2(
+            u32::try_from(ordinal)
+                .map_err(|_| "fixture projection ordinal exceeds u32".to_owned())?,
+        );
+        let relocations = handoff
+            .projection_relocations(handoff_id)
+            .ok_or_else(|| format!("fixture projection {ordinal} has invalid relocations"))?
+            .iter()
+            .map(|target| {
+                projection_ids
+                    .get(target.as_usize())
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "fixture projection {ordinal} references missing relocation {}",
+                            target.0,
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if projection.dependency_row_count != 0 && relocations.is_empty() {
+            return Err(format!(
+                "fixture projection {ordinal} has dependency rows without relocations"
+            ));
+        }
+        for _ in 0..projection.dependency_row_count {
+            publication
+                .__kernel_publish_dependency_row(projection_id, relocations.iter().copied())?;
+        }
+    }
+    let call_projection = handoff
+        .entity_routes
+        .iter()
+        .find(|route| route.domain == CheckedImageRowDomainV2::Call)
+        .and_then(|route| projection_ids.get(route.projection.as_usize()))
+        .copied()
+        .ok_or_else(|| "fixture has no checked Call projection".to_owned())?;
+    for route in &handoff.entity_routes {
+        if route.domain == CheckedImageRowDomainV2::Call {
+            continue;
+        }
+        let projection = projection_ids
+            .get(route.projection.as_usize())
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "fixture route {:?}/{} references missing projection {}",
+                    route.domain, route.dense_index, route.projection.0,
+                )
+            })?;
+        publication.__kernel_route(route.domain, route.dense_index as usize, projection)?;
+    }
+    for dense_index in call_routes {
+        publication.__kernel_route(CheckedImageRowDomainV2::Call, *dense_index, call_projection)?;
+    }
+    Ok(publication)
+}
+
+#[test]
+fn runtime_packed_kernel_publication_seals_without_rich_call_rows() {
+    let fixture = runtime_packed_publication_fixture();
+    let publication = runtime_packed_publication_with_call_routes(
+        &fixture.authority_handoff,
+        fixture.authority.source_bundle_digest_v1,
+        fixture.authority.role,
+        &[0],
+    )
+    .expect("fixture rebuilds the packed publication");
+    let pairing = publication.__kernel_pairing();
+    let (program, receipt) =
+        seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
+            &fixture.project,
+            fixture.packed_construction,
+            fixture.call_count,
+            &fixture.authority,
+            publication,
+        )
+        .expect("RuntimePacked publication seals without rich call rows");
+    assert!(program.calls.is_empty());
+    assert!(
+        program
+            .image_handoff()
+            .entity_projection(CheckedImageRowDomainV2::Call, 0)
+            .is_some()
+    );
+    receipt
+        .__kernel_validate(&pairing, program.image_handoff())
+        .expect("returned receipt binds the publication pairing and sealed image");
+}
+
+#[test]
+fn runtime_packed_kernel_publication_requires_empty_rich_calls() {
+    let fixture = runtime_packed_publication_fixture();
+    let publication = runtime_packed_publication_with_call_routes(
+        &fixture.authority_handoff,
+        fixture.authority.source_bundle_digest_v1,
+        fixture.authority.role,
+        &[0],
+    )
+    .expect("fixture rebuilds the packed publication");
+    let error =
+        seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
+            &fixture.project,
+            fixture.rich_construction,
+            fixture.call_count,
+            &fixture.authority,
+            publication,
+        )
+        .expect_err("RuntimePacked boundary must reject retained rich calls");
+    assert!(error.contains("retains 1 rich call rows"), "{error}");
+}
+
+#[test]
+fn runtime_packed_kernel_publication_rejects_missing_call_route() {
+    let fixture = runtime_packed_publication_fixture();
+    let publication = runtime_packed_publication_with_call_routes(
+        &fixture.authority_handoff,
+        fixture.authority.source_bundle_digest_v1,
+        fixture.authority.role,
+        &[0, 2],
+    )
+    .expect("fixture rebuilds a publication with a gap in its Call routes");
+    let error =
+        seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
+            &fixture.project,
+            fixture.packed_construction,
+            3,
+            &fixture.authority,
+            publication,
+        )
+        .expect_err("missing RuntimePacked Call route must fail closed");
+    assert!(
+        error.contains("missing dense Call route 1 before route 2"),
+        "{error}"
+    );
+}
+
+#[test]
+fn runtime_packed_kernel_publication_rejects_out_of_range_call_route() {
+    let fixture = runtime_packed_publication_fixture();
+    let publication = runtime_packed_publication_with_call_routes(
+        &fixture.authority_handoff,
+        fixture.authority.source_bundle_digest_v1,
+        fixture.authority.role,
+        &[0, 1],
+    )
+    .expect("fixture rebuilds a publication with an extra Call route");
+    let error =
+        seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
+            &fixture.project,
+            fixture.packed_construction,
+            fixture.call_count,
+            &fixture.authority,
+            publication,
+        )
+        .expect_err("out-of-range RuntimePacked Call route must fail closed");
+    assert!(
+        error.contains("Call route 1 is outside authoritative packed call count 1"),
+        "{error}"
+    );
+}
+
+#[test]
+fn kernel_publication_rejects_duplicate_call_route_at_construction() {
+    let fixture = runtime_packed_publication_fixture();
+    let error = runtime_packed_publication_with_call_routes(
+        &fixture.authority_handoff,
+        fixture.authority.source_bundle_digest_v1,
+        fixture.authority.role,
+        &[0, 0],
+    )
+    .expect_err("duplicate Call routes are not constructible");
+    assert!(error.contains("Call route 0 is published twice"), "{error}");
+}
+
 #[test]
 fn project_checked_metadata_reconstruction_uses_only_parser_and_checked_rows() {
     let project = boon_parser::parse_project_syntax(

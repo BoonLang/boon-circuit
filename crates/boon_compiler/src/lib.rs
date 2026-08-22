@@ -289,9 +289,11 @@ pub struct CheckedSourceFromSource {
     pub syntax: CheckedSourceSyntax,
     pub output: boon_checked::CheckOutput,
     pub profile: CheckedDiagnosticsProfile,
-    /// Parser-issued call identities supplied by the dense kernel. Legacy
-    /// checked constructions derive them from parser slots during sealing.
-    checked_call_occurrences: Option<Box<[boon_syntax::StableOccurrenceKey]>>,
+    /// Exact call-family authority used while granting the runtime checked
+    /// capability. RuntimePacked owns only the packed count and invocation
+    /// routes; EditorRich retains parser-issued structural occurrences for its
+    /// explicit replay/oracle projection.
+    checked_call_seal_authority: Option<CheckedCallSealAuthority>,
     /// Definition-owned checked-image authority emitted only by the dense
     /// kernel. A verified request consumes it instead of serializing every
     /// rich checked row to prove the same immutable definitions again.
@@ -303,6 +305,11 @@ pub struct CheckedSourceFromSource {
     /// route. It is sealed to the checked image immediately before semantic
     /// elaboration and never enters the serializable checked DTO.
     kernel_semantic_input: boon_compiler_kernel::KernelSemanticInputConstructionV1,
+}
+
+pub(crate) enum CheckedCallSealAuthority {
+    RuntimePacked { call_count: usize },
+    EditorRich(Box<[boon_syntax::StableOccurrenceKey]>),
 }
 
 /// Selects which public diagnostic projection must survive checked-image
@@ -940,7 +947,7 @@ pub(crate) fn checked_source_from_checked_fields(
     kernel_compile_work: boon_compiler_kernel::KernelCompileWork,
     kernel_solve_work: boon_compiler_kernel::KernelSolveWork,
     typecheck_ms: f64,
-    checked_call_occurrences: Option<Box<[boon_syntax::StableOccurrenceKey]>>,
+    checked_call_seal_authority: Option<CheckedCallSealAuthority>,
     checked_image_kernel_authority: Option<Box<boon_checked::CheckedImageKernelAuthorityV1>>,
     checked_image_kernel_publication: Option<Box<boon_checked::CheckedImageKernelPublicationV1>>,
     report_demand: CheckedReportDemand,
@@ -1105,7 +1112,7 @@ pub(crate) fn checked_source_from_checked_fields(
             typecheck_ms,
             total_ms: parse_ms + typecheck_ms,
         },
-        checked_call_occurrences,
+        checked_call_seal_authority,
         checked_image_kernel_authority,
         checked_image_kernel_publication,
         kernel_semantic_input,
@@ -1189,7 +1196,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         syntax,
         output,
         mut profile,
-        checked_call_occurrences,
+        checked_call_seal_authority,
         checked_image_kernel_authority,
         checked_image_kernel_publication,
         kernel_semantic_input,
@@ -1203,7 +1210,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
     let (checked, kernel_pairing_receipt) = checked_program_from_output(
         syntax,
         output,
-        checked_call_occurrences,
+        checked_call_seal_authority,
         checked_image_kernel_authority,
         checked_image_kernel_publication,
     )?;
@@ -1273,15 +1280,23 @@ fn finish_checked_program_to_machine_plan(
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let finish_started = Instant::now();
     let checked_expression_count = checked.expressions.len();
-    let checked_call_count = checked.calls.len();
+    let checked_call_count = kernel_semantic_input.call_count();
+    if !checked.calls.is_empty() && checked.calls.len() != checked_call_count {
+        return Err(PlanError::new(format!(
+            "rich checked call projection has {} rows but its paired packed authority has {checked_call_count}",
+            checked.calls.len(),
+        ))
+        .into());
+    }
     if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
         eprintln!(
-            "boon_compiler checked_program scopes={} declarations={} statements={} expressions={} callables={} calls={}",
+            "boon_compiler checked_program scopes={} declarations={} statements={} expressions={} callables={} calls={} rich_call_rows={}",
             checked.scopes.len(),
             checked.declarations.len(),
             checked.statements.len(),
             checked.expressions.len(),
             checked.callables.len(),
+            checked_call_count,
             checked.calls.len(),
         );
     }
@@ -1373,7 +1388,7 @@ impl CheckedSyntaxRef<'_> {
 fn checked_program_from_output(
     syntax: CheckedSyntaxRef<'_>,
     output: boon_checked::CheckOutput,
-    checked_call_occurrences: Option<Box<[boon_syntax::StableOccurrenceKey]>>,
+    checked_call_seal_authority: Option<CheckedCallSealAuthority>,
     checked_image_kernel_authority: Option<Box<boon_checked::CheckedImageKernelAuthorityV1>>,
     checked_image_kernel_publication: Option<Box<boon_checked::CheckedImageKernelPublicationV1>>,
 ) -> CompilerResult<(
@@ -1422,7 +1437,7 @@ fn checked_program_from_output(
         (Some(program), None) => Ok((program, None)),
         (None, Some(construction)) => match syntax {
             CheckedSyntaxRef::Assembled(program)
-                if checked_call_occurrences.is_none()
+                if checked_call_seal_authority.is_none()
                     && checked_image_kernel_authority.is_none()
                     && checked_image_kernel_publication.is_none() =>
             {
@@ -1435,11 +1450,30 @@ fn checked_program_from_output(
             )
             .into()),
             CheckedSyntaxRef::UnitNative(program) => match (
-                checked_call_occurrences,
+                checked_call_seal_authority,
                 checked_image_kernel_authority,
                 checked_image_kernel_publication,
             ) {
-                (Some(call_occurrences), Some(authority), Some(publication)) => {
+                (
+                    Some(CheckedCallSealAuthority::RuntimePacked { call_count }),
+                    Some(authority),
+                    Some(publication),
+                ) => {
+                    boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
+                        program,
+                        construction,
+                        call_count,
+                        &authority,
+                        *publication,
+                    )
+                    .map(|(program, receipt)| (program, Some(receipt)))
+                    .map_err(|error| PlanError::new(error).into())
+                }
+                (
+                    Some(CheckedCallSealAuthority::EditorRich(call_occurrences)),
+                    Some(authority),
+                    Some(publication),
+                ) => {
                     boon_typecheck::seal_project_checked_program_construction_with_kernel_publication_and_pairing(
                             program,
                             construction,
@@ -1454,7 +1488,11 @@ fn checked_program_from_output(
                     "kernel checked authority has no construction-owned image publication",
                 )
                 .into()),
-                (Some(call_occurrences), None, None) => {
+                (
+                    Some(CheckedCallSealAuthority::EditorRich(call_occurrences)),
+                    None,
+                    None,
+                ) => {
                     boon_typecheck::seal_project_checked_program_construction_with_call_occurrences(
                         program,
                         construction,

@@ -5,7 +5,7 @@
 //! roots, contextual expansion consumes its retained definitions, and the
 //! construction-owned image will consume the categorized obligations.
 
-use crate::out_net::ProducerRootSpec;
+use crate::{call_view::CallCatalog, out_net::ProducerRootSpec};
 use boon_checked::{
     CheckedCallableKind, CheckedExprId, CheckedProgramFields, CheckedStatementId,
     CheckedStatementKind, DeclId, LexicalScopeId,
@@ -45,6 +45,7 @@ pub(crate) struct VerifiedSemanticIntentV1 {
 impl VerifiedSemanticIntentV1 {
     pub(crate) fn build(
         program: &CheckedProgramFields,
+        calls: &CallCatalog<'_>,
         producer_roots: &[ProducerRootSpec],
         retained_definitions: BTreeSet<DeclId>,
     ) -> Result<Self, String> {
@@ -184,16 +185,16 @@ impl VerifiedSemanticIntentV1 {
                 statement: Some(list.statement),
             });
         }
-        for call in &program.calls {
+        for call in calls.calls() {
             if callables
-                .get(&call.callable)
+                .get(&call.callable())
                 .is_some_and(|callable| callable.kind == CheckedCallableKind::External)
             {
                 roots.push(VerifiedIntentRootV1 {
                     kind: VerifiedIntentRootKindV1::ExternalCall,
-                    expression: call.expression,
-                    owner_callable: call.owner_callable,
-                    declaration: Some(call.callable),
+                    expression: call.expression(),
+                    owner_callable: call.owner_callable(),
+                    declaration: Some(call.callable()),
                     statement: None,
                 });
             }
@@ -361,7 +362,9 @@ document: Document/new(root: [])
             checked.report.diagnostics
         );
         let (program, _) = checked.program.unwrap().into_parts();
-        let intent = VerifiedSemanticIntentV1::build(&program, &[], BTreeSet::new()).unwrap();
+        let calls = CallCatalog::rich(&program).unwrap();
+        let intent =
+            VerifiedSemanticIntentV1::build(&program, &calls, &[], BTreeSet::new()).unwrap();
         assert_eq!(
             intent.program_schedule_roots().len(),
             3,

@@ -2429,7 +2429,9 @@ fn materialization_target_lists(
                 }
                 pending.push(materialization.source);
             } else {
-                pending.extend(value.kind.direct_children());
+                value
+                    .kind
+                    .for_each_direct_child(|child| pending.push(child));
             }
         }
     }
@@ -6632,9 +6634,11 @@ fn reachable_expression_members(
                         "semantic expression member traversal references missing materialization {materialization}"
                     )
                 })?;
-            pending.extend(materialization.expression_roots());
+            materialization.for_each_expression_root(|root| pending.push(root));
         }
-        pending.extend(value.kind.direct_children());
+        value
+            .kind
+            .for_each_direct_child(|child| pending.push(child));
     }
     Ok(visited.into_iter().collect())
 }
@@ -6662,9 +6666,11 @@ fn expression_reaches(
                 .ok_or_else(|| {
                     format!("reachability references missing materialization {materialization}")
                 })?;
-            pending.extend(materialization.expression_roots());
+            materialization.for_each_expression_root(|root| pending.push(root));
         }
-        pending.extend(value.kind.direct_children());
+        value
+            .kind
+            .for_each_direct_child(|child| pending.push(child));
     }
     Ok(false)
 }

@@ -19,6 +19,7 @@ use crate::execution::{
 use crate::{
     ExecutionPending, OutCallInstanceId, OutInputValue, OutNetId, ResolvedOutGraph as OutNet,
     ScopedCheckedExpr, SemanticImageBuilder, StaticOwnerId,
+    call_view::{CallCatalog, CallContextRef, CallEntryRef, CallRef},
     definition_templates::{
         DefinitionExecutionTemplateRef, definition_execution_template,
         definition_execution_templates,
@@ -27,12 +28,12 @@ use crate::{
 };
 pub(crate) use boon_checked::erase_runtime_type_vars;
 use boon_checked::{
-    CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedContextBinding,
-    CheckedContextualOperation, CheckedDeclarationKind, CheckedExprId, CheckedExpression,
-    CheckedExpressionKind, CheckedImageHandoffV4, CheckedMatchPattern, CheckedParameterKind,
-    CheckedParameterRequirement, CheckedPassedAccess, CheckedProgramFields, CheckedResourceBinding,
-    CheckedSourceId, CheckedStateId, CheckedStateKind, CheckedTextSegment, CheckedValueUse,
-    ContextFormalId, DeclId, FlowMode, FlowType, Type, is_renderable_type,
+    CheckedCallId, CheckedCallableKind, CheckedContextBinding, CheckedContextualOperation,
+    CheckedDeclarationKind, CheckedExprId, CheckedExpression, CheckedExpressionKind,
+    CheckedImageHandoffV4, CheckedMatchPattern, CheckedParameterKind, CheckedParameterRequirement,
+    CheckedPassedAccess, CheckedProgramFields, CheckedResourceBinding, CheckedSourceId,
+    CheckedStateId, CheckedStateKind, CheckedTextSegment, CheckedValueUse, ContextFormalId, DeclId,
+    FlowMode, FlowType, Type, is_renderable_type,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -282,17 +283,17 @@ impl fmt::Display for ExpansionError {
     }
 }
 
-struct CheckedProgramLookup {
+struct CheckedProgramLookup<'a> {
+    calls: &'a CallCatalog<'a>,
     expressions_by_id: Vec<Option<Option<usize>>>,
     declarations_by_id: Vec<Option<Option<usize>>>,
     statements_by_id: Vec<Option<Option<usize>>>,
     scopes_by_id: Vec<Option<Option<usize>>>,
-    calls_by_id: Vec<Option<Option<usize>>>,
     callables_by_declaration: Vec<Option<Option<usize>>>,
     declarations_by_scope_and_name: Vec<BTreeMap<String, Option<DeclId>>>,
     pattern_bindings_by_declaration: Vec<Option<Option<usize>>>,
     statements_by_value: Vec<Vec<usize>>,
-    element_contexts_by_declaration: Vec<Option<Option<(usize, usize)>>>,
+    element_contexts_by_declaration: Vec<Option<Option<(CheckedCallId, usize)>>>,
     source_by_expression: Vec<Option<Option<usize>>>,
     state_by_expression: Vec<Option<Option<usize>>>,
     source_declarations: Vec<bool>,
@@ -321,62 +322,46 @@ struct CheckedSourceContainmentIndex {
 }
 
 impl CheckedSourceContainmentIndex {
-    fn new(program: &CheckedProgramFields, lookup: &CheckedProgramLookup) -> Self {
+    fn new(program: &CheckedProgramFields, lookup: &CheckedProgramLookup<'_>) -> Self {
         let mut actual_inputs_by_formal = BTreeMap::<DeclId, Vec<CheckedExprId>>::new();
         let mut contextual_lists_by_output = BTreeMap::<DeclId, Vec<CheckedExprId>>::new();
         let mut forwarded_outputs_by_formal = BTreeMap::<DeclId, Vec<DeclId>>::new();
-        for call in &program.calls {
+        for call in lookup.calls.calls() {
             let mut indexed_inputs = BTreeSet::new();
-            for entry in &call.entries {
-                match entry {
-                    CheckedCallEntry::Input { formal, value, .. } => {
-                        if indexed_inputs.insert(*formal) {
-                            actual_inputs_by_formal
-                                .entry(*formal)
-                                .or_default()
-                                .push(*value);
-                        }
-                    }
-                    CheckedCallEntry::FreshOut { formal, output, .. }
-                    | CheckedCallEntry::ForwardOut {
-                        formal,
-                        target: output,
-                        ..
-                    } => {
-                        forwarded_outputs_by_formal
-                            .entry(*formal)
+            for entry in lookup.calls.entries(call) {
+                if let Some((value, _, _)) = entry.input() {
+                    let formal = entry.formal();
+                    if indexed_inputs.insert(formal) {
+                        actual_inputs_by_formal
+                            .entry(formal)
                             .or_default()
-                            .push(*output);
+                            .push(value);
                     }
+                } else if let Some(output) = entry.output() {
+                    forwarded_outputs_by_formal
+                        .entry(entry.formal())
+                        .or_default()
+                        .push(output);
                 }
             }
             let Some(operation) = lookup
-                .callable(program, call.callable)
+                .callable(program, call.callable())
                 .and_then(|callable| callable.contextual_operation)
             else {
                 continue;
             };
             let (_, list_formal, row_formal, _, _) = contextual_operation_formals(operation);
-            let Some(list) = call.entries.iter().find_map(|entry| match entry {
-                CheckedCallEntry::Input { formal, value, .. } if *formal == list_formal => {
-                    Some(*value)
-                }
-                _ => None,
+            let Some(list) = lookup.calls.entries(call).find_map(|entry| {
+                (entry.formal() == list_formal)
+                    .then(|| entry.input().map(|(value, _, _)| value))
+                    .flatten()
             }) else {
                 continue;
             };
-            for entry in &call.entries {
-                let output = match entry {
-                    CheckedCallEntry::FreshOut { formal, output, .. } if *formal == row_formal => {
-                        Some(*output)
-                    }
-                    CheckedCallEntry::ForwardOut { formal, target, .. }
-                        if *formal == row_formal =>
-                    {
-                        Some(*target)
-                    }
-                    _ => None,
-                };
+            for entry in lookup.calls.entries(call) {
+                let output = (entry.formal() == row_formal)
+                    .then(|| entry.output())
+                    .flatten();
                 if let Some(output) = output {
                     contextual_lists_by_output
                         .entry(output)
@@ -395,7 +380,7 @@ impl CheckedSourceContainmentIndex {
     fn projection_contains_source<'a>(
         &self,
         program: &'a CheckedProgramFields,
-        lookup: &CheckedProgramLookup,
+        lookup: &CheckedProgramLookup<'_>,
         target: DeclId,
         projection: &[&'a str],
     ) -> bool {
@@ -405,7 +390,7 @@ impl CheckedSourceContainmentIndex {
     fn declaration_contains_source<'a>(
         &self,
         program: &'a CheckedProgramFields,
-        lookup: &CheckedProgramLookup,
+        lookup: &CheckedProgramLookup<'_>,
         target: DeclId,
         projection: &[&'a str],
         active: &mut BTreeSet<CheckedSourceContainmentNode<'a>>,
@@ -466,7 +451,7 @@ impl CheckedSourceContainmentIndex {
     fn expression_contains_source<'a>(
         &self,
         program: &'a CheckedProgramFields,
-        lookup: &CheckedProgramLookup,
+        lookup: &CheckedProgramLookup<'_>,
         expression_id: CheckedExprId,
         projection: &[&'a str],
         active: &mut BTreeSet<CheckedSourceContainmentNode<'a>>,
@@ -535,10 +520,10 @@ impl CheckedSourceContainmentIndex {
                 }
             }
             CheckedExpressionKind::Call { call } => lookup
-                .call(program, *call)
+                .call(*call)
                 .and_then(|call| {
                     lookup
-                        .callable(program, call.callable)
+                        .callable(program, call.callable())
                         .map(|callable| (call, callable))
                 })
                 .is_some_and(|(call, callable)| {
@@ -552,11 +537,9 @@ impl CheckedSourceContainmentIndex {
                     if matches!(
                         callable.contextual_operation,
                         Some(CheckedContextualOperation::Find { .. })
-                    ) || matches!(
-                        call.function.as_str(),
-                        "List/get" | "List/latest" | "List/find"
-                    ) {
-                        return checked_call_named_input(callable, call, "list").is_some_and(
+                    ) || matches!(call.function(), "List/get" | "List/latest" | "List/find")
+                    {
+                        return checked_call_named_input(lookup.calls, call, "list").is_some_and(
                             |list| {
                                 self.list_item_contains_source(
                                     program, lookup, list, projection, active,
@@ -634,7 +617,7 @@ impl CheckedSourceContainmentIndex {
     fn list_item_contains_source<'a>(
         &self,
         program: &'a CheckedProgramFields,
-        lookup: &CheckedProgramLookup,
+        lookup: &CheckedProgramLookup<'_>,
         expression_id: CheckedExprId,
         projection: &[&'a str],
         active: &mut BTreeSet<CheckedSourceContainmentNode<'a>>,
@@ -681,10 +664,10 @@ impl CheckedSourceContainmentIndex {
                             })
                     }),
                 CheckedExpressionKind::Call { call } => lookup
-                    .call(program, *call)
+                    .call(*call)
                     .and_then(|call| {
                         lookup
-                            .callable(program, call.callable)
+                            .callable(program, call.callable())
                             .map(|callable| (call, callable))
                     })
                     .is_some_and(|(call, callable)| {
@@ -696,16 +679,13 @@ impl CheckedSourceContainmentIndex {
                             });
                         }
                         match callable.contextual_operation {
-                            Some(CheckedContextualOperation::Map { body, .. }) => call
-                                .entries
-                                .iter()
-                                .find_map(|entry| match entry {
-                                    CheckedCallEntry::Input { formal, value, .. }
-                                        if *formal == body =>
-                                    {
-                                        Some(*value)
-                                    }
-                                    _ => None,
+                            Some(CheckedContextualOperation::Map { body, .. }) => lookup
+                                .calls
+                                .entries(call)
+                                .find_map(|entry| {
+                                    (entry.formal() == body)
+                                        .then(|| entry.input().map(|(value, _, _)| value))
+                                        .flatten()
                                 })
                                 .is_some_and(|body| {
                                     self.expression_contains_source(
@@ -718,16 +698,13 @@ impl CheckedSourceContainmentIndex {
                                 | CheckedContextualOperation::Remove { list, .. }
                                 | CheckedContextualOperation::SortBy { list, .. }
                                 | CheckedContextualOperation::ThenBy { list, .. },
-                            ) => call
-                                .entries
-                                .iter()
-                                .find_map(|entry| match entry {
-                                    CheckedCallEntry::Input { formal, value, .. }
-                                        if *formal == list =>
-                                    {
-                                        Some(*value)
-                                    }
-                                    _ => None,
+                            ) => lookup
+                                .calls
+                                .entries(call)
+                                .find_map(|entry| {
+                                    (entry.formal() == list)
+                                        .then(|| entry.input().map(|(value, _, _)| value))
+                                        .flatten()
                                 })
                                 .is_some_and(|list| {
                                     self.list_item_contains_source(
@@ -769,7 +746,7 @@ impl CheckedSourceContainmentIndex {
     fn output_contains_source<'a>(
         &self,
         program: &'a CheckedProgramFields,
-        lookup: &CheckedProgramLookup,
+        lookup: &CheckedProgramLookup<'_>,
         target: DeclId,
         projection: &[&'a str],
         active: &mut BTreeSet<CheckedSourceContainmentNode<'a>>,
@@ -797,28 +774,20 @@ impl CheckedSourceContainmentIndex {
     }
 }
 
-fn checked_call_named_input(
-    callable: &boon_checked::CheckedCallableSignature,
-    call: &boon_checked::CheckedCall,
+fn checked_call_named_input<'a>(
+    calls: &CallCatalog<'a>,
+    call: CallRef<'a>,
     name: &str,
 ) -> Option<CheckedExprId> {
-    let formal = callable
-        .parameters
-        .iter()
-        .find(|parameter| parameter.name == name)?
-        .decl_id;
-    call.entries.iter().find_map(|entry| match entry {
-        CheckedCallEntry::Input {
-            formal: candidate,
-            value,
-            ..
-        } if *candidate == formal => Some(*value),
-        _ => None,
+    calls.entries(call).find_map(|entry| {
+        (entry.parameter().name == name)
+            .then(|| entry.input().map(|(value, _, _)| value))
+            .flatten()
     })
 }
 
-impl CheckedProgramLookup {
-    fn new(program: &CheckedProgramFields) -> Self {
+impl<'catalog> CheckedProgramLookup<'catalog> {
+    fn new(program: &CheckedProgramFields, calls: &'catalog CallCatalog<'catalog>) -> Self {
         let mut expressions_by_id = Vec::new();
         for (index, expression) in program.expressions.iter().enumerate() {
             insert_dense_index(&mut expressions_by_id, expression.id.0 as usize, index);
@@ -860,10 +829,6 @@ impl CheckedProgramLookup {
                 current = parent;
             }
         }
-        let mut calls_by_id = Vec::new();
-        for (index, call) in program.calls.iter().enumerate() {
-            insert_dense_index(&mut calls_by_id, call.id.0 as usize, index);
-        }
         let mut callables_by_declaration = Vec::new();
         for (index, callable) in program.callables.iter().enumerate() {
             insert_dense_index(
@@ -900,12 +865,12 @@ impl CheckedProgramLookup {
             }
         }
         let mut element_contexts_by_declaration = Vec::new();
-        for (call_index, call) in program.calls.iter().enumerate() {
-            for (context_index, context) in call.contexts.iter().enumerate() {
+        for call in calls.calls() {
+            for (context_index, context) in calls.contexts(call).enumerate() {
                 insert_dense_value(
                     &mut element_contexts_by_declaration,
                     context.declaration.0 as usize,
-                    (call_index, context_index),
+                    (call.id(), context_index),
                 );
             }
         }
@@ -930,11 +895,11 @@ impl CheckedProgramLookup {
             }
         }
         Self {
+            calls,
             expressions_by_id,
             declarations_by_id,
             statements_by_id,
             scopes_by_id,
-            calls_by_id,
             callables_by_declaration,
             declarations_by_scope_and_name,
             pattern_bindings_by_declaration,
@@ -1053,18 +1018,8 @@ impl CheckedProgramLookup {
             .filter(|candidate| candidate.id == scope)
     }
 
-    fn call<'a>(
-        &self,
-        program: &'a CheckedProgramFields,
-        call: CheckedCallId,
-    ) -> Option<&'a boon_checked::CheckedCall> {
-        self.calls_by_id
-            .get(call.0 as usize)
-            .copied()
-            .flatten()
-            .flatten()
-            .and_then(|index| program.calls.get(index))
-            .filter(|candidate| candidate.id == call)
+    fn call(&self, call: CheckedCallId) -> Option<CallRef<'catalog>> {
+        self.calls.get(call)
     }
 
     fn callable<'a>(
@@ -1114,22 +1069,15 @@ impl CheckedProgramLookup {
             .unwrap_or_default()
     }
 
-    fn element_context<'a>(
-        &self,
-        program: &'a CheckedProgramFields,
-        declaration: DeclId,
-    ) -> Option<(
-        &'a boon_checked::CheckedCall,
-        &'a boon_checked::CheckedCallContext,
-    )> {
+    fn element_context(&self, declaration: DeclId) -> Option<(CallRef<'catalog>, CallContextRef)> {
         let (call, context) = self
             .element_contexts_by_declaration
             .get(declaration.0 as usize)
             .copied()
             .flatten()
             .flatten()?;
-        let call = program.calls.get(call)?;
-        let context = call.contexts.get(context)?;
+        let call = self.calls.get(call)?;
+        let context = self.calls.contexts(call).nth(context)?;
         (context.declaration == declaration).then_some((call, context))
     }
 
@@ -1352,6 +1300,8 @@ fn push_default_order_direction(
 
 pub(crate) fn derive_contextual_materializations(
     program: &CheckedProgramFields,
+    calls: &CallCatalog<'_>,
+    call_types: &crate::call_view::CallTypeCatalog,
     kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
     out_net: &OutNet,
     retained_ordinary_declarations: &BTreeSet<DeclId>,
@@ -1365,18 +1315,18 @@ pub(crate) fn derive_contextual_materializations(
     ),
     ExpansionError,
 > {
-    let lookup = CheckedProgramLookup::new(program);
+    let lookup = CheckedProgramLookup::new(program, calls);
     let mut candidates = Vec::new();
-    for checked_call in &program.calls {
+    for checked_call in calls.calls() {
         let callable = lookup
-            .callable(program, checked_call.callable)
-            .ok_or(ExpansionError::MissingCallable(checked_call.callable))?;
+            .callable(program, checked_call.callable())
+            .ok_or(ExpansionError::MissingCallable(checked_call.callable()))?;
         let Some(operation) = callable.contextual_operation else {
             continue;
         };
         let (operation_kind, list_formal, row_formal, body_formal, direction_formal) =
             contextual_operation_formals(operation);
-        for producer in out_net.concrete_producers_for_checked_call(checked_call.id) {
+        for producer in out_net.concrete_producers_for_checked_call(checked_call.id()) {
             if out_net.ports[producer.port.as_usize()].formal != row_formal {
                 continue;
             }
@@ -1388,7 +1338,7 @@ pub(crate) fn derive_contextual_materializations(
                     .find(|binding| binding.formal == formal)
                     .and_then(|binding| binding.checked_value())
                     .ok_or(ExpansionError::MissingOperationInput {
-                        call: checked_call.id,
+                        call: checked_call.id(),
                         formal,
                     })
             };
@@ -1405,10 +1355,10 @@ pub(crate) fn derive_contextual_materializations(
                 .owner_scope_for_net(producer.net)
                 .ok_or(ExpansionError::MissingOwnerScope(producer.net))?;
             candidates.push(ContextualCandidate {
-                call: checked_call.id,
+                call: checked_call.id(),
                 instance: producer.call,
-                checked_expression: checked_call.expression,
-                function: checked_call.function.clone(),
+                checked_expression: checked_call.expression(),
+                function: checked_call.function().to_owned(),
                 owner: producer.owner,
                 net: producer.net,
                 operation: operation_kind,
@@ -1490,6 +1440,7 @@ pub(crate) fn derive_contextual_materializations(
     let mut required_ordinary_definitions = BTreeSet::new();
     let builder_indexes = SemanticExpressionBuilderIndexes::new(
         program,
+        call_types,
         kernel_input,
         out_net,
         retained_ordinary_declarations,
@@ -2356,7 +2307,7 @@ fn add_missing_context_projection(ty: &Type, fields: &[String], leaf: Type) -> T
 /// scheme leaves keep their alpha correlation with parameters/results.
 fn completed_context_formal_flow_types(
     program: &CheckedProgramFields,
-    lookup: &CheckedProgramLookup,
+    lookup: &CheckedProgramLookup<'_>,
 ) -> Result<BTreeMap<ContextFormalId, FlowType>, ExpansionError> {
     let mut owners = BTreeMap::new();
     let mut completed = BTreeMap::new();
@@ -2412,17 +2363,16 @@ fn completed_context_formal_flow_types(
     // by every selected call to close to an empty runtime capture.
     loop {
         let mut changed = false;
-        for call in &program.calls {
+        for call in lookup.calls.calls() {
             let CheckedContextBinding::Inherited {
                 formal: caller_formal,
-            } = call.context_binding
+            } = call.context_binding()
             else {
                 continue;
             };
-            let target_formal = program
-                .callables
-                .iter()
-                .find(|callable| callable.decl_id == call.callable)
+            let target_formal = lookup
+                .calls
+                .callable(call.callable())
                 .and_then(|callable| callable.context_formal);
             if target_formal.is_some_and(|formal| whole_value_requirements.contains(&formal)) {
                 changed |= whole_value_requirements.insert(caller_formal);
@@ -2449,6 +2399,8 @@ fn completed_context_formal_flow_types(
 
 fn semantic_call_inventory(
     program: &CheckedProgramFields,
+    call_catalog: &crate::call_view::CallCatalog<'_>,
+    call_types: &mut crate::call_view::CallTypeCatalog,
     semantic_scope_ids: &BTreeMap<boon_checked::LexicalScopeId, SemanticScopeId>,
     callable_ids: &BTreeMap<DeclId, SemanticCallableId>,
 ) -> Result<(Vec<SemanticCall>, BTreeMap<CheckedCallId, SemanticCallId>), ExpansionError> {
@@ -2457,164 +2409,556 @@ fn semantic_call_inventory(
         .iter()
         .map(|expression| (expression.id, expression))
         .collect::<BTreeMap<_, _>>();
-    let callables = program
-        .callables
-        .iter()
-        .map(|callable| (callable.decl_id, callable))
-        .collect::<BTreeMap<_, _>>();
-    let temporally_gated = crate::temporally_gated_checked_expressions(program);
+    let temporally_gated = crate::temporally_gated_checked_expressions(program, call_catalog);
     let mut call_ids = BTreeMap::new();
-    let mut calls = Vec::with_capacity(program.calls.len());
-    for (index, call) in program.calls.iter().enumerate() {
+    let mut calls = Vec::with_capacity(call_catalog.len());
+    for (index, call) in call_catalog.calls().enumerate() {
         let id = SemanticCallId(index);
-        if call_ids.insert(call.id, id).is_some() {
+        if call_ids.insert(call.id(), id).is_some() {
             return Err(ExpansionError::InvalidLocalBindings(format!(
                 "checked call {} is defined more than once",
-                call.id.0
+                call.id().0
             )));
         }
-        let callable = callables.get(&call.callable).copied().ok_or_else(|| {
+        let callable = call_catalog.callable(call.callable()).ok_or_else(|| {
             ExpansionError::InvalidLocalBindings(format!(
                 "checked call {} references missing callable {}",
-                call.id.0, call.callable.0
+                call.id().0,
+                call.callable().0
             ))
         })?;
-        let semantic_callable = callable_ids.get(&call.callable).copied().ok_or_else(|| {
+        let semantic_callable = callable_ids.get(&call.callable()).copied().ok_or_else(|| {
             ExpansionError::InvalidLocalBindings(format!(
                 "checked call {} has no semantic callable {}",
-                call.id.0, call.callable.0
+                call.id().0,
+                call.callable().0
             ))
         })?;
         let owner_callable = call
-            .owner_callable
+            .owner_callable()
             .map(|owner| {
                 callable_ids.get(&owner).copied().ok_or_else(|| {
                     ExpansionError::InvalidLocalBindings(format!(
                         "checked call {} references missing owner callable {}",
-                        call.id.0, owner.0
+                        call.id().0,
+                        owner.0
                     ))
                 })
             })
             .transpose()?;
-        let mut entries = Vec::with_capacity(call.entries.len());
-        for entry in &call.entries {
-            let formal = match entry {
-                CheckedCallEntry::Input { formal, .. }
-                | CheckedCallEntry::FreshOut { formal, .. }
-                | CheckedCallEntry::ForwardOut { formal, .. } => *formal,
-            };
-            let parameter = callable
-                .parameters
-                .iter()
-                .find(|parameter| parameter.decl_id == formal)
-                .ok_or(ExpansionError::MissingFormal {
-                    callable: callable.decl_id,
-                    formal,
-                })?;
+        let mut entries = Vec::with_capacity(call.entry_count());
+        for entry in call_catalog.entries(call) {
+            let parameter = entry.parameter();
+            let formal = parameter.decl_id;
             entries.push(match entry {
-                CheckedCallEntry::Input {
-                    name,
+                CallEntryRef::Input {
                     value,
                     from_pipe,
                     evaluation_scope,
                     ..
                 } => {
                     let value_flow_type = expressions
-                        .get(value)
+                        .get(&value)
                         .map(|expression| expression.flow_type.clone())
-                        .ok_or(ExpansionError::MissingExpression(*value))?;
+                        .ok_or(ExpansionError::MissingExpression(value))?;
                     SemanticCallEntry::Input {
                         formal,
                         ordinal: parameter.ordinal,
-                        name: name.clone(),
-                        checked_value: *value,
+                        name: parameter.name.clone(),
+                        checked_value: value,
                         value_flow_type,
-                        from_pipe: *from_pipe,
-                        evaluation_scope: *evaluation_scope,
+                        from_pipe,
+                        evaluation_scope,
                         requirement: parameter.requirement.clone(),
                     }
                 }
-                CheckedCallEntry::FreshOut {
-                    name,
-                    output,
-                    scope_id,
-                    ..
-                } => SemanticCallEntry::FreshOut {
+                CallEntryRef::FreshOut { output, scope, .. } => SemanticCallEntry::FreshOut {
                     formal,
                     ordinal: parameter.ordinal,
-                    name: name.clone(),
-                    output: *output,
-                    scope: semantic_scope_ids.get(scope_id).copied().ok_or_else(|| {
+                    name: parameter.name.clone(),
+                    output,
+                    scope: semantic_scope_ids.get(&scope).copied().ok_or_else(|| {
                         ExpansionError::InvalidLocalBindings(format!(
                             "checked call {} OUT entry references missing scope {}",
-                            call.id.0, scope_id.0
+                            call.id().0,
+                            scope.0
                         ))
                     })?,
                 },
-                CheckedCallEntry::ForwardOut {
-                    name,
+                CallEntryRef::ForwardOut {
                     target,
                     target_name,
                     ..
                 } => SemanticCallEntry::ForwardOut {
                     formal,
                     ordinal: parameter.ordinal,
-                    name: name.clone(),
-                    target: *target,
-                    target_name: target_name.clone(),
+                    name: parameter.name.clone(),
+                    target,
+                    target_name: target_name.to_owned(),
                 },
             });
         }
-        let contexts = call
-            .contexts
-            .iter()
+        let contexts = call_catalog
+            .contexts(call)
             .map(|context| {
                 Ok(SemanticCallContextBinding {
                     declaration: context.declaration,
                     signature: context.signature,
                     scope: semantic_scope_ids
-                        .get(&context.scope_id)
+                        .get(&context.scope)
                         .copied()
                         .ok_or_else(|| {
                             ExpansionError::InvalidLocalBindings(format!(
                                 "checked call {} context references missing scope {}",
-                                call.id.0, context.scope_id.0
+                                call.id().0,
+                                context.scope.0
                             ))
                         })?,
                 })
             })
             .collect::<Result<Vec<_>, ExpansionError>>()?;
+        let type_facts = call_types.take(call.id()).ok_or_else(|| {
+            ExpansionError::InvalidLocalBindings(format!(
+                "checked call {} has no semantic type facts",
+                call.id().0,
+            ))
+        })?;
         calls.push(SemanticCall {
             id,
-            checked_call: call.id,
-            checked_expression: call.expression,
+            checked_call: call.id(),
+            checked_expression: call.expression(),
             callable: semantic_callable,
             owner_callable,
-            function: call.function.clone(),
-            intrinsic: call.intrinsic,
+            function: call.function().to_owned(),
+            intrinsic: callable.intrinsic,
             external_identity: callable.external_identity,
             entries,
             contexts,
-            context_binding: call.context_binding,
-            contextual_substitutions: call.contextual_substitutions.clone(),
-            type_substitutions: call.type_substitutions.clone(),
-            result: call.result.clone(),
-            role: call.role,
+            context_binding: call.context_binding(),
+            contextual_substitutions: type_facts.contextual_substitutions,
+            type_substitutions: type_facts.type_substitutions,
+            result: type_facts.result,
+            role: callable.role,
             effect: callable.effect,
-            span: call.span,
-            occurrence_segment: crate::out_net::checked_call_occurrence_segment(program, call.id)
-                .map_err(ExpansionError::InvalidLocalBindings)?,
-            temporally_gated: temporally_gated.contains(&call.expression),
+            span: call.span(),
+            occurrence_segment: crate::out_net::checked_call_occurrence_segment(
+                call_catalog,
+                call.id(),
+            )
+            .map_err(ExpansionError::InvalidLocalBindings)?,
+            temporally_gated: temporally_gated.contains(&call.expression()),
         });
     }
     Ok((calls, call_ids))
 }
 
+/// Validate the checked-to-semantic call boundary without reconstructing the
+/// rich inventory that construction just consumed.
+///
+/// This verifier deliberately walks the two authorities independently and
+/// compares their dense identities, references, and borrowed topology. Packed
+/// type values were moved verbatim from `CallTypeCatalog` into `SemanticCall`;
+/// their recursive projection is covered by the differential reconstruction
+/// oracle below in semantic tests, rather than repeated in every release
+/// compilation.
 pub(crate) fn validate_checked_callable_and_call_inventory(
     program: &CheckedProgramFields,
+    calls: &crate::call_view::CallCatalog<'_>,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
-    let lookup = CheckedProgramLookup::new(program);
+    if execution.callables.len() != program.callables.len() {
+        return Err(format!(
+            "semantic callable inventory contains {} rows for {} checked callables",
+            execution.callables.len(),
+            program.callables.len(),
+        ));
+    }
+    for (index, (semantic, checked)) in execution
+        .callables
+        .iter()
+        .zip(&program.callables)
+        .enumerate()
+    {
+        if semantic.id != SemanticCallableId(index)
+            || semantic.checked_callable != checked.decl_id
+            || semantic.kind != checked.kind
+            || semantic.name != checked.name
+            || semantic.external_identity != checked.external_identity
+            || semantic.context_formal != checked.context_formal
+            || semantic.result != checked.result
+            || semantic.role != checked.role
+            || semantic.effect != checked.effect
+            || semantic.body != checked.body
+            || semantic.result_expression != checked.result_expression
+            || semantic.contextual_operation != checked.contextual_operation
+        {
+            return Err(format!(
+                "semantic callable row {index} differs from checked callable {}",
+                checked.decl_id.0,
+            ));
+        }
+        let scope_matches = execution
+            .scopes
+            .get(semantic.scope.as_usize())
+            .is_some_and(|scope| {
+                scope.id == semantic.scope && scope.checked_scope == checked.scope_id
+            });
+        if !scope_matches {
+            return Err(format!(
+                "semantic callable {} does not map checked scope {} exactly",
+                semantic.id, checked.scope_id.0,
+            ));
+        }
+        if semantic.parameters.len() != checked.parameters.len() {
+            return Err(format!(
+                "semantic callable {} contains {} parameters for {} checked parameters",
+                semantic.id,
+                semantic.parameters.len(),
+                checked.parameters.len(),
+            ));
+        }
+        for (ordinal, (semantic_parameter, checked_parameter)) in semantic
+            .parameters
+            .iter()
+            .zip(&checked.parameters)
+            .enumerate()
+        {
+            if semantic_parameter.id != semantic_parameter_id(semantic.id, ordinal)
+                || semantic_parameter.formal != checked_parameter.decl_id
+                || semantic_parameter.ordinal != checked_parameter.ordinal
+                || semantic_parameter.ordinal != ordinal
+                || semantic_parameter.name != checked_parameter.name
+                || semantic_parameter.kind != checked_parameter.kind
+                || semantic_parameter.flow_type != checked_parameter.flow_type
+                || semantic_parameter.requirement != checked_parameter.requirement
+                || semantic_parameter.evaluation_scope != checked_parameter.evaluation_scope
+                || semantic_parameter.start != checked_parameter.start
+                || semantic_parameter.end != checked_parameter.end
+            {
+                return Err(format!(
+                    "semantic callable {} parameter {ordinal} differs from its checked parameter",
+                    semantic.id,
+                ));
+            }
+        }
+        if semantic.contexts.len() != checked.contexts.len() {
+            return Err(format!(
+                "semantic callable {} contains {} contexts for {} checked contexts",
+                semantic.id,
+                semantic.contexts.len(),
+                checked.contexts.len(),
+            ));
+        }
+        for (ordinal, (semantic_context, checked_context)) in
+            semantic.contexts.iter().zip(&checked.contexts).enumerate()
+        {
+            if semantic_context.name != checked_context.name
+                || semantic_context.kind != checked_context.kind
+                || semantic_context.provider != checked_context.provider
+                || semantic_context.flow_type != checked_context.flow_type
+            {
+                return Err(format!(
+                    "semantic callable {} context {ordinal} differs from its checked context",
+                    semantic.id,
+                ));
+            }
+        }
+        match (checked.context_formal, semantic.context_parameter.as_ref()) {
+            (None, None) => {}
+            (Some(formal), Some(parameter))
+                if parameter.id == semantic_parameter_id(semantic.id, checked.parameters.len())
+                    && parameter.formal == formal
+                    && parameter.name == "PASSED" => {}
+            _ => {
+                return Err(format!(
+                    "semantic callable {} has a mismatched PASSED parameter",
+                    semantic.id,
+                ));
+            }
+        }
+    }
+
+    if execution.calls.len() != calls.len() {
+        return Err(format!(
+            "semantic call inventory contains {} rows for {} checked calls",
+            execution.calls.len(),
+            calls.len(),
+        ));
+    }
+    for (index, (semantic, checked)) in execution.calls.iter().zip(calls.calls()).enumerate() {
+        let callable = calls.callable(checked.callable()).ok_or_else(|| {
+            format!(
+                "checked call {} references missing callable {}",
+                checked.id().0,
+                checked.callable().0,
+            )
+        })?;
+        let callable_index = calls.callable_index(checked.callable()).ok_or_else(|| {
+            format!(
+                "checked call {} has no dense callable index",
+                checked.id().0,
+            )
+        })?;
+        let owner_callable = checked
+            .owner_callable()
+            .map(|owner| {
+                calls
+                    .callable_index(owner)
+                    .map(SemanticCallableId)
+                    .ok_or_else(|| {
+                        format!(
+                            "checked call {} owner callable {} has no dense index",
+                            checked.id().0,
+                            owner.0,
+                        )
+                    })
+            })
+            .transpose()?;
+        if semantic.id != SemanticCallId(index)
+            || semantic.checked_call != checked.id()
+            || semantic.checked_expression != checked.expression()
+            || semantic.callable != SemanticCallableId(callable_index)
+            || semantic.owner_callable != owner_callable
+            || semantic.function != checked.function()
+            || semantic.intrinsic != callable.intrinsic
+            || semantic.external_identity != callable.external_identity
+            || semantic.context_binding != checked.context_binding()
+            || semantic.result.mode != checked.result().mode()
+            || semantic.role != callable.role
+            || semantic.effect != callable.effect
+            || semantic.span != checked.span()
+            || semantic
+                .occurrence_segment
+                .strip_prefix("call:")
+                .and_then(|suffix| suffix.parse::<u32>().ok())
+                != Some(checked.id().0)
+        {
+            return Err(format!(
+                "semantic call row {index} differs from checked call {}",
+                checked.id().0,
+            ));
+        }
+
+        if semantic.entries.len() != checked.entry_count() {
+            return Err(format!(
+                "semantic call {} contains {} entries for {} checked entries",
+                semantic.id,
+                semantic.entries.len(),
+                checked.entry_count(),
+            ));
+        }
+        for (ordinal, (semantic_entry, checked_entry)) in semantic
+            .entries
+            .iter()
+            .zip(calls.entries(checked))
+            .enumerate()
+        {
+            let parameter = checked_entry.parameter();
+            let matches = match (semantic_entry, checked_entry) {
+                (
+                    SemanticCallEntry::Input {
+                        formal,
+                        ordinal: semantic_ordinal,
+                        name,
+                        checked_value,
+                        value_flow_type,
+                        from_pipe,
+                        evaluation_scope,
+                        requirement,
+                    },
+                    CallEntryRef::Input {
+                        value,
+                        from_pipe: checked_pipe,
+                        evaluation_scope: checked_scope,
+                        ..
+                    },
+                ) => {
+                    let checked_flow = program
+                        .expressions
+                        .get(value.0 as usize)
+                        .filter(|expression| expression.id == value)
+                        .map(|expression| &expression.flow_type);
+                    *formal == parameter.decl_id
+                        && *semantic_ordinal == parameter.ordinal
+                        && name == &parameter.name
+                        && *checked_value == value
+                        && checked_flow == Some(value_flow_type)
+                        && *from_pipe == checked_pipe
+                        && *evaluation_scope == checked_scope
+                        && requirement == &parameter.requirement
+                }
+                (
+                    SemanticCallEntry::FreshOut {
+                        formal,
+                        ordinal: semantic_ordinal,
+                        name,
+                        output,
+                        scope,
+                    },
+                    CallEntryRef::FreshOut {
+                        output: checked_output,
+                        scope: checked_scope,
+                        ..
+                    },
+                ) => {
+                    *formal == parameter.decl_id
+                        && *semantic_ordinal == parameter.ordinal
+                        && name == &parameter.name
+                        && *output == checked_output
+                        && execution
+                            .scopes
+                            .get(scope.as_usize())
+                            .is_some_and(|semantic_scope| {
+                                semantic_scope.id == *scope
+                                    && semantic_scope.checked_scope == checked_scope
+                            })
+                }
+                (
+                    SemanticCallEntry::ForwardOut {
+                        formal,
+                        ordinal: semantic_ordinal,
+                        name,
+                        target,
+                        target_name,
+                    },
+                    CallEntryRef::ForwardOut {
+                        target: checked_target,
+                        target_name: checked_target_name,
+                        ..
+                    },
+                ) => {
+                    *formal == parameter.decl_id
+                        && *semantic_ordinal == parameter.ordinal
+                        && name == &parameter.name
+                        && *target == checked_target
+                        && target_name == checked_target_name
+                }
+                _ => false,
+            };
+            if !matches {
+                return Err(format!(
+                    "semantic call {} entry {ordinal} differs from its checked entry",
+                    semantic.id,
+                ));
+            }
+        }
+
+        if semantic.contexts.len() != checked.context_count() {
+            return Err(format!(
+                "semantic call {} contains {} contexts for {} checked contexts",
+                semantic.id,
+                semantic.contexts.len(),
+                checked.context_count(),
+            ));
+        }
+        for (ordinal, (semantic_context, checked_context)) in semantic
+            .contexts
+            .iter()
+            .zip(calls.contexts(checked))
+            .enumerate()
+        {
+            let scope_matches = execution
+                .scopes
+                .get(semantic_context.scope.as_usize())
+                .is_some_and(|scope| {
+                    scope.id == semantic_context.scope
+                        && scope.checked_scope == checked_context.scope
+                });
+            if semantic_context.declaration != checked_context.declaration
+                || semantic_context.signature != checked_context.signature
+                || !scope_matches
+            {
+                return Err(format!(
+                    "semantic call {} context {ordinal} differs from its checked context",
+                    semantic.id,
+                ));
+            }
+        }
+
+        if semantic.type_substitutions.len() != checked.type_substitution_count() {
+            return Err(format!(
+                "semantic call {} contains {} substitutions for {} checked substitutions",
+                semantic.id,
+                semantic.type_substitutions.len(),
+                checked.type_substitution_count(),
+            ));
+        }
+        for (ordinal, semantic_substitution) in semantic.type_substitutions.iter().enumerate() {
+            let checked_substitution = checked.type_substitution(ordinal).ok_or_else(|| {
+                format!(
+                    "checked call {} omits substitution {ordinal}",
+                    checked.id().0,
+                )
+            })?;
+            let rich_type_matches = match checked_substitution.value {
+                crate::call_view::CallTypeRef::Rich(ty) => ty == &semantic_substitution.value,
+                crate::call_view::CallTypeRef::Packed(_) => true,
+            };
+            if semantic_substitution.variable != checked_substitution.variable || !rich_type_matches
+            {
+                return Err(format!(
+                    "semantic call {} substitution {ordinal} differs from its checked substitution",
+                    semantic.id,
+                ));
+            }
+        }
+
+        let mut contextual_count = 0usize;
+        for (ordinal, checked_substitution) in calls.contextual_substitutions(checked).enumerate() {
+            contextual_count = ordinal + 1;
+            let semantic_substitution =
+                semantic
+                    .contextual_substitutions
+                    .get(ordinal)
+                    .ok_or_else(|| {
+                        format!(
+                            "semantic call {} omits contextual substitution {ordinal}",
+                            semantic.id,
+                        )
+                    })?;
+            let rich_type_matches = match checked_substitution.value {
+                crate::call_view::CallTypeRef::Rich(ty) => ty == &semantic_substitution.value,
+                crate::call_view::CallTypeRef::Packed(_) => true,
+            };
+            if semantic_substitution.formal != checked_substitution.formal
+                || semantic_substitution.variable != checked_substitution.variable
+                || !rich_type_matches
+            {
+                return Err(format!(
+                    "semantic call {} contextual substitution {ordinal} differs from its checked substitution",
+                    semantic.id,
+                ));
+            }
+        }
+        if semantic.contextual_substitutions.len() != contextual_count {
+            return Err(format!(
+                "semantic call {} has {} contextual substitutions but checked topology has {contextual_count}",
+                semantic.id,
+                semantic.contextual_substitutions.len(),
+            ));
+        }
+        if let crate::call_view::CallFlowRef::Rich(flow) = checked.result()
+            && semantic.result != *flow
+        {
+            return Err(format!(
+                "semantic call {} result differs from its rich checked result",
+                semantic.id,
+            ));
+        }
+    }
+
+    #[cfg(any(test, feature = "test-packed-call-oracle"))]
+    validate_checked_callable_and_call_inventory_reconstruction(program, calls, execution)?;
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-packed-call-oracle"))]
+fn validate_checked_callable_and_call_inventory_reconstruction(
+    program: &CheckedProgramFields,
+    calls: &crate::call_view::CallCatalog<'_>,
+    execution: &SemanticExecutionImageColumnsV1,
+) -> Result<(), String> {
+    let lookup = CheckedProgramLookup::new(program, calls);
     let completed_context_formals =
         completed_context_formal_flow_types(program, &lookup).map_err(|error| error.to_string())?;
     let semantic_scope_ids = program
@@ -2626,8 +2970,16 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
     let (expected_callables, callable_ids) =
         semantic_callable_inventory(program, &semantic_scope_ids, &completed_context_formals)
             .map_err(|error| error.to_string())?;
-    let (expected_calls, _) = semantic_call_inventory(program, &semantic_scope_ids, &callable_ids)
-        .map_err(|error| error.to_string())?;
+    let mut call_types = crate::call_view::CallTypeCatalog::new(calls)?;
+    let (expected_calls, _) = semantic_call_inventory(
+        program,
+        calls,
+        &mut call_types,
+        &semantic_scope_ids,
+        &callable_ids,
+    )
+    .map_err(|error| error.to_string())?;
+    call_types.finish()?;
     let mut actual_callables = execution.callables.clone();
     for callable in &mut actual_callables {
         callable.semantic_root = None;
@@ -2648,6 +3000,8 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
 
 pub(crate) fn derive_semantic_execution_graph(
     program: &CheckedProgramFields,
+    call_catalog: &crate::call_view::CallCatalog<'_>,
+    mut call_types: crate::call_view::CallTypeCatalog,
     kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
     checked_handoff: CheckedImageHandoffV4,
     runtime_flow_terms: boon_checked::CheckedRuntimeFlowTermHandoffV1,
@@ -2673,7 +3027,7 @@ pub(crate) fn derive_semantic_execution_graph(
     let execution_routes = execution_construction_routes_v3(&checked_handoff, out_net)
         .map_err(ExpansionError::InvalidLocalBindings)?;
     trace_phase("construction_routes");
-    let lookup = CheckedProgramLookup::new(program);
+    let lookup = CheckedProgramLookup::new(program, call_catalog);
     let semantic_scope_ids = program
         .scopes
         .iter()
@@ -2710,7 +3064,16 @@ pub(crate) fn derive_semantic_execution_graph(
         &semantic_scope_ids,
         &builder_indexes.completed_context_formals,
     )?;
-    let (calls, call_ids) = semantic_call_inventory(program, &semantic_scope_ids, &callable_ids)?;
+    let (calls, call_ids) = semantic_call_inventory(
+        program,
+        call_catalog,
+        &mut call_types,
+        &semantic_scope_ids,
+        &callable_ids,
+    )?;
+    call_types
+        .finish()
+        .map_err(ExpansionError::InvalidLocalBindings)?;
     let call_occurrences = out_net
         .call_instances
         .iter()
@@ -2730,7 +3093,7 @@ pub(crate) fn derive_semantic_execution_graph(
                             occurrence.id, checked_call.0
                         ))
                     })?;
-                    let checked = lookup.call(program, checked_call).ok_or_else(|| {
+                    let checked = lookup.call(checked_call).ok_or_else(|| {
                         ExpansionError::InvalidLocalBindings(format!(
                             "OUT call occurrence {} references absent checked call {}",
                             occurrence.id, checked_call.0
@@ -2738,9 +3101,9 @@ pub(crate) fn derive_semantic_execution_graph(
                     })?;
                     (
                         Some(call),
-                        checked
-                            .contexts
-                            .iter()
+                        lookup
+                            .calls
+                            .contexts(checked)
                             .map(|context| context.signature)
                             .collect(),
                     )
@@ -4156,7 +4519,9 @@ fn arena_expression_reaches_in_slice(
         else {
             return false;
         };
-        pending.extend(arena_expression_children(&expression.kind));
+        expression
+            .kind
+            .for_each_direct_child(|child| pending.push(child));
     }
     false
 }
@@ -4257,84 +4622,17 @@ fn arena_expression_reaches(
             .ok_or(ExpansionError::MissingExpression(CheckedExprId(
                 id.as_usize() as u32,
             )))?;
-        pending.extend(arena_expression_children(&expression.kind));
+        expression
+            .kind
+            .for_each_direct_child(|child| pending.push(child));
     }
     Ok(false)
-}
-
-fn arena_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticExprId> {
-    match kind {
-        SemanticExpressionKind::CanonicalRead { .. }
-        | SemanticExpressionKind::LocalRead { .. }
-        | SemanticExpressionKind::ExternalRead { .. }
-        | SemanticExpressionKind::ElementState { .. }
-        | SemanticExpressionKind::Drain { .. }
-        | SemanticExpressionKind::Text(_)
-        | SemanticExpressionKind::Number(_)
-        | SemanticExpressionKind::Bits(_)
-        | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Absent
-        | SemanticExpressionKind::Tag(_)
-        | SemanticExpressionKind::Source { .. }
-        | SemanticExpressionKind::Materialize { .. }
-        | SemanticExpressionKind::Delimiter
-        | SemanticExpressionKind::MaterializationLocal { .. }
-        | SemanticExpressionKind::FunctionParameter { .. } => Vec::new(),
-        SemanticExpressionKind::TextTemplate { segments } => segments
-            .iter()
-            .filter_map(|segment| match segment {
-                SemanticTextSegment::Static { .. } => None,
-                SemanticTextSegment::Dynamic { value } => Some(*value),
-            })
-            .collect(),
-        SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields) => {
-            fields.iter().map(|field| field.value).collect()
-        }
-        SemanticExpressionKind::Call {
-            arguments,
-            context_argument,
-            ..
-        } => arguments
-            .iter()
-            .map(|argument| argument.value)
-            .chain(context_argument.iter().map(|argument| argument.value))
-            .collect(),
-        SemanticExpressionKind::Flush { payload: input }
-        | SemanticExpressionKind::FlushBoundary { input }
-        | SemanticExpressionKind::Draining { input }
-        | SemanticExpressionKind::Project { input, .. } => vec![*input],
-        SemanticExpressionKind::Hold {
-            initial, updates, ..
-        } => std::iter::once(*initial)
-            .chain(updates.iter().copied())
-            .collect(),
-        SemanticExpressionKind::Latest { branches } => branches.clone(),
-        SemanticExpressionKind::When { input, arms, .. } => std::iter::once(*input)
-            .chain(arms.iter().map(|arm| arm.output))
-            .collect(),
-        SemanticExpressionKind::Then { input, output } => {
-            std::iter::once(*input).chain(*output).collect()
-        }
-        SemanticExpressionKind::Infix { left, right, .. } => vec![*left, *right],
-        SemanticExpressionKind::MapEntry { key, value } => vec![*key, *value],
-        SemanticExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
-        SemanticExpressionKind::Block { bindings, result } => bindings
-            .iter()
-            .map(|binding| binding.value)
-            .chain(std::iter::once(*result))
-            .collect(),
-        SemanticExpressionKind::List { items, .. }
-        | SemanticExpressionKind::Bytes { items, .. }
-        | SemanticExpressionKind::Map { entries: items }
-        | SemanticExpressionKind::Set { items } => items.clone(),
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn ensure_resource_definition_statement(
     program: &CheckedProgramFields,
-    lookup: &CheckedProgramLookup,
+    lookup: &CheckedProgramLookup<'_>,
     semantic_scope_ids: &BTreeMap<boon_checked::LexicalScopeId, SemanticScopeId>,
     arena: &mut SemanticExpressionArena,
     statements: &mut Vec<SemanticStatement>,
@@ -4835,7 +5133,7 @@ fn executable_latest_has_initial(
 
 fn synthesize_statement_owned_states(
     program: &CheckedProgramFields,
-    lookup: &CheckedProgramLookup,
+    lookup: &CheckedProgramLookup<'_>,
     arena: &mut SemanticExpressionArena,
     statements: &mut [SemanticStatement],
 ) -> Result<(), ExpansionError> {
@@ -5280,7 +5578,7 @@ fn checked_scope(
 }
 
 fn declaration_in_exact_scope(
-    lookup: &CheckedProgramLookup,
+    lookup: &CheckedProgramLookup<'_>,
     scope: boon_checked::LexicalScopeId,
     name: &str,
 ) -> Option<DeclId> {
@@ -5289,7 +5587,7 @@ fn declaration_in_exact_scope(
 
 fn declaration_in_lexical_scope(
     program: &CheckedProgramFields,
-    lookup: &CheckedProgramLookup,
+    lookup: &CheckedProgramLookup<'_>,
     mut scope: boon_checked::LexicalScopeId,
     name: &str,
 ) -> Option<DeclId> {
@@ -5325,7 +5623,7 @@ fn declaration_is_function_local(
 
 fn canonical_declaration_path(
     program: &CheckedProgramFields,
-    lookup: &CheckedProgramLookup,
+    lookup: &CheckedProgramLookup<'_>,
     target: DeclId,
 ) -> Option<String> {
     let declaration = lookup.declaration(program, target)?;
@@ -5357,7 +5655,7 @@ fn canonical_declaration_path(
 
 fn resource_declaration(
     program: &CheckedProgramFields,
-    lookup: &CheckedProgramLookup,
+    lookup: &CheckedProgramLookup<'_>,
     expression: CheckedExprId,
 ) -> Option<DeclId> {
     lookup.expression(program, expression)?.declaration
@@ -5814,6 +6112,7 @@ fn resolve_executable_local_provenance(
 pub(crate) struct SemanticExpressionBuilderIndexes {
     callable_ids: BTreeMap<DeclId, SemanticCallableId>,
     call_ids: BTreeMap<CheckedCallId, SemanticCallId>,
+    call_results: Vec<Option<FlowType>>,
     producer_callable_ids: BTreeMap<crate::ProducerFunctionId, SemanticCallableId>,
     ordinary_callable_ids: BTreeSet<SemanticCallableId>,
     completed_context_formals: BTreeMap<ContextFormalId, FlowType>,
@@ -5862,7 +6161,7 @@ fn ordinary_template_boundary_type_inner(ty: &Type) -> bool {
 
 fn enclosing_function_owner(
     _program: &CheckedProgramFields,
-    lookup: &CheckedProgramLookup,
+    lookup: &CheckedProgramLookup<'_>,
     scope: boon_checked::LexicalScopeId,
 ) -> Option<DeclId> {
     lookup.function_owner(scope)
@@ -5924,7 +6223,7 @@ fn ordinary_callable_base_rejection(
 
 fn ordinary_callable_body_dependencies(
     program: &CheckedProgramFields,
-    lookup: &CheckedProgramLookup,
+    lookup: &CheckedProgramLookup<'_>,
     callable: &boon_checked::CheckedCallableSignature,
     template: DefinitionExecutionTemplateRef<'_>,
     candidates: &BTreeSet<DeclId>,
@@ -6008,23 +6307,23 @@ fn ordinary_callable_body_dependencies(
                     return None;
                 }
                 calls.insert(*call);
-                let Some(call) = lookup.call(program, *call) else {
+                let Some(call) = lookup.call(*call) else {
                     return None;
                 };
-                if call
-                    .entries
-                    .iter()
-                    .any(|entry| !matches!(entry, CheckedCallEntry::Input { .. }))
+                if lookup
+                    .calls
+                    .entries(call)
+                    .any(|entry| entry.input().is_none())
                 {
                     return None;
                 }
-                let Some(target) = lookup.callable(program, call.callable) else {
+                let Some(target) = lookup.callable(program, call.callable()) else {
                     return None;
                 };
                 let context_matches = match target.context_formal {
-                    None => matches!(call.context_binding, CheckedContextBinding::None),
+                    None => matches!(call.context_binding(), CheckedContextBinding::None),
                     Some(_) => matches!(
-                        call.context_binding,
+                        call.context_binding(),
                         CheckedContextBinding::Explicit { .. }
                             | CheckedContextBinding::Inherited { .. }
                     ),
@@ -6038,7 +6337,7 @@ fn ordinary_callable_body_dependencies(
                             && ((target.contexts.is_empty()
                                 && target.context_formal.is_none())
                                 || boon_checked::is_registered_render_constructor(
-                                    &call.function,
+                                    call.function(),
                                 )) => {}
                     CheckedCallableKind::User if candidates.contains(&target.decl_id) => {
                         dependencies.insert(target.decl_id);
@@ -6047,13 +6346,12 @@ fn ordinary_callable_body_dependencies(
                     | CheckedCallableKind::Builtin
                     | CheckedCallableKind::External => return None,
                 }
-                if call.entries.iter().any(|entry| match entry {
-                    CheckedCallEntry::Input { value, .. } => !expression_ids.contains(value),
-                    CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => {
-                        false
-                    }
+                if lookup.calls.entries(call).any(|entry| {
+                    entry
+                        .input()
+                        .is_some_and(|(value, _, _)| !expression_ids.contains(&value))
                 }) || call
-                    .context_binding
+                    .context_binding()
                     .explicit()
                     .is_some_and(|(value, _)| !expression_ids.contains(&value))
                 {
@@ -6116,11 +6414,12 @@ fn ordinary_callable_body_dependencies(
 
 pub(crate) fn ordinary_callable_declarations(
     program: &CheckedProgramFields,
+    calls: &CallCatalog<'_>,
     kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
 ) -> BTreeSet<DeclId> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     let started = trace.then(std::time::Instant::now);
-    let mut lookup = CheckedProgramLookup::new(program);
+    let mut lookup = CheckedProgramLookup::new(program, calls);
     lookup.populate_source_bearing_resource_projections(program, kernel_input);
     let base_candidates = program
         .callables
@@ -6239,10 +6538,11 @@ impl StaticSelectorValue {
 impl SemanticExpressionBuilderIndexes {
     fn new(
         program: &CheckedProgramFields,
+        call_types: &crate::call_view::CallTypeCatalog,
         kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
         out_net: &OutNet,
         retained_ordinary_declarations: &BTreeSet<DeclId>,
-        lookup: &CheckedProgramLookup,
+        lookup: &CheckedProgramLookup<'_>,
     ) -> Result<Self, ExpansionError> {
         let callable_ids = program
             .callables
@@ -6250,12 +6550,34 @@ impl SemanticExpressionBuilderIndexes {
             .enumerate()
             .map(|(index, callable)| (callable.decl_id, SemanticCallableId(index)))
             .collect::<BTreeMap<_, _>>();
-        let call_ids = program
+        let call_ids = lookup
             .calls
-            .iter()
+            .calls()
             .enumerate()
-            .map(|(index, call)| (call.id, SemanticCallId(index)))
+            .map(|(index, call)| (call.id(), SemanticCallId(index)))
             .collect::<BTreeMap<_, _>>();
+        let mut call_results = Vec::new();
+        for call in lookup.calls.calls() {
+            let index = call.id().0 as usize;
+            if call_results.len() <= index {
+                call_results.resize_with(index.saturating_add(1), || None);
+            }
+            let result = call_types
+                .get(call.id())
+                .map(|facts| facts.result.clone())
+                .ok_or_else(|| {
+                    ExpansionError::InvalidLocalBindings(format!(
+                        "checked call {} has no semantic type facts",
+                        call.id().0,
+                    ))
+                })?;
+            if call_results[index].replace(result).is_some() {
+                return Err(ExpansionError::InvalidLocalBindings(format!(
+                    "checked call {} has duplicate result authorities",
+                    call.id().0,
+                )));
+            }
+        }
         let producer_callable_ids = out_net
             .producer_roots()
             .iter()
@@ -6288,6 +6610,7 @@ impl SemanticExpressionBuilderIndexes {
         Ok(Self {
             callable_ids,
             call_ids,
+            call_results,
             producer_callable_ids,
             ordinary_callable_ids,
             completed_context_formals,
@@ -6309,7 +6632,7 @@ impl SemanticExpressionBuilderIndexes {
 fn definition_resource_expression_indexes(
     program: &CheckedProgramFields,
     kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
-    lookup: &CheckedProgramLookup,
+    lookup: &CheckedProgramLookup<'_>,
 ) -> Result<(Vec<Option<CheckedSourceId>>, Vec<Option<CheckedStateId>>), ExpansionError> {
     if kernel_input.is_none() {
         let mut seen = BTreeSet::new();
@@ -6464,7 +6787,7 @@ fn definition_resource_expression_indexes(
 pub(crate) struct SemanticExpressionBuilder<'a> {
     program: &'a CheckedProgramFields,
     kernel_input: Option<&'a boon_compiler_kernel::KernelSemanticInputV1>,
-    lookup: &'a CheckedProgramLookup,
+    lookup: &'a CheckedProgramLookup<'a>,
     out_net: &'a OutNet,
     indexes: &'a SemanticExpressionBuilderIndexes,
     locals: BTreeMap<OutNetId, (StaticOwnerId, SemanticMaterializationLocalId)>,
@@ -6497,7 +6820,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
     fn new(
         program: &'a CheckedProgramFields,
         kernel_input: Option<&'a boon_compiler_kernel::KernelSemanticInputV1>,
-        lookup: &'a CheckedProgramLookup,
+        lookup: &'a CheckedProgramLookup<'a>,
         out_net: &'a OutNet,
         indexes: &'a SemanticExpressionBuilderIndexes,
         locals: BTreeMap<OutNetId, (StaticOwnerId, SemanticMaterializationLocalId)>,
@@ -7124,13 +7447,13 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 {
                     let (call, context) = self
                         .lookup
-                        .element_context(self.program, target)
+                        .element_context(target)
                         .ok_or(ExpansionError::MissingDeclaration(target))?;
                     let instance = self
                         .out_net
-                        .call_instance_for_checked_call(call.id, scoped.frame)
+                        .call_instance_for_checked_call(call.id(), scoped.frame)
                         .ok_or(ExpansionError::MissingCallInstance {
-                            call: call.id,
+                            call: call.id(),
                             frame: scoped.frame,
                         })?;
                     return Ok(self.push(
@@ -7294,7 +7617,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                                     let checked_call = instance
                                         .provenance
                                         .call_id
-                                        .and_then(|call| self.lookup.call(self.program, call));
+                                        .and_then(|call| self.lookup.call(call));
                                     let checked_expression = self
                                         .lookup
                                         .expression(self.program, expanded.checked_expr_id);
@@ -7305,7 +7628,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                                                  checked definition {:?} kind {:?} flow {:?}: \
                                                  {error}",
                                         instance.provenance,
-                                        checked_call.map(|call| call.function.as_str()),
+                                        checked_call.map(|call| call.function()),
                                         target.0,
                                         parameter.name,
                                         parameter.flow_type,
@@ -7726,21 +8049,21 @@ impl<'a> SemanticExpressionBuilder<'a> {
     ) -> Result<SemanticExprId, ExpansionError> {
         let checked_call = self
             .lookup
-            .call(self.program, call_id)
-            .cloned()
+            .call(call_id)
             .ok_or(ExpansionError::MissingCall(call_id))?;
         let callable = self
             .lookup
-            .callable(self.program, checked_call.callable)
+            .callable(self.program, checked_call.callable())
             .cloned()
-            .ok_or(ExpansionError::MissingCallable(checked_call.callable))?;
+            .ok_or(ExpansionError::MissingCallable(checked_call.callable()))?;
         let instance = self
             .out_net
             .call_instance_for_checked_call(call_id, scoped.frame);
-        let has_out = checked_call
-            .entries
-            .iter()
-            .any(|entry| !matches!(entry, CheckedCallEntry::Input { .. }));
+        let has_out = self
+            .lookup
+            .calls
+            .entries(checked_call)
+            .any(|entry| entry.input().is_none());
         let retained_user_call = self.retain_ordinary_calls
             && callable.kind == CheckedCallableKind::User
             // The call node is the invocation overlay. Its exact occurrence
@@ -7760,7 +8083,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 CheckedCallableKind::User => retained_user_call,
                 CheckedCallableKind::Builtin => {
                     (callable.contexts.is_empty() && callable.context_formal.is_none())
-                        || boon_checked::is_registered_render_constructor(&checked_call.function)
+                        || boon_checked::is_registered_render_constructor(checked_call.function())
                 }
                 CheckedCallableKind::External => false,
             };
@@ -7769,10 +8092,10 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 eprintln!(
                     "boon_semantic missing_call_instance checked_call={} function={} owner={:?} expression={} span={:?} frame={:?} frame_provenance={:?} current_ordinary={:?} retained_user_call={} has_out={} call_contexts={} callable_effect={:?} callable_context_formal={:?}",
                     call_id.0,
-                    checked_call.function,
-                    checked_call.owner_callable,
-                    checked_call.expression.0,
-                    checked_call.span,
+                    checked_call.function(),
+                    checked_call.owner_callable(),
+                    checked_call.expression().0,
+                    checked_call.span(),
                     scoped.frame,
                     scoped.frame.and_then(|frame| self
                         .out_net
@@ -7782,7 +8105,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     self.current_ordinary_definition,
                     retained_user_call,
                     has_out,
-                    checked_call.contexts.len(),
+                    checked_call.context_count(),
                     callable.effect,
                     callable.context_formal,
                 );
@@ -7859,7 +8182,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 let checked_call = call_instance
                     .provenance
                     .call_id
-                    .and_then(|call| self.lookup.call(self.program, call));
+                    .and_then(|call| self.lookup.call(call));
                 let checked_result = self.lookup.expression(self.program, result_expression);
                 let expanded_result = &self.expressions[result.as_usize()];
                 ExpansionError::InvalidLocalBindings(format!(
@@ -7867,7 +8190,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                              {result} checked {:?} expanded kind {:?} flow {:?} cannot refine its \
                              occurrence type to {:?}: {error}",
                     call_instance.provenance,
-                    checked_call.map(|call| call.function.as_str()),
+                    checked_call.map(|call| call.function()),
                     checked_result,
                     expanded_result.kind,
                     expanded_result.flow_type,
@@ -7906,7 +8229,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
             return self.wrap_flush_boundary(boundary_expression, result, call_owner);
         }
         if !retained_user_call
-            && !matches!(checked_call.context_binding, CheckedContextBinding::None)
+            && !matches!(checked_call.context_binding(), CheckedContextBinding::None)
         {
             return Err(ExpansionError::PassOnNonexpandedCall(call_id));
         }
@@ -7942,48 +8265,29 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     name: parameter.name.clone(),
                     checked_value: checked_value.expression,
                     value: self.expand_with_inherited_owner(checked_value, argument_owner)?,
-                    from_pipe: checked_call.entries.iter().any(|entry| {
-                        matches!(
-                            entry,
-                            CheckedCallEntry::Input {
-                                formal,
-                                from_pipe: true,
-                                ..
-                            } if *formal == input.formal
-                        )
+                    from_pipe: self.lookup.calls.entries(checked_call).any(|entry| {
+                        entry.formal() == input.formal
+                            && entry.input().is_some_and(|(_, from_pipe, _)| from_pipe)
                     }),
                 });
             }
         } else {
-            arguments.reserve(checked_call.entries.len());
-            for entry in &checked_call.entries {
-                let CheckedCallEntry::Input {
-                    formal,
-                    value,
-                    from_pipe,
-                    ..
-                } = entry
-                else {
+            arguments.reserve(checked_call.entry_count());
+            for entry in self.lookup.calls.entries(checked_call) {
+                let Some((value, from_pipe, _)) = entry.input() else {
                     return Err(ExpansionError::MissingCallInstance {
                         call: call_id,
                         frame: scoped.frame,
                     });
                 };
-                let parameter = callable
-                    .parameters
-                    .iter()
-                    .find(|parameter| parameter.decl_id == *formal)
-                    .ok_or(ExpansionError::MissingFormal {
-                        callable: callable.decl_id,
-                        formal: *formal,
-                    })?;
+                let parameter = entry.parameter();
                 arguments.push(SemanticCallArgument {
-                    formal: *formal,
+                    formal: parameter.decl_id,
                     ordinal: parameter.ordinal,
                     name: parameter.name.clone(),
-                    checked_value: *value,
-                    value: self.expand_in_frame(*value, scoped.frame, scoped.value_frame)?,
-                    from_pipe: *from_pipe,
+                    checked_value: value,
+                    value: self.expand_in_frame(value, scoped.frame, scoped.value_frame)?,
+                    from_pipe,
                 });
             }
         }
@@ -8045,7 +8349,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                             .capture_ordinary_context_argument(expression, owner, formal, value)?,
                     })
                 }
-                (Some(formal), None) => match checked_call.context_binding {
+                (Some(formal), None) => match checked_call.context_binding() {
                     CheckedContextBinding::Explicit { value, .. } => {
                         let checked_value = value;
                         let value =
@@ -8123,9 +8427,10 @@ impl<'a> SemanticExpressionBuilder<'a> {
             CheckedCallableKind::User => unreachable!("specialized user calls are expanded above"),
         };
         let contexts = match instance {
-            Some(instance) => checked_call
-                .contexts
-                .iter()
+            Some(instance) => self
+                .lookup
+                .calls
+                .contexts(checked_call)
                 .map(|context| SemanticCallContextId {
                     call_instance: instance,
                     ordinal: context.signature,
@@ -8150,12 +8455,13 @@ impl<'a> SemanticExpressionBuilder<'a> {
         let semantic_callable = self
             .indexes
             .callable_ids
-            .get(&checked_call.callable)
+            .get(&checked_call.callable())
             .copied()
             .ok_or_else(|| {
                 ExpansionError::InvalidLocalBindings(format!(
                     "checked call {} callable {} has no semantic identity",
-                    call_id.0, checked_call.callable.0
+                    call_id.0,
+                    checked_call.callable().0
                 ))
             })?;
         if retained_user_call {
@@ -8169,11 +8475,17 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 callable: semantic_callable,
                 callable_kind: kind,
                 name: callable.name.clone(),
-                function: checked_call.function.clone(),
-                intrinsic: checked_call.intrinsic,
-                role: checked_call.role,
+                function: checked_call.function().to_owned(),
+                intrinsic: callable.intrinsic,
+                role: callable.role,
                 effect: callable.effect,
-                result: checked_call.result.clone(),
+                result: self
+                    .indexes
+                    .call_results
+                    .get(call_id.0 as usize)
+                    .and_then(Option::as_ref)
+                    .cloned()
+                    .ok_or(ExpansionError::MissingCall(call_id))?,
                 instance,
                 arguments,
                 parameter_bindings,
@@ -8756,21 +9068,13 @@ impl<'a> SemanticExpressionBuilder<'a> {
 
     fn checked_pipeline_input(&self, expression: CheckedExprId) -> Option<CheckedExprId> {
         match &self.lookup.expression(self.program, expression)?.kind {
-            CheckedExpressionKind::Call { call } => self
-                .lookup
-                .call(self.program, *call)?
-                .entries
-                .iter()
-                .find_map(|entry| match entry {
-                    boon_checked::CheckedCallEntry::Input {
-                        value,
-                        from_pipe: true,
-                        ..
-                    } => Some(*value),
-                    boon_checked::CheckedCallEntry::Input { .. }
-                    | boon_checked::CheckedCallEntry::FreshOut { .. }
-                    | boon_checked::CheckedCallEntry::ForwardOut { .. } => None,
-                }),
+            CheckedExpressionKind::Call { call } => self.lookup.call(*call).and_then(|call| {
+                self.lookup.calls.entries(call).find_map(|entry| {
+                    entry
+                        .input()
+                        .and_then(|(value, from_pipe, _)| from_pipe.then_some(value))
+                })
+            }),
             CheckedExpressionKind::Draining { input }
             | CheckedExpressionKind::Hold { initial: input, .. }
             | CheckedExpressionKind::When { input, .. }
@@ -9380,31 +9684,52 @@ mod tests {
             .program
             .expect("valid fixture has a checked program")
             .into_semantic_parts();
-        crate::validate_contextual_bindings(&program)
+        let calls = crate::call_view::CallCatalog::rich(&program)
+            .expect("valid fixture has a valid call catalog");
+        let call_types = crate::call_view::CallTypeCatalog::new(&calls)
+            .expect("valid fixture has valid call type facts");
+        crate::validate_contextual_bindings(&program, &calls)
             .expect("valid fixture has exact contextual bindings");
         let producer_roots =
             crate::resolve_producer_roots(&program, &[]).expect("fixture has no producer errors");
-        let retained = ordinary_callable_declarations(&program, None);
+        let retained = ordinary_callable_declarations(&program, &calls, None);
         let out = crate::out_net::OutNet::<crate::OutPortContractV1>::
             try_build_with_retained_definitions(
                 &program,
                 producer_roots,
                 &retained,
-                |call, _, entry| crate::provisional_out_port_contract(&program, call, entry),
-                |kind, _, _, _, _| kind == CheckedCallableKind::Builtin,
+                |calls, call, _, entry, substitutions| {
+                    crate::provisional_out_port_contract(
+                        &program,
+                        calls,
+                        call,
+                        entry,
+                        substitutions,
+                    )
+                },
+                |_, kind, _, _, _, _| kind == CheckedCallableKind::Builtin,
             )
             .expect("valid fixture has an OUT graph");
         assert!(!out.has_errors(), "OUT diagnostics: {:#?}", out.diagnostics);
         let mut out = out.graph;
-        crate::resolve_out_contracts(&program, &mut out, None)
+        crate::resolve_out_contracts(&program, &calls, &call_types, &mut out, None)
             .expect("valid fixture resolves OUT contracts");
         crate::validate_out_contracts(&program, &out)
             .expect("valid fixture validates OUT contracts");
-        let (materializations, arena, indexes, required) =
-            derive_contextual_materializations(&program, None, &out, &retained, true)
-                .expect("valid fixture derives contextual materializations");
+        let (materializations, arena, indexes, required) = derive_contextual_materializations(
+            &program,
+            &calls,
+            &call_types,
+            None,
+            &out,
+            &retained,
+            true,
+        )
+        .expect("valid fixture derives contextual materializations");
         let builder = derive_semantic_execution_graph(
             &program,
+            &calls,
+            call_types,
             None,
             checked_handoff,
             runtime_flow_terms,
@@ -10062,16 +10387,11 @@ mod tests {
             })
             .expect("child-owned PASSED expression");
         program.expressions[passed].declaration = Some(child_declaration);
-        let lookup = CheckedProgramLookup::new(&program);
-        let passed = &program.expressions[passed];
+        let passed_scope = program.expressions[passed].scope_id;
         assert_ne!(
-            passed.declaration,
+            program.expressions[passed].declaration,
             Some(callable),
             "the regression must cross a child record-field declaration",
-        );
-        assert_eq!(
-            enclosing_function_owner(&program, &lookup, passed.scope_id),
-            Some(callable),
         );
         program
             .context_formals
@@ -10085,6 +10405,12 @@ mod tests {
             field_order: Vec::new(),
             open: true,
         });
+        let calls = CallCatalog::rich(&program).expect("valid checked call catalog");
+        let lookup = CheckedProgramLookup::new(&program, &calls);
+        assert_eq!(
+            enclosing_function_owner(&program, &lookup, passed_scope),
+            Some(callable),
+        );
 
         let completed = completed_context_formal_flow_types(&program, &lookup)
             .expect("completed retained context templates")
@@ -10141,7 +10467,8 @@ mod tests {
             )
         });
 
-        let lookup = CheckedProgramLookup::new(&program);
+        let calls = CallCatalog::rich(&program).expect("valid checked call catalog");
+        let lookup = CheckedProgramLookup::new(&program, &calls);
         let completed = completed_context_formal_flow_types(&program, &lookup)
             .expect("completed retained context templates")
             .remove(&formal)
@@ -10391,7 +10718,8 @@ FUNCTION nested() {
             checked.report.diagnostics
         );
         let program = checked.program.expect("valid fixture has checked program");
-        let lookup = CheckedProgramLookup::new(&program);
+        let calls = CallCatalog::rich(&program).expect("valid checked call catalog");
+        let lookup = CheckedProgramLookup::new(&program, &calls);
         let candidates = program
             .callables
             .iter()

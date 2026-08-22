@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod call_view;
 mod contextual_expansion;
 mod core_lowering;
 mod definition_templates;
@@ -629,8 +630,13 @@ pub struct SemanticProgram {
     source_bundle_digest_v1: SourceBundleDigestV1,
     role: boon_checked::ProgramRole,
     semantic_image: SealedSemanticImageV5,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-packed-call-oracle"))]
     checked_program: CheckedProgramFields,
+    /// Test-only packed authority retained for independent deep validation.
+    /// Production consumes the move-only input during elaboration and keeps
+    /// no second owner alive.
+    #[cfg(any(test, feature = "test-packed-call-oracle"))]
+    kernel_input: Option<Arc<boon_compiler_kernel::KernelSemanticInputV1>>,
     #[cfg(test)]
     execution_graph: SemanticExecutionImageColumnsV1,
     producer_materializations: Vec<ProducerMaterializationRequest>,
@@ -884,23 +890,11 @@ impl SemanticProgram {
             .validate_identity(self.source_bundle_digest_v1, self.role)
             .map_err(SemanticError::new)?;
         let execution = self.execution_graph();
+        #[cfg(any(test, feature = "test-packed-call-oracle"))]
+        self.validate_checked_call_oracle(execution)?;
         #[cfg(test)]
         {
-            if self.source_bundle_digest_v1 != self.checked_program.source_bundle_digest_v1 {
-                return Err(SemanticError::new(
-                    "semantic source bundle digest does not match its checked oracle",
-                ));
-            }
-            validate_contextual_bindings(&self.checked_program)?;
             validate_out_contracts(&self.checked_program, &self.resolved_out_graph)?;
-            contextual_expansion::validate_checked_callable_and_call_inventory(
-                &self.checked_program,
-                execution,
-            )
-            .map_err(SemanticError::new)?;
-            execution
-                .validate_checked_roots(&self.checked_program)
-                .map_err(SemanticError::new)?;
         }
         #[cfg(test)]
         {
@@ -1016,6 +1010,47 @@ impl SemanticProgram {
             ));
         }
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-packed-call-oracle"))]
+    fn validate_checked_call_oracle(
+        &self,
+        execution: &SemanticExecutionImageColumnsV1,
+    ) -> Result<(), SemanticError> {
+        if self.source_bundle_digest_v1 != self.checked_program.source_bundle_digest_v1 {
+            return Err(SemanticError::new(
+                "semantic source bundle digest does not match its checked oracle",
+            ));
+        }
+        let calls =
+            call_view::CallCatalog::new(&self.checked_program, self.kernel_input.as_deref())
+                .map_err(SemanticError::new)?;
+        validate_contextual_bindings(&self.checked_program, &calls)?;
+        contextual_expansion::validate_checked_callable_and_call_inventory(
+            &self.checked_program,
+            &calls,
+            execution,
+        )
+        .map_err(SemanticError::new)?;
+        execution
+            .validate_checked_roots(&self.checked_program)
+            .map_err(SemanticError::new)
+    }
+
+    /// Runs the retained packed-call differential oracle in downstream tests.
+    ///
+    /// This API and its retained inputs do not exist in ordinary production
+    /// builds; `boon_compiler` forwards it only through an explicit test
+    /// feature that timing producers reject.
+    #[cfg(feature = "test-packed-call-oracle")]
+    #[doc(hidden)]
+    pub fn validate_packed_call_oracle(&self) -> Result<(), SemanticError> {
+        if self.kernel_input.is_none() {
+            return Err(SemanticError::new(
+                "semantic program has no retained packed call authority",
+            ));
+        }
+        self.validate_checked_call_oracle(self.execution_graph())
     }
 
     /// Consumed only after `boon_verify` has wrapped this artifact in a
@@ -2749,6 +2784,13 @@ fn elaborate_with_representation(
     retain_ordinary_calls: bool,
     kernel_input: Option<boon_compiler_kernel::KernelSemanticInputV1>,
 ) -> Result<SemanticProgram, SemanticError> {
+    #[cfg(any(test, feature = "test-packed-call-oracle"))]
+    let kernel_input = kernel_input.map(Arc::new);
+    #[cfg(any(test, feature = "test-packed-call-oracle"))]
+    let kernel_input_ref = kernel_input.as_deref();
+    #[cfg(not(any(test, feature = "test-packed-call-oracle")))]
+    let kernel_input_ref = kernel_input.as_ref();
+
     let trace_elaboration = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! elaboration_phase {
         ($name:literal, $expression:expr) => {{
@@ -2774,7 +2816,7 @@ fn elaborate_with_representation(
         .iter()
         .filter(|route| route.domain == CheckedImageRowDomainV2::ResourceProjection)
         .count();
-    if let Some(kernel_input) = kernel_input.as_ref() {
+    if let Some(kernel_input) = kernel_input_ref {
         if resource_route_count != kernel_input.resource_projection_count() {
             return Err(SemanticError::new(format!(
                 "kernel semantic input has {} resource projections but checked image routes {resource_route_count}",
@@ -2815,6 +2857,9 @@ fn elaborate_with_representation(
             checked_program.resource_projection_requirements.len(),
         )));
     }
+    let calls = call_view::CallCatalog::new(&checked_program, kernel_input_ref)
+        .map_err(SemanticError::new)?;
+    let call_types = call_view::CallTypeCatalog::new(&calls).map_err(SemanticError::new)?;
     let source_bundle_digest_v1 = checked_program.source_bundle_digest_v1;
     let role = checked_program.role;
     if trace_elaboration {
@@ -2825,14 +2870,14 @@ fn elaborate_with_representation(
             checked_program.statements.len(),
             checked_program.expressions.len(),
             checked_program.callables.len(),
-            checked_program.calls.len(),
+            calls.len(),
             checked_program.sources.len(),
             checked_program.states.len(),
             checked_program.lists.len(),
             checked_handoff.projections.len(),
         );
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-packed-call-oracle"))]
     let checked_program_oracle = checked_program.clone();
     let producer_materializations = elaboration_phase!(
         "canonical_producer_requests",
@@ -2840,7 +2885,7 @@ fn elaborate_with_representation(
     )?;
     elaboration_phase!(
         "validate_contextual_bindings",
-        validate_contextual_bindings(&checked_program)
+        validate_contextual_bindings(&checked_program, &calls)
     )?;
     let producer_roots = elaboration_phase!(
         "resolve_producer_roots",
@@ -2851,12 +2896,14 @@ fn elaborate_with_representation(
             .then(|| {
                 contextual_expansion::ordinary_callable_declarations(
                     &checked_program,
-                    kernel_input.as_ref(),
+                    &calls,
+                    kernel_input_ref,
                 )
             })
             .unwrap_or_default();
         verified_intent::VerifiedSemanticIntentV1::build(
             &checked_program,
+            &calls,
             &producer_roots,
             retained_definitions,
         )
@@ -2867,11 +2914,15 @@ fn elaborate_with_representation(
         "out_net",
         out_net::OutNet::<OutPortContractV1>::try_build_with_intent(
             &checked_program,
-            kernel_input.as_ref(),
+            &calls,
+            &call_types,
+            kernel_input_ref,
             producer_roots,
             &verified_intent,
-            |call, _, entry| provisional_out_port_contract(&checked_program, call, entry),
-            |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
+            |calls, call, _, entry, substitutions| {
+                provisional_out_port_contract(&checked_program, calls, call, entry, substitutions)
+            },
+            |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
     )?;
     if out_net.has_errors() {
@@ -2894,7 +2945,7 @@ fn elaborate_with_representation(
         let local_substitution_count = resolved_out_graph
             .call_instances
             .iter()
-            .map(|call| call.local_type_substitutions().len())
+            .map(out_net::OutCallInstance::local_type_substitution_count)
             .sum::<usize>();
         let maximum_substitution_count = resolved_out_graph
             .call_instances
@@ -2917,8 +2968,10 @@ fn elaborate_with_representation(
         "resolve_out_contracts",
         resolve_out_contracts(
             &checked_program,
+            &calls,
+            &call_types,
             &mut resolved_out_graph,
-            kernel_input.as_ref(),
+            kernel_input_ref,
         )
     )?;
     elaboration_phase!(
@@ -2934,7 +2987,9 @@ fn elaborate_with_representation(
         "derive_contextual_materializations",
         contextual_expansion::derive_contextual_materializations(
             &checked_program,
-            kernel_input.as_ref(),
+            &calls,
+            &call_types,
+            kernel_input_ref,
             &resolved_out_graph,
             verified_intent.retained_definitions(),
             retain_ordinary_calls,
@@ -2945,7 +3000,9 @@ fn elaborate_with_representation(
         "derive_semantic_execution_graph",
         contextual_expansion::derive_semantic_execution_graph(
             &checked_program,
-            kernel_input.as_ref(),
+            &calls,
+            call_types,
+            kernel_input_ref,
             checked_handoff,
             runtime_flow_terms,
             &resolved_out_graph,
@@ -2985,6 +3042,7 @@ fn elaborate_with_representation(
         "validate_checked_callable_and_call_inventory",
         contextual_expansion::validate_checked_callable_and_call_inventory(
             &checked_program,
+            &calls,
             &execution_graph,
         )
     )
@@ -3153,8 +3211,10 @@ fn elaborate_with_representation(
         source_bundle_digest_v1,
         role,
         semantic_image,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-packed-call-oracle"))]
         checked_program: checked_program_oracle,
+        #[cfg(any(test, feature = "test-packed-call-oracle"))]
+        kernel_input: kernel_input.clone(),
         #[cfg(test)]
         execution_graph: execution_graph_oracle,
         producer_materializations,
@@ -3184,80 +3244,62 @@ fn elaborate_with_representation(
 
 fn provisional_out_port_contract(
     program: &CheckedProgramFields,
-    call: &boon_checked::CheckedCall,
-    entry: &boon_checked::CheckedCallEntry,
+    calls: &call_view::CallCatalog<'_>,
+    call: call_view::CallRef<'_>,
+    entry: call_view::CallEntryRef<'_>,
+    type_substitutions: &[boon_checked::CheckedTypeSubstitution],
 ) -> Result<OutPortContractV1, SemanticError> {
-    let formal = match entry {
-        boon_checked::CheckedCallEntry::Input { formal, .. }
-        | boon_checked::CheckedCallEntry::FreshOut { formal, .. }
-        | boon_checked::CheckedCallEntry::ForwardOut { formal, .. } => *formal,
-    };
-    let callable = program
-        .callables
-        .iter()
-        .find(|callable| callable.decl_id == call.callable)
-        .ok_or_else(|| {
-            SemanticError::new(format!(
-                "checked call {} references missing callable {} while constructing its OUT contract",
-                call.id.0, call.callable.0
-            ))
-        })?;
-    let parameter = callable
-        .parameters
-        .iter()
-        .find(|parameter| parameter.decl_id == formal)
-        .ok_or_else(|| {
-            SemanticError::new(format!(
-                "checked call {} references missing formal {} while constructing its OUT contract",
-                call.id.0, formal.0
-            ))
-        })?;
+    let formal = entry.formal();
+    let callable = calls.callable(call.callable()).ok_or_else(|| {
+        SemanticError::new(format!(
+            "checked call {} references missing callable {} while constructing its OUT contract",
+            call.id().0,
+            call.callable().0
+        ))
+    })?;
+    let parameter = entry.parameter();
     let flow_type = boon_checked::FlowType {
         mode: parameter.flow_type.mode,
-        ty: boon_checked::apply_checked_type_substitutions(
-            &parameter.flow_type.ty,
-            &call.type_substitutions,
-        ),
+        ty: apply_out_type_frame(&parameter.flow_type.ty, type_substitutions),
     };
     let lexical_scope = program
         .expressions
         .iter()
-        .find(|expression| expression.id == call.expression)
+        .find(|expression| expression.id == call.expression())
         .map(|expression| expression.scope_id)
         .ok_or_else(|| {
             SemanticError::new(format!(
                 "checked call {} references missing expression {} while constructing its OUT contract",
-                call.id.0, call.expression.0
+                call.id().0,
+                call.expression().0
             ))
         })?;
     let output_scope = match entry {
-        boon_checked::CheckedCallEntry::FreshOut { scope_id, .. } => *scope_id,
-        boon_checked::CheckedCallEntry::ForwardOut { target, .. } => {
-            let declaration = program
-                .declarations
-                .iter()
-                .find(|declaration| declaration.id == *target)
-                .ok_or_else(|| {
-                    SemanticError::new(format!(
-                        "checked call {} forwards OUT formal {} to missing declaration {}",
-                        call.id.0, formal.0, target.0
-                    ))
-                })?;
+        call_view::CallEntryRef::FreshOut { scope, .. } => scope,
+        call_view::CallEntryRef::ForwardOut { target, .. } => {
+            let declaration = calls.declaration(target).ok_or_else(|| {
+                SemanticError::new(format!(
+                    "checked call {} forwards OUT formal {} to missing declaration {}",
+                    call.id().0,
+                    formal.0,
+                    target.0
+                ))
+            })?;
             declaration.body_scope.ok_or_else(|| {
                 SemanticError::new(format!(
                     "checked call {} forwards OUT formal {} to declaration {} without an output scope",
-                    call.id.0, formal.0, target.0
+                    call.id().0, formal.0, target.0
                 ))
             })?
         }
-        boon_checked::CheckedCallEntry::Input { .. } => lexical_scope,
+        call_view::CallEntryRef::Input { .. } => lexical_scope,
     };
     Ok(OutPortContractV1 {
         resolved_type: flow_type.ty.clone(),
         shape_digest: [0; 32],
         lexical_scope,
         output_scope,
-        role: call.role,
+        role: callable.role,
         generation_identity: None,
         correlation_identity: None,
         presence: OutPresenceCompatibilityV1::from_mode(flow_type.mode),
@@ -3352,6 +3394,8 @@ fn out_contract_resolution_order(graph: &ResolvedOutGraph) -> Result<Vec<usize>,
 
 fn resolve_out_contracts(
     program: &CheckedProgramFields,
+    calls: &call_view::CallCatalog<'_>,
+    call_types: &call_view::CallTypeCatalog,
     graph: &mut ResolvedOutGraph,
     kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
 ) -> Result<(), SemanticError> {
@@ -3391,11 +3435,7 @@ fn resolve_out_contracts(
                 ))
             })?;
         let mut substitutions = graph.type_substitution_environment(call_id);
-        let mut provisional_variables = instance
-            .local_type_substitutions()
-            .iter()
-            .map(|substitution| substitution.variable)
-            .collect::<BTreeSet<_>>();
+        let mut provisional_variables = instance.local_type_variables().collect::<BTreeSet<_>>();
         let parent_substitutions = instance
             .parent
             .map(|parent| graph.type_substitution_environment(parent))
@@ -3435,33 +3475,19 @@ fn resolve_out_contracts(
                 })?;
             let actual = match &input.value {
                 out_net::OutInputValue::Checked(scoped) => {
-                    let mut input_substitutions = parent_substitutions.clone();
-                    if let Some(evaluation_call) = scoped
-                        .evaluation_port
-                        .and_then(|port| graph.ports.get(port.as_usize()))
-                        .map(|port| port.call)
-                    {
-                        if evaluation_call == call_id {
-                            input_substitutions = substitutions.clone();
-                        } else if graph
-                            .call_instances
-                            .get(evaluation_call.as_usize())
-                            .is_some_and(|instance| instance.id == evaluation_call)
-                        {
-                            let evaluation_substitutions =
-                                graph.type_substitution_environment(evaluation_call);
-                            merge_out_contract_substitutions(
-                                &mut input_substitutions,
-                                evaluation_substitutions,
-                            );
-                        }
-                    }
+                    let active_frames = ActiveOutTypeFrames {
+                        frame: Some(call_id),
+                        substitutions: &substitutions,
+                        parent: None,
+                    };
                     concrete_checked_expression_type(
                         program,
+                        calls,
+                        call_types,
                         graph,
                         kernel_input,
                         *scoped,
-                        &input_substitutions,
+                        &active_frames,
                         &mut BTreeSet::new(),
                     )
                     .map_err(|error| {
@@ -3475,7 +3501,7 @@ fn resolve_out_contracts(
                     })?
                 }
                 out_net::OutInputValue::ProducerParameter { flow_type, .. } => {
-                    apply_out_contract_substitutions(&flow_type.ty, &parent_substitutions)
+                    apply_out_type_frame(&flow_type.ty, &parent_substitutions)
                 }
             };
             let actual = canonical_runtime_out_actual(actual);
@@ -3502,12 +3528,7 @@ fn resolve_out_contracts(
                     ))
                 })?;
         }
-        let substitutions = substitutions
-            .into_iter()
-            .map(|(variable, value)| boon_checked::CheckedTypeSubstitution { variable, value })
-            .collect::<Vec<_>>();
-        let resolved_type =
-            boon_checked::apply_checked_type_substitutions(&parameter.flow_type.ty, &substitutions);
+        let resolved_type = apply_out_type_frame(&parameter.flow_type.ty, &substitutions);
         if !out_contract_type_is_resolved(&resolved_type) {
             return Err(SemanticError::new(format!(
                 "OUT port {port_index} has unresolved type {resolved_type:?}"
@@ -3537,11 +3558,10 @@ fn resolve_out_contracts(
             ))
         })?;
         let role = match instance.provenance.call_id {
-            Some(checked_call) => program
-                .calls
-                .iter()
-                .find(|call| call.id == checked_call)
-                .map(|call| call.role)
+            Some(checked_call) => calls
+                .get(checked_call)
+                .and_then(|call| calls.callable(call.callable()))
+                .map(|callable| callable.role)
                 .ok_or_else(|| {
                     SemanticError::new(format!(
                         "OUT call instance {call_id} references missing checked call {}",
@@ -3568,12 +3588,63 @@ fn resolve_out_contracts(
     Ok(())
 }
 
+/// Borrowed live refinements for nested OUT resolution.
+///
+/// Each node preserves one independently alpha-normalized scheme. Searching
+/// the parent chain by frame identity keeps in-progress ancestor bindings
+/// visible without cloning or flattening their maps into the child namespace.
+struct ActiveOutTypeFrames<'a> {
+    frame: Option<OutCallInstanceId>,
+    substitutions: &'a BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
+    parent: Option<&'a ActiveOutTypeFrames<'a>>,
+}
+
+impl ActiveOutTypeFrames<'_> {
+    fn find(
+        &self,
+        frame: Option<OutCallInstanceId>,
+    ) -> Option<&BTreeMap<boon_checked::TypeVar, boon_checked::Type>> {
+        let mut current = Some(self);
+        while let Some(candidate) = current {
+            if candidate.frame == frame {
+                return Some(candidate.substitutions);
+            }
+            current = candidate.parent;
+        }
+        None
+    }
+}
+
+fn select_out_type_frame<'a>(
+    graph: &ResolvedOutGraph,
+    requested_frame: Option<OutCallInstanceId>,
+    active_frames: &'a ActiveOutTypeFrames<'a>,
+) -> Result<std::borrow::Cow<'a, BTreeMap<boon_checked::TypeVar, boon_checked::Type>>, SemanticError>
+{
+    if let Some(substitutions) = active_frames.find(requested_frame) {
+        return Ok(std::borrow::Cow::Borrowed(substitutions));
+    }
+    let Some(frame) = requested_frame else {
+        return Ok(std::borrow::Cow::Owned(BTreeMap::new()));
+    };
+    graph
+        .call_instances
+        .get(frame.as_usize())
+        .filter(|instance| instance.id == frame)
+        .ok_or_else(|| SemanticError::new(format!("missing OUT call type frame {frame}")))?;
+    Ok(std::borrow::Cow::Owned(
+        graph.type_substitution_environment(frame),
+    ))
+}
+
 fn concrete_checked_expression_type(
     program: &CheckedProgramFields,
+    calls: &call_view::CallCatalog<'_>,
+    call_types: &call_view::CallTypeCatalog,
     graph: &ResolvedOutGraph,
     kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
     scoped: ScopedCheckedExpr,
-    active_substitutions: &BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
+    active_frames: &ActiveOutTypeFrames<'_>,
     visiting: &mut BTreeSet<(boon_checked::CheckedExprId, Option<OutCallInstanceId>)>,
 ) -> Result<boon_checked::Type, SemanticError> {
     let key = (scoped.expression, scoped.frame);
@@ -3596,13 +3667,8 @@ fn concrete_checked_expression_type(
             })?;
         match &expression.kind {
             boon_checked::CheckedExpressionKind::Call { call } => {
-                let checked_call = program.calls.iter().find(|candidate| candidate.id == *call);
-                let callable = checked_call.and_then(|call| {
-                    program
-                        .callables
-                        .iter()
-                        .find(|callable| callable.decl_id == call.callable)
-                });
+                let checked_call = calls.get(*call);
+                let callable = checked_call.and_then(|call| calls.callable(call.callable()));
                 let instance_id = match graph.call_instance_for_checked_call(*call, scoped.frame) {
                     Some(instance) => instance,
                     None => {
@@ -3616,61 +3682,48 @@ fn concrete_checked_expression_type(
                         let instance_less_is_pure =
                             checked_call.zip(callable).is_some_and(|(call, callable)| {
                                 graph.intentionally_elided_call(
-                                    call.id,
-                                    call.owner_callable,
+                                    call.id(),
+                                    call.owner_callable(),
                                     scoped.frame,
-                                ) && call.expression == scoped.expression
+                                ) && call.expression() == scoped.expression
                                     && callable.kind == boon_checked::CheckedCallableKind::User
-                                    && call.entries.iter().all(|entry| {
-                                        matches!(
-                                            entry,
-                                            boon_checked::CheckedCallEntry::Input { .. }
-                                        )
-                                    })
-                                    && call.contexts.is_empty()
+                                    && calls.entries(call).all(|entry| entry.input().is_some())
+                                    && call.context_count() == 0
                                     && matches!(
-                                        call.context_binding,
+                                        call.context_binding(),
                                         boon_checked::CheckedContextBinding::None
                                     )
-                                    && call.contextual_substitutions.is_empty()
+                                    && calls.contextual_substitutions(call).next().is_none()
                                     && callable.contexts.is_empty()
                                     && callable.context_formal.is_none()
                                     && callable.contextual_operation.is_none()
                                     && callable.effect
                                         == boon_checked::CheckedEffectSummary::default()
                             });
-                        let occurrence = instance_less_is_pure.then(|| {
-                            let mut substitutions = active_substitutions.clone();
-                            if let Some(frame) = scoped.frame {
-                                merge_out_contract_substitutions(
-                                    &mut substitutions,
-                                    graph.type_substitution_environment(frame),
-                                );
-                            }
-                            let local_substitutions = checked_call
-                                .into_iter()
-                                .flat_map(|call| &call.type_substitutions)
-                                .map(|substitution| {
-                                    (
-                                        substitution.variable,
-                                        apply_out_contract_substitutions(
-                                            &substitution.value,
-                                            &substitutions,
-                                        ),
-                                    )
-                                })
-                                .collect::<Vec<_>>();
-                            substitutions.extend(local_substitutions);
-                            let expression_ty = apply_out_contract_substitutions(
+                        let occurrence = if instance_less_is_pure {
+                            // Both published occurrence types belong to the
+                            // retained definition/owner scheme. Advance that
+                            // owner frame once; child-call substitution keys
+                            // belong to a different scheme and must never be
+                            // merged into this lookup.
+                            let owner_substitutions =
+                                select_out_type_frame(graph, scoped.frame, active_frames)?;
+                            let expression_ty = apply_out_type_frame(
                                 &expression.flow_type.ty,
-                                &substitutions,
+                                owner_substitutions.as_ref(),
                             );
-                            let call_ty = checked_call.map(|call| {
-                                apply_out_contract_substitutions(&call.result.ty, &substitutions)
-                            });
+                            let call_ty = checked_call
+                                .and_then(|call| call_types.get(call.id()))
+                                .map(|facts| {
+                                    apply_out_type_frame(
+                                        &facts.result.ty,
+                                        owner_substitutions.as_ref(),
+                                    )
+                                });
                             (call_ty.as_ref() == Some(&expression_ty)).then_some(expression_ty)
-                        });
-                        let occurrence = occurrence.flatten();
+                        } else {
+                            None
+                        };
                         if let Some(resolved) = occurrence.as_ref().filter(|occurrence| {
                             boon_checked::type_is_recursively_closed(occurrence)
                         }) {
@@ -3680,9 +3733,9 @@ fn concrete_checked_expression_type(
                             "CALL expression {} references missing OUT call instance for checked call {} function {:?} in frame {:?}; checked occurrence after {} substitution(s) is {:?}",
                             scoped.expression.0,
                             call.0,
-                            checked_call.map(|call| call.function.as_str()),
+                            checked_call.map(|call| call.function()),
                             scoped.frame,
-                            active_substitutions.len(),
+                            active_frames.substitutions.len(),
                             occurrence,
                         )));
                     }
@@ -3697,27 +3750,22 @@ fn concrete_checked_expression_type(
                             scoped.expression.0
                         ))
                     })?;
-                if out_contract_type_is_resolved(&instance.result.ty) {
-                    return Ok(instance.result.ty.clone());
-                }
-                let mut substitutions = active_substitutions.clone();
-                let instance_type_environment = graph.type_substitution_environment(instance_id);
-                merge_out_contract_substitutions(&mut substitutions, instance_type_environment);
-                let occurrence_result =
-                    apply_out_contract_substitutions(&instance.result.ty, &substitutions);
-                if out_contract_type_is_resolved(&occurrence_result) {
+                // OutNet stores this occurrence after applying its local call
+                // frame and its parent frame. Reapplying the instance map
+                // would reinterpret a root-owned alpha in the callee scheme.
+                let occurrence_result = &instance.result.ty;
+                if out_contract_type_is_resolved(occurrence_result) {
                     // OutNet has already reconciled the callable scheme with
-                    // this checked occurrence. Its row may still mention
-                    // frame-local alphas, so close those first; recursively
-                    // reconstruct the callable body only while the occurrence
-                    // remains unresolved. This is also required for render
-                    // constructors whose public ABI intentionally exposes less
-                    // structure than their checked occurrence.
-                    return Ok(occurrence_result);
+                    // this checked occurrence. Reconstruct the callable body
+                    // only while the stored root-owned occurrence remains
+                    // unresolved. This is also required for render constructors
+                    // whose public ABI intentionally exposes less structure
+                    // than their checked occurrence.
+                    return Ok(occurrence_result.clone());
                 }
                 if instance.result_is_exact_occurrence {
                     let runtime_occurrence =
-                        contextual_expansion::erase_runtime_type_vars(&occurrence_result);
+                        contextual_expansion::erase_runtime_type_vars(occurrence_result);
                     if out_contract_type_is_resolved(&runtime_occurrence) {
                         // A syntax-discriminated occurrence is the structural
                         // authority even when child-owned runtime correlations
@@ -3728,6 +3776,7 @@ fn concrete_checked_expression_type(
                         return Ok(runtime_occurrence);
                     }
                 }
+                let mut substitutions = graph.type_substitution_environment(instance_id);
                 let callable = program
                     .callables
                     .iter()
@@ -3738,13 +3787,9 @@ fn concrete_checked_expression_type(
                             scoped.expression.0, instance.provenance.callable.0
                         ))
                     })?;
-                let mut provisional_variables = instance
-                    .local_type_substitutions()
-                    .iter()
-                    .map(|substitution| substitution.variable)
-                    .collect::<BTreeSet<_>>();
-                let checked_result =
-                    apply_out_contract_substitutions(&callable.result.ty, &substitutions);
+                let mut provisional_variables =
+                    instance.local_type_variables().collect::<BTreeSet<_>>();
+                let checked_result = apply_out_type_frame(&callable.result.ty, &substitutions);
                 if out_contract_type_is_resolved(&checked_result) {
                     // The checked call already owns a concrete result contract.
                     // Re-walking unrelated monomorphic inputs here would
@@ -3789,38 +3834,26 @@ fn concrete_checked_expression_type(
                         })?;
                     let actual = match &input.value {
                         out_net::OutInputValue::Checked(input) => {
-                            let mut input_substitutions = active_substitutions.clone();
-                            if let Some(evaluation_call) = input
-                                .evaluation_port
-                                .and_then(|port| graph.ports.get(port.as_usize()))
-                                .map(|port| port.call)
-                            {
-                                if evaluation_call == instance_id {
-                                    input_substitutions = substitutions.clone();
-                                } else if graph
-                                    .call_instances
-                                    .get(evaluation_call.as_usize())
-                                    .is_some_and(|instance| instance.id == evaluation_call)
-                                {
-                                    let evaluation_substitutions =
-                                        graph.type_substitution_environment(evaluation_call);
-                                    merge_out_contract_substitutions(
-                                        &mut input_substitutions,
-                                        evaluation_substitutions,
-                                    );
-                                }
-                            }
+                            let child_frames = ActiveOutTypeFrames {
+                                frame: Some(instance_id),
+                                substitutions: &substitutions,
+                                parent: Some(active_frames),
+                            };
                             concrete_checked_expression_type(
                                 program,
+                                calls,
+                                call_types,
                                 graph,
                                 kernel_input,
                                 *input,
-                                &input_substitutions,
+                                &child_frames,
                                 visiting,
                             )?
                         }
                         out_net::OutInputValue::ProducerParameter { flow_type, .. } => {
-                            apply_out_contract_substitutions(&flow_type.ty, active_substitutions)
+                            let parent_substitutions =
+                                select_out_type_frame(graph, instance.parent, active_frames)?;
+                            apply_out_type_frame(&flow_type.ty, parent_substitutions.as_ref())
                         }
                     };
                     if out_contract_type_contains_empty_list_placeholder(&actual) {
@@ -3846,8 +3879,7 @@ fn concrete_checked_expression_type(
                     })?;
                 }
                 for (parameter_name, parameter_type, actual) in deferred_inputs {
-                    let expected =
-                        apply_out_contract_substitutions(&parameter_type, &substitutions);
+                    let expected = apply_out_type_frame(&parameter_type, &substitutions);
                     let contextual_actual =
                         contextualize_empty_list_placeholders(&actual, &expected).unwrap_or(actual);
                     release_provisional_out_contract_bindings(
@@ -3868,15 +3900,22 @@ fn concrete_checked_expression_type(
                         ))
                     })?;
                 }
-                let result = apply_out_contract_substitutions(&callable.result.ty, &substitutions);
+                let result = apply_out_type_frame(&callable.result.ty, &substitutions);
                 if out_contract_type_is_resolved(&result) {
                     return Ok(result);
                 }
                 if callable.kind == boon_checked::CheckedCallableKind::User
                     && let Some(result_expression) = callable.result_expression
                 {
+                    let child_frames = ActiveOutTypeFrames {
+                        frame: Some(instance_id),
+                        substitutions: &substitutions,
+                        parent: Some(active_frames),
+                    };
                     return concrete_checked_expression_type(
                         program,
+                        calls,
+                        call_types,
                         graph,
                         kernel_input,
                         ScopedCheckedExpr {
@@ -3885,7 +3924,7 @@ fn concrete_checked_expression_type(
                             evaluation_port: None,
                             value_frame: scoped.value_frame,
                         },
-                        &substitutions,
+                        &child_frames,
                         visiting,
                     );
                 }
@@ -3904,6 +3943,8 @@ fn concrete_checked_expression_type(
                 ..
             } => concrete_checked_expression_type(
                 program,
+                calls,
+                call_types,
                 graph,
                 kernel_input,
                 ScopedCheckedExpr {
@@ -3912,7 +3953,7 @@ fn concrete_checked_expression_type(
                     evaluation_port: scoped.evaluation_port,
                     value_frame: scoped.value_frame,
                 },
-                active_substitutions,
+                active_frames,
                 visiting,
             ),
             boon_checked::CheckedExpressionKind::Object { fields } => {
@@ -3922,6 +3963,8 @@ fn concrete_checked_expression_type(
                 for field in fields {
                     let field_type = concrete_checked_expression_type(
                         program,
+                        calls,
+                        call_types,
                         graph,
                         kernel_input,
                         ScopedCheckedExpr {
@@ -3930,7 +3973,7 @@ fn concrete_checked_expression_type(
                             evaluation_port: scoped.evaluation_port,
                             value_frame: scoped.value_frame,
                         },
-                        active_substitutions,
+                        active_frames,
                         visiting,
                     )?;
                     if field.spread {
@@ -3970,6 +4013,8 @@ fn concrete_checked_expression_type(
                 for field in fields {
                     let field_type = concrete_checked_expression_type(
                         program,
+                        calls,
+                        call_types,
                         graph,
                         kernel_input,
                         ScopedCheckedExpr {
@@ -3978,7 +4023,7 @@ fn concrete_checked_expression_type(
                             evaluation_port: scoped.evaluation_port,
                             value_frame: scoped.value_frame,
                         },
-                        active_substitutions,
+                        active_frames,
                         visiting,
                     )?;
                     if field.spread {
@@ -4022,22 +4067,26 @@ fn concrete_checked_expression_type(
             | boon_checked::CheckedExpressionKind::While { arms, .. } => {
                 concrete_checked_branch_expression_type(
                     program,
+                    calls,
+                    call_types,
                     graph,
                     kernel_input,
                     scoped,
                     arms,
-                    active_substitutions,
+                    active_frames,
                     visiting,
                 )
             }
             boon_checked::CheckedExpressionKind::Latest { branches } => {
                 concrete_checked_branch_expression_type(
                     program,
+                    calls,
+                    call_types,
                     graph,
                     kernel_input,
                     scoped,
                     branches,
-                    active_substitutions,
+                    active_frames,
                     visiting,
                 )
             }
@@ -4066,10 +4115,12 @@ fn concrete_checked_expression_type(
                 })?;
                 let base = concrete_checked_expression_type(
                     program,
+                    calls,
+                    call_types,
                     graph,
                     kernel_input,
                     passed.value,
-                    active_substitutions,
+                    active_frames,
                     visiting,
                 )?;
                 project_out_contract_type(base, projection).map_err(|error| {
@@ -4082,46 +4133,19 @@ fn concrete_checked_expression_type(
             boon_checked::CheckedExpressionKind::Read {
                 target, projection, ..
             } => {
+                let expression_substitutions =
+                    select_out_type_frame(graph, scoped.frame, active_frames)?;
                 if let Some(payload_type) = exact_checked_resource_projection_type(
                     program,
                     kernel_input,
                     scoped.expression,
-                    active_substitutions,
+                    expression_substitutions.as_ref(),
                 )? {
                     return Ok(payload_type);
                 }
-                let mut expression_substitutions = active_substitutions.clone();
-                let frame_type_environment = scoped
-                    .frame
-                    .map(|frame| {
-                        graph
-                            .call_instances
-                            .get(frame.as_usize())
-                            .filter(|instance| instance.id == frame)
-                            .ok_or_else(|| {
-                                SemanticError::new(format!(
-                                    "READ expression {} references missing OUT call frame {frame}",
-                                    scoped.expression.0
-                                ))
-                            })?;
-                        Ok(graph.type_substitution_environment(frame))
-                    })
-                    .transpose()?
-                    .unwrap_or_default();
-                merge_out_contract_substitutions(
-                    &mut expression_substitutions,
-                    frame_type_environment,
-                );
-                let expression_substitutions = expression_substitutions
-                    .into_iter()
-                    .map(|(variable, value)| boon_checked::CheckedTypeSubstitution {
-                        variable,
-                        value,
-                    })
-                    .collect::<Vec<_>>();
-                let expression_actual = boon_checked::apply_checked_type_substitutions(
+                let expression_actual = apply_out_type_frame(
                     &expression.flow_type.ty,
-                    &expression_substitutions,
+                    expression_substitutions.as_ref(),
                 );
                 let output_actual = scoped
                     .evaluation_port
@@ -4176,16 +4200,18 @@ fn concrete_checked_expression_type(
                                     port.formal.0
                                 ))
                         })?;
-                        let mut output_substitutions = active_substitutions.clone();
-                        let instance_type_environment =
-                            graph.type_substitution_environment(port.call);
-                        merge_out_contract_substitutions(
-                            &mut output_substitutions,
-                            instance_type_environment,
-                        );
-                        Ok(Some(apply_out_contract_substitutions(
+                        // The formal belongs to the port call's callee scheme;
+                        // that instance environment already embeds its parent
+                        // composition. Caller/active keys are a different
+                        // namespace and must not be flattened into this frame.
+                        let output_substitutions = select_out_type_frame(
+                            graph,
+                            Some(port.call),
+                            active_frames,
+                        )?;
+                        Ok(Some(apply_out_type_frame(
                             &parameter.flow_type.ty,
-                            &output_substitutions,
+                            output_substitutions.as_ref(),
                         )))
                     })
                     .transpose()?
@@ -4246,10 +4272,12 @@ fn concrete_checked_expression_type(
                         out_net::OutInputValue::Checked(actual) => {
                             concrete_checked_expression_type(
                                 program,
+                                calls,
+                                call_types,
                                 graph,
                                 kernel_input,
                                 *actual,
-                                active_substitutions,
+                                active_frames,
                                 visiting,
                             )
                         }
@@ -4353,35 +4381,10 @@ fn concrete_checked_expression_type(
                 })
             }
             _ => {
-                let mut substitutions = active_substitutions.clone();
-                let frame_type_environment = scoped
-                    .frame
-                    .map(|frame| {
-                        graph
-                            .call_instances
-                            .get(frame.as_usize())
-                            .filter(|instance| instance.id == frame)
-                            .ok_or_else(|| {
-                                SemanticError::new(format!(
-                                    "expression {} references missing OUT call frame {frame}",
-                                    scoped.expression.0
-                                ))
-                            })?;
-                        Ok(graph.type_substitution_environment(frame))
-                    })
-                    .transpose()?
-                    .unwrap_or_default();
-                merge_out_contract_substitutions(&mut substitutions, frame_type_environment);
-                let substitutions = substitutions
-                    .into_iter()
-                    .map(|(variable, value)| boon_checked::CheckedTypeSubstitution {
-                        variable,
-                        value,
-                    })
-                    .collect::<Vec<_>>();
-                Ok(boon_checked::apply_checked_type_substitutions(
+                let substitutions = select_out_type_frame(graph, scoped.frame, active_frames)?;
+                Ok(apply_out_type_frame(
                     &expression.flow_type.ty,
-                    &substitutions,
+                    substitutions.as_ref(),
                 ))
             }
         }
@@ -4392,11 +4395,13 @@ fn concrete_checked_expression_type(
 
 fn concrete_checked_branch_expression_type(
     program: &CheckedProgramFields,
+    calls: &call_view::CallCatalog<'_>,
+    call_types: &call_view::CallTypeCatalog,
     graph: &ResolvedOutGraph,
     kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
     scoped: ScopedCheckedExpr,
     branches: &[boon_checked::CheckedExprId],
-    active_substitutions: &BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
+    active_frames: &ActiveOutTypeFrames<'_>,
     visiting: &mut BTreeSet<(boon_checked::CheckedExprId, Option<OutCallInstanceId>)>,
 ) -> Result<boon_checked::Type, SemanticError> {
     let expression = program
@@ -4419,28 +4424,11 @@ fn concrete_checked_branch_expression_type(
     if boon_checked::type_is_recursively_closed(&expression.flow_type.ty) {
         return Ok(expression.flow_type.ty.clone());
     }
-    let mut substitutions = active_substitutions.clone();
-    let frame_type_environment = scoped
-        .frame
-        .map(|frame| {
-            graph
-                .call_instances
-                .get(frame.as_usize())
-                .filter(|instance| instance.id == frame)
-                .ok_or_else(|| {
-                    SemanticError::new(format!(
-                        "branch expression {} references missing OUT call frame {frame}",
-                        scoped.expression.0
-                    ))
-                })?;
-            Ok(graph.type_substitution_environment(frame))
-        })
-        .transpose()?
-        .unwrap_or_default();
-    merge_out_contract_substitutions(&mut substitutions, frame_type_environment);
-    let container_is_contextually_closed = out_contract_type_is_resolved(
-        &apply_out_contract_substitutions(&expression.flow_type.ty, &substitutions),
-    );
+    let mut substitutions = select_out_type_frame(graph, scoped.frame, active_frames)?.into_owned();
+    let container_is_contextually_closed = out_contract_type_is_resolved(&apply_out_type_frame(
+        &expression.flow_type.ty,
+        &substitutions,
+    ));
 
     let mut concrete_branches = Vec::new();
     for branch in branches {
@@ -4454,8 +4442,15 @@ fn concrete_checked_branch_expression_type(
                     scoped.expression.0, branch.0
                 ))
             })?;
+        let branch_frames = ActiveOutTypeFrames {
+            frame: scoped.frame,
+            substitutions: &substitutions,
+            parent: Some(active_frames),
+        };
         let concrete = concrete_checked_expression_type(
             program,
+            calls,
+            call_types,
             graph,
             kernel_input,
             ScopedCheckedExpr {
@@ -4464,7 +4459,7 @@ fn concrete_checked_branch_expression_type(
                 evaluation_port: scoped.evaluation_port,
                 value_frame: scoped.value_frame,
             },
-            &substitutions,
+            &branch_frames,
             visiting,
         )?;
         let concrete =
@@ -4494,7 +4489,7 @@ fn concrete_checked_branch_expression_type(
         concrete_branches.push(concrete);
     }
 
-    let result = apply_out_contract_substitutions(&expression.flow_type.ty, &substitutions);
+    let result = apply_out_type_frame(&expression.flow_type.ty, &substitutions);
     if out_contract_type_is_resolved(&result) {
         return Ok(result);
     }
@@ -4535,7 +4530,7 @@ fn exact_checked_resource_projection_type(
             .flow_type
             .ty
             .clone();
-        let required_type = apply_out_contract_substitutions(&published_type, substitutions);
+        let required_type = apply_out_type_frame(&published_type, substitutions);
         let mut exact_type = None;
         for origin in requirement.origins() {
             let source_id = origin.source();
@@ -4549,7 +4544,7 @@ fn exact_checked_resource_projection_type(
                         expression.0, source_id.0,
                     ))
                 })?;
-            let source_type = apply_out_contract_substitutions(&source.payload_type, substitutions);
+            let source_type = apply_out_type_frame(&source.payload_type, substitutions);
             let projected =
                 project_out_contract_type_segments(source_type, origin.payload_projection())
                     .map_err(|error| {
@@ -4611,7 +4606,7 @@ fn exact_checked_resource_projection_type(
         return Ok(None);
     }
 
-    let required_type = apply_out_contract_substitutions(&requirement.required_type, substitutions);
+    let required_type = apply_out_type_frame(&requirement.required_type, substitutions);
     let mut exact_type = None;
     for origin in &requirement.source_origins {
         let source = program
@@ -4624,7 +4619,7 @@ fn exact_checked_resource_projection_type(
                     expression.0, origin.source.0
                 ))
             })?;
-        let source_type = apply_out_contract_substitutions(&source.payload_type, substitutions);
+        let source_type = apply_out_type_frame(&source.payload_type, substitutions);
         let projected = project_out_contract_type(source_type, &origin.payload_projection)
             .map_err(|error| {
                 SemanticError::new(format!(
@@ -4715,11 +4710,17 @@ fn validate_resource_required_type(
     )))
 }
 
-fn apply_out_contract_substitutions(
+/// Applies exactly one OUT type frame.
+///
+/// Every OUT environment is directional: keys belong to the local scheme
+/// while replacement values already belong to its caller or root frame.
+/// Recursively looking those values up in the local map can capture an
+/// unrelated caller alpha with the same ordinal.
+fn apply_out_type_frame(
     ty: &boon_checked::Type,
-    substitutions: &BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
+    substitutions: &(impl boon_checked::CheckedTypeSubstitutionLookup + ?Sized),
 ) -> boon_checked::Type {
-    boon_checked::apply_checked_type_environment(ty, substitutions)
+    boon_checked::apply_checked_type_substitution_lookup_once(ty, substitutions)
 }
 
 fn project_out_contract_type(
@@ -5223,23 +5224,10 @@ fn unify_out_contract_type_impl(
     Ok(())
 }
 
-fn merge_out_contract_substitutions(
-    substitutions: &mut BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
-    additions: impl IntoIterator<Item = (boon_checked::TypeVar, boon_checked::Type)>,
-) {
-    for (variable, value) in additions {
-        match substitutions.get(&variable) {
-            Some(existing)
-                if out_contract_type_is_resolved(existing)
-                    && !out_contract_type_is_resolved(&value) => {}
-            _ => {
-                substitutions.insert(variable, value);
-            }
-        }
-    }
-}
-
-fn validate_contextual_bindings(program: &CheckedProgramFields) -> Result<(), SemanticError> {
+fn validate_contextual_bindings(
+    program: &CheckedProgramFields,
+    calls: &call_view::CallCatalog<'_>,
+) -> Result<(), SemanticError> {
     let callables = program
         .callables
         .iter()
@@ -5319,26 +5307,29 @@ fn validate_contextual_bindings(program: &CheckedProgramFields) -> Result<(), Se
         .iter()
         .map(|expression| expression.id)
         .collect::<BTreeSet<_>>();
-    for call in &program.calls {
-        let callable = callables.get(&call.callable).ok_or_else(|| {
+    for call in calls.calls() {
+        let callable = callables.get(&call.callable()).ok_or_else(|| {
             SemanticError::new(format!(
                 "checked call {} references missing callable {}",
-                call.id.0, call.callable.0
+                call.id().0,
+                call.callable().0
             ))
         })?;
         let target_formal = callable.context_formal;
-        match call.context_binding {
+        match call.context_binding() {
             boon_checked::CheckedContextBinding::Explicit { value, .. } => {
                 if target_formal.is_none() {
                     return Err(SemanticError::new(format!(
                         "checked call {} has explicit PASS context for noncontextual callable {}",
-                        call.id.0, call.callable.0
+                        call.id().0,
+                        call.callable().0
                     )));
                 }
                 if !expressions.contains(&value) {
                     return Err(SemanticError::new(format!(
                         "checked call {} explicit PASS context references missing expression {}",
-                        call.id.0, value.0
+                        call.id().0,
+                        value.0
                     )));
                 }
             }
@@ -5346,19 +5337,22 @@ fn validate_contextual_bindings(program: &CheckedProgramFields) -> Result<(), Se
                 if target_formal.is_none() {
                     return Err(SemanticError::new(format!(
                         "checked call {} inherits PASS context for noncontextual callable {}",
-                        call.id.0, call.callable.0
+                        call.id().0,
+                        call.callable().0
                     )));
                 }
-                let owner = call.owner_callable.ok_or_else(|| {
+                let owner = call.owner_callable().ok_or_else(|| {
                     SemanticError::new(format!(
                         "root checked call {} cannot inherit contextual formal {}",
-                        call.id.0, formal.0
+                        call.id().0,
+                        formal.0
                     ))
                 })?;
                 let owner_callable = callables.get(&owner).ok_or_else(|| {
                     SemanticError::new(format!(
                         "checked call {} inherits from missing owner callable {}",
-                        call.id.0, owner.0
+                        call.id().0,
+                        owner.0
                     ))
                 })?;
                 if owner_callable.context_formal != Some(formal)
@@ -5368,7 +5362,9 @@ fn validate_contextual_bindings(program: &CheckedProgramFields) -> Result<(), Se
                 {
                     return Err(SemanticError::new(format!(
                         "checked call {} inherits contextual formal {} outside owner callable {}",
-                        call.id.0, formal.0, owner.0
+                        call.id().0,
+                        formal.0,
+                        owner.0
                     )));
                 }
             }
@@ -5376,34 +5372,41 @@ fn validate_contextual_bindings(program: &CheckedProgramFields) -> Result<(), Se
                 if let Some(formal) = target_formal {
                     return Err(SemanticError::new(format!(
                         "checked call {} to contextual callable {} has no explicit or inherited binding for formal {}",
-                        call.id.0, call.callable.0, formal.0
+                        call.id().0,
+                        call.callable().0,
+                        formal.0
                     )));
                 }
             }
         }
 
         let mut substitutions = BTreeSet::new();
-        for substitution in &call.contextual_substitutions {
+        for substitution in calls.contextual_substitutions(call) {
             let Some(formal) = target_formal else {
                 return Err(SemanticError::new(format!(
                     "checked call {} has contextual substitutions for noncontextual callable {}",
-                    call.id.0, call.callable.0
+                    call.id().0,
+                    call.callable().0
                 )));
             };
             if substitution.formal != formal
                 || formals_by_id
                     .get(&substitution.formal)
-                    .is_none_or(|definition| definition.callable != call.callable)
+                    .is_none_or(|definition| definition.callable != call.callable())
             {
                 return Err(SemanticError::new(format!(
                     "checked call {} contextual substitution formal {} is not owned by callable {}",
-                    call.id.0, substitution.formal.0, call.callable.0
+                    call.id().0,
+                    substitution.formal.0,
+                    call.callable().0
                 )));
             }
             if !substitutions.insert((substitution.formal, substitution.variable)) {
                 return Err(SemanticError::new(format!(
                     "checked call {} repeats contextual substitution formal {} variable {:?}",
-                    call.id.0, substitution.formal.0, substitution.variable
+                    call.id().0,
+                    substitution.formal.0,
+                    substitution.variable
                 )));
             }
         }
@@ -5707,16 +5710,12 @@ fn exact_producer_callable<'a>(
 
 pub(crate) fn temporally_gated_checked_expressions(
     program: &CheckedProgramFields,
+    calls: &call_view::CallCatalog<'_>,
 ) -> BTreeSet<boon_checked::CheckedExprId> {
     let expressions = program
         .expressions
         .iter()
         .map(|expression| (expression.id, expression))
-        .collect::<BTreeMap<_, _>>();
-    let calls = program
-        .calls
-        .iter()
-        .map(|call| (call.id, call))
         .collect::<BTreeMap<_, _>>();
     let mut pending = Vec::new();
     for expression in &program.expressions {
@@ -5746,7 +5745,7 @@ pub(crate) fn temporally_gated_checked_expressions(
         };
         pending.extend(checked_expression_children_for_call_analysis(
             &expression.kind,
-            &calls,
+            calls,
         ));
     }
     gated
@@ -5754,7 +5753,7 @@ pub(crate) fn temporally_gated_checked_expressions(
 
 fn checked_expression_children_for_call_analysis(
     kind: &boon_checked::CheckedExpressionKind,
-    calls: &BTreeMap<boon_checked::CheckedCallId, &boon_checked::CheckedCall>,
+    calls: &call_view::CallCatalog<'_>,
 ) -> Vec<boon_checked::CheckedExprId> {
     use boon_checked::CheckedExpressionKind as Kind;
     match kind {
@@ -5769,16 +5768,13 @@ fn checked_expression_children_for_call_analysis(
             fields.iter().map(|field| field.value).collect()
         }
         Kind::Call { call } => calls
-            .get(call)
+            .get(*call)
             .into_iter()
             .flat_map(|call| {
-                call.entries
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        boon_checked::CheckedCallEntry::Input { value, .. } => Some(*value),
-                        _ => None,
-                    })
-                    .chain(call.context_binding.explicit().map(|(value, _)| value))
+                calls
+                    .entries(call)
+                    .filter_map(|entry| entry.input().map(|(value, _, _)| value))
+                    .chain(call.context_binding().explicit().map(|(value, _)| value))
             })
             .collect(),
         Kind::Flush { payload: input } | Kind::Draining { input } => vec![*input],
@@ -6076,6 +6072,121 @@ mod tests {
         }
     }
 
+    fn resolve_out_contracts_rich(
+        program: &CheckedProgramFields,
+        graph: &mut ResolvedOutGraph,
+    ) -> Result<(), SemanticError> {
+        let calls = call_view::CallCatalog::rich(program).map_err(SemanticError::new)?;
+        let call_types = call_view::CallTypeCatalog::new(&calls).map_err(SemanticError::new)?;
+        resolve_out_contracts(program, &calls, &call_types, graph, None)
+    }
+
+    fn concrete_checked_expression_type_rich(
+        program: &CheckedProgramFields,
+        graph: &ResolvedOutGraph,
+        scoped: ScopedCheckedExpr,
+        active_substitutions: &BTreeMap<boon_checked::TypeVar, Type>,
+        visiting: &mut BTreeSet<(boon_checked::CheckedExprId, Option<OutCallInstanceId>)>,
+    ) -> Result<Type, SemanticError> {
+        let calls = call_view::CallCatalog::rich(program).map_err(SemanticError::new)?;
+        let call_types = call_view::CallTypeCatalog::new(&calls).map_err(SemanticError::new)?;
+        let active_frames = ActiveOutTypeFrames {
+            frame: scoped.frame,
+            substitutions: active_substitutions,
+            parent: None,
+        };
+        concrete_checked_expression_type(
+            program,
+            &calls,
+            &call_types,
+            graph,
+            None,
+            scoped,
+            &active_frames,
+            visiting,
+        )
+    }
+
+    fn concrete_checked_branch_expression_type_rich(
+        program: &CheckedProgramFields,
+        graph: &ResolvedOutGraph,
+        scoped: ScopedCheckedExpr,
+        branches: &[boon_checked::CheckedExprId],
+        active_substitutions: &BTreeMap<boon_checked::TypeVar, Type>,
+        visiting: &mut BTreeSet<(boon_checked::CheckedExprId, Option<OutCallInstanceId>)>,
+    ) -> Result<Type, SemanticError> {
+        let calls = call_view::CallCatalog::rich(program).map_err(SemanticError::new)?;
+        let call_types = call_view::CallTypeCatalog::new(&calls).map_err(SemanticError::new)?;
+        let active_frames = ActiveOutTypeFrames {
+            frame: scoped.frame,
+            substitutions: active_substitutions,
+            parent: None,
+        };
+        concrete_checked_branch_expression_type(
+            program,
+            &calls,
+            &call_types,
+            graph,
+            None,
+            scoped,
+            branches,
+            &active_frames,
+            visiting,
+        )
+    }
+
+    fn ordinary_callable_declarations_rich(
+        program: &CheckedProgramFields,
+    ) -> BTreeSet<boon_checked::DeclId> {
+        let calls = call_view::CallCatalog::rich(program)
+            .expect("typechecked fixture has a valid call catalog");
+        contextual_expansion::ordinary_callable_declarations(program, &calls, None)
+    }
+
+    #[test]
+    fn out_contract_scheme_boundary_does_not_capture_caller_alpha_by_ordinal() {
+        let callee_result = Type::Var(boon_checked::TypeVar(0));
+        let directional_row = [
+            boon_checked::CheckedTypeSubstitution {
+                variable: boon_checked::TypeVar(0),
+                value: Type::Var(boon_checked::TypeVar(1)),
+            },
+            boon_checked::CheckedTypeSubstitution {
+                variable: boon_checked::TypeVar(1),
+                value: Type::Number,
+            },
+        ];
+        let resolved_frame = BTreeMap::from([
+            (
+                boon_checked::TypeVar(0),
+                Type::Var(boon_checked::TypeVar(1)),
+            ),
+            (boon_checked::TypeVar(1), Type::Number),
+        ]);
+
+        assert_eq!(
+            apply_out_type_frame(&callee_result, directional_row.as_slice()),
+            Type::Var(boon_checked::TypeVar(1)),
+            "the provisional OUT contract must cross the callee-to-caller frame once"
+        );
+        let stored_root_occurrence = apply_out_type_frame(&callee_result, &resolved_frame);
+        assert_eq!(
+            stored_root_occurrence,
+            Type::Var(boon_checked::TypeVar(1)),
+            "the final OUT contract must not reinterpret a caller alpha as a callee key"
+        );
+        assert_eq!(
+            apply_out_type_frame(&stored_root_occurrence, &resolved_frame),
+            Type::Number,
+            "reapplying an instance frame would corrupt its already root-owned occurrence"
+        );
+        assert_eq!(
+            boon_checked::apply_checked_type_environment(&callee_result, &resolved_frame),
+            Type::Number,
+            "the regression must distinguish one-frame application from recursive capture"
+        );
+    }
+
     #[test]
     fn out_contract_type_variable_widens_independently_of_input_order() {
         let variable = boon_checked::TypeVar(7);
@@ -6250,7 +6361,7 @@ mod tests {
     }
 
     #[test]
-    fn call_occurrence_closes_its_frame_alphas_before_callable_fallback() {
+    fn call_occurrence_is_root_owned_before_callable_fallback() {
         let parsed = boon_parser::parse_source(
             "semantic-exact-call-occurrence.bn",
             r#"
@@ -6258,7 +6369,7 @@ FUNCTION identity(value) {
     value
 }
 
-result: identity(value: 1)
+result: identity(value: [element: 1])
 "#,
         )
         .expect("exact-call fixture parses");
@@ -6270,45 +6381,51 @@ result: identity(value: 1)
             .iter()
             .find(|call| call.function == "identity")
             .expect("fixture has one identity call");
+        let callable = checked
+            .callables
+            .iter()
+            .find(|callable| callable.decl_id == checked_call.callable)
+            .expect("identity call has a checked callable");
+        assert!(
+            boon_checked::runtime_type_contains_var(&callable.result.ty),
+            "identity keeps a generic result scheme",
+        );
+        let expected = Type::object(boon_checked::ObjectShape {
+            fields: BTreeMap::from([("element".to_owned(), Type::Number)]),
+            field_order: vec!["element".to_owned()],
+            open: false,
+        });
+        assert!(
+            checked_call
+                .type_substitutions
+                .iter()
+                .any(|substitution| substitution.value == expected),
+            "the checked call closes its generic scheme at the occurrence",
+        );
         let producer_roots = resolve_producer_roots(&checked, &[]).unwrap();
-        let mut graph = out_net::OutNet::<OutPortContractV1>::try_build_with(
+        let graph = out_net::OutNet::<OutPortContractV1>::try_build_with(
             &checked,
             producer_roots,
-            |call, _, entry| provisional_out_port_contract(&checked, call, entry),
-            |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
+            |calls, call, _, entry, substitutions| {
+                provisional_out_port_contract(&checked, calls, call, entry, substitutions)
+            },
+            |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
         .expect("exact-call fixture builds one OUT graph")
         .graph;
         let instance_id = graph
             .call_instance_for_checked_call(checked_call.id, None)
             .expect("identity call has one root OUT frame");
-        let occurrence_alpha = boon_checked::TypeVar(u32::MAX - 1);
-        let expected = Type::object(boon_checked::ObjectShape {
-            fields: BTreeMap::from([("element".to_owned(), Type::Number)]),
-            field_order: vec!["element".to_owned()],
-            open: false,
-        });
-        {
-            let instance = &mut graph.call_instances[instance_id.as_usize()];
-            instance.result.ty = Type::object(boon_checked::ObjectShape {
-                fields: BTreeMap::from([("element".to_owned(), Type::Var(occurrence_alpha))]),
-                field_order: vec!["element".to_owned()],
-                open: false,
-            });
-            instance.result_is_exact_occurrence = false;
-        }
-        graph.push_local_type_substitution_for_test(
-            instance_id,
-            boon_checked::CheckedTypeSubstitution {
-                variable: occurrence_alpha,
-                value: Type::Number,
-            },
+        let stored_occurrence = &graph.call_instances[instance_id.as_usize()].result.ty;
+        assert_eq!(stored_occurrence, &expected);
+        assert!(
+            boon_checked::type_is_recursively_closed(stored_occurrence),
+            "OutNet stores call occurrences after their local and parent frames",
         );
 
-        let actual = concrete_checked_expression_type(
+        let actual = concrete_checked_expression_type_rich(
             &checked,
             &graph,
-            None,
             ScopedCheckedExpr {
                 expression: checked_call.expression,
                 frame: None,
@@ -6318,7 +6435,7 @@ result: identity(value: 1)
             &BTreeMap::new(),
             &mut BTreeSet::new(),
         )
-        .expect("the checked occurrence closes through its own OUT frame");
+        .expect("the root-owned checked occurrence resolves without frame replay");
 
         assert_eq!(actual, expected);
     }
@@ -6348,8 +6465,10 @@ result: identity(value: 1)
         let mut graph = out_net::OutNet::<OutPortContractV1>::try_build_with(
             &checked,
             producer_roots,
-            |call, _, entry| provisional_out_port_contract(&checked, call, entry),
-            |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
+            |calls, call, _, entry, substitutions| {
+                provisional_out_port_contract(&checked, calls, call, entry, substitutions)
+            },
+            |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
         .expect("exact-runtime-call fixture builds one OUT graph")
         .graph;
@@ -6365,10 +6484,9 @@ result: identity(value: 1)
         });
         instance.result_is_exact_occurrence = true;
 
-        let actual = concrete_checked_expression_type(
+        let actual = concrete_checked_expression_type_rich(
             &checked,
             &graph,
-            None,
             ScopedCheckedExpr {
                 expression: checked_call.expression,
                 frame: None,
@@ -6443,8 +6561,10 @@ result:
         let graph = out_net::OutNet::<OutPortContractV1>::try_build_with(
             &fields,
             producer_roots,
-            |call, _, entry| provisional_out_port_contract(&fields, call, entry),
-            |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
+            |calls, call, _, entry, substitutions| {
+                provisional_out_port_contract(&fields, calls, call, entry, substitutions)
+            },
+            |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
         .expect("closed branch-container fixture builds one OUT graph")
         .graph;
@@ -6472,10 +6592,9 @@ result:
             .flow_type
             .ty = Type::Var(boon_checked::TypeVar(10));
 
-        let actual = concrete_checked_branch_expression_type(
+        let actual = concrete_checked_branch_expression_type_rich(
             &fields,
             &graph,
-            None,
             ScopedCheckedExpr {
                 expression: container,
                 frame: None,
@@ -6511,10 +6630,9 @@ result:
             .ty = Type::Var(boon_checked::TypeVar(10));
         let substitutions = BTreeMap::from([(boon_checked::TypeVar(0), Type::Number)]);
 
-        let error = concrete_checked_branch_expression_type(
+        let error = concrete_checked_branch_expression_type_rich(
             &fields,
             &graph,
-            None,
             ScopedCheckedExpr {
                 expression: container,
                 frame: None,
@@ -6566,10 +6684,9 @@ result:
             expression.flow_type.ty = Type::Var(variable);
         }
 
-        let actual = concrete_checked_branch_expression_type(
+        let actual = concrete_checked_branch_expression_type_rich(
             &fields,
             &graph,
-            None,
             ScopedCheckedExpr {
                 expression: container,
                 frame: None,
@@ -6595,22 +6712,34 @@ result:
         let fields: boon_checked::CheckedProgramFields =
             toml::from_str(&encoded).expect("temporary checked artifact decodes");
         let producer_roots = resolve_producer_roots(&fields, &[]).unwrap();
-        let retained = contextual_expansion::ordinary_callable_declarations(&fields, None);
-        let intent =
-            verified_intent::VerifiedSemanticIntentV1::build(&fields, &producer_roots, retained)
-                .expect("cached NovyWave semantic intent");
+        let calls = call_view::CallCatalog::rich(&fields)
+            .expect("cached NovyWave artifact has a valid call catalog");
+        let call_types = call_view::CallTypeCatalog::new(&calls)
+            .expect("cached NovyWave artifact has valid call type facts");
+        let retained = contextual_expansion::ordinary_callable_declarations(&fields, &calls, None);
+        let intent = verified_intent::VerifiedSemanticIntentV1::build(
+            &fields,
+            &calls,
+            &producer_roots,
+            retained,
+        )
+        .expect("cached NovyWave semantic intent");
         let out_net = out_net::OutNet::<OutPortContractV1>::try_build_with_intent(
             &fields,
+            &calls,
+            &call_types,
             None,
             producer_roots,
             &intent,
-            |call, _, entry| provisional_out_port_contract(&fields, call, entry),
-            |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
+            |calls, call, _, entry, substitutions| {
+                provisional_out_port_contract(&fields, calls, call, entry, substitutions)
+            },
+            |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
         .expect("cached NovyWave OUT graph builds");
         assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
         let mut graph = out_net.graph.clone();
-        resolve_out_contracts(&fields, &mut graph, None)
+        resolve_out_contracts(&fields, &calls, &call_types, &mut graph, None)
             .expect("cached artifact resolves every NovyWave OUT contract");
         let compact_expression = fields
             .expressions
@@ -6715,9 +6844,15 @@ result:
             }
             frame = instance.parent;
         }
-        let retained = contextual_expansion::ordinary_callable_declarations(&fields, None);
+        let retained = contextual_expansion::ordinary_callable_declarations(&fields, &calls, None);
         contextual_expansion::derive_contextual_materializations(
-            &fields, None, &graph, &retained, true,
+            &fields,
+            &calls,
+            &call_types,
+            None,
+            &graph,
+            &retained,
+            true,
         )
         .expect("cached artifact derives every NovyWave contextual materialization");
     }
@@ -7150,9 +7285,11 @@ store: [
         assert_ne!(first_call.function, renamed_call.function);
         assert_ne!(first_call.span, renamed_call.span);
         assert_eq!(first_call.id, renamed_call.id);
+        let first_calls = call_view::CallCatalog::rich(&first_checked).unwrap();
+        let renamed_calls = call_view::CallCatalog::rich(&renamed_checked).unwrap();
         assert_eq!(
-            crate::out_net::checked_call_occurrence_segment(&first_checked, first_call.id).unwrap(),
-            crate::out_net::checked_call_occurrence_segment(&renamed_checked, renamed_call.id,)
+            crate::out_net::checked_call_occurrence_segment(&first_calls, first_call.id).unwrap(),
+            crate::out_net::checked_call_occurrence_segment(&renamed_calls, renamed_call.id,)
                 .unwrap()
         );
 
@@ -7880,13 +8017,15 @@ FUNCTION selectable_row(row) {
         let out_net = out_net::OutNet::<OutPortContractV1>::try_build_with(
             &checked,
             producer_roots,
-            |call, _, entry| provisional_out_port_contract(&checked, call, entry),
-            |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
+            |calls, call, _, entry, substitutions| {
+                provisional_out_port_contract(&checked, calls, call, entry, substitutions)
+            },
+            |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
         .unwrap();
         assert!(!out_net.has_errors());
         let mut graph = out_net.graph;
-        resolve_out_contracts(&checked, &mut graph, None)
+        resolve_out_contracts_rich(&checked, &mut graph)
             .expect("mapped source payload projection resolves its OUT contract");
         assert!(
             graph
@@ -7948,13 +8087,15 @@ store: [
         let out_net = out_net::OutNet::<OutPortContractV1>::try_build_with(
             &checked,
             producer_roots,
-            |call, _, entry| provisional_out_port_contract(&checked, call, entry),
-            |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
+            |calls, call, _, entry, substitutions| {
+                provisional_out_port_contract(&checked, calls, call, entry, substitutions)
+            },
+            |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
         .unwrap();
         assert!(!out_net.has_errors());
         let mut graph = out_net.graph;
-        resolve_out_contracts(&checked, &mut graph, None)
+        resolve_out_contracts_rich(&checked, &mut graph)
             .expect("OUT resolution must preserve the checked arm-local payload type");
         assert!(
             graph
@@ -8226,8 +8367,11 @@ FUNCTION lane_row(row) {
         for variable in environment.keys() {
             assert_eq!(
                 out.apply_type_substitutions(inherited.id, &Type::Var(*variable)),
-                boon_checked::apply_checked_type_environment(&Type::Var(*variable), &environment,),
-                "parent-linked lookup must match the flattened checked environment"
+                boon_checked::apply_checked_type_substitution_lookup_once(
+                    &Type::Var(*variable),
+                    &environment,
+                ),
+                "parent-linked lookup must match one application of its resolved frame"
             );
         }
     }
@@ -8450,7 +8594,7 @@ result: mapped(value: 0)
             checked.report.diagnostics,
         );
         let checked = checked.program.expect("retained-call checked program");
-        let retained = contextual_expansion::ordinary_callable_declarations(&checked, None);
+        let retained = ordinary_callable_declarations_rich(&checked);
         for name in ["classify", "rows"] {
             let callable = checked
                 .callables
@@ -8467,8 +8611,10 @@ result: mapped(value: 0)
             &checked,
             producer_roots,
             &retained,
-            |call, _, entry| provisional_out_port_contract(&checked, call, entry),
-            |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
+            |calls, call, _, entry, substitutions| {
+                provisional_out_port_contract(&checked, calls, call, entry, substitutions)
+            },
+            |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
         .unwrap();
         assert!(!out_net.has_errors(), "{:#?}", out_net.diagnostics);
@@ -8502,10 +8648,9 @@ result: mapped(value: 0)
             Some(rows_instance),
         ));
         let frame_substitutions = out_net.graph.type_substitution_environment(rows_instance);
-        let exact = concrete_checked_expression_type(
+        let exact = concrete_checked_expression_type_rich(
             &checked,
             &out_net.graph,
-            None,
             ScopedCheckedExpr {
                 expression: classify_call.expression,
                 frame: Some(rows_instance),
@@ -8523,10 +8668,9 @@ result: mapped(value: 0)
             .expect("classify checked expression");
         assert_eq!(exact, checked_expression.flow_type.ty);
         assert!(boon_checked::type_is_recursively_closed(&exact));
-        let missing_root_frame = concrete_checked_expression_type(
+        let missing_root_frame = concrete_checked_expression_type_rich(
             &checked,
             &out_net.graph,
-            None,
             ScopedCheckedExpr {
                 expression: classify_call.expression,
                 frame: None,
@@ -8543,7 +8687,7 @@ result: mapped(value: 0)
                 .contains("references missing OUT call instance"),
         );
         let mut graph = out_net.graph;
-        resolve_out_contracts(&checked, &mut graph, None)
+        resolve_out_contracts_rich(&checked, &mut graph)
             .expect("a resolved retained-call occurrence must supply the OUT input type");
         assert!(
             graph

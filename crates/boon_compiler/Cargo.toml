@@ -14,6 +14,9 @@ test-flat-oracle = ["boon_semantic/test-flat-oracle"]
 # Enables the bounded dense-kernel differential producer. It is absent from
 # ordinary compiler binaries and cannot become a runtime fallback.
 test-kernel-oracle = ["boon_typecheck/legacy-owner-oracle"]
+# Retains packed semantic authority only for explicit deep differential tests.
+# Never enable this feature for product or NovyWave timing producers.
+test-packed-call-oracle = ["boon_semantic/test-packed-call-oracle"]
 
 [dependencies]
 boon_checked.workspace = true

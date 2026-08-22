@@ -2227,7 +2227,9 @@ fn exact_visual_contract_known(
                 return Ok(true);
             }
         }
-        pending.extend(expression.kind.direct_children());
+        expression
+            .kind
+            .for_each_direct_child(|child| pending.push(child));
     }
     Ok(false)
 }
@@ -2372,7 +2374,9 @@ fn reachable_lowering_expressions(
                 })?;
                 pending.push(value);
             }
-            pending.extend(expression.kind.direct_children());
+            expression
+                .kind
+                .for_each_direct_child(|child| pending.push(child));
         }
         let reverse_markers = execution
             .expressions
@@ -2428,9 +2432,9 @@ fn build_transient_collections(
                 consumers.entry(*result).or_default().push(expression.id);
             }
             kind => {
-                for child in kind.direct_children() {
+                kind.for_each_direct_child(|child| {
                     consumers.entry(child).or_default().push(expression.id);
-                }
+                });
             }
         }
         if let SemanticExpressionKind::LocalRead {
@@ -2948,7 +2952,9 @@ fn transient_operand_is_safe(
             }
             _ => {}
         }
-        pending.extend(expression.kind.direct_children());
+        expression
+            .kind
+            .for_each_direct_child(|child| pending.push(child));
     }
     true
 }

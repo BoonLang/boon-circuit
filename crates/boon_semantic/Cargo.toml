@@ -11,6 +11,9 @@ default = []
 # differential oracle tests. Production compiler/runtime targets never enable
 # this feature.
 test-flat-oracle = []
+# Retains the packed call authority and checked rows only in downstream
+# differential tests. Ordinary compiler/runtime builds never enable it.
+test-packed-call-oracle = []
 
 [dependencies]
 boon_checked.workspace = true

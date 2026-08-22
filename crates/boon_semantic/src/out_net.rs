@@ -6,17 +6,18 @@
 
 use crate::{
     ProducerMaterializationMode,
+    call_view::{CallCatalog, CallEntryRef, CallRef, CallTypeCatalog},
     definition_templates::{
         DefinitionExecutionNodeRef, definition_execution_template, definition_execution_templates,
     },
 };
 use boon_checked::{
-    CheckedCall, CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedCallableSignature,
-    CheckedContextBinding, CheckedDeclaration, CheckedDeclarationKind, CheckedEvaluationScope,
-    CheckedExprId, CheckedExpressionKind, CheckedMatchPattern, CheckedPassedAccess,
-    CheckedPatternBinding, CheckedProgramFields, CheckedScopeKind, CheckedTypeSubstitution,
-    CheckedTypeSubstitutionFrameLookup, ContextFormalId, DeclId, FlowType, LexicalScopeId, Type,
-    TypeVar, apply_checked_type_substitution_frames, apply_checked_type_substitutions_once,
+    CheckedCallId, CheckedCallableKind, CheckedContextBinding, CheckedDeclarationKind,
+    CheckedEvaluationScope, CheckedExprId, CheckedExpressionKind, CheckedMatchPattern,
+    CheckedPassedAccess, CheckedPatternBinding, CheckedProgramFields, CheckedScopeKind,
+    CheckedTypeSubstitution, CheckedTypeSubstitutionFrameLookup, ContextFormalId, DeclId, FlowType,
+    LexicalScopeId, Type, TypeVar, apply_checked_type_substitution_frames,
+    apply_checked_type_substitutions_once,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -130,13 +131,13 @@ pub struct OutCallProvenance {
     pub callable: DeclId,
 }
 
-impl From<&CheckedCall> for OutCallProvenance {
-    fn from(call: &CheckedCall) -> Self {
+impl From<CallRef<'_>> for OutCallProvenance {
+    fn from(call: CallRef<'_>) -> Self {
         Self {
-            call_id: Some(call.id),
-            expression: call.expression,
-            owner_callable: call.owner_callable,
-            callable: call.callable,
+            call_id: Some(call.id()),
+            expression: call.expression(),
+            owner_callable: call.owner_callable(),
+            callable: call.callable(),
         }
     }
 }
@@ -151,13 +152,14 @@ pub struct OutCallInstance {
     pub inputs: Vec<OutInputBinding>,
     pub passed: Option<PassedBinding>,
     pub ports: Vec<OutPortId>,
-    /// Substitutions introduced by this checked call only. Inherited entries
-    /// remain owned by `parent`; retaining their full structural types in
-    /// every descendant makes deep generic call graphs quadratic in memory.
+    /// Test-only copy of the checked call's raw directional substitutions.
+    /// Production keeps only the resolved local frame below; the packed call
+    /// catalog remains the static source while this graph is constructed.
+    #[cfg(test)]
     local_type_substitutions: Vec<CheckedTypeSubstitution>,
-    /// Local keys with values resolved once through their parent invocation.
-    /// This remains proportional to local call facts and never copies an
-    /// ancestor key set into a descendant frame.
+    /// Local callee keys with values resolved once into the root caller
+    /// namespace. One such frame is sufficient after construction and avoids
+    /// retaining a second recursive `Type` copy for every occurrence.
     #[serde(skip)]
     resolved_type_substitutions: Vec<CheckedTypeSubstitution>,
     #[serde(skip)]
@@ -172,8 +174,19 @@ pub struct OutCallInstance {
 }
 
 impl OutCallInstance {
+    #[cfg(test)]
     pub fn local_type_substitutions(&self) -> &[CheckedTypeSubstitution] {
         &self.local_type_substitutions
+    }
+
+    pub(crate) fn local_type_substitution_count(&self) -> usize {
+        self.resolved_type_substitutions.len()
+    }
+
+    pub(crate) fn local_type_variables(&self) -> impl Iterator<Item = TypeVar> + '_ {
+        self.resolved_type_substitutions
+            .iter()
+            .map(|substitution| substitution.variable)
     }
 }
 
@@ -286,18 +299,20 @@ struct OutTypeSubstitutionFrames<'a>(&'a [OutCallInstance]);
 impl CheckedTypeSubstitutionFrameLookup for OutTypeSubstitutionFrames<'_> {
     type Frame = OutCallInstanceId;
 
-    fn parent(&self, frame: Self::Frame) -> Option<Self::Frame> {
-        self.0
-            .get(frame.as_usize())
-            .filter(|instance| instance.id == frame)
-            .and_then(|instance| instance.parent)
+    fn parent(&self, _frame: Self::Frame) -> Option<Self::Frame> {
+        // Each retained value was already advanced through its parent frame
+        // exactly once when the occurrence was built. Re-entering the parent
+        // here would reinterpret root-owned values in another alpha namespace.
+        None
     }
 
     fn substitutions(&self, frame: Self::Frame) -> &[CheckedTypeSubstitution] {
         self.0
             .get(frame.as_usize())
             .filter(|instance| instance.id == frame)
-            .map_or(&[], |instance| instance.local_type_substitutions())
+            .map_or(&[], |instance| {
+                instance.resolved_type_substitutions.as_slice()
+            })
     }
 
     fn frame_count(&self) -> usize {
@@ -436,8 +451,9 @@ impl<Contract> OutNet<Contract> {
     ///
     /// Raw `TypeVar` ordinals from ancestor call schemes are not globally
     /// unique, so their maps cannot be flattened into one `BTreeMap`. Values
-    /// are instead composed through ordered one-shot parent frames while the
-    /// returned keys remain solely in this call's scheme namespace.
+    /// are instead composed through ordered one-shot parent frames during
+    /// construction. This returns the resulting single local-scheme-to-root
+    /// row; its keys remain solely in this call's scheme namespace.
     pub fn type_substitution_environment(
         &self,
         call: OutCallInstanceId,
@@ -450,35 +466,10 @@ impl<Contract> OutNet<Contract> {
         else {
             return environment;
         };
-        debug_assert_eq!(
-            instance.local_type_substitutions.len(),
-            instance.resolved_type_substitutions.len()
-        );
         for substitution in &instance.resolved_type_substitutions {
             environment.insert(substitution.variable, substitution.value.clone());
         }
         environment
-    }
-
-    #[cfg(test)]
-    pub(crate) fn push_local_type_substitution_for_test(
-        &mut self,
-        call: OutCallInstanceId,
-        substitution: CheckedTypeSubstitution,
-    ) {
-        let parent = self.call_instances[call.as_usize()].parent;
-        let resolved = CheckedTypeSubstitution {
-            variable: substitution.variable,
-            value: apply_type_substitution_frames(
-                &self.call_instances,
-                parent,
-                &substitution.value,
-            ),
-        };
-        let instance = &mut self.call_instances[call.as_usize()];
-        instance.local_type_substitutions.push(substitution);
-        instance.resolved_type_substitutions.push(resolved);
-        instance.type_substitution_count = instance.type_substitution_count.saturating_add(1);
     }
 
     pub fn type_substitution_count(&self, call: OutCallInstanceId) -> usize {
@@ -521,7 +512,7 @@ impl<Contract> OutNet<Contract> {
 
     pub fn distributed_call_occurrence(
         &self,
-        program: &CheckedProgramFields,
+        _program: &CheckedProgramFields,
         instance: OutCallInstanceId,
     ) -> Result<(DistributedCallOccurrenceRoot, String), String> {
         let mut ancestry = Vec::new();
@@ -567,7 +558,7 @@ impl<Contract> OutNet<Contract> {
                     format!("non-root OUT call instance {call} has no checked call provenance")
                 })?;
             path.push('/');
-            path.push_str(&checked_call_occurrence_segment(program, checked)?);
+            path.push_str(&checked_call_occurrence_segment_unchecked(checked));
         }
         Ok((root, path))
     }
@@ -610,16 +601,18 @@ fn producer_identity_text(identity: [u8; 32]) -> String {
     identity.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-pub fn checked_call_occurrence_segment(
-    program: &CheckedProgramFields,
+pub(crate) fn checked_call_occurrence_segment(
+    calls: &CallCatalog<'_>,
     call_id: CheckedCallId,
 ) -> Result<String, String> {
-    program
-        .calls
-        .iter()
-        .find(|candidate| candidate.id == call_id)
+    calls
+        .get(call_id)
         .ok_or_else(|| format!("checked call {} is missing", call_id.0))?;
-    Ok(format!("call:{}", call_id.0))
+    Ok(checked_call_occurrence_segment_unchecked(call_id))
+}
+
+fn checked_call_occurrence_segment_unchecked(call_id: CheckedCallId) -> String {
+    format!("call:{}", call_id.0)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -802,8 +795,8 @@ impl OutNet<()> {
         Self::build_with(
             program,
             producer_roots,
-            |_, _, _| (),
-            |kind, _, _, _, _| kind == CheckedCallableKind::Builtin,
+            |_, _, _, _, _| (),
+            |_, kind, _, _, _, _| kind == CheckedCallableKind::Builtin,
         )
     }
 }
@@ -813,16 +806,28 @@ impl<Contract> OutNet<Contract> {
     /// capabilities to be supplied by a later schema without changing the
     /// current `CheckedProgram` adapter.
     #[cfg(test)]
-    pub(crate) fn build_with<MakeContract, IsProducer>(
-        program: &CheckedProgramFields,
+    pub(crate) fn build_with<'program, MakeContract, IsProducer>(
+        program: &'program CheckedProgramFields,
         producer_roots: Vec<ProducerRootSpec>,
         make_contract: MakeContract,
         is_structural_producer: IsProducer,
     ) -> OutNetBuild<Contract>
     where
-        MakeContract: FnMut(&CheckedCall, usize, &CheckedCallEntry) -> Contract,
-        IsProducer:
-            FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
+        MakeContract: FnMut(
+            &CallCatalog<'program>,
+            CallRef<'program>,
+            usize,
+            CallEntryRef<'program>,
+            &[CheckedTypeSubstitution],
+        ) -> Contract,
+        IsProducer: FnMut(
+            &CallCatalog<'program>,
+            CheckedCallableKind,
+            CallRef<'program>,
+            usize,
+            CallEntryRef<'program>,
+            &Contract,
+        ) -> bool,
     {
         Self::build_with_retained_definitions(
             program,
@@ -834,26 +839,45 @@ impl<Contract> OutNet<Contract> {
     }
 
     #[cfg(test)]
-    pub(crate) fn build_with_retained_definitions<MakeContract, IsProducer>(
-        program: &CheckedProgramFields,
+    pub(crate) fn build_with_retained_definitions<'program, MakeContract, IsProducer>(
+        program: &'program CheckedProgramFields,
         producer_roots: Vec<ProducerRootSpec>,
         retained_definitions: &BTreeSet<DeclId>,
         make_contract: MakeContract,
         is_structural_producer: IsProducer,
     ) -> OutNetBuild<Contract>
     where
-        MakeContract: FnMut(&CheckedCall, usize, &CheckedCallEntry) -> Contract,
-        IsProducer:
-            FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
+        MakeContract: FnMut(
+            &CallCatalog<'program>,
+            CallRef<'program>,
+            usize,
+            CallEntryRef<'program>,
+            &[CheckedTypeSubstitution],
+        ) -> Contract,
+        IsProducer: FnMut(
+            &CallCatalog<'program>,
+            CheckedCallableKind,
+            CallRef<'program>,
+            usize,
+            CallEntryRef<'program>,
+            &Contract,
+        ) -> bool,
     {
+        let calls = crate::call_view::CallCatalog::rich(program)
+            .expect("checked OUT test fixture has a valid call catalog");
+        let call_types = CallTypeCatalog::new(&calls)
+            .expect("checked OUT test fixture has valid call type facts");
         let intent = crate::verified_intent::VerifiedSemanticIntentV1::build(
             program,
+            &calls,
             &producer_roots,
             retained_definitions.clone(),
         )
         .expect("checked OUT test fixture has valid verified intent");
         OutNetBuilder::new(
             program,
+            &calls,
+            &call_types,
             None,
             producer_roots,
             &intent,
@@ -864,16 +888,28 @@ impl<Contract> OutNet<Contract> {
     }
 
     #[cfg(test)]
-    pub(crate) fn try_build_with<MakeContract, IsProducer, BuildError>(
-        program: &CheckedProgramFields,
+    pub(crate) fn try_build_with<'program, MakeContract, IsProducer, BuildError>(
+        program: &'program CheckedProgramFields,
         producer_roots: Vec<ProducerRootSpec>,
         make_contract: MakeContract,
         is_structural_producer: IsProducer,
     ) -> Result<OutNetBuild<Contract>, BuildError>
     where
-        MakeContract: FnMut(&CheckedCall, usize, &CheckedCallEntry) -> Result<Contract, BuildError>,
-        IsProducer:
-            FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
+        MakeContract: FnMut(
+            &CallCatalog<'program>,
+            CallRef<'program>,
+            usize,
+            CallEntryRef<'program>,
+            &[CheckedTypeSubstitution],
+        ) -> Result<Contract, BuildError>,
+        IsProducer: FnMut(
+            &CallCatalog<'program>,
+            CheckedCallableKind,
+            CallRef<'program>,
+            usize,
+            CallEntryRef<'program>,
+            &Contract,
+        ) -> bool,
     {
         Self::try_build_with_retained_definitions(
             program,
@@ -885,26 +921,50 @@ impl<Contract> OutNet<Contract> {
     }
 
     #[cfg(test)]
-    pub(crate) fn try_build_with_retained_definitions<MakeContract, IsProducer, BuildError>(
-        program: &CheckedProgramFields,
+    pub(crate) fn try_build_with_retained_definitions<
+        'program,
+        MakeContract,
+        IsProducer,
+        BuildError,
+    >(
+        program: &'program CheckedProgramFields,
         producer_roots: Vec<ProducerRootSpec>,
         retained_definitions: &BTreeSet<DeclId>,
         make_contract: MakeContract,
         is_structural_producer: IsProducer,
     ) -> Result<OutNetBuild<Contract>, BuildError>
     where
-        MakeContract: FnMut(&CheckedCall, usize, &CheckedCallEntry) -> Result<Contract, BuildError>,
-        IsProducer:
-            FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
+        MakeContract: FnMut(
+            &CallCatalog<'program>,
+            CallRef<'program>,
+            usize,
+            CallEntryRef<'program>,
+            &[CheckedTypeSubstitution],
+        ) -> Result<Contract, BuildError>,
+        IsProducer: FnMut(
+            &CallCatalog<'program>,
+            CheckedCallableKind,
+            CallRef<'program>,
+            usize,
+            CallEntryRef<'program>,
+            &Contract,
+        ) -> bool,
     {
+        let calls = crate::call_view::CallCatalog::rich(program)
+            .expect("checked OUT test fixture has a valid call catalog");
+        let call_types = CallTypeCatalog::new(&calls)
+            .expect("checked OUT test fixture has valid call type facts");
         let intent = crate::verified_intent::VerifiedSemanticIntentV1::build(
             program,
+            &calls,
             &producer_roots,
             retained_definitions.clone(),
         )
         .expect("checked OUT test fixture has valid verified intent");
         Self::try_build_with_intent(
             program,
+            &calls,
+            &call_types,
             None,
             producer_roots,
             &intent,
@@ -913,28 +973,44 @@ impl<Contract> OutNet<Contract> {
         )
     }
 
-    pub(crate) fn try_build_with_intent<MakeContract, IsProducer, BuildError>(
-        program: &CheckedProgramFields,
-        kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
+    pub(crate) fn try_build_with_intent<'program, MakeContract, IsProducer, BuildError>(
+        program: &'program CheckedProgramFields,
+        calls: &CallCatalog<'program>,
+        call_types: &CallTypeCatalog,
+        kernel_input: Option<&'program boon_compiler_kernel::KernelSemanticInputV1>,
         producer_roots: Vec<ProducerRootSpec>,
         intent: &crate::verified_intent::VerifiedSemanticIntentV1,
         make_contract: MakeContract,
         mut is_structural_producer: IsProducer,
     ) -> Result<OutNetBuild<Contract>, BuildError>
     where
-        MakeContract: FnMut(&CheckedCall, usize, &CheckedCallEntry) -> Result<Contract, BuildError>,
-        IsProducer:
-            FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
+        MakeContract: FnMut(
+            &CallCatalog<'program>,
+            CallRef<'program>,
+            usize,
+            CallEntryRef<'program>,
+            &[CheckedTypeSubstitution],
+        ) -> Result<Contract, BuildError>,
+        IsProducer: FnMut(
+            &CallCatalog<'program>,
+            CheckedCallableKind,
+            CallRef<'program>,
+            usize,
+            CallEntryRef<'program>,
+            &Contract,
+        ) -> bool,
     {
         let build = OutNetBuilder::new(
             program,
+            calls,
+            call_types,
             kernel_input,
             producer_roots,
             intent,
             make_contract,
-            |kind, call, entry_ordinal, entry, contract: &Result<Contract, BuildError>| {
+            |catalog, kind, call, entry_ordinal, entry, contract: &Result<Contract, BuildError>| {
                 contract.as_ref().is_ok_and(|contract| {
-                    is_structural_producer(kind, call, entry_ordinal, entry, contract)
+                    is_structural_producer(catalog, kind, call, entry_ordinal, entry, contract)
                 })
             },
         )
@@ -1092,13 +1168,12 @@ enum StaticOwnerNode {
     Call(OutCallInstanceId),
 }
 
-struct OutNetBuilder<'program, Contract, MakeContract, IsProducer> {
+struct OutNetBuilder<'catalog, 'program, Contract, MakeContract, IsProducer> {
     program: &'program CheckedProgramFields,
+    calls: &'catalog CallCatalog<'program>,
+    call_types: &'catalog CallTypeCatalog,
     kernel_input: Option<&'program boon_compiler_kernel::KernelSemanticInputV1>,
-    signature_by_id: BTreeMap<DeclId, &'program CheckedCallableSignature>,
-    calls_by_owner: BTreeMap<Option<DeclId>, Vec<usize>>,
-    call_index_by_id: BTreeMap<CheckedCallId, usize>,
-    declaration_by_id: BTreeMap<DeclId, &'program CheckedDeclaration>,
+    calls_by_owner: BTreeMap<Option<DeclId>, Vec<CheckedCallId>>,
     pattern_binding_by_declaration: BTreeMap<DeclId, &'program CheckedPatternBinding>,
     statements_with_children_by_value: BTreeMap<CheckedExprId, usize>,
     function_owner_by_scope: Vec<Option<DeclId>>,
@@ -1149,47 +1224,51 @@ impl<'a> DefinitionNodeIndex<'a> {
     }
 }
 
-impl<'program, Contract, MakeContract, IsProducer>
-    OutNetBuilder<'program, Contract, MakeContract, IsProducer>
+impl<'catalog, 'program, Contract, MakeContract, IsProducer>
+    OutNetBuilder<'catalog, 'program, Contract, MakeContract, IsProducer>
 where
-    MakeContract: FnMut(&CheckedCall, usize, &CheckedCallEntry) -> Contract,
-    IsProducer:
-        FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
+    MakeContract: FnMut(
+        &CallCatalog<'program>,
+        CallRef<'program>,
+        usize,
+        CallEntryRef<'program>,
+        &[CheckedTypeSubstitution],
+    ) -> Contract,
+    IsProducer: FnMut(
+        &CallCatalog<'program>,
+        CheckedCallableKind,
+        CallRef<'program>,
+        usize,
+        CallEntryRef<'program>,
+        &Contract,
+    ) -> bool,
 {
     fn new(
         program: &'program CheckedProgramFields,
+        calls: &'catalog CallCatalog<'program>,
+        call_types: &'catalog CallTypeCatalog,
         kernel_input: Option<&'program boon_compiler_kernel::KernelSemanticInputV1>,
         producer_root_specs: Vec<ProducerRootSpec>,
         intent: &crate::verified_intent::VerifiedSemanticIntentV1,
         make_contract: MakeContract,
         is_structural_producer: IsProducer,
     ) -> Self {
-        let signature_by_id = program
-            .callables
-            .iter()
-            .map(|signature| (signature.decl_id, signature))
-            .collect();
-        let mut calls_by_owner = BTreeMap::<Option<DeclId>, Vec<usize>>::new();
-        let mut call_index_by_id = BTreeMap::new();
-        for (index, call) in program.calls.iter().enumerate() {
+        let mut calls_by_owner = BTreeMap::<Option<DeclId>, Vec<CheckedCallId>>::new();
+        for call in calls.calls() {
             calls_by_owner
-                .entry(call.owner_callable)
+                .entry(call.owner_callable())
                 .or_default()
-                .push(index);
-            call_index_by_id.insert(call.id, index);
+                .push(call.id());
         }
-        for calls in calls_by_owner.values_mut() {
-            calls.sort_by_key(|index| {
-                let call = &program.calls[*index];
-                (call.expression, call.id, call.callable, *index)
+        for owned_calls in calls_by_owner.values_mut() {
+            owned_calls.sort_by_key(|id| {
+                let call = calls
+                    .get(*id)
+                    .expect("validated call owner index remains exact");
+                (call.expression(), call.id(), call.callable())
             });
         }
 
-        let declaration_by_id = program
-            .declarations
-            .iter()
-            .map(|declaration| (declaration.id, declaration))
-            .collect();
         let pattern_binding_by_declaration = program
             .pattern_bindings
             .iter()
@@ -1212,8 +1291,8 @@ where
             }
         }
         let resource_owning_callables =
-            resource_owning_callables(program, &signature_by_id, &function_owner_by_scope);
-        let mut diagnostics = alias_cycle_diagnostics(program);
+            resource_owning_callables(program, calls, &function_owner_by_scope);
+        let mut diagnostics = alias_cycle_diagnostics(calls);
         let mut rich_definition_templates = BTreeSet::new();
         let mut definition_node_by_expression = Vec::new();
         for template in definition_execution_templates(program, kernel_input) {
@@ -1227,7 +1306,7 @@ where
             }
             if !template.has_expected_schema()
                 || template.nodes().last().map(|node| node.expression()) != Some(template.result())
-                || signature_by_id.get(&callable).is_none_or(|callable| {
+                || calls.callable(callable).is_none_or(|callable| {
                     callable.kind != CheckedCallableKind::User
                         || callable.result_expression != Some(template.result())
                 })
@@ -1283,8 +1362,8 @@ where
                 }
             }
             for call in template.calls() {
-                match call_index_by_id.get(&call).copied() {
-                    Some(index) if program.calls[index].owner_callable == Some(callable) => {}
+                match calls.get(call) {
+                    Some(candidate) if candidate.owner_callable() == Some(callable) => {}
                     None => diagnostics.push(OutNetDiagnostic::InvalidDefinitionTemplate {
                         callable,
                         reason: format!("missing call {}", call.0),
@@ -1308,15 +1387,14 @@ where
         }
         let retained_definitions = intent.retained_definitions();
         let retained_overlay_definitions =
-            retained_overlay_definitions(program, retained_definitions, &signature_by_id);
+            retained_overlay_definitions(calls, retained_definitions);
         let root_expressions = intent.program_schedule_roots().to_vec();
         Self {
             program,
+            calls,
+            call_types,
             kernel_input,
-            signature_by_id,
             calls_by_owner,
-            call_index_by_id,
-            declaration_by_id,
             pattern_binding_by_declaration,
             statements_with_children_by_value,
             function_owner_by_scope,
@@ -1361,7 +1439,7 @@ where
     }
 
     fn instantiate_producer_root(&mut self, spec: ProducerRootSpec) {
-        let Some(signature) = self.signature_by_id.get(&spec.callable).copied() else {
+        let Some(signature) = self.calls.callable(spec.callable) else {
             return;
         };
         let Some(result_expression) = signature.result_expression else {
@@ -1393,6 +1471,7 @@ where
             inputs,
             passed: None,
             ports: Vec::new(),
+            #[cfg(test)]
             local_type_substitutions: Vec::new(),
             resolved_type_substitutions: Vec::new(),
             type_substitution_count: 0,
@@ -1410,14 +1489,14 @@ where
         );
     }
 
-    fn reachable_call_indices(
+    fn reachable_calls(
         &mut self,
         owner_callable: Option<DeclId>,
         frame: Option<OutCallInstanceId>,
-    ) -> Vec<usize> {
+    ) -> Vec<CheckedCallId> {
         let conservative = owner_callable.is_some_and(|owner| {
             self.resource_owning_callables.contains(&owner)
-                || self.signature_by_id.get(&owner).is_some_and(|callable| {
+                || self.calls.callable(owner).is_some_and(|callable| {
                     callable.effect.writes_state
                         || callable.effect.emits_source
                         || callable.effect.invokes_host
@@ -1449,8 +1528,8 @@ where
         let mut pending = owner_callable.map_or_else(
             || self.root_expressions.clone(),
             |owner| {
-                self.signature_by_id
-                    .get(&owner)
+                self.calls
+                    .callable(owner)
                     .and_then(|callable| callable.result_expression)
                     .into_iter()
                     .collect()
@@ -1469,9 +1548,9 @@ where
                     .and_then(|(node_owner, node)| (node_owner == owner).then_some(node))
             {
                 if let Some(call) = node.call()
-                    && let Some(index) = self.call_index_by_id.get(&call).copied()
+                    && self.calls.get(call).is_some()
                 {
-                    reachable.insert(index);
+                    reachable.insert(call);
                 }
                 if let Some(selector) = node.selector() {
                     pending.push(selector.input());
@@ -1503,7 +1582,7 @@ where
             };
             match &expression.kind {
                 CheckedExpressionKind::Read { target, .. } => {
-                    if let Some(declaration) = self.declaration_by_id.get(target)
+                    if let Some(declaration) = self.calls.declaration(*target)
                         && declaration.kind == CheckedDeclarationKind::Field
                         && self
                             .function_owner_by_scope
@@ -1516,18 +1595,21 @@ where
                     }
                 }
                 CheckedExpressionKind::Call { call } => {
-                    let Some(index) = self.call_index_by_id.get(call).copied() else {
+                    let Some(call_ref) = self.calls.get(*call) else {
                         continue;
                     };
-                    reachable.insert(index);
-                    let call = &self.program.calls[index];
-                    pending.extend(call.entries.iter().filter_map(|entry| match entry {
-                        CheckedCallEntry::Input { value, .. } => Some(*value),
-                        CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => {
-                            None
-                        }
-                    }));
-                    pending.extend(call.context_binding.explicit().map(|(value, _)| value));
+                    reachable.insert(*call);
+                    pending.extend(
+                        self.calls
+                            .entries(call_ref)
+                            .filter_map(|entry| entry.input().map(|(value, _, _)| value)),
+                    );
+                    pending.extend(
+                        call_ref
+                            .context_binding()
+                            .explicit()
+                            .map(|(value, _)| value),
+                    );
                 }
                 CheckedExpressionKind::When { input, arms } => {
                     pending.push(*input);
@@ -1614,7 +1696,6 @@ where
             Some(owner) => definition_execution_template(self.program, self.kernel_input, owner)
                 .into_iter()
                 .flat_map(|template| template.calls())
-                .filter_map(|call| self.call_index_by_id.get(&call).copied())
                 .filter(|call| reachable.contains(call))
                 .collect::<Vec<_>>(),
             None => self
@@ -1630,10 +1711,10 @@ where
             self.retained_overlay_frames += 1;
             let reachable_count = demanded.len();
             let mut intentionally_elided = Vec::new();
-            demanded.retain(|index| {
-                let requires_overlay = self.retained_call_site_requires_overlay(*index);
-                if !requires_overlay && let Some(call) = self.program.calls.get(*index) {
-                    intentionally_elided.push((call.id, frame));
+            demanded.retain(|call| {
+                let requires_overlay = self.retained_call_site_requires_overlay(*call);
+                if !requires_overlay {
+                    intentionally_elided.push((*call, frame));
                 }
                 requires_overlay
             });
@@ -1646,19 +1727,19 @@ where
         demanded
     }
 
-    fn retained_call_site_requires_overlay(&self, call_index: usize) -> bool {
-        let Some(call) = self.program.calls.get(call_index) else {
+    fn retained_call_site_requires_overlay(&self, call_id: CheckedCallId) -> bool {
+        let Some(call) = self.calls.get(call_id) else {
             return true;
         };
-        if !call.contexts.is_empty()
-            || call
-                .entries
-                .iter()
-                .any(|entry| !matches!(entry, CheckedCallEntry::Input { .. }))
+        if call.context_count() != 0
+            || self
+                .calls
+                .entries(call)
+                .any(|entry| !matches!(entry, CallEntryRef::Input { .. }))
         {
             return true;
         }
-        let Some(callable) = self.signature_by_id.get(&call.callable).copied() else {
+        let Some(callable) = self.calls.callable(call.callable()) else {
             return true;
         };
         match callable.kind {
@@ -1683,8 +1764,8 @@ where
         frame: Option<OutCallInstanceId>,
     ) -> bool {
         let mut pending = self
-            .signature_by_id
-            .get(&callable)
+            .calls
+            .callable(callable)
             .and_then(|signature| signature.result_expression)
             .into_iter()
             .collect::<Vec<_>>();
@@ -1735,8 +1816,8 @@ where
                     target, projection, ..
                 } if projection.is_empty() => {
                     pending.extend(
-                        self.declaration_by_id
-                            .get(target)
+                        self.calls
+                            .declaration(*target)
                             .and_then(|declaration| declaration.value),
                     );
                 }
@@ -1847,15 +1928,14 @@ where
             .filter(|candidate| candidate.id == expression)?;
         let type_selected_occurrence = match &definition.kind {
             CheckedExpressionKind::Call { .. } => true,
-            CheckedExpressionKind::Read { target, .. } => self
-                .declaration_by_id
-                .get(target)
-                .is_some_and(|declaration| {
+            CheckedExpressionKind::Read { target, .. } => {
+                self.calls.declaration(*target).is_some_and(|declaration| {
                     matches!(
                         declaration.kind,
                         CheckedDeclarationKind::FreshOut | CheckedDeclarationKind::OutParameter
                     )
-                }),
+                })
+            }
             _ => false,
         };
         let inferred_selector = type_selected_occurrence
@@ -1907,7 +1987,7 @@ where
                         visited,
                     );
                 }
-                if let Some(declaration) = self.declaration_by_id.get(target)
+                if let Some(declaration) = self.calls.declaration(*target)
                     && declaration.kind == CheckedDeclarationKind::Field
                     && self
                         .function_owner_by_scope
@@ -2005,24 +2085,27 @@ where
         mut frame_bindings: BTreeMap<DeclId, usize>,
         active_callables: &mut Vec<DeclId>,
     ) {
-        let program = self.program;
-        let static_calls = self.reachable_call_indices(owner_callable, parent);
+        let calls = self.calls;
+        let call_types = self.call_types;
+        let static_calls = self.reachable_calls(owner_callable, parent);
         let mut pending_calls = Vec::with_capacity(static_calls.len());
         let mut pending_forwards = Vec::new();
 
         // Allocate every fresh declaration in the frame before resolving any
         // forwarding edge. DeclId resolution has already happened, so this is
         // deterministic and independent of checked-call storage order.
-        for static_call_index in static_calls {
-            let checked_call = &program.calls[static_call_index];
+        for checked_call_id in static_calls {
+            let Some(checked_call) = calls.get(checked_call_id) else {
+                continue;
+            };
             let provenance = OutCallProvenance::from(checked_call);
             let instance = OutCallInstanceId(self.call_instances.len());
-            let signature = self.signature_by_id.get(&checked_call.callable).copied();
+            let signature = self.calls.callable(checked_call.callable());
             let inherited_parent_output_node =
                 parent.and_then(|parent| self.call_instances[parent.as_usize()].parent_output_node);
             let inherited_passed =
                 parent.and_then(|parent| self.call_instances[parent.as_usize()].passed);
-            let passed = match checked_call.context_binding {
+            let passed = match checked_call.context_binding() {
                 CheckedContextBinding::Explicit { value, .. } => signature.and_then(|signature| {
                     signature.context_formal.map(|formal| PassedBinding {
                         formal,
@@ -2047,17 +2130,17 @@ where
                         self.diagnostics
                             .push(OutNetDiagnostic::MissingPassedContext {
                                 call: instance,
-                                callable: checked_call.callable,
+                                callable: checked_call.callable(),
                             });
                     }
                     passed
                 }
                 CheckedContextBinding::None => {
-                    if signature.is_some_and(CheckedCallableSignature::requires_pass) {
+                    if signature.is_some_and(|signature| signature.requires_pass()) {
                         self.diagnostics
                             .push(OutNetDiagnostic::MissingPassedContext {
                                 call: instance,
-                                callable: checked_call.callable,
+                                callable: checked_call.callable(),
                             });
                     }
                     None
@@ -2067,7 +2150,26 @@ where
             // are callee alphas and its values are caller alphas; pre-flattening
             // those values through an ancestry map aliases unrelated equal
             // ordinals from intermediate call schemes.
-            let local_type_substitutions = checked_call.type_substitutions.to_vec();
+            let fallback_result;
+            let (local_type_substitutions, checked_call_result): (
+                &[CheckedTypeSubstitution],
+                &FlowType,
+            ) = if let Some(facts) = call_types.get(checked_call.id()) {
+                (facts.type_substitutions.as_slice(), &facts.result)
+            } else {
+                self.diagnostics
+                    .push(OutNetDiagnostic::InvalidDefinitionTemplate {
+                        callable: checked_call
+                            .owner_callable()
+                            .unwrap_or_else(|| checked_call.callable()),
+                        reason: format!("call {} has no semantic type facts", checked_call.id().0,),
+                    });
+                fallback_result = FlowType {
+                    mode: checked_call.result().mode(),
+                    ty: Type::Unknown,
+                };
+                (&[], &fallback_result)
+            };
             let resolved_type_substitutions = local_type_substitutions
                 .iter()
                 .map(|substitution| CheckedTypeSubstitution {
@@ -2085,17 +2187,17 @@ where
                 .saturating_add(local_type_substitutions.len());
             let result_scheme = signature
                 .map(|signature| &signature.result)
-                .unwrap_or(&checked_call.result);
+                .unwrap_or(checked_call_result);
             let local_result =
-                apply_checked_type_substitutions_once(&result_scheme.ty, &local_type_substitutions);
+                apply_checked_type_substitutions_once(&result_scheme.ty, local_type_substitutions);
             let instantiated_result =
                 apply_type_substitution_frames(&self.call_instances, parent, &local_result);
             let checked_occurrence_result = apply_type_substitution_frames(
                 &self.call_instances,
                 parent,
-                &checked_call.result.ty,
+                &checked_call_result.ty,
             );
-            let checked_result = if checked_call.syntax_discriminated_result {
+            let checked_result = if checked_call.syntax_discriminated_result() {
                 // Checked-call finalization owns syntax-discriminated
                 // occurrences. A heterogeneous dispatcher may have a closed
                 // scalar principal while this exact tagged request selects a
@@ -2112,8 +2214,8 @@ where
             let expression_result = self
                 .program
                 .expressions
-                .get(checked_call.expression.0 as usize)
-                .filter(|expression| expression.id == checked_call.expression)
+                .get(checked_call.expression().0 as usize)
+                .filter(|expression| expression.id == checked_call.expression())
                 .map(|expression| {
                     apply_type_substitution_frames(
                         &self.call_instances,
@@ -2125,8 +2227,8 @@ where
             let occurrence_result =
                 boon_checked::specialize_checked_call_result(&checked_result, &expression_result);
             let enclosing_result = checked_call
-                .owner_callable
-                .and_then(|owner| self.signature_by_id.get(&owner).copied())
+                .owner_callable()
+                .and_then(|owner| self.calls.callable(owner))
                 .and_then(|owner| {
                     parent.map(|parent| {
                         (
@@ -2138,11 +2240,11 @@ where
                     })
                 })
                 .filter(|(owner, parent, _, parent_is_exact)| {
-                    owner.result_expression == Some(checked_call.expression)
+                    owner.result_expression == Some(checked_call.expression())
                         || (*parent_is_exact
                             && self.call_is_callable_result_output(
                                 owner.decl_id,
-                                checked_call.expression,
+                                checked_call.expression(),
                                 Some(*parent),
                             ))
                 });
@@ -2159,7 +2261,7 @@ where
                     }
                 })
                 .unwrap_or(occurrence_result);
-            let result_is_exact_occurrence = checked_call.syntax_discriminated_result
+            let result_is_exact_occurrence = checked_call.syntax_discriminated_result()
                 || enclosing_result
                     .as_ref()
                     .is_some_and(|(_, _, _, enclosing_is_exact)| *enclosing_is_exact);
@@ -2169,19 +2271,20 @@ where
                 // resolved on the checked call.
                 mode: enclosing_result
                     .map(|(_, _, enclosing, _)| enclosing.mode)
-                    .unwrap_or(checked_call.result.mode),
+                    .unwrap_or(checked_call_result.mode),
                 ty: result_type,
             };
             self.call_instances.push(OutCallInstance {
                 id: instance,
                 parent,
                 provenance,
-                parent_output: self.nearest_repeated_output(checked_call.expression),
+                parent_output: self.nearest_repeated_output(checked_call.expression()),
                 parent_output_node: inherited_parent_output_node,
                 inputs: Vec::new(),
                 passed,
                 ports: Vec::new(),
-                local_type_substitutions,
+                #[cfg(test)]
+                local_type_substitutions: local_type_substitutions.to_vec(),
                 resolved_type_substitutions,
                 type_substitution_count,
                 result,
@@ -2193,43 +2296,46 @@ where
             if kind.is_none() {
                 self.diagnostics.push(OutNetDiagnostic::MissingCallable {
                     call: instance,
-                    callable: checked_call.callable,
+                    callable: checked_call.callable(),
                 });
             }
 
             let mut output_bindings = BTreeMap::new();
-            for (entry_ordinal, entry) in checked_call.entries.iter().enumerate() {
+            for (entry_ordinal, entry) in calls.entries(checked_call).enumerate() {
                 let (formal, name, binding) = match entry {
-                    CheckedCallEntry::Input { .. } => continue,
-                    CheckedCallEntry::FreshOut {
-                        formal,
-                        name,
+                    CallEntryRef::Input { .. } => continue,
+                    CallEntryRef::FreshOut {
+                        parameter,
                         output,
-                        scope_id,
+                        scope,
                     } => (
-                        *formal,
-                        name.clone(),
+                        parameter.decl_id,
+                        parameter.name.clone(),
                         OutPortBinding::Fresh {
-                            output: *output,
-                            scope_id: *scope_id,
+                            output,
+                            scope_id: scope,
                         },
                     ),
-                    CheckedCallEntry::ForwardOut {
-                        formal,
-                        name,
-                        target,
-                        ..
+                    CallEntryRef::ForwardOut {
+                        parameter, target, ..
                     } => (
-                        *formal,
-                        name.clone(),
-                        OutPortBinding::Forward { target: *target },
+                        parameter.decl_id,
+                        parameter.name.clone(),
+                        OutPortBinding::Forward { target },
                     ),
                 };
-                let contract = (self.make_contract)(checked_call, entry_ordinal, entry);
+                let contract = (self.make_contract)(
+                    calls,
+                    checked_call,
+                    entry_ordinal,
+                    entry,
+                    &local_type_substitutions,
+                );
                 let port = OutPortId(self.ports.len());
                 let union_node = self.union_find.make_set();
                 if kind.is_some_and(|kind| {
                     (self.is_structural_producer)(
+                        calls,
                         kind,
                         checked_call,
                         entry_ordinal,
@@ -2279,12 +2385,11 @@ where
                     }
                 }
             }
-            self.call_instances[instance.as_usize()].inputs = checked_call
-                .entries
-                .iter()
+            self.call_instances[instance.as_usize()].inputs = calls
+                .entries(checked_call)
                 .filter_map(|entry| {
-                    let CheckedCallEntry::Input {
-                        formal,
+                    let CallEntryRef::Input {
+                        parameter,
                         value,
                         evaluation_scope,
                         ..
@@ -2299,12 +2404,12 @@ where
                         .ports
                         .iter()
                         .copied()
-                        .find(|port_id| self.ports[port_id.as_usize()].formal == *formal),
+                        .find(|port_id| self.ports[port_id.as_usize()].formal == formal),
                     };
                     Some(OutInputBinding {
-                        formal: *formal,
+                        formal: parameter.decl_id,
                         value: OutInputValue::Checked(ScopedCheckedExpr {
-                            expression: *value,
+                            expression: value,
                             frame: parent,
                             evaluation_port,
                             value_frame: None,
@@ -2314,7 +2419,7 @@ where
                 .collect();
             pending_calls.push(PendingFrameCall {
                 instance,
-                callable: checked_call.callable,
+                callable: checked_call.callable(),
                 kind,
                 output_bindings,
             });
@@ -2439,7 +2544,7 @@ where
         if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
             eprintln!(
                 "boon_semantic out_demand checked_call_sites={} retained_definitions={} retained_overlay_definitions={} expanded_frames={} frame_expansion_skips={} retained_overlay_frames={} lexical_call_sites_considered={} demanded_call_sites_instantiated={} retained_overlay_call_sites_instantiated={} conservative_effect_frames={} direct_body_call_sites_not_instantiated={}",
-                self.program.calls.len(),
+                self.calls.len(),
                 self.retained_definitions.len(),
                 self.retained_overlay_definitions.len(),
                 self.expanded_frames,
@@ -2906,7 +3011,7 @@ fn checked_scope(
 
 fn resource_owning_callables(
     program: &CheckedProgramFields,
-    signatures: &BTreeMap<DeclId, &CheckedCallableSignature>,
+    calls: &CallCatalog<'_>,
     function_owner_by_scope: &[Option<DeclId>],
 ) -> BTreeSet<DeclId> {
     let mut owners = BTreeSet::new();
@@ -2923,11 +3028,9 @@ fn resource_owning_callables(
             boon_checked::CheckedExpressionKind::Source
             | boon_checked::CheckedExpressionKind::Hold { .. }
             | boon_checked::CheckedExpressionKind::Latest { .. } => true,
-            boon_checked::CheckedExpressionKind::Call { call } => program
-                .calls
-                .get(call.0 as usize)
-                .filter(|candidate| candidate.id == call)
-                .and_then(|call| signatures.get(&call.callable))
+            boon_checked::CheckedExpressionKind::Call { call } => calls
+                .get(call)
+                .and_then(|call| calls.callable(call.callable()))
                 .is_some_and(|callable| {
                     callable.kind != CheckedCallableKind::User
                         && (callable.effect.writes_state
@@ -2964,26 +3067,27 @@ fn resource_owning_callables(
 /// the retained user-call chain that reaches such a context; context-free
 /// builtin work remains exclusively in the canonical definition body.
 fn retained_overlay_definitions(
-    program: &CheckedProgramFields,
+    calls: &CallCatalog<'_>,
     retained: &BTreeSet<DeclId>,
-    signatures: &BTreeMap<DeclId, &CheckedCallableSignature>,
 ) -> BTreeSet<DeclId> {
     let mut required = BTreeSet::new();
     let mut retained_dependencies = BTreeMap::<DeclId, BTreeSet<DeclId>>::new();
 
-    for call in &program.calls {
-        let Some(owner) = call.owner_callable.filter(|owner| retained.contains(owner)) else {
+    for call in calls.calls() {
+        let Some(owner) = call
+            .owner_callable()
+            .filter(|owner| retained.contains(owner))
+        else {
             continue;
         };
-        let Some(target) = signatures.get(&call.callable).copied() else {
+        let Some(target) = calls.callable(call.callable()) else {
             required.insert(owner);
             continue;
         };
-        let direct_overlay = !call.contexts.is_empty()
-            || call
-                .entries
-                .iter()
-                .any(|entry| !matches!(entry, CheckedCallEntry::Input { .. }))
+        let direct_overlay = call.context_count() != 0
+            || calls
+                .entries(call)
+                .any(|entry| !matches!(entry, CallEntryRef::Input { .. }))
             || match target.kind {
                 CheckedCallableKind::User => !retained.contains(&target.decl_id),
                 CheckedCallableKind::Builtin | CheckedCallableKind::External => {
@@ -3021,15 +3125,14 @@ fn retained_overlay_definitions(
     required
 }
 
-fn alias_cycle_diagnostics(program: &CheckedProgramFields) -> Vec<OutNetDiagnostic> {
-    let edges = program
-        .calls
-        .iter()
+fn alias_cycle_diagnostics(calls: &CallCatalog<'_>) -> Vec<OutNetDiagnostic> {
+    let edges = calls
+        .calls()
         .flat_map(|call| {
-            call.entries.iter().filter_map(move |entry| match entry {
-                CheckedCallEntry::ForwardOut { formal, target, .. } => {
-                    Some((*target, *formal, OutCallProvenance::from(call)))
-                }
+            calls.entries(call).filter_map(move |entry| match entry {
+                CallEntryRef::ForwardOut {
+                    parameter, target, ..
+                } => Some((target, parameter.decl_id, OutCallProvenance::from(call))),
                 _ => None,
             })
         })
@@ -3144,14 +3247,20 @@ mod tests {
     }
 
     fn retained_definition_build(program: &CheckedProgramFields) -> OutNetBuild {
-        let retained = crate::contextual_expansion::ordinary_callable_declarations(program, None);
+        let retained = retained_declarations(program);
         OutNet::build_with_retained_definitions(
             program,
             Vec::new(),
             &retained,
-            |_, _, _| (),
-            |kind, _, _, _, _| kind == CheckedCallableKind::Builtin,
+            |_, _, _, _, _| (),
+            |_, kind, _, _, _, _| kind == CheckedCallableKind::Builtin,
         )
+    }
+
+    fn retained_declarations(program: &CheckedProgramFields) -> BTreeSet<DeclId> {
+        let calls = crate::call_view::CallCatalog::rich(program)
+            .expect("typechecked fixture has a valid call catalog");
+        crate::contextual_expansion::ordinary_callable_declarations(program, &calls, None)
     }
 
     #[test]
@@ -3213,8 +3322,7 @@ FUNCTION outer(value) {
 result: outer(value: TEXT { hello })
 "#,
         );
-        let retained_definitions =
-            crate::contextual_expansion::ordinary_callable_declarations(&program, None);
+        let retained_definitions = retained_declarations(&program);
         for name in ["identity", "label", "outer"] {
             let callable = program
                 .callables
@@ -3286,8 +3394,7 @@ rows: LIST { [value: 1] }
 result: rows |> mapped(row, new: row.value + 1)
 "#,
         );
-        let retained_out =
-            crate::contextual_expansion::ordinary_callable_declarations(&out_program, None);
+        let retained_out = retained_declarations(&out_program);
         let mapped = out_program
             .callables
             .iter()
@@ -3310,8 +3417,7 @@ FUNCTION controls() {
 result: controls()
 "#,
         );
-        let retained_resource =
-            crate::contextual_expansion::ordinary_callable_declarations(&resource_program, None);
+        let retained_resource = retained_declarations(&resource_program);
         let controls = resource_program
             .callables
             .iter()

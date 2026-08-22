@@ -2313,7 +2313,7 @@ fn collect_capture_requests(
         }
         return Ok(());
     }
-    for child in expression_children(execution, &value.kind)? {
+    try_for_each_expression_child(execution, &value.kind, |child| {
         collect_capture_requests(
             execution,
             owners,
@@ -2324,8 +2324,8 @@ fn collect_capture_requests(
             target_row,
             visited,
             requests,
-        )?;
-    }
+        )
+    })?;
     Ok(())
 }
 
@@ -5837,18 +5837,21 @@ fn owner_descends_from(
         .any(|owner| owner == ancestor))
 }
 
-fn expression_children(
+fn try_for_each_expression_child(
     execution: &SemanticExecutionImageColumnsV1,
     kind: &SemanticExpressionKind,
-) -> Result<Vec<SemanticExprId>, SemanticScopeStorageError> {
-    execution.expression_children(kind).ok_or_else(|| {
-        let SemanticExpressionKind::Materialize { materialization } = kind else {
-            unreachable!("only invalid materialization references lack expression children");
-        };
-        SemanticScopeStorageError::new(format!(
-            "expression references missing materialization {materialization}"
-        ))
-    })
+    visit: impl FnMut(SemanticExprId) -> Result<(), SemanticScopeStorageError>,
+) -> Result<(), SemanticScopeStorageError> {
+    execution
+        .try_for_each_expression_child(kind, visit)
+        .ok_or_else(|| {
+            let SemanticExpressionKind::Materialize { materialization } = kind else {
+                unreachable!("only invalid materialization references lack expression children");
+            };
+            SemanticScopeStorageError::new(format!(
+                "expression references missing materialization {materialization}"
+            ))
+        })?
 }
 
 fn hex_identity(identity: &[u8; 32]) -> String {

@@ -1174,7 +1174,10 @@ fn reachable_expressions(
             continue;
         }
         let expression = require_expression(execution, expression)?;
-        pending.extend(expression_children(execution, &expression.kind)?);
+        try_for_each_expression_child(execution, &expression.kind, |child| {
+            pending.push(child);
+            Ok(())
+        })?;
     }
     Ok(reachable)
 }
@@ -1223,10 +1226,11 @@ fn binding_input_reachability(
         {
             continue;
         }
-        for child in expression_children(execution, &expression.kind)? {
+        try_for_each_expression_child(execution, &expression.kind, |child| {
             parents.entry(child).or_default().insert(expression.id);
             pending.push(child);
-        }
+            Ok(())
+        })?;
     }
     Ok(BindingInputReachability {
         expressions: reachable,
@@ -1491,9 +1495,11 @@ impl BindingLeafTraversal<'_> {
                 }
             }
             _ => {
-                for child in expression_children(self.execution, &expression.kind)? {
+                let execution = self.execution;
+                try_for_each_expression_child(execution, &expression.kind, |child| {
                     self.visit(child, mode.clone(), additional_projection.clone(), false)?;
-                }
+                    Ok(())
+                })?;
             }
         }
         self.visiting.remove(&id);
@@ -1509,18 +1515,21 @@ fn canonical_event_attribute(attribute: &str) -> &str {
     }
 }
 
-fn expression_children(
+fn try_for_each_expression_child(
     execution: &SemanticExecutionImageColumnsV1,
     kind: &SemanticExpressionKind,
-) -> Result<Vec<SemanticExprId>, SemanticViewBindingError> {
-    execution.expression_children(kind).ok_or_else(|| {
-        let SemanticExpressionKind::Materialize { materialization } = kind else {
-            unreachable!("only invalid materialization references lack expression children");
-        };
-        SemanticViewBindingError::new(format!(
-            "view traversal references missing semantic materialization {materialization}"
-        ))
-    })
+    visit: impl FnMut(SemanticExprId) -> Result<(), SemanticViewBindingError>,
+) -> Result<(), SemanticViewBindingError> {
+    execution
+        .try_for_each_expression_child(kind, visit)
+        .ok_or_else(|| {
+            let SemanticExpressionKind::Materialize { materialization } = kind else {
+                unreachable!("only invalid materialization references lack expression children");
+            };
+            SemanticViewBindingError::new(format!(
+                "view traversal references missing semantic materialization {materialization}"
+            ))
+        })?
 }
 
 fn record_style_render_node(expression: &SemanticExpression) -> bool {

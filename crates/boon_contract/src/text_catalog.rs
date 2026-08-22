@@ -108,8 +108,20 @@ impl PathRow {
 pub struct PackedTextCatalog {
     bytes: Box<[u8]>,
     symbols: Box<[SymbolRow]>,
+    /// Lexical rank of each `SymbolId`, computed once when the project text
+    /// authority freezes. Canonical type rows compare four-byte ranks instead
+    /// of repeatedly chasing and comparing UTF-8 slices in solver hot loops.
+    symbol_lexical_ranks: Box<[u32]>,
     symbol_slots: Box<[u32]>,
     paths: Box<[PathRow]>,
+    /// Transitional exact lookup index for the rich-input consumer.
+    ///
+    /// Packed syntax writes `PathId` while parsing and will make this column
+    /// unnecessary.  Until that producer lands, retaining one project-wide
+    /// open-addressed index lets the consuming compatibility boundary replace
+    /// every boxed path with its dense coordinate without allocating a second
+    /// path map or linearly scanning the path store.
+    path_slots: Box<[u32]>,
 }
 
 impl PackedTextCatalog {
@@ -143,13 +155,17 @@ impl PackedTextCatalog {
         left: SymbolId,
         right: SymbolId,
     ) -> Result<Ordering, TextCatalogError> {
-        let left = self.symbol(left).ok_or_else(|| {
+        let left = self.symbol_lexical_rank(left).ok_or_else(|| {
             TextCatalogError::new(format!("symbol {} is outside the catalog", left.0))
         })?;
-        let right = self.symbol(right).ok_or_else(|| {
+        let right = self.symbol_lexical_rank(right).ok_or_else(|| {
             TextCatalogError::new(format!("symbol {} is outside the catalog", right.0))
         })?;
-        Ok(left.cmp(right))
+        Ok(left.cmp(&right))
+    }
+
+    fn symbol_lexical_rank(&self, id: SymbolId) -> Option<u32> {
+        self.symbol_lexical_ranks.get(id.as_usize()).copied()
     }
 
     fn path(&self, id: PathId) -> Option<PathRow> {
@@ -158,6 +174,32 @@ impl PackedTextCatalog {
 
     fn path_digest(&self, id: PathId) -> Option<[u8; 32]> {
         self.path(id).map(PathRow::stable_digest)
+    }
+
+    fn lookup_path<'a>(
+        &self,
+        segments: impl IntoIterator<Item = &'a str>,
+    ) -> Option<PathId> {
+        let mut path = PathId::ROOT;
+        for segment in segments {
+            let symbol = self.lookup_symbol(segment)?;
+            let fingerprint = path_lookup_hash(path, symbol);
+            let mut slot = fingerprint as usize & (self.path_slots.len() - 1);
+            loop {
+                let encoded = self.path_slots[slot];
+                if encoded == EMPTY_SLOT {
+                    return None;
+                }
+                let candidate = PathId(encoded);
+                let row = self.paths[candidate.as_usize()];
+                if row.parent == path && row.segment == symbol.0 {
+                    path = candidate;
+                    break;
+                }
+                slot = (slot + 1) & (self.path_slots.len() - 1);
+            }
+        }
+        Some(path)
     }
 
     fn symbol_count(&self) -> usize {
@@ -314,6 +356,10 @@ impl ProjectTextSnapshot {
         self.catalog.compare_symbols(left, right)
     }
 
+    pub fn symbol_lexical_rank(&self, id: SymbolId) -> Option<u32> {
+        self.catalog.symbol_lexical_rank(id)
+    }
+
     pub fn qualified_path(&self, id: PathId) -> Option<QualifiedPathId> {
         self.catalog.path(id).map(|_| QualifiedPathId {
             authority: self.authority,
@@ -335,6 +381,16 @@ impl ProjectTextSnapshot {
 
     pub fn path_digest(&self, id: PathId) -> Option<[u8; 32]> {
         self.catalog.path_digest(id)
+    }
+
+    /// Resolve one temporary rich path to its already-interned project
+    /// coordinate without allocating. New packed producers carry `PathId`
+    /// directly and never call this method.
+    pub fn lookup_path<'a>(
+        &self,
+        segments: impl IntoIterator<Item = &'a str>,
+    ) -> Option<PathId> {
+        self.catalog.lookup_path(segments)
     }
 
     pub fn resolve_qualified_path(
@@ -580,13 +636,26 @@ impl PackedTextCatalogBuilder {
     }
 
     pub fn freeze(self) -> ProjectTextSnapshot {
+        let mut lexical_order = (0..self.symbols.len()).collect::<Vec<_>>();
+        lexical_order.sort_unstable_by(|left, right| {
+            let left = self.symbols[*left];
+            let right = self.symbols[*right];
+            self.bytes[left.bytes()].cmp(&self.bytes[right.bytes()])
+        });
+        let mut symbol_lexical_ranks = vec![0_u32; self.symbols.len()];
+        for (rank, symbol) in lexical_order.into_iter().enumerate() {
+            symbol_lexical_ranks[symbol] =
+                u32::try_from(rank).expect("packed symbol count already fits the u32 namespace");
+        }
         ProjectTextSnapshot {
             authority: self.authority,
             catalog: Arc::new(PackedTextCatalog {
                 bytes: self.bytes.into_boxed_slice(),
                 symbols: self.symbols.into_boxed_slice(),
+                symbol_lexical_ranks: symbol_lexical_ranks.into_boxed_slice(),
                 symbol_slots: self.symbol_slots.into_boxed_slice(),
                 paths: self.paths.into_boxed_slice(),
+                path_slots: self.path_slots.into_boxed_slice(),
             }),
         }
     }
@@ -785,7 +854,34 @@ mod tests {
             catalog.format_qualified_path(first, "/").unwrap(),
             "alpha/beta"
         );
+        assert_eq!(
+            catalog.lookup_path(["alpha", "beta"]),
+            Some(first.coordinate())
+        );
+        assert_eq!(catalog.lookup_path(["alpha", "missing"]), None);
         assert_eq!(catalog.path_depth(first.coordinate()), Some(2));
+    }
+
+    #[test]
+    fn frozen_symbol_ranks_preserve_byte_lexical_order() {
+        let mut authority = PackedTextCatalogBuilder::new();
+        let zebra = authority.intern_symbol("zebra").unwrap();
+        let alpha = authority.intern_symbol("alpha").unwrap();
+        let alphabet = authority.intern_symbol("alphabet").unwrap();
+        let catalog = authority.freeze();
+
+        assert_eq!(
+            catalog.compare_symbols(alpha.coordinate(), alphabet.coordinate()),
+            Ok(Ordering::Less)
+        );
+        assert_eq!(
+            catalog.compare_symbols(alphabet.coordinate(), zebra.coordinate()),
+            Ok(Ordering::Less)
+        );
+        assert!(
+            catalog.symbol_lexical_rank(alpha.coordinate()).unwrap()
+                < catalog.symbol_lexical_rank(zebra.coordinate()).unwrap()
+        );
     }
 
     #[test]

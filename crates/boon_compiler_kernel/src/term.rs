@@ -2314,14 +2314,24 @@ impl TypeTermArena {
         }
         let mut canonical_fields = self.object_field_scratch.take();
         canonical_fields.extend_from_slice(semantic_fields);
-        canonical_fields
-            .sort_unstable_by(|left, right| self.name(left.name).cmp(self.name(right.name)));
+        canonical_fields.sort_unstable_by_key(|field| {
+            self.text_catalog
+                .symbol_lexical_rank(field.name)
+                .expect("object field symbol belongs to the project text authority")
+        });
         let mut semantic_order = self.semantic_order_scratch.take();
         semantic_order.extend(semantic_fields.iter().map(|field| {
+            let rank = self
+                .text_catalog
+                .symbol_lexical_rank(field.name)
+                .expect("object field symbol belongs to the project text authority");
             u32::try_from(
                 canonical_fields
-                    .iter()
-                    .position(|candidate| candidate.name == field.name)
+                    .binary_search_by_key(&rank, |candidate| {
+                        self.text_catalog
+                            .symbol_lexical_rank(candidate.name)
+                            .expect("object field symbol belongs to the project text authority")
+                    })
                     .expect("semantic object field exists in canonical fields"),
             )
             .expect("kernel object field count exceeds u32")

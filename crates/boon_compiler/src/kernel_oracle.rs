@@ -21842,10 +21842,125 @@ FUNCTION stateful_row(row) {
                 );
             }
         }
+        assert_eq!(packed_input.call_count(), rich.fields.calls.len());
+        assert!(
+            packed_input.calls().map(|call| call.id()).eq(rich
+                .fields
+                .calls
+                .iter()
+                .map(|call| call.id)),
+            "packed call iterator must preserve final checked order",
+        );
         for call in &rich.fields.calls {
+            let topology = packed_input
+                .call(call.id)
+                .expect("every checked call has packed topology");
+            assert_eq!(topology.id(), call.id);
+            assert_eq!(topology.expression(), call.expression);
+            assert_eq!(topology.callable(), call.callable);
+            assert_eq!(topology.owner_callable(), call.owner_callable);
+            assert_eq!(topology.function(), call.function);
+            assert_eq!(topology.span(), call.span);
+            assert_eq!(topology.context_binding(), call.context_binding);
+            assert_eq!(
+                topology.syntax_discriminated_result(),
+                call.syntax_discriminated_result,
+            );
+            assert_eq!(topology.entry_count(), call.entries.len());
+            assert_eq!(topology.context_count(), call.contexts.len());
+            let target_signature = rich
+                .fields
+                .callables
+                .iter()
+                .find(|callable| callable.decl_id == call.callable)
+                .expect("packed topology target has a rich signature");
+            for (packed, rich_entry) in topology.entries().zip(&call.entries) {
+                use boon_compiler_kernel::KernelSemanticCallEntryRef as PackedEntry;
+                let rich_formal = match rich_entry {
+                    boon_checked::CheckedCallEntry::Input { formal, .. }
+                    | boon_checked::CheckedCallEntry::FreshOut { formal, .. }
+                    | boon_checked::CheckedCallEntry::ForwardOut { formal, .. } => *formal,
+                };
+                let parameter = target_signature
+                    .parameters
+                    .iter()
+                    .find(|parameter| parameter.decl_id == rich_formal)
+                    .expect("rich call entry formal belongs to target signature");
+                match (packed, rich_entry) {
+                    (
+                        PackedEntry::Input {
+                            parameter_ordinal,
+                            value,
+                            from_pipe,
+                        },
+                        boon_checked::CheckedCallEntry::Input {
+                            value: rich_value,
+                            from_pipe: rich_pipe,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(parameter_ordinal as usize, parameter.ordinal);
+                        assert_eq!(value, *rich_value);
+                        assert_eq!(from_pipe, *rich_pipe);
+                    }
+                    (
+                        PackedEntry::FreshOut {
+                            parameter_ordinal,
+                            output,
+                            scope,
+                        },
+                        boon_checked::CheckedCallEntry::FreshOut {
+                            output: rich_output,
+                            scope_id,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(parameter_ordinal as usize, parameter.ordinal);
+                        assert_eq!(output, *rich_output);
+                        assert_eq!(scope, *scope_id);
+                    }
+                    (
+                        PackedEntry::ForwardOut {
+                            parameter_ordinal,
+                            target,
+                        },
+                        boon_checked::CheckedCallEntry::ForwardOut {
+                            target: rich_target,
+                            ..
+                        },
+                    ) => {
+                        assert_eq!(parameter_ordinal as usize, parameter.ordinal);
+                        assert_eq!(target, *rich_target);
+                    }
+                    (packed, rich) => panic!(
+                        "packed call {} entry kind differs: packed={packed:?} rich={rich:?}",
+                        call.id.0,
+                    ),
+                }
+            }
+            for (packed, rich_context) in topology.contexts().zip(&call.contexts) {
+                assert_eq!(packed.declaration, rich_context.declaration);
+                assert_eq!(packed.signature_ordinal as usize, rich_context.signature);
+                assert_eq!(packed.scope, rich_context.scope_id);
+            }
+            assert_eq!(
+                topology.authored_site_digest_v4(),
+                boon_checked::checked_structural_call_site_digest_v4(
+                    &rich.call_occurrences[call.id.0 as usize],
+                )
+                .expect("rich call occurrence hashes"),
+            );
             let facts = packed_input
                 .call_type_facts(call.id)
                 .expect("every checked call has packed type facts");
+            assert_eq!(
+                packed_type_materializer
+                    .materialize_flow(topology.result())
+                    .expect("materialize packed topology base call result"),
+                call.result,
+                "packed topology call {} base result differs from its rich call row",
+                call.id.0,
+            );
             let target = rich
                 .fields
                 .callables
@@ -21923,6 +22038,14 @@ FUNCTION stateful_row(row) {
                     .expect("materialize packed published call result"),
                 published.flow_type,
                 "packed call {} published result differs from its checked expression",
+                call.id.0,
+            );
+            assert_eq!(
+                packed_type_materializer
+                    .materialize_flow(topology.published_result())
+                    .expect("materialize packed topology published call result"),
+                published.flow_type,
+                "packed topology call {} published result differs from its checked expression",
                 call.id.0,
             );
             assert_eq!(

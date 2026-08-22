@@ -356,6 +356,8 @@ impl KernelCheckedRows {
                 })?;
             }
         }
+        self.semantic_input
+            .rebase_definition_spans(owner, start_line, start_byte)?;
         Ok(())
     }
 }
@@ -404,6 +406,12 @@ struct KernelSemanticCallResultPathLocatorV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct KernelSemanticDefinitionRelocationV1 {
     callable: DeclId,
+    owner_callable: Option<DeclId>,
+    context_formal: Option<ContextFormalId>,
+    context_formal_ordinal: Option<u32>,
+    result_expression: CheckedExprId,
+    containing_scope: LexicalScopeId,
+    scopes: KernelCheckedRowRange,
     declarations: KernelCheckedRowRange,
     type_variables: KernelCheckedRowRange,
     expressions: KernelCheckedRowRange,
@@ -411,6 +419,13 @@ struct KernelSemanticDefinitionRelocationV1 {
     sources: KernelCheckedRowRange,
     states: KernelCheckedRowRange,
     lists: KernelCheckedRowRange,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct KernelSemanticDefinitionSpanRelocationV1 {
+    /// Zero means the source-unit relocation has not been installed yet.
+    start_line: usize,
+    start_byte: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -436,8 +451,10 @@ pub struct KernelSemanticInputConstructionV1 {
     definition_code: Arc<crate::DefinitionCodeStore>,
     expression_count: u32,
     declaration_count: u32,
+    call_count: u32,
     source_count: u32,
     definition_relocations: Box<[KernelSemanticDefinitionRelocationV1]>,
+    definition_span_relocations: Box<[KernelSemanticDefinitionSpanRelocationV1]>,
     /// Dense by immutable `KernelAbiCallableId`; unreferenced ABI schemes have
     /// no checked declaration relocation but remain available as packed type
     /// authorities in `definition_code`.
@@ -554,6 +571,43 @@ pub struct KernelSemanticDefinitionExecutionTemplateIter<'a> {
 }
 
 #[derive(Clone, Copy)]
+pub struct KernelSemanticCallRef<'a> {
+    input: &'a KernelSemanticInputV1,
+    owner: KernelOwnerId,
+    ordinal: u32,
+}
+
+pub struct KernelSemanticCallIter<'a> {
+    input: &'a KernelSemanticInputV1,
+    next: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelSemanticCallEntryRef {
+    Input {
+        parameter_ordinal: u32,
+        value: CheckedExprId,
+        from_pipe: bool,
+    },
+    FreshOut {
+        parameter_ordinal: u32,
+        output: DeclId,
+        scope: LexicalScopeId,
+    },
+    ForwardOut {
+        parameter_ordinal: u32,
+        target: DeclId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelSemanticCallContextRef {
+    pub declaration: DeclId,
+    pub signature_ordinal: u32,
+    pub scope: LexicalScopeId,
+}
+
+#[derive(Clone, Copy)]
 pub struct KernelSemanticDefinitionExecutionNodeRef<'a> {
     input: &'a KernelSemanticInputV1,
     node: crate::PackedExecutionNodeRef<'a>,
@@ -628,6 +682,264 @@ pub struct KernelSemanticResourceOriginRef<'a> {
     source_owner: KernelOwnerId,
     source: crate::KernelSourceId,
     payload_projection: &'a [boon_contract::SymbolId],
+}
+
+impl<'a> Iterator for KernelSemanticCallIter<'a> {
+    type Item = KernelSemanticCallRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.input.construction.call_count {
+            return None;
+        }
+        let id = CheckedCallId(self.next);
+        self.next += 1;
+        self.input.call(id)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.input.construction.call_count.saturating_sub(self.next) as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for KernelSemanticCallIter<'_> {}
+
+impl<'a> KernelSemanticCallRef<'a> {
+    fn code(self) -> crate::DefinitionCodeRef<'a> {
+        self.input
+            .construction
+            .definition_code
+            .definition(self.owner)
+            .expect("sealed kernel semantic call owner has definition code")
+    }
+
+    pub fn id(self) -> CheckedCallId {
+        self.input
+            .construction
+            .relocate_call(crate::PackedCallRef::new(self.owner, self.ordinal))
+            .expect("sealed kernel semantic call relocates")
+    }
+
+    pub fn expression(self) -> CheckedExprId {
+        let expression = self
+            .code()
+            .call_expression(self.ordinal as usize)
+            .expect("sealed kernel semantic call has an expression");
+        self.input
+            .construction
+            .relocate_expression(crate::PackedExpressionRef::new(self.owner, expression))
+            .expect("sealed kernel semantic call expression relocates")
+    }
+
+    pub fn target_scheme(self) -> KernelCallableSchemeRef<'a> {
+        let target = self
+            .code()
+            .call_target(self.ordinal as usize)
+            .flatten()
+            .expect("sealed kernel semantic call has a target scheme");
+        self.input.callable_scheme_ref(target)
+    }
+
+    pub fn callable(self) -> DeclId {
+        match self.target_scheme().target {
+            crate::KernelCallableSchemeId::User(owner) => {
+                self.input
+                    .definition_relocation(owner)
+                    .expect("sealed user call target relocates")
+                    .callable
+            }
+            crate::KernelCallableSchemeId::Abi(callable) => {
+                self.input
+                    .construction
+                    .abi_relocation(callable)
+                    .expect("sealed ABI call target relocates")
+                    .callable
+            }
+        }
+    }
+
+    pub fn owner_callable(self) -> Option<DeclId> {
+        self.input
+            .definition_relocation(self.owner)
+            .expect("sealed kernel semantic call owner relocates")
+            .owner_callable
+    }
+
+    pub fn function(self) -> &'a str {
+        let symbol = self
+            .code()
+            .call_function(self.ordinal as usize)
+            .expect("sealed kernel semantic call has a function symbol");
+        self.input
+            .construction
+            .definition_code
+            .symbol(symbol)
+            .expect("sealed kernel semantic call function belongs to its text authority")
+    }
+
+    pub fn entry_count(self) -> usize {
+        self.code()
+            .call_entries(self.ordinal as usize)
+            .expect("sealed kernel semantic call has an entry span")
+            .len()
+    }
+
+    pub fn entries(self) -> impl ExactSizeIterator<Item = KernelSemanticCallEntryRef> + 'a {
+        let input = self.input;
+        let owner = self.owner;
+        self.code()
+            .call_entries(self.ordinal as usize)
+            .expect("sealed kernel semantic call has an entry span")
+            .iter()
+            .copied()
+            .map(move |entry| match entry {
+                crate::PackedCallEntry::Input {
+                    parameter_ordinal,
+                    value,
+                    from_pipe,
+                } => KernelSemanticCallEntryRef::Input {
+                    parameter_ordinal,
+                    value: input
+                        .construction
+                        .relocate_value(owner, value)
+                        .expect("sealed kernel semantic call input relocates"),
+                    from_pipe,
+                },
+                crate::PackedCallEntry::FreshOut {
+                    parameter_ordinal,
+                    output,
+                    scope,
+                } => KernelSemanticCallEntryRef::FreshOut {
+                    parameter_ordinal,
+                    output: input
+                        .construction
+                        .relocate_declaration(owner, KernelDeclarationReference::Local(output))
+                        .expect("sealed kernel semantic FreshOut relocates"),
+                    scope: input
+                        .construction
+                        .relocate_scope(owner, KernelScopeReference::Local(scope))
+                        .expect("sealed kernel semantic FreshOut scope relocates"),
+                },
+                crate::PackedCallEntry::ForwardOut {
+                    parameter_ordinal,
+                    target,
+                } => KernelSemanticCallEntryRef::ForwardOut {
+                    parameter_ordinal,
+                    target: input
+                        .construction
+                        .relocate_declaration(owner, target)
+                        .expect("sealed kernel semantic ForwardOut target relocates"),
+                },
+            })
+    }
+
+    pub fn context_count(self) -> usize {
+        self.code()
+            .call_contexts(self.ordinal as usize)
+            .expect("sealed kernel semantic call has a context span")
+            .len()
+    }
+
+    pub fn contexts(self) -> impl ExactSizeIterator<Item = KernelSemanticCallContextRef> + 'a {
+        let input = self.input;
+        let owner = self.owner;
+        self.code()
+            .call_contexts(self.ordinal as usize)
+            .expect("sealed kernel semantic call has a context span")
+            .iter()
+            .copied()
+            .map(move |context| KernelSemanticCallContextRef {
+                declaration: input
+                    .construction
+                    .relocate_declaration(
+                        owner,
+                        KernelDeclarationReference::Local(context.declaration),
+                    )
+                    .expect("sealed kernel semantic call context declaration relocates"),
+                signature_ordinal: context.signature_ordinal,
+                scope: input
+                    .construction
+                    .relocate_scope(owner, context.scope)
+                    .expect("sealed kernel semantic call context scope relocates"),
+            })
+    }
+
+    pub fn context_binding(self) -> CheckedContextBinding {
+        match self
+            .code()
+            .call_context_binding(self.ordinal as usize)
+            .expect("sealed kernel semantic call has a context binding")
+        {
+            crate::PackedCallContextBinding::None => CheckedContextBinding::None,
+            crate::PackedCallContextBinding::Explicit { value, span } => {
+                CheckedContextBinding::Explicit {
+                    value: self
+                        .input
+                        .construction
+                        .relocate_value(self.owner, value)
+                        .expect("sealed kernel semantic explicit PASS value relocates"),
+                    span: self
+                        .input
+                        .construction
+                        .rebase_span(self.owner, span)
+                        .expect("sealed kernel semantic explicit PASS span relocates"),
+                }
+            }
+            crate::PackedCallContextBinding::Inherited {
+                caller_formal_ordinal,
+            } => CheckedContextBinding::Inherited {
+                formal: self
+                    .input
+                    .definition_relocation(self.owner)
+                    .filter(|relocation| {
+                        relocation.context_formal_ordinal == Some(caller_formal_ordinal)
+                    })
+                    .and_then(|relocation| relocation.context_formal)
+                    .expect("sealed kernel semantic inherited PASS formal relocates"),
+            },
+        }
+    }
+
+    pub fn result(self) -> KernelPackedFlowRef<'a> {
+        self.input
+            .call_type_facts(self.id())
+            .expect("sealed kernel semantic call has packed type facts")
+            .base_result()
+    }
+
+    /// Final expression publication after occurrence-local widening.
+    ///
+    /// This is deliberately separate from [`Self::result`], which preserves
+    /// the historical `CheckedCall::result` contract.
+    pub fn published_result(self) -> KernelPackedFlowRef<'a> {
+        self.input
+            .call_type_facts(self.id())
+            .expect("sealed kernel semantic call has packed type facts")
+            .published_result()
+    }
+
+    pub fn syntax_discriminated_result(self) -> bool {
+        self.code()
+            .call_syntax_discriminated_result(self.ordinal as usize)
+            .expect("sealed kernel semantic call has a syntax result flag")
+    }
+
+    pub fn span(self) -> CheckedSpan {
+        let span = self
+            .code()
+            .call_span(self.ordinal as usize)
+            .expect("sealed kernel semantic call has a source span");
+        self.input
+            .construction
+            .rebase_span(self.owner, span)
+            .expect("sealed kernel semantic call span relocates")
+    }
+
+    pub fn authored_site_digest_v4(self) -> [u8; 32] {
+        self.code()
+            .call_authored_site_digest_v4(self.ordinal as usize)
+            .expect("sealed kernel semantic call has an authored-site digest")
+    }
 }
 
 impl<'a> Iterator for KernelSemanticDefinitionExecutionTemplateIter<'a> {
@@ -934,6 +1246,84 @@ impl KernelSemanticInputConstructionV1 {
             .map(CheckedExprId)
     }
 
+    fn relocate_value(
+        &self,
+        owner: KernelOwnerId,
+        value: KernelValueReference,
+    ) -> Option<CheckedExprId> {
+        let expression = match value {
+            KernelValueReference::Local(expression) => {
+                crate::PackedExpressionRef::new(owner, expression)
+            }
+            KernelValueReference::External(external) => match external.target {
+                KernelExternalTarget::Expression(expression) => {
+                    crate::PackedExpressionRef::new(external.owner, expression)
+                }
+                KernelExternalTarget::Result => {
+                    return self
+                        .definition_relocation(external.owner)
+                        .map(|relocation| relocation.result_expression);
+                }
+            },
+        };
+        self.relocate_expression(expression)
+    }
+
+    fn relocate_scope(
+        &self,
+        owner: KernelOwnerId,
+        scope: KernelScopeReference,
+    ) -> Option<LexicalScopeId> {
+        match scope {
+            KernelScopeReference::ProjectRoot => Some(LexicalScopeId(0)),
+            KernelScopeReference::Containing => self
+                .definition_relocation(owner)
+                .map(|relocation| relocation.containing_scope),
+            KernelScopeReference::Local(scope) => self
+                .definition_relocation(owner)?
+                .scopes
+                .resolve(scope.0, "semantic scope")
+                .ok()
+                .map(LexicalScopeId),
+            KernelScopeReference::Owner {
+                owner: target,
+                scope,
+            } => self
+                .definition_relocation(target)?
+                .scopes
+                .resolve(scope.0, "semantic owner scope")
+                .ok()
+                .map(LexicalScopeId),
+        }
+    }
+
+    fn relocate_declaration(
+        &self,
+        owner: KernelOwnerId,
+        declaration: KernelDeclarationReference,
+    ) -> Option<DeclId> {
+        match declaration {
+            KernelDeclarationReference::Local(declaration) => self
+                .definition_relocation(owner)?
+                .declarations
+                .resolve(declaration.0, "semantic declaration")
+                .ok()
+                .map(DeclId),
+            KernelDeclarationReference::OwnerPublic(target) => {
+                self.definition_relocation(target).map(|row| row.callable)
+            }
+            KernelDeclarationReference::OwnerDeclaration {
+                owner: target,
+                declaration,
+            } => self
+                .definition_relocation(target)?
+                .declarations
+                .resolve(declaration.0, "semantic owner declaration")
+                .ok()
+                .map(DeclId),
+        }
+    }
+
     fn relocate_call(&self, call: crate::PackedCallRef) -> Option<CheckedCallId> {
         let range = self.definition_relocation(call.owner())?.calls;
         range
@@ -1011,6 +1401,93 @@ impl KernelSemanticInputConstructionV1 {
         let start = path.projection_start as usize;
         let end = start.checked_add(path.projection_len as usize)?;
         self.call_result_path_symbols.get(start..end)
+    }
+
+    fn rebase_definition_spans(
+        &mut self,
+        owner: KernelOwnerId,
+        start_line: usize,
+        start_byte: usize,
+    ) -> Result<(), KernelCheckedLinkError> {
+        if start_line == 0 {
+            return Err(KernelCheckedLinkError::new(
+                "kernel semantic span relocation has no source line",
+            ));
+        }
+        let slot = self
+            .definition_span_relocations
+            .get_mut(owner.0 as usize)
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel semantic span relocation references missing definition {}",
+                    owner.0,
+                ))
+            })?;
+        if slot.start_line != 0 {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel semantic definition {} spans were rebased twice",
+                owner.0,
+            )));
+        }
+        let code = self.definition_code.definition(owner).ok_or_else(|| {
+            KernelCheckedLinkError::new(format!(
+                "kernel semantic span relocation has no definition code {}",
+                owner.0,
+            ))
+        })?;
+        for ordinal in 0..code.call_count() {
+            let mut span = checked_span(code.call_span(ordinal).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel semantic definition {} omits packed call span {ordinal}",
+                    owner.0,
+                ))
+            })?);
+            rebase_checked_span(
+                &mut span,
+                start_line,
+                start_byte,
+                &format!("kernel semantic definition {} call {ordinal}", owner.0),
+            )?;
+            if let crate::PackedCallContextBinding::Explicit { span, .. } =
+                code.call_context_binding(ordinal).ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel semantic definition {} omits packed call binding {ordinal}",
+                        owner.0,
+                    ))
+                })?
+            {
+                let mut span = checked_span(span);
+                rebase_checked_span(
+                    &mut span,
+                    start_line,
+                    start_byte,
+                    &format!("kernel semantic definition {} call {ordinal} PASS", owner.0),
+                )?;
+            }
+        }
+        *slot = KernelSemanticDefinitionSpanRelocationV1 {
+            start_line,
+            start_byte,
+        };
+        Ok(())
+    }
+
+    fn rebase_span(
+        &self,
+        owner: KernelOwnerId,
+        span: crate::KernelSourceSpan,
+    ) -> Option<CheckedSpan> {
+        let relocation = self
+            .definition_span_relocations
+            .get(owner.0 as usize)
+            .filter(|relocation| relocation.start_line != 0)?;
+        Some(CheckedSpan {
+            line: relocation
+                .start_line
+                .checked_add(span.line.checked_sub(1)?)?,
+            start: relocation.start_byte.checked_add(span.start)?,
+            end: relocation.start_byte.checked_add(span.end)?,
+        })
     }
 
     fn materialize_rich_definition_execution(&self) -> Box<[CheckedDefinitionExecutionTemplateV1]> {
@@ -1253,6 +1730,12 @@ impl KernelSemanticInputConstructionV1 {
         let mut definition_relocations = Vec::with_capacity(layout.definitions.len());
         let mut definition_execution_owners = Vec::new();
         for definition in &layout.definitions {
+            let definition_view = snapshot.definition(definition.owner).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel semantic input has no definition view {}",
+                    definition.owner.0,
+                ))
+            })?;
             let code = snapshot
                 .definition_code
                 .definition(definition.owner)
@@ -1304,6 +1787,17 @@ impl KernelSemanticInputConstructionV1 {
             }
             definition_relocations.push(KernelSemanticDefinitionRelocationV1 {
                 callable: definition.public_declaration,
+                owner_callable: definition_view
+                    .linkage()
+                    .root_statement
+                    .and_then(|root| definition_view.facts().statements.get(root.0 as usize))
+                    .filter(|root| matches!(root.kind, crate::KernelStatementKind::Function { .. }))
+                    .map(|_| definition.public_declaration),
+                context_formal: definition.context_formal,
+                context_formal_ordinal: definition_view.linkage().context_formal_ordinal,
+                result_expression: definition.result_expression,
+                containing_scope: definition.containing_scope,
+                scopes: definition.scopes,
                 declarations: definition.declarations,
                 type_variables: definition.type_variables,
                 expressions: definition.expressions,
@@ -1452,8 +1946,14 @@ impl KernelSemanticInputConstructionV1 {
             definition_code: Arc::clone(&snapshot.definition_code),
             expression_count: layout.totals.expressions,
             declaration_count: layout.totals.declarations.saturating_sub(1),
+            call_count: layout.totals.calls,
             source_count: layout.totals.sources,
             definition_relocations: definition_relocations.into_boxed_slice(),
+            definition_span_relocations: vec![
+                KernelSemanticDefinitionSpanRelocationV1::default();
+                definition_count
+            ]
+            .into_boxed_slice(),
             abi_relocations: abi_relocations.into_boxed_slice(),
             definition_execution_owners: definition_execution_owners.into_boxed_slice(),
             call_result_paths,
@@ -1466,6 +1966,271 @@ impl KernelSemanticInputConstructionV1 {
             ),
             checked_image_pairing,
         })
+    }
+
+    /// Debug-build firewall between the permanent packed topology and the
+    /// compatibility `CheckedCall` graph. Production release compilation does
+    /// not pay for this replay; editor/oracle tests exercise it before the
+    /// rich owner is deleted from RuntimePacked.
+    #[cfg(debug_assertions)]
+    fn validate_rich_call_topology(
+        &self,
+        calls: &[CheckedCall],
+        occurrences: &[StableOccurrenceKey],
+        callables: &[CheckedCallableSignature],
+        declarations: &[CheckedDeclaration],
+    ) -> Result<(), KernelCheckedLinkError> {
+        if calls.len() != self.call_count as usize || occurrences.len() != calls.len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel packed call topology has {} rows but rich calls/occurrences have {}/{}",
+                self.call_count,
+                calls.len(),
+                occurrences.len(),
+            )));
+        }
+        for (index, (rich, occurrence)) in calls.iter().zip(occurrences).enumerate() {
+            let id = CheckedCallId(u32::try_from(index).map_err(|_| {
+                KernelCheckedLinkError::new("kernel packed call topology count exceeds u32")
+            })?);
+            if rich.id != id {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel rich call {} is not dense at index {index}",
+                    rich.id.0,
+                )));
+            }
+            let local = self.local_call(id).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel packed call topology has no local coordinate for call {}",
+                    id.0,
+                ))
+            })?;
+            let code = self
+                .definition_code
+                .definition(local.owner())
+                .expect("local call always has definition code");
+            let ordinal = local.ordinal() as usize;
+            let expression = code.call_expression(ordinal).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel packed call topology omits call {} expression",
+                    id.0,
+                ))
+            })?;
+            if self.relocate_expression(crate::PackedExpressionRef::new(local.owner(), expression))
+                != Some(rich.expression)
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel packed call {} expression differs from rich topology",
+                    id.0,
+                )));
+            }
+            let relocation = self
+                .definition_relocation(local.owner())
+                .expect("local call always has a relocation");
+            if relocation.owner_callable != rich.owner_callable
+                || code
+                    .call_function(ordinal)
+                    .and_then(|symbol| self.definition_code.symbol(symbol))
+                    != Some(rich.function.as_str())
+                || checked_span(code.call_span(ordinal).expect("sealed call has span")) != rich.span
+                || code.call_syntax_discriminated_result(ordinal)
+                    != Some(rich.syntax_discriminated_result)
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel packed call {} header differs from rich topology",
+                    id.0,
+                )));
+            }
+            let target = code.call_target(ordinal).flatten().ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel packed call {} has no target scheme",
+                    id.0,
+                ))
+            })?;
+            let callable = match target {
+                crate::KernelCallableSchemeId::User(owner) => {
+                    self.definition_relocation(owner).map(|row| row.callable)
+                }
+                crate::KernelCallableSchemeId::Abi(callable) => {
+                    self.abi_relocation(callable).map(|row| row.callable)
+                }
+            }
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel packed call {} target has no relocation",
+                    id.0,
+                ))
+            })?;
+            let signature = callables
+                .iter()
+                .find(|candidate| candidate.decl_id == callable)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel packed call {} target {} has no signature",
+                        id.0, callable.0,
+                    ))
+                })?;
+            if rich.callable != callable
+                || rich.function != signature.name
+                || rich.entries.len()
+                    != code
+                        .call_entries(ordinal)
+                        .expect("sealed call has entries")
+                        .len()
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel packed call {} target or entry count differs from rich topology",
+                    id.0,
+                )));
+            }
+            for (entry_index, (packed, rich_entry)) in code
+                .call_entries(ordinal)
+                .expect("sealed call has entries")
+                .iter()
+                .copied()
+                .zip(&rich.entries)
+                .enumerate()
+            {
+                let parameter = signature
+                    .parameters
+                    .get(packed.parameter_ordinal() as usize)
+                    .filter(|parameter| parameter.ordinal == packed.parameter_ordinal() as usize)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel packed call {} entry {entry_index} has no target parameter {}",
+                            id.0,
+                            packed.parameter_ordinal(),
+                        ))
+                    })?;
+                let matches = match (packed, rich_entry) {
+                    (
+                        crate::PackedCallEntry::Input {
+                            value, from_pipe, ..
+                        },
+                        CheckedCallEntry::Input {
+                            formal,
+                            name,
+                            value: rich_value,
+                            from_pipe: rich_pipe,
+                            evaluation_scope,
+                        },
+                    ) => {
+                        *formal == parameter.decl_id
+                            && name == &parameter.name
+                            && self.relocate_value(local.owner(), value) == Some(*rich_value)
+                            && from_pipe == *rich_pipe
+                            && *evaluation_scope == parameter.evaluation_scope
+                    }
+                    (
+                        crate::PackedCallEntry::FreshOut { output, scope, .. },
+                        CheckedCallEntry::FreshOut {
+                            formal,
+                            name,
+                            output: rich_output,
+                            scope_id,
+                        },
+                    ) => {
+                        *formal == parameter.decl_id
+                            && name == &parameter.name
+                            && self.relocate_declaration(
+                                local.owner(),
+                                KernelDeclarationReference::Local(output),
+                            ) == Some(*rich_output)
+                            && self
+                                .relocate_scope(local.owner(), KernelScopeReference::Local(scope))
+                                == Some(*scope_id)
+                    }
+                    (
+                        crate::PackedCallEntry::ForwardOut { target, .. },
+                        CheckedCallEntry::ForwardOut {
+                            formal,
+                            name,
+                            target: rich_target,
+                            target_name,
+                        },
+                    ) => {
+                        let target = self.relocate_declaration(local.owner(), target);
+                        *formal == parameter.decl_id
+                            && name == &parameter.name
+                            && target == Some(*rich_target)
+                            && declarations
+                                .iter()
+                                .find(|declaration| Some(declaration.id) == target)
+                                .is_some_and(|declaration| declaration.name == *target_name)
+                    }
+                    _ => false,
+                };
+                if !matches {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel packed call {} entry {entry_index} differs from rich topology",
+                        id.0,
+                    )));
+                }
+            }
+            let packed_contexts = code
+                .call_contexts(ordinal)
+                .expect("sealed call has contexts");
+            if packed_contexts.len() != rich.contexts.len() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel packed call {} context count differs from rich topology",
+                    id.0,
+                )));
+            }
+            for (packed, rich_context) in packed_contexts.iter().zip(&rich.contexts) {
+                if self.relocate_declaration(
+                    local.owner(),
+                    KernelDeclarationReference::Local(packed.declaration),
+                ) != Some(rich_context.declaration)
+                    || packed.signature_ordinal as usize != rich_context.signature
+                    || self.relocate_scope(local.owner(), packed.scope)
+                        != Some(rich_context.scope_id)
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel packed call {} context {} differs from rich topology",
+                        id.0, packed.signature_ordinal,
+                    )));
+                }
+            }
+            let packed_binding = match code
+                .call_context_binding(ordinal)
+                .expect("sealed call has context binding")
+            {
+                crate::PackedCallContextBinding::None => CheckedContextBinding::None,
+                crate::PackedCallContextBinding::Explicit { value, span } => {
+                    CheckedContextBinding::Explicit {
+                        value: self
+                            .relocate_value(local.owner(), value)
+                            .expect("sealed explicit PASS value relocates"),
+                        span: checked_span(span),
+                    }
+                }
+                crate::PackedCallContextBinding::Inherited {
+                    caller_formal_ordinal,
+                } => CheckedContextBinding::Inherited {
+                    formal: (relocation.context_formal_ordinal == Some(caller_formal_ordinal))
+                        .then_some(relocation.context_formal)
+                        .flatten()
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel packed call {} inherits a mismatched context formal {caller_formal_ordinal}",
+                                id.0,
+                            ))
+                        })?,
+                },
+            };
+            if packed_binding != rich.context_binding
+                || code.call_authored_site_digest_v4(ordinal)
+                    != Some(
+                        boon_checked::checked_structural_call_site_digest_v4(occurrence)
+                            .map_err(KernelCheckedLinkError::new)?,
+                    )
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel packed call {} PASS binding or authored identity differs from rich topology",
+                    id.0,
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn seal(
@@ -1539,6 +2304,23 @@ impl KernelSemanticInputConstructionV1 {
                 return Err(KernelCheckedLinkError::new(format!(
                     "kernel semantic resource projection {ordinal} has no relocation to target {}",
                     requirement.target.0,
+                )));
+            }
+        }
+        for (owner, relocation) in self.definition_span_relocations.iter().enumerate() {
+            let owner = KernelOwnerId(u32::try_from(owner).map_err(|_| {
+                KernelCheckedLinkError::new("kernel semantic definition count exceeds u32")
+            })?);
+            let code = self.definition_code.definition(owner).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel semantic span relocation has no definition code {}",
+                    owner.0,
+                ))
+            })?;
+            if code.call_count() != 0 && relocation.start_line == 0 {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel semantic definition {} has calls but no installed source-span relocation",
+                    owner.0,
                 )));
             }
         }
@@ -1651,6 +2433,27 @@ impl KernelSemanticInputV1 {
 
     pub fn definition_count(&self) -> usize {
         self.construction.definition_count
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.construction.call_count as usize
+    }
+
+    /// Iterate the one packed call-topology authority in final checked order.
+    pub fn calls(&self) -> KernelSemanticCallIter<'_> {
+        KernelSemanticCallIter {
+            input: self,
+            next: 0,
+        }
+    }
+
+    pub fn call(&self, call: CheckedCallId) -> Option<KernelSemanticCallRef<'_>> {
+        let call = self.construction.local_call(call)?;
+        Some(KernelSemanticCallRef {
+            input: self,
+            owner: call.owner(),
+            ordinal: call.ordinal(),
+        })
     }
 
     fn packed_type_ref(
@@ -3596,6 +4399,13 @@ impl KernelCheckedLinkLayout {
             packed_call_result_path_symbols,
             semantic_resource_projections,
             checked_image_publication.__kernel_pairing(),
+        )?;
+        #[cfg(debug_assertions)]
+        semantic_input.validate_rich_call_topology(
+            &calls,
+            &call_occurrences,
+            &callables,
+            &declarations,
         )?;
         #[cfg(test)]
         if semantic_input.materialize_rich_definition_execution_templates()

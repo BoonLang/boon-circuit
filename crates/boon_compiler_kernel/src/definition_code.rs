@@ -4,8 +4,10 @@ use crate::packed_call_types::{
     PackedCallableParameterTraversalScratch, packed_callable_type_parameter_sources_match,
 };
 use crate::{
-    FrozenTypeStore, KernelAbiCallableId, KernelArtifactFlowTermV1, KernelOwnerId,
-    KernelSolveError, TypeTermId, TypeVariableId, alpha_normalize_flow_type,
+    FrozenTypeStore, KernelAbiCallableId, KernelArtifactFlowTermV1, KernelDeclarationId,
+    KernelDeclarationReference, KernelExternalTarget, KernelOwnerId, KernelScopeId,
+    KernelScopeReference, KernelSolveError, KernelSourceSpan, KernelValueReference, TypeTermId,
+    TypeVariableId, alpha_normalize_flow_type,
 };
 use boon_checked::{FlowMode, FlowType, Type, TypeVar};
 use boon_contract::SymbolId;
@@ -207,6 +209,8 @@ pub struct DefinitionCodeStore {
     expression_kind_types: Box<[Option<crate::TypeTermId>]>,
     declaration_flows: Box<[Option<PackedFlow>]>,
     calls: Box<[PackedCallFacts]>,
+    call_entries: Box<[PackedCallEntry]>,
+    call_contexts: Box<[PackedCallContext]>,
     call_substitutions: Box<[PackedCallTypeSubstitution]>,
     source_payload_types: Box<[crate::TypeTermId]>,
     states: Box<[PackedPublishedState]>,
@@ -645,7 +649,13 @@ impl DefinitionCodeStore {
                             substitutions.len(),
                         )));
                     }
-                    continue;
+                    if call.is_type_only_test_fixture() {
+                        continue;
+                    }
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} call expression {} has no target scheme",
+                        call.expression.0,
+                    )));
                 };
                 let parameter_count = match target {
                     KernelCallableSchemeId::User(target) => self
@@ -733,6 +743,171 @@ impl DefinitionCodeStore {
                         "kernel definition-code ABI scheme {callable} parameter {} has invalid local alpha {} from base {}",
                         parameter.source.0, parameter.linked_local, scheme.variable_base.0,
                     )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate all borrowed call-topology coordinates once while sealing.
+    ///
+    /// Scope IDs are presentation coordinates and are checked by the link
+    /// layout, which owns scope cardinalities. Everything addressable through
+    /// this store is fail-closed here in every build profile.
+    fn validate_call_topology(&self) -> Result<(), KernelSolveError> {
+        let validate_value = |owner: usize,
+                              value: KernelValueReference|
+         -> Result<(), KernelSolveError> {
+            let valid = match value {
+                KernelValueReference::Local(expression) => self
+                    .definitions
+                    .get(owner)
+                    .is_some_and(|definition| expression.0 < definition.expressions.len),
+                KernelValueReference::External(external) => self
+                    .definitions
+                    .get(external.owner.0 as usize)
+                    .is_some_and(|definition| match external.target {
+                        KernelExternalTarget::Expression(expression) => {
+                            expression.0 < definition.expressions.len
+                        }
+                        KernelExternalTarget::Result => true,
+                    }),
+            };
+            valid.then_some(()).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel definition-code owner {owner} call topology references missing value {value:?}",
+                ))
+            })
+        };
+        let validate_declaration = |owner: usize,
+                                    target: KernelDeclarationReference|
+         -> Result<(), KernelSolveError> {
+            let valid = match target {
+                KernelDeclarationReference::Local(declaration) => self
+                    .definitions
+                    .get(owner)
+                    .is_some_and(|definition| declaration.0 < definition.declaration_flows.len),
+                KernelDeclarationReference::OwnerPublic(target) => {
+                    self.definitions.get(target.0 as usize).is_some()
+                }
+                KernelDeclarationReference::OwnerDeclaration {
+                    owner: target,
+                    declaration,
+                } => self
+                    .definitions
+                    .get(target.0 as usize)
+                    .is_some_and(|definition| declaration.0 < definition.declaration_flows.len),
+            };
+            valid.then_some(()).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel definition-code owner {owner} call topology references missing declaration {target:?}",
+                ))
+            })
+        };
+
+        for (owner, definition) in self.definitions.iter().enumerate() {
+            let calls = definition.calls.get(&self.calls).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel definition-code owner {owner} has an invalid call span"
+                ))
+            })?;
+            for call in calls {
+                let missing_test_topology = call.is_type_only_test_fixture();
+                if !missing_test_topology && call.target.is_none() {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} call expression {} has no target scheme",
+                        call.expression.0,
+                    )));
+                }
+                if !missing_test_topology
+                    && call
+                        .function
+                        .and_then(|symbol| self.symbol(symbol))
+                        .is_none()
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} call expression {} has a foreign function symbol",
+                        call.expression.0,
+                    )));
+                }
+                let entries = call.entries.get(&self.call_entries).ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} call expression {} has an invalid entry span",
+                        call.expression.0,
+                    ))
+                })?;
+                let contexts = call.contexts.get(&self.call_contexts).ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} call expression {} has an invalid context span",
+                        call.expression.0,
+                    ))
+                })?;
+                let target_formal_count = match call.target {
+                    Some(KernelCallableSchemeId::User(target)) => self
+                        .definitions
+                        .get(target.0 as usize)
+                        .map(|definition| definition.formals.len as usize),
+                    Some(KernelCallableSchemeId::Abi(target)) => self
+                        .abi_callable_schemes
+                        .get(target.0 as usize)
+                        .map(|scheme| scheme.formals.len as usize),
+                    None => None,
+                };
+                if call.target.is_none() && (!entries.is_empty() || !contexts.is_empty()) {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} call expression {} has topology without a target scheme",
+                        call.expression.0,
+                    )));
+                }
+                let Some(target_formal_count) =
+                    target_formal_count.or_else(|| missing_test_topology.then_some(0))
+                else {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} call expression {} references a missing target scheme",
+                        call.expression.0,
+                    )));
+                };
+                for (ordinal, entry) in entries.iter().copied().enumerate() {
+                    let parameter = entry.parameter_ordinal();
+                    if parameter as usize >= target_formal_count {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel definition-code owner {owner} call expression {} entry parameter {parameter} is outside its target's {target_formal_count} formals",
+                            call.expression.0,
+                        )));
+                    }
+                    if entries[..ordinal]
+                        .iter()
+                        .any(|seen| seen.parameter_ordinal() == parameter)
+                    {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel definition-code owner {owner} call expression {} repeats entry parameter {parameter}",
+                            call.expression.0,
+                        )));
+                    }
+                    match entry {
+                        PackedCallEntry::Input { value, .. } => validate_value(owner, value)?,
+                        PackedCallEntry::FreshOut { output, .. } => {
+                            validate_declaration(owner, KernelDeclarationReference::Local(output))?;
+                        }
+                        PackedCallEntry::ForwardOut { target, .. } => {
+                            validate_declaration(owner, target)?;
+                        }
+                    }
+                }
+                for (ordinal, context) in contexts.iter().enumerate() {
+                    if context.signature_ordinal as usize != ordinal {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel definition-code owner {owner} call expression {} context {} is not dense at ordinal {ordinal}",
+                            call.expression.0, context.signature_ordinal,
+                        )));
+                    }
+                    validate_declaration(
+                        owner,
+                        KernelDeclarationReference::Local(context.declaration),
+                    )?;
+                }
+                if let PackedCallContextBinding::Explicit { value, .. } = call.context_binding {
+                    validate_value(owner, value)?;
                 }
             }
         }
@@ -1376,6 +1551,62 @@ impl<'a> DefinitionCodeRef<'a> {
             .expect("sealed definition-code call span is valid")
             .get(ordinal)
             .map(|call| call.target)
+    }
+
+    pub(crate) fn call_function(self, ordinal: usize) -> Option<SymbolId> {
+        self.code
+            .calls
+            .get(&self.store.calls)
+            .expect("sealed definition-code call span is valid")
+            .get(ordinal)
+            .and_then(|call| call.function)
+    }
+
+    pub(crate) fn call_entries(self, ordinal: usize) -> Option<&'a [PackedCallEntry]> {
+        self.code
+            .calls
+            .get(&self.store.calls)
+            .expect("sealed definition-code call span is valid")
+            .get(ordinal)?
+            .entries
+            .get(&self.store.call_entries)
+    }
+
+    pub(crate) fn call_contexts(self, ordinal: usize) -> Option<&'a [PackedCallContext]> {
+        self.code
+            .calls
+            .get(&self.store.calls)
+            .expect("sealed definition-code call span is valid")
+            .get(ordinal)?
+            .contexts
+            .get(&self.store.call_contexts)
+    }
+
+    pub(crate) fn call_context_binding(self, ordinal: usize) -> Option<PackedCallContextBinding> {
+        self.code
+            .calls
+            .get(&self.store.calls)
+            .expect("sealed definition-code call span is valid")
+            .get(ordinal)
+            .map(|call| call.context_binding)
+    }
+
+    pub(crate) fn call_span(self, ordinal: usize) -> Option<KernelSourceSpan> {
+        self.code
+            .calls
+            .get(&self.store.calls)
+            .expect("sealed definition-code call span is valid")
+            .get(ordinal)
+            .map(|call| call.span)
+    }
+
+    pub(crate) fn call_authored_site_digest_v4(self, ordinal: usize) -> Option<[u8; 32]> {
+        self.code
+            .calls
+            .get(&self.store.calls)
+            .expect("sealed definition-code call span is valid")
+            .get(ordinal)
+            .map(|call| call.authored_site_digest_v4)
     }
 
     pub(crate) fn base_expression(self, ordinal: usize) -> Option<KernelArtifactFlowTermV1> {
@@ -2186,8 +2417,89 @@ impl PackedResourceProjectionRequirement {
 struct PackedCallFacts {
     expression: crate::KernelExpressionId,
     target: Option<KernelCallableSchemeId>,
+    function: Option<SymbolId>,
+    entries: Span32,
+    contexts: Span32,
+    context_binding: PackedCallContextBinding,
     substitutions: Span32,
     syntax_discriminated_result: bool,
+    span: KernelSourceSpan,
+    authored_site_digest_v4: [u8; 32],
+}
+
+impl PackedCallFacts {
+    /// Focused kernel solver tests may retain call type equations without
+    /// constructing source topology. This shape is impossible in every build
+    /// where `boon_compiler_kernel` is a production dependency.
+    fn is_type_only_test_fixture(&self) -> bool {
+        cfg!(test)
+            && self.function.is_none()
+            && self.entries.len == 0
+            && self.contexts.len == 0
+            && matches!(self.context_binding, PackedCallContextBinding::None)
+            && self.span == KernelSourceSpan::default()
+            && self.authored_site_digest_v4 == [0; 32]
+    }
+}
+
+/// One occurrence binding in definition-local coordinates.
+///
+/// Parameter ordinals address the retained target callable scheme. Names,
+/// parameter contracts, and evaluation policy remain owned once by that
+/// scheme; this row never copies them per call occurrence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PackedCallEntry {
+    Input {
+        parameter_ordinal: u32,
+        value: KernelValueReference,
+        from_pipe: bool,
+    },
+    FreshOut {
+        parameter_ordinal: u32,
+        output: KernelDeclarationId,
+        scope: KernelScopeId,
+    },
+    ForwardOut {
+        parameter_ordinal: u32,
+        target: KernelDeclarationReference,
+    },
+}
+
+impl PackedCallEntry {
+    pub(crate) const fn parameter_ordinal(self) -> u32 {
+        match self {
+            Self::Input {
+                parameter_ordinal, ..
+            }
+            | Self::FreshOut {
+                parameter_ordinal, ..
+            }
+            | Self::ForwardOut {
+                parameter_ordinal, ..
+            } => parameter_ordinal,
+        }
+    }
+}
+
+/// One ABI-declared call context in caller-definition coordinates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PackedCallContext {
+    pub(crate) declaration: KernelDeclarationId,
+    pub(crate) signature_ordinal: u32,
+    pub(crate) scope: KernelScopeReference,
+}
+
+/// Complete PASSED binding without a checked-ID or rich span allocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PackedCallContextBinding {
+    None,
+    Explicit {
+        value: KernelValueReference,
+        span: KernelSourceSpan,
+    },
+    Inherited {
+        caller_formal_ordinal: u32,
+    },
 }
 
 /// Revision-local identity of the generic scheme targeted by one checked
@@ -2204,9 +2516,17 @@ pub enum KernelCallableSchemeId {
 pub(crate) struct PackedCallFactsInput {
     pub(crate) expression: crate::KernelExpressionId,
     pub(crate) target: Option<KernelCallableSchemeId>,
+    pub(crate) function: Option<SymbolId>,
+    pub(crate) entry_start: u32,
+    pub(crate) entry_len: u32,
+    pub(crate) context_start: u32,
+    pub(crate) context_len: u32,
+    pub(crate) context_binding: PackedCallContextBinding,
     pub(crate) substitution_start: u32,
     pub(crate) substitution_len: u32,
     pub(crate) syntax_discriminated_result: bool,
+    pub(crate) span: KernelSourceSpan,
+    pub(crate) authored_site_digest_v4: [u8; 32],
 }
 
 /// Packed ABI scheme before its local columns are appended to the permanent
@@ -2312,6 +2632,8 @@ pub(crate) struct DefinitionAdditionalTypeRoots<'a> {
     pub(crate) expression_kind_types: &'a [Option<crate::TypeTermId>],
     pub(crate) declaration_flows: &'a [Option<PackedFlow>],
     pub(crate) calls: &'a [PackedCallFactsInput],
+    pub(crate) call_entries: &'a [PackedCallEntry],
+    pub(crate) call_contexts: &'a [PackedCallContext],
     pub(crate) call_substitutions: &'a [PackedCallTypeSubstitution],
     pub(crate) source_payload_types: &'a [crate::TypeTermId],
     /// Number of authored state candidates in the immutable definition facts.
@@ -2353,6 +2675,8 @@ pub(crate) struct DefinitionCodeBuilder {
     expression_kind_types: Vec<Option<crate::TypeTermId>>,
     declaration_flows: Vec<Option<PackedFlow>>,
     calls: Vec<PackedCallFacts>,
+    call_entries: Vec<PackedCallEntry>,
+    call_contexts: Vec<PackedCallContext>,
     call_substitutions: Vec<PackedCallTypeSubstitution>,
     source_payload_types: Vec<crate::TypeTermId>,
     states: Vec<PackedPublishedState>,
@@ -2387,6 +2711,8 @@ impl DefinitionCodeBuilder {
             expression_kind_types: Vec::with_capacity(flows.saturating_sub(definitions)),
             declaration_flows: Vec::new(),
             calls: Vec::new(),
+            call_entries: Vec::new(),
+            call_contexts: Vec::new(),
             call_substitutions: Vec::new(),
             source_payload_types: Vec::new(),
             states: Vec::new(),
@@ -2841,6 +3167,20 @@ impl DefinitionCodeBuilder {
             &mut self.call_substitutions,
             additional.call_substitutions.iter().copied(),
         )?;
+        let call_entry_base = u32::try_from(self.call_entries.len()).map_err(|_| {
+            KernelSolveError::new("kernel definition-code call-entry start exceeds u32")
+        })?;
+        let _call_entries = Span32::append(
+            &mut self.call_entries,
+            additional.call_entries.iter().copied(),
+        )?;
+        let call_context_base = u32::try_from(self.call_contexts.len()).map_err(|_| {
+            KernelSolveError::new("kernel definition-code call-context start exceeds u32")
+        })?;
+        let _call_contexts = Span32::append(
+            &mut self.call_contexts,
+            additional.call_contexts.iter().copied(),
+        )?;
         let mut packed_calls = Vec::with_capacity(additional.calls.len());
         if additional
             .calls
@@ -2852,11 +3192,20 @@ impl DefinitionCodeBuilder {
                 owner.0,
             )));
         }
+        let mut next_substitution = 0_u32;
+        let mut next_entry = 0_u32;
+        let mut next_context = 0_u32;
         for call in additional.calls {
             if call.expression.0 >= expressions.len {
                 return Err(KernelSolveError::new(format!(
                     "kernel definition-code owner {} call expression {} is outside its expression rows",
                     owner.0, call.expression.0,
+                )));
+            }
+            if call.substitution_start != next_substitution {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code owner {} call expression {} starts substitutions at {} instead of the next dense row {next_substitution}",
+                    owner.0, call.expression.0, call.substitution_start,
                 )));
             }
             let local_end = call
@@ -2872,9 +3221,72 @@ impl DefinitionCodeBuilder {
                     "kernel definition-code call-substitution span is outside its definition",
                 ));
             }
+            next_substitution = local_end;
+            if call.entry_start != next_entry {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code owner {} call expression {} starts entries at {} instead of the next dense row {next_entry}",
+                    owner.0, call.expression.0, call.entry_start,
+                )));
+            }
+            let local_entry_end =
+                call.entry_start
+                    .checked_add(call.entry_len)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(
+                            "kernel definition-code local call-entry span overflows u32",
+                        )
+                    })?;
+            if local_entry_end as usize > additional.call_entries.len() {
+                return Err(KernelSolveError::new(
+                    "kernel definition-code call-entry span is outside its definition",
+                ));
+            }
+            next_entry = local_entry_end;
+            if call.context_start != next_context {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code owner {} call expression {} starts contexts at {} instead of the next dense row {next_context}",
+                    owner.0, call.expression.0, call.context_start,
+                )));
+            }
+            let local_context_end = call
+                .context_start
+                .checked_add(call.context_len)
+                .ok_or_else(|| {
+                    KernelSolveError::new(
+                        "kernel definition-code local call-context span overflows u32",
+                    )
+                })?;
+            if local_context_end as usize > additional.call_contexts.len() {
+                return Err(KernelSolveError::new(
+                    "kernel definition-code call-context span is outside its definition",
+                ));
+            }
+            next_context = local_context_end;
             packed_calls.push(PackedCallFacts {
                 expression: call.expression,
                 target: call.target,
+                function: call.function,
+                entries: Span32 {
+                    start: call_entry_base
+                        .checked_add(call.entry_start)
+                        .ok_or_else(|| {
+                            KernelSolveError::new(
+                                "kernel definition-code call-entry span overflows u32",
+                            )
+                        })?,
+                    len: call.entry_len,
+                },
+                contexts: Span32 {
+                    start: call_context_base
+                        .checked_add(call.context_start)
+                        .ok_or_else(|| {
+                            KernelSolveError::new(
+                                "kernel definition-code call-context span overflows u32",
+                            )
+                        })?,
+                    len: call.context_len,
+                },
+                context_binding: call.context_binding,
                 substitutions: Span32 {
                     start: call_substitution_base
                         .checked_add(call.substitution_start)
@@ -2886,7 +3298,33 @@ impl DefinitionCodeBuilder {
                     len: call.substitution_len,
                 },
                 syntax_discriminated_result: call.syntax_discriminated_result,
+                span: call.span,
+                authored_site_digest_v4: call.authored_site_digest_v4,
             });
+        }
+        for (label, consumed, supplied) in [
+            (
+                "call-substitution",
+                next_substitution as usize,
+                additional.call_substitutions.len(),
+            ),
+            (
+                "call-entry",
+                next_entry as usize,
+                additional.call_entries.len(),
+            ),
+            (
+                "call-context",
+                next_context as usize,
+                additional.call_contexts.len(),
+            ),
+        ] {
+            if consumed != supplied {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code owner {} consumes {consumed} {label} rows but received {supplied}",
+                    owner.0,
+                )));
+            }
         }
         let calls = Span32::append(&mut self.calls, packed_calls)?;
         if self.execution_node_by_call.len() != calls.start as usize {
@@ -3092,6 +3530,8 @@ impl DefinitionCodeBuilder {
             expression_kind_types: self.expression_kind_types.into_boxed_slice(),
             declaration_flows: self.declaration_flows.into_boxed_slice(),
             calls: self.calls.into_boxed_slice(),
+            call_entries: self.call_entries.into_boxed_slice(),
+            call_contexts: self.call_contexts.into_boxed_slice(),
             call_substitutions: self.call_substitutions.into_boxed_slice(),
             source_payload_types: self.source_payload_types.into_boxed_slice(),
             states: self.states.into_boxed_slice(),
@@ -3114,6 +3554,7 @@ impl DefinitionCodeBuilder {
         };
         store.validate_execution()?;
         store.validate_callable_schemes()?;
+        store.validate_call_topology()?;
         #[cfg(debug_assertions)]
         store.validate()?;
         Ok(store)
@@ -3142,9 +3583,17 @@ mod tests {
                     u32::try_from(ordinal).expect("test call count fits u32"),
                 ),
                 target: None,
+                function: None,
+                entry_start: 0,
+                entry_len: 0,
+                context_start: 0,
+                context_len: 0,
+                context_binding: PackedCallContextBinding::None,
                 substitution_start: 0,
                 substitution_len: 0,
                 syntax_discriminated_result: false,
+                span: KernelSourceSpan::default(),
+                authored_site_digest_v4: [0; 32],
             })
             .collect::<Vec<_>>();
         let expression_flush_types = vec![None; expression_count];
@@ -3176,6 +3625,8 @@ mod tests {
                     expression_kind_types: &expression_kind_types,
                     declaration_flows: &[],
                     calls: &calls,
+                    call_entries: &[],
+                    call_contexts: &[],
                     call_substitutions: &[],
                     source_payload_types: &source_payload_types,
                     state_input_count: state_count,
@@ -3196,7 +3647,12 @@ mod tests {
         target: Option<KernelCallableSchemeId>,
         substitution_parameters: &[u32],
     ) -> Result<DefinitionCodeStore, KernelSolveError> {
-        let mut arena = TypeTermArena::new();
+        let mut text = boon_contract::PackedTextCatalogBuilder::new();
+        let function = text
+            .intern_symbol("test_call")
+            .expect("test function symbol interns")
+            .coordinate();
+        let mut arena = TypeTermArena::with_text(text.freeze());
         let user_source = TypeVariableId(7);
         let abi_base = TypeVariableId(100);
         let abi_result_source = TypeVariableId(102);
@@ -3239,10 +3695,18 @@ mod tests {
         let calls = [PackedCallFactsInput {
             expression: crate::KernelExpressionId(0),
             target,
+            function: target.map(|_| function),
+            entry_start: 0,
+            entry_len: 0,
+            context_start: 0,
+            context_len: 0,
+            context_binding: PackedCallContextBinding::None,
             substitution_start: 0,
             substitution_len: u32::try_from(substitution_parameters.len())
                 .expect("test substitution count fits u32"),
             syntax_discriminated_result: true,
+            span: KernelSourceSpan::default(),
+            authored_site_digest_v4: [0; 32],
         }];
         let substitutions = substitution_parameters
             .iter()
@@ -3268,6 +3732,8 @@ mod tests {
                 expression_kind_types: &[None],
                 declaration_flows: &[],
                 calls: &calls,
+                call_entries: &[],
+                call_contexts: &[],
                 call_substitutions: &substitutions,
                 source_payload_types: &[],
                 state_input_count: 0,
@@ -3542,6 +4008,8 @@ mod tests {
                     expression_kind_types: &kind_types,
                     declaration_flows: &declarations,
                     calls: &[],
+                    call_entries: &[],
+                    call_contexts: &[],
                     call_substitutions: &[],
                     source_payload_types: &[],
                     state_input_count: states.len(),
@@ -3604,9 +4072,17 @@ mod tests {
         let invalid_call = [PackedCallFactsInput {
             expression: crate::KernelExpressionId(1),
             target: None,
+            function: None,
+            entry_start: 0,
+            entry_len: 0,
+            context_start: 0,
+            context_len: 0,
+            context_binding: PackedCallContextBinding::None,
             substitution_start: 0,
             substitution_len: 0,
             syntax_discriminated_result: false,
+            span: KernelSourceSpan::default(),
+            authored_site_digest_v4: [0; 32],
         }];
         let mut builder = DefinitionCodeBuilder::with_capacity(1, 1, 0);
         let error = builder
@@ -3622,6 +4098,8 @@ mod tests {
                     expression_kind_types: &[None],
                     declaration_flows: &[],
                     calls: &invalid_call,
+                    call_entries: &[],
+                    call_contexts: &[],
                     call_substitutions: &[],
                     source_payload_types: &[],
                     state_input_count: 0,
@@ -3660,6 +4138,8 @@ mod tests {
                     expression_kind_types: &[None],
                     declaration_flows: &[],
                     calls: &[],
+                    call_entries: &[],
+                    call_contexts: &[],
                     call_substitutions: &[],
                     source_payload_types: &[],
                     state_input_count: 1,
@@ -3679,6 +4159,158 @@ mod tests {
                 .to_string()
                 .contains("outside its 1 authored state rows")
         );
+    }
+
+    #[test]
+    fn call_topology_rejects_invalid_spans_and_duplicate_parameters() {
+        let mut text = boon_contract::PackedTextCatalogBuilder::new();
+        let function = text
+            .intern_symbol("topology_test")
+            .expect("test function symbol interns")
+            .coordinate();
+        let arena = TypeTermArena::with_text(text.freeze());
+        let unknown = arena.unknown();
+        let flow = KernelArtifactFlowTermV1 {
+            mode: FlowMode::Continuous,
+            term: unknown,
+            stable_digest: [0; 32],
+            runtime_erased_digest: [0; 32],
+        };
+        let call = PackedCallFactsInput {
+            expression: crate::KernelExpressionId(0),
+            target: Some(KernelCallableSchemeId::Abi(KernelAbiCallableId(0))),
+            function: Some(function),
+            entry_start: 0,
+            entry_len: 1,
+            context_start: 0,
+            context_len: 0,
+            context_binding: PackedCallContextBinding::None,
+            substitution_start: 0,
+            substitution_len: 0,
+            syntax_discriminated_result: false,
+            span: KernelSourceSpan {
+                line: 1,
+                start: 0,
+                end: 1,
+            },
+            authored_site_digest_v4: [1; 32],
+        };
+        let mut builder = DefinitionCodeBuilder::with_capacity(1, 1, 0);
+        builder
+            .install_abi_callable_schemes(
+                vec![PackedAbiCallableSchemeInput {
+                    formals: vec![PackedFlow {
+                        mode: flow.mode,
+                        term: flow.term,
+                    }]
+                    .into_boxed_slice(),
+                    result: PackedFlow {
+                        mode: flow.mode,
+                        term: flow.term,
+                    },
+                    type_parameters: Box::new([]),
+                    variable_base: TypeVariableId(0),
+                }]
+                .into_boxed_slice(),
+            )
+            .unwrap();
+        let error = builder
+            .push(
+                KernelOwnerId(0),
+                flow,
+                &[],
+                &[flow],
+                DefinitionAdditionalTypeRoots {
+                    effect_summary: crate::KernelEffectSummary::default(),
+                    basis_fingerprint_v14: [0; 32],
+                    expression_flush_types: &[None],
+                    expression_kind_types: &[None],
+                    declaration_flows: &[],
+                    calls: &[call],
+                    call_entries: &[],
+                    call_contexts: &[],
+                    call_substitutions: &[],
+                    source_payload_types: &[],
+                    state_input_count: 0,
+                    states: &[],
+                    list_item_types: &[],
+                    resource_projection_requirements: &[],
+                    resource_projection_origins: &[],
+                    resource_projection_symbols: &[],
+                    alpha_variables: &[],
+                    callable_type_parameters: &[],
+                    stable_digest: [0; 32],
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("call-entry span is outside"));
+
+        let mut builder = DefinitionCodeBuilder::with_capacity(1, 1, 0);
+        builder
+            .install_abi_callable_schemes(
+                vec![PackedAbiCallableSchemeInput {
+                    formals: vec![PackedFlow {
+                        mode: flow.mode,
+                        term: flow.term,
+                    }]
+                    .into_boxed_slice(),
+                    result: PackedFlow {
+                        mode: flow.mode,
+                        term: flow.term,
+                    },
+                    type_parameters: Box::new([]),
+                    variable_base: TypeVariableId(0),
+                }]
+                .into_boxed_slice(),
+            )
+            .unwrap();
+        let duplicate_entries = [
+            PackedCallEntry::Input {
+                parameter_ordinal: 0,
+                value: KernelValueReference::Local(crate::KernelExpressionId(0)),
+                from_pipe: false,
+            },
+            PackedCallEntry::Input {
+                parameter_ordinal: 0,
+                value: KernelValueReference::Local(crate::KernelExpressionId(0)),
+                from_pipe: false,
+            },
+        ];
+        let duplicate_call = PackedCallFactsInput {
+            entry_len: 2,
+            ..call
+        };
+        builder
+            .push(
+                KernelOwnerId(0),
+                flow,
+                &[],
+                &[flow],
+                DefinitionAdditionalTypeRoots {
+                    effect_summary: crate::KernelEffectSummary::default(),
+                    basis_fingerprint_v14: [0; 32],
+                    expression_flush_types: &[None],
+                    expression_kind_types: &[None],
+                    declaration_flows: &[],
+                    calls: &[duplicate_call],
+                    call_entries: &duplicate_entries,
+                    call_contexts: &[],
+                    call_substitutions: &[],
+                    source_payload_types: &[],
+                    state_input_count: 0,
+                    states: &[],
+                    list_item_types: &[],
+                    resource_projection_requirements: &[],
+                    resource_projection_origins: &[],
+                    resource_projection_symbols: &[],
+                    alpha_variables: &[],
+                    callable_type_parameters: &[],
+                    stable_digest: [0; 32],
+                },
+            )
+            .unwrap();
+        let error = builder.finish(Arc::new(arena.freeze())).unwrap_err();
+        assert!(error.to_string().contains("repeats entry parameter 0"));
     }
 
     #[test]
@@ -3727,6 +4359,8 @@ mod tests {
                     expression_kind_types: &[None, None],
                     declaration_flows: &[],
                     calls: &[],
+                    call_entries: &[],
+                    call_contexts: &[],
                     call_substitutions: &[],
                     source_payload_types: &[],
                     state_input_count: 0,

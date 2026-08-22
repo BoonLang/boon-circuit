@@ -7,7 +7,8 @@ use crate::{
     DefinitionTermProofScratch, FrozenTypeStore, KernelCollectionOperationKind, KernelPattern,
     KernelRecordEntry, KernelSelectArm, KernelSolveError, KernelSolveWork, KernelSummaryCallInput,
     KernelSummaryNode, KernelSummaryProgram, KernelSummaryProjectionStep, KernelSummaryRecordEntry,
-    KernelSummarySelectArm, KernelSummaryValueId, OutputId, PackedCallFactsInput, PackedCallRef,
+    KernelSummarySelectArm, KernelSummaryValueId, OutputId, PackedCallContext,
+    PackedCallContextBinding, PackedCallEntry, PackedCallFactsInput, PackedCallRef,
     PackedCallTypeSubstitution, PackedCallableTypeParameter, PackedDiagnosticTypes,
     PackedExpressionRef, PackedFlow, PackedPublishedState,
     PackedResourceProjectionRequirementInput, PackedSourceReadInput, PublishMode, TypeTerm,
@@ -1643,6 +1644,8 @@ pub enum KernelCallInputRoleRef<'a> {
 #[derive(Debug)]
 struct SolvedDefinitionCallFacts {
     calls: Box<[PackedCallFactsInput]>,
+    entries: Box<[PackedCallEntry]>,
+    contexts: Box<[PackedCallContext]>,
     substitutions: Box<[PackedCallTypeSubstitution]>,
 }
 
@@ -6362,6 +6365,8 @@ fn build_definition_code_builder(
     {
         let SolvedDefinitionCallFacts {
             calls: packed_calls,
+            entries: packed_call_entries,
+            contexts: packed_call_contexts,
             substitutions: packed_call_substitutions,
         } = owner_call_facts;
         let resource_projection_facts = &resource_projection_facts[owner_index];
@@ -6689,6 +6694,8 @@ fn build_definition_code_builder(
                 expression_kind_types: &expression_kind_types,
                 declaration_flows: &declaration_flows,
                 calls: &packed_calls,
+                call_entries: &packed_call_entries,
+                call_contexts: &packed_call_contexts,
                 call_substitutions: &packed_call_substitutions,
                 source_payload_types: &source_payload_types,
                 state_input_count: definition_facts[owner_index].states.len(),
@@ -9222,6 +9229,151 @@ fn project_interface_snapshot(
 /// interfaces. Complete checked demand additionally retains substitutions and
 /// exact call-result syntax receipts; diagnostics demand deliberately neither
 /// computes nor roots those checked-only facts.
+fn packed_call_parameter<'a>(
+    program: &'a KernelProjectProgramInput,
+    definition_facts: &'a [KernelDefinitionFactsInput],
+    abi: &'a crate::KernelAbiInput,
+    target: crate::KernelCallableSchemeId,
+    role: KernelCallInputRoleRef<'_>,
+) -> Result<(u32, CheckedParameterKind, &'a str), KernelSolveError> {
+    match (target, role) {
+        (
+            crate::KernelCallableSchemeId::User(owner),
+            KernelCallInputRoleRef::Formal { ordinal },
+        ) => {
+            let target_input = program.owners.get(owner.0 as usize).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel packed call topology references missing user owner {}",
+                    owner.0,
+                ))
+            })?;
+            let facts = definition_facts.get(owner.0 as usize).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel packed call topology references missing user facts {}",
+                    owner.0,
+                ))
+            })?;
+            let root = facts
+                .linkage
+                .root_statement
+                .and_then(|root| facts.statements.get(root.0 as usize))
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel packed call topology user owner {} has no function header",
+                        owner.0,
+                    ))
+                })?;
+            let KernelStatementKind::Function { parameters, .. } = &root.kind else {
+                return Err(KernelSolveError::new(format!(
+                    "kernel packed call topology user owner {} is not callable",
+                    owner.0,
+                )));
+            };
+            let parameter = parameters
+                .get(ordinal as usize)
+                .filter(|parameter| parameter.ordinal == ordinal)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel packed call topology user owner {} has no parameter {ordinal}",
+                        owner.0,
+                    ))
+                })?;
+            if ordinal >= target_input.formal_count {
+                return Err(KernelSolveError::new(format!(
+                    "kernel packed call topology user owner {} parameter {ordinal} is outside its formal count {}",
+                    owner.0, target_input.formal_count,
+                )));
+            }
+            Ok((
+                ordinal,
+                match parameter.kind {
+                    KernelParameterKind::Value => CheckedParameterKind::Value,
+                    KernelParameterKind::Out => CheckedParameterKind::Out,
+                },
+                parameter.name.as_ref(),
+            ))
+        }
+        (crate::KernelCallableSchemeId::Abi(callable), KernelCallInputRoleRef::Abi { name }) => {
+            let callable = abi.callable_by_id(callable).ok_or_else(|| {
+                KernelSolveError::new(
+                    "kernel packed call topology references a missing ABI callable",
+                )
+            })?;
+            let parameter = callable
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name.as_ref() == name)
+                .or_else(|| {
+                    (name == "$pipe").then(|| {
+                        callable
+                            .parameters
+                            .iter()
+                            .find(|parameter| parameter.kind == CheckedParameterKind::Value)
+                    })?
+                })
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel packed call topology ABI `{}` has no parameter `{name}`",
+                        callable.name,
+                    ))
+                })?;
+            Ok((parameter.ordinal, parameter.kind, parameter.name.as_ref()))
+        }
+        (crate::KernelCallableSchemeId::User(owner), KernelCallInputRoleRef::Abi { name }) => {
+            Err(KernelSolveError::new(format!(
+                "kernel packed call topology user owner {} received ABI parameter `{name}`",
+                owner.0,
+            )))
+        }
+        (
+            crate::KernelCallableSchemeId::Abi(callable),
+            KernelCallInputRoleRef::Formal { ordinal },
+        ) => Err(KernelSolveError::new(format!(
+            "kernel packed call topology ABI {} received user formal {ordinal}",
+            callable.0,
+        ))),
+    }
+}
+
+fn exact_call_declaration_by_origin<'a>(
+    facts: &'a KernelDefinitionFactsInput,
+    origin: &KernelDeclarationOrigin,
+    label: &str,
+) -> Result<&'a KernelDeclarationInput, KernelSolveError> {
+    let mut declarations = facts
+        .declarations
+        .iter()
+        .filter(|declaration| &declaration.origin == origin);
+    let declaration = declarations.next().ok_or_else(|| {
+        KernelSolveError::new(format!(
+            "kernel packed call topology has no {label} declaration for {origin:?}",
+        ))
+    })?;
+    if declarations.next().is_some() {
+        return Err(KernelSolveError::new(format!(
+            "kernel packed call topology has multiple {label} declarations for {origin:?}",
+        )));
+    }
+    Ok(declaration)
+}
+
+fn exact_call_declaration_presentation<'a>(
+    facts: &'a KernelDefinitionFactsInput,
+    declaration: KernelDeclarationId,
+) -> Result<&'a KernelDeclarationPresentation, KernelSolveError> {
+    facts
+        .presentation
+        .declarations
+        .get(declaration.0 as usize)
+        .filter(|row| row.declaration == declaration)
+        .ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel packed call topology declaration {} has no presentation row",
+                declaration.0,
+            ))
+        })
+}
+
 fn project_call_facts_and_diagnostics(
     program: &KernelProjectProgramInput,
     definition_facts: &[KernelDefinitionFactsInput],
@@ -9252,6 +9404,8 @@ fn project_call_facts_and_diagnostics(
         let owner_id = definition.owner;
         let owner = definition.outputs;
         let mut owner_call_facts = Vec::with_capacity(owner.calls.len());
+        let mut owner_call_entries = Vec::new();
+        let mut owner_call_contexts = Vec::new();
         let mut owner_call_substitutions = Vec::new();
         let mut diagnostics =
             collect_definition_diagnostic_artifacts(owner_id, definition.input, definition.facts)
@@ -9263,7 +9417,7 @@ fn project_call_facts_and_diagnostics(
                     types: None,
                 })
                 .collect::<Vec<_>>();
-        for call in definition.calls() {
+        for (call_ordinal, call) in definition.calls().enumerate() {
             let call_target = call.target();
             let mut target_scheme = match call_target {
                 KernelCallTargetRef::User { target, .. } => {
@@ -9405,6 +9559,324 @@ fn project_call_facts_and_diagnostics(
             if !retain_call_facts {
                 continue;
             }
+            let source_topology_complete = definition
+                .facts
+                .call_syntax
+                .get(call_ordinal)
+                .is_some_and(|syntax| syntax.expression == call.expression())
+                && definition
+                    .facts
+                    .presentation
+                    .expressions
+                    .get(call.expression().0 as usize)
+                    .is_some_and(|row| row.expression == call.expression());
+            if cfg!(test) && !source_topology_complete {
+                // Focused solver tests intentionally construct only type
+                // equations. They never enter the checked linker, so retain
+                // their call type facts while leaving source topology absent.
+                // Non-test builds fail closed below and can never publish a
+                // RuntimePacked call without exact syntax/presentation.
+                let substitution_start = u32::try_from(owner_call_substitutions.len())
+                    .expect("kernel definition call-substitution start exceeds u32");
+                owner_call_substitutions.extend_from_slice(&substitutions);
+                let substitution_len = u32::try_from(substitutions.len())
+                    .expect("kernel definition call-substitution count exceeds u32");
+                let result_output = owner.expressions.get(call.expression().0 as usize).copied();
+                let result_is_concrete = result_output
+                    .and_then(|output| artifact.term(output))
+                    .is_some_and(|term| {
+                        packed_term_has_concrete_outer_shape(artifact.terms(), term)
+                    });
+                let call_syntax_selected = result_output.is_some_and(|output| {
+                    artifact
+                        .output_flags(output)
+                        .is_some_and(|flags| flags.call_syntax_selected)
+                });
+                let exact_structural_constructor = matches!(
+                    call_target,
+                    KernelCallTargetRef::RenderConstructor { .. }
+                        | KernelCallTargetRef::PureBuiltin {
+                            kind: KernelPureBuiltinKind::RecordConstructor,
+                        }
+                );
+                owner_call_facts.push(PackedCallFactsInput {
+                    expression: call.expression(),
+                    target: target_scheme,
+                    function: None,
+                    entry_start: u32::try_from(owner_call_entries.len())
+                        .expect("kernel definition call-entry start exceeds u32"),
+                    entry_len: 0,
+                    context_start: u32::try_from(owner_call_contexts.len())
+                        .expect("kernel definition call-context start exceeds u32"),
+                    context_len: 0,
+                    context_binding: PackedCallContextBinding::None,
+                    substitution_start,
+                    substitution_len,
+                    syntax_discriminated_result: (exact_structural_constructor
+                        || call.solve.syntax_discriminated_candidate
+                        || (matches!(call_target, KernelCallTargetRef::User { .. })
+                            && (call_syntax_selected
+                                || call.solve.syntax_discriminated_root_output.is_some_and(
+                                    |output| {
+                                        artifact
+                                            .output_flags(output)
+                                            .is_some_and(|flags| flags.syntax_selected_here)
+                                    },
+                                ))))
+                        && result_is_concrete,
+                    span: KernelSourceSpan::default(),
+                    authored_site_digest_v4: [0; 32],
+                });
+                continue;
+            }
+            let syntax = definition
+                .facts
+                .call_syntax
+                .get(call_ordinal)
+                .filter(|syntax| syntax.expression == call.expression())
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition {} call expression {} has no aligned authored syntax row",
+                        owner_id.0,
+                        call.expression().0,
+                    ))
+                })?;
+            let target_scheme = target_scheme.ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel definition {} call `{}` has no retained target scheme",
+                    owner_id.0, syntax.function,
+                ))
+            })?;
+            let function = artifact
+                .terms()
+                .text_snapshot()
+                .lookup_symbol(&syntax.function)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition {} call function `{}` is absent from the project text authority",
+                        owner_id.0, syntax.function,
+                    ))
+                })?;
+            let presentation = definition
+                .facts
+                .presentation
+                .expressions
+                .get(call.expression().0 as usize)
+                .filter(|row| row.expression == call.expression())
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition {} call expression {} has no presentation row",
+                        owner_id.0,
+                        call.expression().0,
+                    ))
+                })?;
+            let entry_start = u32::try_from(owner_call_entries.len())
+                .expect("kernel definition call-entry start exceeds u32");
+            let pipe_input = syntax
+                .pipe_input
+                .map(|value| definition.resolve_value(value, call.expression().0 as usize))
+                .transpose()
+                .map_err(|error| KernelSolveError::new(error.to_string()))?;
+            for input in call.inputs() {
+                let role = call
+                    .input_role(input)
+                    .map_err(|error| KernelSolveError::new(error.to_string()))?;
+                if let (
+                    KernelCallTargetRef::User { target, .. },
+                    KernelCallInputRoleRef::Formal { ordinal },
+                ) = (call_target, role)
+                    && definition_facts
+                        .get(target.0 as usize)
+                        .is_some_and(|facts| facts.linkage.context_formal_ordinal == Some(ordinal))
+                {
+                    // PASSED is retained by the dedicated context binding,
+                    // never as an ordinary call entry.
+                    continue;
+                }
+                let value = call
+                    .input_value(input)
+                    .map_err(|error| KernelSolveError::new(error.to_string()))?;
+                let (parameter_ordinal, parameter_kind, parameter_name) =
+                    packed_call_parameter(program, definition_facts, abi, target_scheme, role)?;
+                let from_pipe = pipe_input == Some(value);
+                let argument = if from_pipe {
+                    None
+                } else {
+                    syntax.arguments.iter().find(|argument| {
+                        argument.name.as_ref() == parameter_name
+                            && definition
+                                .resolve_value(argument.value, call.expression().0 as usize)
+                                .is_ok_and(|argument| argument == value)
+                    })
+                };
+                match parameter_kind {
+                    CheckedParameterKind::Value => {
+                        if argument
+                            .is_some_and(|argument| argument.kind != KernelCallArgumentKind::Named)
+                        {
+                            return Err(KernelSolveError::new(format!(
+                                "kernel definition {} call `{}` binds value input `{parameter_name}` as a bare OUT",
+                                owner_id.0, syntax.function,
+                            )));
+                        }
+                        if !from_pipe && argument.is_none() {
+                            return Err(KernelSolveError::new(format!(
+                                "kernel definition {} call `{}` value input `{parameter_name}` has no exact authored argument",
+                                owner_id.0, syntax.function,
+                            )));
+                        }
+                        owner_call_entries.push(PackedCallEntry::Input {
+                            parameter_ordinal,
+                            value,
+                            from_pipe,
+                        });
+                    }
+                    CheckedParameterKind::Out => {
+                        if from_pipe {
+                            return Err(KernelSolveError::new(format!(
+                                "kernel definition {} call `{}` pipes into OUT parameter `{parameter_name}`",
+                                owner_id.0, syntax.function,
+                            )));
+                        }
+                        let argument = argument.ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "kernel definition {} call `{}` OUT input `{parameter_name}` has no exact authored argument",
+                                owner_id.0, syntax.function,
+                            ))
+                        })?;
+                        match argument.kind {
+                            KernelCallArgumentKind::BareBinding => {
+                                let declaration = exact_call_declaration_by_origin(
+                                    definition.facts,
+                                    &KernelDeclarationOrigin::CallbackBinding {
+                                        call: call.expression(),
+                                        ordinal: parameter_ordinal,
+                                    },
+                                    "FreshOut",
+                                )?;
+                                let presentation = exact_call_declaration_presentation(
+                                    definition.facts,
+                                    declaration.id,
+                                )?;
+                                let scope = presentation.body_scope.ok_or_else(|| {
+                                    KernelSolveError::new(format!(
+                                        "kernel definition {} FreshOut `{parameter_name}` has no output scope",
+                                        owner_id.0,
+                                    ))
+                                })?;
+                                owner_call_entries.push(PackedCallEntry::FreshOut {
+                                    parameter_ordinal,
+                                    output: declaration.id,
+                                    scope,
+                                });
+                            }
+                            KernelCallArgumentKind::Named => {
+                                let KernelValueReference::Local(expression) = value else {
+                                    return Err(KernelSolveError::new(format!(
+                                        "kernel definition {} call `{}` forwards OUT `{parameter_name}` through a non-local occurrence",
+                                        owner_id.0, syntax.function,
+                                    )));
+                                };
+                                let binding = definition
+                                    .facts
+                                    .lexical_bindings
+                                    .iter()
+                                    .find(|binding| {
+                                        binding.expression == expression
+                                            && binding.projection.is_empty()
+                                    })
+                                    .ok_or_else(|| {
+                                        KernelSolveError::new(format!(
+                                            "kernel definition {} call `{}` forwarded OUT `{parameter_name}` has no exact lexical target",
+                                            owner_id.0, syntax.function,
+                                        ))
+                                    })?;
+                                let KernelLexicalBindingTargetInput::Declaration(target) =
+                                    binding.target
+                                else {
+                                    return Err(KernelSolveError::new(format!(
+                                        "kernel definition {} call `{}` forwarded OUT `{parameter_name}` targets a non-declaration",
+                                        owner_id.0, syntax.function,
+                                    )));
+                                };
+                                owner_call_entries.push(PackedCallEntry::ForwardOut {
+                                    parameter_ordinal,
+                                    target,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            let entry_len = u32::try_from(owner_call_entries.len())
+                .expect("kernel definition call-entry count exceeds u32")
+                .checked_sub(entry_start)
+                .expect("kernel definition call-entry range is monotonic");
+
+            let context_start = u32::try_from(owner_call_contexts.len())
+                .expect("kernel definition call-context start exceeds u32");
+            if let crate::KernelCallableSchemeId::Abi(callable) = target_scheme {
+                let callable = abi.callable_by_id(callable).ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition {} call `{}` references a missing ABI context scheme",
+                        owner_id.0, syntax.function,
+                    ))
+                })?;
+                for (context_ordinal, context) in callable.contexts.iter().enumerate() {
+                    let context_ordinal = u32::try_from(context_ordinal)
+                        .expect("kernel call-context ordinal exceeds u32");
+                    let declaration = exact_call_declaration_by_origin(
+                        definition.facts,
+                        &KernelDeclarationOrigin::CallContext {
+                            call: call.expression(),
+                            ordinal: context_ordinal,
+                        },
+                        "call context",
+                    )?;
+                    if declaration.name != context.name {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel definition {} call `{}` context {context_ordinal} is named `{}` instead of `{}`",
+                            owner_id.0, syntax.function, declaration.name, context.name,
+                        )));
+                    }
+                    let presentation =
+                        exact_call_declaration_presentation(definition.facts, declaration.id)?;
+                    owner_call_contexts.push(PackedCallContext {
+                        declaration: declaration.id,
+                        signature_ordinal: context_ordinal,
+                        scope: presentation.scope,
+                    });
+                }
+            }
+            let context_len = u32::try_from(owner_call_contexts.len())
+                .expect("kernel definition call-context count exceeds u32")
+                .checked_sub(context_start)
+                .expect("kernel definition call-context range is monotonic");
+            let context_binding = if let Some(pass) = syntax.pass {
+                PackedCallContextBinding::Explicit {
+                    value: definition
+                        .resolve_value(pass.value, call.expression().0 as usize)
+                        .map_err(|error| KernelSolveError::new(error.to_string()))?,
+                    span: pass.span,
+                }
+            } else if let KernelCallTargetRef::User {
+                inherited_formal: Some(inherited),
+                ..
+            } = call_target
+            {
+                if definition.facts.linkage.context_formal_ordinal != Some(inherited.caller_ordinal)
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition {} call `{}` inherits caller formal {} without matching linkage",
+                        owner_id.0, syntax.function, inherited.caller_ordinal,
+                    )));
+                }
+                PackedCallContextBinding::Inherited {
+                    caller_formal_ordinal: inherited.caller_ordinal,
+                }
+            } else {
+                PackedCallContextBinding::None
+            };
             let substitution_start = u32::try_from(owner_call_substitutions.len())
                 .expect("kernel definition call-substitution start exceeds u32");
             owner_call_substitutions.extend_from_slice(&substitutions);
@@ -9428,7 +9900,13 @@ fn project_call_facts_and_diagnostics(
             );
             owner_call_facts.push(PackedCallFactsInput {
                 expression: call.expression(),
-                target: target_scheme,
+                target: Some(target_scheme),
+                function: Some(function),
+                entry_start,
+                entry_len,
+                context_start,
+                context_len,
+                context_binding,
                 substitution_start,
                 substitution_len,
                 // CheckedCall exposes one existing exact-occurrence bit to
@@ -9449,11 +9927,18 @@ fn project_call_facts_and_diagnostics(
                                 },
                             ))))
                     && result_is_concrete,
+                span: presentation.span,
+                authored_site_digest_v4: boon_checked::checked_structural_call_site_digest_v4(
+                    &syntax.occurrence,
+                )
+                .map_err(KernelSolveError::new)?,
             });
         }
         diagnostics.sort_unstable_by(|left, right| left.metadata.site().cmp(right.metadata.site()));
         project_call_facts.push(SolvedDefinitionCallFacts {
             calls: owner_call_facts.into_boxed_slice(),
+            entries: owner_call_entries.into_boxed_slice(),
+            contexts: owner_call_contexts.into_boxed_slice(),
             substitutions: owner_call_substitutions.into_boxed_slice(),
         });
         project_diagnostics.push(SolvedDefinitionDiagnostics {

@@ -3556,6 +3556,8 @@ mod tests {
                 expression_kind_types: &[None],
                 declaration_flows: &[],
                 calls: &[],
+                call_entries: &[],
+                call_contexts: &[],
                 call_substitutions: &[],
                 source_payload_types: &[],
                 state_input_count: 0,

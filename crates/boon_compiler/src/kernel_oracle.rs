@@ -22,8 +22,8 @@ use boon_compiler_kernel::{
     KernelAbiParameterInput, KernelAbiResultSpecialization, KernelCallArgumentKind,
     KernelCallArgumentSource, KernelCallInputRole, KernelCallPassInput, KernelCallShapeArgument,
     KernelCallShapeInput, KernelCallShapeParameter, KernelCallShapeResolution,
-    KernelCallSyntaxArgument, KernelCallSyntaxInput, KernelCallTypeSubstitution,
-    KernelCallableAbiInput, KernelCallableKind, KernelCheckProduct, KernelCheckedLinkLayout,
+    KernelCallSyntaxArgument, KernelCallSyntaxInput, KernelCallableAbiInput, KernelCallableKind,
+    KernelCheckProduct, KernelCheckedCallableTypeParameterLayout, KernelCheckedLinkLayout,
     KernelCheckedRowProjectionDemand, KernelCollectionKind, KernelCompileWork,
     KernelConditionalKind, KernelDeclarationId, KernelDeclarationInput, KernelDeclarationKind,
     KernelDeclarationOrigin, KernelDeclarationPresentation, KernelDeclarationReference,
@@ -43,8 +43,8 @@ use boon_compiler_kernel::{
     KernelStateInput, KernelStatementChildReference, KernelStatementId, KernelStatementInput,
     KernelStatementKind, KernelStatementParameter, KernelStatementPresentation,
     KernelStatementReference, KernelStatementValueUse, KernelStructuralDeclarationInput,
-    KernelTextTemplateSegment, KernelTypeMismatch, KernelValueReference, is_kernel_host_effect,
-    is_registered_kernel_host_effect, project_kernel_call_shape,
+    KernelTextTemplateSegment, KernelTypeMismatch, KernelTypeParameterId, KernelValueReference,
+    is_kernel_host_effect, is_registered_kernel_host_effect, project_kernel_call_shape,
     project_kernel_source_expression_diagnostics,
 };
 use boon_data::{Bits, ExactNumber};
@@ -415,8 +415,16 @@ pub struct KernelOwnerOracleCall {
     pub pass: Option<KernelOwnerOracleCallPass>,
     pub target: KernelOwnerOracleCallTarget,
     pub inputs: Box<[KernelOwnerOracleCallInput]>,
-    pub type_substitutions: Box<[KernelCallTypeSubstitution]>,
+    pub type_substitutions: Box<[KernelOwnerOracleCallTypeSubstitution]>,
     pub result: FlowType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelOwnerOracleCallTypeSubstitution {
+    /// Target-bound packed parameter ordinal. This is deliberately not a
+    /// linked alpha coordinate or an absolute checked `TypeVar`.
+    pub variable: KernelTypeParameterId,
+    pub value: Type,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -503,6 +511,7 @@ pub struct KernelOwnerOracleReport {
     pub checked_statements: Box<[CheckedStatement]>,
     pub checked_statement_keys: Box<[StableStatementKey]>,
     pub checked_callables: Box<[CheckedCallableSignature]>,
+    pub checked_callable_type_parameters: Box<[KernelCheckedCallableTypeParameterLayout]>,
     pub checked_context_formals: Box<[CheckedContextFormal]>,
     pub checked_calls: Box<[CheckedCall]>,
     pub checked_call_occurrences: Box<[StableOccurrenceKey]>,
@@ -1245,6 +1254,8 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
     let mut checked_statements: Box<[CheckedStatement]> = Box::new([]);
     let mut checked_statement_keys: Box<[StableStatementKey]> = Box::new([]);
     let mut checked_callables: Box<[CheckedCallableSignature]> = Box::new([]);
+    let mut checked_callable_type_parameters: Box<[KernelCheckedCallableTypeParameterLayout]> =
+        Box::new([]);
     let mut checked_context_formals: Box<[CheckedContextFormal]> = Box::new([]);
     let mut checked_calls: Box<[CheckedCall]> = Box::new([]);
     let mut checked_call_occurrences: Box<[StableOccurrenceKey]> = Box::new([]);
@@ -1301,6 +1312,9 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                         .expect("a solved kernel graph retains its immutable input");
                     let layout_started = Instant::now();
                     let layout = KernelCheckedLinkLayout::new(kernel_input, &checked)
+                        .map_err(|error| error.to_string())?;
+                    let materialized_callable_type_parameters = layout
+                        .callable_type_parameter_layouts(&checked)
                         .map_err(|error| error.to_string())?;
                     let layout_us = elapsed_us(layout_started.elapsed());
                     checked_link_references = layout.totals().resolved_references;
@@ -1412,6 +1426,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     checked_states = materialized_states;
                     checked_lists = materialized_lists;
                     checked_callables = materialized_callables;
+                    checked_callable_type_parameters = materialized_callable_type_parameters;
                     checked_context_formals = materialized_context_formals;
                     checked_calls = materialized_calls;
                     checked_call_occurrences = materialized_call_occurrences;
@@ -2061,6 +2076,16 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                             let facts = code
                                 .materialize_call_facts(ordinal)
                                 .expect("kernel call owns one packed fact row");
+                            let type_substitutions = facts
+                                .substitutions
+                                .into_vec()
+                                .into_iter()
+                                .map(|substitution| KernelOwnerOracleCallTypeSubstitution {
+                                    variable: substitution.variable,
+                                    value: substitution.value,
+                                })
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice();
                             let result = code
                                 .materialize_expression(expression.0 as usize)
                                 .expect("kernel call owns one packed result flow");
@@ -2172,7 +2197,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                                     })
                                     .collect::<Vec<_>>()
                                     .into_boxed_slice(),
-                                type_substitutions: facts.substitutions,
+                                type_substitutions,
                                 result,
                             }
                         })
@@ -2307,6 +2332,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
         checked_statements,
         checked_statement_keys,
         checked_callables,
+        checked_callable_type_parameters,
         checked_context_formals,
         checked_calls,
         checked_call_occurrences,
@@ -11987,9 +12013,8 @@ mod tests {
         CheckedDeclarationKind, CheckedExpressionKind, CheckedProgramFields, CheckedStatementKind,
         DeclId, ObjectShape, SharedVariantSet, TypeVar, Variant,
     };
-    use boon_compiler_kernel::{KernelTypeParameterId, derive_kernel_call_type_substitutions};
     use boon_parser::{parse_project_syntax, parse_source};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::Path;
     use std::time::Instant;
@@ -12944,51 +12969,1116 @@ mod tests {
         mismatches
     }
 
-    fn normalized_checked_call_substitutions(
-        call: &boon_checked::CheckedCall,
-        callables: &[CheckedCallableSignature],
-        context_formals: &[CheckedContextFormal],
-    ) -> Option<Box<[KernelCallTypeSubstitution]>> {
-        let callable = callables
-            .iter()
-            .find(|callable| callable.decl_id == call.callable)?;
+    fn collect_checked_type_variables(ty: &Type, variables: &mut BTreeSet<boon_checked::TypeVar>) {
+        match ty {
+            Type::Var(variable) => {
+                variables.insert(*variable);
+            }
+            Type::Object(shape) => {
+                for (_, field) in shape.ordered_fields() {
+                    collect_checked_type_variables(field, variables);
+                }
+            }
+            Type::List(item) | Type::Set(item) => {
+                collect_checked_type_variables(item, variables);
+            }
+            Type::Map { key, value } => {
+                collect_checked_type_variables(key, variables);
+                collect_checked_type_variables(value, variables);
+            }
+            Type::Function { args, result } => {
+                for argument in args {
+                    collect_checked_type_variables(argument, variables);
+                }
+                collect_checked_type_variables(&result.ty, variables);
+            }
+            Type::VariantSet(variants) => {
+                for variant in variants {
+                    if let Variant::Tagged { fields, .. } = variant {
+                        for (_, field) in fields.ordered_fields() {
+                            collect_checked_type_variables(field, variables);
+                        }
+                    }
+                }
+            }
+            Type::Union(members) => {
+                for member in members {
+                    collect_checked_type_variables(member, variables);
+                }
+            }
+            Type::Text
+            | Type::Number
+            | Type::Bytes(_)
+            | Type::Bits { .. }
+            | Type::Absent
+            | Type::RenderContract
+            | Type::UnresolvedShape { .. }
+            | Type::Unknown => {}
+        }
+    }
+
+    fn checked_callable_scheme_roots<'a>(
+        callable: &'a CheckedCallableSignature,
+        context_formals: &'a [CheckedContextFormal],
+    ) -> Result<Vec<&'a FlowType>, String> {
         let mut parameters = callable.parameters.iter().collect::<Vec<_>>();
         parameters.sort_unstable_by_key(|parameter| parameter.ordinal);
-        let mut variables = BTreeMap::new();
-        for parameter in parameters {
-            collect_callable_type_parameter_ids(&parameter.flow_type.ty, &mut variables);
+        for (ordinal, parameter) in parameters.iter().enumerate() {
+            if parameter.ordinal != ordinal {
+                return Err(format!(
+                    "callable {:?} has non-dense parameter ordinal {} at row {ordinal}",
+                    callable.decl_id, parameter.ordinal,
+                ));
+            }
         }
+        let mut roots = parameters
+            .into_iter()
+            .map(|parameter| &parameter.flow_type)
+            .collect::<Vec<_>>();
         if let Some(formal) = callable.context_formal {
             let context = context_formals
                 .iter()
-                .find(|context| context.id == formal)?;
-            collect_callable_type_parameter_ids(&context.scheme.flow_type.ty, &mut variables);
+                .find(|context| context.id == formal)
+                .ok_or_else(|| {
+                    format!(
+                        "callable {:?} references missing PASSED context formal {formal:?}",
+                        callable.decl_id,
+                    )
+                })?;
+            roots.push(&context.scheme.flow_type);
         }
-        collect_callable_type_parameter_ids(&callable.result.ty, &mut variables);
-        let mut substitutions = call
+        roots.push(&callable.result);
+        Ok(roots)
+    }
+
+    fn direct_checked_callable_parameter_map(
+        callable: &CheckedCallableSignature,
+        context_formals: &[CheckedContextFormal],
+        layouts: &[KernelCheckedCallableTypeParameterLayout],
+    ) -> Result<BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>, String> {
+        let roots = checked_callable_scheme_roots(callable, context_formals)?;
+        let mut variables = BTreeSet::new();
+        for root in roots {
+            collect_checked_type_variables(&root.ty, &mut variables);
+        }
+        let retained = layouts
+            .iter()
+            .filter(|layout| layout.callable == callable.decl_id)
+            .collect::<Vec<_>>();
+        let mut by_variable = BTreeMap::new();
+        let mut by_parameter = BTreeMap::new();
+        let mut retained_target = None;
+        for (ordinal, layout) in retained.iter().enumerate() {
+            if retained_target
+                .replace(layout.target)
+                .is_some_and(|target| target != layout.target)
+            {
+                return Err(format!(
+                    "callable {:?} retained parameter rows disagree on their target scheme",
+                    callable.decl_id,
+                ));
+            }
+            let expected = boon_compiler_kernel::KernelTypeParameterId(
+                u32::try_from(ordinal)
+                    .map_err(|_| "checked callable type-parameter count exceeds u32".to_owned())?,
+            );
+            if layout.parameter != expected {
+                return Err(format!(
+                    "callable {:?} retained parameter order skips {:?} at {:?}",
+                    callable.decl_id, expected, layout.parameter,
+                ));
+            }
+            if by_variable
+                .insert(layout.linked_variable, layout.parameter)
+                .is_some()
+            {
+                return Err(format!(
+                    "callable {:?} repeats linked variable {:?}",
+                    callable.decl_id, layout.linked_variable,
+                ));
+            }
+            if by_parameter
+                .insert(layout.parameter, layout.linked_variable)
+                .is_some()
+            {
+                return Err(format!(
+                    "callable {:?} repeats target-bound parameter {:?}",
+                    callable.decl_id, layout.parameter,
+                ));
+            }
+        }
+        let retained_variables = by_variable.keys().copied().collect::<BTreeSet<_>>();
+        if variables != retained_variables {
+            return Err(format!(
+                "callable {:?} packed parameter layout differs from its parameter/PASSED/result variables: scheme={variables:?} retained={retained_variables:?}",
+                callable.decl_id,
+            ));
+        }
+        Ok(by_variable)
+    }
+
+    #[derive(Debug)]
+    struct CheckedCallableTypeParameterAlignment {
+        direct: BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>,
+        current: BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>,
+        used_direct_specialization: bool,
+    }
+
+    fn align_checked_callable_type_parameters(
+        direct: &CheckedCallableSignature,
+        direct_context_formals: &[CheckedContextFormal],
+        current: &CheckedCallableSignature,
+        current_context_formals: &[CheckedContextFormal],
+        layouts: &[KernelCheckedCallableTypeParameterLayout],
+        allow_direct_specialization: bool,
+    ) -> Result<CheckedCallableTypeParameterAlignment, String> {
+        fn contains_unresolved_parameter(
+            direct: &Type,
+            direct_parameters: &BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>,
+            current_by_parameter: &BTreeMap<KernelTypeParameterId, boon_checked::TypeVar>,
+            specialized_parameters: &BTreeMap<KernelTypeParameterId, Type>,
+        ) -> Result<bool, String> {
+            match direct {
+                Type::Var(variable) => {
+                    let parameter = direct_parameters.get(variable).copied().ok_or_else(|| {
+                        format!("direct callable variable {variable:?} has no retained parameter")
+                    })?;
+                    Ok(!current_by_parameter.contains_key(&parameter)
+                        && !specialized_parameters.contains_key(&parameter))
+                }
+                Type::Object(shape) => {
+                    for (_, field) in shape.ordered_fields() {
+                        if contains_unresolved_parameter(
+                            field,
+                            direct_parameters,
+                            current_by_parameter,
+                            specialized_parameters,
+                        )? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                Type::List(item) | Type::Set(item) => contains_unresolved_parameter(
+                    item,
+                    direct_parameters,
+                    current_by_parameter,
+                    specialized_parameters,
+                ),
+                Type::Map { key, value } => Ok(contains_unresolved_parameter(
+                    key,
+                    direct_parameters,
+                    current_by_parameter,
+                    specialized_parameters,
+                )? || contains_unresolved_parameter(
+                    value,
+                    direct_parameters,
+                    current_by_parameter,
+                    specialized_parameters,
+                )?),
+                Type::Function { args, result } => {
+                    for argument in args {
+                        if contains_unresolved_parameter(
+                            argument,
+                            direct_parameters,
+                            current_by_parameter,
+                            specialized_parameters,
+                        )? {
+                            return Ok(true);
+                        }
+                    }
+                    contains_unresolved_parameter(
+                        &result.ty,
+                        direct_parameters,
+                        current_by_parameter,
+                        specialized_parameters,
+                    )
+                }
+                Type::VariantSet(variants) => {
+                    for variant in variants {
+                        if let Variant::Tagged { fields, .. } = variant {
+                            for (_, field) in fields.ordered_fields() {
+                                if contains_unresolved_parameter(
+                                    field,
+                                    direct_parameters,
+                                    current_by_parameter,
+                                    specialized_parameters,
+                                )? {
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                    Ok(false)
+                }
+                Type::Union(members) => {
+                    for member in members {
+                        if contains_unresolved_parameter(
+                            member,
+                            direct_parameters,
+                            current_by_parameter,
+                            specialized_parameters,
+                        )? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                Type::Text
+                | Type::Number
+                | Type::Bytes(_)
+                | Type::Bits { .. }
+                | Type::Absent
+                | Type::RenderContract
+                | Type::UnresolvedShape { .. }
+                | Type::Unknown => Ok(false),
+            }
+        }
+
+        fn align_shape(
+            direct: &ObjectShape,
+            current: &ObjectShape,
+            direct_parameters: &BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>,
+            current_parameters: &mut BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>,
+            current_by_parameter: &mut BTreeMap<KernelTypeParameterId, boon_checked::TypeVar>,
+            specialized_parameters: &mut BTreeMap<KernelTypeParameterId, Type>,
+            allow_direct_specialization: bool,
+        ) -> Result<(), String> {
+            if direct.open != current.open
+                || direct.field_order != current.field_order
+                || direct.fields.len() != current.fields.len()
+            {
+                return Err("callable object parameter structure differs".to_owned());
+            }
+            for (name, direct_field) in &direct.fields {
+                let current_field = current
+                    .fields
+                    .get(name)
+                    .ok_or_else(|| format!("callable object parameter omits field `{name}`"))?;
+                align_type(
+                    direct_field,
+                    current_field,
+                    direct_parameters,
+                    current_parameters,
+                    current_by_parameter,
+                    specialized_parameters,
+                    allow_direct_specialization,
+                )?;
+            }
+            Ok(())
+        }
+
+        fn align_type(
+            direct: &Type,
+            current: &Type,
+            direct_parameters: &BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>,
+            current_parameters: &mut BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>,
+            current_by_parameter: &mut BTreeMap<KernelTypeParameterId, boon_checked::TypeVar>,
+            specialized_parameters: &mut BTreeMap<KernelTypeParameterId, Type>,
+            allow_direct_specialization: bool,
+        ) -> Result<(), String> {
+            if !contains_unresolved_parameter(
+                direct,
+                direct_parameters,
+                current_by_parameter,
+                specialized_parameters,
+            )? {
+                return Ok(());
+            }
+            match (direct, current) {
+                (Type::Var(direct), Type::Var(current)) => {
+                    let parameter = direct_parameters.get(direct).copied().ok_or_else(|| {
+                        format!("direct callable variable {direct:?} has no retained parameter")
+                    })?;
+                    if specialized_parameters.contains_key(&parameter) {
+                        return Err(format!(
+                            "target parameter {parameter:?} is both specialized and mapped to a current variable"
+                        ));
+                    }
+                    if current_parameters
+                        .insert(*current, parameter)
+                        .is_some_and(|seen| seen != parameter)
+                    {
+                        return Err(format!(
+                            "current callable variable {current:?} maps to conflicting target parameters"
+                        ));
+                    }
+                    if current_by_parameter
+                        .insert(parameter, *current)
+                        .is_some_and(|seen| seen != *current)
+                    {
+                        return Err(format!(
+                            "target parameter {parameter:?} maps to conflicting current variables"
+                        ));
+                    }
+                    Ok(())
+                }
+                (Type::Var(direct), current) if allow_direct_specialization => {
+                    let parameter = direct_parameters.get(direct).copied().ok_or_else(|| {
+                        format!("direct callable variable {direct:?} has no retained parameter")
+                    })?;
+                    let mut current_variables = BTreeSet::new();
+                    collect_checked_type_variables(current, &mut current_variables);
+                    if !current_variables.is_empty() {
+                        return Err(format!(
+                            "target parameter {parameter:?} specializes to a non-concrete current type"
+                        ));
+                    }
+                    if current_by_parameter.contains_key(&parameter) {
+                        return Err(format!(
+                            "target parameter {parameter:?} is both mapped to a current variable and specialized"
+                        ));
+                    }
+                    if specialized_parameters
+                        .insert(parameter, current.clone())
+                        .is_some_and(|seen| seen != *current)
+                    {
+                        return Err(format!(
+                            "target parameter {parameter:?} has conflicting concrete specializations"
+                        ));
+                    }
+                    Ok(())
+                }
+                (Type::Object(direct), Type::Object(current)) => align_shape(
+                    direct,
+                    current,
+                    direct_parameters,
+                    current_parameters,
+                    current_by_parameter,
+                    specialized_parameters,
+                    allow_direct_specialization,
+                ),
+                (Type::List(direct), Type::List(current))
+                | (Type::Set(direct), Type::Set(current)) => align_type(
+                    direct,
+                    current,
+                    direct_parameters,
+                    current_parameters,
+                    current_by_parameter,
+                    specialized_parameters,
+                    allow_direct_specialization,
+                ),
+                (
+                    Type::Map {
+                        key: direct_key,
+                        value: direct_value,
+                    },
+                    Type::Map {
+                        key: current_key,
+                        value: current_value,
+                    },
+                ) => {
+                    align_type(
+                        direct_key,
+                        current_key,
+                        direct_parameters,
+                        current_parameters,
+                        current_by_parameter,
+                        specialized_parameters,
+                        allow_direct_specialization,
+                    )?;
+                    align_type(
+                        direct_value,
+                        current_value,
+                        direct_parameters,
+                        current_parameters,
+                        current_by_parameter,
+                        specialized_parameters,
+                        allow_direct_specialization,
+                    )
+                }
+                (
+                    Type::Function {
+                        args: direct_args,
+                        result: direct_result,
+                    },
+                    Type::Function {
+                        args: current_args,
+                        result: current_result,
+                    },
+                ) => {
+                    if direct_args.len() != current_args.len()
+                        || direct_result.mode != current_result.mode
+                    {
+                        return Err("callable function parameter structure differs".to_owned());
+                    }
+                    for (direct, current) in direct_args.iter().zip(current_args) {
+                        align_type(
+                            direct,
+                            current,
+                            direct_parameters,
+                            current_parameters,
+                            current_by_parameter,
+                            specialized_parameters,
+                            allow_direct_specialization,
+                        )?;
+                    }
+                    align_type(
+                        &direct_result.ty,
+                        &current_result.ty,
+                        direct_parameters,
+                        current_parameters,
+                        current_by_parameter,
+                        specialized_parameters,
+                        allow_direct_specialization,
+                    )
+                }
+                (Type::VariantSet(direct), Type::VariantSet(current)) => {
+                    if direct.len() != current.len() {
+                        return Err("callable variant parameter structure differs".to_owned());
+                    }
+                    for (direct, current) in direct.iter().zip(current.iter()) {
+                        match (direct, current) {
+                            (Variant::Tag(direct), Variant::Tag(current)) if direct == current => {}
+                            (
+                                Variant::Tagged {
+                                    tag: direct_tag,
+                                    fields: direct_fields,
+                                },
+                                Variant::Tagged {
+                                    tag: current_tag,
+                                    fields: current_fields,
+                                },
+                            ) if direct_tag == current_tag => align_shape(
+                                direct_fields,
+                                current_fields,
+                                direct_parameters,
+                                current_parameters,
+                                current_by_parameter,
+                                specialized_parameters,
+                                allow_direct_specialization,
+                            )?,
+                            _ => {
+                                return Err("callable variant parameter member differs".to_owned());
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                (Type::Union(direct), Type::Union(current)) => {
+                    if direct.len() != current.len() {
+                        return Err("callable union parameter structure differs".to_owned());
+                    }
+                    for (direct, current) in direct.iter().zip(current) {
+                        align_type(
+                            direct,
+                            current,
+                            direct_parameters,
+                            current_parameters,
+                            current_by_parameter,
+                            specialized_parameters,
+                            allow_direct_specialization,
+                        )?;
+                    }
+                    Ok(())
+                }
+                _ if direct == current => Ok(()),
+                _ => Err(format!(
+                    "callable parameter structure differs: direct={direct:?} current={current:?}"
+                )),
+            }
+        }
+
+        let direct_parameters =
+            direct_checked_callable_parameter_map(direct, direct_context_formals, layouts)?;
+        let direct_roots = checked_callable_scheme_roots(direct, direct_context_formals)?;
+        let current_roots = checked_callable_scheme_roots(current, current_context_formals)?;
+        if direct_roots.len() != current_roots.len() {
+            return Err(format!(
+                "callable scheme root count differs: direct={} current={}",
+                direct_roots.len(),
+                current_roots.len(),
+            ));
+        }
+        let mut current_parameters = BTreeMap::new();
+        let mut current_by_parameter = BTreeMap::new();
+        let mut specialized_parameters = BTreeMap::new();
+        for (direct, current) in direct_roots.into_iter().zip(current_roots) {
+            if direct.mode != current.mode {
+                return Err(format!(
+                    "callable scheme flow mode differs: direct={:?} current={:?}",
+                    direct.mode, current.mode,
+                ));
+            }
+            align_type(
+                &direct.ty,
+                &current.ty,
+                &direct_parameters,
+                &mut current_parameters,
+                &mut current_by_parameter,
+                &mut specialized_parameters,
+                allow_direct_specialization,
+            )?;
+        }
+        if current_by_parameter.len() + specialized_parameters.len() != direct_parameters.len() {
+            return Err(format!(
+                "callable parameter alpha count differs: direct={} current={} specialized={}",
+                direct_parameters.len(),
+                current_by_parameter.len(),
+                specialized_parameters.len(),
+            ));
+        }
+        Ok(CheckedCallableTypeParameterAlignment {
+            direct: direct_parameters,
+            current: current_parameters,
+            used_direct_specialization: !specialized_parameters.is_empty(),
+        })
+    }
+
+    fn checked_call_type_parameter_alignment(
+        direct_call: &boon_checked::CheckedCall,
+        current_call: &boon_checked::CheckedCall,
+        direct: &CheckedCallableSignature,
+        direct_context_formals: &[CheckedContextFormal],
+        current: &CheckedCallableSignature,
+        current_context_formals: &[CheckedContextFormal],
+        layouts: &[KernelCheckedCallableTypeParameterLayout],
+        allow_direct_specialization: bool,
+    ) -> Result<CheckedCallableTypeParameterAlignment, String> {
+        if direct_call.callable != direct.decl_id || current_call.callable != current.decl_id {
+            return Err("call frame does not target its supplied callable signature".to_owned());
+        }
+
+        let empty_frame =
+            direct_call.type_substitutions.is_empty() && current_call.type_substitutions.is_empty();
+        if empty_frame {
+            let direct_parameters =
+                direct_checked_callable_parameter_map(direct, direct_context_formals, layouts)?;
+            return Ok(CheckedCallableTypeParameterAlignment {
+                direct: direct_parameters,
+                current: BTreeMap::new(),
+                used_direct_specialization: false,
+            });
+        }
+
+        match align_checked_callable_type_parameters(
+            direct,
+            direct_context_formals,
+            current,
+            current_context_formals,
+            layouts,
+            allow_direct_specialization,
+        ) {
+            Ok(alignment) => {
+                if alignment.used_direct_specialization
+                    && !legacy_selector_implicit_binding_matches(
+                        direct_call,
+                        current_call,
+                        direct,
+                        current,
+                        direct_context_formals,
+                        current_context_formals,
+                    )
+                {
+                    return Err(
+                        "legacy selector specialization lacks exact callable-surface evidence"
+                            .to_owned(),
+                    );
+                }
+                Ok(alignment)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn normalized_checked_call_substitutions(
+        call: &boon_checked::CheckedCall,
+        parameters: &BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>,
+    ) -> Result<Box<[KernelOwnerOracleCallTypeSubstitution]>, String> {
+        let mut seen = BTreeSet::new();
+        let mut normalized = Vec::with_capacity(call.type_substitutions.len());
+        for substitution in &call.type_substitutions {
+            let Some(local) = parameters.get(&substitution.variable).copied() else {
+                return Err(format!(
+                    "call {:?} substitution targets foreign variable {:?}",
+                    call.id, substitution.variable,
+                ));
+            };
+            if !seen.insert(local) {
+                return Err(format!(
+                    "call {:?} repeats target-local substitution {local:?}",
+                    call.id,
+                ));
+            }
+            normalized.push(KernelOwnerOracleCallTypeSubstitution {
+                variable: local,
+                value: substitution.value.clone(),
+            });
+        }
+        Ok(normalized_kernel_call_type_substitutions(&normalized))
+    }
+
+    #[test]
+    fn checked_substitutions_use_explicit_sparse_linked_layout() {
+        fn fixture(
+            callable: DeclId,
+            object_variable: u32,
+            list_variable: u32,
+            context_only_variable: u32,
+            caller_variable: u32,
+            reverse_substitutions: bool,
+        ) -> (
+            CheckedCallableSignature,
+            CheckedContextFormal,
+            boon_checked::CheckedCall,
+        ) {
+            let context_formal = boon_checked::ContextFormalId(callable.0);
+            let variable = |variable| Type::Var(boon_checked::TypeVar(variable));
+            let flow = |ty| FlowType {
+                mode: FlowMode::Continuous,
+                ty,
+            };
+            let formal = Type::Union(vec![
+                Type::object(ObjectShape::from_ordered_fields(
+                    [("value".to_owned(), variable(object_variable))],
+                    false,
+                )),
+                Type::List(Type::shared(variable(list_variable))),
+            ]);
+            let signature = CheckedCallableSignature {
+                decl_id: callable,
+                scope_id: boon_checked::LexicalScopeId(1),
+                kind: boon_checked::CheckedCallableKind::User,
+                name: "sparse".to_owned(),
+                intrinsic: None,
+                external_identity: None,
+                parameters: vec![boon_checked::CheckedParameter {
+                    decl_id: DeclId(callable.0 + 10),
+                    name: "value".to_owned(),
+                    kind: boon_checked::CheckedParameterKind::Value,
+                    ordinal: 0,
+                    flow_type: flow(formal),
+                    requirement: boon_checked::CheckedParameterRequirement::Required,
+                    evaluation_scope: boon_checked::CheckedEvaluationScope::Parent,
+                    start: 0,
+                    end: 0,
+                }],
+                // Callable contexts are semantic surfaces, not generic-key
+                // authorities. This variable must not become substitutable.
+                contexts: vec![boon_checked::CheckedCallableContext {
+                    name: "state".to_owned(),
+                    kind: boon_checked::CheckedCallContextKind::ElementState,
+                    provider: DeclId(callable.0 + 11),
+                    flow_type: flow(variable(context_only_variable)),
+                }],
+                context_formal: Some(context_formal),
+                result: flow(variable(object_variable)),
+                role: boon_checked::ProgramRole::Client,
+                effect: boon_checked::CheckedEffectSummary::default(),
+                body: None,
+                result_expression: None,
+                contextual_operation: None,
+            };
+            let context = CheckedContextFormal {
+                id: context_formal,
+                callable,
+                scheme: boon_checked::CheckedContextScheme {
+                    flow_type: flow(variable(list_variable)),
+                    projections: Vec::new(),
+                },
+            };
+            let mut type_substitutions = vec![
+                boon_checked::CheckedTypeSubstitution {
+                    variable: boon_checked::TypeVar(object_variable),
+                    value: Type::Var(boon_checked::TypeVar(caller_variable)),
+                },
+                boon_checked::CheckedTypeSubstitution {
+                    variable: boon_checked::TypeVar(list_variable),
+                    value: Type::Text,
+                },
+            ];
+            if reverse_substitutions {
+                type_substitutions.reverse();
+            }
+            let call = boon_checked::CheckedCall {
+                id: boon_checked::CheckedCallId(0),
+                expression: boon_checked::CheckedExprId(0),
+                callable,
+                owner_callable: None,
+                function: "sparse".to_owned(),
+                intrinsic: None,
+                entries: Vec::new(),
+                contexts: Vec::new(),
+                context_binding: boon_checked::CheckedContextBinding::None,
+                contextual_substitutions: Vec::new(),
+                type_substitutions,
+                syntax_discriminated_result: false,
+                result: flow(Type::Var(boon_checked::TypeVar(caller_variable))),
+                role: boon_checked::ProgramRole::Client,
+                span: boon_checked::CheckedSpan::default(),
+            };
+            (signature, context, call)
+        }
+
+        let (direct_signature, direct_context, direct_call) =
+            fixture(DeclId(1), 102, 100, 155, 190, false);
+        let (current_signature, current_context, current_call) =
+            fixture(DeclId(2), 9, 7, 55, 19, true);
+        let layouts = [
+            KernelCheckedCallableTypeParameterLayout {
+                target: boon_compiler_kernel::KernelCallableSchemeId::User(KernelOwnerId(0)),
+                callable: direct_signature.decl_id,
+                parameter: boon_compiler_kernel::KernelTypeParameterId(0),
+                linked_local: 2,
+                linked_variable: boon_checked::TypeVar(102),
+            },
+            KernelCheckedCallableTypeParameterLayout {
+                target: boon_compiler_kernel::KernelCallableSchemeId::User(KernelOwnerId(0)),
+                callable: direct_signature.decl_id,
+                parameter: boon_compiler_kernel::KernelTypeParameterId(1),
+                linked_local: 0,
+                linked_variable: boon_checked::TypeVar(100),
+            },
+        ];
+        let alignment = align_checked_callable_type_parameters(
+            &direct_signature,
+            &[direct_context.clone()],
+            &current_signature,
+            &[current_context.clone()],
+            &layouts,
+            false,
+        )
+        .expect("sparse checked layouts align through retained target parameters");
+        assert!(!alignment.used_direct_specialization);
+        let direct = normalized_checked_call_substitutions(&direct_call, &alignment.direct)
+            .expect("direct sparse layout normalizes");
+        let current = normalized_checked_call_substitutions(&current_call, &alignment.current)
+            .expect("current sparse layout normalizes");
+
+        assert_eq!(direct, current);
+        assert_eq!(
+            direct
+                .iter()
+                .map(|substitution| substitution.variable)
+                .collect::<Vec<_>>(),
+            vec![KernelTypeParameterId(0), KernelTypeParameterId(1),],
+        );
+
+        let mut foreign = current_call.clone();
+        foreign
+            .type_substitutions
+            .push(boon_checked::CheckedTypeSubstitution {
+                variable: boon_checked::TypeVar(55),
+                value: Type::Number,
+            });
+        assert!(
+            normalized_checked_call_substitutions(&foreign, &alignment.current)
+                .expect_err("context-only variables are not callable parameters")
+                .contains("foreign variable")
+        );
+        let mut duplicate = direct_call.clone();
+        duplicate
+            .type_substitutions
+            .push(duplicate.type_substitutions[0].clone());
+        assert!(
+            normalized_checked_call_substitutions(&duplicate, &alignment.direct)
+                .expect_err("duplicate target substitutions fail closed")
+                .contains("repeats target-local substitution")
+        );
+        let mut split_target_layouts = layouts;
+        split_target_layouts[1].target = boon_compiler_kernel::KernelCallableSchemeId::Abi(
+            boon_compiler_kernel::KernelAbiCallableId(0),
+        );
+        assert!(
+            direct_checked_callable_parameter_map(
+                &direct_signature,
+                &[direct_context.clone()],
+                &split_target_layouts,
+            )
+            .expect_err("one callable may not receive parameter rows from two target schemes")
+            .contains("disagree on their target scheme")
+        );
+
+        let mut direct_monomorphic = direct_signature.clone();
+        direct_monomorphic.parameters[0].flow_type.ty = Type::Number;
+        direct_monomorphic.contexts.clear();
+        direct_monomorphic.context_formal = None;
+        direct_monomorphic.result.ty = Type::Number;
+        let mut drifted_monomorphic = direct_monomorphic.clone();
+        drifted_monomorphic.result.ty = Type::Text;
+        let mut empty_direct_call = direct_call.clone();
+        empty_direct_call.type_substitutions.clear();
+        empty_direct_call.callable = direct_monomorphic.decl_id;
+        let mut empty_current_call = current_call.clone();
+        empty_current_call.type_substitutions.clear();
+        empty_current_call.callable = drifted_monomorphic.decl_id;
+        let empty_alignment = checked_call_type_parameter_alignment(
+            &empty_direct_call,
+            &empty_current_call,
+            &direct_monomorphic,
+            &[],
+            &drifted_monomorphic,
+            &[],
+            &[],
+            false,
+        )
+        .expect("an empty frame compares no rich scheme identity");
+        assert!(empty_alignment.direct.is_empty());
+        assert!(empty_alignment.current.is_empty());
+        assert!(
+            checked_call_type_parameter_alignment(
+                &empty_direct_call,
+                &empty_current_call,
+                &direct_monomorphic,
+                &[],
+                &drifted_monomorphic,
+                &[],
+                &layouts,
+                false,
+            )
+            .expect_err("an empty frame must still validate its direct retained sidecar")
+            .contains("packed parameter layout differs")
+        );
+
+        let mut specialized_signature = current_signature.clone();
+        specialized_signature.parameters[0].flow_type.ty = Type::Union(vec![
+            Type::object(ObjectShape::from_ordered_fields(
+                [("value".to_owned(), Type::Text)],
+                false,
+            )),
+            Type::List(Type::shared(Type::Number)),
+        ]);
+        specialized_signature.result.ty = Type::Text;
+        let mut specialized_context = current_context.clone();
+        specialized_context.scheme.flow_type.ty = Type::Number;
+        let specialized = align_checked_callable_type_parameters(
+            &direct_signature,
+            &[direct_context.clone()],
+            &specialized_signature,
+            &[specialized_context.clone()],
+            &layouts,
+            true,
+        )
+        .expect("the proven selector representation may specialize a whole target alpha");
+        assert!(specialized.used_direct_specialization);
+        assert!(specialized.current.is_empty());
+
+        assert!(
+            align_checked_callable_type_parameters(
+                &direct_signature,
+                &[direct_context.clone()],
+                &specialized_signature,
+                &[specialized_context],
+                &layouts,
+                false,
+            )
+            .expect_err("generic specialization is restricted to the selector gate")
+            .contains("structure differs")
+        );
+
+        let mut conflicting = current_signature.clone();
+        conflicting.parameters[0].flow_type.ty = Type::Union(vec![
+            Type::object(ObjectShape::from_ordered_fields(
+                [("value".to_owned(), Type::Var(boon_checked::TypeVar(7)))],
+                false,
+            )),
+            Type::List(Type::shared(Type::Var(boon_checked::TypeVar(7)))),
+        ]);
+        conflicting.result.ty = Type::Var(boon_checked::TypeVar(7));
+        assert!(
+            align_checked_callable_type_parameters(
+                &direct_signature,
+                &[direct_context],
+                &conflicting,
+                &[current_context],
+                &layouts,
+                false,
+            )
+            .expect_err("two target parameters may not collapse to one current variable")
+            .contains("conflicting target parameters")
+        );
+    }
+
+    fn applied_checked_callable_surface(
+        call: &boon_checked::CheckedCall,
+        callable: &CheckedCallableSignature,
+        context_formals: &[CheckedContextFormal],
+    ) -> Result<(Box<[FlowType]>, usize), String> {
+        if call.callable != callable.decl_id {
+            return Err(format!(
+                "call {:?} targets {:?}, not supplied callable {:?}",
+                call.id, call.callable, callable.decl_id,
+            ));
+        }
+        let mut parameters = callable.parameters.iter().collect::<Vec<_>>();
+        parameters.sort_unstable_by_key(|parameter| parameter.ordinal);
+        let mut surface = parameters
+            .into_iter()
+            .map(|parameter| parameter.flow_type.clone())
+            .chain(
+                callable
+                    .contexts
+                    .iter()
+                    .map(|context| context.flow_type.clone()),
+            )
+            .collect::<Vec<_>>();
+        if let Some(formal) = callable.context_formal {
+            let context = context_formals
+                .iter()
+                .find(|context| context.id == formal)
+                .ok_or_else(|| {
+                    format!(
+                        "callable {:?} references missing PASSED context formal {formal:?}",
+                        callable.decl_id,
+                    )
+                })?;
+            surface.push(context.scheme.flow_type.clone());
+        }
+        surface.push(callable.result.clone());
+        let scheme_len = surface.len();
+
+        let mut variables = BTreeSet::new();
+        if call
             .type_substitutions
             .iter()
-            .filter_map(|substitution| {
-                Some(KernelCallTypeSubstitution {
-                    variable: *variables.get(&substitution.variable)?,
-                    value: substitution.value.clone(),
-                })
-            })
-            .collect::<Vec<_>>();
-        if substitutions.len() != call.type_substitutions.len() {
-            return None;
+            .any(|substitution| !variables.insert(substitution.variable))
+        {
+            return Err(format!(
+                "call {:?} repeats a target type-variable substitution",
+                call.id,
+            ));
         }
-        substitutions.sort_unstable_by_key(|substitution| substitution.variable);
-        Some(normalized_kernel_call_type_substitutions(&substitutions))
+        for flow in &mut surface {
+            flow.ty = boon_checked::apply_checked_type_substitutions_once(
+                &flow.ty,
+                &call.type_substitutions,
+            );
+        }
+        // The occurrence result is already in the caller's namespace. Feeding
+        // it through the callee-keyed frame could capture an unrelated caller
+        // TypeVar with the same absolute number.
+        surface.push(call.result.clone());
+        let neutral = FlowType {
+            mode: FlowMode::Absent,
+            ty: Type::Absent,
+        };
+        let normalized = alpha_normalize_owner(&neutral, surface).1;
+        Ok((normalized.into_boxed_slice(), scheme_len))
+    }
+
+    #[test]
+    fn applied_callable_surface_uses_one_shot_cross_namespace_substitution() {
+        let flow = |variable| FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::Var(boon_checked::TypeVar(variable)),
+        };
+        let callable = CheckedCallableSignature {
+            decl_id: DeclId(1),
+            scope_id: boon_checked::LexicalScopeId(1),
+            kind: boon_checked::CheckedCallableKind::User,
+            name: "capture".to_owned(),
+            intrinsic: None,
+            external_identity: None,
+            parameters: vec![boon_checked::CheckedParameter {
+                decl_id: DeclId(2),
+                name: "value".to_owned(),
+                kind: boon_checked::CheckedParameterKind::Value,
+                ordinal: 0,
+                flow_type: flow(0),
+                requirement: boon_checked::CheckedParameterRequirement::Required,
+                evaluation_scope: boon_checked::CheckedEvaluationScope::Parent,
+                start: 0,
+                end: 0,
+            }],
+            contexts: Vec::new(),
+            context_formal: None,
+            result: flow(1),
+            role: boon_checked::ProgramRole::Client,
+            effect: boon_checked::CheckedEffectSummary::default(),
+            body: None,
+            result_expression: None,
+            contextual_operation: None,
+        };
+        let call = boon_checked::CheckedCall {
+            id: boon_checked::CheckedCallId(0),
+            expression: boon_checked::CheckedExprId(0),
+            callable: callable.decl_id,
+            owner_callable: None,
+            function: callable.name.clone(),
+            intrinsic: None,
+            entries: Vec::new(),
+            contexts: Vec::new(),
+            context_binding: boon_checked::CheckedContextBinding::None,
+            contextual_substitutions: Vec::new(),
+            type_substitutions: vec![
+                boon_checked::CheckedTypeSubstitution {
+                    variable: boon_checked::TypeVar(0),
+                    value: Type::Var(boon_checked::TypeVar(1)),
+                },
+                boon_checked::CheckedTypeSubstitution {
+                    variable: boon_checked::TypeVar(1),
+                    value: Type::Number,
+                },
+            ],
+            syntax_discriminated_result: false,
+            // Already caller-owned: the numeric identity collides with a
+            // callee key but must remain the caller variable.
+            result: flow(1),
+            role: boon_checked::ProgramRole::Client,
+            span: boon_checked::CheckedSpan::default(),
+        };
+
+        let (surface, scheme_len) = applied_checked_callable_surface(&call, &callable, &[])
+            .expect("one-shot callable surface applies");
+        assert_eq!(scheme_len, 2);
+        assert_eq!(surface[0].ty, Type::Var(boon_checked::TypeVar(0)));
+        assert_eq!(surface[1].ty, Type::Number);
+        assert_eq!(surface[2].ty, Type::Var(boon_checked::TypeVar(0)));
+    }
+
+    /// Match the one known legacy generic-selector representation difference
+    /// without discarding the dense call environment. The dense target keeps
+    /// a principal alpha plus an explicit occurrence binding; the legacy
+    /// checker can instead bake that binding into its callable surface.
+    fn legacy_selector_implicit_binding_matches(
+        direct: &boon_checked::CheckedCall,
+        current: &boon_checked::CheckedCall,
+        direct_callable: &CheckedCallableSignature,
+        current_callable: &CheckedCallableSignature,
+        direct_context_formals: &[CheckedContextFormal],
+        current_context_formals: &[CheckedContextFormal],
+    ) -> bool {
+        if !direct.syntax_discriminated_result
+            || !current.syntax_discriminated_result
+            || direct.type_substitutions.is_empty()
+        {
+            return false;
+        }
+        let Ok((direct, direct_scheme_len)) =
+            applied_checked_callable_surface(direct, direct_callable, direct_context_formals)
+        else {
+            return false;
+        };
+        let Ok((current, current_scheme_len)) =
+            applied_checked_callable_surface(current, current_callable, current_context_formals)
+        else {
+            return false;
+        };
+        if direct_scheme_len != current_scheme_len
+            || direct.len() != current.len()
+            || direct.len() != direct_scheme_len + 1
+        {
+            return false;
+        }
+        direct[..direct_scheme_len]
+            .iter()
+            .zip(&current[..current_scheme_len])
+            .all(|(direct, current)| {
+                direct.mode == current.mode
+                    && legacy_generic_selector_type_matches(&direct.ty, &current.ty)
+            })
+            && direct[direct_scheme_len] == current[current_scheme_len]
     }
 
     fn direct_call_inventory_mismatches(
         report: &KernelOwnerOracleReport,
         checked: &CheckedProgramFields,
         stable_by_checked_expression: &BTreeMap<boon_checked::CheckedExprId, StableExpressionKey>,
+        project: &ProjectSyntaxSnapshot,
         require_syntax_provenance_parity: bool,
     ) -> Vec<String> {
         let mut mismatches = Vec::new();
+        let current_callable_owners = checked_callable_owners(checked, project);
         let direct_stable = |expression: boon_checked::CheckedExprId| {
             report
                 .checked_expression_keys
@@ -13145,6 +14235,14 @@ mod tests {
             };
             let direct_callable = callable_key(direct.callable, &report.checked_callables);
             let current_callable = callable_key(current.callable, &checked.callables);
+            let direct_callable_signature = report
+                .checked_callables
+                .iter()
+                .find(|callable| callable.decl_id == direct.callable);
+            let current_callable_signature = checked
+                .callables
+                .iter()
+                .find(|callable| callable.decl_id == current.callable);
             let direct_owner = direct
                 .owner_callable
                 .and_then(|owner| callable_key(owner, &report.checked_callables));
@@ -13202,16 +14300,69 @@ mod tests {
                 boon_checked::CheckedContextBinding::Inherited { .. } => "inherited".to_owned(),
                 boon_checked::CheckedContextBinding::None => "none".to_owned(),
             };
-            let direct_substitutions = normalized_checked_call_substitutions(
-                direct,
-                &report.checked_callables,
-                &report.checked_context_formals,
-            );
-            let current_substitutions = normalized_checked_call_substitutions(
-                current,
-                &checked.callables,
-                &checked.context_formals,
-            );
+            let legacy_selector_target = current_callable_owners
+                .get(&current.callable)
+                .and_then(|target| report.supported.iter().find(|owner| &owner.owner == target))
+                .is_some_and(|owner| !owner.generic_selector_dependents.is_empty());
+            let parameter_alignment = match (direct_callable_signature, current_callable_signature)
+            {
+                (Some(direct_callable), Some(current_callable)) => {
+                    checked_call_type_parameter_alignment(
+                        direct,
+                        current,
+                        direct_callable,
+                        &report.checked_context_formals,
+                        current_callable,
+                        &checked.context_formals,
+                        &report.checked_callable_type_parameters,
+                        legacy_selector_target
+                            && direct.syntax_discriminated_result
+                            && current.syntax_discriminated_result,
+                    )
+                }
+                (None, _) | (_, None) => {
+                    Err("call target is missing a direct or current callable signature".to_owned())
+                }
+            };
+            let direct_substitutions =
+                parameter_alignment
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|alignment| {
+                        normalized_checked_call_substitutions(direct, &alignment.direct)
+                    });
+            let current_substitutions = parameter_alignment
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|alignment| {
+                    normalized_checked_call_substitutions(current, &alignment.current)
+                });
+            let used_direct_specialization = parameter_alignment
+                .as_ref()
+                .is_ok_and(|alignment| alignment.used_direct_specialization);
+            let substitutions_match = match (&direct_substitutions, &current_substitutions) {
+                (Ok(direct), Ok(current)) if direct == current && !used_direct_specialization => {
+                    true
+                }
+                (Ok(_), Ok(_)) if legacy_selector_target => {
+                    match (direct_callable_signature, current_callable_signature) {
+                        (Some(direct_callable), Some(current_callable)) => {
+                            legacy_selector_implicit_binding_matches(
+                                direct,
+                                current,
+                                direct_callable,
+                                current_callable,
+                                &report.checked_context_formals,
+                                &checked.context_formals,
+                            )
+                        }
+                        (None, _) | (_, None) => false,
+                    }
+                }
+                // Normalization errors fail closed even when both layouts
+                // happen to produce the same error string.
+                (Ok(_), Ok(_)) | (Ok(_), Err(_)) | (Err(_), Ok(_)) | (Err(_), Err(_)) => false,
+            };
             let exact_render_constructor_replaces_legacy_base = direct.syntax_discriminated_result
                 && !current.syntax_discriminated_result
                 && render_constructor_kind(&direct.function).is_some()
@@ -13231,9 +14382,10 @@ mod tests {
                 || direct_entries != current_entries
                 || direct_contexts != current_contexts
                 || direct_binding != current_binding
+                || !substitutions_match
             {
                 mismatches.push(format!(
-                    "kernel direct call {stable:?} differs: direct_function={:?} current_function={:?} direct_callable={direct_callable:?} current_callable={current_callable:?} direct_owner={direct_owner:?} current_owner={current_owner:?} direct_entries={direct_entries:?} current_entries={current_entries:?} direct_contexts={direct_contexts:?} current_contexts={current_contexts:?} direct_binding={direct_binding:?} current_binding={current_binding:?} direct_substitutions={direct_substitutions:?} current_substitutions={current_substitutions:?} direct_discriminated={} current_discriminated={} direct_span={:?} current_span={:?} direct_result={:?} current_result={:?}",
+                    "kernel direct call {stable:?} differs: direct_function={:?} current_function={:?} direct_callable={direct_callable:?} current_callable={current_callable:?} direct_owner={direct_owner:?} current_owner={current_owner:?} direct_entries={direct_entries:?} current_entries={current_entries:?} direct_contexts={direct_contexts:?} current_contexts={current_contexts:?} direct_binding={direct_binding:?} current_binding={current_binding:?} direct_substitutions={direct_substitutions:?} current_substitutions={current_substitutions:?} direct_signature={direct_callable_signature:?} current_signature={current_callable_signature:?} direct_discriminated={} current_discriminated={} direct_span={:?} current_span={:?} direct_result={:?} current_result={:?}",
                     direct.function,
                     current.function,
                     direct.syntax_discriminated_result,
@@ -13291,180 +14443,9 @@ mod tests {
             .count()
     }
 
-    fn collect_callable_type_parameter_ids(
-        ty: &Type,
-        parameters: &mut BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>,
-    ) {
-        match ty {
-            Type::Var(variable) => {
-                let next = KernelTypeParameterId(
-                    u32::try_from(parameters.len())
-                        .expect("checked callable type-parameter count exceeds u32"),
-                );
-                parameters.entry(*variable).or_insert(next);
-            }
-            Type::Object(shape) => {
-                for (_, field) in shape.ordered_fields() {
-                    collect_callable_type_parameter_ids(field, parameters);
-                }
-            }
-            Type::List(item) | Type::Set(item) => {
-                collect_callable_type_parameter_ids(item, parameters);
-            }
-            Type::Map { key, value } => {
-                collect_callable_type_parameter_ids(key, parameters);
-                collect_callable_type_parameter_ids(value, parameters);
-            }
-            Type::Function { args, result } => {
-                for argument in args {
-                    collect_callable_type_parameter_ids(argument, parameters);
-                }
-                collect_callable_type_parameter_ids(&result.ty, parameters);
-            }
-            Type::VariantSet(variants) => {
-                for variant in variants {
-                    if let Variant::Tagged { fields, .. } = variant {
-                        for (_, field) in fields.ordered_fields() {
-                            collect_callable_type_parameter_ids(field, parameters);
-                        }
-                    }
-                }
-            }
-            Type::Union(members) => {
-                for member in members {
-                    collect_callable_type_parameter_ids(member, parameters);
-                }
-            }
-            Type::Text
-            | Type::Number
-            | Type::Bytes(_)
-            | Type::Bits { .. }
-            | Type::Absent
-            | Type::RenderContract
-            | Type::UnresolvedShape { .. }
-            | Type::Unknown => {}
-        }
-    }
-
-    fn checked_call_type_substitutions(
-        checked: &CheckedProgramFields,
-        call: &boon_checked::CheckedCall,
-        target_formals: &[FlowType],
-        target_result: &FlowType,
-    ) -> Option<Box<[KernelCallTypeSubstitution]>> {
-        let signature = checked
-            .callables
-            .iter()
-            .find(|signature| signature.decl_id == call.callable)?;
-        let mut parameters = signature.parameters.iter().collect::<Vec<_>>();
-        parameters.sort_unstable_by_key(|parameter| parameter.ordinal);
-        let mut target_formals = target_formals.to_vec();
-        let mut target_result = target_result.clone();
-
-        let mut actuals = Vec::new();
-        for entry in &call.entries {
-            let boon_checked::CheckedCallEntry::Input { formal, value, .. } = entry else {
-                continue;
-            };
-            let parameter = parameters
-                .iter()
-                .find(|parameter| parameter.decl_id == *formal)?;
-            let actual = checked
-                .expressions
-                .get(value.0 as usize)?
-                .flow_type
-                .ty
-                .clone();
-            actuals.push((u32::try_from(parameter.ordinal).ok()?, actual));
-        }
-        let context_ordinal = u32::try_from(parameters.len()).ok()?;
-        if let Some((value, _)) = call.context_binding.explicit() {
-            let actual = checked
-                .expressions
-                .get(value.0 as usize)?
-                .flow_type
-                .ty
-                .clone();
-            actuals.push((context_ordinal, actual));
-        } else if let Some(formal) = call.context_binding.inherited()
-            && let Some(actual) = checked.context_formal(formal)
-        {
-            actuals.push((context_ordinal, actual.scheme.flow_type.ty.clone()));
-        }
-
-        // Checked scheme ordinals are definition-local and can numerically
-        // collide across caller/callee rows. Isolate both namespaces before
-        // asking the permanent kernel for its canonical substitution product.
-        let mut target_parameters = BTreeMap::new();
-        for formal in &target_formals {
-            collect_callable_type_parameter_ids(&formal.ty, &mut target_parameters);
-        }
-        collect_callable_type_parameter_ids(&target_result.ty, &mut target_parameters);
-        let target_replacements = target_parameters
-            .iter()
-            .map(|(variable, parameter)| (*variable, Type::Var(boon_checked::TypeVar(parameter.0))))
-            .collect::<BTreeMap<_, _>>();
-        for formal in &mut target_formals {
-            formal.ty =
-                boon_checked::apply_checked_type_environment(&formal.ty, &target_replacements);
-        }
-        target_result.ty =
-            boon_checked::apply_checked_type_environment(&target_result.ty, &target_replacements);
-
-        let mut actual_parameters = BTreeMap::new();
-        for (_, actual) in &actuals {
-            collect_callable_type_parameter_ids(actual, &mut actual_parameters);
-        }
-        let actual_replacements = actual_parameters
-            .iter()
-            .map(|(variable, parameter)| {
-                (
-                    *variable,
-                    Type::Var(boon_checked::TypeVar(
-                        u32::try_from(target_parameters.len())
-                            .expect("target parameter count exceeds u32")
-                            .saturating_add(parameter.0),
-                    )),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        for (_, actual) in &mut actuals {
-            *actual = boon_checked::apply_checked_type_environment(actual, &actual_replacements);
-        }
-
-        let mut substitutions = derive_kernel_call_type_substitutions(
-            &target_formals,
-            &target_result,
-            &actuals,
-            matches!(
-                call.function.as_str(),
-                "List/append" | "Map/upsert" | "Set/add"
-            )
-            .then_some(&call.result.ty),
-        )
-        .into_vec();
-
-        let neutral = FlowType {
-            mode: FlowMode::Continuous,
-            ty: Type::Absent,
-        };
-        let normalized = alpha_normalize_owner(
-            &neutral,
-            substitutions.iter().map(|substitution| FlowType {
-                mode: FlowMode::Continuous,
-                ty: substitution.value.clone(),
-            }),
-        )
-        .1;
-        for (substitution, flow) in substitutions.iter_mut().zip(normalized) {
-            substitution.value = flow.ty;
-        }
-        Some(substitutions.into_boxed_slice())
-    }
-
     fn normalized_kernel_call_type_substitutions(
-        substitutions: &[KernelCallTypeSubstitution],
-    ) -> Box<[KernelCallTypeSubstitution]> {
+        substitutions: &[KernelOwnerOracleCallTypeSubstitution],
+    ) -> Box<[KernelOwnerOracleCallTypeSubstitution]> {
         let neutral = FlowType {
             mode: FlowMode::Continuous,
             ty: Type::Absent,
@@ -13486,8 +14467,8 @@ mod tests {
     }
 
     fn call_substitution_mismatch(
-        kernel: &[KernelCallTypeSubstitution],
-        checked: &[KernelCallTypeSubstitution],
+        kernel: &[KernelOwnerOracleCallTypeSubstitution],
+        checked: &[KernelOwnerOracleCallTypeSubstitution],
         legacy_selector_target: bool,
     ) -> Option<String> {
         let kernel = kernel
@@ -13616,6 +14597,20 @@ mod tests {
                 ));
             }
         }
+        let direct_checked_calls = report
+            .checked_calls
+            .iter()
+            .filter_map(|call| {
+                Some((
+                    report
+                        .checked_expression_keys
+                        .get(call.expression.0 as usize)?
+                        .as_ref()?
+                        .clone(),
+                    call,
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
 
         for (stable, (owner, kernel)) in &kernel_calls {
             let Some(current) = current_calls.get(stable) else {
@@ -13692,25 +14687,66 @@ mod tests {
                                 current.context_binding,
                                 boon_checked::CheckedContextBinding::Inherited { .. }
                             );
-                    if target_matches
-                        && let Some(target_interface) = kernel_interfaces.get(target)
-                        && let Some(current_substitutions) = checked_call_type_substitutions(
-                            checked,
-                            current,
-                            &target_interface.formals,
-                            &target_interface.result,
-                        )
-                    {
+                    if target_matches {
+                        let Some(target_interface) = kernel_interfaces.get(target) else {
+                            mismatches.push(format!(
+                                "kernel owner {owner:?} call {stable:?} targets missing oracle interface {target:?}",
+                            ));
+                            continue;
+                        };
                         let kernel_substitutions =
                             normalized_kernel_call_type_substitutions(&kernel.type_substitutions);
-                        if let Some(reason) = call_substitution_mismatch(
-                            &kernel_substitutions,
-                            &current_substitutions,
-                            !target_interface.generic_selector_dependents.is_empty(),
-                        ) {
-                            mismatches.push(format!(
-                                "kernel owner {owner:?} call {stable:?} substitutions differ from checked: {reason}; kernel={kernel_substitutions:?} checked={current_substitutions:?}"
-                            ));
+                        let current_substitutions: Result<
+                            Box<[KernelOwnerOracleCallTypeSubstitution]>,
+                            String,
+                        > = (|| {
+                            let direct_call =
+                                direct_checked_calls.get(stable).ok_or_else(|| {
+                                    "kernel call has no direct checked projection".to_owned()
+                                })?;
+                            let direct_callable = report
+                                .checked_callables
+                                .iter()
+                                .find(|callable| callable.decl_id == direct_call.callable)
+                                .ok_or_else(|| {
+                                    "direct call targets a missing callable signature".to_owned()
+                                })?;
+                            let current_callable = checked
+                                .callables
+                                .iter()
+                                .find(|callable| callable.decl_id == current.callable)
+                                .ok_or_else(|| {
+                                    "current call targets a missing callable signature".to_owned()
+                                })?;
+                            let alignment = checked_call_type_parameter_alignment(
+                                direct_call,
+                                current,
+                                direct_callable,
+                                &report.checked_context_formals,
+                                current_callable,
+                                &checked.context_formals,
+                                &report.checked_callable_type_parameters,
+                                !target_interface.generic_selector_dependents.is_empty()
+                                    && direct_call.syntax_discriminated_result
+                                    && current.syntax_discriminated_result,
+                            )?;
+                            normalized_checked_call_substitutions(current, &alignment.current)
+                        })();
+                        match current_substitutions {
+                            Ok(current_substitutions) => {
+                                if let Some(reason) = call_substitution_mismatch(
+                                    &kernel_substitutions,
+                                    &current_substitutions,
+                                    !target_interface.generic_selector_dependents.is_empty(),
+                                ) {
+                                    mismatches.push(format!(
+                                        "kernel owner {owner:?} call {stable:?} substitutions differ from checked: {reason}; kernel={kernel_substitutions:?} checked={current_substitutions:?}"
+                                    ));
+                                }
+                            }
+                            Err(error) => mismatches.push(format!(
+                                "kernel owner {owner:?} call {stable:?} checked substitutions are invalid: {error}"
+                            )),
                         }
                     }
                     target_matches
@@ -14955,6 +15991,7 @@ mod tests {
             &report,
             &checked,
             &stable_by_checked_expression,
+            &project,
             true,
         ));
         assert!(
@@ -16184,7 +17221,7 @@ mod tests {
 
     #[test]
     fn selector_contaminated_checked_calls_do_not_invent_kernel_substitutions() {
-        let checked = [KernelCallTypeSubstitution {
+        let checked = [KernelOwnerOracleCallTypeSubstitution {
             variable: KernelTypeParameterId(0),
             value: Type::VariantSet(
                 vec![
@@ -16199,7 +17236,7 @@ mod tests {
         assert_eq!(call_substitution_mismatch(&[], &checked, true), None);
         assert!(
             call_substitution_mismatch(
-                &[KernelCallTypeSubstitution {
+                &[KernelOwnerOracleCallTypeSubstitution {
                     variable: KernelTypeParameterId(0),
                     value: Type::Number,
                 }],
@@ -20784,7 +21821,7 @@ FUNCTION stateful_row(row) {
                 packed_type_materializer
                     .materialize_flow(
                         packed_input
-                            .expression_flow(expression.id)
+                            .published_expression_flow(expression.id)
                             .expect("every checked expression has one packed flow"),
                     )
                     .expect("materialize packed expression flow"),
@@ -20809,34 +21846,109 @@ FUNCTION stateful_row(row) {
             let facts = packed_input
                 .call_type_facts(call.id)
                 .expect("every checked call has packed type facts");
+            let target = rich
+                .fields
+                .callables
+                .iter()
+                .find(|callable| callable.decl_id == call.callable)
+                .expect("every checked call targets a callable signature");
+            let mut target_parameters = target.parameters.iter().collect::<Vec<_>>();
+            target_parameters.sort_unstable_by_key(|parameter| parameter.ordinal);
+            let target_context = target.context_formal.map(|formal| {
+                rich.fields
+                    .context_formals
+                    .iter()
+                    .find(|context| context.id == formal)
+                    .expect("target callable context formal exists")
+            });
+            let scheme = facts.target_scheme();
+            assert_eq!(
+                scheme.declaration(),
+                call.callable,
+                "packed call {} target identity differs from its rich callable",
+                call.id.0,
+            );
+            assert_eq!(
+                scheme.formal_count(),
+                target_parameters.len() + usize::from(target_context.is_some()),
+                "packed call {} target formal count differs from its rich callable",
+                call.id.0,
+            );
+            for (ordinal, expected) in target_parameters
+                .iter()
+                .map(|parameter| &parameter.flow_type)
+                .chain(
+                    target_context
+                        .iter()
+                        .map(|context| &context.scheme.flow_type),
+                )
+                .enumerate()
+            {
+                assert_eq!(
+                    packed_type_materializer
+                        .materialize_flow(
+                            scheme.formal(ordinal).expect("packed target formal exists"),
+                        )
+                        .expect("materialize packed target formal"),
+                    *expected,
+                    "packed call {} target formal {ordinal} differs from its rich callable",
+                    call.id.0,
+                );
+            }
+            assert_eq!(
+                packed_type_materializer
+                    .materialize_flow(scheme.result())
+                    .expect("materialize packed target result"),
+                target.result,
+                "packed call {} target result differs from its rich callable",
+                call.id.0,
+            );
+            assert_eq!(
+                packed_type_materializer
+                    .materialize_flow(facts.base_result())
+                    .expect("materialize packed base call result"),
+                call.result,
+                "packed call {} base result differs from its rich call row",
+                call.id.0,
+            );
+            let published = rich
+                .fields
+                .expressions
+                .get(call.expression.0 as usize)
+                .filter(|expression| expression.id == call.expression)
+                .expect("checked call expression exists");
+            assert_eq!(
+                packed_type_materializer
+                    .materialize_flow(facts.published_result())
+                    .expect("materialize packed published call result"),
+                published.flow_type,
+                "packed call {} published result differs from its checked expression",
+                call.id.0,
+            );
             assert_eq!(
                 facts.syntax_discriminated_result(),
                 call.syntax_discriminated_result,
             );
-            let expected = normalized_checked_call_substitutions(
-                call,
-                &rich.fields.callables,
-                &rich.fields.context_formals,
-            )
-            .expect("rich call substitutions map to the target callable scheme");
+            let mut expected = call
+                .type_substitutions
+                .iter()
+                .map(|substitution| (substitution.variable, substitution.value.clone()))
+                .collect::<Vec<_>>();
+            expected.sort_unstable_by_key(|(variable, _)| *variable);
             let mut packed = facts
                 .substitutions()
                 .map(|substitution| {
-                    Ok::<_, boon_compiler_kernel::KernelCheckedLinkError>(
-                        KernelCallTypeSubstitution {
-                            variable: substitution.parameter(),
-                            value: packed_type_materializer
-                                .materialize_type(substitution.value())?,
-                        },
-                    )
+                    Ok::<_, boon_compiler_kernel::KernelCheckedLinkError>((
+                        substitution.parameter().linked_variable(),
+                        packed_type_materializer.materialize_type(substitution.value())?,
+                    ))
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .expect("materialize packed call substitutions");
-            packed.sort_unstable_by_key(|substitution| substitution.variable);
+            packed.sort_unstable_by_key(|(variable, _)| *variable);
             assert_eq!(
-                packed.as_slice(),
-                expected.as_ref(),
-                "packed call {} substitutions differ from the target callable scheme",
+                packed, expected,
+                "packed call {} substitutions differ from final target-variable identities",
                 call.id.0,
             );
         }
@@ -20885,7 +21997,7 @@ FUNCTION stateful_row(row) {
         let foreign_error = packed_type_materializer
             .materialize_flow(
                 rich_input
-                    .expression_flow(rich_expression)
+                    .published_expression_flow(rich_expression)
                     .expect("EditorRich input exposes its first packed expression flow"),
             )
             .expect_err("a compatibility materializer must reject a foreign semantic input");
@@ -22056,6 +23168,7 @@ FUNCTION stateful_row(row) {
                 &report,
                 fields,
                 &stable_by_checked_expression,
+                &project,
                 true,
             ));
             eprintln!(

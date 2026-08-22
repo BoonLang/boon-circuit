@@ -86,10 +86,26 @@ pub struct KernelCheckedDefinitionLayout {
 /// materialized.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCheckedAbiCallableLayout {
-    pub name: Box<str>,
+    pub callable: crate::KernelAbiCallableId,
     pub declaration: DeclId,
     pub parameters: Box<[DeclId]>,
     pub type_variables: KernelCheckedRowRange,
+}
+
+/// Explicit relocation of one packed callable parameter into the final
+/// checked type-variable namespace.
+///
+/// `parameter` is the target-bound packed traversal ordinal, while
+/// `linked_local` is the callable's own alpha coordinate.  Keeping both
+/// coordinates prevents compatibility/oracle code from inferring generic
+/// identity from the numeric shape of a rich [`TypeVar`] range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelCheckedCallableTypeParameterLayout {
+    pub target: crate::KernelCallableSchemeId,
+    pub callable: DeclId,
+    pub parameter: crate::KernelTypeParameterId,
+    pub linked_local: u32,
+    pub linked_variable: TypeVar,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -354,7 +370,6 @@ impl KernelCheckedRows {
 pub struct KernelCheckedLinkLayout {
     definitions: Box<[KernelCheckedDefinitionLayout]>,
     abi_callables: Box<[KernelCheckedAbiCallableLayout]>,
-    abi_callable_by_name: BTreeMap<Box<str>, usize>,
     definition_declarations_end: u32,
     totals: KernelCheckedLinkTotals,
 }
@@ -398,6 +413,12 @@ struct KernelSemanticDefinitionRelocationV1 {
     lists: KernelCheckedRowRange,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KernelSemanticAbiRelocationV1 {
+    callable: DeclId,
+    type_variables: KernelCheckedRowRange,
+}
+
 /// Move-only construction authority transported beside the compatibility
 /// checked image.
 ///
@@ -417,6 +438,10 @@ pub struct KernelSemanticInputConstructionV1 {
     declaration_count: u32,
     source_count: u32,
     definition_relocations: Box<[KernelSemanticDefinitionRelocationV1]>,
+    /// Dense by immutable `KernelAbiCallableId`; unreferenced ABI schemes have
+    /// no checked declaration relocation but remain available as packed type
+    /// authorities in `definition_code`.
+    abi_relocations: Box<[Option<KernelSemanticAbiRelocationV1>]>,
     /// Owners with execution templates, ordered by final callable ID.
     definition_execution_owners: Box<[KernelOwnerId]>,
     call_result_paths: Box<[KernelSemanticCallResultPathLocatorV1]>,
@@ -438,29 +463,57 @@ pub struct KernelSemanticInputV1 {
     checked_image_digest: [u8; 32],
 }
 
-/// Definition-scoped borrowed reference to one packed type term.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KernelPackedTypeScope {
+    Definition(KernelOwnerId),
+    Abi(crate::KernelAbiCallableId),
+}
+
+/// Scope-qualified borrowed reference to one packed type term.
 ///
-/// A raw `TypeTermId` is never exposed: its store and definition-local alpha
-/// namespace are both part of this value. Structural consumers inspect it
-/// without allocation; explicit compatibility code may materialize one rich
+/// A raw `TypeTermId` is never exposed: its store and definition/ABI-local
+/// alpha namespace are both part of this value. Structural consumers inspect
+/// it without allocation; explicit compatibility code may materialize one rich
 /// checked type through the final linked alpha namespace.
 #[derive(Clone, Copy)]
-pub struct KernelDefinitionTypeRef<'a> {
+pub struct KernelPackedTypeRef<'a> {
     input: &'a KernelSemanticInputV1,
-    owner: KernelOwnerId,
+    scope: KernelPackedTypeScope,
     term: crate::TypeTermId,
 }
 
 #[derive(Clone, Copy)]
-pub struct KernelDefinitionFlowRef<'a> {
+pub struct KernelPackedFlowRef<'a> {
     mode: FlowMode,
-    ty: KernelDefinitionTypeRef<'a>,
+    ty: KernelPackedTypeRef<'a>,
+}
+
+/// Borrowed generic scheme targeted by one call.
+///
+/// User and ABI schemes share one packed term store but retain disjoint alpha
+/// namespaces. The target identity carried here keeps every returned flow and
+/// parameter token bound to the correct namespace.
+#[derive(Clone, Copy)]
+pub struct KernelCallableSchemeRef<'a> {
+    input: &'a KernelSemanticInputV1,
+    target: crate::KernelCallableSchemeId,
+}
+
+/// Target-bound generic parameter token. Its ordinal is meaningful only in
+/// the callable scheme retained in this value.
+#[derive(Clone, Copy)]
+pub struct KernelCallableTypeParameterRef<'a> {
+    scheme: KernelCallableSchemeRef<'a>,
+    ordinal: crate::KernelTypeParameterId,
 }
 
 #[derive(Clone, Copy)]
 pub struct KernelDefinitionCallTypeFactsRef<'a> {
     input: &'a KernelSemanticInputV1,
     owner: KernelOwnerId,
+    target: crate::KernelCallableSchemeId,
+    base_result: crate::PackedFlow,
+    published_result: crate::PackedFlow,
     substitutions: &'a [crate::PackedCallTypeSubstitution],
     syntax_discriminated_result: bool,
 }
@@ -469,12 +522,13 @@ pub struct KernelDefinitionCallTypeFactsRef<'a> {
 pub struct KernelDefinitionCallTypeSubstitutionRef<'a> {
     input: &'a KernelSemanticInputV1,
     owner: KernelOwnerId,
+    target: crate::KernelCallableSchemeId,
     substitution: &'a crate::PackedCallTypeSubstitution,
 }
 
 /// Explicit, phase-scoped compatibility projector for packed semantic types.
 ///
-/// Structural consumers use [`KernelDefinitionTypeRef`] directly and allocate
+/// Structural consumers use [`KernelPackedTypeRef`] directly and allocate
 /// nothing. A rich checked/editor boundary creates one of these and reuses its
 /// recursive export cache for the complete projection instead of allocating a
 /// project-sized cache for each type root.
@@ -482,7 +536,7 @@ pub struct KernelDefinitionCallTypeSubstitutionRef<'a> {
 pub struct KernelSemanticTypeMaterializer<'a> {
     input: &'a KernelSemanticInputV1,
     cache: DefinitionTypeMaterializationCache,
-    owner: Option<KernelOwnerId>,
+    scope: Option<KernelPackedTypeScope>,
     variables: BTreeMap<TypeVar, TypeVar>,
     next: u32,
     alpha_end: u32,
@@ -861,6 +915,15 @@ impl KernelSemanticInputConstructionV1 {
         owner: KernelOwnerId,
     ) -> Option<&KernelSemanticDefinitionRelocationV1> {
         self.definition_relocations.get(owner.0 as usize)
+    }
+
+    fn abi_relocation(
+        &self,
+        callable: crate::KernelAbiCallableId,
+    ) -> Option<&KernelSemanticAbiRelocationV1> {
+        self.abi_relocations
+            .get(callable.0 as usize)
+            .and_then(Option::as_ref)
     }
 
     fn relocate_expression(&self, expression: crate::PackedExpressionRef) -> Option<CheckedExprId> {
@@ -1260,6 +1323,68 @@ impl KernelSemanticInputConstructionV1 {
                 "kernel semantic execution templates repeat a callable relocation",
             ));
         }
+        let mut abi_relocations = vec![None; snapshot.definition_code.abi_callable_count()];
+        for callable in &layout.abi_callables {
+            let slot = abi_relocations
+                .get_mut(callable.callable.0 as usize)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel semantic ABI relocation {} is outside its packed scheme table",
+                        callable.callable.0,
+                    ))
+                })?;
+            if slot.is_some() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel semantic input repeats ABI relocation {}",
+                    callable.callable.0,
+                )));
+            }
+            let scheme = snapshot
+                .definition_code
+                .abi_callable_scheme(callable.callable)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel semantic input has no packed ABI scheme {}",
+                        callable.callable.0,
+                    ))
+                })?;
+            if scheme.callable() != callable.callable {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel semantic ABI scheme {} has mismatched identity {}",
+                    callable.callable.0,
+                    scheme.callable().0,
+                )));
+            }
+            for parameter in scheme.type_parameters() {
+                let expected_local = parameter
+                    .source
+                    .0
+                    .checked_sub(scheme.variable_base().0)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel semantic ABI scheme {} parameter {} precedes variable base {}",
+                            callable.callable.0,
+                            parameter.source.0,
+                            scheme.variable_base().0,
+                        ))
+                    })?;
+                if expected_local != parameter.linked_local
+                    || parameter.linked_local >= callable.type_variables.len
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel semantic ABI scheme {} parameter {} maps to invalid linked alpha {} in a {}-row namespace",
+                        callable.callable.0,
+                        parameter.source.0,
+                        parameter.linked_local,
+                        callable.type_variables.len,
+                    )));
+                }
+            }
+            *slot = Some(KernelSemanticAbiRelocationV1 {
+                callable: callable.declaration,
+                type_variables: callable.type_variables,
+            });
+        }
         let mut previous_call = None;
         let mut next_symbol = 0u32;
         for path in &call_result_paths {
@@ -1329,6 +1454,7 @@ impl KernelSemanticInputConstructionV1 {
             declaration_count: layout.totals.declarations.saturating_sub(1),
             source_count: layout.totals.sources,
             definition_relocations: definition_relocations.into_boxed_slice(),
+            abi_relocations: abi_relocations.into_boxed_slice(),
             definition_execution_owners: definition_execution_owners.into_boxed_slice(),
             call_result_paths,
             call_result_path_symbols,
@@ -1527,15 +1653,33 @@ impl KernelSemanticInputV1 {
         self.construction.definition_count
     }
 
+    fn packed_type_ref(
+        &self,
+        scope: KernelPackedTypeScope,
+        term: crate::TypeTermId,
+    ) -> KernelPackedTypeRef<'_> {
+        KernelPackedTypeRef {
+            input: self,
+            scope,
+            term,
+        }
+    }
+
     fn definition_type_ref(
         &self,
         owner: KernelOwnerId,
         term: crate::TypeTermId,
-    ) -> KernelDefinitionTypeRef<'_> {
-        KernelDefinitionTypeRef {
+    ) -> KernelPackedTypeRef<'_> {
+        self.packed_type_ref(KernelPackedTypeScope::Definition(owner), term)
+    }
+
+    fn callable_scheme_ref(
+        &self,
+        target: crate::KernelCallableSchemeId,
+    ) -> KernelCallableSchemeRef<'_> {
+        KernelCallableSchemeRef {
             input: self,
-            owner,
-            term,
+            target,
         }
     }
 
@@ -1546,7 +1690,7 @@ impl KernelSemanticInputV1 {
         KernelSemanticTypeMaterializer {
             input: self,
             cache: self.construction.definition_code.materialization_cache(),
-            owner: None,
+            scope: None,
             variables: BTreeMap::new(),
             next: 0,
             alpha_end: 0,
@@ -1555,17 +1699,34 @@ impl KernelSemanticInputV1 {
 
     /// Borrow the checked occurrence flow directly from the packed definition
     /// store. Resource-required publication overrides are already reflected.
-    pub fn expression_flow(
+    pub fn published_expression_flow(
         &self,
         expression: CheckedExprId,
-    ) -> Option<KernelDefinitionFlowRef<'_>> {
+    ) -> Option<KernelPackedFlowRef<'_>> {
         let expression = self.construction.local_expression(expression)?;
         let flow = self
             .construction
             .definition_code
             .definition(expression.owner())?
             .published_expression(expression.expression().0 as usize)?;
-        Some(KernelDefinitionFlowRef {
+        Some(KernelPackedFlowRef {
+            mode: flow.mode,
+            ty: self.definition_type_ref(expression.owner(), flow.term),
+        })
+    }
+
+    /// Borrow the occurrence flow before resource publication overrides.
+    pub fn base_expression_flow(
+        &self,
+        expression: CheckedExprId,
+    ) -> Option<KernelPackedFlowRef<'_>> {
+        let expression = self.construction.local_expression(expression)?;
+        let flow = self
+            .construction
+            .definition_code
+            .definition(expression.owner())?
+            .base_expression(expression.expression().0 as usize)?;
+        Some(KernelPackedFlowRef {
             mode: flow.mode,
             ty: self.definition_type_ref(expression.owner(), flow.term),
         })
@@ -1578,14 +1739,14 @@ impl KernelSemanticInputV1 {
     pub fn declared_declaration_flow(
         &self,
         declaration: DeclId,
-    ) -> Option<KernelDefinitionFlowRef<'_>> {
+    ) -> Option<KernelPackedFlowRef<'_>> {
         let (owner, ordinal) = self.construction.local_declaration(declaration)?;
         let flow = self
             .construction
             .definition_code
             .definition(owner)?
             .declared_declaration_flow(ordinal as usize)?;
-        Some(KernelDefinitionFlowRef {
+        Some(KernelPackedFlowRef {
             mode: flow.mode,
             ty: self.definition_type_ref(owner, flow.term),
         })
@@ -1600,12 +1761,25 @@ impl KernelSemanticInputV1 {
     ) -> Option<KernelDefinitionCallTypeFactsRef<'_>> {
         let call = self.construction.local_call(call)?;
         let code = self.construction.definition_code.definition(call.owner())?;
+        let ordinal = call.ordinal() as usize;
+        let expression = code.call_expression(ordinal)?;
+        let target = code.call_target(ordinal)??;
+        let base_result = code.base_expression(expression.0 as usize)?;
+        let published_result = code.published_expression(expression.0 as usize)?;
         Some(KernelDefinitionCallTypeFactsRef {
             input: self,
             owner: call.owner(),
-            substitutions: code.call_type_substitutions(call.ordinal() as usize)?,
-            syntax_discriminated_result: code
-                .call_syntax_discriminated_result(call.ordinal() as usize)?,
+            target,
+            base_result: crate::PackedFlow {
+                mode: base_result.mode,
+                term: base_result.term,
+            },
+            published_result: crate::PackedFlow {
+                mode: published_result.mode,
+                term: published_result.term,
+            },
+            substitutions: code.call_type_substitutions(ordinal)?,
+            syntax_discriminated_result: code.call_syntax_discriminated_result(ordinal)?,
         })
     }
 
@@ -1852,7 +2026,7 @@ impl KernelSemanticInputV1 {
     }
 }
 
-impl<'a> KernelDefinitionTypeRef<'a> {
+impl<'a> KernelPackedTypeRef<'a> {
     fn with_term(self, term: crate::TypeTermId) -> Self {
         Self { term, ..self }
     }
@@ -1860,46 +2034,93 @@ impl<'a> KernelDefinitionTypeRef<'a> {
 
 impl KernelSemanticTypeMaterializer<'_> {
     /// Materialize one type from this projector's packed input through the
-    /// definition's final linked alpha namespace.
+    /// definition or ABI scheme's final linked alpha namespace.
     pub fn materialize_type(
         &mut self,
-        ty: KernelDefinitionTypeRef<'_>,
+        ty: KernelPackedTypeRef<'_>,
     ) -> Result<Type, KernelCheckedLinkError> {
         if !std::ptr::eq(self.input, ty.input) {
             return Err(KernelCheckedLinkError::new(
                 "a semantic type projector cannot materialize a foreign packed input",
             ));
         }
-        let code = self
+        if self.scope != Some(ty.scope) {
+            match ty.scope {
+                KernelPackedTypeScope::Definition(owner) => {
+                    let code = self
+                        .input
+                        .construction
+                        .definition_code
+                        .definition(owner)
+                        .expect("sealed kernel semantic type owner exists");
+                    let alpha_start = self
+                        .input
+                        .construction
+                        .definition_relocation(owner)
+                        .expect("sealed kernel semantic type relocation exists")
+                        .type_variables
+                        .start;
+                    self.alpha_end =
+                        code.populate_linked_variables(&mut self.variables, alpha_start);
+                }
+                KernelPackedTypeScope::Abi(callable) => {
+                    let scheme = self
+                        .input
+                        .construction
+                        .definition_code
+                        .abi_callable_scheme(callable)
+                        .expect("sealed kernel semantic ABI scheme exists");
+                    let relocation = self
+                        .input
+                        .construction
+                        .abi_relocation(callable)
+                        .expect("a semantic ABI type has a checked relocation");
+                    self.variables.clear();
+                    for parameter in scheme.type_parameters() {
+                        let linked = relocation
+                            .type_variables
+                            .resolve(parameter.linked_local, "semantic ABI type variable")?;
+                        if self
+                            .variables
+                            .insert(TypeVar(parameter.source.0), TypeVar(linked))
+                            .is_some()
+                        {
+                            return Err(KernelCheckedLinkError::new(format!(
+                                "kernel semantic ABI scheme {} repeats packed parameter {}",
+                                callable.0, parameter.source.0,
+                            )));
+                        }
+                    }
+                    self.alpha_end = relocation
+                        .type_variables
+                        .start
+                        .checked_add(relocation.type_variables.len)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(
+                                "kernel semantic ABI type-variable namespace overflows u32",
+                            )
+                        })?;
+                }
+            }
+            self.next = self.alpha_end;
+            self.scope = Some(ty.scope);
+        }
+        Ok(self
             .input
             .construction
             .definition_code
-            .definition(ty.owner)
-            .expect("sealed kernel semantic type owner exists");
-        let alpha_start = self
-            .input
-            .construction
-            .definition_relocation(ty.owner)
-            .expect("sealed kernel semantic type relocation exists")
-            .type_variables
-            .start;
-        if self.owner != Some(ty.owner) {
-            self.alpha_end = code.populate_linked_variables(&mut self.variables, alpha_start);
-            self.next = self.alpha_end;
-            self.owner = Some(ty.owner);
-        }
-        Ok(code.materialize_linked_type_term(
-            &mut self.cache,
-            &mut self.variables,
-            &mut self.next,
-            self.alpha_end,
-            ty.term,
-        ))
+            .materialize_linked_type_term(
+                &mut self.cache,
+                &mut self.variables,
+                &mut self.next,
+                self.alpha_end,
+                ty.term,
+            ))
     }
 
     pub fn materialize_flow(
         &mut self,
-        flow: KernelDefinitionFlowRef<'_>,
+        flow: KernelPackedFlowRef<'_>,
     ) -> Result<FlowType, KernelCheckedLinkError> {
         Ok(FlowType {
             mode: flow.mode,
@@ -1908,7 +2129,7 @@ impl KernelSemanticTypeMaterializer<'_> {
     }
 }
 
-impl boon_checked::CheckedTypeView for KernelDefinitionTypeRef<'_> {
+impl boon_checked::CheckedTypeView for KernelPackedTypeRef<'_> {
     fn list_item(self) -> Option<Self> {
         match self
             .input
@@ -1992,26 +2213,255 @@ impl boon_checked::CheckedTypeView for KernelDefinitionTypeRef<'_> {
     }
 }
 
-impl<'a> KernelDefinitionFlowRef<'a> {
+impl<'a> KernelPackedFlowRef<'a> {
     pub const fn mode(self) -> FlowMode {
         self.mode
     }
 
-    pub const fn ty(self) -> KernelDefinitionTypeRef<'a> {
+    pub const fn ty(self) -> KernelPackedTypeRef<'a> {
         self.ty
     }
 }
 
+impl<'a> KernelCallableSchemeRef<'a> {
+    pub const fn identity(self) -> crate::KernelCallableSchemeId {
+        self.target
+    }
+
+    pub fn declaration(self) -> DeclId {
+        match self.target {
+            crate::KernelCallableSchemeId::User(owner) => {
+                self.input
+                    .construction
+                    .definition_relocation(owner)
+                    .expect("sealed callable scheme owner has a relocation")
+                    .callable
+            }
+            crate::KernelCallableSchemeId::Abi(callable) => {
+                self.input
+                    .construction
+                    .abi_relocation(callable)
+                    .expect("sealed ABI callable scheme has a relocation")
+                    .callable
+            }
+        }
+    }
+
+    fn scope(self) -> KernelPackedTypeScope {
+        match self.target {
+            crate::KernelCallableSchemeId::User(owner) => KernelPackedTypeScope::Definition(owner),
+            crate::KernelCallableSchemeId::Abi(callable) => KernelPackedTypeScope::Abi(callable),
+        }
+    }
+
+    fn flow(self, flow: crate::PackedFlow) -> KernelPackedFlowRef<'a> {
+        KernelPackedFlowRef {
+            mode: flow.mode,
+            ty: self.input.packed_type_ref(self.scope(), flow.term),
+        }
+    }
+
+    pub fn formal_count(self) -> usize {
+        match self.target {
+            crate::KernelCallableSchemeId::User(owner) => self
+                .input
+                .construction
+                .definition_code
+                .definition(owner)
+                .expect("sealed callable scheme owner exists")
+                .formals()
+                .len(),
+            crate::KernelCallableSchemeId::Abi(callable) => self
+                .input
+                .construction
+                .definition_code
+                .abi_callable_scheme(callable)
+                .expect("sealed ABI callable scheme exists")
+                .formals()
+                .len(),
+        }
+    }
+
+    pub fn formal(self, ordinal: usize) -> Option<KernelPackedFlowRef<'a>> {
+        let flow = match self.target {
+            crate::KernelCallableSchemeId::User(owner) => {
+                let flow = *self
+                    .input
+                    .construction
+                    .definition_code
+                    .definition(owner)?
+                    .formals()
+                    .get(ordinal)?;
+                crate::PackedFlow {
+                    mode: flow.mode,
+                    term: flow.term,
+                }
+            }
+            crate::KernelCallableSchemeId::Abi(callable) => *self
+                .input
+                .construction
+                .definition_code
+                .abi_callable_scheme(callable)?
+                .formals()
+                .get(ordinal)?,
+        };
+        Some(self.flow(flow))
+    }
+
+    pub fn result(self) -> KernelPackedFlowRef<'a> {
+        let flow = match self.target {
+            crate::KernelCallableSchemeId::User(owner) => self
+                .input
+                .construction
+                .definition_code
+                .definition(owner)
+                .expect("sealed callable scheme owner exists")
+                .result_flow(),
+            crate::KernelCallableSchemeId::Abi(callable) => self
+                .input
+                .construction
+                .definition_code
+                .abi_callable_scheme(callable)
+                .expect("sealed ABI callable scheme exists")
+                .result(),
+        };
+        self.flow(flow)
+    }
+
+    pub fn type_parameter_count(self) -> usize {
+        match self.target {
+            crate::KernelCallableSchemeId::User(owner) => self
+                .input
+                .construction
+                .definition_code
+                .definition(owner)
+                .expect("sealed callable scheme owner exists")
+                .callable_type_parameters()
+                .len(),
+            crate::KernelCallableSchemeId::Abi(callable) => self
+                .input
+                .construction
+                .definition_code
+                .abi_callable_scheme(callable)
+                .expect("sealed ABI callable scheme exists")
+                .type_parameters()
+                .len(),
+        }
+    }
+
+    pub fn type_parameter(self, ordinal: usize) -> Option<KernelCallableTypeParameterRef<'a>> {
+        (ordinal < self.type_parameter_count()).then_some(KernelCallableTypeParameterRef {
+            scheme: self,
+            ordinal: crate::KernelTypeParameterId(u32::try_from(ordinal).ok()?),
+        })
+    }
+}
+
+impl<'a> KernelCallableTypeParameterRef<'a> {
+    pub const fn scheme(self) -> KernelCallableSchemeRef<'a> {
+        self.scheme
+    }
+
+    pub const fn ordinal(self) -> crate::KernelTypeParameterId {
+        self.ordinal
+    }
+
+    /// Alpha coordinate inside this callable's own linked type-variable
+    /// range. Unlike [`Self::ordinal`], this is independent of packed term
+    /// traversal order.
+    pub fn linked_local(self) -> u32 {
+        match self.scheme.target {
+            crate::KernelCallableSchemeId::User(owner) => {
+                self.scheme
+                    .input
+                    .construction
+                    .definition_code
+                    .definition(owner)
+                    .expect("sealed callable parameter owner exists")
+                    .callable_type_parameters()[self.ordinal.0 as usize]
+                    .linked_local
+            }
+            crate::KernelCallableSchemeId::Abi(callable) => {
+                self.scheme
+                    .input
+                    .construction
+                    .definition_code
+                    .abi_callable_scheme(callable)
+                    .expect("sealed ABI callable parameter scheme exists")
+                    .type_parameters()[self.ordinal.0 as usize]
+                    .linked_local
+            }
+        }
+    }
+
+    /// Final checked type-variable identity for this retained target
+    /// parameter. The mapping follows the scheme's explicit `linked_local`
+    /// row; it never reconstructs parameter order from a rich recursive type.
+    pub fn linked_variable(self) -> TypeVar {
+        let variables = match self.scheme.target {
+            crate::KernelCallableSchemeId::User(owner) => {
+                let variables = self
+                    .scheme
+                    .input
+                    .construction
+                    .definition_relocation(owner)
+                    .expect("sealed callable parameter owner relocates")
+                    .type_variables;
+                variables
+            }
+            crate::KernelCallableSchemeId::Abi(callable) => {
+                let variables = self
+                    .scheme
+                    .input
+                    .construction
+                    .abi_relocation(callable)
+                    .expect("sealed ABI callable parameter relocates")
+                    .type_variables;
+                variables
+            }
+        };
+        TypeVar(
+            variables
+                .resolve(self.linked_local(), "callable type parameter")
+                .expect("sealed callable parameter linked alpha is valid"),
+        )
+    }
+}
+
 impl<'a> KernelDefinitionCallTypeFactsRef<'a> {
+    pub fn target_scheme(self) -> KernelCallableSchemeRef<'a> {
+        self.input.callable_scheme_ref(self.target)
+    }
+
+    pub fn base_result(self) -> KernelPackedFlowRef<'a> {
+        KernelPackedFlowRef {
+            mode: self.base_result.mode,
+            ty: self
+                .input
+                .definition_type_ref(self.owner, self.base_result.term),
+        }
+    }
+
+    pub fn published_result(self) -> KernelPackedFlowRef<'a> {
+        KernelPackedFlowRef {
+            mode: self.published_result.mode,
+            ty: self
+                .input
+                .definition_type_ref(self.owner, self.published_result.term),
+        }
+    }
+
     pub fn substitutions(
         self,
     ) -> impl ExactSizeIterator<Item = KernelDefinitionCallTypeSubstitutionRef<'a>> {
         let input = self.input;
         let owner = self.owner;
+        let target = self.target;
         self.substitutions.iter().map(
             move |substitution| KernelDefinitionCallTypeSubstitutionRef {
                 input,
                 owner,
+                target,
                 substitution,
             },
         )
@@ -2023,11 +2473,14 @@ impl<'a> KernelDefinitionCallTypeFactsRef<'a> {
 }
 
 impl<'a> KernelDefinitionCallTypeSubstitutionRef<'a> {
-    pub const fn parameter(self) -> crate::KernelTypeParameterId {
-        self.substitution.variable
+    pub fn parameter(self) -> KernelCallableTypeParameterRef<'a> {
+        self.input
+            .callable_scheme_ref(self.target)
+            .type_parameter(self.substitution.variable.0 as usize)
+            .expect("sealed call substitution parameter belongs to its target scheme")
     }
 
-    pub fn value(self) -> KernelDefinitionTypeRef<'a> {
+    pub fn value(self) -> KernelPackedTypeRef<'a> {
         self.input
             .definition_type_ref(self.owner, self.substitution.term)
     }
@@ -2891,15 +3344,16 @@ impl KernelCheckedLinkLayout {
         }
         totals.callables = totals.user_callables;
         let definition_declarations_end = totals.declarations;
-        let referenced_abi_callables = referenced_abi_callable_names(snapshot)?;
+        let referenced_abi_callables = referenced_abi_callable_ids(project, snapshot)?;
         let mut abi_callables = Vec::with_capacity(referenced_abi_callables.len());
-        let mut abi_callable_by_name = BTreeMap::new();
-        for name in referenced_abi_callables {
-            let callable = project.abi().callable(&name).ok_or_else(|| {
+        for callable_id in referenced_abi_callables {
+            let callable = project.abi().callable_by_id(callable_id).ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
-                    "kernel checked linker references ABI callable `{name}` absent from its immutable project ABI"
+                    "kernel checked linker references ABI callable ID {} absent from its immutable project ABI",
+                    callable_id.0,
                 ))
             })?;
+            let name = callable.name.as_ref();
             let declaration = DeclId(totals.declarations);
             totals.declarations = totals.declarations.checked_add(1).ok_or_else(|| {
                 KernelCheckedLinkError::new(
@@ -2931,17 +3385,8 @@ impl KernelCheckedLinkLayout {
                 type_variable_ordinals.len(),
                 "ABI type variable",
             )?;
-            let index = abi_callables.len();
-            if abi_callable_by_name
-                .insert(name.clone().into_boxed_str(), index)
-                .is_some()
-            {
-                return Err(KernelCheckedLinkError::new(format!(
-                    "kernel checked linker repeats referenced ABI callable `{name}`"
-                )));
-            }
             abi_callables.push(KernelCheckedAbiCallableLayout {
-                name: name.into_boxed_str(),
+                callable: callable_id,
                 declaration,
                 parameters,
                 type_variables,
@@ -2993,7 +3438,6 @@ impl KernelCheckedLinkLayout {
         let mut layout = Self {
             definitions: definitions.into_boxed_slice(),
             abi_callables: abi_callables.into_boxed_slice(),
-            abi_callable_by_name,
             definition_declarations_end,
             totals,
         };
@@ -3064,7 +3508,6 @@ impl KernelCheckedLinkLayout {
             lists,
         } = base;
         let (calls, call_occurrences) = self.materialize_calls_with_cache(
-            project,
             snapshot,
             &callables,
             &declarations,
@@ -3202,7 +3645,8 @@ impl KernelCheckedLinkLayout {
         let (user_callables, context_formals) =
             self.materialize_user_callables_with_cache(snapshot, role, type_cache)?;
         let mut callables = user_callables.into_vec();
-        let (abi_callables, abi_declarations) = self.materialize_abi_callables(project.abi())?;
+        let (abi_callables, abi_declarations) =
+            self.materialize_abi_callables_with_cache(project.abi(), snapshot, type_cache)?;
         callables.extend(abi_callables);
         declarations.extend(abi_declarations);
         Ok(KernelCheckedBaseRows {
@@ -4321,20 +4765,115 @@ impl KernelCheckedLinkLayout {
         &self.definitions
     }
 
+    /// Project retained callable-parameter identities through this exact
+    /// checked layout.
+    ///
+    /// This is an explicit compatibility boundary. Runtime packed consumers
+    /// keep using target-bound parameter tokens; editor and differential
+    /// projections can request this small sidecar when they must compare rich
+    /// checked programs whose absolute `TypeVar` ranges differ.
+    pub fn callable_type_parameter_layouts(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<Box<[KernelCheckedCallableTypeParameterLayout]>, KernelCheckedLinkError> {
+        let mut parameters = Vec::new();
+        for definition in &self.definitions {
+            let code = snapshot
+                .definition_code
+                .definition(definition.owner)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel checked linker has no packed callable scheme for definition {}",
+                        definition.owner.0,
+                    ))
+                })?;
+            for (ordinal, parameter) in code.callable_type_parameters().iter().enumerate() {
+                parameters.push(KernelCheckedCallableTypeParameterLayout {
+                    target: crate::KernelCallableSchemeId::User(definition.owner),
+                    callable: definition.public_declaration,
+                    parameter: crate::KernelTypeParameterId(u32::try_from(ordinal).map_err(
+                        |_| {
+                            KernelCheckedLinkError::new(
+                                "kernel callable type-parameter ordinal exceeds u32",
+                            )
+                        },
+                    )?),
+                    linked_local: parameter.linked_local,
+                    linked_variable: TypeVar(
+                        definition
+                            .type_variables
+                            .resolve(parameter.linked_local, "callable type parameter")?,
+                    ),
+                });
+            }
+        }
+        for callable in &self.abi_callables {
+            let scheme = snapshot
+                .definition_code
+                .abi_callable_scheme(callable.callable)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel checked linker has no packed ABI callable scheme {}",
+                        callable.callable.0,
+                    ))
+                })?;
+            for (ordinal, parameter) in scheme.type_parameters().iter().enumerate() {
+                parameters.push(KernelCheckedCallableTypeParameterLayout {
+                    target: crate::KernelCallableSchemeId::Abi(callable.callable),
+                    callable: callable.declaration,
+                    parameter: crate::KernelTypeParameterId(u32::try_from(ordinal).map_err(
+                        |_| {
+                            KernelCheckedLinkError::new(
+                                "kernel ABI type-parameter ordinal exceeds u32",
+                            )
+                        },
+                    )?),
+                    linked_local: parameter.linked_local,
+                    linked_variable: TypeVar(
+                        callable
+                            .type_variables
+                            .resolve(parameter.linked_local, "ABI callable type parameter")?,
+                    ),
+                });
+            }
+        }
+        parameters.sort_unstable_by_key(|parameter| (parameter.target, parameter.parameter));
+        for (index, parameter) in parameters.iter().enumerate() {
+            if parameters[..index]
+                .iter()
+                .rev()
+                .take_while(|previous| previous.target == parameter.target)
+                .any(|previous| {
+                    previous.parameter == parameter.parameter
+                        || previous.linked_local == parameter.linked_local
+                        || previous.linked_variable == parameter.linked_variable
+                })
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel checked callable scheme {:?} repeats a parameter, linked alpha, or linked variable",
+                    parameter.target,
+                )));
+            }
+        }
+        Ok(parameters.into_boxed_slice())
+    }
+
     pub fn abi_callables(&self) -> &[KernelCheckedAbiCallableLayout] {
         &self.abi_callables
     }
 
     pub fn abi_callable(
         &self,
-        name: &str,
+        callable: crate::KernelAbiCallableId,
     ) -> Result<&KernelCheckedAbiCallableLayout, KernelCheckedLinkError> {
-        self.abi_callable_by_name
-            .get(name)
-            .and_then(|index| self.abi_callables.get(*index))
+        self.abi_callables
+            .binary_search_by_key(&callable, |layout| layout.callable)
+            .ok()
+            .and_then(|index| self.abi_callables.get(index))
             .ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
-                    "kernel checked linker references unallocated ABI callable `{name}`"
+                    "kernel checked linker references unallocated ABI callable ID {}",
+                    callable.0,
                 ))
             })
     }
@@ -5408,30 +5947,91 @@ impl KernelCheckedLinkLayout {
     pub fn materialize_abi_callables(
         &self,
         abi: &KernelAbiInput,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<(Box<[CheckedCallableSignature]>, Box<[CheckedDeclaration]>), KernelCheckedLinkError>
+    {
+        let mut type_cache = snapshot.definition_code.materialization_cache();
+        self.materialize_abi_callables_with_cache(abi, snapshot, &mut type_cache)
+    }
+
+    fn materialize_abi_callables_with_cache(
+        &self,
+        abi: &KernelAbiInput,
+        snapshot: &KernelCheckedSnapshot,
+        type_cache: &mut DefinitionTypeMaterializationCache,
     ) -> Result<(Box<[CheckedCallableSignature]>, Box<[CheckedDeclaration]>), KernelCheckedLinkError>
     {
         let mut callables = Vec::with_capacity(self.totals.abi_callables as usize);
         let mut declarations = Vec::new();
         for layout in &self.abi_callables {
-            let callable = abi.callable(&layout.name).ok_or_else(|| {
+            let callable = abi.callable_by_id(layout.callable).ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
-                    "kernel checked ABI materializer cannot find `{}` in its immutable ABI",
-                    layout.name,
+                    "kernel checked ABI materializer cannot find ID {} in its immutable ABI",
+                    layout.callable.0,
                 ))
             })?;
+            let name = callable.name.as_ref();
+            let scheme = snapshot
+                .definition_code
+                .abi_callable_scheme(layout.callable)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel checked ABI materializer cannot find packed scheme ID {}",
+                        layout.callable.0,
+                    ))
+                })?;
             if callable.parameters.len() != layout.parameters.len() {
                 return Err(KernelCheckedLinkError::new(format!(
                     "kernel checked ABI callable `{}` has {} parameters in its layout and {} in its contract",
-                    layout.name,
+                    name,
                     layout.parameters.len(),
                     callable.parameters.len(),
                 )));
             }
+            if scheme.formals().len() != callable.parameters.len() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel checked ABI callable `{name}` has {} packed formals and {} contract parameters",
+                    scheme.formals().len(),
+                    callable.parameters.len(),
+                )));
+            }
+            let alpha_end = layout
+                .type_variables
+                .start
+                .checked_add(layout.type_variables.len)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel checked ABI callable `{name}` type-variable namespace overflows u32"
+                    ))
+                })?;
+            let mut variables = BTreeMap::<TypeVar, TypeVar>::new();
+            for parameter in scheme.type_parameters() {
+                let linked = layout
+                    .type_variables
+                    .resolve(parameter.linked_local, "ABI type variable")?;
+                if variables
+                    .insert(TypeVar(parameter.source.0), TypeVar(linked))
+                    .is_some()
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel checked ABI callable `{name}` repeats packed parameter {}",
+                        parameter.source.0,
+                    )));
+                }
+            }
+            let mut next = alpha_end;
             let parameters = callable
                 .parameters
                 .iter()
                 .zip(layout.parameters.iter().copied())
-                .map(|(parameter, decl_id)| {
+                .zip(scheme.formals().iter().copied())
+                .map(|((parameter, decl_id), packed_flow)| {
+                    if parameter.flow_type.mode != packed_flow.mode {
+                        return Err(KernelCheckedLinkError::new(format!(
+                            "kernel checked ABI callable `{name}` parameter `{}` packed mode {:?} differs from contract mode {:?}",
+                            parameter.name, packed_flow.mode, parameter.flow_type.mode,
+                        )));
+                    }
                     let evaluation_scope = match parameter.evaluation_scope {
                         crate::KernelParameterEvaluationScope::Parent => {
                             CheckedEvaluationScope::Parent
@@ -5444,7 +6044,7 @@ impl KernelCheckedLinkLayout {
                                 .ok_or_else(|| {
                                     KernelCheckedLinkError::new(format!(
                                         "kernel checked ABI callable `{}` parameter `{}` targets missing OUT ordinal {parameter_ordinal}",
-                                        layout.name, parameter.name,
+                                        name, parameter.name,
                                     ))
                                 })?;
                             CheckedEvaluationScope::Output { formal }
@@ -5455,7 +6055,16 @@ impl KernelCheckedLinkLayout {
                         name: parameter.name.to_string(),
                         kind: parameter.kind,
                         ordinal: parameter.ordinal as usize,
-                        flow_type: relocate_abi_flow_type(layout, &parameter.flow_type)?,
+                        flow_type: FlowType {
+                            mode: packed_flow.mode,
+                            ty: snapshot.definition_code.materialize_linked_type_term(
+                                type_cache,
+                                &mut variables,
+                                &mut next,
+                                alpha_end,
+                                packed_flow.term,
+                            ),
+                        },
                         requirement: parameter.requirement.clone(),
                         evaluation_scope,
                         start: 0,
@@ -5474,7 +6083,7 @@ impl KernelCheckedLinkLayout {
                         .ok_or_else(|| {
                             KernelCheckedLinkError::new(format!(
                                 "kernel checked ABI callable `{}` context `{}` targets missing parameter ordinal {}",
-                                layout.name, context.name, context.provider_parameter_ordinal,
+                                name, context.name, context.provider_parameter_ordinal,
                             ))
                         })?;
                     Ok(CheckedCallableContext {
@@ -5485,7 +6094,23 @@ impl KernelCheckedLinkLayout {
                     })
                 })
                 .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?;
-            let result = relocate_abi_flow_type(layout, &callable.result)?;
+            let packed_result = scheme.result();
+            if callable.result.mode != packed_result.mode {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel checked ABI callable `{name}` packed result mode {:?} differs from contract mode {:?}",
+                    packed_result.mode, callable.result.mode,
+                )));
+            }
+            let result = FlowType {
+                mode: packed_result.mode,
+                ty: snapshot.definition_code.materialize_linked_type_term(
+                    type_cache,
+                    &mut variables,
+                    &mut next,
+                    alpha_end,
+                    packed_result.term,
+                ),
+            };
             callables.push(CheckedCallableSignature {
                 decl_id: layout.declaration,
                 scope_id: LexicalScopeId(0),
@@ -5495,11 +6120,11 @@ impl KernelCheckedLinkLayout {
                     crate::KernelCallableKind::User => {
                         return Err(KernelCheckedLinkError::new(format!(
                             "kernel immutable ABI unexpectedly contains user callable `{}`",
-                            layout.name,
+                            name,
                         )));
                     }
                 },
-                name: layout.name.to_string(),
+                name: name.to_string(),
                 intrinsic: callable.intrinsic,
                 external_identity: callable.external_identity,
                 parameters: parameters.clone(),
@@ -5512,13 +6137,13 @@ impl KernelCheckedLinkLayout {
                 result_expression: None,
                 contextual_operation: callable
                     .contextual_operation
-                    .map(|operation| checked_abi_contextual_operation(layout, operation))
+                    .map(|operation| checked_abi_contextual_operation(layout, name, operation))
                     .transpose()?,
             });
             declarations.push(CheckedDeclaration {
                 id: layout.declaration,
                 scope_id: LexicalScopeId(0),
-                name: layout.name.to_string(),
+                name: name.to_string(),
                 kind: match callable.kind {
                     crate::KernelCallableKind::Builtin => CheckedDeclarationKind::Builtin,
                     crate::KernelCallableKind::External => CheckedDeclarationKind::External,
@@ -5587,24 +6212,16 @@ impl KernelCheckedLinkLayout {
     /// relocates those facts into final checked IDs.
     pub fn materialize_calls(
         &self,
-        project: &KernelProjectInput,
         snapshot: &KernelCheckedSnapshot,
         callables: &[CheckedCallableSignature],
         declarations: &[CheckedDeclaration],
     ) -> Result<(Box<[CheckedCall]>, Box<[StableOccurrenceKey]>), KernelCheckedLinkError> {
         let mut type_cache = snapshot.definition_code.materialization_cache();
-        self.materialize_calls_with_cache(
-            project,
-            snapshot,
-            callables,
-            declarations,
-            &mut type_cache,
-        )
+        self.materialize_calls_with_cache(snapshot, callables, declarations, &mut type_cache)
     }
 
     fn materialize_calls_with_cache(
         &self,
-        project: &KernelProjectInput,
         snapshot: &KernelCheckedSnapshot,
         callables: &[CheckedCallableSignature],
         declarations: &[CheckedDeclaration],
@@ -5702,16 +6319,19 @@ impl KernelCheckedLinkLayout {
                             call.expression().0,
                         ))
                     })?;
-                let callable_id = match call.target() {
-                    KernelCallTargetRef::User { target, .. } => {
+                let target_scheme = code.call_target(ordinal).flatten().ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel definition {} call expression {} has no retained target scheme",
+                        owner.0,
+                        call.expression().0,
+                    ))
+                })?;
+                let callable_id = match target_scheme {
+                    crate::KernelCallableSchemeId::User(target) => {
                         self.definition(target)?.public_declaration
                     }
-                    KernelCallTargetRef::RenderConstructor { .. }
-                    | KernelCallTargetRef::PureBuiltin { .. }
-                    | KernelCallTargetRef::FixedAbi
-                    | KernelCallTargetRef::HostEffect { .. }
-                    | KernelCallTargetRef::FieldProjection { .. } => {
-                        self.abi_callable(&syntax.function)?.declaration
+                    crate::KernelCallableSchemeId::Abi(callable) => {
+                        self.abi_callable(callable)?.declaration
                     }
                 };
                 let target = callable_by_declaration.get(&callable_id).copied().ok_or_else(|| {
@@ -5981,51 +6601,38 @@ impl KernelCheckedLinkLayout {
                     CheckedContextBinding::None
                 };
 
-                let (
-                    raw_substitutions,
-                    target_variables,
-                    target_type_variables,
-                    target_variables_are_linked,
-                    context,
-                ) = match call.target() {
-                    KernelCallTargetRef::User { target, .. } => {
-                        let target_definition = snapshot.definition(target).ok_or_else(|| {
-                            KernelCheckedLinkError::new(format!(
-                                "kernel call `{}` references missing target definition {}",
-                                syntax.function, target.0,
-                            ))
-                        })?;
-                        let target_code =
-                            snapshot.definition_code.definition(target).ok_or_else(|| {
-                                KernelCheckedLinkError::new(format!(
-                                    "kernel call `{}` has no packed target definition {}",
+                let (raw_substitutions, target_parameters, target_type_variables, context) =
+                    match call.target() {
+                        KernelCallTargetRef::User { target, .. } => {
+                            if target_scheme != crate::KernelCallableSchemeId::User(target) {
+                                return Err(KernelCheckedLinkError::new(format!(
+                                    "kernel call `{}` retained a target scheme that differs from user owner {}",
                                     syntax.function, target.0,
-                                ))
-                            })?;
-                        let target_layout = self.definition(target)?;
-                        let mut target_materializer = target_code
-                            .linked_materializer(type_cache, target_layout.type_variables.start);
-                        let target_formals = (0..target_code.formals().len())
-                            .map(|ordinal| {
-                                target_materializer
-                                    .materialize_formal(ordinal)
-                                    .ok_or_else(|| {
-                                        KernelCheckedLinkError::new(format!(
-                                            "kernel callable `{}` has no packed formal {ordinal}",
-                                            syntax.function,
-                                        ))
-                                    })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let target_result = target_materializer.materialize_result();
-                        let variables = callable_type_parameter_variables(
-                            target_formals.iter(),
-                            &target_result,
-                        );
-                        let context = target_definition
+                                )));
+                            }
+                            let target_definition =
+                                snapshot.definition(target).ok_or_else(|| {
+                                    KernelCheckedLinkError::new(format!(
+                                        "kernel call `{}` references missing target definition {}",
+                                        syntax.function, target.0,
+                                    ))
+                                })?;
+                            let target_code =
+                                snapshot.definition_code.definition(target).ok_or_else(|| {
+                                    KernelCheckedLinkError::new(format!(
+                                        "kernel call `{}` has no packed target definition {}",
+                                        syntax.function, target.0,
+                                    ))
+                                })?;
+                            let target_layout = self.definition(target)?;
+                            let context = target_definition
                                 .linkage()
                                 .context_formal_ordinal
                                 .map(|ordinal| {
+                                    let mut target_materializer = target_code.linked_materializer(
+                                        type_cache,
+                                        target_layout.type_variables.start,
+                                    );
                                     let flow = target_materializer
                                         .materialize_formal(ordinal as usize)
                                         .ok_or_else(|| {
@@ -6049,45 +6656,46 @@ impl KernelCheckedLinkLayout {
                                     ))
                                 })
                                 .transpose()?;
-                        (
-                            packed_call.substitutions.into_vec(),
-                            variables,
-                            target_layout.type_variables,
-                            true,
-                            context,
-                        )
-                    }
-                    KernelCallTargetRef::RenderConstructor { .. }
-                    | KernelCallTargetRef::PureBuiltin { .. }
-                    | KernelCallTargetRef::FixedAbi
-                    | KernelCallTargetRef::HostEffect { .. }
-                    | KernelCallTargetRef::FieldProjection { .. } => {
-                        let contract =
-                            project.abi().callable(&syntax.function).ok_or_else(|| {
-                                KernelCheckedLinkError::new(format!(
-                                    "kernel call `{}` has no immutable ABI contract",
+                            (
+                                packed_call.substitutions.into_vec(),
+                                target_code.callable_type_parameters(),
+                                target_layout.type_variables,
+                                context,
+                            )
+                        }
+                        KernelCallTargetRef::RenderConstructor { .. }
+                        | KernelCallTargetRef::PureBuiltin { .. }
+                        | KernelCallTargetRef::FixedAbi
+                        | KernelCallTargetRef::HostEffect { .. }
+                        | KernelCallTargetRef::FieldProjection { .. } => {
+                            let crate::KernelCallableSchemeId::Abi(callable) = target_scheme else {
+                                return Err(KernelCheckedLinkError::new(format!(
+                                    "kernel ABI call `{}` retained a user target scheme",
                                     syntax.function,
-                                ))
-                            })?;
-                        (
-                            packed_call.substitutions.into_vec(),
-                            callable_type_parameter_variables(
-                                contract
-                                    .parameters
-                                    .iter()
-                                    .map(|parameter| &parameter.flow_type),
-                                &contract.result,
-                            ),
-                            self.abi_callable(&syntax.function)?.type_variables,
-                            false,
-                            None,
-                        )
-                    }
-                };
+                                )));
+                            };
+                            let target_layout = self.abi_callable(callable)?;
+                            let scheme = snapshot
+                                .definition_code
+                                .abi_callable_scheme(target_layout.callable)
+                                .ok_or_else(|| {
+                                    KernelCheckedLinkError::new(format!(
+                                        "kernel call `{}` has no retained packed ABI scheme {}",
+                                        syntax.function, target_layout.callable.0,
+                                    ))
+                                })?;
+                            (
+                                packed_call.substitutions.into_vec(),
+                                scheme.type_parameters(),
+                                target_layout.type_variables,
+                                None,
+                            )
+                        }
+                    };
                 let mut type_substitutions = Vec::with_capacity(raw_substitutions.len());
                 let mut contextual_substitutions = Vec::new();
                 for substitution in raw_substitutions {
-                    let raw_variable = target_variables
+                    let parameter = target_parameters
                         .get(substitution.variable.0 as usize)
                         .copied()
                         .ok_or_else(|| {
@@ -6096,17 +6704,13 @@ impl KernelCheckedLinkLayout {
                                 syntax.function, substitution.variable.0,
                             ))
                         })?;
-                    let variable = if target_variables_are_linked {
-                        raw_variable
-                    } else {
-                        TypeVar(
-                            target_type_variables
-                                .resolve(raw_variable.0, "call target type variable")?,
-                        )
-                    };
+                    let variable = TypeVar(
+                        target_type_variables
+                            .resolve(parameter.linked_local, "call target type variable")?,
+                    );
                     let value = substitution.value;
                     if let Some((formal, context_variables)) = &context
-                        && context_variables.contains(&raw_variable)
+                        && context_variables.contains(&variable)
                     {
                         contextual_substitutions.push(CheckedContextTypeSubstitution {
                             formal: *formal,
@@ -8698,82 +9302,20 @@ fn value_flow_authority_cached(
     Ok((authority, flow))
 }
 
-fn callable_type_parameter_variables<'a>(
-    formals: impl IntoIterator<Item = &'a FlowType>,
-    result: &FlowType,
-) -> Vec<TypeVar> {
-    let mut parameters = Vec::new();
-    for formal in formals {
-        collect_callable_type_parameter_variables(&formal.ty, &mut parameters);
-    }
-    collect_callable_type_parameter_variables(&result.ty, &mut parameters);
-    parameters
-}
-
-fn collect_callable_type_parameter_variables(ty: &Type, parameters: &mut Vec<TypeVar>) {
-    match ty {
-        Type::Var(variable) => {
-            if !parameters.contains(variable) {
-                u32::try_from(parameters.len())
-                    .expect("kernel checked callable type-parameter count exceeds u32");
-                parameters.push(*variable);
-            }
-        }
-        Type::Object(shape) => {
-            for field in shape.ordered_fields().into_iter().map(|(_, field)| field) {
-                collect_callable_type_parameter_variables(field, parameters);
-            }
-        }
-        Type::List(item) | Type::Set(item) => {
-            collect_callable_type_parameter_variables(item, parameters);
-        }
-        Type::Map { key, value } => {
-            collect_callable_type_parameter_variables(key, parameters);
-            collect_callable_type_parameter_variables(value, parameters);
-        }
-        Type::Function { args, result } => {
-            for argument in args {
-                collect_callable_type_parameter_variables(argument, parameters);
-            }
-            collect_callable_type_parameter_variables(&result.ty, parameters);
-        }
-        Type::VariantSet(variants) => {
-            for variant in variants {
-                if let Variant::Tagged { fields, .. } = variant {
-                    for field in fields.ordered_fields().into_iter().map(|(_, field)| field) {
-                        collect_callable_type_parameter_variables(field, parameters);
-                    }
-                }
-            }
-        }
-        Type::Union(members) => {
-            for member in members {
-                collect_callable_type_parameter_variables(member, parameters);
-            }
-        }
-        Type::Text
-        | Type::Number
-        | Type::Bytes(_)
-        | Type::Bits { .. }
-        | Type::Absent
-        | Type::RenderContract
-        | Type::UnresolvedShape { .. }
-        | Type::Unknown => {}
-    }
-}
-
 fn type_variables_in_flow(flow: &FlowType) -> BTreeSet<TypeVar> {
     let mut variables = BTreeSet::new();
     collect_flow_type_variables(flow, &mut variables);
     variables
 }
 
-fn referenced_abi_callable_names(
+fn referenced_abi_callable_ids(
+    project: &KernelProjectInput,
     snapshot: &KernelCheckedSnapshot,
-) -> Result<BTreeSet<String>, KernelCheckedLinkError> {
-    let mut names = BTreeSet::new();
+) -> Result<BTreeSet<crate::KernelAbiCallableId>, KernelCheckedLinkError> {
+    let mut callables = BTreeSet::new();
     for definition in snapshot.definition_refs() {
         let owner = definition.owner().0;
+        let code = definition.code();
         let mut syntax_by_expression = BTreeMap::new();
         for syntax in &definition.facts().call_syntax {
             if syntax_by_expression
@@ -8792,38 +9334,106 @@ fn referenced_abi_callable_names(
                     "kernel definition {owner} omits packed call {ordinal}",
                 ))
             })?;
-            if matches!(call.target(), KernelCallTargetRef::User { .. }) {
-                continue;
-            }
-            let function = syntax_by_expression
-                .get(&call.expression())
-                .copied()
+            let retained = code
+                .call_target(ordinal)
+                .flatten()
                 .ok_or_else(|| {
                     KernelCheckedLinkError::new(format!(
-                        "kernel definition {owner} ABI call expression {} has no authored call identity",
+                        "kernel definition {owner} call expression {} has no retained callable-scheme target",
                         call.expression().0,
                     ))
                 })?;
-            if let KernelCallTargetRef::HostEffect { operation } = call.target()
-                && operation != function
+            let parameter_count = match call.target() {
+                KernelCallTargetRef::User { target, .. } => {
+                    if retained != crate::KernelCallableSchemeId::User(target) {
+                        return Err(KernelCheckedLinkError::new(format!(
+                            "kernel definition {owner} user call expression {} retained target {retained:?} instead of owner {}",
+                            call.expression().0,
+                            target.0,
+                        )));
+                    }
+                    snapshot
+                        .definition_code
+                        .definition(target)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition {owner} calls missing packed definition {}",
+                                target.0,
+                            ))
+                        })?
+                        .callable_type_parameters()
+                        .len()
+                }
+                KernelCallTargetRef::RenderConstructor { .. }
+                | KernelCallTargetRef::PureBuiltin { .. }
+                | KernelCallTargetRef::FixedAbi
+                | KernelCallTargetRef::HostEffect { .. }
+                | KernelCallTargetRef::FieldProjection { .. } => {
+                    let function = syntax_by_expression
+                        .get(&call.expression())
+                        .copied()
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition {owner} ABI call expression {} has no authored call identity",
+                                call.expression().0,
+                            ))
+                        })?;
+                    if let KernelCallTargetRef::HostEffect { operation } = call.target()
+                        && operation != function
+                    {
+                        return Err(KernelCheckedLinkError::new(format!(
+                            "kernel definition {owner} host call expression {} names `{function}` but targets `{operation}`",
+                            call.expression().0,
+                        )));
+                    }
+                    if let KernelCallTargetRef::FieldProjection { field } = call.target()
+                        && function.strip_prefix("Field/") != Some(field)
+                    {
+                        return Err(KernelCheckedLinkError::new(format!(
+                            "kernel definition {owner} field projection call {} names `{function}` instead of `Field/{field}`",
+                            call.expression().0,
+                        )));
+                    }
+                    let callable = project.abi().callable_id(function).ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {owner} references ABI callable `{function}` absent from its immutable project ABI",
+                        ))
+                    })?;
+                    if retained != crate::KernelCallableSchemeId::Abi(callable) {
+                        return Err(KernelCheckedLinkError::new(format!(
+                            "kernel definition {owner} ABI call expression {} retained target {retained:?} instead of ABI ID {}",
+                            call.expression().0,
+                            callable.0,
+                        )));
+                    }
+                    let scheme = snapshot
+                        .definition_code
+                        .abi_callable_scheme(callable)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel definition {owner} calls missing packed ABI scheme {}",
+                                callable.0,
+                            ))
+                        })?;
+                    callables.insert(callable);
+                    scheme.type_parameters().len()
+                }
+            };
+            for substitution in code
+                .call_type_substitutions(ordinal)
+                .expect("sealed call substitution span is valid")
             {
-                return Err(KernelCheckedLinkError::new(format!(
-                    "kernel definition {owner} host call expression {} names `{function}` but targets `{operation}`",
-                    call.expression().0,
-                )));
+                if substitution.variable.0 as usize >= parameter_count {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel definition {owner} call expression {} substitution parameter {} is outside its target scheme's {parameter_count} parameters",
+                        call.expression().0,
+                        substitution.variable.0,
+                    )));
+                }
             }
-            if let KernelCallTargetRef::FieldProjection { field } = call.target()
-                && function.strip_prefix("Field/") != Some(field)
-            {
-                return Err(KernelCheckedLinkError::new(format!(
-                    "kernel definition {owner} field projection call {} names `{function}` instead of `Field/{field}`",
-                    call.expression().0,
-                )));
-            }
-            names.insert(function.to_owned());
         }
     }
-    Ok(names)
+    Ok(callables)
 }
 
 fn abi_callable_type_variables(callable: &crate::KernelCallableAbiInput) -> BTreeSet<TypeVar> {
@@ -8850,6 +9460,7 @@ fn relocate_abi_flow_type(
 
 fn checked_abi_contextual_operation(
     layout: &KernelCheckedAbiCallableLayout,
+    name: &str,
     operation: KernelAbiContextualOperation,
 ) -> Result<CheckedContextualOperation, KernelCheckedLinkError> {
     let parameter = |ordinal: u32, role: &str| {
@@ -8860,7 +9471,7 @@ fn checked_abi_contextual_operation(
             .ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
                     "kernel ABI callable `{}` contextual {role} references missing parameter ordinal {ordinal}",
-                    layout.name,
+                    name,
                 ))
             })
     };
@@ -9497,6 +10108,194 @@ mod tests {
             diagnostics: Box::new([]),
             diagnostic_values: Box::new([]),
         }
+    }
+
+    #[test]
+    fn generic_union_substitutions_link_to_their_explicit_target_alphas() {
+        let unit = SourceUnitId::from_path("generic-union.bn").unwrap();
+        let provider_key = owner_key(&unit, "provider");
+        let consumer_key = owner_key(&unit, "consumer");
+        let actual = boon_checked::canonical_union_type(vec![
+            Type::List(Type::shared(Type::Number)),
+            Type::object(ObjectShape::from_ordered_fields(
+                [("value".to_owned(), Type::Text)],
+                false,
+            )),
+        ]);
+        let provider = KernelOwnerProgramInput {
+            nodes: vec![KernelOwnerNode {
+                kind: KernelOwnerNodeKind::Known(actual),
+                inputs: Box::new([]),
+                mode: FlowMode::Continuous,
+            }]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: Box::new([]),
+            result: KernelExpressionId(0),
+        };
+        let consumer = KernelOwnerProgramInput {
+            nodes: vec![KernelOwnerNode {
+                kind: KernelOwnerNodeKind::PureBuiltin {
+                    kind: crate::KernelPureBuiltinKind::RecordConstructor,
+                },
+                inputs: vec![KernelOwnerInputEdge {
+                    role: KernelOwnerEdgeRole::AbiArgument {
+                        name: "$pipe".into(),
+                    },
+                    expression: KernelExpressionId(1),
+                }]
+                .into_boxed_slice(),
+                mode: FlowMode::Continuous,
+            }]
+            .into_boxed_slice(),
+            formal_count: 0,
+            external_expressions: vec![KernelExternalExpression {
+                owner: KernelOwnerId(0),
+                target: KernelExternalTarget::Result,
+            }]
+            .into_boxed_slice(),
+            result: KernelExpressionId(0),
+        };
+        let mut provider_facts = facts(&unit, &provider_key, "provider");
+        provider_facts.presentation.expressions[0].declaration = None;
+        provider_facts.lexical_bindings = vec![KernelLexicalBindingInput {
+            expression: KernelExpressionId(0),
+            target: KernelLexicalBindingTargetInput::Declaration(
+                KernelDeclarationReference::Local(KernelDeclarationId(0)),
+            ),
+            projection: Box::new([]),
+            access: KernelLexicalAccess::Read,
+        }]
+        .into_boxed_slice();
+        let mut consumer_facts = facts(&unit, &consumer_key, "consumer");
+        consumer_facts.call_syntax = vec![crate::KernelCallSyntaxInput {
+            expression: KernelExpressionId(0),
+            occurrence: StableOccurrenceKey {
+                source_unit_id: unit.clone(),
+                route: boon_syntax::StableOccurrenceRoute {
+                    owner: None,
+                    statement_route: Vec::new(),
+                    expression_route: Vec::new(),
+                },
+            },
+            function: "Generic/union".into(),
+            pipe_input: Some(KernelExpressionId(1)),
+            arguments: Box::new([]),
+            pass: None,
+        }]
+        .into_boxed_slice();
+
+        let list_parameter = TypeVar(0);
+        let object_parameter = TypeVar(1);
+        let formal = boon_checked::canonical_union_type(vec![
+            Type::List(Type::shared(Type::Var(list_parameter))),
+            Type::object(ObjectShape::from_ordered_fields(
+                [("value".to_owned(), Type::Var(object_parameter))],
+                false,
+            )),
+        ]);
+        let abi = crate::KernelAbiInput::new(
+            ProgramRole::Client,
+            [crate::KernelCallableAbiInput {
+                name: "Generic/union".into(),
+                kind: crate::KernelCallableKind::Builtin,
+                intrinsic: None,
+                external_identity: None,
+                parameters: vec![crate::KernelAbiParameterInput {
+                    name: "value".into(),
+                    kind: CheckedParameterKind::Value,
+                    ordinal: 0,
+                    flow_type: FlowType {
+                        mode: FlowMode::Continuous,
+                        ty: formal,
+                    },
+                    requirement: CheckedParameterRequirement::Required,
+                    evaluation_scope: crate::KernelParameterEvaluationScope::Parent,
+                }]
+                .into_boxed_slice(),
+                contexts: Box::new([]),
+                result: FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: Type::Number,
+                },
+                result_specialization: crate::KernelAbiResultSpecialization::Fixed,
+                role: ProgramRole::Client,
+                effect: CheckedEffectSummary::default(),
+                contextual_operation: None,
+            }],
+        )
+        .unwrap();
+        let project = KernelProjectInput::new_with_abi(
+            KernelProjectProgramInput {
+                owners: vec![provider, consumer].into_boxed_slice(),
+            },
+            vec![provider_facts, consumer_facts].into_boxed_slice(),
+            vec![provider_key, consumer_key].into_boxed_slice(),
+            abi,
+        )
+        .unwrap();
+        let mut session = KernelSession::new(project.clone());
+        let checked = session.check(CheckDemand::CheckedImage).unwrap();
+        let KernelCheckProduct::CheckedImage(snapshot) = checked.product else {
+            unreachable!()
+        };
+        let layout = KernelCheckedLinkLayout::new(&project, &snapshot).unwrap();
+        let [abi_layout] = layout.abi_callables() else {
+            panic!("generic union fixture must allocate one ABI callable")
+        };
+        assert_eq!(
+            layout
+                .callable_type_parameter_layouts(&snapshot)
+                .expect("retained ABI parameters relocate through the exact checked layout")
+                .as_ref(),
+            [
+                KernelCheckedCallableTypeParameterLayout {
+                    target: crate::KernelCallableSchemeId::Abi(crate::KernelAbiCallableId(0)),
+                    callable: abi_layout.declaration,
+                    parameter: crate::KernelTypeParameterId(0),
+                    linked_local: object_parameter.0,
+                    linked_variable: TypeVar(abi_layout.type_variables.start + object_parameter.0,),
+                },
+                KernelCheckedCallableTypeParameterLayout {
+                    target: crate::KernelCallableSchemeId::Abi(crate::KernelAbiCallableId(0)),
+                    callable: abi_layout.declaration,
+                    parameter: crate::KernelTypeParameterId(1),
+                    linked_local: list_parameter.0,
+                    linked_variable: TypeVar(abi_layout.type_variables.start + list_parameter.0,),
+                },
+            ],
+        );
+        let rows = layout
+            .materialize_rows(
+                &project,
+                &snapshot,
+                SourceBundleDigestV1::new(
+                    "generic-union.bn",
+                    [boon_contract::SourceBundleUnit::new("generic-union.bn", "")],
+                )
+                .unwrap(),
+                ProgramRole::Client,
+                KernelCheckedRowProjectionDemand::EditorRich,
+            )
+            .unwrap();
+        let [call] = rows.calls.as_ref() else {
+            panic!("generic union fixture must link one checked call")
+        };
+        let substitutions = call
+            .type_substitutions
+            .iter()
+            .map(|substitution| (substitution.variable, substitution.value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            substitutions.get(&object_parameter),
+            Some(&Type::Text),
+            "packed parameter zero is Object<U> and must link to U, not rich Union's first T",
+        );
+        assert_eq!(
+            substitutions.get(&list_parameter),
+            Some(&Type::Number),
+            "packed parameter one is List<T> and must link to T",
+        );
     }
 
     #[test]

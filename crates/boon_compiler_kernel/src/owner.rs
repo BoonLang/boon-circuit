@@ -8,11 +8,13 @@ use crate::{
     KernelRecordEntry, KernelSelectArm, KernelSolveError, KernelSolveWork, KernelSummaryCallInput,
     KernelSummaryNode, KernelSummaryProgram, KernelSummaryProjectionStep, KernelSummaryRecordEntry,
     KernelSummarySelectArm, KernelSummaryValueId, OutputId, PackedCallFactsInput, PackedCallRef,
-    PackedCallTypeSubstitution, PackedDiagnosticTypes, PackedExpressionRef, PackedFlow,
-    PackedPublishedState, PackedResourceProjectionRequirementInput, PackedSourceReadInput,
-    PublishMode, TypeTerm, TypeTermHead, TypeTermId, TypeVariableId, UnsealedComponentArtifact,
-    VariantTerm, build_borrowed_snapshot_receipts, build_snapshot_receipts,
-    definition_basis_fingerprint, definition_basis_fingerprint_with_buffer, solve_component,
+    PackedCallTypeSubstitution, PackedCallableTypeParameter, PackedDiagnosticTypes,
+    PackedExpressionRef, PackedFlow, PackedPublishedState,
+    PackedResourceProjectionRequirementInput, PackedSourceReadInput, PublishMode, TypeTerm,
+    TypeTermHead, TypeTermId, TypeVariableId, UnsealedComponentArtifact, VariantTerm,
+    build_borrowed_snapshot_receipts, build_snapshot_receipts,
+    collect_packed_callable_type_parameter_sources, definition_basis_fingerprint,
+    definition_basis_fingerprint_with_buffer, solve_component,
 };
 use boon_checked::{
     BytesType, CheckedListKeyPolicy, CheckedParameterKind, CheckedStateKind, FlowMode, FlowType,
@@ -1644,6 +1646,13 @@ struct SolvedDefinitionCallFacts {
     substitutions: Box<[PackedCallTypeSubstitution]>,
 }
 
+#[derive(Debug)]
+struct SolvedProjectCallProjection {
+    definitions: Box<[SolvedDefinitionCallFacts]>,
+    diagnostics: Box<[SolvedDefinitionDiagnostics]>,
+    abi_schemes: Box<[crate::PackedAbiCallableSchemeInput]>,
+}
+
 /// Phase-local diagnostic row before it is appended to the packed interface
 /// columns. Non-type diagnostics can reuse their existing metadata verbatim;
 /// call-input diagnostics keep recursive types exclusively in the parallel
@@ -1927,11 +1936,12 @@ pub struct RichKernelCallArtifact {
     pub result: FlowType,
 }
 
-/// Stable ordinal of a schematic type variable in one callable interface.
+/// Stable ordinal in one retained packed callable scheme's canonical generic
+/// parameter row.
 ///
-/// Ordinals are assigned by walking formals in declaration order followed by
-/// the result. They therefore remain meaningful across fresh solver arenas and
-/// never expose global checked-program `TypeVar` numbering.
+/// The ordinal is meaningful only together with its target callable. It is
+/// neither a definition-local alpha coordinate nor a checked/global `TypeVar`
+/// number; consumers translate it through the retained scheme row.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct KernelTypeParameterId(pub u32);
 
@@ -4037,7 +4047,7 @@ impl KernelProjectSolveSession {
         let mut artifact = self.component.solve_outputs(&demand)?;
         let public_results = project_public_results(&self.owners, &artifact);
         let public_formals = project_public_formals(&self.owners, &artifact);
-        let (_, diagnostics) = project_call_facts_and_diagnostics(
+        let call_projection = project_call_facts_and_diagnostics(
             &self.program,
             &self.definition_facts,
             &self.owners,
@@ -4046,7 +4056,8 @@ impl KernelProjectSolveSession {
             &public_results,
             &public_formals,
             false,
-        );
+        )?;
+        let diagnostics = call_projection.diagnostics;
         let interface = project_interface_snapshot(
             &self.program,
             &self.definition_facts,
@@ -4068,7 +4079,7 @@ impl KernelProjectSolveSession {
         let mut projected = ComponentOutputSnapshot::project_unsealed(&mut artifact);
         let public_results = project_public_results(&self.owners, &projected);
         let public_formals = project_public_formals(&self.owners, &projected);
-        let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
+        let call_projection = project_call_facts_and_diagnostics(
             &self.program,
             &self.definition_facts,
             &self.owners,
@@ -4077,7 +4088,12 @@ impl KernelProjectSolveSession {
             &public_results,
             &public_formals,
             true,
-        );
+        )?;
+        let SolvedProjectCallProjection {
+            definitions: call_facts,
+            diagnostics,
+            abi_schemes,
+        } = call_projection;
         let interface = project_interface_snapshot(
             &self.program,
             &self.definition_facts,
@@ -4107,6 +4123,7 @@ impl KernelProjectSolveSession {
             call_facts,
             &diagnostics,
             &resource_projection_facts,
+            abi_schemes,
         )?;
         let artifact = artifact.seal();
         let types = artifact.type_store();
@@ -6304,6 +6321,7 @@ fn build_definition_code_builder(
     call_facts: Box<[SolvedDefinitionCallFacts]>,
     diagnostics: &[SolvedDefinitionDiagnostics],
     resource_projection_facts: &[DefinitionResourceProjectionFacts],
+    abi_schemes: Box<[crate::PackedAbiCallableSchemeInput]>,
 ) -> Result<DefinitionCodeBuilder, KernelSolveError> {
     if call_facts.len() != owners.len()
         || diagnostics.len() != owners.len()
@@ -6319,6 +6337,7 @@ fn build_definition_code_builder(
         .sum();
     let mut builder =
         DefinitionCodeBuilder::with_capacity(owners.len(), flow_capacity, flow_capacity);
+    builder.install_abi_callable_schemes(abi_schemes)?;
     let mut formal_roots = Vec::new();
     let mut expression_roots = Vec::new();
     let mut packed_formal_flows = Vec::new();
@@ -6332,6 +6351,9 @@ fn build_definition_code_builder(
     let mut list_item_types = Vec::new();
     let mut packed_resource_projection_requirements = Vec::new();
     let mut proof_scratch = DefinitionTermProofScratch::default();
+    let mut callable_type_scratch = crate::PackedCallableParameterTraversalScratch::default();
+    let mut callable_parameter_sources = Vec::new();
+    let mut callable_type_parameters = Vec::new();
     let owner_effects = project_owner_effect_summaries(program, definition_facts);
     let synthetic_state_ordinals =
         allocate_project_synthetic_state_ordinals(program, owners, definition_facts);
@@ -6550,6 +6572,34 @@ fn build_definition_code_builder(
         for requirement in &resource_projection_facts.requirements {
             proof_scratch.visit_alpha_root(artifact.terms(), requirement.required_term)?;
         }
+        collect_packed_callable_type_parameter_sources(
+            artifact.terms(),
+            formal_roots.iter().map(|(term, _)| *term),
+            result_term,
+            &mut callable_type_scratch,
+            &mut callable_parameter_sources,
+        );
+        callable_type_parameters.clear();
+        for source in callable_parameter_sources.iter().copied() {
+            let linked_local = proof_scratch
+                .alpha_variable_sources()
+                .iter()
+                .position(|candidate| *candidate == source)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner_index} callable parameter {} is absent from its linked alpha authority",
+                        source.0,
+                    ))
+                })?;
+            callable_type_parameters.push(PackedCallableTypeParameter {
+                source,
+                linked_local: u32::try_from(linked_local).map_err(|_| {
+                    KernelSolveError::new(
+                        "kernel definition callable parameter ordinal exceeds u32",
+                    )
+                })?,
+            });
+        }
         let stable_digest = definition_code_types_stable_digest(
             artifact.terms(),
             &mut proof_scratch,
@@ -6648,6 +6698,7 @@ fn build_definition_code_builder(
                 resource_projection_origins: &resource_projection_facts.origins,
                 resource_projection_symbols: &resource_projection_facts.symbols,
                 alpha_variables: proof_scratch.alpha_variable_sources(),
+                callable_type_parameters: &callable_type_parameters,
                 stable_digest,
             },
         )?;
@@ -9180,15 +9231,14 @@ fn project_call_facts_and_diagnostics(
     public_results: &[PackedFlow],
     public_formals: &[Box<[PackedFlow]>],
     retain_call_facts: bool,
-) -> (
-    Box<[SolvedDefinitionCallFacts]>,
-    Box<[SolvedDefinitionDiagnostics]>,
-) {
-    let packed_abi = retain_call_facts.then(|| {
+) -> Result<SolvedProjectCallProjection, KernelSolveError> {
+    let abi_schemes = if retain_call_facts {
         let first_projection_variable = u32::try_from(artifact.work().variables)
             .expect("kernel solver variable namespace exceeds u32");
         pack_abi_call_surfaces(abi, artifact.terms_mut(), first_projection_variable)
-    });
+    } else {
+        Box::new([])
+    };
     let mut project_call_facts = Vec::with_capacity(owners.len());
     let mut project_diagnostics = Vec::with_capacity(owners.len());
     let mut call_scratch = crate::PackedCallTypeScratch::default();
@@ -9215,6 +9265,16 @@ fn project_call_facts_and_diagnostics(
                 .collect::<Vec<_>>();
         for call in definition.calls() {
             let call_target = call.target();
+            let mut target_scheme = match call_target {
+                KernelCallTargetRef::User { target, .. } => {
+                    Some(crate::KernelCallableSchemeId::User(target))
+                }
+                KernelCallTargetRef::RenderConstructor { .. }
+                | KernelCallTargetRef::PureBuiltin { .. }
+                | KernelCallTargetRef::FixedAbi
+                | KernelCallTargetRef::HostEffect { .. }
+                | KernelCallTargetRef::FieldProjection { .. } => None,
+            };
             substitutions.clear();
             if let KernelCallTargetRef::User { target, .. } = call_target {
                 let target_formals = public_formals
@@ -9328,20 +9388,19 @@ fn project_call_facts_and_diagnostics(
                     });
                 }
             } else if retain_call_facts {
-                project_abi_call_type_substitutions(
+                target_scheme = project_abi_call_type_substitutions(
                     owner_index,
                     call,
                     owners,
                     abi,
                     artifact,
                     public_results,
-                    packed_abi
-                        .as_deref()
-                        .expect("checked call projection packed the ABI surfaces"),
+                    &abi_schemes,
                     &mut call_scratch,
                     &mut actuals,
                     &mut substitutions,
-                );
+                )
+                .map(crate::KernelCallableSchemeId::Abi);
             }
             if !retain_call_facts {
                 continue;
@@ -9369,6 +9428,7 @@ fn project_call_facts_and_diagnostics(
             );
             owner_call_facts.push(PackedCallFactsInput {
                 expression: call.expression(),
+                target: target_scheme,
                 substitution_start,
                 substitution_len,
                 // CheckedCall exposes one existing exact-occurrence bit to
@@ -9400,10 +9460,11 @@ fn project_call_facts_and_diagnostics(
             rows: diagnostics.into_boxed_slice(),
         });
     }
-    (
-        project_call_facts.into_boxed_slice(),
-        project_diagnostics.into_boxed_slice(),
-    )
+    Ok(SolvedProjectCallProjection {
+        definitions: project_call_facts.into_boxed_slice(),
+        diagnostics: project_diagnostics.into_boxed_slice(),
+        abi_schemes,
+    })
 }
 
 /// Publish immutable-ABI substitutions while the caller's solver namespace is
@@ -9418,11 +9479,11 @@ fn project_abi_call_type_substitutions(
     abi: &crate::KernelAbiInput,
     artifact: &ComponentOutputSnapshot<'_>,
     public_results: &[PackedFlow],
-    packed_abi: &[PackedAbiCallSurface],
+    packed_abi: &[crate::PackedAbiCallableSchemeInput],
     scratch: &mut crate::PackedCallTypeScratch,
     actuals: &mut Vec<(u32, TypeTermId)>,
     substitutions: &mut Vec<PackedCallTypeSubstitution>,
-) {
+) -> Option<crate::KernelAbiCallableId> {
     let facts = call.definition.facts;
     let Ok(syntax) = facts
         .call_syntax
@@ -9431,13 +9492,13 @@ fn project_abi_call_type_substitutions(
     else {
         // Lower-level equation tests intentionally omit checked-image syntax.
         // Production linking validates and requires the authored row.
-        return;
+        return None;
     };
     let Some(target_id) = abi.callable_id(&syntax.function) else {
         // The same lower-level tests may install a builtin equation directly
         // without the project ABI table. A production project cannot reach the
         // checked linker with that incomplete contract.
-        return;
+        return None;
     };
     let target = abi
         .callable_by_id(target_id)
@@ -9498,6 +9559,7 @@ fn project_abi_call_type_substitutions(
         scratch,
         substitutions,
     );
+    Some(target_id)
 }
 
 fn project_call_value_term(
@@ -9530,25 +9592,28 @@ fn project_call_value_term(
     }
 }
 
-#[derive(Debug)]
-struct PackedAbiCallSurface {
-    formals: Box<[PackedFlow]>,
-    result: PackedFlow,
-}
-
 fn pack_abi_call_surfaces(
     abi: &crate::KernelAbiInput,
     terms: &mut crate::TypeTermArena,
     mut next_variable: u32,
-) -> Box<[PackedAbiCallSurface]> {
+) -> Box<[crate::PackedAbiCallableSchemeInput]> {
+    let mut parameter_scratch = crate::PackedCallableParameterTraversalScratch::default();
+    let mut parameter_sources = Vec::new();
     abi.callables()
         .iter()
         .map(|callable| {
             let base = next_variable;
             let mut variable_count = 0_u32;
+            for parameter in &callable.parameters {
+                extend_checked_type_variable_extent(&parameter.flow_type.ty, &mut variable_count);
+            }
+            for context in &callable.contexts {
+                extend_checked_type_variable_extent(&context.flow_type.ty, &mut variable_count);
+            }
+            extend_checked_type_variable_extent(&callable.result.ty, &mut variable_count);
             let mut import = |ty: &Type| {
                 terms.import_checked_type(ty, &mut |source| {
-                    variable_count = variable_count.max(source.0.saturating_add(1));
+                    debug_assert!(source.0 < variable_count);
                     TypeVariableId(
                         base.checked_add(source.0)
                             .expect("kernel ABI projection variable namespace exceeds u32"),
@@ -9571,10 +9636,78 @@ fn pack_abi_call_surfaces(
             next_variable = next_variable
                 .checked_add(variable_count)
                 .expect("kernel ABI projection variable namespace exceeds u32");
-            PackedAbiCallSurface { formals, result }
+            collect_packed_callable_type_parameter_sources(
+                terms,
+                formals.iter().map(|formal| formal.term),
+                result.term,
+                &mut parameter_scratch,
+                &mut parameter_sources,
+            );
+            let type_parameters = parameter_sources
+                .iter()
+                .copied()
+                .map(|source| PackedCallableTypeParameter {
+                    source,
+                    linked_local: source
+                        .0
+                        .checked_sub(base)
+                        .expect("packed ABI parameter precedes its variable base"),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            crate::PackedAbiCallableSchemeInput {
+                formals,
+                result,
+                type_parameters,
+                variable_base: TypeVariableId(base),
+            }
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
+}
+
+fn extend_checked_type_variable_extent(ty: &Type, extent: &mut u32) {
+    match ty {
+        Type::Var(variable) => *extent = (*extent).max(variable.0.saturating_add(1)),
+        Type::Object(shape) => {
+            for field in shape.fields.values() {
+                extend_checked_type_variable_extent(field, extent);
+            }
+        }
+        Type::List(item) | Type::Set(item) => extend_checked_type_variable_extent(item, extent),
+        Type::Map { key, value } => {
+            extend_checked_type_variable_extent(key, extent);
+            extend_checked_type_variable_extent(value, extent);
+        }
+        Type::Function { args, result } => {
+            for argument in args {
+                extend_checked_type_variable_extent(argument, extent);
+            }
+            extend_checked_type_variable_extent(&result.ty, extent);
+        }
+        Type::VariantSet(variants) => {
+            for variant in variants {
+                if let Variant::Tagged { fields, .. } = variant {
+                    for field in fields.fields.values() {
+                        extend_checked_type_variable_extent(field, extent);
+                    }
+                }
+            }
+        }
+        Type::Union(members) => {
+            for member in members {
+                extend_checked_type_variable_extent(member, extent);
+            }
+        }
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown => {}
+    }
 }
 
 fn packed_kernel_type_mismatch(
@@ -26277,6 +26410,29 @@ mod tests {
             .unwrap();
         assert_eq!(provider.alpha_variable_count(), 1);
         assert_eq!(caller.alpha_variable_count(), 1);
+        assert_eq!(
+            caller.call_target(0),
+            Some(Some(crate::KernelCallableSchemeId::Abi(
+                crate::KernelAbiCallableId(0),
+            ))),
+        );
+        let abi_scheme = snapshot
+            .definition_code
+            .abi_callable_scheme(crate::KernelAbiCallableId(0))
+            .expect("List/length retains one packed ABI scheme");
+        assert_eq!(abi_scheme.formals().len(), 1);
+        assert_eq!(
+            abi_scheme.result().term,
+            snapshot.definition_code.type_store().as_arena().number()
+        );
+        assert_eq!(abi_scheme.type_parameters().len(), 1);
+        assert_eq!(
+            abi_scheme.type_parameters()[0],
+            PackedCallableTypeParameter {
+                source: abi_scheme.variable_base(),
+                linked_local: 0,
+            },
+        );
         let mut cache = snapshot.definition_code.materialization_cache();
         let mut linked = caller.linked_materializer(
             &mut cache,

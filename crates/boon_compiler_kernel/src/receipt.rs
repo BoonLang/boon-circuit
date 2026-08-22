@@ -3565,6 +3565,7 @@ mod tests {
                 resource_projection_origins: &[],
                 resource_projection_symbols: &[],
                 alpha_variables: &[],
+                callable_type_parameters: &[],
                 stable_digest,
             };
             let mut builder = DefinitionCodeBuilder::with_capacity(2, 2, 0);

@@ -1,6 +1,6 @@
 use crate::{
-    KernelTypeParameterId, PackedCallTypeSubstitution, PackedFlow, TypeTermArena, TypeTermHead,
-    TypeTermId, TypeVariableId, VariantTerm,
+    KernelTypeParameterId, PackedCallTypeSubstitution, PackedCallableTypeParameter, PackedFlow,
+    TypeTermArena, TypeTermHead, TypeTermId, TypeVariableId, VariantTerm,
 };
 use boon_contract::SymbolId;
 
@@ -26,6 +26,19 @@ pub(crate) struct PackedCallTypeScratch {
     remapped_terms: Vec<TypeTermId>,
     postorder: Vec<(TypeTermId, bool)>,
     remapped_children: Vec<TypeTermId>,
+}
+
+/// Small sealing-only traversal state for checking retained callable
+/// parameter order.
+///
+/// Unlike the occurrence matcher this deliberately does not index arrays by
+/// `TypeVariableId`: generic arities are tiny, while project-global variable
+/// IDs can be large. Linear duplicate checks therefore avoid zeroing a pair
+/// of project-sized maps during release sealing.
+#[derive(Debug, Default)]
+pub(crate) struct PackedCallableParameterTraversalScratch {
+    traversal: Vec<TypeTermId>,
+    children: Vec<TypeTermId>,
 }
 
 impl PackedCallTypeScratch {
@@ -79,22 +92,35 @@ impl PackedCallTypeScratch {
         }
     }
 
+    fn prepare_parameter_roots(
+        &mut self,
+        arena: &TypeTermArena,
+        roots: impl IntoIterator<Item = TypeTermId>,
+    ) {
+        self.next_parameter_generation();
+        for root in roots {
+            self.collect_parameters(arena, root);
+        }
+        self.matched.resize(self.parameter_sources.len(), None);
+        self.matched.fill(None);
+        self.result_matched
+            .resize(self.parameter_sources.len(), None);
+        self.result_matched.fill(None);
+    }
+
     fn prepare_parameters(
         &mut self,
         arena: &TypeTermArena,
         formals: &[PackedFlow],
         result: PackedFlow,
     ) {
-        self.next_parameter_generation();
-        for formal in formals {
-            self.collect_parameters(arena, formal.term);
-        }
-        self.collect_parameters(arena, result.term);
-        self.matched.resize(self.parameter_sources.len(), None);
-        self.matched.fill(None);
-        self.result_matched
-            .resize(self.parameter_sources.len(), None);
-        self.result_matched.fill(None);
+        self.prepare_parameter_roots(
+            arena,
+            formals
+                .iter()
+                .map(|formal| formal.term)
+                .chain(std::iter::once(result.term)),
+        );
     }
 
     fn next_term_generation(&mut self, term_count: usize) {
@@ -121,6 +147,88 @@ impl PackedCallTypeScratch {
         self.term_generations[index] = self.term_generation;
         self.remapped_terms[index] = remapped;
     }
+}
+
+/// Retain the exact generic-parameter order used by packed call matching.
+///
+/// Parameter IDs are traversal ordinals, not definition alpha ordinals.  A
+/// later semantic consumer therefore needs this source-variable sequence to
+/// interpret a [`KernelTypeParameterId`] without rediscovering the callable's
+/// recursive type structure or depending on canonical object-field order.
+pub(crate) fn collect_packed_callable_type_parameter_sources(
+    arena: &TypeTermArena,
+    formal_terms: impl IntoIterator<Item = TypeTermId>,
+    result: TypeTermId,
+    scratch: &mut PackedCallableParameterTraversalScratch,
+    output: &mut Vec<TypeVariableId>,
+) {
+    output.clear();
+    visit_packed_callable_type_parameter_sources(
+        arena,
+        formal_terms,
+        result,
+        scratch,
+        |variable| {
+            if !output.contains(&variable) {
+                output.push(variable);
+            }
+            true
+        },
+    );
+}
+
+/// Check that a retained parameter column exactly matches packed call
+/// matching's first-occurrence traversal, without allocating storage indexed
+/// by the project-wide variable namespace.
+pub(crate) fn packed_callable_type_parameter_sources_match(
+    arena: &TypeTermArena,
+    formal_terms: impl IntoIterator<Item = TypeTermId>,
+    result: TypeTermId,
+    expected: &[PackedCallableTypeParameter],
+    scratch: &mut PackedCallableParameterTraversalScratch,
+) -> bool {
+    let mut matched = 0usize;
+    visit_packed_callable_type_parameter_sources(arena, formal_terms, result, scratch, |variable| {
+        if expected[..matched]
+            .iter()
+            .any(|parameter| parameter.source == variable)
+        {
+            return true;
+        }
+        if expected.get(matched).map(|parameter| parameter.source) != Some(variable) {
+            return false;
+        }
+        matched += 1;
+        true
+    }) && matched == expected.len()
+}
+
+fn visit_packed_callable_type_parameter_sources(
+    arena: &TypeTermArena,
+    formal_terms: impl IntoIterator<Item = TypeTermId>,
+    result: TypeTermId,
+    scratch: &mut PackedCallableParameterTraversalScratch,
+    mut visit: impl FnMut(TypeVariableId) -> bool,
+) -> bool {
+    scratch.traversal.clear();
+    scratch.children.clear();
+    for root in formal_terms.into_iter().chain(std::iter::once(result)) {
+        scratch.traversal.push(root);
+        while let Some(term) = scratch.traversal.pop() {
+            if let TypeTermHead::Variable(variable) = arena.term_head(term) {
+                if !visit(variable) {
+                    return false;
+                }
+                continue;
+            }
+            scratch.children.clear();
+            arena.append_term_children(term, &mut scratch.children);
+            scratch
+                .traversal
+                .extend(scratch.children.iter().rev().copied());
+        }
+    }
+    true
 }
 
 /// Derive one occurrence-local generic environment directly from packed term
@@ -732,6 +840,66 @@ fn packed_variant_is_assignable_to(
                 && packed_object_is_assignable_to(arena, actual, expected, actual_open)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callable_parameter_collection_preserves_authored_object_order() {
+        let mut arena = TypeTermArena::new();
+        let z = arena.intern_name("z");
+        let a = arena.intern_name("a");
+        let z_variable = TypeVariableId(9);
+        let a_variable = TypeVariableId(7);
+        let result_variable = TypeVariableId(11);
+        let z_term = arena.variable(z_variable);
+        let a_term = arena.variable(a_variable);
+        let result = arena.variable(result_variable);
+        let formal = arena.object([(z, z_term), (a, a_term)], false);
+
+        let mut scratch = PackedCallableParameterTraversalScratch::default();
+        let mut parameters = Vec::new();
+        collect_packed_callable_type_parameter_sources(
+            &arena,
+            [formal],
+            result,
+            &mut scratch,
+            &mut parameters,
+        );
+
+        assert_eq!(parameters, [z_variable, a_variable, result_variable]);
+    }
+
+    #[test]
+    fn callable_parameter_collection_follows_packed_generic_union_order() {
+        let mut arena = TypeTermArena::new();
+        let field = arena.intern_name("value");
+        let list_variable = TypeVariableId(31);
+        let object_variable = TypeVariableId(37);
+        let list_term = arena.variable(list_variable);
+        let object_term = arena.variable(object_variable);
+        let list = arena.list(list_term);
+        let object = arena.object([(field, object_term)], false);
+        // Packed unions canonicalize by type kind, so Object precedes List
+        // even when candidates arrive in the opposite order. The retained
+        // target-parameter sequence must use this traversal; rebuilding a
+        // rich Type and Debug-sorting it used to swap T and U.
+        let formal = arena.union([list, object]);
+
+        let mut scratch = PackedCallableParameterTraversalScratch::default();
+        let mut parameters = Vec::new();
+        collect_packed_callable_type_parameter_sources(
+            &arena,
+            [formal],
+            arena.number(),
+            &mut scratch,
+            &mut parameters,
+        );
+
+        assert_eq!(parameters, [object_variable, list_variable]);
     }
 }
 

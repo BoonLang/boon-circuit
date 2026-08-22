@@ -34,10 +34,10 @@ pub use distributed_compiler::{
 #[cfg(feature = "test-kernel-oracle")]
 #[doc(hidden)]
 pub use kernel_oracle::{
-    KernelOwnerOracleDiagnostic, KernelOwnerOracleDiagnosticSite, KernelOwnerOracleEntry,
-    KernelOwnerOracleReport, KernelOwnerOracleTimings, kernel_owner_oracle,
-    kernel_owner_oracle_with_source_payloads, present_kernel_source_diagnostic,
-    profile_kernel_owner_oracle_with_source_payloads,
+    KernelOwnerOracleCallTypeSubstitution, KernelOwnerOracleDiagnostic,
+    KernelOwnerOracleDiagnosticSite, KernelOwnerOracleEntry, KernelOwnerOracleReport,
+    KernelOwnerOracleTimings, kernel_owner_oracle, kernel_owner_oracle_with_source_payloads,
+    present_kernel_source_diagnostic, profile_kernel_owner_oracle_with_source_payloads,
 };
 pub use session::{
     CancellationToken, CompileIntent, CompilerProject, CompilerSession, CompilerSessionResult,

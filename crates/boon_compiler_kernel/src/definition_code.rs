@@ -1,8 +1,11 @@
 #[cfg(debug_assertions)]
 use crate::TypeTerm;
+use crate::packed_call_types::{
+    PackedCallableParameterTraversalScratch, packed_callable_type_parameter_sources_match,
+};
 use crate::{
-    FrozenTypeStore, KernelArtifactFlowTermV1, KernelOwnerId, KernelSolveError, TypeTermId,
-    TypeVariableId, alpha_normalize_flow_type,
+    FrozenTypeStore, KernelAbiCallableId, KernelArtifactFlowTermV1, KernelOwnerId,
+    KernelSolveError, TypeTermId, TypeVariableId, alpha_normalize_flow_type,
 };
 use boon_checked::{FlowMode, FlowType, Type, TypeVar};
 use boon_contract::SymbolId;
@@ -174,6 +177,10 @@ struct DefinitionCode {
     list_item_types: Span32,
     resource_projection_requirements: Span32,
     alpha_variables: Span32,
+    /// Exact traversal-order generic scheme parameters. These are not alpha
+    /// ordinals: authored object/union order can differ from the canonical
+    /// proof traversal used by `alpha_variables`.
+    callable_type_parameters: Span32,
     /// Dense reverse index for this definition's local expressions. Values
     /// address `DefinitionCodeStore::execution_nodes`; `u32::MAX` means the
     /// expression is not retained by any callable execution template.
@@ -208,6 +215,9 @@ pub struct DefinitionCodeStore {
     resource_projection_origins: Box<[PackedSourceRead]>,
     resource_projection_symbols: Box<[SymbolId]>,
     alpha_variables: Box<[TypeVariableId]>,
+    callable_type_parameters: Box<[PackedCallableTypeParameter]>,
+    abi_callable_schemes: Box<[PackedAbiCallableScheme]>,
+    abi_callable_formals: Box<[PackedFlow]>,
     execution_nodes: Box<[PackedExecutionNode]>,
     execution_dependencies: Box<[PackedExpressionRef]>,
     execution_selectors: Box<[PackedExecutionSelector]>,
@@ -248,6 +258,23 @@ impl DefinitionCodeStore {
             })
     }
 
+    pub(crate) fn abi_callable_count(&self) -> usize {
+        self.abi_callable_schemes.len()
+    }
+
+    pub(crate) fn abi_callable_scheme(
+        &self,
+        callable: KernelAbiCallableId,
+    ) -> Option<PackedAbiCallableSchemeRef<'_>> {
+        self.abi_callable_schemes
+            .get(callable.0 as usize)
+            .map(|scheme| PackedAbiCallableSchemeRef {
+                store: self,
+                callable,
+                scheme,
+            })
+    }
+
     pub(crate) fn execution_node(
         &self,
         expression: PackedExpressionRef,
@@ -272,6 +299,17 @@ impl DefinitionCodeStore {
             // may need one exceptional type.
             types: Vec::new(),
         }
+    }
+
+    pub(crate) fn materialize_linked_type_term(
+        &self,
+        cache: &mut DefinitionTypeMaterializationCache,
+        variables: &mut BTreeMap<TypeVar, TypeVar>,
+        next: &mut u32,
+        alpha_end: u32,
+        term: TypeTermId,
+    ) -> Type {
+        materialize_linked_type_term(self, cache, variables, next, alpha_end, term)
     }
 
     fn expression_node_slot(&self, expression: PackedExpressionRef) -> Option<&u32> {
@@ -513,6 +551,194 @@ impl DefinitionCodeStore {
         Ok(())
     }
 
+    /// Seal callable schemes and occurrence substitutions in every build
+    /// profile.
+    ///
+    /// These rows are later borrowed without rebuilding recursive types. A
+    /// malformed target or a reordered generic-parameter column would
+    /// otherwise silently bind an occurrence substitution to the wrong alpha
+    /// variable in release builds. Reuse one packed traversal scratch across
+    /// the whole store so validation grows only to the largest callable.
+    fn validate_callable_schemes(&self) -> Result<(), KernelSolveError> {
+        let arena = self.types.as_arena();
+        let mut scratch = PackedCallableParameterTraversalScratch::default();
+
+        for (owner, definition) in self.definitions.iter().enumerate() {
+            let formals = definition.formals.get(&self.flows).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel definition-code owner {owner} has an invalid formal span"
+                ))
+            })?;
+            let alpha_variables = definition
+                .alpha_variables
+                .get(&self.alpha_variables)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} has an invalid alpha-variable span"
+                    ))
+                })?;
+            let parameters = definition
+                .callable_type_parameters
+                .get(&self.callable_type_parameters)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} has an invalid callable-parameter span"
+                    ))
+                })?;
+            if !packed_callable_type_parameter_sources_match(
+                arena,
+                formals.iter().map(|flow| flow.term),
+                definition.result.term,
+                parameters,
+                &mut scratch,
+            ) {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code owner {owner} callable parameter order does not match its packed formals and result"
+                )));
+            }
+            for parameter in parameters {
+                if alpha_variables
+                    .get(parameter.linked_local as usize)
+                    .copied()
+                    != Some(parameter.source)
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} callable parameter {} has invalid linked alpha {}",
+                        parameter.source.0, parameter.linked_local,
+                    )));
+                }
+            }
+
+            let calls = definition.calls.get(&self.calls).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel definition-code owner {owner} has an invalid call span"
+                ))
+            })?;
+            if calls
+                .windows(2)
+                .any(|calls| calls[0].expression >= calls[1].expression)
+            {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code owner {owner} calls are not in unique expression order"
+                )));
+            }
+            for call in calls {
+                if call.expression.0 >= definition.expressions.len {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} call expression {} is outside its expression rows",
+                        call.expression.0,
+                    )));
+                }
+                let substitutions = call
+                    .substitutions
+                    .get(&self.call_substitutions)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel definition-code owner {owner} has an invalid call-substitution span"
+                        ))
+                    })?;
+                let Some(target) = call.target else {
+                    if !substitutions.is_empty() {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel definition-code owner {owner} call expression {} has {} substitutions without a target scheme",
+                            call.expression.0,
+                            substitutions.len(),
+                        )));
+                    }
+                    continue;
+                };
+                let parameter_count = match target {
+                    KernelCallableSchemeId::User(target) => self
+                        .definitions
+                        .get(target.0 as usize)
+                        .and_then(|definition| {
+                            definition
+                                .callable_type_parameters
+                                .get(&self.callable_type_parameters)
+                        })
+                        .ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "kernel definition-code owner {owner} calls missing user scheme {}",
+                                target.0,
+                            ))
+                        })?
+                        .len(),
+                    KernelCallableSchemeId::Abi(target) => self
+                        .abi_callable_schemes
+                        .get(target.0 as usize)
+                        .and_then(|scheme| {
+                            scheme.type_parameters.get(&self.callable_type_parameters)
+                        })
+                        .ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "kernel definition-code owner {owner} calls missing ABI scheme {}",
+                                target.0,
+                            ))
+                        })?
+                        .len(),
+                };
+                for (ordinal, substitution) in substitutions.iter().enumerate() {
+                    if substitution.variable.0 as usize >= parameter_count {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel definition-code owner {owner} call expression {} substitution parameter {} is outside its target scheme's {parameter_count} parameters",
+                            call.expression.0, substitution.variable.0,
+                        )));
+                    }
+                    if substitutions[..ordinal]
+                        .iter()
+                        .any(|seen| seen.variable == substitution.variable)
+                    {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel definition-code owner {owner} call expression {} repeats substitution parameter {}",
+                            call.expression.0, substitution.variable.0,
+                        )));
+                    }
+                }
+            }
+        }
+
+        for (callable, scheme) in self.abi_callable_schemes.iter().enumerate() {
+            let formals = scheme
+                .formals
+                .get(&self.abi_callable_formals)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code ABI scheme {callable} has an invalid formal span"
+                    ))
+                })?;
+            let parameters = scheme
+                .type_parameters
+                .get(&self.callable_type_parameters)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code ABI scheme {callable} has an invalid parameter span"
+                    ))
+                })?;
+            if !packed_callable_type_parameter_sources_match(
+                arena,
+                formals.iter().map(|flow| flow.term),
+                scheme.result.term,
+                parameters,
+                &mut scratch,
+            ) {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code ABI scheme {callable} parameter order does not match its packed formals and result"
+                )));
+            }
+            for parameter in parameters {
+                if parameter.source.0.checked_sub(scheme.variable_base.0)
+                    != Some(parameter.linked_local)
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code ABI scheme {callable} parameter {} has invalid local alpha {} from base {}",
+                        parameter.source.0, parameter.linked_local, scheme.variable_base.0,
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(debug_assertions)]
     fn validate(&self) -> Result<(), KernelSolveError> {
         let mut term_generations = vec![0_u32; self.types.len()];
@@ -590,6 +816,43 @@ impl DefinitionCodeStore {
                     )));
                 }
             }
+            let alpha_variables = definition
+                .alpha_variables
+                .get(&self.alpha_variables)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} has an invalid alpha-variable span"
+                    ))
+                })?;
+            let callable_type_parameters = definition
+                .callable_type_parameters
+                .get(&self.callable_type_parameters)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} has an invalid callable-parameter span"
+                    ))
+                })?;
+            for (ordinal, parameter) in callable_type_parameters.iter().enumerate() {
+                if callable_type_parameters[..ordinal]
+                    .iter()
+                    .any(|seen| seen.source == parameter.source)
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} repeats callable parameter {}",
+                        parameter.source.0,
+                    )));
+                }
+                if alpha_variables
+                    .get(parameter.linked_local as usize)
+                    .copied()
+                    != Some(parameter.source)
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} callable parameter {} has invalid linked alpha {}",
+                        parameter.source.0, parameter.linked_local,
+                    )));
+                }
+            }
             let calls = definition
                 .calls
                 .get(&self.calls)
@@ -609,13 +872,66 @@ impl DefinitionCodeStore {
                         call.expression.0,
                     )));
                 }
-                call.substitutions
+                let substitutions = call
+                    .substitutions
                     .get(&self.call_substitutions)
                     .ok_or_else(|| {
                         KernelSolveError::new(format!(
                             "kernel definition-code owner {owner} has an invalid call-substitution span"
                         ))
                     })?;
+                if let Some(target) = call.target {
+                    let parameter_count = match target {
+                        KernelCallableSchemeId::User(target) => self
+                            .definitions
+                            .get(target.0 as usize)
+                            .and_then(|definition| {
+                                definition
+                                    .callable_type_parameters
+                                    .get(&self.callable_type_parameters)
+                            })
+                            .ok_or_else(|| {
+                                KernelSolveError::new(format!(
+                                    "kernel definition-code owner {owner} calls missing user scheme {}",
+                                    target.0,
+                                ))
+                            })?
+                            .len(),
+                        KernelCallableSchemeId::Abi(target) => self
+                            .abi_callable_scheme(target)
+                            .ok_or_else(|| {
+                                KernelSolveError::new(format!(
+                                    "kernel definition-code owner {owner} calls missing ABI scheme {}",
+                                    target.0,
+                                ))
+                            })?
+                            .type_parameters()
+                            .len(),
+                    };
+                    for (ordinal, substitution) in substitutions.iter().enumerate() {
+                        if substitution.variable.0 as usize >= parameter_count {
+                            return Err(KernelSolveError::new(format!(
+                                "kernel definition-code owner {owner} call expression {} substitution parameter {} is outside its target scheme's {parameter_count} parameters",
+                                call.expression.0, substitution.variable.0,
+                            )));
+                        }
+                        if substitutions[..ordinal]
+                            .iter()
+                            .any(|seen| seen.variable == substitution.variable)
+                        {
+                            return Err(KernelSolveError::new(format!(
+                                "kernel definition-code owner {owner} call expression {} repeats substitution parameter {}",
+                                call.expression.0, substitution.variable.0,
+                            )));
+                        }
+                    }
+                } else if !substitutions.is_empty() {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} call expression {} has {} substitutions without a target scheme",
+                        call.expression.0,
+                        substitutions.len(),
+                    )));
+                }
             }
             let states = definition
                 .states
@@ -659,14 +975,6 @@ impl DefinitionCodeStore {
                         })?;
                 }
             }
-            let alpha_variables = definition
-                .alpha_variables
-                .get(&self.alpha_variables)
-                .ok_or_else(|| {
-                    KernelSolveError::new(format!(
-                        "kernel definition-code owner {owner} has an invalid alpha-variable span"
-                    ))
-                })?;
             for variable in alpha_variables.iter().copied() {
                 let index = variable.0 as usize;
                 if variable_generations.len() <= index {
@@ -771,62 +1079,136 @@ impl DefinitionCodeStore {
                     .iter()
                     .copied(),
             );
-            while let Some(term) = stack.pop() {
-                let index = term.0 as usize;
-                let Some(seen) = term_generations.get_mut(index) else {
-                    return Err(KernelSolveError::new(format!(
-                        "kernel definition-code owner {owner} references missing type term {}",
-                        term.0
-                    )));
-                };
-                if *seen == generation {
-                    continue;
-                }
-                *seen = generation;
-                match self.types.as_arena().term(term) {
-                    TypeTerm::Variable(variable) => {
-                        if variable_generations.get(variable.0 as usize).copied()
-                            != Some(generation)
-                        {
-                            return Err(KernelSolveError::new(format!(
-                                "kernel definition-code owner {owner} omits type variable {} from its alpha map",
-                                variable.0
-                            )));
-                        }
-                    }
-                    TypeTerm::VariantSet(variants) => {
-                        stack.extend(variants.iter().filter_map(|variant| match variant {
-                            crate::VariantTerm::Tag(_) => None,
-                            crate::VariantTerm::Tagged { fields, .. } => Some(*fields),
-                        }));
-                    }
-                    TypeTerm::Object { fields, .. } => {
-                        stack.extend(fields.canonical_iter().map(|field| field.ty));
-                    }
-                    TypeTerm::List(item) | TypeTerm::Set(item) => stack.push(item),
-                    TypeTerm::Function { args, result, .. } => {
-                        stack.extend(args.iter().copied());
-                        stack.push(result);
-                    }
-                    TypeTerm::Union(members) => stack.extend(members.iter().copied()),
-                    TypeTerm::Map { key, value } => {
-                        stack.push(key);
-                        stack.push(value);
-                    }
-                    TypeTerm::Text
-                    | TypeTerm::Number
-                    | TypeTerm::Bytes(_)
-                    | TypeTerm::Absent
-                    | TypeTerm::OpenObjectPlaceholder
-                    | TypeTerm::RenderContract
-                    | TypeTerm::UnresolvedShape(_)
-                    | TypeTerm::Unknown
-                    | TypeTerm::Bits(_) => {}
-                }
+            validate_type_roots(
+                &self.types,
+                &mut stack,
+                &mut term_generations,
+                &variable_generations,
+                generation,
+                &format!("kernel definition-code owner {owner}"),
+            )?;
+        }
+        for (callable, scheme) in self.abi_callable_schemes.iter().enumerate() {
+            generation = generation.wrapping_add(1);
+            if generation == 0 {
+                term_generations.fill(0);
+                variable_generations.fill(0);
+                generation = 1;
             }
+            let formals = scheme
+                .formals
+                .get(&self.abi_callable_formals)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code ABI scheme {callable} has an invalid formal span",
+                    ))
+                })?;
+            let parameters = scheme
+                .type_parameters
+                .get(&self.callable_type_parameters)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code ABI scheme {callable} has an invalid parameter span",
+                    ))
+                })?;
+            for parameter in parameters {
+                let index = parameter.source.0 as usize;
+                if variable_generations.len() <= index {
+                    variable_generations.resize(index + 1, 0);
+                }
+                if variable_generations[index] == generation {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code ABI scheme {callable} repeats parameter {}",
+                        parameter.source.0,
+                    )));
+                }
+                if parameter.source.0.checked_sub(scheme.variable_base.0)
+                    != Some(parameter.linked_local)
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code ABI scheme {callable} parameter {} has invalid local alpha {} from base {}",
+                        parameter.source.0, parameter.linked_local, scheme.variable_base.0,
+                    )));
+                }
+                variable_generations[index] = generation;
+            }
+            stack.clear();
+            stack.push(scheme.result.term);
+            stack.extend(formals.iter().map(|flow| flow.term));
+            validate_type_roots(
+                &self.types,
+                &mut stack,
+                &mut term_generations,
+                &variable_generations,
+                generation,
+                &format!("kernel definition-code ABI scheme {callable}"),
+            )?;
         }
         Ok(())
     }
+}
+
+#[cfg(debug_assertions)]
+fn validate_type_roots(
+    types: &FrozenTypeStore,
+    stack: &mut Vec<TypeTermId>,
+    term_generations: &mut [u32],
+    variable_generations: &[u32],
+    generation: u32,
+    authority: &str,
+) -> Result<(), KernelSolveError> {
+    while let Some(term) = stack.pop() {
+        let index = term.0 as usize;
+        let Some(seen) = term_generations.get_mut(index) else {
+            return Err(KernelSolveError::new(format!(
+                "{authority} references missing type term {}",
+                term.0,
+            )));
+        };
+        if *seen == generation {
+            continue;
+        }
+        *seen = generation;
+        match types.as_arena().term(term) {
+            TypeTerm::Variable(variable) => {
+                if variable_generations.get(variable.0 as usize).copied() != Some(generation) {
+                    return Err(KernelSolveError::new(format!(
+                        "{authority} omits type variable {} from its alpha map",
+                        variable.0,
+                    )));
+                }
+            }
+            TypeTerm::VariantSet(variants) => {
+                stack.extend(variants.iter().filter_map(|variant| match variant {
+                    crate::VariantTerm::Tag(_) => None,
+                    crate::VariantTerm::Tagged { fields, .. } => Some(*fields),
+                }));
+            }
+            TypeTerm::Object { fields, .. } => {
+                stack.extend(fields.canonical_iter().map(|field| field.ty));
+            }
+            TypeTerm::List(item) | TypeTerm::Set(item) => stack.push(item),
+            TypeTerm::Function { args, result, .. } => {
+                stack.extend(args.iter().copied());
+                stack.push(result);
+            }
+            TypeTerm::Union(members) => stack.extend(members.iter().copied()),
+            TypeTerm::Map { key, value } => {
+                stack.push(key);
+                stack.push(value);
+            }
+            TypeTerm::Text
+            | TypeTerm::Number
+            | TypeTerm::Bytes(_)
+            | TypeTerm::Absent
+            | TypeTerm::OpenObjectPlaceholder
+            | TypeTerm::RenderContract
+            | TypeTerm::UnresolvedShape(_)
+            | TypeTerm::Unknown
+            | TypeTerm::Bits(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Borrowed, store-qualified view of one definition's packed flow rows.
@@ -835,6 +1217,13 @@ pub struct DefinitionCodeRef<'a> {
     store: &'a DefinitionCodeStore,
     owner: KernelOwnerId,
     code: &'a DefinitionCode,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PackedAbiCallableSchemeRef<'a> {
+    store: &'a DefinitionCodeStore,
+    callable: KernelAbiCallableId,
+    scheme: &'a PackedAbiCallableScheme,
 }
 
 /// Store-qualified borrowed view of one callable execution template.
@@ -949,6 +1338,13 @@ impl<'a> DefinitionCodeRef<'a> {
             .expect("sealed definition-code formal span is valid")
     }
 
+    pub(crate) const fn result_flow(self) -> PackedFlow {
+        PackedFlow {
+            mode: self.code.result.mode,
+            term: self.code.result.term,
+        }
+    }
+
     pub(crate) fn expressions(self) -> &'a [KernelArtifactFlowTermV1] {
         self.code
             .expressions
@@ -971,6 +1367,19 @@ impl<'a> DefinitionCodeRef<'a> {
             .expect("sealed definition-code call span is valid")
             .get(ordinal)
             .map(|call| call.expression)
+    }
+
+    pub(crate) fn call_target(self, ordinal: usize) -> Option<Option<KernelCallableSchemeId>> {
+        self.code
+            .calls
+            .get(&self.store.calls)
+            .expect("sealed definition-code call span is valid")
+            .get(ordinal)
+            .map(|call| call.target)
+    }
+
+    pub(crate) fn base_expression(self, ordinal: usize) -> Option<KernelArtifactFlowTermV1> {
+        self.expressions().get(ordinal).copied()
     }
 
     pub(crate) const fn effect_summary(self) -> crate::KernelEffectSummary {
@@ -1129,6 +1538,13 @@ impl<'a> DefinitionCodeRef<'a> {
             .expect("sealed definition-code alpha-variable span is valid")
     }
 
+    pub(crate) fn callable_type_parameters(self) -> &'a [PackedCallableTypeParameter] {
+        self.code
+            .callable_type_parameters
+            .get(&self.store.callable_type_parameters)
+            .expect("sealed definition-code callable-parameter span is valid")
+    }
+
     pub(crate) fn alpha_variable_count(self) -> usize {
         self.code.alpha_variables.len as usize
     }
@@ -1191,17 +1607,6 @@ impl<'a> DefinitionCodeRef<'a> {
                     .expect("sealed definition alpha-variable count exceeds u32"),
             )
             .expect("linked definition alpha-variable namespace overflows u32")
-    }
-
-    pub(crate) fn materialize_linked_type_term(
-        self,
-        cache: &mut DefinitionTypeMaterializationCache,
-        variables: &mut BTreeMap<TypeVar, TypeVar>,
-        next: &mut u32,
-        alpha_end: u32,
-        term: TypeTermId,
-    ) -> Type {
-        materialize_linked_type_term(self, cache, variables, next, alpha_end, term)
     }
 
     pub fn materialize_result(self) -> FlowType {
@@ -1401,6 +1806,34 @@ impl<'a> DefinitionCodeRef<'a> {
             "sealed definition-code alpha map omitted a materialized variable"
         );
         normalized
+    }
+}
+
+impl<'a> PackedAbiCallableSchemeRef<'a> {
+    pub(crate) const fn callable(self) -> KernelAbiCallableId {
+        self.callable
+    }
+
+    pub(crate) fn formals(self) -> &'a [PackedFlow] {
+        self.scheme
+            .formals
+            .get(&self.store.abi_callable_formals)
+            .expect("sealed ABI callable formal span is valid")
+    }
+
+    pub(crate) const fn result(self) -> PackedFlow {
+        self.scheme.result
+    }
+
+    pub(crate) fn type_parameters(self) -> &'a [PackedCallableTypeParameter] {
+        self.scheme
+            .type_parameters
+            .get(&self.store.callable_type_parameters)
+            .expect("sealed ABI callable parameter span is valid")
+    }
+
+    pub(crate) const fn variable_base(self) -> TypeVariableId {
+        self.scheme.variable_base
     }
 }
 
@@ -1634,7 +2067,7 @@ impl DefinitionCodeMaterializer<'_, '_> {
 
     fn materialize_type(&mut self, term: TypeTermId) -> Type {
         materialize_linked_type_term(
-            self.code,
+            self.code.store,
             self.cache,
             &mut self.variables,
             &mut self.next,
@@ -1645,7 +2078,7 @@ impl DefinitionCodeMaterializer<'_, '_> {
 }
 
 fn materialize_linked_type_term(
-    code: DefinitionCodeRef<'_>,
+    store: &DefinitionCodeStore,
     cache: &mut DefinitionTypeMaterializationCache,
     variables: &mut BTreeMap<TypeVar, TypeVar>,
     next: &mut u32,
@@ -1654,10 +2087,10 @@ fn materialize_linked_type_term(
 ) -> Type {
     assert_eq!(
         cache.type_store_identity,
-        Arc::as_ptr(&code.store.types) as usize,
+        Arc::as_ptr(&store.types) as usize,
         "a definition type cache cannot materialize a foreign frozen type store",
     );
-    let arena = code.store.types.as_arena();
+    let arena = store.types.as_arena();
     if cache.types.len() != arena.len() {
         cache.types.resize(arena.len(), None);
     }
@@ -1752,16 +2185,56 @@ impl PackedResourceProjectionRequirement {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PackedCallFacts {
     expression: crate::KernelExpressionId,
+    target: Option<KernelCallableSchemeId>,
     substitutions: Span32,
     syntax_discriminated_result: bool,
+}
+
+/// Revision-local identity of the generic scheme targeted by one checked
+/// call. User definitions and immutable ABI callables deliberately remain in
+/// disjoint namespaces; semantic consumers must never manufacture a fake
+/// definition owner for an ABI term.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum KernelCallableSchemeId {
+    User(KernelOwnerId),
+    Abi(KernelAbiCallableId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PackedCallFactsInput {
     pub(crate) expression: crate::KernelExpressionId,
+    pub(crate) target: Option<KernelCallableSchemeId>,
     pub(crate) substitution_start: u32,
     pub(crate) substitution_len: u32,
     pub(crate) syntax_discriminated_result: bool,
+}
+
+/// Packed ABI scheme before its local columns are appended to the permanent
+/// definition-code store. The variable base preserves the ABI-local alpha
+/// namespace, including gaps introduced only by contextual contracts.
+#[derive(Debug)]
+pub(crate) struct PackedAbiCallableSchemeInput {
+    pub(crate) formals: Box<[PackedFlow]>,
+    pub(crate) result: PackedFlow,
+    pub(crate) type_parameters: Box<[PackedCallableTypeParameter]>,
+    pub(crate) variable_base: TypeVariableId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PackedCallableTypeParameter {
+    pub(crate) source: TypeVariableId,
+    /// Definition-alpha or normalized ABI-local ordinal used by the checked
+    /// relocation. This is intentionally distinct from the call-matching
+    /// parameter ordinal (the row's position in its scheme span).
+    pub(crate) linked_local: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackedAbiCallableScheme {
+    formals: Span32,
+    result: PackedFlow,
+    type_parameters: Span32,
+    variable_base: TypeVariableId,
 }
 
 const MISSING_SYNTHETIC_STATE_ORDINAL: u32 = u32::MAX;
@@ -1850,6 +2323,7 @@ pub(crate) struct DefinitionAdditionalTypeRoots<'a> {
     pub(crate) resource_projection_origins: &'a [PackedSourceReadInput],
     pub(crate) resource_projection_symbols: &'a [SymbolId],
     pub(crate) alpha_variables: &'a [TypeVariableId],
+    pub(crate) callable_type_parameters: &'a [PackedCallableTypeParameter],
     pub(crate) stable_digest: [u8; 32],
 }
 
@@ -1887,6 +2361,10 @@ pub(crate) struct DefinitionCodeBuilder {
     resource_projection_origins: Vec<PackedSourceRead>,
     resource_projection_symbols: Vec<SymbolId>,
     alpha_variables: Vec<TypeVariableId>,
+    callable_type_parameters: Vec<PackedCallableTypeParameter>,
+    abi_callable_schemes: Vec<PackedAbiCallableScheme>,
+    abi_callable_formals: Vec<PackedFlow>,
+    abi_schemes_installed: bool,
     execution_nodes: Vec<PackedExecutionNode>,
     execution_dependencies: Vec<PackedExpressionRef>,
     execution_selectors: Vec<PackedExecutionSelector>,
@@ -1917,6 +2395,10 @@ impl DefinitionCodeBuilder {
             resource_projection_origins: Vec::new(),
             resource_projection_symbols: Vec::new(),
             alpha_variables: Vec::with_capacity(alpha_variables),
+            callable_type_parameters: Vec::new(),
+            abi_callable_schemes: Vec::new(),
+            abi_callable_formals: Vec::new(),
+            abi_schemes_installed: false,
             execution_nodes: Vec::new(),
             execution_dependencies: Vec::new(),
             execution_selectors: Vec::new(),
@@ -1927,6 +2409,36 @@ impl DefinitionCodeBuilder {
             active_execution: None,
             next_execution_serial: 0,
         }
+    }
+
+    /// Install the immutable ABI schemes once, preserving their dense
+    /// `KernelAbiCallableId` order and flattening all variable-sized payloads
+    /// into permanent store columns.
+    pub(crate) fn install_abi_callable_schemes(
+        &mut self,
+        schemes: Box<[PackedAbiCallableSchemeInput]>,
+    ) -> Result<(), KernelSolveError> {
+        if std::mem::replace(&mut self.abi_schemes_installed, true) {
+            return Err(KernelSolveError::new(
+                "kernel definition-code ABI schemes may be installed only once",
+            ));
+        }
+        self.abi_callable_schemes.reserve(schemes.len());
+        for scheme in schemes.into_vec() {
+            let formals =
+                Span32::append(&mut self.abi_callable_formals, scheme.formals.into_vec())?;
+            let type_parameters = Span32::append(
+                &mut self.callable_type_parameters,
+                scheme.type_parameters.into_vec(),
+            )?;
+            self.abi_callable_schemes.push(PackedAbiCallableScheme {
+                formals,
+                result: scheme.result,
+                type_parameters,
+                variable_base: scheme.variable_base,
+            });
+        }
+        Ok(())
     }
 
     /// Reserve the project-wide execution columns once before walking any
@@ -2362,6 +2874,7 @@ impl DefinitionCodeBuilder {
             }
             packed_calls.push(PackedCallFacts {
                 expression: call.expression,
+                target: call.target,
                 substitutions: Span32 {
                     start: call_substitution_base
                         .checked_add(call.substitution_start)
@@ -2532,6 +3045,10 @@ impl DefinitionCodeBuilder {
             &mut self.alpha_variables,
             additional.alpha_variables.iter().copied(),
         )?;
+        let callable_type_parameters = Span32::append(
+            &mut self.callable_type_parameters,
+            additional.callable_type_parameters.iter().copied(),
+        )?;
         self.definitions.push(DefinitionCode {
             effect_summary: additional.effect_summary,
             basis_fingerprint_v14: additional.basis_fingerprint_v14,
@@ -2547,6 +3064,7 @@ impl DefinitionCodeBuilder {
             list_item_types,
             resource_projection_requirements,
             alpha_variables,
+            callable_type_parameters,
             execution_node_by_expression,
             execution_result: MISSING_EXECUTION_ROW,
             execution_nodes: Span32::default(),
@@ -2584,6 +3102,9 @@ impl DefinitionCodeBuilder {
             resource_projection_origins: self.resource_projection_origins.into_boxed_slice(),
             resource_projection_symbols: self.resource_projection_symbols.into_boxed_slice(),
             alpha_variables: self.alpha_variables.into_boxed_slice(),
+            callable_type_parameters: self.callable_type_parameters.into_boxed_slice(),
+            abi_callable_schemes: self.abi_callable_schemes.into_boxed_slice(),
+            abi_callable_formals: self.abi_callable_formals.into_boxed_slice(),
             execution_nodes: self.execution_nodes.into_boxed_slice(),
             execution_dependencies: self.execution_dependencies.into_boxed_slice(),
             execution_selectors: self.execution_selectors.into_boxed_slice(),
@@ -2592,6 +3113,7 @@ impl DefinitionCodeBuilder {
             execution_node_by_expression: self.execution_node_by_expression.into_boxed_slice(),
         };
         store.validate_execution()?;
+        store.validate_callable_schemes()?;
         #[cfg(debug_assertions)]
         store.validate()?;
         Ok(store)
@@ -2619,6 +3141,7 @@ mod tests {
                 expression: crate::KernelExpressionId(
                     u32::try_from(ordinal).expect("test call count fits u32"),
                 ),
+                target: None,
                 substitution_start: 0,
                 substitution_len: 0,
                 syntax_discriminated_result: false,
@@ -2662,10 +3185,162 @@ mod tests {
                     resource_projection_origins: &[],
                     resource_projection_symbols: &[],
                     alpha_variables: &[],
+                    callable_type_parameters: &[],
                     stable_digest: [owner as u8; 32],
                 },
             )
             .unwrap();
+    }
+
+    fn build_callable_scheme_fixture(
+        target: Option<KernelCallableSchemeId>,
+        substitution_parameters: &[u32],
+    ) -> Result<DefinitionCodeStore, KernelSolveError> {
+        let mut arena = TypeTermArena::new();
+        let user_source = TypeVariableId(7);
+        let abi_base = TypeVariableId(100);
+        let abi_result_source = TypeVariableId(102);
+        let user_term = arena.variable(user_source);
+        let abi_formal_term = arena.variable(abi_base);
+        let abi_result_term = arena.variable(abi_result_source);
+        let user_flow = KernelArtifactFlowTermV1 {
+            mode: FlowMode::Continuous,
+            term: user_term,
+            stable_digest: [7; 32],
+            runtime_erased_digest: [8; 32],
+        };
+        let abi_parameters = [
+            PackedCallableTypeParameter {
+                source: abi_base,
+                linked_local: 0,
+            },
+            PackedCallableTypeParameter {
+                source: abi_result_source,
+                linked_local: 2,
+            },
+        ];
+        let mut builder = DefinitionCodeBuilder::with_capacity(1, 2, 1);
+        builder.install_abi_callable_schemes(
+            vec![PackedAbiCallableSchemeInput {
+                formals: vec![PackedFlow {
+                    mode: FlowMode::Continuous,
+                    term: abi_formal_term,
+                }]
+                .into_boxed_slice(),
+                result: PackedFlow {
+                    mode: FlowMode::TickPresent,
+                    term: abi_result_term,
+                },
+                type_parameters: abi_parameters.into(),
+                variable_base: abi_base,
+            }]
+            .into_boxed_slice(),
+        )?;
+        let calls = [PackedCallFactsInput {
+            expression: crate::KernelExpressionId(0),
+            target,
+            substitution_start: 0,
+            substitution_len: u32::try_from(substitution_parameters.len())
+                .expect("test substitution count fits u32"),
+            syntax_discriminated_result: true,
+        }];
+        let substitutions = substitution_parameters
+            .iter()
+            .map(|parameter| PackedCallTypeSubstitution {
+                variable: crate::KernelTypeParameterId(*parameter),
+                term: user_term,
+            })
+            .collect::<Vec<_>>();
+        let alpha = [user_source];
+        let user_parameters = [PackedCallableTypeParameter {
+            source: user_source,
+            linked_local: 0,
+        }];
+        builder.push(
+            KernelOwnerId(0),
+            user_flow,
+            &[user_flow],
+            &[user_flow],
+            DefinitionAdditionalTypeRoots {
+                effect_summary: crate::KernelEffectSummary::default(),
+                basis_fingerprint_v14: [9; 32],
+                expression_flush_types: &[None],
+                expression_kind_types: &[None],
+                declaration_flows: &[],
+                calls: &calls,
+                call_substitutions: &substitutions,
+                source_payload_types: &[],
+                state_input_count: 0,
+                states: &[],
+                list_item_types: &[],
+                resource_projection_requirements: &[],
+                resource_projection_origins: &[],
+                resource_projection_symbols: &[],
+                alpha_variables: &alpha,
+                callable_type_parameters: &user_parameters,
+                stable_digest: [10; 32],
+            },
+        )?;
+        builder.finish(Arc::new(arena.freeze()))
+    }
+
+    #[test]
+    fn callable_schemes_retain_target_parameters_and_sparse_abi_alphas() {
+        let target = Some(KernelCallableSchemeId::Abi(KernelAbiCallableId(0)));
+        let store =
+            build_callable_scheme_fixture(target, &[1]).expect("valid callable scheme fixture");
+        let user = store.definition(KernelOwnerId(0)).unwrap();
+        assert_eq!(
+            user.call_target(0),
+            Some(Some(KernelCallableSchemeId::Abi(KernelAbiCallableId(0)))),
+        );
+        assert_eq!(
+            user.callable_type_parameters(),
+            &[PackedCallableTypeParameter {
+                source: TypeVariableId(7),
+                linked_local: 0,
+            }],
+        );
+        let abi = store.abi_callable_scheme(KernelAbiCallableId(0)).unwrap();
+        assert_eq!(abi.variable_base(), TypeVariableId(100));
+        assert_eq!(abi.formals().len(), 1);
+        assert_eq!(abi.result().mode, FlowMode::TickPresent);
+        assert_eq!(
+            abi.type_parameters(),
+            &[
+                PackedCallableTypeParameter {
+                    source: TypeVariableId(100),
+                    linked_local: 0,
+                },
+                PackedCallableTypeParameter {
+                    source: TypeVariableId(102),
+                    linked_local: 2,
+                },
+            ],
+        );
+
+        let error = build_callable_scheme_fixture(target, &[2])
+            .expect_err("substitution ordinal outside the retained target scheme must fail");
+        assert!(
+            error.to_string().contains("outside its target scheme"),
+            "unexpected target-bound parameter error: {error}",
+        );
+
+        let error = build_callable_scheme_fixture(None, &[0])
+            .expect_err("targetless call substitutions must fail closed");
+        assert!(
+            error.to_string().contains("without a target scheme"),
+            "unexpected targetless substitution error: {error}",
+        );
+
+        let error = build_callable_scheme_fixture(target, &[0, 0])
+            .expect_err("duplicate target parameter substitutions must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("repeats substitution parameter 0"),
+            "unexpected duplicate substitution error: {error}",
+        );
     }
 
     #[test]
@@ -2876,6 +3551,7 @@ mod tests {
                     resource_projection_origins: &[],
                     resource_projection_symbols: &[],
                     alpha_variables: &alpha,
+                    callable_type_parameters: &[],
                     stable_digest: [3; 32],
                 },
             )
@@ -2927,6 +3603,7 @@ mod tests {
         };
         let invalid_call = [PackedCallFactsInput {
             expression: crate::KernelExpressionId(1),
+            target: None,
             substitution_start: 0,
             substitution_len: 0,
             syntax_discriminated_result: false,
@@ -2954,6 +3631,7 @@ mod tests {
                     resource_projection_origins: &[],
                     resource_projection_symbols: &[],
                     alpha_variables: &[],
+                    callable_type_parameters: &[],
                     stable_digest: [0; 32],
                 },
             )
@@ -2991,6 +3669,7 @@ mod tests {
                     resource_projection_origins: &[],
                     resource_projection_symbols: &[],
                     alpha_variables: &[],
+                    callable_type_parameters: &[],
                     stable_digest: [0; 32],
                 },
             )
@@ -3057,6 +3736,7 @@ mod tests {
                     resource_projection_origins: &[],
                     resource_projection_symbols: &[],
                     alpha_variables: &[],
+                    callable_type_parameters: &[],
                     stable_digest: [0; 32],
                 },
             )

@@ -1,9 +1,9 @@
 use crate::{
     ArtifactOutput, ComponentArtifact, ComponentOutputSnapshot, ComponentProgram,
     KERNEL_SUMMARY_DEFINITION_RANKING_LEN, KernelCollectionOperationKind,
-    KernelCollectionProjectionKind, KernelOperationRef, KernelPattern, KernelRecordEntry,
-    KernelSelectArm, KernelSolveWork, KernelSummaryCallInput, KernelSummaryDefinitionWork,
-    KernelSummaryNode, KernelSummaryProgram, KernelSummaryRecordEntry, OperationId,
+    KernelCollectionProjectionKind, KernelOperationRef, KernelRecordEntry, KernelSelectArm,
+    KernelSolveWork, KernelSummaryCallInput, KernelSummaryDefinitionWork, KernelSummaryNode,
+    KernelSummaryProgram, KernelSummaryRecordEntry, OperationId, PackedKernelPattern,
     PackedOperationTable, ProgramConsumer, ProgramOperationRef, PublishMode,
     ResidualOperationFrame, TypeTerm, TypeTermHead, TypeTermId, TypeVariableId,
     UnsealedComponentArtifact, VariantTerm, term::ScratchPool,
@@ -11,7 +11,7 @@ use crate::{
 use boon_contract::SymbolId;
 use std::collections::VecDeque;
 use std::error::Error;
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelSolveError {
@@ -1138,7 +1138,7 @@ impl ComponentSolver {
         candidates.reserve(arms.len());
         let mut syntax_selected = singleton && selector_parameter_derived;
         for arm in arms {
-            if singleton && !self.pattern_accepts(selector, &arm.pattern) {
+            if singleton && !self.pattern_accepts(selector, arm.pattern) {
                 continue;
             }
             let candidate = self.import_frame_term(frame_index, frame, arm.output);
@@ -1400,7 +1400,7 @@ impl ComponentSolver {
     fn project_pattern(
         &mut self,
         provider: TypeVariableId,
-        pattern: &KernelPattern,
+        pattern: PackedKernelPattern,
         fields: &[SymbolId],
         consumer: TypeVariableId,
     ) {
@@ -1422,8 +1422,9 @@ impl ComponentSolver {
             }
             Some(projected) => self.bind_equal(consumer, projected),
             None if authoritative => {
+                let pattern = self.pattern_diagnostic_debug(pattern);
                 let missing = self.program.terms.unresolved_shape(format!(
-                    "authoritative provider does not satisfy pattern projection {pattern:?}"
+                    "authoritative provider does not satisfy pattern projection {pattern}"
                 ));
                 self.replace_binding(consumer, missing, true);
             }
@@ -1438,27 +1439,65 @@ impl ComponentSolver {
         }
     }
 
+    /// Preserve the legacy diagnostic bytes without retaining the rich
+    /// string-owning pattern in solver bytecode. This allocates only on the
+    /// already-failing projection path.
+    fn pattern_diagnostic_debug(&self, pattern: PackedKernelPattern) -> String {
+        match pattern {
+            PackedKernelPattern::Wildcard => "Wildcard".to_owned(),
+            PackedKernelPattern::Number => "Number".to_owned(),
+            PackedKernelPattern::Text => "Text".to_owned(),
+            PackedKernelPattern::Bits { width } => format!("Bits {{ width: {width} }}"),
+            PackedKernelPattern::Tag { name, fields } => {
+                let text = self.program.terms.text_snapshot();
+                let name = text
+                    .symbol(name)
+                    .expect("packed pattern tag belongs to the program text authority");
+                let depth = text
+                    .path_depth(fields)
+                    .expect("packed pattern fields belong to the program text authority");
+                let mut rendered = format!("Tag {{ name: {name:?}, fields: [");
+                for ordinal in 0..depth {
+                    if ordinal != 0 {
+                        rendered.push_str(", ");
+                    }
+                    let field = text
+                        .path_symbol_at(fields, ordinal)
+                        .and_then(|field| text.symbol(field))
+                        .expect("packed pattern field belongs to the program text authority");
+                    write!(&mut rendered, "{field:?}").expect("writing into a String cannot fail");
+                }
+                rendered.push_str("] }");
+                rendered
+            }
+            PackedKernelPattern::Binding { name } => {
+                let name = self
+                    .program
+                    .terms
+                    .text_snapshot()
+                    .symbol(name)
+                    .expect("packed pattern binding belongs to the program text authority");
+                format!("Binding {{ name: {name:?} }}")
+            }
+            PackedKernelPattern::Invalid => "Invalid".to_owned(),
+        }
+    }
+
     fn narrow_pattern_payload(
         &mut self,
         provider: TypeTermId,
-        pattern: &KernelPattern,
+        pattern: PackedKernelPattern,
     ) -> Option<TypeTermId> {
         let provider = self.resolve_term_head(provider);
         match pattern {
-            KernelPattern::Tag { name, .. } => match self.program.terms.term_head(provider) {
+            PackedKernelPattern::Tag { name, .. } => match self.program.terms.term_head(provider) {
                 TypeTermHead::VariantSet(variants) => {
                     let mut matched = None;
                     for ordinal in 0..variants.len() {
                         let variant = self.program.terms.variant_terms(variants)[ordinal];
                         matched = match variant {
-                            VariantTerm::Tagged { tag, fields }
-                                if self.program.terms.name(tag) == name.as_ref() =>
-                            {
-                                Some(fields)
-                            }
-                            VariantTerm::Tag(tag)
-                                if self.program.terms.name(tag) == name.as_ref() =>
-                            {
+                            VariantTerm::Tagged { tag, fields } if tag == name => Some(fields),
+                            VariantTerm::Tag(tag) if tag == name => {
                                 Some(self.program.terms.object([], false))
                             }
                             VariantTerm::Tag(_) | VariantTerm::Tagged { .. } => None,
@@ -1485,22 +1524,24 @@ impl ComponentSolver {
                 }
                 _ => None,
             },
-            KernelPattern::Number
+            PackedKernelPattern::Number
                 if matches!(self.program.terms.term(provider), TypeTerm::Number) =>
             {
                 Some(provider)
             }
-            KernelPattern::Text if matches!(self.program.terms.term(provider), TypeTerm::Text) => {
+            PackedKernelPattern::Text
+                if matches!(self.program.terms.term(provider), TypeTerm::Text) =>
+            {
                 Some(provider)
             }
-            KernelPattern::Bits { width } if matches!(self.program.terms.term(provider), TypeTerm::Bits(actual) if actual == *width) => {
+            PackedKernelPattern::Bits { width } if matches!(self.program.terms.term(provider), TypeTerm::Bits(actual) if actual == width) => {
                 Some(provider)
             }
-            KernelPattern::Wildcard | KernelPattern::Binding { .. } => Some(provider),
-            KernelPattern::Number
-            | KernelPattern::Text
-            | KernelPattern::Bits { .. }
-            | KernelPattern::Invalid => None,
+            PackedKernelPattern::Wildcard | PackedKernelPattern::Binding { .. } => Some(provider),
+            PackedKernelPattern::Number
+            | PackedKernelPattern::Text
+            | PackedKernelPattern::Bits { .. }
+            | PackedKernelPattern::Invalid => None,
         }
     }
 
@@ -1517,7 +1558,7 @@ impl ComponentSolver {
 
     fn pattern_projection_scaffold(
         &mut self,
-        pattern: &KernelPattern,
+        pattern: PackedKernelPattern,
         fields: &[SymbolId],
         consumer: TypeTermId,
     ) -> Option<TypeTermId> {
@@ -1526,15 +1567,18 @@ impl ComponentSolver {
             payload = self.program.terms.object([(*field, payload)], true);
         }
         match pattern {
-            KernelPattern::Tag { name, .. } => {
-                let variant = self.program.terms.tagged_variant(name, payload);
+            PackedKernelPattern::Tag { name, .. } => {
+                let variant = VariantTerm::Tagged {
+                    tag: name,
+                    fields: payload,
+                };
                 Some(self.program.terms.variant_set([variant]))
             }
-            KernelPattern::Wildcard | KernelPattern::Binding { .. } => Some(payload),
-            KernelPattern::Number
-            | KernelPattern::Text
-            | KernelPattern::Bits { .. }
-            | KernelPattern::Invalid => None,
+            PackedKernelPattern::Wildcard | PackedKernelPattern::Binding { .. } => Some(payload),
+            PackedKernelPattern::Number
+            | PackedKernelPattern::Text
+            | PackedKernelPattern::Bits { .. }
+            | PackedKernelPattern::Invalid => None,
         }
     }
 
@@ -1623,7 +1667,7 @@ impl ComponentSolver {
         candidates.reserve(arms.len());
         let mut syntax_selected = singleton && selector_parameter_derived;
         for arm in arms {
-            if singleton && !self.pattern_accepts(selector, &arm.pattern) {
+            if singleton && !self.pattern_accepts(selector, arm.pattern) {
                 continue;
             }
             syntax_selected |= self.term_syntax_selected(arm.output);
@@ -1666,18 +1710,22 @@ impl ComponentSolver {
         })
     }
 
-    fn pattern_accepts(&self, selector: TypeTermId, pattern: &KernelPattern) -> bool {
+    fn pattern_accepts(&self, selector: TypeTermId, pattern: PackedKernelPattern) -> bool {
         match pattern {
-            KernelPattern::Wildcard | KernelPattern::Binding { .. } => true,
-            KernelPattern::Number => matches!(self.program.terms.term(selector), TypeTerm::Number),
-            KernelPattern::Text => matches!(self.program.terms.term(selector), TypeTerm::Text),
-            KernelPattern::Bits { width } => {
-                matches!(self.program.terms.term(selector), TypeTerm::Bits(actual) if actual == *width)
+            PackedKernelPattern::Wildcard | PackedKernelPattern::Binding { .. } => true,
+            PackedKernelPattern::Number => {
+                matches!(self.program.terms.term(selector), TypeTerm::Number)
             }
-            KernelPattern::Tag { name, .. } => {
-                matches!(self.program.terms.term(selector), TypeTerm::VariantSet(variants) if variants.iter().any(|variant| self.program.terms.name(variant.tag()) == name.as_ref()))
+            PackedKernelPattern::Text => {
+                matches!(self.program.terms.term(selector), TypeTerm::Text)
             }
-            KernelPattern::Invalid => false,
+            PackedKernelPattern::Bits { width } => {
+                matches!(self.program.terms.term(selector), TypeTerm::Bits(actual) if actual == width)
+            }
+            PackedKernelPattern::Tag { name, .. } => {
+                matches!(self.program.terms.term(selector), TypeTerm::VariantSet(variants) if variants.iter().any(|variant| variant.tag() == name))
+            }
+            PackedKernelPattern::Invalid => false,
         }
     }
 
@@ -2020,7 +2068,7 @@ impl ComponentSolver {
                 );
                 if singleton {
                     for arm in arms {
-                        if !self.pattern_accepts(selector_term, &arm.pattern) {
+                        if !self.pattern_accepts(selector_term, arm.pattern) {
                             continue;
                         }
                         let mut candidate = self.evaluate_summary_value(
@@ -3217,7 +3265,15 @@ mod tests {
     use super::*;
     use crate::{ComponentProgramBuilder, KernelSummarySelectArm, PublishMode};
     use boon_checked::{FlowMode, ObjectShape, Type, Variant};
+    use boon_contract::PathId;
     use std::{collections::BTreeSet, sync::Arc};
+
+    fn tag_pattern(name: SymbolId) -> PackedKernelPattern {
+        PackedKernelPattern::Tag {
+            name,
+            fields: PathId::ROOT,
+        }
+    }
 
     #[test]
     fn staged_output_demand_extends_one_solver_without_running_disconnected_work() {
@@ -3361,6 +3417,7 @@ mod tests {
         let actual = builder.new_contextual_hole();
         let output = builder.new_authoritative_provider();
         let true_tag = builder.terms_mut().variant_tag("True");
+        let true_name = true_tag.tag();
         let true_type = builder.terms_mut().variant_set([true_tag]);
         builder.add_publish(selector, [true_type], PublishMode::Replace);
 
@@ -3386,14 +3443,11 @@ mod tests {
                     syntax_discriminating: true,
                     arms: vec![
                         KernelSummarySelectArm {
-                            pattern: KernelPattern::Tag {
-                                name: "True".into(),
-                                fields: Box::new([]),
-                            },
+                            pattern: tag_pattern(true_name),
                             output: crate::KernelSummaryValueId(2),
                         },
                         KernelSummarySelectArm {
-                            pattern: KernelPattern::Wildcard,
+                            pattern: PackedKernelPattern::Wildcard,
                             output: crate::KernelSummaryValueId(5),
                         },
                     ]
@@ -3444,6 +3498,7 @@ mod tests {
         let actual = builder.new_contextual_hole();
         let output = builder.new_authoritative_provider();
         let true_tag = builder.terms_mut().variant_tag("True");
+        let true_name = true_tag.tag();
         let true_type = builder.terms_mut().variant_set([true_tag]);
         builder.add_publish(selector, [true_type], PublishMode::Replace);
 
@@ -3469,14 +3524,11 @@ mod tests {
                     syntax_discriminating: true,
                     arms: vec![
                         KernelSummarySelectArm {
-                            pattern: KernelPattern::Tag {
-                                name: "True".into(),
-                                fields: Box::new([]),
-                            },
+                            pattern: tag_pattern(true_name),
                             output: crate::KernelSummaryValueId(2),
                         },
                         KernelSummarySelectArm {
-                            pattern: KernelPattern::Wildcard,
+                            pattern: PackedKernelPattern::Wildcard,
                             output: crate::KernelSummaryValueId(5),
                         },
                     ]
@@ -3545,6 +3597,7 @@ mod tests {
         let output = builder.new_authoritative_provider();
         let kind = builder.terms_mut().intern_name("kind");
         let true_tag = builder.terms_mut().variant_tag("True");
+        let true_name = true_tag.tag();
         let true_type = builder.terms_mut().variant_set([true_tag]);
         let actual_type = builder.terms_mut().object([(kind, true_type)], false);
         builder.add_publish(actual, [actual_type], PublishMode::Replace);
@@ -3562,14 +3615,11 @@ mod tests {
                     syntax_discriminating: true,
                     arms: vec![
                         KernelSummarySelectArm {
-                            pattern: KernelPattern::Tag {
-                                name: "True".into(),
-                                fields: Box::new([]),
-                            },
+                            pattern: tag_pattern(true_name),
                             output: crate::KernelSummaryValueId(1),
                         },
                         KernelSummarySelectArm {
-                            pattern: KernelPattern::Wildcard,
+                            pattern: PackedKernelPattern::Wildcard,
                             output: crate::KernelSummaryValueId(2),
                         },
                     ]
@@ -3889,6 +3939,8 @@ mod tests {
         let output = builder.new_authoritative_provider();
         let true_variant = builder.terms_mut().variant_tag("True");
         let false_variant = builder.terms_mut().variant_tag("False");
+        let true_name = true_variant.tag();
+        let false_name = false_variant.tag();
         let selector_type = builder
             .terms_mut()
             .variant_set([true_variant, false_variant]);
@@ -3908,17 +3960,11 @@ mod tests {
             selector,
             [
                 KernelSelectArm {
-                    pattern: KernelPattern::Tag {
-                        name: "True".into(),
-                        fields: Box::new([]),
-                    },
+                    pattern: tag_pattern(true_name),
                     output: header,
                 },
                 KernelSelectArm {
-                    pattern: KernelPattern::Tag {
-                        name: "False".into(),
-                        fields: Box::new([]),
-                    },
+                    pattern: tag_pattern(false_name),
                     output: empty,
                 },
             ],

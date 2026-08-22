@@ -2480,6 +2480,62 @@ pub struct CheckedProgram {
     runtime_flow_terms: CheckedRuntimeFlowTermHandoffV1,
 }
 
+/// Move-only checked authority produced for the compact RuntimePacked path.
+///
+/// Unlike [`CheckedProgram`], this capability does not retain a rich
+/// [`CheckedProgramFields`] owner. The typechecker creates it only after the
+/// kernel publication, definition authority, dense entity counts, resource
+/// routes, and process-local pairing have been validated together. Semantic
+/// construction can then consume these three proof products directly.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct RuntimePackedCheckedSealV1 {
+    image_handoff: CheckedImageHandoffV4,
+    pairing_receipt: CheckedImageKernelPairingReceiptV1,
+    runtime_flow_terms: CheckedRuntimeFlowTermHandoffV1,
+}
+
+impl RuntimePackedCheckedSealV1 {
+    #[doc(hidden)]
+    pub fn __typechecker_new(
+        image_handoff: CheckedImageHandoffV4,
+        pairing_receipt: CheckedImageKernelPairingReceiptV1,
+        runtime_flow_terms: CheckedRuntimeFlowTermHandoffV1,
+    ) -> Self {
+        Self {
+            image_handoff,
+            pairing_receipt,
+            runtime_flow_terms,
+        }
+    }
+
+    pub fn image_handoff(&self) -> &CheckedImageHandoffV4 {
+        &self.image_handoff
+    }
+
+    pub fn pairing_receipt(&self) -> &CheckedImageKernelPairingReceiptV1 {
+        &self.pairing_receipt
+    }
+
+    pub fn runtime_flow_terms(&self) -> &CheckedRuntimeFlowTermHandoffV1 {
+        &self.runtime_flow_terms
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        CheckedImageHandoffV4,
+        CheckedImageKernelPairingReceiptV1,
+        CheckedRuntimeFlowTermHandoffV1,
+    ) {
+        (
+            self.image_handoff,
+            self.pairing_receipt,
+            self.runtime_flow_terms,
+        )
+    }
+}
+
 /// Completed typechecker construction before a runtime handoff is requested.
 ///
 /// Diagnostics and editor projections may inspect these immutable checked

@@ -800,11 +800,36 @@ impl<'a> UnitOwnerSyntaxView<'a> {
 
     pub fn expressions(&self) -> impl Iterator<Item = &'a AstExpr> + 'a {
         let expressions = &self.fields.ast.expressions;
-        self.entry.expressions.iter().map(move |expression| {
+        let owner_expressions: &'a [UnitLocalExpressionId] = &self.entry.expressions;
+        owner_expressions.iter().map(move |expression| {
             expressions
                 .get(expression.as_usize())
                 .expect("parser owner index expression locator resolves")
         })
+    }
+
+    /// Number of expressions in this owner's dense parser-arena order.
+    ///
+    /// This is a borrowed index query: it does not rebuild an owner-local
+    /// expression table.
+    pub fn expression_count(&self) -> usize {
+        self.entry.expressions.len()
+    }
+
+    /// Return one expression by its dense owner-local parser-arena ordinal.
+    pub fn expression_at(&self, ordinal: usize) -> Option<&'a AstExpr> {
+        let expression = self.entry.expressions.get(ordinal)?;
+        self.fields.ast.expressions.get(expression.as_usize())
+    }
+
+    /// Resolve a syntax expression ID to its dense owner-local ordinal.
+    ///
+    /// Owner expression IDs are retained in parser-arena order, so the lookup
+    /// is allocation-free and logarithmic. An expression from another owner or
+    /// syntax-unit namespace is rejected.
+    pub fn dense_expression_ordinal(&self, expression_id: usize) -> Option<usize> {
+        let expression = self.local_expression_id(expression_id)?;
+        self.entry.expressions.binary_search(&expression).ok()
     }
 
     pub fn stable_expression_keys(&self) -> impl Iterator<Item = StableExpressionKey> + 'a {
@@ -10798,8 +10823,42 @@ document:
         );
 
         let mut seen = BTreeSet::new();
-        for (coordinate, view) in indexed {
+        for (coordinate, view) in indexed.iter().copied() {
             assert!(seen.insert(coordinate));
+            let expressions = view.expressions().collect::<Vec<_>>();
+            let stable_expressions = view.stable_expression_keys().collect::<Vec<_>>();
+            assert_eq!(view.expression_count(), expressions.len());
+            assert_eq!(stable_expressions.len(), expressions.len());
+            for (ordinal, (expression, stable)) in expressions
+                .iter()
+                .copied()
+                .zip(stable_expressions)
+                .enumerate()
+            {
+                assert!(std::ptr::eq(
+                    view.expression_at(ordinal)
+                        .expect("dense owner expression ordinal resolves"),
+                    expression,
+                ));
+                assert_eq!(view.dense_expression_ordinal(expression.id), Some(ordinal),);
+                assert_eq!(
+                    view.stable_expression_key_for_syntax(expression.id),
+                    Some(stable),
+                );
+            }
+            assert!(view.expression_at(view.expression_count()).is_none());
+            assert!(view.dense_expression_ordinal(usize::MAX).is_none());
+            if let Some(foreign_expression) = indexed
+                .iter()
+                .filter(|(other, _)| *other != coordinate)
+                .flat_map(|(_, other)| other.expressions())
+                .next()
+            {
+                assert!(
+                    view.dense_expression_ordinal(foreign_expression.id)
+                        .is_none()
+                );
+            }
             let resolved = project
                 .owner_view_by_coord(coordinate)
                 .expect("project resolves its indexed owner coordinate");

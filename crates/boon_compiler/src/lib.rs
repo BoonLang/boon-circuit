@@ -1193,7 +1193,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
     let mut cancellation = CancellationProbe::new(cancellation);
     cancellation.checkpoint().map_err(PlanError::new)?;
     let CheckedSourceFromSource {
-        syntax,
+        syntax: syntax_owner,
         output,
         mut profile,
         checked_call_seal_authority,
@@ -1203,7 +1203,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
     } = checked_source;
     let deferred_runtime_handoff = output.construction.is_some();
     let runtime_handoff_started = Instant::now();
-    let syntax = match &syntax {
+    let syntax = match &syntax_owner {
         CheckedSourceSyntax::Assembled(program) => CheckedSyntaxRef::Assembled(program),
         CheckedSourceSyntax::UnitNative(program) => CheckedSyntaxRef::UnitNative(program),
     };
@@ -1214,6 +1214,11 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         checked_image_kernel_authority,
         checked_image_kernel_publication,
     )?;
+    // Checked sealing is the final consumer of parser arenas on the ordinary
+    // verified path. Release the project snapshot before semantic expansion
+    // and backend construction so source/token/AST storage cannot contribute
+    // to their peak RSS.
+    drop(syntax_owner);
     let kernel_pairing_receipt = kernel_pairing_receipt.ok_or_else(|| {
         PlanError::new("kernel checked construction produced no semantic pairing receipt")
     })?;

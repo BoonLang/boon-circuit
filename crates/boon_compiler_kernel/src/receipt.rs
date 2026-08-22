@@ -4,13 +4,13 @@ use crate::{
     BytesTerm, DefinitionCodeRef, DefinitionCodeStore, KernelCallInputRoleRef, KernelCallTarget,
     KernelCallTargetRef, KernelDeclarationReference, KernelDefinitionFactsInput,
     KernelDefinitionRef, KernelDiagnosticArtifact, KernelDiagnosticKind, KernelExpressionId,
-    KernelExpressionKindRef, KernelExternalExpression, KernelExternalTarget,
-    KernelInterfaceSnapshot, KernelLexicalBindingTarget, KernelLexicalBindingTargetRef,
-    KernelOwnerBuildError, KernelOwnerId, KernelOwnerNodeKind, KernelOwnerProgramInput,
-    KernelProjectProgramInput, KernelSolveError, KernelStatePathRef, KernelStatementChildReference,
-    KernelStatementReference, KernelValueReference, PackedDiagnosticMetadata,
-    PackedDiagnosticTypes, PackedFlow, RichDefinitionArtifact, TypeTerm, TypeTermArena, TypeTermId,
-    TypeVariableId, VariantTerm,
+    KernelExternalExpression, KernelExternalTarget, KernelInterfaceSnapshot,
+    KernelLexicalBindingTarget, KernelLexicalBindingTargetRef, KernelOwnerBuildError,
+    KernelOwnerId, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelSolveError,
+    KernelStatePathRef, KernelStatementChildReference, KernelStatementReference,
+    KernelValueReference, PackedDiagnosticMetadata, PackedDiagnosticTypes, PackedFlow,
+    PackedKernelOwnerNodeKind, PackedKernelProjectProgram, RichDefinitionArtifact, TypeTerm,
+    TypeTermArena, TypeTermId, TypeVariableId, VariantTerm, kernel_owner_edge_role_ref,
 };
 use boon_checked::{FlowType, ObjectShape, SharedObjectShape, Type, TypeVar, Variant};
 use boon_effect_schema::{
@@ -386,7 +386,7 @@ pub(crate) fn build_packed_snapshot_receipts(
 /// kept temporarily as a differential oracle until every downstream consumer
 /// has moved to the same borrowed definition view.
 pub(crate) fn build_borrowed_snapshot_receipts(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     definition_facts: &[KernelDefinitionFactsInput],
     code: &DefinitionCodeStore,
     interface: &KernelInterfaceSnapshot,
@@ -397,7 +397,7 @@ pub(crate) fn build_borrowed_snapshot_receipts(
     ),
     KernelSolveError,
 > {
-    let definition_count = program.owners.len();
+    let definition_count = program.definition_count();
     if definition_count != definition_facts.len()
         || definition_count != code.definition_count()
         || definition_count != interface.definition_count()
@@ -946,7 +946,7 @@ fn fingerprint_packed_definition_range(
 
 fn fingerprint_borrowed_definition_range(
     range: Range<usize>,
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     definition_facts: &[KernelDefinitionFactsInput],
     code: &DefinitionCodeStore,
     interface: &KernelInterfaceSnapshot,
@@ -962,7 +962,7 @@ fn fingerprint_borrowed_definition_range(
                 .expect("kernel definition count exceeds dense u32 namespace"),
         );
         let definition =
-            KernelDefinitionRef::from_authorities(program, definition_facts, code, owner)
+            KernelDefinitionRef::from_rich_authorities(program, definition_facts, code, owner)
                 .ok_or_else(|| {
                     KernelSolveError::new(format!(
                         "kernel borrowed authorities omit owner {definition_index}"
@@ -1254,17 +1254,23 @@ struct BorrowedExpressionsHash<'a> {
 
 impl Hash for BorrowedExpressionsHash<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let expressions = &self.definition.input().nodes;
+        let expressions = self.definition.input().nodes();
         expressions.len().hash(state);
         for (index, expression) in expressions.iter().enumerate() {
             let id = KernelExpressionId(
                 u32::try_from(index).expect("kernel expression count exceeds u32"),
             );
             id.hash(state);
-            KernelExpressionKindRef::from(&expression.kind).hash(state);
-            expression.inputs.len().hash(state);
-            for input in &expression.inputs {
-                input.role.hash(state);
+            self.definition
+                .expression_kind(id)
+                .expect("validated expression text remains in its project authority")
+                .hash(state);
+            let inputs = expression.inputs(self.definition.input());
+            inputs.len().hash(state);
+            for input in inputs {
+                kernel_owner_edge_role_ref(self.definition.input(), input.role)
+                    .expect("validated edge text remains in its project authority")
+                    .hash(state);
                 resolve_hash_value(self.definition, input.expression, index).hash(state);
             }
             self.definition
@@ -1373,15 +1379,20 @@ impl Hash for BorrowedEffectsHash<'_> {
         let effect_count = self
             .definition
             .input()
-            .nodes
+            .nodes()
             .iter()
-            .filter(|node| matches!(node.kind, KernelOwnerNodeKind::HostEffect { .. }))
+            .filter(|node| matches!(node.kind, PackedKernelOwnerNodeKind::HostEffect { .. }))
             .count();
         effect_count.hash(state);
-        for (index, node) in self.definition.input().nodes.iter().enumerate() {
-            let KernelOwnerNodeKind::HostEffect { operation } = &node.kind else {
+        for (index, node) in self.definition.input().nodes().iter().enumerate() {
+            let PackedKernelOwnerNodeKind::HostEffect { operation } = node.kind else {
                 continue;
             };
+            let operation = self
+                .definition
+                .input()
+                .symbol(operation)
+                .expect("validated host-effect text remains in its project authority");
             let spec = host_effect_policy(operation)
                 .expect("validated host-effect operation remains in the ABI registry");
             KernelExpressionId(u32::try_from(index).expect("kernel expression count exceeds u32"))
@@ -1423,25 +1434,33 @@ impl Hash for BorrowedStatesHash<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.definition.state_count().hash(state);
         for published in self.definition.states() {
-            let input = published.input();
             published.id().hash(state);
-            input.binding_declaration.hash(state);
-            input.declaration.hash(state);
-            input.statement.hash(state);
-            input.expression.hash(state);
+            published.binding_declaration().hash(state);
+            published.declaration().hash(state);
+            published.statement().hash(state);
+            published.expression().hash(state);
             published
                 .initial()
                 .expect("validated state initial remains resolvable")
                 .hash(state);
-            input.declaration.hash(state);
+            published.declaration().hash(state);
             match published.path() {
-                KernelStatePathRef::Authored(projection) => projection.hash(state),
+                KernelStatePathRef::Authored(projection) => {
+                    projection.len().hash(state);
+                    for symbol in projection.iter() {
+                        self.definition
+                            .input()
+                            .symbol(symbol)
+                            .expect("sealed state path symbol belongs to its text authority")
+                            .hash(state);
+                    }
+                }
                 KernelStatePathRef::Synthetic(ordinal) => {
                     1usize.hash(state);
                     hash_synthetic_state_name(ordinal, state);
                 }
             }
-            input.kind.hash(state);
+            published.kind().hash(state);
         }
     }
 }
@@ -1872,18 +1891,18 @@ fn build_packed_dependency_graph(
 }
 
 fn build_borrowed_dependency_graph(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     facts: &[KernelDefinitionFactsInput],
     code: &DefinitionCodeStore,
     interface: &KernelInterfaceSnapshot,
 ) -> Result<KernelDefinitionDependencyGraph, KernelSolveError> {
-    let mut rows = Vec::with_capacity(program.owners.len());
-    for definition_index in 0..program.owners.len() {
+    let mut rows = Vec::with_capacity(program.definition_count());
+    for definition_index in 0..program.definition_count() {
         let owner = KernelOwnerId(
             u32::try_from(definition_index)
                 .expect("kernel definition count exceeds the dense u32 namespace"),
         );
-        let definition = KernelDefinitionRef::from_authorities(program, facts, code, owner)
+        let definition = KernelDefinitionRef::from_rich_authorities(program, facts, code, owner)
             .ok_or_else(|| {
                 KernelSolveError::new(format!(
                     "kernel borrowed authorities omit owner {definition_index}"
@@ -1915,7 +1934,7 @@ fn build_borrowed_dependency_graph(
 }
 
 fn validate_borrowed_definition_diagnostics(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     facts: &[KernelDefinitionFactsInput],
     code: &DefinitionCodeStore,
     interface: &KernelInterfaceSnapshot,
@@ -1932,7 +1951,7 @@ fn validate_borrowed_definition_diagnostics(
             | crate::KernelDiagnosticSite::CallPass {
                 call: expression, ..
             } => {
-                if expression.0 as usize >= definition.input().nodes.len() {
+                if expression.0 as usize >= definition.input().nodes().len() {
                     return Err(KernelSolveError::new(format!(
                         "kernel definition {owner_index} diagnostic references missing expression {}",
                         expression.0
@@ -1944,7 +1963,9 @@ fn validate_borrowed_definition_diagnostics(
                 target,
                 formal_ordinal,
             } => {
-                if target.0 as usize >= program.owners.len() || target.0 as usize >= facts.len() {
+                if target.0 as usize >= program.definition_count()
+                    || target.0 as usize >= facts.len()
+                {
                     return Err(KernelSolveError::new(format!(
                         "kernel definition {owner_index} diagnostic targets missing definition {}",
                         target.0
@@ -2008,11 +2029,11 @@ fn borrowed_definition_dependencies(
     definition: KernelDefinitionRef<'_>,
 ) -> Result<Vec<KernelDefinitionDependency>, KernelSolveError> {
     let mut dependencies = Vec::new();
-    for (expression_index, expression) in definition.input().nodes.iter().enumerate() {
+    for (expression_index, expression) in definition.input().nodes().iter().enumerate() {
         let expression_id = KernelExpressionId(
             u32::try_from(expression_index).expect("kernel expression count exceeds u32"),
         );
-        for (input, edge) in expression.inputs.iter().enumerate() {
+        for (input, edge) in expression.inputs(definition.input()).iter().enumerate() {
             push_value_dependency(
                 &mut dependencies,
                 KernelDependencySource::ExpressionInput {
@@ -2131,21 +2152,20 @@ fn borrowed_definition_dependencies(
         );
     }
     for state in definition.states() {
-        let input = state.input();
         push_declaration_dependency(
             &mut dependencies,
             KernelDependencySource::StateBindingDeclaration { state: state.id() },
-            input.binding_declaration,
+            state.binding_declaration(),
         );
         push_declaration_dependency(
             &mut dependencies,
             KernelDependencySource::StateDeclaration { state: state.id() },
-            input.declaration,
+            state.declaration(),
         );
         push_statement_dependency(
             &mut dependencies,
             KernelDependencySource::StateStatement { state: state.id() },
-            input.statement,
+            state.statement(),
         );
         push_value_dependency(
             &mut dependencies,
@@ -2155,7 +2175,7 @@ fn borrowed_definition_dependencies(
         push_declaration_dependency(
             &mut dependencies,
             KernelDependencySource::StatePathAnchor { state: state.id() },
-            input.declaration,
+            state.declaration(),
         );
     }
     for list in &definition.facts().lists {
@@ -2209,22 +2229,23 @@ fn borrowed_definition_dependencies(
 }
 
 fn validate_borrowed_dependency_target(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     facts: &[KernelDefinitionFactsInput],
     code: &DefinitionCodeStore,
     consumer: usize,
     target: KernelDependencyTarget,
 ) -> Result<(), KernelSolveError> {
     let provider = target.owner().0 as usize;
-    let definition = KernelDefinitionRef::from_authorities(program, facts, code, target.owner())
-        .ok_or_else(|| {
-            KernelSolveError::new(format!(
-                "kernel definition {consumer} depends on missing definition {provider}"
-            ))
-        })?;
+    let definition =
+        KernelDefinitionRef::from_rich_authorities(program, facts, code, target.owner())
+            .ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel definition {consumer} depends on missing definition {provider}"
+                ))
+            })?;
     match target {
         KernelDependencyTarget::Expression { expression, .. }
-            if expression.0 as usize >= definition.input().nodes.len() =>
+            if expression.0 as usize >= definition.input().nodes().len() =>
         {
             return Err(KernelSolveError::new(format!(
                 "kernel definition {consumer} depends on missing expression {} in definition {provider}",

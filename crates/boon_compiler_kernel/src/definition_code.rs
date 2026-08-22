@@ -20,13 +20,17 @@ use std::sync::Arc;
 /// every start, length, and end once; consumers receive only borrowed slices.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct Span32 {
-    start: u32,
-    len: u32,
+pub(crate) struct Span32 {
+    pub(crate) start: u32,
+    pub(crate) len: u32,
 }
 
 impl Span32 {
-    fn from_bounds(start: usize, end: usize, label: &str) -> Result<Self, KernelSolveError> {
+    pub(crate) fn from_bounds(
+        start: usize,
+        end: usize,
+        label: &str,
+    ) -> Result<Self, KernelSolveError> {
         let start = u32::try_from(start).map_err(|_| {
             KernelSolveError::new(format!(
                 "kernel definition-code {label} column start exceeds u32"
@@ -47,7 +51,7 @@ impl Span32 {
         })
     }
 
-    fn append<T>(
+    pub(crate) fn append<T>(
         column: &mut Vec<T>,
         rows: impl IntoIterator<Item = T>,
     ) -> Result<Self, KernelSolveError> {
@@ -69,10 +73,17 @@ impl Span32 {
         Ok(Self { start, len })
     }
 
-    fn get<'a, T>(self, column: &'a [T]) -> Option<&'a [T]> {
+    pub(crate) fn get<'a, T>(self, column: &'a [T]) -> Option<&'a [T]> {
         let start = self.start as usize;
         let end = start.checked_add(self.len as usize)?;
         column.get(start..end)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn get_mut<'a, T>(self, column: &'a mut [T]) -> Option<&'a mut [T]> {
+        let start = self.start as usize;
+        let end = start.checked_add(self.len as usize)?;
+        column.get_mut(start..end)
     }
 
     fn contains(self, index: usize) -> bool {
@@ -203,6 +214,7 @@ struct DefinitionCode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DefinitionCodeStore {
     types: Arc<FrozenTypeStore>,
+    runtime_facts: Arc<crate::PackedDefinitionFactsStore>,
     definitions: Box<[DefinitionCode]>,
     flows: Box<[KernelArtifactFlowTermV1]>,
     expression_flush_types: Box<[Option<crate::TypeTermId>]>,
@@ -237,6 +249,18 @@ impl DefinitionCodeStore {
 
     pub fn definition_count(&self) -> usize {
         self.definitions.len()
+    }
+
+    pub(crate) fn runtime_facts(
+        &self,
+        owner: KernelOwnerId,
+    ) -> Option<crate::PackedDefinitionFactsRef<'_>> {
+        self.runtime_facts.definition(owner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_facts_store(&self) -> &Arc<crate::PackedDefinitionFactsStore> {
+        &self.runtime_facts
     }
 
     pub(crate) fn definitions(&self) -> impl ExactSizeIterator<Item = DefinitionCodeRef<'_>> + '_ {
@@ -1457,6 +1481,12 @@ impl<'a> DefinitionCodeRef<'a> {
         self.owner
     }
 
+    pub(crate) fn runtime_facts(self) -> crate::PackedDefinitionFactsRef<'a> {
+        self.store
+            .runtime_facts(self.owner)
+            .expect("sealed definition-code runtime facts remain aligned")
+    }
+
     pub(crate) const fn has_execution_template(self) -> bool {
         self.code.execution_result != MISSING_EXECUTION_ROW
     }
@@ -1634,6 +1664,15 @@ impl<'a> DefinitionCodeRef<'a> {
         self.code.source_payload_types.len as usize
     }
 
+    pub(crate) fn source_payload_term(self, ordinal: usize) -> Option<crate::TypeTermId> {
+        self.code
+            .source_payload_types
+            .get(&self.store.source_payload_types)
+            .expect("sealed definition-code SOURCE-payload span is valid")
+            .get(ordinal)
+            .copied()
+    }
+
     pub(crate) fn state_count(self) -> usize {
         self.code.states.len as usize
     }
@@ -1647,6 +1686,15 @@ impl<'a> DefinitionCodeRef<'a> {
 
     pub(crate) fn list_count(self) -> usize {
         self.code.list_item_types.len as usize
+    }
+
+    pub(crate) fn list_item_term(self, ordinal: usize) -> Option<crate::TypeTermId> {
+        self.code
+            .list_item_types
+            .get(&self.store.list_item_types)
+            .expect("sealed definition-code LIST-item span is valid")
+            .get(ordinal)
+            .copied()
     }
 
     pub(crate) fn published_expression(self, ordinal: usize) -> Option<KernelArtifactFlowTermV1> {
@@ -2669,6 +2717,8 @@ struct ActiveExecutionTemplate {
 
 #[derive(Debug)]
 pub(crate) struct DefinitionCodeBuilder {
+    runtime_facts: crate::PackedDefinitionFactsStoreBuilder,
+    prepared_runtime_facts: Option<Arc<crate::PackedDefinitionFactsStore>>,
     definitions: Vec<DefinitionCode>,
     flows: Vec<KernelArtifactFlowTermV1>,
     expression_flush_types: Vec<Option<crate::TypeTermId>>,
@@ -2705,6 +2755,8 @@ pub(crate) struct DefinitionCodeBuilder {
 impl DefinitionCodeBuilder {
     pub(crate) fn with_capacity(definitions: usize, flows: usize, alpha_variables: usize) -> Self {
         Self {
+            runtime_facts: crate::PackedDefinitionFactsStoreBuilder::with_capacity(definitions),
+            prepared_runtime_facts: None,
             definitions: Vec::with_capacity(definitions),
             flows: Vec::with_capacity(flows),
             expression_flush_types: Vec::with_capacity(flows.saturating_sub(definitions)),
@@ -2735,6 +2787,22 @@ impl DefinitionCodeBuilder {
             active_execution: None,
             next_execution_serial: 0,
         }
+    }
+
+    pub(crate) fn use_prepared_runtime_facts(
+        &mut self,
+        facts: Arc<crate::PackedDefinitionFactsStore>,
+    ) -> Result<(), KernelSolveError> {
+        if self.prepared_runtime_facts.is_some()
+            || self.runtime_facts.definition_count() != 0
+            || !self.definitions.is_empty()
+        {
+            return Err(KernelSolveError::new(
+                "kernel definition-code runtime facts must be installed before definition rows",
+            ));
+        }
+        self.prepared_runtime_facts = Some(facts);
+        Ok(())
     }
 
     /// Install the immutable ABI schemes once, preserving their dense
@@ -3119,6 +3187,28 @@ impl DefinitionCodeBuilder {
                 self.definitions.len(),
                 owner.0
             )));
+        }
+        if let Some(facts) = &self.prepared_runtime_facts {
+            if facts.definition_count() <= self.definitions.len() {
+                return Err(KernelSolveError::new(
+                    "kernel prepared runtime facts omit a definition header",
+                ));
+            }
+        } else {
+            match self
+                .runtime_facts
+                .definition_count()
+                .cmp(&self.definitions.len())
+            {
+                std::cmp::Ordering::Equal => self.runtime_facts.push_empty(),
+                std::cmp::Ordering::Greater
+                    if self.runtime_facts.definition_count() == self.definitions.len() + 1 => {}
+                _ => {
+                    return Err(KernelSolveError::new(
+                        "kernel definition-code runtime facts lost alignment with definition headers",
+                    ));
+                }
+            }
         }
         let formals = Span32::append(&mut self.flows, formal_flows.iter().copied())?;
         let expressions = Span32::append(&mut self.flows, expression_flows.iter().copied())?;
@@ -3522,8 +3612,22 @@ impl DefinitionCodeBuilder {
                 active.token.owner.0,
             )));
         }
+        let runtime_facts = match self.prepared_runtime_facts {
+            Some(facts) => {
+                if facts.definition_count() != self.definitions.len() {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel prepared runtime facts contain {} definitions for {} code rows",
+                        facts.definition_count(),
+                        self.definitions.len(),
+                    )));
+                }
+                facts
+            }
+            None => Arc::new(self.runtime_facts.finish()),
+        };
         let store = DefinitionCodeStore {
             types,
+            runtime_facts,
             definitions: self.definitions.into_boxed_slice(),
             flows: self.flows.into_boxed_slice(),
             expression_flush_types: self.expression_flush_types.into_boxed_slice(),

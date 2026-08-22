@@ -10,12 +10,14 @@ use crate::{
     KernelSummarySelectArm, KernelSummaryValueId, OutputId, PackedCallContext,
     PackedCallContextBinding, PackedCallEntry, PackedCallFactsInput, PackedCallRef,
     PackedCallTypeSubstitution, PackedCallableTypeParameter, PackedDiagnosticTypes,
-    PackedExpressionRef, PackedFlow, PackedPublishedState,
-    PackedResourceProjectionRequirementInput, PackedSourceReadInput, PublishMode, TypeTerm,
-    TypeTermHead, TypeTermId, TypeTermImportScratch, TypeTermImportSession, TypeVariableId,
-    UnsealedComponentArtifact, VariantTerm, build_borrowed_snapshot_receipts,
-    build_snapshot_receipts, collect_packed_callable_type_parameter_sources,
-    definition_basis_fingerprint, definition_basis_fingerprint_with_buffer, solve_component,
+    PackedExpressionRef, PackedFlow, PackedKernelOwnerEdgeRole, PackedKernelOwnerNode,
+    PackedKernelOwnerNodeKind, PackedKernelOwnerProgramRef, PackedKernelPathRef,
+    PackedKernelProjectProgram, PackedPublishedState, PackedResourceProjectionRequirementInput,
+    PackedSourceReadInput, PublishMode, TypeTerm, TypeTermHead, TypeTermId, TypeTermImportScratch,
+    TypeTermImportSession, TypeVariableId, UnsealedComponentArtifact, VariantTerm,
+    build_borrowed_snapshot_receipts, build_snapshot_receipts,
+    collect_packed_callable_type_parameter_sources, definition_basis_fingerprint,
+    definition_basis_fingerprint_with_buffer, solve_component,
 };
 use boon_checked::{
     BytesType, CheckedListKeyPolicy, CheckedParameterKind, CheckedStateKind, FlowMode, FlowType,
@@ -549,7 +551,7 @@ impl KernelDefinitionPresentation {
 /// The dense declaration ID is intentionally revision-local. The origin is
 /// expressed only through other definition-local IDs so a linker can relocate
 /// it without retaining parser arenas, byte offsets, or legacy checker IDs.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum KernelDeclarationOrigin {
     Statement {
         statement: KernelStatementId,
@@ -630,7 +632,7 @@ pub enum KernelStatementReference {
     OwnerPublic(KernelOwnerId),
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelLexicalBindingTargetInput {
     Declaration(KernelDeclarationReference),
     ContextFormal {
@@ -1131,9 +1133,10 @@ pub struct KernelOwnerProgram {
 #[derive(Debug)]
 pub struct KernelProjectProgram {
     component: ComponentProgram,
-    program: Arc<KernelProjectProgramInput>,
+    program: Arc<PackedKernelProjectProgram>,
     owners: Box<[KernelProjectOwnerOutputs]>,
     definition_facts: Arc<[KernelDefinitionFactsInput]>,
+    runtime_facts: Arc<crate::PackedDefinitionFactsStore>,
     /// Exact immutable ABI metadata needed by post-solve packed publication.
     /// Type equations have already consumed the ABI; retaining this shared
     /// table avoids reconstructing contextual call behavior from checked DTOs.
@@ -1146,9 +1149,10 @@ pub struct KernelProjectProgram {
 /// state and immutable equation program.
 pub(crate) struct KernelProjectSolveSession {
     component: ComponentSolveSession,
-    program: Arc<KernelProjectProgramInput>,
+    program: Arc<PackedKernelProjectProgram>,
     owners: Box<[KernelProjectOwnerOutputs]>,
     definition_facts: Arc<[KernelDefinitionFactsInput]>,
+    runtime_facts: Arc<crate::PackedDefinitionFactsStore>,
     abi: Arc<crate::KernelAbiInput>,
     compile_work: KernelCompileWork,
 }
@@ -1161,10 +1165,13 @@ pub(crate) struct KernelProjectSolveSession {
 #[derive(Debug)]
 pub struct KernelSolvedProject {
     definition_code: Arc<DefinitionCodeStore>,
-    program: Arc<KernelProjectProgramInput>,
+    program: Arc<PackedKernelProjectProgram>,
     #[cfg(test)]
     owners: Box<[KernelProjectOwnerOutputs]>,
+    #[cfg(test)]
     definition_facts: Arc<[KernelDefinitionFactsInput]>,
+    dependencies: crate::KernelDefinitionDependencyGraph,
+    currentness: Box<[crate::KernelPackedDefinitionCurrentnessReceipt]>,
     derived: Arc<KernelSolvedDerived>,
     work: KernelSolveWork,
 }
@@ -1255,27 +1262,27 @@ struct KernelProjectOwnerOutputs {
 #[derive(Clone, Copy)]
 struct KernelDefinitionInputRef<'a> {
     owner: KernelOwnerId,
-    input: &'a KernelOwnerProgramInput,
+    input: PackedKernelOwnerProgramRef<'a>,
     facts: &'a KernelDefinitionFactsInput,
     outputs: &'a KernelProjectOwnerOutputs,
 }
 
 struct KernelProjectDefinitionRefs<'a> {
-    program: &'a KernelProjectProgramInput,
+    program: &'a PackedKernelProjectProgram,
     facts: &'a [KernelDefinitionFactsInput],
     outputs: &'a [KernelProjectOwnerOutputs],
 }
 
 impl<'a> KernelProjectDefinitionRefs<'a> {
     fn new(
-        program: &'a KernelProjectProgramInput,
+        program: &'a PackedKernelProjectProgram,
         facts: &'a [KernelDefinitionFactsInput],
         outputs: &'a [KernelProjectOwnerOutputs],
     ) -> Result<Self, KernelSolveError> {
-        if program.owners.len() != facts.len() || facts.len() != outputs.len() {
+        if program.definition_count() != facts.len() || facts.len() != outputs.len() {
             return Err(KernelSolveError::new(format!(
                 "kernel definition authorities have {} program, {} fact, and {} solve rows",
-                program.owners.len(),
+                program.definition_count(),
                 facts.len(),
                 outputs.len(),
             )));
@@ -1289,8 +1296,7 @@ impl<'a> KernelProjectDefinitionRefs<'a> {
 
     fn definitions(&self) -> impl ExactSizeIterator<Item = KernelDefinitionInputRef<'a>> + '_ {
         self.program
-            .owners
-            .iter()
+            .owners()
             .zip(self.facts)
             .zip(self.outputs)
             .enumerate()
@@ -1313,12 +1319,12 @@ impl<'a> KernelDefinitionInputRef<'a> {
         encoded: KernelExpressionId,
         consumer: usize,
     ) -> Result<KernelValueReference, KernelOwnerBuildError> {
-        kernel_value_reference(self.input, encoded, consumer)
+        packed_kernel_value_reference(self.input, encoded, consumer)
     }
 
     fn call(self, ordinal: usize) -> Option<KernelProjectCallRef<'a>> {
         let solve = self.outputs.calls.get(ordinal)?;
-        let node = self.input.nodes.get(solve.expression.0 as usize)?;
+        let node = self.input.node(solve.expression)?;
         Some(KernelProjectCallRef {
             definition: self,
             solve,
@@ -1342,8 +1348,8 @@ impl<'a> KernelDefinitionInputRef<'a> {
 #[derive(Clone, Copy)]
 pub struct KernelDefinitionRef<'a> {
     owner: KernelOwnerId,
-    input: &'a KernelOwnerProgramInput,
-    facts: &'a KernelDefinitionFactsInput,
+    input: PackedKernelOwnerProgramRef<'a>,
+    facts: Option<&'a KernelDefinitionFactsInput>,
     code: crate::DefinitionCodeRef<'a>,
 }
 
@@ -1356,12 +1362,12 @@ pub struct KernelDefinitionIter<'a> {
 pub struct KernelDefinitionCallRef<'a> {
     definition: KernelDefinitionRef<'a>,
     expression: KernelExpressionId,
-    node: &'a KernelOwnerNode,
+    node: &'a PackedKernelOwnerNode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelStatePathRef<'a> {
-    Authored(&'a [Box<str>]),
+    Authored(crate::PackedKernelPathRef<'a>),
     Synthetic(u32),
 }
 
@@ -1377,7 +1383,7 @@ pub enum KernelLexicalBindingTargetRef {
 pub struct KernelPublishedStateRef<'a> {
     definition: KernelDefinitionRef<'a>,
     id: KernelStateId,
-    input: &'a KernelStateInput,
+    input: &'a crate::PackedState,
     synthetic_ordinal: Option<u32>,
 }
 
@@ -1420,10 +1426,10 @@ impl<'a> Iterator for KernelPublishedStateIter<'a> {
             id,
             input: self
                 .definition
-                .facts
-                .states
+                .runtime_facts()
+                .states()
                 .get(row.input_ordinal as usize)
-                .expect("sealed published-state coordinate is inside definition facts"),
+                .expect("sealed published-state coordinate is inside packed definition facts"),
             synthetic_ordinal: row.synthetic_ordinal(),
         })
     }
@@ -1437,38 +1443,54 @@ impl ExactSizeIterator for KernelPublishedStateIter<'_> {}
 
 impl<'a> KernelDefinitionRef<'a> {
     pub(crate) fn from_authorities(
-        program: &'a KernelProjectProgramInput,
-        facts: &'a [KernelDefinitionFactsInput],
+        program: &'a PackedKernelProjectProgram,
         code: &'a DefinitionCodeStore,
         owner: KernelOwnerId,
     ) -> Option<Self> {
         let index = owner.0 as usize;
         Some(Self {
             owner,
-            input: program.owners.get(index)?,
-            facts: facts.get(index)?,
+            input: program.owner_at(index)?,
+            facts: None,
             code: code.definition(owner)?,
         })
+    }
+
+    pub(crate) fn from_rich_authorities(
+        program: &'a PackedKernelProjectProgram,
+        facts: &'a [KernelDefinitionFactsInput],
+        code: &'a DefinitionCodeStore,
+        owner: KernelOwnerId,
+    ) -> Option<Self> {
+        let mut definition = Self::from_authorities(program, code, owner)?;
+        definition.facts = Some(facts.get(owner.0 as usize)?);
+        Some(definition)
     }
 
     pub const fn owner(self) -> KernelOwnerId {
         self.owner
     }
 
-    pub const fn input(self) -> &'a KernelOwnerProgramInput {
+    pub const fn input(self) -> PackedKernelOwnerProgramRef<'a> {
         self.input
     }
 
     pub const fn facts(self) -> &'a KernelDefinitionFactsInput {
-        self.facts
+        self.facts.expect(
+            "rich definition facts are available only during compatibility receipt construction",
+        )
+    }
+
+    pub(crate) fn runtime_facts(self) -> crate::PackedDefinitionFactsRef<'a> {
+        self.code.runtime_facts()
     }
 
     pub const fn code(self) -> crate::DefinitionCodeRef<'a> {
         self.code
     }
 
-    pub const fn linkage(self) -> KernelDefinitionLinkage {
-        self.facts.linkage
+    pub fn linkage(self) -> KernelDefinitionLinkage {
+        self.code.runtime_facts().linkage()
     }
 
     pub fn resolve_value(
@@ -1476,7 +1498,7 @@ impl<'a> KernelDefinitionRef<'a> {
         encoded: KernelExpressionId,
         consumer: usize,
     ) -> Result<KernelValueReference, KernelOwnerBuildError> {
-        kernel_value_reference(self.input, encoded, consumer)
+        packed_kernel_value_reference(self.input, encoded, consumer)
     }
 
     pub fn resolve_structural_declaration(
@@ -1485,7 +1507,7 @@ impl<'a> KernelDefinitionRef<'a> {
         value: KernelExpressionId,
         consumer: usize,
     ) -> Result<KernelDeclarationReference, KernelOwnerBuildError> {
-        link_structural_declaration(self.input, declaration, value, consumer)
+        link_packed_structural_declaration(self.input, declaration, value, consumer)
     }
 
     pub fn resolve_lexical_target(
@@ -1511,10 +1533,12 @@ impl<'a> KernelDefinitionRef<'a> {
     }
 
     pub fn expression_effect(self, expression: KernelExpressionId) -> Option<KernelEffectSummary> {
-        let node = self.input.nodes.get(expression.0 as usize)?;
+        let node = self.input.node(expression)?;
         match &node.kind {
-            KernelOwnerNodeKind::UserCall { target, .. } => self.code.effect_summary_for(*target),
-            _ => Some(local_expression_effect(&node.kind)),
+            PackedKernelOwnerNodeKind::UserCall { target, .. } => {
+                self.code.effect_summary_for(*target)
+            }
+            _ => Some(local_packed_expression_effect(&node.kind)),
         }
     }
 
@@ -1523,9 +1547,8 @@ impl<'a> KernelDefinitionRef<'a> {
         expression: KernelExpressionId,
     ) -> Option<KernelExpressionKindRef<'a>> {
         self.input
-            .nodes
-            .get(expression.0 as usize)
-            .map(|node| (&node.kind).into())
+            .node(expression)
+            .and_then(|node| KernelExpressionKindRef::from_packed(self.input, &node.kind))
     }
 
     pub fn call_count(self) -> usize {
@@ -1537,7 +1560,7 @@ impl<'a> KernelDefinitionRef<'a> {
         Some(KernelDefinitionCallRef {
             definition: self,
             expression,
-            node: self.input.nodes.get(expression.0 as usize)?,
+            node: self.input.node(expression)?,
         })
     }
 
@@ -1556,7 +1579,7 @@ impl<'a> KernelDefinitionRef<'a> {
     pub fn materialize_host_effects(
         self,
     ) -> Result<Box<[KernelHostEffectArtifact]>, KernelOwnerBuildError> {
-        collect_host_effect_artifacts(self.input)
+        collect_packed_host_effect_artifacts(self.input)
     }
 }
 
@@ -1565,22 +1588,22 @@ impl<'a> KernelDefinitionCallRef<'a> {
         self.expression
     }
 
-    pub const fn node(self) -> &'a KernelOwnerNode {
+    pub const fn node(self) -> &'a PackedKernelOwnerNode {
         self.node
     }
 
     pub fn target(self) -> KernelCallTargetRef<'a> {
-        kernel_call_target_ref(&self.node.kind)
+        kernel_call_target_ref(self.definition.input, &self.node.kind)
             .expect("sealed packed call coordinate points to a call node")
     }
 
-    pub fn inputs(self) -> &'a [KernelOwnerInputEdge] {
-        &self.node.inputs
+    pub fn inputs(self) -> &'a [crate::PackedKernelOwnerInputEdge] {
+        self.node.inputs(self.definition.input)
     }
 
     pub fn input_value(
         self,
-        edge: &KernelOwnerInputEdge,
+        edge: &crate::PackedKernelOwnerInputEdge,
     ) -> Result<KernelValueReference, KernelOwnerBuildError> {
         self.definition
             .resolve_value(edge.expression, self.expression.0 as usize)
@@ -1588,9 +1611,14 @@ impl<'a> KernelDefinitionCallRef<'a> {
 
     pub fn input_role(
         self,
-        edge: &'a KernelOwnerInputEdge,
+        edge: &'a crate::PackedKernelOwnerInputEdge,
     ) -> Result<KernelCallInputRoleRef<'a>, KernelOwnerBuildError> {
-        kernel_call_input_role_ref(&self.node.kind, &edge.role, self.expression)
+        kernel_call_input_role_ref(
+            self.definition.input,
+            &self.node.kind,
+            &edge.role,
+            self.expression,
+        )
     }
 }
 
@@ -1599,14 +1627,35 @@ impl<'a> KernelPublishedStateRef<'a> {
         self.id
     }
 
-    pub const fn input(self) -> &'a KernelStateInput {
-        self.input
+    pub const fn binding_declaration(self) -> KernelDeclarationReference {
+        self.input.binding_declaration
     }
 
-    pub const fn path(self) -> KernelStatePathRef<'a> {
+    pub const fn declaration(self) -> KernelDeclarationReference {
+        self.input.declaration
+    }
+
+    pub const fn statement(self) -> KernelStatementReference {
+        self.input.statement
+    }
+
+    pub const fn expression(self) -> KernelExpressionId {
+        self.input.expression
+    }
+
+    pub const fn kind(self) -> CheckedStateKind {
+        self.input.kind
+    }
+
+    pub fn path(self) -> KernelStatePathRef<'a> {
         match self.synthetic_ordinal {
             Some(ordinal) => KernelStatePathRef::Synthetic(ordinal),
-            None => KernelStatePathRef::Authored(&self.input.projection),
+            None => KernelStatePathRef::Authored(
+                self.definition
+                    .input()
+                    .path(self.input.projection)
+                    .expect("sealed state path belongs to its text authority"),
+            ),
         }
     }
 
@@ -1648,7 +1697,7 @@ pub enum KernelCallTargetRef<'a> {
         inherited_formal: Option<KernelInheritedFormal>,
     },
     RenderConstructor {
-        kind: &'a KernelRenderConstructorKind,
+        kind: KernelRenderConstructorKindRef<'a>,
     },
     PureBuiltin {
         kind: KernelPureBuiltinKind,
@@ -1662,6 +1711,12 @@ pub enum KernelCallTargetRef<'a> {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelRenderConstructorKindRef<'a> {
+    Fixed(&'a str),
+    StripeDirection,
+}
+
 impl KernelCallTargetRef<'_> {
     #[cfg(test)]
     fn to_owned(self) -> KernelCallTarget {
@@ -1673,9 +1728,16 @@ impl KernelCallTargetRef<'_> {
                 target,
                 inherited_formal,
             },
-            Self::RenderConstructor { kind } => {
-                KernelCallTarget::RenderConstructor { kind: kind.clone() }
-            }
+            Self::RenderConstructor { kind } => KernelCallTarget::RenderConstructor {
+                kind: match kind {
+                    KernelRenderConstructorKindRef::Fixed(name) => {
+                        KernelRenderConstructorKind::Fixed(name.into())
+                    }
+                    KernelRenderConstructorKindRef::StripeDirection => {
+                        KernelRenderConstructorKind::StripeDirection
+                    }
+                },
+            },
             Self::PureBuiltin { kind } => KernelCallTarget::PureBuiltin { kind },
             Self::FixedAbi => KernelCallTarget::FixedAbi,
             Self::HostEffect { operation } => KernelCallTarget::HostEffect {
@@ -1692,29 +1754,42 @@ impl KernelCallTargetRef<'_> {
     }
 }
 
-fn kernel_call_target_ref(kind: &KernelOwnerNodeKind) -> Option<KernelCallTargetRef<'_>> {
+fn kernel_call_target_ref<'a>(
+    owner: PackedKernelOwnerProgramRef<'a>,
+    kind: &PackedKernelOwnerNodeKind,
+) -> Option<KernelCallTargetRef<'a>> {
     match kind {
-        KernelOwnerNodeKind::UserCall {
+        PackedKernelOwnerNodeKind::UserCall {
             target,
             inherited_formal,
         } => Some(KernelCallTargetRef::User {
             target: *target,
             inherited_formal: *inherited_formal,
         }),
-        KernelOwnerNodeKind::RenderConstructor { kind } => {
-            Some(KernelCallTargetRef::RenderConstructor { kind })
+        PackedKernelOwnerNodeKind::RenderConstructor { kind } => {
+            Some(KernelCallTargetRef::RenderConstructor {
+                kind: match kind {
+                    crate::PackedKernelRenderConstructorKind::Fixed(name) => {
+                        KernelRenderConstructorKindRef::Fixed(owner.symbol(*name)?)
+                    }
+                    crate::PackedKernelRenderConstructorKind::StripeDirection => {
+                        KernelRenderConstructorKindRef::StripeDirection
+                    }
+                },
+            })
         }
-        KernelOwnerNodeKind::PureBuiltin { kind } => {
+        PackedKernelOwnerNodeKind::PureBuiltin { kind } => {
             Some(KernelCallTargetRef::PureBuiltin { kind: *kind })
         }
-        KernelOwnerNodeKind::FixedAbiCall { .. }
-        | KernelOwnerNodeKind::FixedAbiCallPacked { .. } => Some(KernelCallTargetRef::FixedAbi),
-        KernelOwnerNodeKind::HostEffect { operation } => Some(KernelCallTargetRef::HostEffect {
-            operation: operation.as_ref(),
-        }),
-        KernelOwnerNodeKind::FieldProjection { field } => {
+        PackedKernelOwnerNodeKind::FixedAbiCall { .. } => Some(KernelCallTargetRef::FixedAbi),
+        PackedKernelOwnerNodeKind::HostEffect { operation } => {
+            Some(KernelCallTargetRef::HostEffect {
+                operation: owner.symbol(*operation)?,
+            })
+        }
+        PackedKernelOwnerNodeKind::FieldProjection { field } => {
             Some(KernelCallTargetRef::FieldProjection {
-                field: field.as_ref(),
+                field: owner.symbol(*field)?,
             })
         }
         _ => None,
@@ -1725,7 +1800,7 @@ fn kernel_call_target_ref(kind: &KernelOwnerNodeKind) -> Option<KernelCallTarget
 struct KernelProjectCallRef<'a> {
     definition: KernelDefinitionInputRef<'a>,
     solve: &'a KernelProjectCallSolve,
-    node: &'a KernelOwnerNode,
+    node: &'a PackedKernelOwnerNode,
 }
 
 impl<'a> KernelProjectCallRef<'a> {
@@ -1734,17 +1809,17 @@ impl<'a> KernelProjectCallRef<'a> {
     }
 
     fn target(self) -> KernelCallTargetRef<'a> {
-        kernel_call_target_ref(&self.node.kind)
+        kernel_call_target_ref(self.definition.input, &self.node.kind)
             .expect("validated project call sidecar points to a non-call node")
     }
 
-    fn inputs(self) -> &'a [KernelOwnerInputEdge] {
-        &self.node.inputs
+    fn inputs(self) -> &'a [crate::PackedKernelOwnerInputEdge] {
+        self.node.inputs(self.definition.input)
     }
 
     fn input_value(
         self,
-        edge: &KernelOwnerInputEdge,
+        edge: &crate::PackedKernelOwnerInputEdge,
     ) -> Result<KernelValueReference, KernelOwnerBuildError> {
         self.definition
             .resolve_value(edge.expression, self.expression().0 as usize)
@@ -1752,33 +1827,43 @@ impl<'a> KernelProjectCallRef<'a> {
 
     fn input_role(
         self,
-        edge: &'a KernelOwnerInputEdge,
+        edge: &'a crate::PackedKernelOwnerInputEdge,
     ) -> Result<KernelCallInputRoleRef<'a>, KernelOwnerBuildError> {
-        kernel_call_input_role_ref(&self.node.kind, &edge.role, self.expression())
+        kernel_call_input_role_ref(
+            self.definition.input,
+            &self.node.kind,
+            &edge.role,
+            self.expression(),
+        )
     }
 }
 
 fn kernel_call_input_role_ref<'a>(
-    kind: &KernelOwnerNodeKind,
-    role: &'a KernelOwnerEdgeRole,
+    owner: PackedKernelOwnerProgramRef<'a>,
+    kind: &PackedKernelOwnerNodeKind,
+    role: &'a PackedKernelOwnerEdgeRole,
     expression: KernelExpressionId,
 ) -> Result<KernelCallInputRoleRef<'a>, KernelOwnerBuildError> {
     match (kind, role) {
         (
-            KernelOwnerNodeKind::UserCall { .. },
-            KernelOwnerEdgeRole::CallArgument { ordinal }
-            | KernelOwnerEdgeRole::CallOutArgument { ordinal },
+            PackedKernelOwnerNodeKind::UserCall { .. },
+            PackedKernelOwnerEdgeRole::CallArgument { ordinal }
+            | PackedKernelOwnerEdgeRole::CallOutArgument { ordinal },
         ) => Ok(KernelCallInputRoleRef::Formal { ordinal: *ordinal }),
         (
-            KernelOwnerNodeKind::RenderConstructor { .. }
-            | KernelOwnerNodeKind::PureBuiltin { .. }
-            | KernelOwnerNodeKind::FixedAbiCall { .. }
-            | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
-            | KernelOwnerNodeKind::HostEffect { .. }
-            | KernelOwnerNodeKind::FieldProjection { .. },
-            KernelOwnerEdgeRole::AbiArgument { name },
+            PackedKernelOwnerNodeKind::RenderConstructor { .. }
+            | PackedKernelOwnerNodeKind::PureBuiltin { .. }
+            | PackedKernelOwnerNodeKind::FixedAbiCall { .. }
+            | PackedKernelOwnerNodeKind::HostEffect { .. }
+            | PackedKernelOwnerNodeKind::FieldProjection { .. },
+            PackedKernelOwnerEdgeRole::AbiArgument { name },
         ) => Ok(KernelCallInputRoleRef::Abi {
-            name: name.as_ref(),
+            name: owner.symbol(*name).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel call node {} ABI input name is outside its text authority",
+                    expression.0,
+                ))
+            })?,
         }),
         (_, role) => Err(KernelOwnerBuildError::new(format!(
             "kernel call node {} has non-call input role {role:?}",
@@ -2962,25 +3047,25 @@ pub enum KernelExpressionKindRef<'a> {
     MapEntry,
     FormalRead {
         formal: u32,
-        fields: &'a [Box<str>],
+        fields: PackedKernelPathRef<'a>,
     },
     ContextRead {
         formal: u32,
-        fields: &'a [Box<str>],
+        fields: PackedKernelPathRef<'a>,
     },
     LexicalRead {
-        fields: &'a [Box<str>],
+        fields: PackedKernelPathRef<'a>,
     },
     ValueRead {
-        fields: &'a [Box<str>],
+        fields: PackedKernelPathRef<'a>,
         mode_narrowing: Option<KernelExpressionId>,
     },
     DerivedRead {
-        fields: &'a [Box<str>],
+        fields: PackedKernelPathRef<'a>,
     },
     PatternRead {
-        pattern: &'a KernelPattern,
-        fields: &'a [Box<str>],
+        pattern: KernelPatternRef<'a>,
+        fields: PackedKernelPathRef<'a>,
     },
     CollectionItemRead,
     FreshOut,
@@ -2989,7 +3074,7 @@ pub enum KernelExpressionKindRef<'a> {
         inherited_formal: Option<KernelInheritedFormal>,
     },
     RenderConstructor {
-        kind: &'a KernelRenderConstructorKind,
+        kind: KernelRenderConstructorKindRef<'a>,
     },
     PureBuiltin {
         kind: KernelPureBuiltinKind,
@@ -3007,7 +3092,7 @@ pub enum KernelExpressionKindRef<'a> {
     Draining,
     Hold,
     MatchArm {
-        pattern: &'a KernelPattern,
+        pattern: KernelPatternRef<'a>,
     },
     Arrow,
     Delimiter,
@@ -3018,73 +3103,347 @@ pub enum KernelExpressionKindRef<'a> {
     },
 }
 
-impl<'a> From<&'a KernelOwnerNodeKind> for KernelExpressionKindRef<'a> {
-    fn from(kind: &'a KernelOwnerNodeKind) -> Self {
-        match kind {
-            KernelOwnerNodeKind::Known(_) | KernelOwnerNodeKind::KnownPacked(_) => Self::Known,
-            KernelOwnerNodeKind::Source(_) | KernelOwnerNodeKind::SourcePacked(_) => Self::Source,
-            KernelOwnerNodeKind::Absent => Self::Absent,
-            KernelOwnerNodeKind::Text => Self::Text,
-            KernelOwnerNodeKind::TextTemplate => Self::TextTemplate,
-            KernelOwnerNodeKind::Number => Self::Number,
-            KernelOwnerNodeKind::Byte => Self::Byte,
-            KernelOwnerNodeKind::Bits(width) => Self::Bits(*width),
-            KernelOwnerNodeKind::Tag(tag) => Self::Tag(tag),
-            KernelOwnerNodeKind::Record { tag } => Self::Record {
-                tag: tag.as_deref(),
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelPatternRef<'a> {
+    Wildcard,
+    Number,
+    Text,
+    Bits {
+        width: u32,
+    },
+    Tag {
+        name: &'a str,
+        fields: PackedKernelPathRef<'a>,
+    },
+    Binding {
+        name: &'a str,
+    },
+    Invalid,
+}
+
+/// Stable-hash-compatible borrowed view over one packed owner edge role.
+///
+/// Variant order mirrors `KernelOwnerEdgeRole`; text is resolved through the
+/// owning project authority so receipts never depend on process-local IDs.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum KernelOwnerEdgeRoleRef<'a> {
+    RecordField { name: &'a str, spread: bool },
+    TextDynamic,
+    BlockResult,
+    CollectionItem,
+    MapEntry,
+    MapKey,
+    MapValue,
+    ReadProvider,
+    CallArgument { ordinal: u32 },
+    CallOutArgument { ordinal: u32 },
+    AbiArgument { name: &'a str },
+    LatestBranch,
+    WhenInput,
+    WhenArm,
+    ThenInput,
+    ThenOutput,
+    InfixLeft,
+    InfixRight,
+    DrainingInput,
+    HoldInitial,
+    HoldUpdate,
+    MatchOutput,
+    ArrowOutput,
+    FlushPayload,
+}
+
+pub(crate) fn kernel_owner_edge_role_ref<'a>(
+    owner: PackedKernelOwnerProgramRef<'a>,
+    role: PackedKernelOwnerEdgeRole,
+) -> Option<KernelOwnerEdgeRoleRef<'a>> {
+    Some(match role {
+        PackedKernelOwnerEdgeRole::RecordField { name, spread } => {
+            KernelOwnerEdgeRoleRef::RecordField {
+                name: owner.symbol(name)?,
+                spread,
+            }
+        }
+        PackedKernelOwnerEdgeRole::TextDynamic => KernelOwnerEdgeRoleRef::TextDynamic,
+        PackedKernelOwnerEdgeRole::BlockResult => KernelOwnerEdgeRoleRef::BlockResult,
+        PackedKernelOwnerEdgeRole::CollectionItem => KernelOwnerEdgeRoleRef::CollectionItem,
+        PackedKernelOwnerEdgeRole::MapEntry => KernelOwnerEdgeRoleRef::MapEntry,
+        PackedKernelOwnerEdgeRole::MapKey => KernelOwnerEdgeRoleRef::MapKey,
+        PackedKernelOwnerEdgeRole::MapValue => KernelOwnerEdgeRoleRef::MapValue,
+        PackedKernelOwnerEdgeRole::ReadProvider => KernelOwnerEdgeRoleRef::ReadProvider,
+        PackedKernelOwnerEdgeRole::CallArgument { ordinal } => {
+            KernelOwnerEdgeRoleRef::CallArgument { ordinal }
+        }
+        PackedKernelOwnerEdgeRole::CallOutArgument { ordinal } => {
+            KernelOwnerEdgeRoleRef::CallOutArgument { ordinal }
+        }
+        PackedKernelOwnerEdgeRole::AbiArgument { name } => KernelOwnerEdgeRoleRef::AbiArgument {
+            name: owner.symbol(name)?,
+        },
+        PackedKernelOwnerEdgeRole::LatestBranch => KernelOwnerEdgeRoleRef::LatestBranch,
+        PackedKernelOwnerEdgeRole::WhenInput => KernelOwnerEdgeRoleRef::WhenInput,
+        PackedKernelOwnerEdgeRole::WhenArm => KernelOwnerEdgeRoleRef::WhenArm,
+        PackedKernelOwnerEdgeRole::ThenInput => KernelOwnerEdgeRoleRef::ThenInput,
+        PackedKernelOwnerEdgeRole::ThenOutput => KernelOwnerEdgeRoleRef::ThenOutput,
+        PackedKernelOwnerEdgeRole::InfixLeft => KernelOwnerEdgeRoleRef::InfixLeft,
+        PackedKernelOwnerEdgeRole::InfixRight => KernelOwnerEdgeRoleRef::InfixRight,
+        PackedKernelOwnerEdgeRole::DrainingInput => KernelOwnerEdgeRoleRef::DrainingInput,
+        PackedKernelOwnerEdgeRole::HoldInitial => KernelOwnerEdgeRoleRef::HoldInitial,
+        PackedKernelOwnerEdgeRole::HoldUpdate => KernelOwnerEdgeRoleRef::HoldUpdate,
+        PackedKernelOwnerEdgeRole::MatchOutput => KernelOwnerEdgeRoleRef::MatchOutput,
+        PackedKernelOwnerEdgeRole::ArrowOutput => KernelOwnerEdgeRoleRef::ArrowOutput,
+        PackedKernelOwnerEdgeRole::FlushPayload => KernelOwnerEdgeRoleRef::FlushPayload,
+    })
+}
+
+impl<'a> KernelExpressionKindRef<'a> {
+    fn from_packed(
+        owner: PackedKernelOwnerProgramRef<'a>,
+        kind: &PackedKernelOwnerNodeKind,
+    ) -> Option<Self> {
+        Some(match kind {
+            PackedKernelOwnerNodeKind::Known(_) => Self::Known,
+            PackedKernelOwnerNodeKind::Source(_) => Self::Source,
+            PackedKernelOwnerNodeKind::Absent => Self::Absent,
+            PackedKernelOwnerNodeKind::Text => Self::Text,
+            PackedKernelOwnerNodeKind::TextTemplate => Self::TextTemplate,
+            PackedKernelOwnerNodeKind::Number => Self::Number,
+            PackedKernelOwnerNodeKind::Byte => Self::Byte,
+            PackedKernelOwnerNodeKind::Bits(width) => Self::Bits(*width),
+            PackedKernelOwnerNodeKind::Tag(tag) => Self::Tag(owner.symbol(*tag)?),
+            PackedKernelOwnerNodeKind::Record { tag } => Self::Record {
+                tag: match tag {
+                    Some(tag) => Some(owner.symbol(*tag)?),
+                    None => None,
+                },
             },
-            KernelOwnerNodeKind::Block => Self::Block,
-            KernelOwnerNodeKind::Collection { kind, capacity } => Self::Collection {
+            PackedKernelOwnerNodeKind::Block => Self::Block,
+            PackedKernelOwnerNodeKind::Collection { kind, capacity } => Self::Collection {
                 kind: *kind,
-                capacity: *capacity,
+                capacity: capacity.map(|capacity| capacity as usize),
             },
-            KernelOwnerNodeKind::MapEntry => Self::MapEntry,
-            KernelOwnerNodeKind::FormalRead { formal, fields } => Self::FormalRead {
+            PackedKernelOwnerNodeKind::MapEntry => Self::MapEntry,
+            PackedKernelOwnerNodeKind::FormalRead { formal, fields } => Self::FormalRead {
                 formal: *formal,
-                fields,
+                fields: owner.path(*fields)?,
             },
-            KernelOwnerNodeKind::ContextRead { formal, fields } => Self::ContextRead {
+            PackedKernelOwnerNodeKind::ContextRead { formal, fields } => Self::ContextRead {
                 formal: *formal,
-                fields,
+                fields: owner.path(*fields)?,
             },
-            KernelOwnerNodeKind::LexicalRead { fields } => Self::LexicalRead { fields },
-            KernelOwnerNodeKind::ValueRead {
+            PackedKernelOwnerNodeKind::LexicalRead { fields } => Self::LexicalRead {
+                fields: owner.path(*fields)?,
+            },
+            PackedKernelOwnerNodeKind::ValueRead {
                 fields,
                 mode_narrowing,
             } => Self::ValueRead {
-                fields,
+                fields: owner.path(*fields)?,
                 mode_narrowing: *mode_narrowing,
             },
-            KernelOwnerNodeKind::DerivedRead { fields } => Self::DerivedRead { fields },
-            KernelOwnerNodeKind::PatternRead { pattern, fields } => {
-                Self::PatternRead { pattern, fields }
-            }
-            KernelOwnerNodeKind::CollectionItemRead => Self::CollectionItemRead,
-            KernelOwnerNodeKind::FreshOut => Self::FreshOut,
-            KernelOwnerNodeKind::UserCall {
+            PackedKernelOwnerNodeKind::DerivedRead { fields } => Self::DerivedRead {
+                fields: owner.path(*fields)?,
+            },
+            PackedKernelOwnerNodeKind::PatternRead { pattern, fields } => Self::PatternRead {
+                pattern: KernelPatternRef::from_packed(owner, *pattern)?,
+                fields: owner.path(*fields)?,
+            },
+            PackedKernelOwnerNodeKind::CollectionItemRead => Self::CollectionItemRead,
+            PackedKernelOwnerNodeKind::FreshOut => Self::FreshOut,
+            PackedKernelOwnerNodeKind::UserCall {
                 target,
                 inherited_formal,
             } => Self::UserCall {
                 target: *target,
                 inherited_formal: *inherited_formal,
             },
-            KernelOwnerNodeKind::RenderConstructor { kind } => Self::RenderConstructor { kind },
-            KernelOwnerNodeKind::PureBuiltin { kind } => Self::PureBuiltin { kind: *kind },
-            KernelOwnerNodeKind::FixedAbiCall { .. }
-            | KernelOwnerNodeKind::FixedAbiCallPacked { .. } => Self::FixedAbiCall,
-            KernelOwnerNodeKind::HostEffect { operation } => Self::HostEffect { operation },
-            KernelOwnerNodeKind::Latest => Self::Latest,
-            KernelOwnerNodeKind::When => Self::When,
-            KernelOwnerNodeKind::Then => Self::Then,
-            KernelOwnerNodeKind::Infix { operation } => Self::Infix { operation },
-            KernelOwnerNodeKind::Draining => Self::Draining,
-            KernelOwnerNodeKind::Hold => Self::Hold,
-            KernelOwnerNodeKind::MatchArm { pattern } => Self::MatchArm { pattern },
-            KernelOwnerNodeKind::Arrow => Self::Arrow,
-            KernelOwnerNodeKind::Delimiter => Self::Delimiter,
-            KernelOwnerNodeKind::Unknown => Self::Unknown,
-            KernelOwnerNodeKind::Flush => Self::Flush,
-            KernelOwnerNodeKind::FieldProjection { field } => Self::FieldProjection { field },
+            PackedKernelOwnerNodeKind::RenderConstructor { kind } => Self::RenderConstructor {
+                kind: match kind {
+                    crate::PackedKernelRenderConstructorKind::Fixed(name) => {
+                        KernelRenderConstructorKindRef::Fixed(owner.symbol(*name)?)
+                    }
+                    crate::PackedKernelRenderConstructorKind::StripeDirection => {
+                        KernelRenderConstructorKindRef::StripeDirection
+                    }
+                },
+            },
+            PackedKernelOwnerNodeKind::PureBuiltin { kind } => Self::PureBuiltin { kind: *kind },
+            PackedKernelOwnerNodeKind::FixedAbiCall { .. } => Self::FixedAbiCall,
+            PackedKernelOwnerNodeKind::HostEffect { operation } => Self::HostEffect {
+                operation: owner.symbol(*operation)?,
+            },
+            PackedKernelOwnerNodeKind::Latest => Self::Latest,
+            PackedKernelOwnerNodeKind::When => Self::When,
+            PackedKernelOwnerNodeKind::Then => Self::Then,
+            PackedKernelOwnerNodeKind::Infix { operation } => Self::Infix {
+                operation: owner.symbol(*operation)?,
+            },
+            PackedKernelOwnerNodeKind::Draining => Self::Draining,
+            PackedKernelOwnerNodeKind::Hold => Self::Hold,
+            PackedKernelOwnerNodeKind::MatchArm { pattern } => Self::MatchArm {
+                pattern: KernelPatternRef::from_packed(owner, *pattern)?,
+            },
+            PackedKernelOwnerNodeKind::Arrow => Self::Arrow,
+            PackedKernelOwnerNodeKind::Delimiter => Self::Delimiter,
+            PackedKernelOwnerNodeKind::Unknown => Self::Unknown,
+            PackedKernelOwnerNodeKind::Flush => Self::Flush,
+            PackedKernelOwnerNodeKind::FieldProjection { field } => Self::FieldProjection {
+                field: owner.symbol(*field)?,
+            },
+        })
+    }
+}
+
+impl<'a> KernelPatternRef<'a> {
+    fn from_packed(
+        owner: PackedKernelOwnerProgramRef<'a>,
+        pattern: crate::PackedKernelPattern,
+    ) -> Option<Self> {
+        Some(match pattern {
+            crate::PackedKernelPattern::Wildcard => Self::Wildcard,
+            crate::PackedKernelPattern::Number => Self::Number,
+            crate::PackedKernelPattern::Text => Self::Text,
+            crate::PackedKernelPattern::Bits { width } => Self::Bits { width },
+            crate::PackedKernelPattern::Tag { name, fields } => Self::Tag {
+                name: owner.symbol(name)?,
+                fields: owner.path(fields)?,
+            },
+            crate::PackedKernelPattern::Binding { name } => Self::Binding {
+                name: owner.symbol(name)?,
+            },
+            crate::PackedKernelPattern::Invalid => Self::Invalid,
+        })
+    }
+}
+
+#[cfg(test)]
+impl KernelRenderConstructorKindRef<'_> {
+    fn to_owned(self) -> KernelRenderConstructorKind {
+        match self {
+            Self::Fixed(name) => KernelRenderConstructorKind::Fixed(name.into()),
+            Self::StripeDirection => KernelRenderConstructorKind::StripeDirection,
+        }
+    }
+}
+
+#[cfg(test)]
+impl KernelPatternRef<'_> {
+    fn to_owned(self) -> KernelPattern {
+        match self {
+            Self::Wildcard => KernelPattern::Wildcard,
+            Self::Number => KernelPattern::Number,
+            Self::Text => KernelPattern::Text,
+            Self::Bits { width } => KernelPattern::Bits { width },
+            Self::Tag { name, fields } => KernelPattern::Tag {
+                name: name.into(),
+                fields: (0..fields.len())
+                    .map(|ordinal| {
+                        fields
+                            .name_at(ordinal)
+                            .expect("packed pattern path resolves")
+                            .into()
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            },
+            Self::Binding { name } => KernelPattern::Binding { name: name.into() },
+            Self::Invalid => KernelPattern::Invalid,
+        }
+    }
+}
+
+#[cfg(test)]
+impl KernelExpressionKindRef<'_> {
+    fn to_owned(self) -> KernelExpressionArtifactKind {
+        let path = |fields: PackedKernelPathRef<'_>| {
+            (0..fields.len())
+                .map(|ordinal| {
+                    fields
+                        .name_at(ordinal)
+                        .expect("packed expression path resolves")
+                        .into()
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        };
+        match self {
+            Self::Known => KernelExpressionArtifactKind::Known,
+            Self::Source => KernelExpressionArtifactKind::Source,
+            Self::Absent => KernelExpressionArtifactKind::Absent,
+            Self::Text => KernelExpressionArtifactKind::Text,
+            Self::TextTemplate => KernelExpressionArtifactKind::TextTemplate,
+            Self::Number => KernelExpressionArtifactKind::Number,
+            Self::Byte => KernelExpressionArtifactKind::Byte,
+            Self::Bits(width) => KernelExpressionArtifactKind::Bits(width),
+            Self::Tag(tag) => KernelExpressionArtifactKind::Tag(tag.into()),
+            Self::Record { tag } => KernelExpressionArtifactKind::Record {
+                tag: tag.map(Into::into),
+            },
+            Self::Block => KernelExpressionArtifactKind::Block,
+            Self::Collection { kind, capacity } => {
+                KernelExpressionArtifactKind::Collection { kind, capacity }
+            }
+            Self::MapEntry => KernelExpressionArtifactKind::MapEntry,
+            Self::FormalRead { formal, fields } => KernelExpressionArtifactKind::FormalRead {
+                formal,
+                fields: path(fields),
+            },
+            Self::ContextRead { formal, fields } => KernelExpressionArtifactKind::ContextRead {
+                formal,
+                fields: path(fields),
+            },
+            Self::LexicalRead { fields } => KernelExpressionArtifactKind::LexicalRead {
+                fields: path(fields),
+            },
+            Self::ValueRead {
+                fields,
+                mode_narrowing,
+            } => KernelExpressionArtifactKind::ValueRead {
+                fields: path(fields),
+                mode_narrowing,
+            },
+            Self::DerivedRead { fields } => KernelExpressionArtifactKind::DerivedRead {
+                fields: path(fields),
+            },
+            Self::PatternRead { pattern, fields } => KernelExpressionArtifactKind::PatternRead {
+                pattern: pattern.to_owned(),
+                fields: path(fields),
+            },
+            Self::CollectionItemRead => KernelExpressionArtifactKind::CollectionItemRead,
+            Self::FreshOut => KernelExpressionArtifactKind::FreshOut,
+            Self::UserCall {
+                target,
+                inherited_formal,
+            } => KernelExpressionArtifactKind::UserCall {
+                target,
+                inherited_formal,
+            },
+            Self::RenderConstructor { kind } => KernelExpressionArtifactKind::RenderConstructor {
+                kind: kind.to_owned(),
+            },
+            Self::PureBuiltin { kind } => KernelExpressionArtifactKind::PureBuiltin { kind },
+            Self::FixedAbiCall => KernelExpressionArtifactKind::FixedAbiCall,
+            Self::HostEffect { operation } => KernelExpressionArtifactKind::HostEffect {
+                operation: operation.into(),
+            },
+            Self::Latest => KernelExpressionArtifactKind::Latest,
+            Self::When => KernelExpressionArtifactKind::When,
+            Self::Then => KernelExpressionArtifactKind::Then,
+            Self::Infix { operation } => KernelExpressionArtifactKind::Infix {
+                operation: operation.into(),
+            },
+            Self::Draining => KernelExpressionArtifactKind::Draining,
+            Self::Hold => KernelExpressionArtifactKind::Hold,
+            Self::MatchArm { pattern } => KernelExpressionArtifactKind::MatchArm {
+                pattern: pattern.to_owned(),
+            },
+            Self::Arrow => KernelExpressionArtifactKind::Arrow,
+            Self::Delimiter => KernelExpressionArtifactKind::Delimiter,
+            Self::Unknown => KernelExpressionArtifactKind::Unknown,
+            Self::Flush => KernelExpressionArtifactKind::Flush,
+            Self::FieldProjection { field } => KernelExpressionArtifactKind::FieldProjection {
+                field: field.into(),
+            },
         }
     }
 }
@@ -3417,10 +3776,10 @@ pub struct KernelCheckedSnapshot {
     /// Shared normalized owner program retained once for borrowed structural
     /// views. Published definition rows remain a compatibility product until
     /// their downstream consumers are moved onto this authority.
-    pub(crate) program: Arc<KernelProjectProgramInput>,
-    /// Shared immutable syntax/link facts for every dense definition. These
-    /// rows are owned once by `KernelProjectInput`; checked publication keeps
-    /// the same allocation instead of cloning rich paths and literal values.
+    pub(crate) program: Arc<PackedKernelProjectProgram>,
+    /// Test-only compatibility oracle. Production snapshots retain the packed
+    /// fact authority in `definition_code` and no recursive rich graph.
+    #[cfg(test)]
     pub(crate) definition_facts: Arc<[KernelDefinitionFactsInput]>,
     /// One packed, store-qualified authority for all solver-owned definition
     /// flow roots. The checked linker consumes this directly; rich artifacts
@@ -3441,12 +3800,7 @@ impl KernelCheckedSnapshot {
     }
 
     pub fn definition(&self, owner: KernelOwnerId) -> Option<KernelDefinitionRef<'_>> {
-        KernelDefinitionRef::from_authorities(
-            &self.program,
-            &self.definition_facts,
-            &self.definition_code,
-            owner,
-        )
+        KernelDefinitionRef::from_authorities(&self.program, &self.definition_code, owner)
     }
 
     pub fn definition_refs(&self) -> KernelDefinitionIter<'_> {
@@ -3944,8 +4298,7 @@ pub struct KernelDiagnosticValueArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelDemandedDefinitionSnapshot {
     owners: Box<[KernelOwnerId]>,
-    program: Arc<KernelProjectProgramInput>,
-    definition_facts: Arc<[KernelDefinitionFactsInput]>,
+    program: Arc<PackedKernelProjectProgram>,
     definition_code: Arc<DefinitionCodeStore>,
     interface: Arc<KernelInterfaceSnapshot>,
     work: KernelSolveWork,
@@ -3962,35 +4315,22 @@ impl KernelDemandedDefinitionSnapshot {
 
     pub fn definition(&self, owner: KernelOwnerId) -> Option<KernelDefinitionRef<'_>> {
         self.owners.binary_search(&owner).ok()?;
-        KernelDefinitionRef::from_authorities(
-            &self.program,
-            &self.definition_facts,
-            &self.definition_code,
-            owner,
-        )
+        KernelDefinitionRef::from_authorities(&self.program, &self.definition_code, owner)
     }
 
     pub fn definition_refs(
         &self,
     ) -> impl ExactSizeIterator<Item = (KernelOwnerId, KernelDefinitionRef<'_>)> + '_ {
         self.owners.iter().copied().map(|owner| {
-            let definition = KernelDefinitionRef::from_authorities(
-                &self.program,
-                &self.definition_facts,
-                &self.definition_code,
-                owner,
-            )
-            .expect("validated demanded owner remains in every shared authority");
+            let definition =
+                KernelDefinitionRef::from_authorities(&self.program, &self.definition_code, owner)
+                    .expect("validated demanded owner remains in every shared authority");
             (owner, definition)
         })
     }
 
-    pub fn program(&self) -> &Arc<KernelProjectProgramInput> {
+    pub fn program(&self) -> &Arc<PackedKernelProjectProgram> {
         &self.program
-    }
-
-    pub fn definition_facts(&self) -> &Arc<[KernelDefinitionFactsInput]> {
-        &self.definition_facts
     }
 
     pub fn definition_code(&self) -> &Arc<DefinitionCodeStore> {
@@ -4180,6 +4520,7 @@ impl KernelProjectProgram {
             program: self.program,
             owners: self.owners,
             definition_facts: self.definition_facts,
+            runtime_facts: self.runtime_facts,
             abi: self.abi,
             compile_work: self.compile_work,
         })
@@ -4274,6 +4615,7 @@ impl KernelProjectSolveSession {
             &self.program,
             &self.owners,
             &self.definition_facts,
+            Arc::clone(&self.runtime_facts),
             &self.abi,
             &mut artifact,
             &flush_terms,
@@ -4286,10 +4628,18 @@ impl KernelProjectSolveSession {
         let types = artifact.type_store();
         let interface = Arc::new(interface.finish(Arc::clone(&types)));
         let definition_code = Arc::new(definition_code.finish(types)?);
+        let receipts_started = Instant::now();
+        let (dependencies, currentness) = build_borrowed_snapshot_receipts(
+            &self.program,
+            &self.definition_facts,
+            &definition_code,
+            &interface,
+        )?;
+        let receipts_us = receipts_started.elapsed().as_micros();
         let finalize_us = finalize_started.elapsed().as_micros();
         if trace {
             eprintln!(
-                "kernel-solve-detail component_us={solve_us} packed_finalize_us={finalize_us}"
+                "kernel-solve-detail component_us={solve_us} packed_finalize_us={finalize_us} receipts_us={receipts_us}"
             );
         }
         let work = artifact.work;
@@ -4298,7 +4648,10 @@ impl KernelProjectSolveSession {
             program: self.program,
             #[cfg(test)]
             owners: self.owners,
+            #[cfg(test)]
             definition_facts: self.definition_facts,
+            dependencies,
+            currentness,
             derived: Arc::new(KernelSolvedDerived { interface }),
             work,
         })
@@ -4355,13 +4708,8 @@ impl KernelSolvedProject {
         };
         #[cfg(not(test))]
         let (effects_us, preparation_us, definitions_us) = (0_u128, 0_u128, 0_u128);
-        let receipts_started = Instant::now();
-        let (dependencies, currentness) = build_borrowed_snapshot_receipts(
-            &self.program,
-            &self.definition_facts,
-            &definition_code,
-            &interface,
-        )?;
+        let dependencies = self.dependencies.clone();
+        let currentness = self.currentness.clone();
         #[cfg(test)]
         {
             let (compatibility_dependencies, compatibility_currentness) =
@@ -4381,7 +4729,7 @@ impl KernelSolvedProject {
                 "borrowed V17/V3/V18 receipts must exactly match the compatibility artifact",
             );
         }
-        let receipts_us = receipts_started.elapsed().as_micros();
+        let receipts_us = 0_u128;
         if trace {
             eprintln!(
                 "kernel-checked-detail interface_us={interface_us} effects_us={effects_us} preparation_us={preparation_us} definitions_us={definitions_us} receipts_us={receipts_us} total_us={}",
@@ -4392,6 +4740,7 @@ impl KernelSolvedProject {
             #[cfg(test)]
             definitions,
             program: Arc::clone(&self.program),
+            #[cfg(test)]
             definition_facts: Arc::clone(&self.definition_facts),
             definition_code,
             interface,
@@ -4426,7 +4775,6 @@ impl KernelSolvedProject {
         Ok(KernelDemandedDefinitionSnapshot {
             owners: demanded.into_boxed_slice(),
             program: Arc::clone(&self.program),
-            definition_facts: Arc::clone(&self.definition_facts),
             definition_code,
             interface,
             work: self.work,
@@ -4705,7 +5053,7 @@ struct ResourceProjectionRequirementFact {
 }
 
 struct ResourceProjectionResolver<'a> {
-    program: &'a KernelProjectProgramInput,
+    program: &'a PackedKernelProjectProgram,
     owners: &'a [KernelProjectOwnerOutputs],
     definition_facts: &'a [KernelDefinitionFactsInput],
     abi: &'a crate::KernelAbiInput,
@@ -4726,7 +5074,7 @@ struct ResourceProjectionResolver<'a> {
 
 impl<'a> ResourceProjectionResolver<'a> {
     fn new(
-        program: &'a KernelProjectProgramInput,
+        program: &'a PackedKernelProjectProgram,
         owners: &'a [KernelProjectOwnerOutputs],
         definition_facts: &'a [KernelDefinitionFactsInput],
         abi: &'a crate::KernelAbiInput,
@@ -4869,8 +5217,8 @@ impl<'a> ResourceProjectionResolver<'a> {
         })
     }
 
-    fn input(&self, owner: KernelOwnerId) -> Option<&'a KernelOwnerProgramInput> {
-        self.program.owners.get(owner.0 as usize)
+    fn input(&self, owner: KernelOwnerId) -> Option<PackedKernelOwnerProgramRef<'a>> {
+        self.program.owner(owner)
     }
 
     fn facts(&self, owner: KernelOwnerId) -> Option<&'a KernelDefinitionFactsInput> {
@@ -4881,7 +5229,7 @@ impl<'a> ResourceProjectionResolver<'a> {
         let index = owner.0 as usize;
         Some(KernelDefinitionInputRef {
             owner,
-            input: self.program.owners.get(index)?,
+            input: self.program.owner_at(index)?,
             facts: self.definition_facts.get(index)?,
             outputs: self.owners.get(index)?,
         })
@@ -4934,9 +5282,12 @@ impl<'a> ResourceProjectionResolver<'a> {
         declaration: &KernelDeclarationInput,
     ) -> Option<ResourceExpressionKey> {
         let encoded = declaration.value?;
-        let value =
-            kernel_value_reference(self.input(key.owner)?, encoded, declaration.id.0 as usize)
-                .ok()?;
+        let value = packed_kernel_value_reference(
+            self.input(key.owner)?,
+            encoded,
+            declaration.id.0 as usize,
+        )
+        .ok()?;
         self.expression_key(key.owner, value)
     }
 
@@ -4962,8 +5313,8 @@ impl<'a> ResourceProjectionResolver<'a> {
         }
     }
 
-    fn expression(&self, key: ResourceExpressionKey) -> Option<&'a KernelOwnerNode> {
-        self.input(key.owner)?.nodes.get(key.expression.0 as usize)
+    fn expression(&self, key: ResourceExpressionKey) -> Option<&'a PackedKernelOwnerNode> {
+        self.input(key.owner)?.node(key.expression)
     }
 
     fn lexical_index(&self, key: ResourceExpressionKey) -> Option<ResourceLexicalIndex> {
@@ -5012,17 +5363,21 @@ impl<'a> ResourceProjectionResolver<'a> {
         self.facts(key.owner)?.execution_shapes.get(ordinal)
     }
 
-    fn inputs(&self, key: ResourceExpressionKey) -> &'a [KernelOwnerInputEdge] {
-        self.expression(key)
-            .map_or(&[], |expression| expression.inputs.as_ref())
+    fn inputs(&self, key: ResourceExpressionKey) -> &'a [crate::PackedKernelOwnerInputEdge] {
+        self.expression(key).map_or(&[], |expression| {
+            expression.inputs(
+                self.input(key.owner)
+                    .expect("indexed resource expression retains its owner"),
+            )
+        })
     }
 
     fn input_expression_key(
         &self,
         consumer: ResourceExpressionKey,
-        input: &KernelOwnerInputEdge,
+        input: &crate::PackedKernelOwnerInputEdge,
     ) -> Option<ResourceExpressionKey> {
-        let value = kernel_value_reference(
+        let value = packed_kernel_value_reference(
             self.input(consumer.owner)?,
             input.expression,
             consumer.expression.0 as usize,
@@ -5034,10 +5389,10 @@ impl<'a> ResourceProjectionResolver<'a> {
     fn first_input(
         &self,
         key: ResourceExpressionKey,
-        matches: impl Fn(&KernelOwnerEdgeRole) -> bool,
+        matches: impl Fn(&PackedKernelOwnerEdgeRole) -> bool,
     ) -> Option<ResourceExpressionKey> {
         self.expression(key)?
-            .inputs
+            .inputs(self.input(key.owner)?)
             .iter()
             .find(|input| matches(&input.role))
             .and_then(|input| self.input_expression_key(key, input))
@@ -5082,7 +5437,7 @@ impl<'a> ResourceProjectionResolver<'a> {
         &'b self,
         key: ResourceExpressionKey,
         call: KernelProjectCallRef<'a>,
-        input: &'a KernelOwnerInputEdge,
+        input: &'a crate::PackedKernelOwnerInputEdge,
     ) -> Option<&'b crate::KernelAbiParameterInput> {
         let callable = self.abi.callable(&self.call_syntax(key)?.function)?;
         match call.input_role(input).ok()? {
@@ -5135,7 +5490,7 @@ impl<'a> ResourceProjectionResolver<'a> {
         &self,
         key: ResourceExpressionKey,
         call: KernelProjectCallRef<'a>,
-        input: &'a KernelOwnerInputEdge,
+        input: &'a crate::PackedKernelOwnerInputEdge,
         ordinal: u32,
         name: &str,
     ) -> Option<ResourceDeclarationKey> {
@@ -5143,7 +5498,7 @@ impl<'a> ResourceProjectionResolver<'a> {
         let input_value = call.input_value(input).ok()?;
         let argument = syntax.arguments.iter().find(|argument| {
             argument.name.as_ref() == name
-                && kernel_value_reference(
+                && packed_kernel_value_reference(
                     self.input(key.owner).expect("checked call owner"),
                     argument.value,
                     call.expression().0 as usize,
@@ -5638,7 +5993,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             return;
         }
         match &row.kind {
-            KernelOwnerNodeKind::Record { .. } => {
+            PackedKernelOwnerNodeKind::Record { .. } => {
                 if let Some(projection) = paths.row(projection)
                     && let Some(KernelExecutionShapeInput::Record { fields, .. }) =
                         self.shape(expression)
@@ -5646,7 +6001,7 @@ impl<'a> ResourceProjectionResolver<'a> {
                     for candidate in fields.iter().filter(|candidate| {
                         self.text.lookup_symbol(&candidate.name) == Some(projection.head)
                     }) {
-                        if let Some(value) = kernel_value_reference(
+                        if let Some(value) = packed_kernel_value_reference(
                             self.input(expression.owner)
                                 .expect("checked expression owner"),
                             candidate.value,
@@ -5660,13 +6015,12 @@ impl<'a> ResourceProjectionResolver<'a> {
                     }
                 }
             }
-            KernelOwnerNodeKind::UserCall { .. }
-            | KernelOwnerNodeKind::RenderConstructor { .. }
-            | KernelOwnerNodeKind::PureBuiltin { .. }
-            | KernelOwnerNodeKind::FixedAbiCall { .. }
-            | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
-            | KernelOwnerNodeKind::HostEffect { .. }
-            | KernelOwnerNodeKind::FieldProjection { .. } => {
+            PackedKernelOwnerNodeKind::UserCall { .. }
+            | PackedKernelOwnerNodeKind::RenderConstructor { .. }
+            | PackedKernelOwnerNodeKind::PureBuiltin { .. }
+            | PackedKernelOwnerNodeKind::FixedAbiCall { .. }
+            | PackedKernelOwnerNodeKind::HostEffect { .. }
+            | PackedKernelOwnerNodeKind::FieldProjection { .. } => {
                 if let Some(call) = self.call(expression) {
                     match call.target() {
                         KernelCallTargetRef::User { target, .. } => {
@@ -5722,65 +6076,65 @@ impl<'a> ResourceProjectionResolver<'a> {
                     }
                 }
             }
-            KernelOwnerNodeKind::Draining => {
+            PackedKernelOwnerNodeKind::Draining => {
                 if let Some(input) = self.first_input(expression, |role| {
-                    matches!(role, KernelOwnerEdgeRole::DrainingInput)
+                    matches!(role, PackedKernelOwnerEdgeRole::DrainingInput)
                 }) {
                     self.expression_sources(paths, input, projection, scratch);
                 }
             }
-            KernelOwnerNodeKind::Hold => {
+            PackedKernelOwnerNodeKind::Hold => {
                 if let Some(input) = self.first_input(expression, |role| {
-                    matches!(role, KernelOwnerEdgeRole::HoldInitial)
+                    matches!(role, PackedKernelOwnerEdgeRole::HoldInitial)
                 }) {
                     self.expression_sources(paths, input, projection, scratch);
                 }
             }
-            KernelOwnerNodeKind::Flush => {
+            PackedKernelOwnerNodeKind::Flush => {
                 if let Some(input) = self.first_input(expression, |role| {
-                    matches!(role, KernelOwnerEdgeRole::FlushPayload)
+                    matches!(role, PackedKernelOwnerEdgeRole::FlushPayload)
                 }) {
                     self.expression_sources(paths, input, projection, scratch);
                 }
             }
-            KernelOwnerNodeKind::Latest => {
+            PackedKernelOwnerNodeKind::Latest => {
                 for input in self.inputs(expression) {
-                    if matches!(input.role, KernelOwnerEdgeRole::LatestBranch)
+                    if matches!(input.role, PackedKernelOwnerEdgeRole::LatestBranch)
                         && let Some(branch) = self.input_expression_key(expression, input)
                     {
                         self.expression_sources(paths, branch, projection, scratch);
                     }
                 }
             }
-            KernelOwnerNodeKind::When => {
+            PackedKernelOwnerNodeKind::When => {
                 for input in self.inputs(expression) {
-                    if matches!(input.role, KernelOwnerEdgeRole::WhenArm)
+                    if matches!(input.role, PackedKernelOwnerEdgeRole::WhenArm)
                         && let Some(arm) = self.input_expression_key(expression, input)
                     {
                         self.expression_sources(paths, arm, projection, scratch);
                     }
                 }
             }
-            KernelOwnerNodeKind::Then => {
+            PackedKernelOwnerNodeKind::Then => {
                 if let Some(output) = self.first_input(expression, |role| {
-                    matches!(role, KernelOwnerEdgeRole::ThenOutput)
+                    matches!(role, PackedKernelOwnerEdgeRole::ThenOutput)
                 }) {
                     self.expression_sources(paths, output, projection, scratch);
                 }
             }
-            KernelOwnerNodeKind::MatchArm { .. } => {
+            PackedKernelOwnerNodeKind::MatchArm { .. } => {
                 if let Some(output) = self.first_input(expression, |role| {
-                    matches!(role, KernelOwnerEdgeRole::MatchOutput)
+                    matches!(role, PackedKernelOwnerEdgeRole::MatchOutput)
                 }) {
                     self.expression_sources(paths, output, projection, scratch);
                 }
             }
-            KernelOwnerNodeKind::Block => {
+            PackedKernelOwnerNodeKind::Block => {
                 if let Some(KernelExecutionShapeInput::Block {
                     result: Some(result),
                     ..
                 }) = self.shape(expression)
-                    && let Some(result) = kernel_value_reference(
+                    && let Some(result) = packed_kernel_value_reference(
                         self.input(expression.owner)
                             .expect("checked expression owner"),
                         *result,
@@ -5792,36 +6146,36 @@ impl<'a> ResourceProjectionResolver<'a> {
                     self.expression_sources(paths, result, projection, scratch);
                 }
             }
-            KernelOwnerNodeKind::MapEntry => {
+            PackedKernelOwnerNodeKind::MapEntry => {
                 if let Some(key) = self.first_input(expression, |role| {
-                    matches!(role, KernelOwnerEdgeRole::MapKey)
+                    matches!(role, PackedKernelOwnerEdgeRole::MapKey)
                 }) {
                     self.expression_sources(paths, key, ResourceProjectionId::ROOT, scratch);
                 }
                 if let Some(value) = self.first_input(expression, |role| {
-                    matches!(role, KernelOwnerEdgeRole::MapValue)
+                    matches!(role, PackedKernelOwnerEdgeRole::MapValue)
                 }) {
                     self.expression_sources(paths, value, projection, scratch);
                 }
             }
-            KernelOwnerNodeKind::Collection {
+            PackedKernelOwnerNodeKind::Collection {
                 kind: KernelCollectionKind::Map,
                 ..
             } => {
                 for input in self.inputs(expression) {
-                    if matches!(input.role, KernelOwnerEdgeRole::MapEntry)
+                    if matches!(input.role, PackedKernelOwnerEdgeRole::MapEntry)
                         && let Some(entry) = self.input_expression_key(expression, input)
                     {
                         self.expression_sources(paths, entry, projection, scratch);
                     }
                 }
             }
-            KernelOwnerNodeKind::Collection {
+            PackedKernelOwnerNodeKind::Collection {
                 kind: KernelCollectionKind::Set,
                 ..
             } => {
                 for input in self.inputs(expression) {
-                    if matches!(input.role, KernelOwnerEdgeRole::CollectionItem)
+                    if matches!(input.role, PackedKernelOwnerEdgeRole::CollectionItem)
                         && let Some(item) = self.input_expression_key(expression, input)
                     {
                         self.expression_sources(paths, item, projection, scratch);
@@ -5851,12 +6205,12 @@ impl<'a> ResourceProjectionResolver<'a> {
             return;
         };
         match &row.kind {
-            KernelOwnerNodeKind::Collection {
+            PackedKernelOwnerNodeKind::Collection {
                 kind: KernelCollectionKind::List,
                 ..
             } => {
                 for input in self.inputs(expression) {
-                    if matches!(&input.role, KernelOwnerEdgeRole::CollectionItem)
+                    if matches!(&input.role, PackedKernelOwnerEdgeRole::CollectionItem)
                         && let Some(item) = self.input_expression_key(expression, input)
                     {
                         self.expression_sources(paths, item, projection, scratch);
@@ -5888,13 +6242,12 @@ impl<'a> ResourceProjectionResolver<'a> {
                     }
                 }
             }
-            KernelOwnerNodeKind::UserCall { .. }
-            | KernelOwnerNodeKind::RenderConstructor { .. }
-            | KernelOwnerNodeKind::PureBuiltin { .. }
-            | KernelOwnerNodeKind::FixedAbiCall { .. }
-            | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
-            | KernelOwnerNodeKind::HostEffect { .. }
-            | KernelOwnerNodeKind::FieldProjection { .. } => {
+            PackedKernelOwnerNodeKind::UserCall { .. }
+            | PackedKernelOwnerNodeKind::RenderConstructor { .. }
+            | PackedKernelOwnerNodeKind::PureBuiltin { .. }
+            | PackedKernelOwnerNodeKind::FixedAbiCall { .. }
+            | PackedKernelOwnerNodeKind::HostEffect { .. }
+            | PackedKernelOwnerNodeKind::FieldProjection { .. } => {
                 if let Some(call) = self.call(expression) {
                     match call.target() {
                         KernelCallTargetRef::User { target, .. } => {
@@ -5961,58 +6314,58 @@ impl<'a> ResourceProjectionResolver<'a> {
                     }
                 }
             }
-            KernelOwnerNodeKind::Draining => {
+            PackedKernelOwnerNodeKind::Draining => {
                 if let Some(input) = self.first_input(expression, |role| {
-                    matches!(role, KernelOwnerEdgeRole::DrainingInput)
+                    matches!(role, PackedKernelOwnerEdgeRole::DrainingInput)
                 }) {
                     self.list_item_sources(paths, input, projection, scratch);
                 }
             }
-            KernelOwnerNodeKind::Hold => {
+            PackedKernelOwnerNodeKind::Hold => {
                 if let Some(input) = self.first_input(expression, |role| {
-                    matches!(role, KernelOwnerEdgeRole::HoldInitial)
+                    matches!(role, PackedKernelOwnerEdgeRole::HoldInitial)
                 }) {
                     self.list_item_sources(paths, input, projection, scratch);
                 }
             }
-            KernelOwnerNodeKind::Latest => {
+            PackedKernelOwnerNodeKind::Latest => {
                 for input in self.inputs(expression) {
-                    if matches!(&input.role, KernelOwnerEdgeRole::LatestBranch)
+                    if matches!(&input.role, PackedKernelOwnerEdgeRole::LatestBranch)
                         && let Some(branch) = self.input_expression_key(expression, input)
                     {
                         self.list_item_sources(paths, branch, projection, scratch);
                     }
                 }
             }
-            KernelOwnerNodeKind::When => {
+            PackedKernelOwnerNodeKind::When => {
                 for input in self.inputs(expression) {
-                    if matches!(&input.role, KernelOwnerEdgeRole::WhenArm)
+                    if matches!(&input.role, PackedKernelOwnerEdgeRole::WhenArm)
                         && let Some(arm) = self.input_expression_key(expression, input)
                     {
                         self.list_item_sources(paths, arm, projection, scratch);
                     }
                 }
             }
-            KernelOwnerNodeKind::Then => {
+            PackedKernelOwnerNodeKind::Then => {
                 if let Some(output) = self.first_input(expression, |role| {
-                    matches!(role, KernelOwnerEdgeRole::ThenOutput)
+                    matches!(role, PackedKernelOwnerEdgeRole::ThenOutput)
                 }) {
                     self.list_item_sources(paths, output, projection, scratch);
                 }
             }
-            KernelOwnerNodeKind::MatchArm { .. } => {
+            PackedKernelOwnerNodeKind::MatchArm { .. } => {
                 if let Some(output) = self.first_input(expression, |role| {
-                    matches!(role, KernelOwnerEdgeRole::MatchOutput)
+                    matches!(role, PackedKernelOwnerEdgeRole::MatchOutput)
                 }) {
                     self.list_item_sources(paths, output, projection, scratch);
                 }
             }
-            KernelOwnerNodeKind::Block => {
+            PackedKernelOwnerNodeKind::Block => {
                 if let Some(KernelExecutionShapeInput::Block {
                     result: Some(result),
                     ..
                 }) = self.shape(expression)
-                    && let Some(result) = kernel_value_reference(
+                    && let Some(result) = packed_kernel_value_reference(
                         self.input(expression.owner)
                             .expect("checked expression owner"),
                         *result,
@@ -6277,7 +6630,7 @@ fn packed_resource_projection_type_is_specific(
 }
 
 fn project_resource_projection_facts(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     owners: &[KernelProjectOwnerOutputs],
     definition_facts: &[KernelDefinitionFactsInput],
     abi: &crate::KernelAbiInput,
@@ -6471,9 +6824,10 @@ fn project_resource_projection_facts(
 }
 
 fn build_definition_code_builder(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     owners: &[KernelProjectOwnerOutputs],
     definition_facts: &[KernelDefinitionFactsInput],
+    runtime_facts: Arc<crate::PackedDefinitionFactsStore>,
     abi: &crate::KernelAbiInput,
     artifact: &mut UnsealedComponentArtifact,
     flush_terms: &ProjectExpressionFlushTerms,
@@ -6496,6 +6850,7 @@ fn build_definition_code_builder(
         .sum();
     let mut builder =
         DefinitionCodeBuilder::with_capacity(owners.len(), flow_capacity, flow_capacity);
+    builder.use_prepared_runtime_facts(runtime_facts)?;
     builder.install_abi_callable_schemes(abi_schemes)?;
     let mut formal_roots = Vec::new();
     let mut expression_roots = Vec::new();
@@ -6558,17 +6913,17 @@ fn build_definition_code_builder(
                     )
                 }),
         );
+        let input = program.owner_at(owner_index).ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel definition-code omits packed owner {owner_index}"
+            ))
+        })?;
         expression_kind_types.clear();
-        for expression in &program.owners[owner_index].nodes {
+        for expression in input.nodes() {
             let term = match &expression.kind {
-                KernelOwnerNodeKind::Known(ty)
-                | KernelOwnerNodeKind::Source(ty)
-                | KernelOwnerNodeKind::FixedAbiCall { result: ty } => {
-                    Some(import_post_solve_type(artifact.terms_mut(), ty))
-                }
-                KernelOwnerNodeKind::KnownPacked(reference)
-                | KernelOwnerNodeKind::SourcePacked(reference)
-                | KernelOwnerNodeKind::FixedAbiCallPacked { result: reference } => Some(
+                PackedKernelOwnerNodeKind::Known(reference)
+                | PackedKernelOwnerNodeKind::Source(reference)
+                | PackedKernelOwnerNodeKind::FixedAbiCall { result: reference } => Some(
                     artifact.terms().resolve_type_ref(*reference).ok_or_else(|| {
                         KernelSolveError::new(
                             "kernel expression type reference belongs to another project authority",
@@ -6629,11 +6984,7 @@ fn build_definition_code_builder(
             .zip(synthetic_state_ordinals[owner_index].iter().copied())
             .enumerate()
             .filter(|(_, (state, _))| {
-                state_input_candidate_survives(
-                    &program.owners[owner_index],
-                    state,
-                    &owner.expression_modes,
-                )
+                packed_state_input_candidate_survives(input, state, &owner.expression_modes)
             })
         {
             if state.synthetic_path != synthetic_ordinal.is_some() {
@@ -6906,16 +7257,15 @@ fn definition_execution_owner<'a>(
 }
 
 fn definition_execution_expression(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     owner: KernelOwnerId,
     expression: KernelExpressionId,
     context: &str,
 ) -> Result<PackedExpressionRef, KernelSolveError> {
-    if !program
-        .owners
-        .get(owner.0 as usize)
-        .and_then(|definition| definition.nodes.get(expression.0 as usize))
-        .is_some()
+    if program
+        .owner(owner)
+        .and_then(|definition| definition.node(expression))
+        .is_none()
     {
         return Err(KernelSolveError::new(format!(
             "kernel packed execution {context} references missing expression {}:{}",
@@ -6926,7 +7276,7 @@ fn definition_execution_expression(
 }
 
 fn definition_execution_value(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     definition_facts: &[KernelDefinitionFactsInput],
     owner: KernelOwnerId,
     value: KernelValueReference,
@@ -7255,7 +7605,7 @@ fn definition_execution_call_syntax<'a>(
 }
 
 fn append_definition_execution_statement_dependencies(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     definition_facts: &[KernelDefinitionFactsInput],
     expression_offsets: &[u32],
     statement_offsets: &[u32],
@@ -7308,8 +7658,13 @@ fn append_definition_execution_statement_dependencies(
         let value = row
             .value
             .map(|encoded| {
-                let value = kernel_value_reference(
-                    &program.owners[statement.owner.0 as usize],
+                let value = packed_kernel_value_reference(
+                    program.owner(statement.owner).ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel packed execution statement references missing owner {}",
+                            statement.owner.0,
+                        ))
+                    })?,
                     encoded,
                     statement.statement.0 as usize,
                 )
@@ -7382,7 +7737,7 @@ fn definition_execution_block_shape<'a>(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_definition_execution_dependencies(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     owners: &[KernelProjectOwnerOutputs],
     definition_facts: &[KernelDefinitionFactsInput],
     abi: &crate::KernelAbiInput,
@@ -7408,24 +7763,19 @@ fn collect_definition_execution_dependencies(
             owner.0,
         ))
     })?;
-    let expression_row = program
-        .owners
-        .get(owner.0 as usize)
-        .ok_or_else(|| {
-            KernelSolveError::new(format!(
-                "kernel packed execution references missing owner {}",
-                owner.0,
-            ))
-        })?
-        .nodes
-        .get(expression.expression().0 as usize)
-        .ok_or_else(|| {
-            KernelSolveError::new(format!(
-                "kernel packed execution references missing node {}:{}",
-                owner.0,
-                expression.expression().0,
-            ))
-        })?;
+    let owner_input = program.owner(owner).ok_or_else(|| {
+        KernelSolveError::new(format!(
+            "kernel packed execution references missing owner {}",
+            owner.0,
+        ))
+    })?;
+    let expression_row = owner_input.node(expression.expression()).ok_or_else(|| {
+        KernelSolveError::new(format!(
+            "kernel packed execution references missing node {}:{}",
+            owner.0,
+            expression.expression().0,
+        ))
+    })?;
     let payload = facts
         .expression_payloads
         .get(expression.expression().0 as usize)
@@ -7439,9 +7789,9 @@ fn collect_definition_execution_dependencies(
     if matches!(payload, KernelExpressionSemanticPayload::Delimiter) {
         return Ok(());
     }
-    let resolve_input = |input: &KernelOwnerInputEdge| {
-        kernel_value_reference(
-            &program.owners[owner.0 as usize],
+    let resolve_input = |input: &crate::PackedKernelOwnerInputEdge| {
+        packed_kernel_value_reference(
+            owner_input,
             input.expression,
             expression.expression().0 as usize,
         )
@@ -7455,7 +7805,7 @@ fn collect_definition_execution_dependencies(
     if call_ordinal != u32::MAX {
         let definition_ref = KernelDefinitionInputRef {
             owner,
-            input: &program.owners[owner.0 as usize],
+            input: owner_input,
             facts,
             outputs: definition,
         };
@@ -7480,18 +7830,23 @@ fn collect_definition_execution_dependencies(
                 ))
             })?)
         };
-        for input in &expression_row.inputs {
+        for input in expression_row.inputs(owner_input) {
             let consumed = match (user_call, &input.role) {
-                (true, KernelOwnerEdgeRole::CallArgument { .. }) => true,
-                (true, KernelOwnerEdgeRole::CallOutArgument { .. }) => false,
-                (false, KernelOwnerEdgeRole::AbiArgument { name }) => {
+                (true, PackedKernelOwnerEdgeRole::CallArgument { .. }) => true,
+                (true, PackedKernelOwnerEdgeRole::CallOutArgument { .. }) => false,
+                (false, PackedKernelOwnerEdgeRole::AbiArgument { name }) => {
+                    let name = owner_input.symbol(*name).ok_or_else(|| {
+                        KernelSolveError::new(
+                            "kernel packed execution ABI argument name is outside its text authority",
+                        )
+                    })?;
                     let callable = abi_callable.expect("non-user call has an ABI contract");
                     let parameter = callable
                         .parameters
                         .iter()
-                        .find(|parameter| parameter.name.as_ref() == name.as_ref())
+                        .find(|parameter| parameter.name.as_ref() == name)
                         .or_else(|| {
-                            (name.as_ref() == "$pipe").then(|| {
+                            (name == "$pipe").then(|| {
                                 callable
                                     .parameters
                                     .iter()
@@ -7530,14 +7885,15 @@ fn collect_definition_execution_dependencies(
         return Ok(());
     }
 
-    for input in &expression_row.inputs {
+    for input in expression_row.inputs(owner_input) {
         if matches!(
             input.role,
-            KernelOwnerEdgeRole::CallOutArgument { .. } | KernelOwnerEdgeRole::HoldUpdate
+            PackedKernelOwnerEdgeRole::CallOutArgument { .. }
+                | PackedKernelOwnerEdgeRole::HoldUpdate
         ) {
             continue;
         }
-        if matches!(input.role, KernelOwnerEdgeRole::ReadProvider) {
+        if matches!(input.role, PackedKernelOwnerEdgeRole::ReadProvider) {
             let present = *read_provider_present.get(flat_expression).ok_or_else(|| {
                 KernelSolveError::new(
                     "kernel packed execution read-provider presence index is out of range",
@@ -7571,7 +7927,7 @@ fn collect_definition_execution_dependencies(
 
     if matches!(
         expression_row.kind,
-        KernelOwnerNodeKind::Hold | KernelOwnerNodeKind::MatchArm { .. }
+        PackedKernelOwnerNodeKind::Hold | PackedKernelOwnerNodeKind::MatchArm { .. }
     ) {
         *statement_generation = statement_generation.wrapping_add(1);
         if *statement_generation == 0 {
@@ -7591,7 +7947,7 @@ fn collect_definition_execution_dependencies(
             dependencies,
         )?;
     }
-    if matches!(expression_row.kind, KernelOwnerNodeKind::Block) {
+    if matches!(expression_row.kind, PackedKernelOwnerNodeKind::Block) {
         let KernelExecutionShapeInput::Block {
             bindings, result, ..
         } = definition_execution_block_shape(facts, expression.expression())?
@@ -7599,8 +7955,8 @@ fn collect_definition_execution_dependencies(
             unreachable!("BLOCK shape helper returned a non-BLOCK row")
         };
         for binding in bindings {
-            let value = kernel_value_reference(
-                &program.owners[owner.0 as usize],
+            let value = packed_kernel_value_reference(
+                owner_input,
                 binding.value,
                 expression.expression().0 as usize,
             )
@@ -7614,8 +7970,8 @@ fn collect_definition_execution_dependencies(
             )?);
         }
         if let Some(result) = result {
-            let value = kernel_value_reference(
-                &program.owners[owner.0 as usize],
+            let value = packed_kernel_value_reference(
+                owner_input,
                 *result,
                 expression.expression().0 as usize,
             )
@@ -7635,7 +7991,7 @@ fn collect_definition_execution_dependencies(
 }
 
 fn collect_definition_execution_selector(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     definition_facts: &[KernelDefinitionFactsInput],
     owners: &[KernelProjectOwnerOutputs],
     expression: PackedExpressionRef,
@@ -7656,15 +8012,16 @@ fn collect_definition_execution_selector(
     if *kind == KernelConditionalKind::While {
         return Ok(None);
     }
-    let row = program
-        .owners
-        .get(expression.owner().0 as usize)
-        .and_then(|definition| definition.nodes.get(expression.expression().0 as usize))
+    let input = program.owner(expression.owner()).ok_or_else(|| {
+        KernelSolveError::new("kernel packed execution selector owner is missing")
+    })?;
+    let row = input
+        .node(expression.expression())
         .ok_or_else(|| KernelSolveError::new("kernel packed execution selector node is missing"))?;
     let mut selector_inputs = row
-        .inputs
+        .inputs(input)
         .iter()
-        .filter(|input| matches!(input.role, KernelOwnerEdgeRole::WhenInput));
+        .filter(|input| matches!(input.role, PackedKernelOwnerEdgeRole::WhenInput));
     let selector = selector_inputs.next().ok_or_else(|| {
         KernelSolveError::new(format!(
             "kernel packed execution WHEN {}:{} has no selector input",
@@ -7680,12 +8037,12 @@ fn collect_definition_execution_selector(
         )));
     }
     for arm in row
-        .inputs
+        .inputs(input)
         .iter()
-        .filter(|input| matches!(input.role, KernelOwnerEdgeRole::WhenArm))
+        .filter(|input| matches!(input.role, PackedKernelOwnerEdgeRole::WhenArm))
     {
-        let value = kernel_value_reference(
-            &program.owners[expression.owner().0 as usize],
+        let value = packed_kernel_value_reference(
+            input,
             arm.expression,
             expression.expression().0 as usize,
         )
@@ -7698,8 +8055,8 @@ fn collect_definition_execution_selector(
             "WHEN arm",
         )?);
     }
-    let selector = kernel_value_reference(
-        &program.owners[expression.owner().0 as usize],
+    let selector = packed_kernel_value_reference(
+        input,
         selector.expression,
         expression.expression().0 as usize,
     )
@@ -7715,14 +8072,16 @@ fn collect_definition_execution_selector(
 }
 
 fn build_definition_execution_code(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     owners: &[KernelProjectOwnerOutputs],
     definition_facts: &[KernelDefinitionFactsInput],
     abi: &crate::KernelAbiInput,
     builder: &mut DefinitionCodeBuilder,
 ) -> Result<(), KernelSolveError> {
     let expression_offsets = definition_execution_offsets(
-        program.owners.iter().map(|owner| owner.nodes.len()),
+        program
+            .owners()
+            .map(PackedKernelOwnerProgramRef::node_count),
         "expression",
     )?;
     let statement_offsets = definition_execution_offsets(
@@ -7732,10 +8091,14 @@ fn build_definition_execution_code(
     let expression_count = expression_offsets.last().copied().unwrap_or(0) as usize;
     let statement_count = statement_offsets.last().copied().unwrap_or(0) as usize;
     let dependency_capacity = program
-        .owners
-        .iter()
-        .flat_map(|owner| owner.nodes.iter())
-        .map(|expression| expression.inputs.len())
+        .owners()
+        .map(|owner| {
+            owner
+                .nodes()
+                .iter()
+                .map(|expression| expression.inputs(owner).len())
+                .sum::<usize>()
+        })
         .sum::<usize>()
         .saturating_add(
             definition_facts
@@ -7764,12 +8127,16 @@ fn build_definition_execution_code(
         })
         .count();
     let selector_arm_capacity = program
-        .owners
-        .iter()
-        .flat_map(|owner| owner.nodes.iter())
-        .flat_map(|expression| expression.inputs.iter())
-        .filter(|input| matches!(input.role, KernelOwnerEdgeRole::WhenArm))
-        .count();
+        .owners()
+        .map(|owner| {
+            owner
+                .nodes()
+                .iter()
+                .flat_map(|expression| expression.inputs(owner))
+                .filter(|input| matches!(input.role, PackedKernelOwnerEdgeRole::WhenArm))
+                .count()
+        })
+        .sum::<usize>();
     let call_capacity = owners.iter().map(|owner| owner.calls.len()).sum();
     builder.reserve_execution(
         expression_count,
@@ -7789,6 +8156,12 @@ fn build_definition_execution_code(
         let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
             KernelSolveError::new("kernel packed execution definition count exceeds u32")
         })?);
+        let input = program.owner(owner).ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel packed execution references missing owner {}",
+                owner.0,
+            ))
+        })?;
         for (ordinal, call) in definition.calls.iter().enumerate() {
             let expression = definition_execution_expression(
                 program,
@@ -7817,12 +8190,8 @@ fn build_definition_execution_code(
             let Some(encoded) = statement.value else {
                 continue;
             };
-            let value = kernel_value_reference(
-                &program.owners[owner_index],
-                encoded,
-                statement.id.0 as usize,
-            )
-            .map_err(|error| KernelSolveError::new(error.to_string()))?;
+            let value = packed_kernel_value_reference(input, encoded, statement.id.0 as usize)
+                .map_err(|error| KernelSolveError::new(error.to_string()))?;
             let expression = definition_execution_value(
                 program,
                 definition_facts,
@@ -7845,11 +8214,16 @@ fn build_definition_execution_code(
                 binding.expression,
                 "lexical read",
             )?;
-            let expression_row = &program.owners[owner_index].nodes[binding.expression.0 as usize];
+            let expression_row = input.node(binding.expression).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel packed execution lexical binding references missing expression {}:{}",
+                    owner.0, binding.expression.0,
+                ))
+            })?;
             if !expression_row
-                .inputs
+                .inputs(input)
                 .iter()
-                .any(|input| matches!(input.role, KernelOwnerEdgeRole::ReadProvider))
+                .any(|input| matches!(input.role, PackedKernelOwnerEdgeRole::ReadProvider))
             {
                 continue;
             }
@@ -8338,15 +8712,145 @@ pub(crate) fn test_compatibility_definition_materializations() -> usize {
 }
 
 #[cfg(test)]
+fn materialize_packed_owner_program(
+    input: PackedKernelOwnerProgramRef<'_>,
+) -> KernelOwnerProgramInput {
+    let nodes = input
+        .nodes()
+        .iter()
+        .map(|node| {
+            let artifact = KernelExpressionKindRef::from_packed(input, &node.kind)
+                .expect("validated packed opcode resolves")
+                .to_owned();
+            let kind = match artifact {
+                KernelExpressionArtifactKind::Known => {
+                    let PackedKernelOwnerNodeKind::Known(reference) = node.kind else {
+                        unreachable!("packed Known view retains its type reference")
+                    };
+                    KernelOwnerNodeKind::KnownPacked(reference)
+                }
+                KernelExpressionArtifactKind::Source => {
+                    let PackedKernelOwnerNodeKind::Source(reference) = node.kind else {
+                        unreachable!("packed Source view retains its type reference")
+                    };
+                    KernelOwnerNodeKind::SourcePacked(reference)
+                }
+                KernelExpressionArtifactKind::Absent => KernelOwnerNodeKind::Absent,
+                KernelExpressionArtifactKind::Text => KernelOwnerNodeKind::Text,
+                KernelExpressionArtifactKind::TextTemplate => KernelOwnerNodeKind::TextTemplate,
+                KernelExpressionArtifactKind::Number => KernelOwnerNodeKind::Number,
+                KernelExpressionArtifactKind::Byte => KernelOwnerNodeKind::Byte,
+                KernelExpressionArtifactKind::Bits(width) => KernelOwnerNodeKind::Bits(width),
+                KernelExpressionArtifactKind::Tag(tag) => KernelOwnerNodeKind::Tag(tag),
+                KernelExpressionArtifactKind::Record { tag } => KernelOwnerNodeKind::Record { tag },
+                KernelExpressionArtifactKind::Block => KernelOwnerNodeKind::Block,
+                KernelExpressionArtifactKind::Collection { kind, capacity } => {
+                    KernelOwnerNodeKind::Collection { kind, capacity }
+                }
+                KernelExpressionArtifactKind::MapEntry => KernelOwnerNodeKind::MapEntry,
+                KernelExpressionArtifactKind::FormalRead { formal, fields } => {
+                    KernelOwnerNodeKind::FormalRead { formal, fields }
+                }
+                KernelExpressionArtifactKind::ContextRead { formal, fields } => {
+                    KernelOwnerNodeKind::ContextRead { formal, fields }
+                }
+                KernelExpressionArtifactKind::LexicalRead { fields } => {
+                    KernelOwnerNodeKind::LexicalRead { fields }
+                }
+                KernelExpressionArtifactKind::ValueRead {
+                    fields,
+                    mode_narrowing,
+                } => KernelOwnerNodeKind::ValueRead {
+                    fields,
+                    mode_narrowing,
+                },
+                KernelExpressionArtifactKind::DerivedRead { fields } => {
+                    KernelOwnerNodeKind::DerivedRead { fields }
+                }
+                KernelExpressionArtifactKind::PatternRead { pattern, fields } => {
+                    KernelOwnerNodeKind::PatternRead { pattern, fields }
+                }
+                KernelExpressionArtifactKind::CollectionItemRead => {
+                    KernelOwnerNodeKind::CollectionItemRead
+                }
+                KernelExpressionArtifactKind::FreshOut => KernelOwnerNodeKind::FreshOut,
+                KernelExpressionArtifactKind::UserCall {
+                    target,
+                    inherited_formal,
+                } => KernelOwnerNodeKind::UserCall {
+                    target,
+                    inherited_formal,
+                },
+                KernelExpressionArtifactKind::RenderConstructor { kind } => {
+                    KernelOwnerNodeKind::RenderConstructor { kind }
+                }
+                KernelExpressionArtifactKind::PureBuiltin { kind } => {
+                    KernelOwnerNodeKind::PureBuiltin { kind }
+                }
+                KernelExpressionArtifactKind::FixedAbiCall => {
+                    let PackedKernelOwnerNodeKind::FixedAbiCall { result } = node.kind else {
+                        unreachable!("packed fixed ABI view retains its type reference")
+                    };
+                    KernelOwnerNodeKind::FixedAbiCallPacked { result }
+                }
+                KernelExpressionArtifactKind::HostEffect { operation } => {
+                    KernelOwnerNodeKind::HostEffect { operation }
+                }
+                KernelExpressionArtifactKind::Latest => KernelOwnerNodeKind::Latest,
+                KernelExpressionArtifactKind::When => KernelOwnerNodeKind::When,
+                KernelExpressionArtifactKind::Then => KernelOwnerNodeKind::Then,
+                KernelExpressionArtifactKind::Infix { operation } => {
+                    KernelOwnerNodeKind::Infix { operation }
+                }
+                KernelExpressionArtifactKind::Draining => KernelOwnerNodeKind::Draining,
+                KernelExpressionArtifactKind::Hold => KernelOwnerNodeKind::Hold,
+                KernelExpressionArtifactKind::MatchArm { pattern } => {
+                    KernelOwnerNodeKind::MatchArm { pattern }
+                }
+                KernelExpressionArtifactKind::Arrow => KernelOwnerNodeKind::Arrow,
+                KernelExpressionArtifactKind::Delimiter => KernelOwnerNodeKind::Delimiter,
+                KernelExpressionArtifactKind::Unknown => KernelOwnerNodeKind::Unknown,
+                KernelExpressionArtifactKind::Flush => KernelOwnerNodeKind::Flush,
+                KernelExpressionArtifactKind::FieldProjection { field } => {
+                    KernelOwnerNodeKind::FieldProjection { field }
+                }
+            };
+            KernelOwnerNode {
+                kind,
+                inputs: node
+                    .inputs(input)
+                    .iter()
+                    .map(|edge| KernelOwnerInputEdge {
+                        role: input
+                            .materialize_edge_role(edge.role)
+                            .expect("validated packed edge role resolves"),
+                        expression: edge.expression,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                mode: node.mode,
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    KernelOwnerProgramInput {
+        nodes,
+        formal_count: input.formal_count(),
+        external_expressions: input.external_expressions().into(),
+        result: input.result(),
+    }
+}
+
+#[cfg(test)]
 fn materialize_project_definition_structures(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     definition_facts: &[KernelDefinitionFactsInput],
     owners: &[KernelProjectOwnerOutputs],
     synthetic_state_ordinals: &[Box<[Option<u32>]>],
     owner_effects: &[KernelEffectSummary],
     demanded: Option<&[KernelOwnerId]>,
 ) -> Result<Box<[DefinitionArtifact]>, KernelSolveError> {
-    if program.owners.len() != owners.len() || definition_facts.len() != owners.len() {
+    if program.definition_count() != owners.len() || definition_facts.len() != owners.len() {
         return Err(KernelSolveError::new(
             "kernel structural publication received mismatched program authorities",
         ));
@@ -8374,7 +8878,10 @@ fn materialize_project_definition_structures(
             #[cfg(test)]
             TEST_COMPATIBILITY_DEFINITION_MATERIALIZATIONS
                 .set(TEST_COMPATIBILITY_DEFINITION_MATERIALIZATIONS.get() + 1);
-            let input = &program.owners[owner_index];
+            let packed_input = program
+                .owner_at(owner_index)
+                .expect("validated materialized owner remains present");
+            let input = materialize_packed_owner_program(packed_input);
             let facts = &definition_facts[owner_index];
             if facts.states.len() != synthetic_state_ordinals.len() {
                 return Err(KernelSolveError::new(
@@ -8395,7 +8902,7 @@ fn materialize_project_definition_structures(
                         .map(|edge| {
                             Ok(KernelExpressionInputArtifact {
                                 role: edge.role.clone(),
-                                value: kernel_value_reference(input, edge.expression, index)
+                                value: kernel_value_reference(&input, edge.expression, index)
                                     .map_err(|error| KernelSolveError::new(error.to_string()))?,
                             })
                         })
@@ -8410,11 +8917,11 @@ fn materialize_project_definition_structures(
                 })
                 .collect::<Result<Vec<_>, KernelSolveError>>()?
                 .into_boxed_slice();
-            let statements = collect_statement_artifacts(input, facts)
+            let statements = collect_statement_artifacts(&input, facts)
                 .map_err(|error| KernelSolveError::new(error.to_string()))?;
-            let execution_shapes = collect_execution_shape_artifacts(input, facts)
+            let execution_shapes = collect_execution_shape_artifacts(&input, facts)
                 .map_err(|error| KernelSolveError::new(error.to_string()))?;
-            let call_syntax = collect_call_syntax_artifacts(input, facts)
+            let call_syntax = collect_call_syntax_artifacts(&input, facts)
                 .map_err(|error| KernelSolveError::new(error.to_string()))?;
             let declarations = facts
                 .declarations
@@ -8428,7 +8935,7 @@ fn materialize_project_definition_structures(
                         value: declaration
                             .value
                             .map(|value| {
-                                kernel_value_reference(input, value, declaration.id.0 as usize)
+                                kernel_value_reference(&input, value, declaration.id.0 as usize)
                                     .map_err(|error| KernelSolveError::new(error.to_string()))
                             })
                             .transpose()?,
@@ -8436,13 +8943,13 @@ fn materialize_project_definition_structures(
                 })
                 .collect::<Result<Vec<_>, KernelSolveError>>()?
                 .into_boxed_slice();
-            let lexical_bindings = collect_lexical_binding_artifacts(input, facts)
+            let lexical_bindings = collect_lexical_binding_artifacts(&input, facts)
                 .map_err(|error| KernelSolveError::new(error.to_string()))?;
             let definition = KernelDefinitionInputRef {
                 owner: KernelOwnerId(
                     u32::try_from(owner_index).expect("kernel definition count exceeds u32"),
                 ),
-                input,
+                input: packed_input,
                 facts,
                 outputs: owner,
             };
@@ -8502,7 +9009,7 @@ fn materialize_project_definition_structures(
                 .iter()
                 .zip(synthetic_state_ordinals.iter().copied())
                 .filter(|(state, _)| {
-                    state_input_candidate_survives(input, state, &owner.expression_modes)
+                    state_input_candidate_survives(&input, state, &owner.expression_modes)
                 })
                 .enumerate()
                 .map(|(index, (state, synthetic_ordinal))| {
@@ -8530,7 +9037,7 @@ fn materialize_project_definition_structures(
                         statement: state.statement,
                         expression: state.expression,
                         initial: kernel_value_reference(
-                            input,
+                            &input,
                             state.initial,
                             state.expression.0 as usize,
                         )
@@ -8567,7 +9074,7 @@ fn materialize_project_definition_structures(
                 declarations,
                 lexical_bindings,
                 calls,
-                effects: collect_host_effect_artifacts(input)
+                effects: collect_packed_host_effect_artifacts(packed_input)
                     .map_err(|error| KernelSolveError::new(error.to_string()))?,
                 sources,
                 states,
@@ -8619,7 +9126,7 @@ impl ProjectExpressionFlushTerms {
 }
 
 fn project_expression_flush_terms(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     owners: &[KernelProjectOwnerOutputs],
     artifact: &mut UnsealedComponentArtifact,
 ) -> Result<ProjectExpressionFlushTerms, KernelSolveError> {
@@ -8697,22 +9204,25 @@ fn project_expression_flush_terms(
 
     let mut dependency_counts = vec![0_u32; total];
     let mut base_counts = vec![0_u32; total];
-    for (owner_index, input) in program.owners.iter().enumerate() {
-        for (local, expression) in input.nodes.iter().enumerate() {
+    for (owner_index, input) in program.owners().enumerate() {
+        for (local, expression) in input.nodes().iter().enumerate() {
             let index = definition_offsets[owner_index] as usize + local;
-            let carries_input_flush = |role: &KernelOwnerEdgeRole| match &expression.kind {
-                KernelOwnerNodeKind::Record { .. } | KernelOwnerNodeKind::Block => false,
-                KernelOwnerNodeKind::Hold => matches!(role, KernelOwnerEdgeRole::HoldUpdate),
+            let carries_input_flush = |role: &PackedKernelOwnerEdgeRole| match &expression.kind {
+                PackedKernelOwnerNodeKind::Record { .. } | PackedKernelOwnerNodeKind::Block => {
+                    false
+                }
+                PackedKernelOwnerNodeKind::Hold => {
+                    matches!(role, PackedKernelOwnerEdgeRole::HoldUpdate)
+                }
                 _ => true,
             };
-            for input in expression
-                .inputs
+            for edge in expression
+                .inputs(input)
                 .iter()
                 .filter(|input| carries_input_flush(&input.role))
             {
-                let value =
-                    kernel_value_reference(&program.owners[owner_index], input.expression, local)
-                        .map_err(|error| KernelSolveError::new(error.to_string()))?;
+                let value = packed_kernel_value_reference(input, edge.expression, local)
+                    .map_err(|error| KernelSolveError::new(error.to_string()))?;
                 if value_index(owner_index, value).is_some() {
                     dependency_counts[index] =
                         dependency_counts[index].checked_add(1).ok_or_else(|| {
@@ -8720,7 +9230,7 @@ fn project_expression_flush_terms(
                         })?;
                 }
             }
-            if let KernelOwnerNodeKind::UserCall { target, .. } = &expression.kind
+            if let PackedKernelOwnerNodeKind::UserCall { target, .. } = &expression.kind
                 && result_expressions.get(target.0 as usize).is_some()
             {
                 dependency_counts[index] =
@@ -8728,18 +9238,14 @@ fn project_expression_flush_terms(
                         KernelSolveError::new("kernel FLUSH dependency count exceeds u32")
                     })?;
             }
-            if matches!(expression.kind, KernelOwnerNodeKind::Flush) {
+            if matches!(expression.kind, PackedKernelOwnerNodeKind::Flush) {
                 for payload in expression
-                    .inputs
+                    .inputs(input)
                     .iter()
-                    .filter(|input| matches!(input.role, KernelOwnerEdgeRole::FlushPayload))
+                    .filter(|input| matches!(input.role, PackedKernelOwnerEdgeRole::FlushPayload))
                 {
-                    let value = kernel_value_reference(
-                        &program.owners[owner_index],
-                        payload.expression,
-                        local,
-                    )
-                    .map_err(|error| KernelSolveError::new(error.to_string()))?;
+                    let value = packed_kernel_value_reference(input, payload.expression, local)
+                        .map_err(|error| KernelSolveError::new(error.to_string()))?;
                     if value_term(owner_index, value, artifact).is_some() {
                         base_counts[index] =
                             base_counts[index].checked_add(1).ok_or_else(|| {
@@ -8774,47 +9280,46 @@ fn project_expression_flush_terms(
     let mut bases = vec![artifact.terms().absent(); base_len];
     let mut dependency_cursors = dependency_offsets[..total].to_vec();
     let mut base_cursors = base_offsets[..total].to_vec();
-    for (owner_index, input) in program.owners.iter().enumerate() {
-        for (local, expression) in input.nodes.iter().enumerate() {
+    for (owner_index, input) in program.owners().enumerate() {
+        for (local, expression) in input.nodes().iter().enumerate() {
             let index = definition_offsets[owner_index] as usize + local;
-            let carries_input_flush = |role: &KernelOwnerEdgeRole| match &expression.kind {
-                KernelOwnerNodeKind::Record { .. } | KernelOwnerNodeKind::Block => false,
-                KernelOwnerNodeKind::Hold => matches!(role, KernelOwnerEdgeRole::HoldUpdate),
+            let carries_input_flush = |role: &PackedKernelOwnerEdgeRole| match &expression.kind {
+                PackedKernelOwnerNodeKind::Record { .. } | PackedKernelOwnerNodeKind::Block => {
+                    false
+                }
+                PackedKernelOwnerNodeKind::Hold => {
+                    matches!(role, PackedKernelOwnerEdgeRole::HoldUpdate)
+                }
                 _ => true,
             };
-            for input in expression
-                .inputs
+            for edge in expression
+                .inputs(input)
                 .iter()
                 .filter(|input| carries_input_flush(&input.role))
             {
-                let value =
-                    kernel_value_reference(&program.owners[owner_index], input.expression, local)
-                        .map_err(|error| KernelSolveError::new(error.to_string()))?;
+                let value = packed_kernel_value_reference(input, edge.expression, local)
+                    .map_err(|error| KernelSolveError::new(error.to_string()))?;
                 if let Some(provider) = value_index(owner_index, value) {
                     let cursor = &mut dependency_cursors[index];
                     dependencies[*cursor as usize] = provider;
                     *cursor += 1;
                 }
             }
-            if let KernelOwnerNodeKind::UserCall { target, .. } = &expression.kind
+            if let PackedKernelOwnerNodeKind::UserCall { target, .. } = &expression.kind
                 && let Some(provider) = result_expressions.get(target.0 as usize)
             {
                 let cursor = &mut dependency_cursors[index];
                 dependencies[*cursor as usize] = *provider;
                 *cursor += 1;
             }
-            if matches!(expression.kind, KernelOwnerNodeKind::Flush) {
+            if matches!(expression.kind, PackedKernelOwnerNodeKind::Flush) {
                 for payload in expression
-                    .inputs
+                    .inputs(input)
                     .iter()
-                    .filter(|input| matches!(input.role, KernelOwnerEdgeRole::FlushPayload))
+                    .filter(|input| matches!(input.role, PackedKernelOwnerEdgeRole::FlushPayload))
                 {
-                    let value = kernel_value_reference(
-                        &program.owners[owner_index],
-                        payload.expression,
-                        local,
-                    )
-                    .map_err(|error| KernelSolveError::new(error.to_string()))?;
+                    let value = packed_kernel_value_reference(input, payload.expression, local)
+                        .map_err(|error| KernelSolveError::new(error.to_string()))?;
                     if let Some(term) = value_term(owner_index, value, artifact) {
                         let cursor = &mut base_cursors[index];
                         bases[*cursor as usize] = term;
@@ -8997,25 +9502,50 @@ fn local_expression_effect(kind: &KernelOwnerNodeKind) -> KernelEffectSummary {
     }
 }
 
+fn local_packed_expression_effect(kind: &PackedKernelOwnerNodeKind) -> KernelEffectSummary {
+    match kind {
+        PackedKernelOwnerNodeKind::Source(_) => KernelEffectSummary {
+            emits_source: true,
+            ..KernelEffectSummary::default()
+        },
+        PackedKernelOwnerNodeKind::Hold
+        | PackedKernelOwnerNodeKind::Latest
+        | PackedKernelOwnerNodeKind::PureBuiltin {
+            kind: KernelPureBuiltinKind::BoolToggle,
+        } => KernelEffectSummary {
+            reads_state: true,
+            writes_state: true,
+            ..KernelEffectSummary::default()
+        },
+        PackedKernelOwnerNodeKind::HostEffect { .. } => KernelEffectSummary {
+            invokes_host: true,
+            ..KernelEffectSummary::default()
+        },
+        _ => KernelEffectSummary::default(),
+    }
+}
+
 /// Compute each callable's direct effect surface once over the dense owner
 /// graph. Effects form a four-bit monotone lattice, so reverse-call consumers
 /// converge by queue exhaustion even for recursive call components.
 fn project_owner_effect_summaries(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     definition_facts: &[KernelDefinitionFactsInput],
 ) -> Box<[KernelEffectSummary]> {
-    debug_assert_eq!(definition_facts.len(), program.owners.len());
+    debug_assert_eq!(definition_facts.len(), program.definition_count());
     let mut summaries = program
-        .owners
-        .iter()
+        .owners()
         .zip(definition_facts)
         .map(|(input, facts)| {
             let mut summary =
                 input
-                    .nodes
+                    .nodes()
                     .iter()
                     .fold(KernelEffectSummary::default(), |summary, expression| {
-                        merge_kernel_effects(summary, local_expression_effect(&expression.kind))
+                        merge_kernel_effects(
+                            summary,
+                            local_packed_expression_effect(&expression.kind),
+                        )
                     });
             for declaration in &facts.declarations {
                 match declaration.kind {
@@ -9037,10 +9567,10 @@ fn project_owner_effect_summaries(
             summary
         })
         .collect::<Vec<_>>();
-    let mut consumers = vec![Vec::<usize>::new(); program.owners.len()];
-    for (caller, owner) in program.owners.iter().enumerate() {
-        for target in owner.nodes.iter().filter_map(|expression| {
-            let KernelOwnerNodeKind::UserCall { target, .. } = &expression.kind else {
+    let mut consumers = vec![Vec::<usize>::new(); program.definition_count()];
+    for (caller, owner) in program.owners().enumerate() {
+        for target in owner.nodes().iter().filter_map(|expression| {
+            let PackedKernelOwnerNodeKind::UserCall { target, .. } = &expression.kind else {
                 return None;
             };
             Some(target.0 as usize)
@@ -9054,8 +9584,8 @@ fn project_owner_effect_summaries(
         target_consumers.sort_unstable();
         target_consumers.dedup();
     }
-    let mut queued = vec![true; program.owners.len()];
-    let mut pending = (0..program.owners.len()).collect::<VecDeque<_>>();
+    let mut queued = vec![true; program.definition_count()];
+    let mut pending = (0..program.definition_count()).collect::<VecDeque<_>>();
     while let Some(target) = pending.pop_front() {
         queued[target] = false;
         let target_summary = summaries[target];
@@ -9087,7 +9617,7 @@ fn direct_expression_effect(
 }
 
 fn interface_output_demand(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     definition_facts: &[KernelDefinitionFactsInput],
     owners: &[KernelProjectOwnerOutputs],
 ) -> Box<[OutputId]> {
@@ -9117,7 +9647,7 @@ fn interface_output_demand(
         }
     }
 
-    debug_assert_eq!(program.owners.len(), owners.len());
+    debug_assert_eq!(program.definition_count(), owners.len());
     debug_assert_eq!(definition_facts.len(), owners.len());
     let estimated = owners
         .iter()
@@ -9155,8 +9685,14 @@ fn interface_output_demand(
             .iter()
             .copied()
             .map(|value| {
-                kernel_value_reference(&program.owners[owner_index], value, value.0 as usize)
-                    .expect("validated diagnostic value remains in its definition namespace")
+                packed_kernel_value_reference(
+                    program
+                        .owner_at(owner_index)
+                        .expect("validated diagnostic owner remains present"),
+                    value,
+                    value.0 as usize,
+                )
+                .expect("validated diagnostic value remains in its definition namespace")
             })
         {
             insert_value(&mut outputs, owners, owner_index, value);
@@ -9272,7 +9808,7 @@ fn append_interface_span<T>(
 }
 
 fn project_interface_snapshot(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     definition_facts: &[KernelDefinitionFactsInput],
     owners: &[KernelProjectOwnerOutputs],
     artifact: &ComponentOutputSnapshot<'_>,
@@ -9307,8 +9843,14 @@ fn project_interface_snapshot(
                 .iter()
                 .copied()
                 .map(|value| {
-                    kernel_value_reference(&program.owners[owner], value, value.0 as usize)
-                        .expect("validated diagnostic value remains in its definition namespace")
+                    packed_kernel_value_reference(
+                        program
+                            .owner_at(owner)
+                            .expect("validated diagnostic owner remains present"),
+                        value,
+                        value.0 as usize,
+                    )
+                    .expect("validated diagnostic value remains in its definition namespace")
                 }),
         );
         owner_value_types.clear();
@@ -9398,7 +9940,7 @@ fn project_interface_snapshot(
 /// exact call-result syntax receipts; diagnostics demand deliberately neither
 /// computes nor roots those checked-only facts.
 fn packed_call_parameter<'a>(
-    program: &'a KernelProjectProgramInput,
+    program: &'a PackedKernelProjectProgram,
     definition_facts: &'a [KernelDefinitionFactsInput],
     abi: &'a crate::KernelAbiInput,
     target: crate::KernelCallableSchemeId,
@@ -9409,7 +9951,7 @@ fn packed_call_parameter<'a>(
             crate::KernelCallableSchemeId::User(owner),
             KernelCallInputRoleRef::Formal { ordinal },
         ) => {
-            let target_input = program.owners.get(owner.0 as usize).ok_or_else(|| {
+            let target_input = program.owner(owner).ok_or_else(|| {
                 KernelSolveError::new(format!(
                     "kernel packed call topology references missing user owner {}",
                     owner.0,
@@ -9446,10 +9988,11 @@ fn packed_call_parameter<'a>(
                         owner.0,
                     ))
                 })?;
-            if ordinal >= target_input.formal_count {
+            if ordinal >= target_input.formal_count() {
                 return Err(KernelSolveError::new(format!(
                     "kernel packed call topology user owner {} parameter {ordinal} is outside its formal count {}",
-                    owner.0, target_input.formal_count,
+                    owner.0,
+                    target_input.formal_count(),
                 )));
             }
             Ok((
@@ -9543,7 +10086,7 @@ fn exact_call_declaration_presentation<'a>(
 }
 
 fn project_call_facts_and_diagnostics(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     definition_facts: &[KernelDefinitionFactsInput],
     owners: &[KernelProjectOwnerOutputs],
     abi: &crate::KernelAbiInput,
@@ -9575,16 +10118,19 @@ fn project_call_facts_and_diagnostics(
         let mut owner_call_entries = Vec::new();
         let mut owner_call_contexts = Vec::new();
         let mut owner_call_substitutions = Vec::new();
-        let mut diagnostics =
-            collect_definition_diagnostic_artifacts(owner_id, definition.input, definition.facts)
-                .expect("validated definition diagnostics remain structurally valid")
-                .into_vec()
-                .into_iter()
-                .map(|diagnostic| SolvedKernelDiagnostic {
-                    metadata: PackedDiagnosticMetadata::Plain(diagnostic),
-                    types: None,
-                })
-                .collect::<Vec<_>>();
+        let mut diagnostics = collect_packed_definition_diagnostic_artifacts(
+            owner_id,
+            definition.input,
+            definition.facts,
+        )
+        .expect("validated definition diagnostics remain structurally valid")
+        .into_vec()
+        .into_iter()
+        .map(|diagnostic| SolvedKernelDiagnostic {
+            metadata: PackedDiagnosticMetadata::Plain(diagnostic),
+            types: None,
+        })
+        .collect::<Vec<_>>();
         for (call_ordinal, call) in definition.calls().enumerate() {
             let call_target = call.target();
             let mut target_scheme = match call_target {
@@ -11579,14 +12125,14 @@ pub fn compile_owner_program_with_definition_facts(
 }
 
 fn compile_owner_program_with_definition_facts_and_text(
-    input: &KernelOwnerProgramInput,
+    rich_input: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
     text: ProjectTextSnapshot,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
     let mut call_digest_scratch = Vec::new();
-    validate_definition_linker_facts(input, facts, None, &mut call_digest_scratch)?;
-    let basis_fingerprint_v14 = definition_basis_fingerprint(input, facts)?;
-    if !input.external_expressions.is_empty() {
+    validate_definition_linker_facts(rich_input, facts, None, &mut call_digest_scratch)?;
+    let basis_fingerprint_v14 = definition_basis_fingerprint(rich_input, facts)?;
+    if !rich_input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
             "standalone owner program cannot import external expressions",
         ));
@@ -11641,11 +12187,22 @@ fn compile_owner_program_with_definition_facts_and_text(
             "standalone owner resources cannot reference another owner",
         ));
     }
-    let result = checked_expression_index(input.result, input.nodes.len(), "owner result")?;
-    let mut builder = ComponentProgramBuilder::with_text(text.clone());
+    let mut rich_program = KernelProjectProgramInput {
+        owners: vec![rich_input.clone()].into_boxed_slice(),
+    };
+    let mut terms = crate::TypeTermArena::with_text(text.clone());
+    crate::pack_project_closed_type_roots(&mut rich_program, &mut terms)?;
+    let packed_input_term_count = terms.len();
+    let packed_program = crate::pack_kernel_project_program(rich_program, &terms)?;
+    let input = packed_program
+        .owner(KernelOwnerId(0))
+        .expect("one-owner compatibility program retains owner zero");
+    let result = checked_expression_index(input.result(), input.node_count(), "owner result")?;
+    let mut builder = ComponentProgramBuilder::with_terms(terms);
     let mut mode_builder = ModeProgramBuilder::default();
-    let mut packed_input_imports = TypeTermImportScratch::default();
-    let formal_static_variants = vec![None; input.formal_count as usize];
+    let mut packed_input_imports =
+        TypeTermImportScratch::with_source_limit(packed_input_term_count);
+    let formal_static_variants = vec![None; input.formal_count() as usize];
     let formal_dependent_expressions = [owner_expressions_depend_on_formals(input)];
     let formal_dependent_results = [formal_dependent_expressions[0][result]];
     let principals = vec![allocate_owner_instance(
@@ -11680,17 +12237,17 @@ fn compile_owner_program_with_definition_facts_and_text(
     };
     let specialization = OwnerSpecialization {
         static_variants: principal.static_variants.clone(),
-        reachable: (0..input.nodes.len())
+        reachable: (0..input.node_count())
             .collect::<Vec<_>>()
             .into_boxed_slice(),
         result_syntax_selected: false,
-        syntax_selected_calls: vec![false; input.nodes.len()].into_boxed_slice(),
+        syntax_selected_calls: vec![false; input.node_count()].into_boxed_slice(),
         invocation_dependencies: formal_dependent_expressions[0].clone(),
-        transparent_type_providers: vec![None; input.nodes.len()].into_boxed_slice(),
+        transparent_type_providers: vec![None; input.node_count()].into_boxed_slice(),
     };
     let module = compile_residual_type_module(
         &text,
-        None,
+        Some(builder.terms()),
         &mut packed_input_imports,
         KernelOwnerId(0),
         input,
@@ -11709,7 +12266,7 @@ fn compile_owner_program_with_definition_facts_and_text(
         )));
     }
     append_residual_type_frame(&mut builder, &module, principal, &[])?;
-    for (index, node) in input.nodes.iter().enumerate() {
+    for (index, node) in input.nodes().iter().enumerate() {
         let equation = node_mode_equation(&mut mode_builder, &context, index, node)?;
         mode_builder.set(principal.expression_modes[index], equation);
     }
@@ -11717,7 +12274,7 @@ fn compile_owner_program_with_definition_facts_and_text(
     let expression_outputs = principal
         .expressions
         .iter()
-        .zip(input.nodes.iter())
+        .zip(input.nodes().iter())
         .map(|(variable, node)| builder.add_output(*variable, node.mode))
         .collect::<Vec<_>>();
     let formal_outputs = principal
@@ -11740,10 +12297,10 @@ fn compile_owner_program_with_definition_facts_and_text(
         .collect::<Vec<_>>()
         .into_boxed_slice();
     let result_output = expression_outputs[result];
-    let statements = collect_statement_artifacts(input, facts)?;
-    let declarations = collect_declaration_artifacts(input, facts)?;
-    let lexical_bindings = collect_lexical_binding_artifacts(input, facts)?;
-    let resources = collect_resource_artifacts(input, facts)?;
+    let statements = collect_statement_artifacts(rich_input, facts)?;
+    let declarations = collect_declaration_artifacts(rich_input, facts)?;
+    let lexical_bindings = collect_lexical_binding_artifacts(rich_input, facts)?;
+    let resources = collect_resource_artifacts(rich_input, facts)?;
     Ok(KernelOwnerProgram {
         component: builder.finish(),
         result_output,
@@ -11751,20 +12308,20 @@ fn compile_owner_program_with_definition_facts_and_text(
         formal_modes,
         expression_outputs: expression_outputs.into_boxed_slice(),
         expression_modes,
-        expression_artifacts: collect_expression_artifacts(input)?,
+        expression_artifacts: collect_expression_artifacts(rich_input)?,
         linkage: facts.linkage,
         relocations: facts.relocations.clone(),
         presentation: facts.presentation.clone(),
         expression_payloads: facts.expression_payloads.clone(),
-        call_syntax: collect_call_syntax_artifacts(input, facts)?,
-        execution_shapes: collect_execution_shape_artifacts(input, facts)?,
+        call_syntax: collect_call_syntax_artifacts(rich_input, facts)?,
+        execution_shapes: collect_execution_shape_artifacts(rich_input, facts)?,
         statements,
         declarations,
         lexical_bindings,
         resources,
-        calls: collect_call_artifacts(input, &vec![false; input.nodes.len()])?,
-        effects: collect_host_effect_artifacts(input)?,
-        diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
+        calls: collect_call_artifacts(rich_input, &vec![false; rich_input.nodes.len()])?,
+        effects: collect_host_effect_artifacts(rich_input)?,
+        diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), rich_input, facts)?,
         basis_fingerprint_v14,
     })
 }
@@ -11891,6 +12448,27 @@ fn kernel_value_reference(
     input
         .external_expressions
         .get(reference - input.nodes.len())
+        .copied()
+        .map(KernelValueReference::External)
+        .ok_or_else(|| {
+            KernelOwnerBuildError::new(format!(
+                "kernel expression {consumer} input references expression {reference} outside the local and external namespaces"
+            ))
+        })
+}
+
+fn packed_kernel_value_reference(
+    input: PackedKernelOwnerProgramRef<'_>,
+    expression: KernelExpressionId,
+    consumer: usize,
+) -> Result<KernelValueReference, KernelOwnerBuildError> {
+    let reference = expression.0 as usize;
+    if reference < input.node_count() {
+        return Ok(KernelValueReference::Local(expression));
+    }
+    input
+        .external_expressions()
+        .get(reference - input.node_count())
         .copied()
         .map(KernelValueReference::External)
         .ok_or_else(|| {
@@ -12717,11 +13295,11 @@ fn allocate_synthetic_state_ordinals(
 }
 
 fn allocate_project_synthetic_state_ordinals(
-    program: &KernelProjectProgramInput,
+    program: &PackedKernelProjectProgram,
     owners: &[KernelProjectOwnerOutputs],
     definition_facts: &[KernelDefinitionFactsInput],
 ) -> Box<[Box<[Option<u32>]>]> {
-    debug_assert_eq!(program.owners.len(), owners.len());
+    debug_assert_eq!(program.definition_count(), owners.len());
     debug_assert_eq!(definition_facts.len(), owners.len());
     let mut next_by_anchor = BTreeMap::<KernelOwnerId, u32>::new();
     owners
@@ -12735,8 +13313,10 @@ fn allocate_project_synthetic_state_ordinals(
                 .iter()
                 .map(|state| {
                     if !state.synthetic_path
-                        || !state_input_candidate_survives(
-                            &program.owners[owner],
+                        || !packed_state_input_candidate_survives(
+                            program
+                                .owner_at(owner)
+                                .expect("validated synthetic-state owner remains present"),
                             state,
                             &definition.expression_modes,
                         )
@@ -12762,6 +13342,7 @@ fn allocate_project_synthetic_state_ordinals(
         .into_boxed_slice()
 }
 
+#[cfg(test)]
 fn state_input_candidate_survives(
     input: &KernelOwnerProgramInput,
     state: &KernelStateInput,
@@ -12772,6 +13353,24 @@ fn state_input_candidate_survives(
     }
     let Ok(KernelValueReference::Local(initial)) =
         kernel_value_reference(input, state.initial, state.expression.0 as usize)
+    else {
+        return false;
+    };
+    expression_modes
+        .get(initial.0 as usize)
+        .is_some_and(|mode| *mode == FlowMode::Continuous)
+}
+
+fn packed_state_input_candidate_survives(
+    input: PackedKernelOwnerProgramRef<'_>,
+    state: &KernelStateInput,
+    expression_modes: &[FlowMode],
+) -> bool {
+    if state.kind != CheckedStateKind::InitialLatest {
+        return true;
+    }
+    let Ok(KernelValueReference::Local(initial)) =
+        packed_kernel_value_reference(input, state.initial, state.expression.0 as usize)
     else {
         return false;
     };
@@ -13434,6 +14033,29 @@ fn link_structural_declaration(
     }
 }
 
+fn link_packed_structural_declaration(
+    input: PackedKernelOwnerProgramRef<'_>,
+    declaration: KernelStructuralDeclarationInput,
+    value: KernelExpressionId,
+    consumer: usize,
+) -> Result<KernelDeclarationReference, KernelOwnerBuildError> {
+    match declaration {
+        KernelStructuralDeclarationInput::Local(declaration) => {
+            Ok(KernelDeclarationReference::Local(declaration))
+        }
+        KernelStructuralDeclarationInput::ValueOwnerPublic => {
+            let KernelValueReference::External(KernelExternalExpression { owner, .. }) =
+                packed_kernel_value_reference(input, value, consumer)?
+            else {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel structural expression {consumer} lost its external owner declaration"
+                )));
+            };
+            Ok(KernelDeclarationReference::OwnerPublic(owner))
+        }
+    }
+}
+
 fn collect_call_artifacts(
     input: &KernelOwnerProgramInput,
     syntax_discriminated_candidates: &[bool],
@@ -13552,24 +14174,23 @@ fn validate_project_call_inputs(
 }
 
 fn collect_project_call_solve_rows(
-    input: &KernelOwnerProgramInput,
+    input: PackedKernelOwnerProgramRef<'_>,
     syntax_discriminated_candidates: &[bool],
     syntax_discriminated_root_outputs: &[Option<OutputId>],
 ) -> Box<[KernelProjectCallSolve]> {
     input
-        .nodes
+        .nodes()
         .iter()
         .enumerate()
         .filter(|(_, node)| {
             matches!(
                 node.kind,
-                KernelOwnerNodeKind::UserCall { .. }
-                    | KernelOwnerNodeKind::RenderConstructor { .. }
-                    | KernelOwnerNodeKind::PureBuiltin { .. }
-                    | KernelOwnerNodeKind::FixedAbiCall { .. }
-                    | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
-                    | KernelOwnerNodeKind::HostEffect { .. }
-                    | KernelOwnerNodeKind::FieldProjection { .. }
+                PackedKernelOwnerNodeKind::UserCall { .. }
+                    | PackedKernelOwnerNodeKind::RenderConstructor { .. }
+                    | PackedKernelOwnerNodeKind::PureBuiltin { .. }
+                    | PackedKernelOwnerNodeKind::FixedAbiCall { .. }
+                    | PackedKernelOwnerNodeKind::HostEffect { .. }
+                    | PackedKernelOwnerNodeKind::FieldProjection { .. }
             )
         })
         .map(|(expression, _)| KernelProjectCallSolve {
@@ -13595,19 +14216,71 @@ fn collect_definition_diagnostic_artifacts(
     facts: &KernelDefinitionFactsInput,
 ) -> Result<Box<[KernelDiagnosticArtifact]>, KernelOwnerBuildError> {
     validate_definition_diagnostic_inputs(owner, input, facts)?;
-    facts
+    Ok(facts
         .diagnostics
         .iter()
-        .map(|diagnostic| {
-            Ok(KernelDiagnosticArtifact {
-                owner,
-                severity: diagnostic.severity,
-                site: diagnostic.site.clone(),
-                kind: diagnostic.kind.clone(),
-            })
+        .map(|diagnostic| KernelDiagnosticArtifact {
+            owner,
+            severity: diagnostic.severity,
+            site: diagnostic.site.clone(),
+            kind: diagnostic.kind.clone(),
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Vec::into_boxed_slice)
+        .collect::<Vec<_>>()
+        .into_boxed_slice())
+}
+
+fn collect_packed_definition_diagnostic_artifacts(
+    owner: KernelOwnerId,
+    input: PackedKernelOwnerProgramRef<'_>,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<Box<[KernelDiagnosticArtifact]>, KernelOwnerBuildError> {
+    validate_packed_definition_diagnostic_inputs(input, facts)?;
+    Ok(facts
+        .diagnostics
+        .iter()
+        .map(|diagnostic| KernelDiagnosticArtifact {
+            owner,
+            severity: diagnostic.severity,
+            site: diagnostic.site.clone(),
+            kind: diagnostic.kind.clone(),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice())
+}
+
+fn validate_packed_definition_diagnostic_inputs(
+    input: PackedKernelOwnerProgramRef<'_>,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<(), KernelOwnerBuildError> {
+    for diagnostic in &facts.diagnostics {
+        if matches!(&diagnostic.kind, KernelDiagnosticKind::CallInputType { .. }) {
+            return Err(KernelOwnerBuildError::new(
+                "definition diagnostic inputs cannot supply solved call-input type payloads",
+            ));
+        }
+        match diagnostic.site {
+            KernelDiagnosticSite::Expression { expression } => {
+                checked_expression_index(
+                    expression,
+                    input.node_count(),
+                    "source diagnostic expression",
+                )?;
+            }
+            KernelDiagnosticSite::CallArgument { call, .. }
+            | KernelDiagnosticSite::CallPass { call, .. } => {
+                checked_expression_index(call, input.node_count(), "call diagnostic expression")?;
+            }
+            KernelDiagnosticSite::CallInput { .. } => {
+                return Err(KernelOwnerBuildError::new(
+                    "definition diagnostic inputs cannot precompute solved call-input failures",
+                ));
+            }
+        }
+    }
+    for expression in facts.diagnostic_values.iter().copied() {
+        packed_kernel_value_reference(input, expression, expression.0 as usize)?;
+    }
+    Ok(())
 }
 
 fn validate_definition_diagnostic_inputs(
@@ -13687,6 +14360,52 @@ fn collect_host_effect_artifacts(
         .map(Vec::into_boxed_slice)
 }
 
+fn collect_packed_host_effect_artifacts(
+    input: PackedKernelOwnerProgramRef<'_>,
+) -> Result<Box<[KernelHostEffectArtifact]>, KernelOwnerBuildError> {
+    input
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter_map(|(expression, node)| {
+            let PackedKernelOwnerNodeKind::HostEffect { operation } = node.kind else {
+                return None;
+            };
+            Some((|| {
+                let operation = input.symbol(operation).ok_or_else(|| {
+                    KernelOwnerBuildError::new(format!(
+                        "kernel host-effect node {expression} references text outside its project authority"
+                    ))
+                })?;
+                let policy = host_effect_policy(operation).ok_or_else(|| {
+                    KernelOwnerBuildError::new(format!(
+                        "kernel host-effect node {expression} names unknown operation `{operation}`"
+                    ))
+                })?;
+                if policy.result_policy != ResultPolicySpec::ReturnValue
+                    || !policy.has_typed_schema
+                {
+                    return Err(KernelOwnerBuildError::new(format!(
+                        "kernel host-effect node {expression} operation `{operation}` has no return-value schema"
+                    )));
+                }
+                Ok(KernelHostEffectArtifact {
+                    expression: KernelExpressionId(
+                        u32::try_from(expression)
+                            .expect("kernel owner expression count exceeds u32"),
+                    ),
+                    operation: policy.operation.into(),
+                    replay: policy.replay,
+                    barrier: policy.barrier,
+                    result_policy: policy.result_policy,
+                    delivery: materialize_delivery_policy(policy.delivery),
+                })
+            })())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
+}
+
 fn validate_host_effect_inputs(
     input: &KernelOwnerProgramInput,
 ) -> Result<(), KernelOwnerBuildError> {
@@ -13737,59 +14456,59 @@ fn validate_project_expression_inputs(
 }
 
 fn expression_formal_dependencies(
-    owner: &KernelOwnerProgramInput,
+    owner: PackedKernelOwnerProgramRef<'_>,
     root: KernelExpressionId,
 ) -> BTreeSet<u32> {
     let mut dependencies = BTreeSet::new();
     let mut visited = BTreeSet::new();
     let mut pending = vec![root.0 as usize];
     while let Some(expression) = pending.pop() {
-        if expression >= owner.nodes.len() || !visited.insert(expression) {
+        if expression >= owner.node_count() || !visited.insert(expression) {
             continue;
         }
-        let node = &owner.nodes[expression];
+        let node = &owner.nodes()[expression];
         match &node.kind {
-            KernelOwnerNodeKind::FormalRead { formal, .. }
-            | KernelOwnerNodeKind::ContextRead { formal, .. } => {
+            PackedKernelOwnerNodeKind::FormalRead { formal, .. }
+            | PackedKernelOwnerNodeKind::ContextRead { formal, .. } => {
                 dependencies.insert(*formal);
             }
             _ => {}
         }
-        pending.extend(node.inputs.iter().filter_map(|input| {
+        pending.extend(node.inputs(owner).iter().filter_map(|input| {
             let input = input.expression.0 as usize;
-            (input < owner.nodes.len()).then_some(input)
+            (input < owner.node_count()).then_some(input)
         }));
     }
     dependencies
 }
 
 fn expression_contains_nested_formal_read(
-    owner: &KernelOwnerProgramInput,
+    owner: PackedKernelOwnerProgramRef<'_>,
     root: KernelExpressionId,
     formal: u32,
 ) -> bool {
     let mut visited = BTreeSet::new();
     let mut pending = vec![root.0 as usize];
     while let Some(expression) = pending.pop() {
-        if expression >= owner.nodes.len() || !visited.insert(expression) {
+        if expression >= owner.node_count() || !visited.insert(expression) {
             continue;
         }
-        let node = &owner.nodes[expression];
+        let node = &owner.nodes()[expression];
         if matches!(
             &node.kind,
-            KernelOwnerNodeKind::FormalRead {
+            PackedKernelOwnerNodeKind::FormalRead {
                 formal: candidate,
                 fields,
-            } | KernelOwnerNodeKind::ContextRead {
+            } | PackedKernelOwnerNodeKind::ContextRead {
                 formal: candidate,
                 fields,
-            } if *candidate == formal && !fields.is_empty()
+            } if *candidate == formal && *fields != boon_contract::PathId::ROOT
         ) {
             return true;
         }
-        pending.extend(node.inputs.iter().filter_map(|input| {
+        pending.extend(node.inputs(owner).iter().filter_map(|input| {
             let input = input.expression.0 as usize;
-            (input < owner.nodes.len()).then_some(input)
+            (input < owner.node_count()).then_some(input)
         }));
     }
     false
@@ -13804,28 +14523,28 @@ fn expression_contains_nested_formal_read(
 /// valid branch-discriminated call into a false diagnostic. Wrapper functions
 /// inherit the same property when they forward one of their formals into that
 /// parameter, so this is a small fixed point over the packed call graph.
-fn project_syntax_discriminated_formals(input: &KernelProjectProgramInput) -> Vec<Box<[u32]>> {
-    let mut formals = vec![BTreeSet::<u32>::new(); input.owners.len()];
-    for (owner_index, owner) in input.owners.iter().enumerate() {
+fn project_syntax_discriminated_formals(input: &PackedKernelProjectProgram) -> Vec<Box<[u32]>> {
+    let mut formals = vec![BTreeSet::<u32>::new(); input.definition_count()];
+    for (owner_index, owner) in input.owners().enumerate() {
         for node in owner
-            .nodes
+            .nodes()
             .iter()
-            .filter(|node| matches!(node.kind, KernelOwnerNodeKind::When))
+            .filter(|node| matches!(node.kind, PackedKernelOwnerNodeKind::When))
         {
             for selector in node
-                .inputs
+                .inputs(owner)
                 .iter()
-                .filter(|input| matches!(input.role, KernelOwnerEdgeRole::WhenInput))
+                .filter(|input| matches!(input.role, PackedKernelOwnerEdgeRole::WhenInput))
             {
                 for formal in expression_formal_dependencies(owner, selector.expression) {
                     let has_branch_projection = node
-                        .inputs
+                        .inputs(owner)
                         .iter()
-                        .filter(|input| matches!(input.role, KernelOwnerEdgeRole::WhenArm))
-                        .filter_map(|arm| owner.nodes.get(arm.expression.0 as usize))
+                        .filter(|input| matches!(input.role, PackedKernelOwnerEdgeRole::WhenArm))
+                        .filter_map(|arm| owner.node(arm.expression))
                         .flat_map(|arm| {
-                            arm.inputs.iter().filter(|input| {
-                                matches!(input.role, KernelOwnerEdgeRole::MatchOutput)
+                            arm.inputs(owner).iter().filter(|input| {
+                                matches!(input.role, PackedKernelOwnerEdgeRole::MatchOutput)
                             })
                         })
                         .any(|output| {
@@ -13841,9 +14560,9 @@ fn project_syntax_discriminated_formals(input: &KernelProjectProgramInput) -> Ve
 
     loop {
         let mut changed = false;
-        for (owner_index, owner) in input.owners.iter().enumerate() {
-            for node in &owner.nodes {
-                let KernelOwnerNodeKind::UserCall {
+        for (owner_index, owner) in input.owners().enumerate() {
+            for node in owner.nodes() {
+                let PackedKernelOwnerNodeKind::UserCall {
                     target,
                     inherited_formal,
                 } = &node.kind
@@ -13856,10 +14575,10 @@ fn project_syntax_discriminated_formals(input: &KernelProjectProgramInput) -> Ve
                 let inherited_is_discriminated = inherited_formal
                     .filter(|inherited| target_formals.contains(&inherited.target_ordinal));
                 let discriminated_inputs = node
-                    .inputs
+                    .inputs(owner)
                     .iter()
                     .filter_map(|input| {
-                        let KernelOwnerEdgeRole::CallArgument { ordinal } = input.role else {
+                        let PackedKernelOwnerEdgeRole::CallArgument { ordinal } = input.role else {
                             return None;
                         };
                         target_formals
@@ -13890,95 +14609,19 @@ fn project_syntax_discriminated_formals(input: &KernelProjectProgramInput) -> Ve
         .collect()
 }
 
-pub fn compile_project_program(
-    input: &KernelProjectProgramInput,
-) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
-    let facts = (0..input.owners.len())
-        .map(|_| KernelDefinitionFactsInput::default())
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    compile_project_program_with_definition_facts(input, &facts)
-}
-
-pub fn compile_project_program_with_definition_facts(
+/// Validate the compatibility DTO while its rich names and source-shaped
+/// rows are still available. Production consumes that DTO immediately after
+/// this gate; the packed compiler never reconstructs it merely to repeat
+/// compatibility validation.
+pub(crate) fn validate_compatibility_project_input(
     input: &KernelProjectProgramInput,
     facts: &[KernelDefinitionFactsInput],
-) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
+) -> Result<(), KernelOwnerBuildError> {
     if facts.len() != input.owners.len() {
         return Err(KernelOwnerBuildError::new(format!(
             "kernel project has {} owners but {} definition-fact tables",
             input.owners.len(),
             facts.len()
-        )));
-    }
-    let text = crate::text::compatibility_project_text_snapshot(
-        &input.owners,
-        facts,
-        &crate::KernelAbiInput::default(),
-    )?;
-    compile_project_program_with_definition_facts_abi_and_text(
-        Arc::new(input.clone()),
-        Arc::from(facts.to_vec()),
-        Arc::new(crate::KernelAbiInput::default()),
-        text,
-    )
-}
-
-pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
-    input: Arc<KernelProjectProgramInput>,
-    facts: Arc<[KernelDefinitionFactsInput]>,
-    abi: Arc<crate::KernelAbiInput>,
-    text: ProjectTextSnapshot,
-) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
-    let basis_fingerprints = Arc::from(project_definition_basis_fingerprints(&input, &facts)?);
-    let terms = crate::TypeTermArena::with_text(text.clone());
-    compile_project_program_with_definition_facts_abi_text_and_terms(
-        input,
-        facts,
-        abi,
-        text,
-        terms,
-        0,
-        basis_fingerprints,
-    )
-}
-
-/// Compile one project by consuming the exact mutable type authority prepared
-/// for this revision.
-///
-/// Compatibility entry points above still create an empty arena from their
-/// frozen text snapshot. Direct packed input instead interns its closed roots
-/// before this call and moves the same arena here; there is no cloneable or
-/// separately frozen prelude type store between input and solver.
-pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
-    input: Arc<KernelProjectProgramInput>,
-    facts: Arc<[KernelDefinitionFactsInput]>,
-    abi: Arc<crate::KernelAbiInput>,
-    text: ProjectTextSnapshot,
-    terms: crate::TypeTermArena,
-    packed_input_term_count: usize,
-    basis_fingerprints: Arc<[[u8; 32]]>,
-) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
-    let program = Arc::clone(&input);
-    let input = input.as_ref();
-    if facts.len() != input.owners.len() {
-        return Err(KernelOwnerBuildError::new(format!(
-            "kernel project has {} owners but {} definition-fact tables",
-            input.owners.len(),
-            facts.len()
-        )));
-    }
-    if basis_fingerprints.len() != input.owners.len() {
-        return Err(KernelOwnerBuildError::new(format!(
-            "kernel project has {} owners but {} definition-basis fingerprints",
-            input.owners.len(),
-            basis_fingerprints.len()
-        )));
-    }
-    if packed_input_term_count > terms.len() {
-        return Err(KernelOwnerBuildError::new(format!(
-            "kernel packed-input term prefix {packed_input_term_count} exceeds the {}-term source arena",
-            terms.len(),
         )));
     }
     let validate_project_declaration = |reference: KernelDeclarationReference,
@@ -14012,13 +14655,8 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
         Ok(())
     };
     let mut call_digest_scratch = Vec::new();
-    for (definition, facts) in facts.iter().enumerate() {
-        validate_definition_linker_facts(
-            &input.owners[definition],
-            facts,
-            Some(definition),
-            &mut call_digest_scratch,
-        )?;
+    for (definition, (owner, facts)) in input.owners.iter().zip(facts).enumerate() {
+        validate_definition_linker_facts(owner, facts, Some(definition), &mut call_digest_scratch)?;
         if let Some(reference) = facts.linkage.public_declaration {
             validate_project_declaration(
                 reference,
@@ -14075,6 +14713,126 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
             validate_resource_owner(list.declaration, "LIST row")?;
             validate_resource_statement_owner(list.statement, "LIST statement")?;
         }
+        let owner_id = KernelOwnerId(
+            u32::try_from(definition).expect("kernel project owner count exceeds u32"),
+        );
+        validate_project_expression_inputs(owner)?;
+        validate_project_call_inputs(owner)?;
+        validate_host_effect_inputs(owner)?;
+        validate_definition_diagnostic_inputs(owner_id, owner, facts)?;
+        validate_project_statement_inputs(owner, facts)?;
+        validate_project_declaration_inputs(owner, facts)?;
+        validate_project_lexical_inputs(owner, facts)?;
+        validate_project_resource_inputs(owner, facts)?;
+    }
+    Ok(())
+}
+
+pub fn compile_project_program(
+    input: &KernelProjectProgramInput,
+) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
+    let facts = (0..input.owners.len())
+        .map(|_| KernelDefinitionFactsInput::default())
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    compile_project_program_with_definition_facts(input, &facts)
+}
+
+pub fn compile_project_program_with_definition_facts(
+    input: &KernelProjectProgramInput,
+    facts: &[KernelDefinitionFactsInput],
+) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
+    if facts.len() != input.owners.len() {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel project has {} owners but {} definition-fact tables",
+            input.owners.len(),
+            facts.len()
+        )));
+    }
+    let text = crate::text::compatibility_project_text_snapshot(
+        &input.owners,
+        facts,
+        &crate::KernelAbiInput::default(),
+    )?;
+    compile_project_program_with_definition_facts_abi_and_text(
+        Arc::new(input.clone()),
+        Arc::from(facts.to_vec()),
+        Arc::new(crate::KernelAbiInput::default()),
+        text,
+    )
+}
+
+pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
+    input: Arc<KernelProjectProgramInput>,
+    facts: Arc<[KernelDefinitionFactsInput]>,
+    abi: Arc<crate::KernelAbiInput>,
+    text: ProjectTextSnapshot,
+) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
+    validate_compatibility_project_input(&input, &facts)?;
+    let basis_fingerprints = Arc::from(project_definition_basis_fingerprints(&input, &facts)?);
+    let mut terms = crate::TypeTermArena::with_text(text.clone());
+    let mut input = Arc::try_unwrap(input).unwrap_or_else(|input| input.as_ref().clone());
+    crate::pack_project_closed_type_roots(&mut input, &mut terms)?;
+    let packed_input_term_count = terms.len();
+    let input = Arc::new(crate::pack_kernel_project_program(input, &terms)?);
+    let runtime_facts = crate::pack_definition_facts_store(&text, &facts)?;
+    compile_project_program_with_definition_facts_abi_text_and_terms(
+        input,
+        facts,
+        runtime_facts,
+        abi,
+        text,
+        terms,
+        packed_input_term_count,
+        basis_fingerprints,
+    )
+}
+
+/// Compile one project by consuming the exact mutable type authority prepared
+/// for this revision.
+///
+/// Compatibility entry points above still create an empty arena from their
+/// frozen text snapshot. Direct packed input instead interns its closed roots
+/// before this call and moves the same arena here; there is no cloneable or
+/// separately frozen prelude type store between input and solver.
+pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
+    input: Arc<crate::PackedKernelProjectProgram>,
+    facts: Arc<[KernelDefinitionFactsInput]>,
+    runtime_facts: Arc<crate::PackedDefinitionFactsStore>,
+    abi: Arc<crate::KernelAbiInput>,
+    text: ProjectTextSnapshot,
+    terms: crate::TypeTermArena,
+    packed_input_term_count: usize,
+    basis_fingerprints: Arc<[[u8; 32]]>,
+) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
+    let program = Arc::clone(&input);
+    let input = input.as_ref();
+    if facts.len() != input.definition_count() {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel project has {} owners but {} definition-fact tables",
+            input.definition_count(),
+            facts.len()
+        )));
+    }
+    if runtime_facts.definition_count() != input.definition_count() {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel project has {} owners but {} packed definition-fact tables",
+            input.definition_count(),
+            runtime_facts.definition_count(),
+        )));
+    }
+    if basis_fingerprints.len() != input.definition_count() {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel project has {} owners but {} definition-basis fingerprints",
+            input.definition_count(),
+            basis_fingerprints.len()
+        )));
+    }
+    if packed_input_term_count > terms.len() {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel packed-input term prefix {packed_input_term_count} exceeds the {}-term source arena",
+            terms.len(),
+        )));
     }
     let mut builder = ComponentProgramBuilder::with_terms(terms);
     let mut mode_builder = ModeProgramBuilder::default();
@@ -14082,55 +14840,34 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
     let mut specializations = HashMap::new();
     let mut residual_modules = ResidualModuleCache::new(packed_input_term_count);
     let mut compile_work = KernelCompileWork {
-        definition_modules: input.owners.len() as u64,
-        principal_expressions: input
-            .owners
-            .iter()
-            .map(|owner| owner.nodes.len() as u64)
-            .sum(),
+        definition_modules: input.definition_count() as u64,
+        principal_expressions: input.owners().map(|owner| owner.node_count() as u64).sum(),
         ..KernelCompileWork::default()
     };
     let formal_dependent_expressions = input
-        .owners
-        .iter()
+        .owners()
         .map(owner_expressions_depend_on_formals)
         .collect::<Vec<_>>();
     let formal_dependent_results = input
-        .owners
-        .iter()
+        .owners()
         .zip(&formal_dependent_expressions)
         .map(|(owner, dependencies)| {
-            let result = owner.result.0 as usize;
+            let result = owner.result().0 as usize;
             dependencies.get(result).copied().unwrap_or(true)
         })
         .collect::<Vec<_>>();
     let principals = input
-        .owners
-        .iter()
+        .owners()
         .map(|owner| {
             allocate_owner_instance(
                 &mut builder,
                 &mut mode_builder,
                 &text,
                 owner,
-                &vec![None; owner.formal_count as usize],
+                &vec![None; owner.formal_count() as usize],
             )
         })
         .collect::<Vec<_>>();
-    for (owner_index, owner) in input.owners.iter().enumerate() {
-        let owner_id = KernelOwnerId(
-            u32::try_from(owner_index).expect("kernel project owner count exceeds u32"),
-        );
-        validate_owner_input(owner_id, owner, &principals)?;
-        validate_project_expression_inputs(owner)?;
-        validate_project_call_inputs(owner)?;
-        validate_host_effect_inputs(owner)?;
-        validate_definition_diagnostic_inputs(owner_id, owner, &facts[owner_index])?;
-        validate_project_statement_inputs(owner, &facts[owner_index])?;
-        validate_project_declaration_inputs(owner, &facts[owner_index])?;
-        validate_project_lexical_inputs(owner, &facts[owner_index])?;
-        validate_project_resource_inputs(owner, &facts[owner_index])?;
-    }
     // A call authored inside a formal-derived WHEN arm owns an exact branch
     // occurrence even when the callee itself contains no SELECT. Seed that
     // provenance from the caller graph before compiling nested callees; the
@@ -14138,8 +14875,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
     // callee. Starting from all-false silently downgraded branch-local calls
     // to their generic callable scheme during semantic OUT expansion.
     let mut syntax_discriminated_call_candidates = input
-        .owners
-        .iter()
+        .owners()
         .enumerate()
         .map(|(owner_index, owner)| {
             syntax_selected_call_nodes(
@@ -14152,9 +14888,8 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
         })
         .collect::<Vec<_>>();
     let mut syntax_discriminated_call_root_outputs = input
-        .owners
-        .iter()
-        .map(|owner| vec![None; owner.nodes.len()])
+        .owners()
+        .map(|owner| vec![None; owner.node_count()])
         .collect::<Vec<_>>();
     let syntax_discriminated_formals = project_syntax_discriminated_formals(input);
     let direct_summaries = compile_direct_result_summaries(&mut builder, input);
@@ -14186,7 +14921,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
                 .count() as u64,
         );
     }
-    for (owner_index, owner) in input.owners.iter().enumerate() {
+    for (owner_index, owner) in input.owners().enumerate() {
         let owner_id = KernelOwnerId(
             u32::try_from(owner_index).expect("kernel project owner count exceeds u32"),
         );
@@ -14216,13 +14951,13 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
         let mut stack = vec![owner_id];
         let specialization = OwnerSpecialization {
             static_variants: instance.static_variants.clone(),
-            reachable: (0..owner.nodes.len())
+            reachable: (0..owner.node_count())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             result_syntax_selected: false,
-            syntax_selected_calls: vec![false; owner.nodes.len()].into_boxed_slice(),
+            syntax_selected_calls: vec![false; owner.node_count()].into_boxed_slice(),
             invocation_dependencies: formal_dependent_expressions[owner_index].clone(),
-            transparent_type_providers: vec![None; owner.nodes.len()].into_boxed_slice(),
+            transparent_type_providers: vec![None; owner.node_count()].into_boxed_slice(),
         };
         let module = compile_residual_type_module(
             &text,
@@ -14249,8 +14984,8 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
         let external_variables = principal_external_variables(owner, input, &principals)?;
         append_residual_type_frame(&mut builder, &module, instance, &external_variables)?;
         compile_work.residual_frames = compile_work.residual_frames.saturating_add(1);
-        for (index, node) in owner.nodes.iter().enumerate() {
-            if matches!(node.kind, KernelOwnerNodeKind::UserCall { .. }) {
+        for (index, node) in owner.nodes().iter().enumerate() {
+            if matches!(node.kind, PackedKernelOwnerNodeKind::UserCall { .. }) {
                 compile_node(
                     &mut builder,
                     &mut mode_builder,
@@ -14276,19 +15011,18 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
     }
     let modes = mode_builder.solve();
     let owners = input
-        .owners
-        .iter()
+        .owners()
         .enumerate()
         .map(|(owner_index, owner)| {
             let result = checked_expression_index(
-                owner.result,
-                owner.nodes.len(),
+                owner.result(),
+                owner.node_count(),
                 &format!("project owner {owner_index} result"),
             )?;
             let expressions = principals[owner_index]
                 .expressions
                 .iter()
-                .zip(owner.nodes.iter())
+                .zip(owner.nodes().iter())
                 .map(|(variable, node)| builder.add_output(*variable, node.mode))
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
@@ -14382,6 +15116,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
         program,
         owners: owners.into_boxed_slice(),
         definition_facts: facts,
+        runtime_facts,
         abi,
         compile_work,
     })
@@ -14658,7 +15393,7 @@ fn allocate_owner_instance(
     builder: &mut ComponentProgramBuilder,
     mode_builder: &mut ModeProgramBuilder,
     text: &ProjectTextSnapshot,
-    owner: &KernelOwnerProgramInput,
+    owner: PackedKernelOwnerProgramRef<'_>,
     formal_static_variants: &[Option<StaticVariantSet>],
 ) -> OwnerInstance {
     let static_variants =
@@ -14676,13 +15411,13 @@ fn allocate_owner_instance(
 fn allocate_owner_instance_with_static_variants(
     builder: &mut ComponentProgramBuilder,
     mode_builder: &mut ModeProgramBuilder,
-    owner: &KernelOwnerProgramInput,
+    owner: PackedKernelOwnerProgramRef<'_>,
     formal_static_variants: &[Option<StaticVariantSet>],
     static_variants: Vec<Option<StaticVariantSet>>,
     transparent_type_providers: Option<&[Option<usize>]>,
 ) -> OwnerInstance {
-    let mut expressions = Vec::with_capacity(owner.nodes.len());
-    for (index, node) in owner.nodes.iter().enumerate() {
+    let mut expressions = Vec::with_capacity(owner.node_count());
+    for (index, node) in owner.nodes().iter().enumerate() {
         if let Some(provider) = transparent_type_providers.and_then(|providers| providers[index]) {
             expressions.push(
                 *expressions
@@ -14691,24 +15426,24 @@ fn allocate_owner_instance_with_static_variants(
             );
         } else if matches!(
             node.kind,
-            KernelOwnerNodeKind::FormalRead { .. }
-                | KernelOwnerNodeKind::ContextRead { .. }
-                | KernelOwnerNodeKind::LexicalRead { .. }
-                | KernelOwnerNodeKind::PatternRead { .. }
+            PackedKernelOwnerNodeKind::FormalRead { .. }
+                | PackedKernelOwnerNodeKind::ContextRead { .. }
+                | PackedKernelOwnerNodeKind::LexicalRead { .. }
+                | PackedKernelOwnerNodeKind::PatternRead { .. }
         ) {
             expressions.push(builder.new_variable());
         } else {
             expressions.push(builder.new_authoritative_provider());
         }
     }
-    assert_eq!(formal_static_variants.len(), owner.formal_count as usize);
+    assert_eq!(formal_static_variants.len(), owner.formal_count() as usize);
     let expression_modes = owner
-        .nodes
+        .nodes()
         .iter()
         .map(|node| mode_builder.new_variable(node.mode))
         .collect::<Vec<_>>()
         .into();
-    let formal_modes = (0..owner.formal_count)
+    let formal_modes = (0..owner.formal_count())
         .map(|_| mode_builder.new_variable(FlowMode::Continuous))
         .collect::<Vec<_>>();
     let formal_mode_sources = formal_modes
@@ -14719,10 +15454,10 @@ fn allocate_owner_instance_with_static_variants(
         .into();
     OwnerInstance {
         expressions,
-        formals: (0..owner.formal_count)
+        formals: (0..owner.formal_count())
             .map(|_| builder.new_contextual_hole())
             .collect(),
-        formal_requirements: (0..owner.formal_count)
+        formal_requirements: (0..owner.formal_count())
             .map(|_| builder.new_contextual_hole())
             .collect(),
         expression_modes,
@@ -14736,7 +15471,7 @@ fn allocate_owner_instance_with_static_variants(
 fn allocate_invocation_owner_instance(
     builder: &mut ComponentProgramBuilder,
     mode_builder: &mut ModeProgramBuilder,
-    owner: &KernelOwnerProgramInput,
+    owner: PackedKernelOwnerProgramRef<'_>,
     principal: &OwnerInstance,
     actuals: &[CallActual],
     formal_static_variants: &[Option<StaticVariantSet>],
@@ -14745,9 +15480,9 @@ fn allocate_invocation_owner_instance(
     reachable: &[usize],
     transparent_type_providers: &[Option<usize>],
 ) -> (OwnerInstance, u64) {
-    assert_eq!(actuals.len(), owner.formal_count as usize);
-    assert_eq!(expression_dependencies.len(), owner.nodes.len());
-    let mut reachable_expressions = vec![false; owner.nodes.len()];
+    assert_eq!(actuals.len(), owner.formal_count() as usize);
+    assert_eq!(expression_dependencies.len(), owner.node_count());
+    let mut reachable_expressions = vec![false; owner.node_count()];
     for index in reachable {
         reachable_expressions[*index] = true;
     }
@@ -14756,8 +15491,8 @@ fn allocate_invocation_owner_instance(
         .zip(expression_dependencies)
         .filter(|(reachable, dependent)| !**reachable && **dependent)
         .count() as u64;
-    let mut expressions = Vec::with_capacity(owner.nodes.len());
-    for (index, node) in owner.nodes.iter().enumerate() {
+    let mut expressions = Vec::with_capacity(owner.node_count());
+    for (index, node) in owner.nodes().iter().enumerate() {
         if !expression_dependencies[index] || !reachable_expressions[index] {
             expressions.push(principal.expressions[index]);
         } else if let Some(provider) = transparent_type_providers[index] {
@@ -14768,10 +15503,10 @@ fn allocate_invocation_owner_instance(
             );
         } else if matches!(
             node.kind,
-            KernelOwnerNodeKind::FormalRead { .. }
-                | KernelOwnerNodeKind::ContextRead { .. }
-                | KernelOwnerNodeKind::LexicalRead { .. }
-                | KernelOwnerNodeKind::PatternRead { .. }
+            PackedKernelOwnerNodeKind::FormalRead { .. }
+                | PackedKernelOwnerNodeKind::ContextRead { .. }
+                | PackedKernelOwnerNodeKind::LexicalRead { .. }
+                | PackedKernelOwnerNodeKind::PatternRead { .. }
         ) {
             expressions.push(builder.new_variable());
         } else {
@@ -14779,7 +15514,7 @@ fn allocate_invocation_owner_instance(
         }
     }
     let expression_modes = owner
-        .nodes
+        .nodes()
         .iter()
         .enumerate()
         .map(|(index, node)| {
@@ -14795,7 +15530,7 @@ fn allocate_invocation_owner_instance(
         OwnerInstance {
             expressions,
             formals: actuals.iter().map(|actual| actual.variable).collect(),
-            formal_requirements: (0..owner.formal_count)
+            formal_requirements: (0..owner.formal_count())
                 .map(|_| builder.new_contextual_hole())
                 .collect(),
             expression_modes,
@@ -14821,7 +15556,7 @@ struct OwnerCompileContext<'a> {
     initial_state_surface: bool,
     text: &'a ProjectTextSnapshot,
     owner: KernelOwnerId,
-    input: &'a KernelOwnerProgramInput,
+    input: PackedKernelOwnerProgramRef<'a>,
     expressions: &'a [TypeVariableId],
     formals: &'a [TypeVariableId],
     formal_requirements: &'a [TypeVariableId],
@@ -14830,7 +15565,7 @@ struct OwnerCompileContext<'a> {
     formal_mode_sources: &'a Arc<[ModeSource]>,
     static_variants: &'a [Option<StaticVariantSet>],
     formal_static_variants: &'a [Option<StaticVariantSet>],
-    project: Option<&'a KernelProjectProgramInput>,
+    project: Option<&'a PackedKernelProjectProgram>,
     principals: &'a [OwnerInstance],
     formal_dependent_results: &'a [bool],
     formal_dependent_expressions: &'a [Box<[bool]>],
@@ -14844,53 +15579,22 @@ struct OwnerCompileContext<'a> {
     packed_input_types: Option<PackedInputTypeProjection<'a>>,
 }
 
-fn validate_owner_input(
-    owner_id: KernelOwnerId,
-    owner: &KernelOwnerProgramInput,
-    principals: &[OwnerInstance],
-) -> Result<(), KernelOwnerBuildError> {
-    checked_expression_index(owner.result, owner.nodes.len(), "project owner result")?;
-    for (index, external) in owner.external_expressions.iter().enumerate() {
-        let Some(target) = principals.get(external.owner.0 as usize) else {
-            return Err(KernelOwnerBuildError::new(format!(
-                "project owner {} external expression {index} targets missing owner {}",
-                owner_id.0, external.owner.0
-            )));
-        };
-        if let KernelExternalTarget::Expression(expression) = external.target {
-            checked_expression_index(
-                expression,
-                target.expressions.len(),
-                &format!("project owner {} external expression {index}", owner_id.0),
-            )?;
-        }
-    }
-    Ok(())
-}
-
 fn edge_static_variants(
     context: &OwnerCompileContext<'_>,
-    edge: &KernelOwnerInputEdge,
+    edge: &crate::PackedKernelOwnerInputEdge,
 ) -> Option<StaticVariantSet> {
     let expression = edge.expression.0 as usize;
-    if expression < context.input.nodes.len() {
+    if expression < context.input.node_count() {
         return context.static_variants[expression].clone();
     }
     let external = context
         .input
-        .external_expressions
-        .get(expression.checked_sub(context.input.nodes.len())?)?;
+        .external_expressions()
+        .get(expression.checked_sub(context.input.node_count())?)?;
     let owner = context.principals.get(external.owner.0 as usize)?;
     let expression = match external.target {
         KernelExternalTarget::Expression(expression) => expression.0 as usize,
-        KernelExternalTarget::Result => {
-            context
-                .project?
-                .owners
-                .get(external.owner.0 as usize)?
-                .result
-                .0 as usize
-        }
+        KernelExternalTarget::Result => context.project?.owner(external.owner)?.result().0 as usize,
     };
     owner.static_variants.get(expression)?.clone()
 }
@@ -14898,22 +15602,14 @@ fn edge_static_variants(
 fn infer_static_variants(
     text: &ProjectTextSnapshot,
     terms: &crate::TypeTermArena,
-    owner: &KernelOwnerProgramInput,
+    owner: PackedKernelOwnerProgramRef<'_>,
     formal_static_variants: &[Option<StaticVariantSet>],
 ) -> Vec<Option<StaticVariantSet>> {
-    let mut variants = vec![None; owner.nodes.len()];
-    for (index, node) in owner.nodes.iter().enumerate() {
+    let mut variants = vec![None; owner.node_count()];
+    for (index, node) in owner.nodes().iter().enumerate() {
         variants[index] = match &node.kind {
-            KernelOwnerNodeKind::Known(Type::VariantSet(values))
-            | KernelOwnerNodeKind::Source(Type::VariantSet(values)) => Some(static_variant_set(
-                values.iter().map(|variant| match variant {
-                    Variant::Tag(tag) | Variant::Tagged { tag, .. } => {
-                        static_variant_symbol(text, tag)
-                    }
-                }),
-            )),
-            KernelOwnerNodeKind::KnownPacked(reference)
-            | KernelOwnerNodeKind::SourcePacked(reference) => terms
+            PackedKernelOwnerNodeKind::Known(reference)
+            | PackedKernelOwnerNodeKind::Source(reference) => terms
                 .resolve_type_ref(*reference)
                 .and_then(|term| match terms.term(term) {
                     TypeTerm::VariantSet(values) => {
@@ -14921,28 +15617,28 @@ fn infer_static_variants(
                     }
                     _ => None,
                 }),
-            KernelOwnerNodeKind::Tag(tag) => {
-                Some(static_variant_set([static_variant_symbol(text, tag)]))
+            PackedKernelOwnerNodeKind::Tag(tag) => Some(static_variant_set([*tag])),
+            PackedKernelOwnerNodeKind::Record { tag: Some(tag) } => {
+                Some(static_variant_set([*tag]))
             }
-            KernelOwnerNodeKind::Record { tag: Some(tag) } => {
-                Some(static_variant_set([static_variant_symbol(text, tag)]))
-            }
-            KernelOwnerNodeKind::FormalRead { formal, fields }
-            | KernelOwnerNodeKind::ContextRead { formal, fields }
-                if fields.is_empty() =>
+            PackedKernelOwnerNodeKind::FormalRead { formal, fields }
+            | PackedKernelOwnerNodeKind::ContextRead { formal, fields }
+                if *fields == boon_contract::PathId::ROOT =>
             {
                 formal_static_variants
                     .get(*formal as usize)
                     .cloned()
                     .flatten()
             }
-            KernelOwnerNodeKind::Infix { operation } if infix_returns_bool(operation) => {
+            PackedKernelOwnerNodeKind::Infix { operation }
+                if text.symbol(*operation).is_some_and(infix_returns_bool) =>
+            {
                 Some(static_variant_set([
                     static_variant_symbol(text, "False"),
                     static_variant_symbol(text, "True"),
                 ]))
             }
-            KernelOwnerNodeKind::PureBuiltin {
+            PackedKernelOwnerNodeKind::PureBuiltin {
                 kind:
                     KernelPureBuiltinKind::TextPredicate
                     | KernelPureBuiltinKind::ListPredicate
@@ -14952,62 +15648,62 @@ fn infer_static_variants(
                 static_variant_symbol(text, "False"),
                 static_variant_symbol(text, "True"),
             ])),
-            KernelOwnerNodeKind::PureBuiltin {
+            PackedKernelOwnerNodeKind::PureBuiltin {
                 kind: KernelPureBuiltinKind::StreamPulses,
             } => Some(static_variant_set([static_variant_symbol(text, "Pulse")])),
             _ => None,
         };
     }
-    for _ in 0..=owner.nodes.len() {
+    for _ in 0..=owner.node_count() {
         let mut changed = false;
-        for (index, node) in owner.nodes.iter().enumerate() {
+        for (index, node) in owner.nodes().iter().enumerate() {
             let next = match &node.kind {
-                KernelOwnerNodeKind::Block => {
+                PackedKernelOwnerNodeKind::Block => {
                     merge_static_edge_variants(owner, node, &variants, |role| {
-                        matches!(role, KernelOwnerEdgeRole::BlockResult)
+                        matches!(role, PackedKernelOwnerEdgeRole::BlockResult)
                     })
                 }
-                KernelOwnerNodeKind::LexicalRead { fields }
-                | KernelOwnerNodeKind::ValueRead { fields, .. }
-                | KernelOwnerNodeKind::DerivedRead { fields }
-                    if fields.is_empty() =>
+                PackedKernelOwnerNodeKind::LexicalRead { fields }
+                | PackedKernelOwnerNodeKind::ValueRead { fields, .. }
+                | PackedKernelOwnerNodeKind::DerivedRead { fields }
+                    if *fields == boon_contract::PathId::ROOT =>
                 {
                     merge_static_edge_variants(owner, node, &variants, |role| {
-                        matches!(role, KernelOwnerEdgeRole::ReadProvider)
+                        matches!(role, PackedKernelOwnerEdgeRole::ReadProvider)
                     })
                 }
-                KernelOwnerNodeKind::Latest => {
+                PackedKernelOwnerNodeKind::Latest => {
                     merge_static_edge_variants(owner, node, &variants, |role| {
-                        matches!(role, KernelOwnerEdgeRole::LatestBranch)
+                        matches!(role, PackedKernelOwnerEdgeRole::LatestBranch)
                     })
                 }
-                KernelOwnerNodeKind::When => {
+                PackedKernelOwnerNodeKind::When => {
                     let arms = possible_when_arm_expressions(text, owner, index, &variants);
                     merge_static_expression_variants(&arms, &variants)
                 }
-                KernelOwnerNodeKind::Then => {
+                PackedKernelOwnerNodeKind::Then => {
                     let has_output = node
-                        .inputs
+                        .inputs(owner)
                         .iter()
-                        .any(|edge| matches!(edge.role, KernelOwnerEdgeRole::ThenOutput));
+                        .any(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::ThenOutput));
                     merge_static_edge_variants(owner, node, &variants, |role| {
-                        matches!(role, KernelOwnerEdgeRole::ThenOutput)
-                            || (!has_output && matches!(role, KernelOwnerEdgeRole::ThenInput))
+                        matches!(role, PackedKernelOwnerEdgeRole::ThenOutput)
+                            || (!has_output && matches!(role, PackedKernelOwnerEdgeRole::ThenInput))
                     })
                 }
-                KernelOwnerNodeKind::Draining => {
+                PackedKernelOwnerNodeKind::Draining => {
                     merge_static_edge_variants(owner, node, &variants, |role| {
-                        matches!(role, KernelOwnerEdgeRole::DrainingInput)
+                        matches!(role, PackedKernelOwnerEdgeRole::DrainingInput)
                     })
                 }
-                KernelOwnerNodeKind::MatchArm { .. } => {
+                PackedKernelOwnerNodeKind::MatchArm { .. } => {
                     merge_static_edge_variants(owner, node, &variants, |role| {
-                        matches!(role, KernelOwnerEdgeRole::MatchOutput)
+                        matches!(role, PackedKernelOwnerEdgeRole::MatchOutput)
                     })
                 }
-                KernelOwnerNodeKind::Arrow => {
+                PackedKernelOwnerNodeKind::Arrow => {
                     merge_static_edge_variants(owner, node, &variants, |role| {
-                        matches!(role, KernelOwnerEdgeRole::ArrowOutput)
+                        matches!(role, PackedKernelOwnerEdgeRole::ArrowOutput)
                     })
                 }
                 _ => variants[index].clone(),
@@ -15065,20 +15761,20 @@ fn packed_term_has_concrete_outer_shape(terms: &crate::TypeTermArena, term: Type
 }
 
 fn merge_static_edge_variants(
-    owner: &KernelOwnerProgramInput,
-    node: &KernelOwnerNode,
+    owner: PackedKernelOwnerProgramRef<'_>,
+    node: &PackedKernelOwnerNode,
     variants: &[Option<StaticVariantSet>],
-    selected: impl Fn(&KernelOwnerEdgeRole) -> bool,
+    selected: impl Fn(&PackedKernelOwnerEdgeRole) -> bool,
 ) -> Option<StaticVariantSet> {
     let expressions = node
-        .inputs
+        .inputs(owner)
         .iter()
         .filter(|edge| selected(&edge.role))
         .map(|edge| edge.expression.0 as usize)
         .collect::<Vec<_>>();
     if expressions
         .iter()
-        .any(|expression| *expression >= owner.nodes.len())
+        .any(|expression| *expression >= owner.node_count())
     {
         return None;
     }
@@ -15100,25 +15796,25 @@ fn merge_static_expression_variants(
 }
 
 fn possible_when_arm_expressions(
-    text: &ProjectTextSnapshot,
-    owner: &KernelOwnerProgramInput,
+    _text: &ProjectTextSnapshot,
+    owner: PackedKernelOwnerProgramRef<'_>,
     when: usize,
     variants: &[Option<StaticVariantSet>],
 ) -> Vec<usize> {
-    let node = &owner.nodes[when];
+    let node = &owner.nodes()[when];
     let arms = node
-        .inputs
+        .inputs(owner)
         .iter()
-        .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::WhenArm))
+        .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::WhenArm))
         .map(|edge| edge.expression.0 as usize)
-        .filter(|arm| *arm < owner.nodes.len())
+        .filter(|arm| *arm < owner.node_count())
         .collect::<Vec<_>>();
     let selector = node
-        .inputs
+        .inputs(owner)
         .iter()
-        .find(|edge| matches!(edge.role, KernelOwnerEdgeRole::WhenInput))
+        .find(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::WhenInput))
         .map(|edge| edge.expression.0 as usize)
-        .filter(|selector| *selector < owner.nodes.len())
+        .filter(|selector| *selector < owner.node_count())
         .and_then(|selector| variants.get(selector))
         .and_then(Option::as_ref);
     let Some(selector) = selector else {
@@ -15128,9 +15824,9 @@ fn possible_when_arm_expressions(
     for tag in selector.iter().copied() {
         if let Some(arm) = arms.iter().copied().find(|arm| {
             matches!(
-                &owner.nodes[*arm].kind,
-                KernelOwnerNodeKind::MatchArm { pattern }
-                    if static_pattern_accepts_tag(text, pattern, tag)
+                &owner.nodes()[*arm].kind,
+                PackedKernelOwnerNodeKind::MatchArm { pattern }
+                    if static_pattern_accepts_tag(pattern, tag)
             )
         }) {
             selected.insert(arm);
@@ -15139,24 +15835,20 @@ fn possible_when_arm_expressions(
     selected.into_iter().collect()
 }
 
-fn static_pattern_accepts_tag(
-    text: &ProjectTextSnapshot,
-    pattern: &KernelPattern,
-    tag: SymbolId,
-) -> bool {
+fn static_pattern_accepts_tag(pattern: &crate::PackedKernelPattern, tag: SymbolId) -> bool {
     match pattern {
-        KernelPattern::Wildcard | KernelPattern::Binding { .. } => true,
-        KernelPattern::Tag { name, .. } => text.lookup_symbol(name) == Some(tag),
-        KernelPattern::Number
-        | KernelPattern::Text
-        | KernelPattern::Bits { .. }
-        | KernelPattern::Invalid => false,
+        crate::PackedKernelPattern::Wildcard | crate::PackedKernelPattern::Binding { .. } => true,
+        crate::PackedKernelPattern::Tag { name, .. } => *name == tag,
+        crate::PackedKernelPattern::Number
+        | crate::PackedKernelPattern::Text
+        | crate::PackedKernelPattern::Bits { .. }
+        | crate::PackedKernelPattern::Invalid => false,
     }
 }
 
 fn reachable_owner_nodes(
     text: &ProjectTextSnapshot,
-    owner: &KernelOwnerProgramInput,
+    owner: PackedKernelOwnerProgramRef<'_>,
     result: usize,
     variants: &[Option<StaticVariantSet>],
 ) -> BTreeSet<usize> {
@@ -15166,22 +15858,22 @@ fn reachable_owner_nodes(
         if !reachable.insert(index) {
             continue;
         }
-        let node = &owner.nodes[index];
-        if matches!(node.kind, KernelOwnerNodeKind::When) {
+        let node = &owner.nodes()[index];
+        if matches!(node.kind, PackedKernelOwnerNodeKind::When) {
             pending.extend(
-                node.inputs
+                node.inputs(owner)
                     .iter()
-                    .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::WhenInput))
+                    .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::WhenInput))
                     .map(|edge| edge.expression.0 as usize)
-                    .filter(|input| *input < owner.nodes.len()),
+                    .filter(|input| *input < owner.node_count()),
             );
             pending.extend(possible_when_arm_expressions(text, owner, index, variants));
         } else {
             pending.extend(
-                node.inputs
+                node.inputs(owner)
                     .iter()
                     .map(|edge| edge.expression.0 as usize)
-                    .filter(|input| *input < owner.nodes.len()),
+                    .filter(|input| *input < owner.node_count()),
             );
         }
     }
@@ -15198,21 +15890,21 @@ fn reachable_owner_nodes(
 /// evaluator merely to rediscover a tag nested inside another call's record.
 fn syntax_selected_call_nodes(
     text: &ProjectTextSnapshot,
-    owner: &KernelOwnerProgramInput,
+    owner: PackedKernelOwnerProgramRef<'_>,
     variants: &[Option<StaticVariantSet>],
     formal_dependencies: &[bool],
 ) -> Box<[bool]> {
-    let mut selected_calls = vec![false; owner.nodes.len()];
-    for (when, node) in owner.nodes.iter().enumerate() {
-        if !matches!(node.kind, KernelOwnerNodeKind::When) {
+    let mut selected_calls = vec![false; owner.node_count()];
+    for (when, node) in owner.nodes().iter().enumerate() {
+        if !matches!(node.kind, PackedKernelOwnerNodeKind::When) {
             continue;
         }
         let Some(selector) = node
-            .inputs
+            .inputs(owner)
             .iter()
-            .find(|edge| matches!(edge.role, KernelOwnerEdgeRole::WhenInput))
+            .find(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::WhenInput))
             .map(|edge| edge.expression.0 as usize)
-            .filter(|selector| *selector < owner.nodes.len())
+            .filter(|selector| *selector < owner.node_count())
         else {
             continue;
         };
@@ -15223,8 +15915,8 @@ fn syntax_selected_call_nodes(
         for arm in arms {
             for expression in reachable_owner_nodes(text, owner, arm, variants) {
                 if matches!(
-                    owner.nodes[expression].kind,
-                    KernelOwnerNodeKind::UserCall { .. }
+                    owner.nodes()[expression].kind,
+                    PackedKernelOwnerNodeKind::UserCall { .. }
                 ) {
                     selected_calls[expression] = true;
                 }
@@ -15235,7 +15927,7 @@ fn syntax_selected_call_nodes(
 }
 
 fn invocation_expression_dependencies(
-    owner: &KernelOwnerProgramInput,
+    owner: PackedKernelOwnerProgramRef<'_>,
     formal_dependencies: &[bool],
     syntax_selected_calls: &[bool],
 ) -> Box<[bool]> {
@@ -15246,11 +15938,11 @@ fn invocation_expression_dependencies(
         .collect::<Vec<_>>();
     loop {
         let mut changed = false;
-        for (index, node) in owner.nodes.iter().enumerate() {
+        for (index, node) in owner.nodes().iter().enumerate() {
             if dependent[index] {
                 continue;
             }
-            if node.inputs.iter().any(|edge| {
+            if node.inputs(owner).iter().any(|edge| {
                 dependent
                     .get(edge.expression.0 as usize)
                     .copied()
@@ -15272,39 +15964,39 @@ fn invocation_expression_dependencies(
 /// artifacts. Specialized invocation frames may point a transparent match arm
 /// directly at its sole output, because the enclosing SELECT owns detachment
 /// and publication. Field-backed delimiter arms remain real record producers.
-fn transparent_type_providers(owner: &KernelOwnerProgramInput) -> Box<[Option<usize>]> {
-    let mut has_use = vec![false; owner.nodes.len()];
-    let mut select_only = vec![true; owner.nodes.len()];
-    for node in &owner.nodes {
-        for edge in &node.inputs {
+fn transparent_type_providers(owner: PackedKernelOwnerProgramRef<'_>) -> Box<[Option<usize>]> {
+    let mut has_use = vec![false; owner.node_count()];
+    let mut select_only = vec![true; owner.node_count()];
+    for node in owner.nodes() {
+        for edge in node.inputs(owner) {
             let expression = edge.expression.0 as usize;
-            if expression >= owner.nodes.len() {
+            if expression >= owner.node_count() {
                 continue;
             }
             has_use[expression] = true;
-            select_only[expression] &= matches!(edge.role, KernelOwnerEdgeRole::WhenArm);
+            select_only[expression] &= matches!(edge.role, PackedKernelOwnerEdgeRole::WhenArm);
         }
     }
     owner
-        .nodes
+        .nodes()
         .iter()
         .enumerate()
         .map(|(expression, node)| {
-            let KernelOwnerNodeKind::MatchArm { .. } = node.kind else {
+            let PackedKernelOwnerNodeKind::MatchArm { .. } = node.kind else {
                 return None;
             };
             let mut outputs = node
-                .inputs
+                .inputs(owner)
                 .iter()
-                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::MatchOutput));
+                .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::MatchOutput));
             let output = outputs.next()?;
             let provider = output.expression.0 as usize;
             (outputs.next().is_none()
-                && node.inputs.len() == 1
+                && node.inputs(owner).len() == 1
                 && provider < expression
                 && has_use[expression]
                 && select_only[expression]
-                && owner.result.0 as usize != expression)
+                && owner.result().0 as usize != expression)
                 .then_some(provider)
         })
         .collect::<Vec<_>>()
@@ -15321,18 +16013,18 @@ fn transparent_type_providers(owner: &KernelOwnerProgramInput) -> Box<[Option<us
 /// formal requirement. User-call inherited formals are implicit inputs, so
 /// they are treated as dependencies even though they do not have an ordinary
 /// edge.
-fn owner_expressions_depend_on_formals(owner: &KernelOwnerProgramInput) -> Box<[bool]> {
+fn owner_expressions_depend_on_formals(owner: PackedKernelOwnerProgramRef<'_>) -> Box<[bool]> {
     let mut dependent = owner
-        .nodes
+        .nodes()
         .iter()
         .map(|node| {
             matches!(
                 node.kind,
-                KernelOwnerNodeKind::FormalRead { .. }
-                    | KernelOwnerNodeKind::ContextRead { .. }
-                    | KernelOwnerNodeKind::FreshOut
-                    | KernelOwnerNodeKind::Hold
-                    | KernelOwnerNodeKind::UserCall {
+                PackedKernelOwnerNodeKind::FormalRead { .. }
+                    | PackedKernelOwnerNodeKind::ContextRead { .. }
+                    | PackedKernelOwnerNodeKind::FreshOut
+                    | PackedKernelOwnerNodeKind::Hold
+                    | PackedKernelOwnerNodeKind::UserCall {
                         inherited_formal: Some(_),
                         ..
                     }
@@ -15341,11 +16033,11 @@ fn owner_expressions_depend_on_formals(owner: &KernelOwnerProgramInput) -> Box<[
         .collect::<Vec<_>>();
     loop {
         let mut changed = false;
-        for (index, node) in owner.nodes.iter().enumerate() {
+        for (index, node) in owner.nodes().iter().enumerate() {
             if dependent[index] {
                 continue;
             }
-            if node.inputs.iter().any(|edge| {
+            if node.inputs(owner).iter().any(|edge| {
                 dependent
                     .get(edge.expression.0 as usize)
                     .copied()
@@ -15364,7 +16056,7 @@ fn owner_expressions_depend_on_formals(owner: &KernelOwnerProgramInput) -> Box<[
 fn import_residual_packed_input_types<'a>(
     builder: &mut ComponentProgramBuilder,
     source: &'a crate::TypeTermArena,
-    owner: &KernelOwnerProgramInput,
+    owner: PackedKernelOwnerProgramRef<'_>,
     specialization: &OwnerSpecialization,
     invocation_dependencies: Option<&[bool]>,
     transparent_type_providers: Option<&[Option<usize>]>,
@@ -15376,10 +16068,10 @@ fn import_residual_packed_input_types<'a>(
         {
             return None;
         }
-        owner.nodes.get(index).and_then(|node| match node.kind {
-            KernelOwnerNodeKind::KnownPacked(reference)
-            | KernelOwnerNodeKind::SourcePacked(reference)
-            | KernelOwnerNodeKind::FixedAbiCallPacked { result: reference } => Some(reference),
+        owner.nodes().get(index).and_then(|node| match node.kind {
+            PackedKernelOwnerNodeKind::Known(reference)
+            | PackedKernelOwnerNodeKind::Source(reference)
+            | PackedKernelOwnerNodeKind::FixedAbiCall { result: reference } => Some(reference),
             _ => None,
         })
     };
@@ -15427,8 +16119,8 @@ fn compile_residual_type_module(
     packed_input_source: Option<&crate::TypeTermArena>,
     packed_input_imports: &mut TypeTermImportScratch,
     owner_id: KernelOwnerId,
-    owner: &KernelOwnerProgramInput,
-    project: Option<&KernelProjectProgramInput>,
+    owner: PackedKernelOwnerProgramRef<'_>,
+    project: Option<&PackedKernelProjectProgram>,
     principals: &[OwnerInstance],
     formal_dependent_results: &[bool],
     formal_dependent_expressions: &[Box<[bool]>],
@@ -15476,7 +16168,7 @@ fn compile_residual_type_module(
         residual_transparent_type_providers.as_deref(),
     );
     let external_variables = owner
-        .external_expressions
+        .external_expressions()
         .iter()
         .map(|_| builder.new_contextual_hole())
         .collect::<Vec<_>>();
@@ -15520,13 +16212,13 @@ fn compile_residual_type_module(
         {
             continue;
         }
-        let node = owner.nodes.get(index).ok_or_else(|| {
+        let node = owner.nodes().get(index).ok_or_else(|| {
             KernelOwnerBuildError::new(format!(
                 "residual module owner {} references missing node {index}",
                 owner_id.0
             ))
         })?;
-        if matches!(node.kind, KernelOwnerNodeKind::UserCall { .. }) {
+        if matches!(node.kind, PackedKernelOwnerNodeKind::UserCall { .. }) {
             calls.push(index);
             continue;
         }
@@ -15627,12 +16319,12 @@ fn append_residual_type_frame(
 }
 
 fn principal_external_variables(
-    owner: &KernelOwnerProgramInput,
-    project: &KernelProjectProgramInput,
+    owner: PackedKernelOwnerProgramRef<'_>,
+    project: &PackedKernelProjectProgram,
     principals: &[OwnerInstance],
 ) -> Result<Vec<TypeVariableId>, KernelOwnerBuildError> {
     owner
-        .external_expressions
+        .external_expressions()
         .iter()
         .map(|external| {
             let target_instance = principals.get(external.owner.0 as usize).ok_or_else(|| {
@@ -15641,24 +16333,21 @@ fn principal_external_variables(
                     external.owner.0
                 ))
             })?;
-            let target_owner = project
-                .owners
-                .get(external.owner.0 as usize)
-                .ok_or_else(|| {
-                    KernelOwnerBuildError::new(format!(
-                        "residual module imports missing owner input {}",
-                        external.owner.0
-                    ))
-                })?;
+            let target_owner = project.owner(external.owner).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "residual module imports missing owner input {}",
+                    external.owner.0
+                ))
+            })?;
             let expression = match external.target {
                 KernelExternalTarget::Expression(expression) => checked_expression_index(
                     expression,
-                    target_owner.nodes.len(),
+                    target_owner.node_count(),
                     "residual external expression",
                 )?,
                 KernelExternalTarget::Result => checked_expression_index(
-                    target_owner.result,
-                    target_owner.nodes.len(),
+                    target_owner.result(),
+                    target_owner.node_count(),
                     "residual external result",
                 )?,
             };
@@ -15681,7 +16370,7 @@ fn specialize_owner(
     compile_work: &mut KernelCompileWork,
     text: &ProjectTextSnapshot,
     terms: &crate::TypeTermArena,
-    project: &KernelProjectProgramInput,
+    project: &PackedKernelProjectProgram,
     formal_dependent_expressions: &[Box<[bool]>],
     target: KernelOwnerId,
     actuals: &[CallActual],
@@ -15710,13 +16399,13 @@ fn specialize_owner_static(
     compile_work: &mut KernelCompileWork,
     text: &ProjectTextSnapshot,
     terms: &crate::TypeTermArena,
-    project: &KernelProjectProgramInput,
+    project: &PackedKernelProjectProgram,
     formal_dependent_expressions: &[Box<[bool]>],
     target: KernelOwnerId,
     formal_static_variants: Box<[Option<StaticVariantSet>]>,
     initial_state_surface: bool,
 ) -> Result<(SpecializationKey, OwnerSpecialization), KernelOwnerBuildError> {
-    let owner = project.owners.get(target.0 as usize).ok_or_else(|| {
+    let owner = project.owner(target).ok_or_else(|| {
         KernelOwnerBuildError::new(format!("user call targets missing owner {}", target.0))
     })?;
     let key = SpecializationKey {
@@ -15730,23 +16419,26 @@ fn specialize_owner_static(
         return Ok((key, specialization.clone()));
     }
     let static_variants = infer_static_variants(text, terms, owner, &formal_static_variants);
-    let result =
-        checked_expression_index(owner.result, owner.nodes.len(), "specialized owner result")?;
+    let result = checked_expression_index(
+        owner.result(),
+        owner.node_count(),
+        "specialized owner result",
+    )?;
     let reachable = reachable_owner_nodes(text, owner, result, &static_variants)
         .into_iter()
         .collect::<Vec<_>>()
         .into_boxed_slice();
     let dependencies = &formal_dependent_expressions[target.0 as usize];
     let local_result_syntax_selected = reachable.iter().copied().any(|expression| {
-        let node = &owner.nodes[expression];
-        if !matches!(node.kind, KernelOwnerNodeKind::When) {
+        let node = &owner.nodes()[expression];
+        if !matches!(node.kind, PackedKernelOwnerNodeKind::When) {
             return false;
         }
-        node.inputs
+        node.inputs(owner)
             .iter()
-            .find(|edge| matches!(edge.role, KernelOwnerEdgeRole::WhenInput))
+            .find(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::WhenInput))
             .map(|edge| edge.expression.0 as usize)
-            .filter(|selector| *selector < owner.nodes.len())
+            .filter(|selector| *selector < owner.node_count())
             .is_some_and(|selector| {
                 dependencies.get(selector).copied().unwrap_or(false)
                     && static_variants
@@ -15782,7 +16474,7 @@ fn instantiate_owner(
     residual_modules: &mut ResidualModuleCache,
     compile_work: &mut KernelCompileWork,
     text: &ProjectTextSnapshot,
-    project: &KernelProjectProgramInput,
+    project: &PackedKernelProjectProgram,
     principals: &[OwnerInstance],
     formal_dependent_results: &[bool],
     formal_dependent_expressions: &[Box<[bool]>],
@@ -15795,15 +16487,15 @@ fn instantiate_owner(
     let target = specialization_key.target;
     let initial_state_surface = specialization_key.initial_state_surface;
     compile_work.max_call_depth = compile_work.max_call_depth.max(stack.len() as u64);
-    let owner = project.owners.get(target.0 as usize).ok_or_else(|| {
+    let owner = project.owner(target).ok_or_else(|| {
         KernelOwnerBuildError::new(format!("user call targets missing owner {}", target.0))
     })?;
-    if actuals.len() != owner.formal_count as usize {
+    if actuals.len() != owner.formal_count() as usize {
         return Err(KernelOwnerBuildError::new(format!(
             "user call to owner {} supplies {} actuals for {} formals",
             target.0,
             actuals.len(),
-            owner.formal_count
+            owner.formal_count()
         )));
     }
     if stack.contains(&target) {
@@ -15827,9 +16519,9 @@ fn instantiate_owner(
         initial_state_surface,
     };
     let owns_state = owner
-        .nodes
+        .nodes()
         .iter()
-        .any(|node| matches!(node.kind, KernelOwnerNodeKind::Hold));
+        .any(|node| matches!(node.kind, PackedKernelOwnerNodeKind::Hold));
     if !owns_state {
         if let Some(instance) = invocations.get(&key) {
             compile_work.reused_invocation_frames =
@@ -15928,8 +16620,8 @@ fn instantiate_owner(
             if !expression_dependencies[index] {
                 continue;
             }
-            let node = &owner.nodes[index];
-            if matches!(node.kind, KernelOwnerNodeKind::UserCall { .. }) {
+            let node = &owner.nodes()[index];
+            if matches!(node.kind, PackedKernelOwnerNodeKind::UserCall { .. }) {
                 compile_node(
                     builder,
                     mode_builder,
@@ -15975,204 +16667,201 @@ fn instantiate_owner(
 }
 
 fn direct_result_summary_supported(
-    project: &KernelProjectProgramInput,
+    project: &PackedKernelProjectProgram,
     owner_id: KernelOwnerId,
     expression: usize,
     active: &mut BTreeSet<(KernelOwnerId, usize)>,
 ) -> bool {
-    let Some(owner) = project.owners.get(owner_id.0 as usize) else {
+    let Some(owner) = project.owner(owner_id) else {
         return false;
     };
-    let Some(node) = owner.nodes.get(expression) else {
+    let Some(node) = owner.nodes().get(expression) else {
         return false;
     };
     if !active.insert((owner_id, expression)) {
         return false;
     }
-    let child = |edge: &KernelOwnerInputEdge, active: &mut BTreeSet<(KernelOwnerId, usize)>| {
+    let child = |edge: &crate::PackedKernelOwnerInputEdge,
+                 active: &mut BTreeSet<(KernelOwnerId, usize)>| {
         direct_result_summary_supported(project, owner_id, edge.expression.0 as usize, active)
     };
+    let inputs = node.inputs(owner);
     let supported = match &node.kind {
-        KernelOwnerNodeKind::Known(ty) | KernelOwnerNodeKind::Source(ty) => {
-            type_is_recursively_closed(ty)
+        PackedKernelOwnerNodeKind::Known(_) | PackedKernelOwnerNodeKind::Source(_) => {
+            inputs.is_empty()
         }
-        KernelOwnerNodeKind::KnownPacked(_) | KernelOwnerNodeKind::SourcePacked(_) => {
-            node.inputs.is_empty()
-        }
-        KernelOwnerNodeKind::Absent
-        | KernelOwnerNodeKind::Text
-        | KernelOwnerNodeKind::Number
-        | KernelOwnerNodeKind::Byte
-        | KernelOwnerNodeKind::Bits(_)
-        | KernelOwnerNodeKind::Tag(_)
-        | KernelOwnerNodeKind::FormalRead { .. }
-        | KernelOwnerNodeKind::ContextRead { .. } => node.inputs.is_empty(),
-        KernelOwnerNodeKind::TextTemplate => node.inputs.iter().all(|edge| {
-            matches!(edge.role, KernelOwnerEdgeRole::TextDynamic) && child(edge, active)
+        PackedKernelOwnerNodeKind::Absent
+        | PackedKernelOwnerNodeKind::Text
+        | PackedKernelOwnerNodeKind::Number
+        | PackedKernelOwnerNodeKind::Byte
+        | PackedKernelOwnerNodeKind::Bits(_)
+        | PackedKernelOwnerNodeKind::Tag(_)
+        | PackedKernelOwnerNodeKind::FormalRead { .. }
+        | PackedKernelOwnerNodeKind::ContextRead { .. } => inputs.is_empty(),
+        PackedKernelOwnerNodeKind::TextTemplate => inputs.iter().all(|edge| {
+            matches!(edge.role, PackedKernelOwnerEdgeRole::TextDynamic) && child(edge, active)
         }),
-        KernelOwnerNodeKind::Record { .. } => node.inputs.iter().all(|edge| {
-            matches!(edge.role, KernelOwnerEdgeRole::RecordField { .. }) && child(edge, active)
+        PackedKernelOwnerNodeKind::Record { .. } => inputs.iter().all(|edge| {
+            matches!(edge.role, PackedKernelOwnerEdgeRole::RecordField { .. })
+                && child(edge, active)
         }),
-        KernelOwnerNodeKind::Collection { kind, .. } => match kind {
+        PackedKernelOwnerNodeKind::Collection { kind, .. } => match kind {
             KernelCollectionKind::List
             | KernelCollectionKind::Bytes
-            | KernelCollectionKind::Set => node.inputs.iter().all(|edge| {
-                matches!(edge.role, KernelOwnerEdgeRole::CollectionItem) && child(edge, active)
+            | KernelCollectionKind::Set => inputs.iter().all(|edge| {
+                matches!(edge.role, PackedKernelOwnerEdgeRole::CollectionItem)
+                    && child(edge, active)
             }),
-            KernelCollectionKind::Map => node.inputs.iter().all(|edge| {
-                matches!(edge.role, KernelOwnerEdgeRole::MapEntry) && child(edge, active)
+            KernelCollectionKind::Map => inputs.iter().all(|edge| {
+                matches!(edge.role, PackedKernelOwnerEdgeRole::MapEntry) && child(edge, active)
             }),
         },
-        KernelOwnerNodeKind::MapEntry => node.inputs.iter().all(|edge| {
+        PackedKernelOwnerNodeKind::MapEntry => inputs.iter().all(|edge| {
             matches!(
                 edge.role,
-                KernelOwnerEdgeRole::MapKey | KernelOwnerEdgeRole::MapValue
+                PackedKernelOwnerEdgeRole::MapKey | PackedKernelOwnerEdgeRole::MapValue
             ) && child(edge, active)
         }),
-        KernelOwnerNodeKind::Block => {
-            let results = node
-                .inputs
+        PackedKernelOwnerNodeKind::Block => {
+            let mut results = inputs
                 .iter()
-                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::BlockResult))
-                .collect::<Vec<_>>();
-            matches!(results.as_slice(), [result] if child(result, active))
+                .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::BlockResult));
+            results
+                .next()
+                .is_some_and(|result| results.next().is_none() && child(result, active))
         }
-        KernelOwnerNodeKind::Draining => {
-            let inputs = node
-                .inputs
+        PackedKernelOwnerNodeKind::Draining => {
+            let mut draining = inputs
                 .iter()
-                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::DrainingInput))
-                .collect::<Vec<_>>();
-            matches!(inputs.as_slice(), [input] if child(input, active))
+                .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::DrainingInput));
+            draining
+                .next()
+                .is_some_and(|input| draining.next().is_none() && child(input, active))
         }
-        KernelOwnerNodeKind::LexicalRead { .. }
-        | KernelOwnerNodeKind::ValueRead { .. }
-        | KernelOwnerNodeKind::DerivedRead { .. } => {
-            let providers = node
-                .inputs
+        PackedKernelOwnerNodeKind::LexicalRead { .. }
+        | PackedKernelOwnerNodeKind::ValueRead { .. }
+        | PackedKernelOwnerNodeKind::DerivedRead { .. } => {
+            let providers = inputs
                 .iter()
-                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider))
+                .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::ReadProvider))
                 .collect::<Vec<_>>();
             matches!(providers.as_slice(), [provider] if {
                 let reference = provider.expression.0 as usize;
-                if reference < owner.nodes.len() {
+                if reference < owner.node_count() {
                     direct_result_summary_supported(project, owner_id, reference, active)
                 } else {
                     owner
-                        .external_expressions
-                        .get(reference - owner.nodes.len())
+                        .external_expressions()
+                        .get(reference - owner.node_count())
                         .is_some()
                 }
             })
         }
         // A pattern projection owns tag-sensitive formal shaping and cannot
         // be represented by the generic field-projection summary bytecode.
-        KernelOwnerNodeKind::PatternRead { .. } => false,
-        KernelOwnerNodeKind::UserCall { target, .. } => {
-            let Some(target_owner) = project.owners.get(target.0 as usize) else {
+        PackedKernelOwnerNodeKind::PatternRead { .. } => false,
+        PackedKernelOwnerNodeKind::UserCall { target, .. } => {
+            let Some(target_owner) = project.owner(*target) else {
                 active.remove(&(owner_id, expression));
                 return false;
             };
-            node.inputs.iter().all(|edge| {
-                matches!(edge.role, KernelOwnerEdgeRole::CallArgument { .. }) && child(edge, active)
+            inputs.iter().all(|edge| {
+                matches!(edge.role, PackedKernelOwnerEdgeRole::CallArgument { .. })
+                    && child(edge, active)
             }) && direct_result_summary_supported(
                 project,
                 *target,
-                target_owner.result.0 as usize,
+                target_owner.result().0 as usize,
                 active,
             )
         }
-        KernelOwnerNodeKind::RenderConstructor { .. } => node.inputs.iter().all(|edge| {
-            matches!(edge.role, KernelOwnerEdgeRole::AbiArgument { .. }) && child(edge, active)
+        PackedKernelOwnerNodeKind::RenderConstructor { .. } => inputs.iter().all(|edge| {
+            matches!(edge.role, PackedKernelOwnerEdgeRole::AbiArgument { .. })
+                && child(edge, active)
         }),
-        KernelOwnerNodeKind::PureBuiltin { kind }
+        PackedKernelOwnerNodeKind::PureBuiltin { kind }
             if direct_summary_fixed_builtin_supported(*kind) =>
         {
-            node.inputs.iter().all(|edge| {
-                matches!(edge.role, KernelOwnerEdgeRole::AbiArgument { .. }) && child(edge, active)
+            inputs.iter().all(|edge| {
+                matches!(edge.role, PackedKernelOwnerEdgeRole::AbiArgument { .. })
+                    && child(edge, active)
             })
         }
-        KernelOwnerNodeKind::When => {
-            let selectors = node
-                .inputs
+        PackedKernelOwnerNodeKind::When => {
+            let selectors = inputs
                 .iter()
-                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::WhenInput))
+                .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::WhenInput))
                 .collect::<Vec<_>>();
             matches!(selectors.as_slice(), [selector] if child(selector, active))
-                && node.inputs.iter().all(|edge| match edge.role {
-                    KernelOwnerEdgeRole::WhenInput => true,
-                    KernelOwnerEdgeRole::WhenArm => child(edge, active),
+                && inputs.iter().all(|edge| match edge.role {
+                    PackedKernelOwnerEdgeRole::WhenInput => true,
+                    PackedKernelOwnerEdgeRole::WhenArm => child(edge, active),
                     _ => false,
                 })
         }
-        KernelOwnerNodeKind::MatchArm { .. } => {
-            let outputs = node
-                .inputs
+        PackedKernelOwnerNodeKind::MatchArm { .. } => {
+            let outputs = inputs
                 .iter()
-                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::MatchOutput))
+                .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::MatchOutput))
                 .collect::<Vec<_>>();
             if !outputs.is_empty() {
-                matches!(outputs.as_slice(), [output] if node.inputs.len() == 1 && child(output, active))
-            } else if node
-                .inputs
+                matches!(outputs.as_slice(), [output] if inputs.len() == 1 && child(output, active))
+            } else if inputs
                 .iter()
-                .any(|edge| matches!(edge.role, KernelOwnerEdgeRole::RecordField { .. }))
+                .any(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::RecordField { .. }))
             {
-                node.inputs.iter().all(|edge| {
-                    matches!(edge.role, KernelOwnerEdgeRole::RecordField { .. })
+                inputs.iter().all(|edge| {
+                    matches!(edge.role, PackedKernelOwnerEdgeRole::RecordField { .. })
                         && child(edge, active)
                 })
             } else {
-                node.inputs.is_empty()
+                inputs.is_empty()
             }
         }
-        KernelOwnerNodeKind::Then => {
-            let has_output = node
-                .inputs
+        PackedKernelOwnerNodeKind::Then => {
+            let has_output = inputs
                 .iter()
-                .any(|edge| matches!(edge.role, KernelOwnerEdgeRole::ThenOutput));
-            let selected = node
-                .inputs
+                .any(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::ThenOutput));
+            let selected = inputs
                 .iter()
                 .filter(|edge| {
-                    matches!(edge.role, KernelOwnerEdgeRole::ThenOutput)
-                        || (!has_output && matches!(edge.role, KernelOwnerEdgeRole::ThenInput))
+                    matches!(edge.role, PackedKernelOwnerEdgeRole::ThenOutput)
+                        || (!has_output
+                            && matches!(edge.role, PackedKernelOwnerEdgeRole::ThenInput))
                 })
                 .collect::<Vec<_>>();
             matches!(selected.as_slice(), [value] if child(value, active))
-                && node.inputs.iter().all(|edge| {
+                && inputs.iter().all(|edge| {
                     matches!(
                         edge.role,
-                        KernelOwnerEdgeRole::ThenInput | KernelOwnerEdgeRole::ThenOutput
+                        PackedKernelOwnerEdgeRole::ThenInput
+                            | PackedKernelOwnerEdgeRole::ThenOutput
                     ) && child(edge, active)
                 })
         }
-        KernelOwnerNodeKind::Infix { .. } => {
-            let left = node
-                .inputs
+        PackedKernelOwnerNodeKind::Infix { .. } => {
+            let left = inputs
                 .iter()
-                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::InfixLeft))
+                .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::InfixLeft))
                 .collect::<Vec<_>>();
-            let right = node
-                .inputs
+            let right = inputs
                 .iter()
-                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::InfixRight))
+                .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::InfixRight))
                 .collect::<Vec<_>>();
             matches!(left.as_slice(), [left] if child(left, active))
                 && matches!(right.as_slice(), [right] if child(right, active))
-                && node.inputs.len() == 2
+                && inputs.len() == 2
         }
-        KernelOwnerNodeKind::Arrow => {
-            let outputs = node
-                .inputs
+        PackedKernelOwnerNodeKind::Arrow => {
+            let outputs = inputs
                 .iter()
-                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ArrowOutput))
+                .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::ArrowOutput))
                 .collect::<Vec<_>>();
-            matches!(outputs.as_slice(), [output] if node.inputs.len() == 1 && child(output, active))
+            matches!(outputs.as_slice(), [output] if inputs.len() == 1 && child(output, active))
         }
-        KernelOwnerNodeKind::Delimiter
-        | KernelOwnerNodeKind::Unknown
-        | KernelOwnerNodeKind::FreshOut => node.inputs.is_empty(),
+        PackedKernelOwnerNodeKind::Delimiter
+        | PackedKernelOwnerNodeKind::Unknown
+        | PackedKernelOwnerNodeKind::FreshOut => inputs.is_empty(),
         _ => false,
     };
     active.remove(&(owner_id, expression));
@@ -16257,7 +16946,7 @@ struct PlannedSummaryValue {
 
 struct DirectSummaryPlanCompiler<'a> {
     builder: &'a mut ComponentProgramBuilder,
-    project: &'a KernelProjectProgramInput,
+    project: &'a PackedKernelProjectProgram,
     summaries: &'a [Option<Arc<CompiledDirectSummary>>],
     nodes: Vec<KernelSummaryNode>,
     inputs: Vec<DirectSummaryInput>,
@@ -16318,16 +17007,13 @@ impl DirectSummaryPlanCompiler<'_> {
     fn project_value(
         &mut self,
         value: PlannedSummaryValue,
-        fields: &[Box<str>],
+        fields: PackedKernelPathRef<'_>,
         mode: DirectSummaryMode,
     ) -> Option<PlannedSummaryValue> {
         if fields.is_empty() {
             return Some(value);
         }
-        let fields = fields
-            .iter()
-            .map(|field| self.builder.terms_mut().intern_name(field))
-            .collect::<Vec<_>>();
+        let fields = fields.iter().collect::<Vec<_>>();
         if let Some(input) = value.formal_projection_input {
             let DirectSummaryInput::FormalProjection {
                 formal,
@@ -16448,8 +17134,9 @@ impl DirectSummaryPlanCompiler<'_> {
             return None;
         }
         let result = (|| {
-            let owner = self.project.owners.get(owner_id.0 as usize)?;
-            let node = owner.nodes.get(expression)?;
+            let owner = self.project.owner(owner_id)?;
+            let node = owner.nodes().get(expression)?;
+            let node_inputs = node.inputs(owner);
             let fixed_mode = DirectSummaryMode::Fixed {
                 owner: owner_id,
                 expression,
@@ -16460,31 +17147,23 @@ impl DirectSummaryPlanCompiler<'_> {
                 formal_projection_input: None,
             };
             match &node.kind {
-                KernelOwnerNodeKind::Known(ty) | KernelOwnerNodeKind::Source(ty)
-                    if type_is_recursively_closed(ty) =>
-                {
-                    let value = self.builder.terms_mut().import_checked_type(ty, &mut |_| {
-                        unreachable!("compiled direct-summary ABI type is closed")
-                    });
-                    Some(term_value(self, value))
-                }
-                KernelOwnerNodeKind::KnownPacked(reference)
-                | KernelOwnerNodeKind::SourcePacked(reference) => {
+                PackedKernelOwnerNodeKind::Known(reference)
+                | PackedKernelOwnerNodeKind::Source(reference) => {
                     let value = self.builder.terms().resolve_type_ref(*reference)?;
                     Some(term_value(self, value))
                 }
-                KernelOwnerNodeKind::Absent => {
+                PackedKernelOwnerNodeKind::Absent => {
                     let value = self.builder.terms().absent();
                     Some(term_value(self, value))
                 }
-                KernelOwnerNodeKind::Text => {
+                PackedKernelOwnerNodeKind::Text => {
                     let value = self.builder.terms().text();
                     Some(term_value(self, value))
                 }
-                KernelOwnerNodeKind::TextTemplate => {
-                    let mut dependencies = Vec::with_capacity(node.inputs.len());
-                    for edge in &node.inputs {
-                        if !matches!(edge.role, KernelOwnerEdgeRole::TextDynamic) {
+                PackedKernelOwnerNodeKind::TextTemplate => {
+                    let mut dependencies = Vec::with_capacity(node_inputs.len());
+                    for edge in node_inputs {
+                        if !matches!(edge.role, PackedKernelOwnerEdgeRole::TextDynamic) {
                             return None;
                         }
                         dependencies.push(
@@ -16508,32 +17187,29 @@ impl DirectSummaryPlanCompiler<'_> {
                         formal_projection_input: None,
                     })
                 }
-                KernelOwnerNodeKind::Number => {
+                PackedKernelOwnerNodeKind::Number => {
                     let value = self.builder.terms().number();
                     Some(term_value(self, value))
                 }
-                KernelOwnerNodeKind::Byte => {
+                PackedKernelOwnerNodeKind::Byte => {
                     let value = self.builder.terms_mut().bytes(crate::BytesTerm::Fixed(1));
                     Some(term_value(self, value))
                 }
-                KernelOwnerNodeKind::Bits(width) => {
+                PackedKernelOwnerNodeKind::Bits(width) => {
                     let value = self.builder.terms_mut().bits(*width);
                     Some(term_value(self, value))
                 }
-                KernelOwnerNodeKind::Tag(tag) => {
-                    let tag = self.builder.terms_mut().variant_tag(tag);
+                PackedKernelOwnerNodeKind::Tag(tag) => {
+                    let tag = VariantTerm::Tag(*tag);
                     let value = self.builder.terms_mut().variant_set([tag]);
                     Some(term_value(self, value))
                 }
-                KernelOwnerNodeKind::FormalRead { formal, fields } => {
+                PackedKernelOwnerNodeKind::FormalRead { formal, fields } => {
+                    let fields = owner.path(*fields)?;
                     let actual = actuals.get(*formal as usize)?;
                     match actual {
                         PlannedSummaryActual::Formal(formal) => {
-                            let fields = fields
-                                .iter()
-                                .map(|field| self.builder.terms_mut().intern_name(field))
-                                .collect::<Vec<_>>()
-                                .into_boxed_slice();
+                            let fields = fields.iter().collect::<Vec<_>>().into_boxed_slice();
                             Some(self.push_formal_projection(*formal, fields, true))
                         }
                         PlannedSummaryActual::Value(value) => {
@@ -16541,15 +17217,12 @@ impl DirectSummaryPlanCompiler<'_> {
                         }
                     }
                 }
-                KernelOwnerNodeKind::ContextRead { formal, fields } => {
+                PackedKernelOwnerNodeKind::ContextRead { formal, fields } => {
+                    let fields = owner.path(*fields)?;
                     let actual = actuals.get(*formal as usize)?;
                     match actual {
                         PlannedSummaryActual::Formal(formal) => {
-                            let fields = fields
-                                .iter()
-                                .map(|field| self.builder.terms_mut().intern_name(field))
-                                .collect::<Vec<_>>()
-                                .into_boxed_slice();
+                            let fields = fields.iter().collect::<Vec<_>>().into_boxed_slice();
                             Some(self.push_formal_projection(*formal, fields, false))
                         }
                         PlannedSummaryActual::Value(value) => {
@@ -16557,10 +17230,11 @@ impl DirectSummaryPlanCompiler<'_> {
                         }
                     }
                 }
-                KernelOwnerNodeKind::Record { tag } => {
-                    let mut entries = Vec::with_capacity(node.inputs.len());
-                    for edge in &node.inputs {
-                        let KernelOwnerEdgeRole::RecordField { name, spread } = &edge.role else {
+                PackedKernelOwnerNodeKind::Record { tag } => {
+                    let mut entries = Vec::with_capacity(node_inputs.len());
+                    for edge in node_inputs {
+                        let PackedKernelOwnerEdgeRole::RecordField { name, spread } = edge.role
+                        else {
                             return None;
                         };
                         let value = self.compile_expression(
@@ -16569,19 +17243,16 @@ impl DirectSummaryPlanCompiler<'_> {
                             actuals,
                             active,
                         )?;
-                        if *spread {
+                        if spread {
                             entries.push(KernelSummaryRecordEntry::Spread { value: value.value });
                         } else {
-                            let name = self.builder.terms_mut().intern_name(name);
                             entries.push(KernelSummaryRecordEntry::Field {
                                 name,
                                 value: value.value,
                             });
                         }
                     }
-                    let tag = tag
-                        .as_ref()
-                        .map(|tag| self.builder.terms_mut().intern_name(tag));
+                    let tag = *tag;
                     Some(PlannedSummaryValue {
                         value: self.push_node(KernelSummaryNode::Record {
                             tag,
@@ -16591,11 +17262,11 @@ impl DirectSummaryPlanCompiler<'_> {
                         formal_projection_input: None,
                     })
                 }
-                KernelOwnerNodeKind::Collection { kind, .. } => match kind {
+                PackedKernelOwnerNodeKind::Collection { kind, .. } => match kind {
                     KernelCollectionKind::List | KernelCollectionKind::Set => {
-                        let mut inputs = Vec::with_capacity(node.inputs.len());
-                        for edge in &node.inputs {
-                            if !matches!(edge.role, KernelOwnerEdgeRole::CollectionItem) {
+                        let mut inputs = Vec::with_capacity(node_inputs.len());
+                        for edge in node_inputs {
+                            if !matches!(edge.role, PackedKernelOwnerEdgeRole::CollectionItem) {
                                 return None;
                             }
                             inputs.push(
@@ -16624,9 +17295,9 @@ impl DirectSummaryPlanCompiler<'_> {
                         })
                     }
                     KernelCollectionKind::Bytes => {
-                        let mut dependencies = Vec::with_capacity(node.inputs.len());
-                        for edge in &node.inputs {
-                            if !matches!(edge.role, KernelOwnerEdgeRole::CollectionItem) {
+                        let mut dependencies = Vec::with_capacity(node_inputs.len());
+                        for edge in node_inputs {
+                            if !matches!(edge.role, PackedKernelOwnerEdgeRole::CollectionItem) {
                                 return None;
                             }
                             dependencies.push(
@@ -16642,7 +17313,7 @@ impl DirectSummaryPlanCompiler<'_> {
                         let bytes = self
                             .builder
                             .terms_mut()
-                            .bytes(crate::BytesTerm::Fixed(node.inputs.len()));
+                            .bytes(crate::BytesTerm::Fixed(node_inputs.len()));
                         let result = self.push_node(KernelSummaryNode::Term(bytes));
                         Some(PlannedSummaryValue {
                             value: self.push_node(KernelSummaryNode::Sequence {
@@ -16656,15 +17327,15 @@ impl DirectSummaryPlanCompiler<'_> {
                     KernelCollectionKind::Map => {
                         let mut keys = Vec::new();
                         let mut values = Vec::new();
-                        for edge in &node.inputs {
-                            if !matches!(edge.role, KernelOwnerEdgeRole::MapEntry) {
+                        for edge in node_inputs {
+                            if !matches!(edge.role, PackedKernelOwnerEdgeRole::MapEntry) {
                                 return None;
                             }
-                            let entry = owner.nodes.get(edge.expression.0 as usize)?;
-                            if !matches!(entry.kind, KernelOwnerNodeKind::MapEntry) {
+                            let entry = owner.nodes().get(edge.expression.0 as usize)?;
+                            if !matches!(entry.kind, PackedKernelOwnerNodeKind::MapEntry) {
                                 return None;
                             }
-                            for entry_edge in &entry.inputs {
+                            for entry_edge in entry.inputs(owner) {
                                 let value = self.compile_expression(
                                     owner_id,
                                     entry_edge.expression.0 as usize,
@@ -16672,8 +17343,8 @@ impl DirectSummaryPlanCompiler<'_> {
                                     active,
                                 )?;
                                 match entry_edge.role {
-                                    KernelOwnerEdgeRole::MapKey => keys.push(value.value),
-                                    KernelOwnerEdgeRole::MapValue => values.push(value.value),
+                                    PackedKernelOwnerEdgeRole::MapKey => keys.push(value.value),
+                                    PackedKernelOwnerEdgeRole::MapValue => values.push(value.value),
                                     _ => return None,
                                 }
                             }
@@ -16689,12 +17360,12 @@ impl DirectSummaryPlanCompiler<'_> {
                         })
                     }
                 },
-                KernelOwnerNodeKind::MapEntry => {
-                    let mut dependencies = Vec::with_capacity(node.inputs.len());
-                    for edge in &node.inputs {
+                PackedKernelOwnerNodeKind::MapEntry => {
+                    let mut dependencies = Vec::with_capacity(node_inputs.len());
+                    for edge in node_inputs {
                         if !matches!(
                             edge.role,
-                            KernelOwnerEdgeRole::MapKey | KernelOwnerEdgeRole::MapValue
+                            PackedKernelOwnerEdgeRole::MapKey | PackedKernelOwnerEdgeRole::MapValue
                         ) {
                             return None;
                         }
@@ -16719,50 +17390,50 @@ impl DirectSummaryPlanCompiler<'_> {
                         formal_projection_input: None,
                     })
                 }
-                KernelOwnerNodeKind::Block => {
-                    let results = node
-                        .inputs
+                PackedKernelOwnerNodeKind::Block => {
+                    let results = node_inputs
                         .iter()
-                        .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::BlockResult))
+                        .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::BlockResult))
                         .collect::<Vec<_>>();
                     let [result] = results.as_slice() else {
                         return None;
                     };
                     self.compile_expression(owner_id, result.expression.0 as usize, actuals, active)
                 }
-                KernelOwnerNodeKind::Draining => {
-                    let inputs = node
-                        .inputs
+                PackedKernelOwnerNodeKind::Draining => {
+                    let inputs = node_inputs
                         .iter()
-                        .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::DrainingInput))
+                        .filter(|edge| {
+                            matches!(edge.role, PackedKernelOwnerEdgeRole::DrainingInput)
+                        })
                         .collect::<Vec<_>>();
                     let [input] = inputs.as_slice() else {
                         return None;
                     };
                     self.compile_expression(owner_id, input.expression.0 as usize, actuals, active)
                 }
-                KernelOwnerNodeKind::LexicalRead { fields }
-                | KernelOwnerNodeKind::ValueRead { fields, .. }
-                | KernelOwnerNodeKind::DerivedRead { fields } => {
-                    let providers = node
-                        .inputs
+                PackedKernelOwnerNodeKind::LexicalRead { fields }
+                | PackedKernelOwnerNodeKind::ValueRead { fields, .. }
+                | PackedKernelOwnerNodeKind::DerivedRead { fields } => {
+                    let fields = owner.path(*fields)?;
+                    let providers = node_inputs
                         .iter()
-                        .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider))
+                        .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::ReadProvider))
                         .collect::<Vec<_>>();
                     let [provider] = providers.as_slice() else {
                         return None;
                     };
                     let reference = provider.expression.0 as usize;
-                    let provider = if reference < owner.nodes.len() {
+                    let provider = if reference < owner.node_count() {
                         self.compile_expression(owner_id, reference, actuals, active)?
                     } else {
                         let external = owner
-                            .external_expressions
-                            .get(reference - owner.nodes.len())?;
-                        let target_owner = self.project.owners.get(external.owner.0 as usize)?;
+                            .external_expressions()
+                            .get(reference - owner.node_count())?;
+                        let target_owner = self.project.owner(external.owner)?;
                         let expression = match external.target {
                             KernelExternalTarget::Expression(expression) => expression.0 as usize,
-                            KernelExternalTarget::Result => target_owner.result.0 as usize,
+                            KernelExternalTarget::Result => target_owner.result().0 as usize,
                         };
                         let input = u32::try_from(self.inputs.len())
                             .expect("kernel summary input count exceeds u32");
@@ -16781,15 +17452,15 @@ impl DirectSummaryPlanCompiler<'_> {
                     };
                     self.project_value(provider, fields, fixed_mode)
                 }
-                KernelOwnerNodeKind::PatternRead { .. } => None,
-                KernelOwnerNodeKind::UserCall {
+                PackedKernelOwnerNodeKind::PatternRead { .. } => None,
+                PackedKernelOwnerNodeKind::UserCall {
                     target,
                     inherited_formal,
                 } => {
-                    let target_owner = self.project.owners.get(target.0 as usize)?;
-                    let mut target_actuals = vec![None; target_owner.formal_count as usize];
-                    for edge in &node.inputs {
-                        let KernelOwnerEdgeRole::CallArgument { ordinal } = edge.role else {
+                    let target_owner = self.project.owner(*target)?;
+                    let mut target_actuals = vec![None; target_owner.formal_count() as usize];
+                    for edge in node_inputs {
+                        let PackedKernelOwnerEdgeRole::CallArgument { ordinal } = edge.role else {
                             return None;
                         };
                         let value = self.compile_expression(
@@ -16824,48 +17495,47 @@ impl DirectSummaryPlanCompiler<'_> {
                     }
                     self.compile_expression(
                         *target,
-                        target_owner.result.0 as usize,
+                        target_owner.result().0 as usize,
                         &target_actuals,
                         active,
                     )
                 }
-                KernelOwnerNodeKind::RenderConstructor { kind } => {
-                    let mut entries = Vec::with_capacity(node.inputs.len() + 1);
+                PackedKernelOwnerNodeKind::RenderConstructor { kind } => {
+                    let mut entries = Vec::with_capacity(node_inputs.len() + 1);
                     let mut direction = None;
-                    for edge in &node.inputs {
-                        let KernelOwnerEdgeRole::AbiArgument { name } = &edge.role else {
+                    for edge in node_inputs {
+                        let PackedKernelOwnerEdgeRole::AbiArgument { name } = edge.role else {
                             return None;
                         };
+                        let name_text = owner.symbol(name)?;
                         let mut value = self.compile_expression(
                             owner_id,
                             edge.expression.0 as usize,
                             actuals,
                             active,
                         )?;
-                        if let Some(expected) =
-                            render_argument_requirement(self.builder, name.as_ref())
+                        if let Some(expected) = render_argument_requirement(self.builder, name_text)
                         {
                             value.value = self.push_node(KernelSummaryNode::Constrain {
                                 value: value.value,
                                 expected,
                             });
                         }
-                        if name.as_ref() == "direction" {
+                        if name_text == "direction" {
                             direction = Some(value.value);
                         }
-                        let name = self.builder.terms_mut().intern_name(name);
                         entries.push(KernelSummaryRecordEntry::Field {
                             name,
                             value: value.value,
                         });
                     }
                     let kind = match kind {
-                        KernelRenderConstructorKind::Fixed(tag) => {
-                            let tag = self.builder.terms_mut().variant_tag(tag);
+                        crate::PackedKernelRenderConstructorKind::Fixed(tag) => {
+                            let tag = VariantTerm::Tag(*tag);
                             let term = self.builder.terms_mut().variant_set([tag]);
                             self.push_node(KernelSummaryNode::Term(term))
                         }
-                        KernelRenderConstructorKind::StripeDirection => {
+                        crate::PackedKernelRenderConstructorKind::StripeDirection => {
                             let row_tag = self.builder.terms_mut().variant_tag("Row");
                             let row = self.builder.terms_mut().variant_set([row_tag]);
                             let stack_tag = self.builder.terms_mut().variant_tag("Stack");
@@ -16875,26 +17545,28 @@ impl DirectSummaryPlanCompiler<'_> {
                             if let Some(direction) = direction {
                                 let row_value = self.push_node(KernelSummaryNode::Term(row));
                                 let stack_value = self.push_node(KernelSummaryNode::Term(stack));
+                                let row_name = self.builder.terms().intern_name("Row");
+                                let column_name = self.builder.terms().intern_name("Column");
                                 self.push_node(KernelSummaryNode::Select {
                                     selector: direction,
                                     syntax_discriminating: false,
                                     arms: vec![
                                         KernelSummarySelectArm {
-                                            pattern: KernelPattern::Tag {
-                                                name: "Row".into(),
-                                                fields: Box::new([]),
+                                            pattern: crate::PackedKernelPattern::Tag {
+                                                name: row_name,
+                                                fields: boon_contract::PathId::ROOT,
                                             },
                                             output: row_value,
                                         },
                                         KernelSummarySelectArm {
-                                            pattern: KernelPattern::Tag {
-                                                name: "Column".into(),
-                                                fields: Box::new([]),
+                                            pattern: crate::PackedKernelPattern::Tag {
+                                                name: column_name,
+                                                fields: boon_contract::PathId::ROOT,
                                             },
                                             output: stack_value,
                                         },
                                         KernelSummarySelectArm {
-                                            pattern: KernelPattern::Wildcard,
+                                            pattern: crate::PackedKernelPattern::Wildcard,
                                             output: fallback_value,
                                         },
                                     ]
@@ -16919,19 +17591,20 @@ impl DirectSummaryPlanCompiler<'_> {
                         formal_projection_input: None,
                     })
                 }
-                KernelOwnerNodeKind::PureBuiltin { kind }
+                PackedKernelOwnerNodeKind::PureBuiltin { kind }
                     if direct_summary_fixed_builtin_supported(*kind) =>
                 {
-                    let mut dependencies = Vec::with_capacity(node.inputs.len());
-                    let mut record_entries = Vec::with_capacity(node.inputs.len());
-                    let mut names = BTreeSet::new();
-                    for edge in &node.inputs {
-                        let KernelOwnerEdgeRole::AbiArgument { name } = &edge.role else {
+                    let mut dependencies = Vec::with_capacity(node_inputs.len());
+                    let mut record_entries = Vec::with_capacity(node_inputs.len());
+                    let mut names = HashSet::new();
+                    for edge in node_inputs {
+                        let PackedKernelOwnerEdgeRole::AbiArgument { name } = edge.role else {
                             return None;
                         };
-                        if !names.insert(name.as_ref()) {
+                        if !names.insert(name) {
                             return None;
                         }
+                        let name_text = owner.symbol(name)?;
                         let mut value = self.compile_expression(
                             owner_id,
                             edge.expression.0 as usize,
@@ -16939,7 +17612,7 @@ impl DirectSummaryPlanCompiler<'_> {
                             active,
                         )?;
                         if let Some(expected) =
-                            pure_builtin_argument_requirement(self.builder, *kind, name.as_ref())
+                            pure_builtin_argument_requirement(self.builder, *kind, name_text)
                         {
                             value.value = self.push_node(KernelSummaryNode::Constrain {
                                 value: value.value,
@@ -16948,7 +17621,7 @@ impl DirectSummaryPlanCompiler<'_> {
                         }
                         if matches!(kind, KernelPureBuiltinKind::RecordConstructor) {
                             record_entries.push(KernelSummaryRecordEntry::Field {
-                                name: self.builder.terms_mut().intern_name(name),
+                                name,
                                 value: value.value,
                             });
                         }
@@ -16993,12 +17666,12 @@ impl DirectSummaryPlanCompiler<'_> {
                         formal_projection_input: None,
                     })
                 }
-                KernelOwnerNodeKind::When => {
+                PackedKernelOwnerNodeKind::When => {
                     let mut selector = None;
                     let mut arms = Vec::new();
-                    for edge in &node.inputs {
+                    for edge in node_inputs {
                         match edge.role {
-                            KernelOwnerEdgeRole::WhenInput => {
+                            PackedKernelOwnerEdgeRole::WhenInput => {
                                 if selector.is_some() {
                                     return None;
                                 }
@@ -17009,9 +17682,10 @@ impl DirectSummaryPlanCompiler<'_> {
                                     active,
                                 )?);
                             }
-                            KernelOwnerEdgeRole::WhenArm => {
-                                let arm = owner.nodes.get(edge.expression.0 as usize)?;
-                                let KernelOwnerNodeKind::MatchArm { pattern } = &arm.kind else {
+                            PackedKernelOwnerEdgeRole::WhenArm => {
+                                let arm = owner.nodes().get(edge.expression.0 as usize)?;
+                                let PackedKernelOwnerNodeKind::MatchArm { pattern } = arm.kind
+                                else {
                                     return None;
                                 };
                                 let output = self.compile_expression(
@@ -17021,7 +17695,7 @@ impl DirectSummaryPlanCompiler<'_> {
                                     active,
                                 )?;
                                 arms.push(KernelSummarySelectArm {
-                                    pattern: pattern.clone(),
+                                    pattern,
                                     output: output.value,
                                 });
                             }
@@ -17039,14 +17713,13 @@ impl DirectSummaryPlanCompiler<'_> {
                         formal_projection_input: None,
                     })
                 }
-                KernelOwnerNodeKind::MatchArm { .. } => {
-                    let outputs = node
-                        .inputs
+                PackedKernelOwnerNodeKind::MatchArm { .. } => {
+                    let outputs = node_inputs
                         .iter()
-                        .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::MatchOutput))
+                        .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::MatchOutput))
                         .collect::<Vec<_>>();
                     if let [output] = outputs.as_slice() {
-                        if node.inputs.len() != 1 {
+                        if node_inputs.len() != 1 {
                             return None;
                         }
                         self.compile_expression(
@@ -17056,14 +17729,14 @@ impl DirectSummaryPlanCompiler<'_> {
                             active,
                         )
                     } else if outputs.is_empty()
-                        && node.inputs.iter().all(|edge| {
-                            matches!(edge.role, KernelOwnerEdgeRole::RecordField { .. })
+                        && node_inputs.iter().all(|edge| {
+                            matches!(edge.role, PackedKernelOwnerEdgeRole::RecordField { .. })
                         })
-                        && !node.inputs.is_empty()
+                        && !node_inputs.is_empty()
                     {
-                        let mut entries = Vec::with_capacity(node.inputs.len());
-                        for edge in &node.inputs {
-                            let KernelOwnerEdgeRole::RecordField { name, spread } = &edge.role
+                        let mut entries = Vec::with_capacity(node_inputs.len());
+                        for edge in node_inputs {
+                            let PackedKernelOwnerEdgeRole::RecordField { name, spread } = edge.role
                             else {
                                 return None;
                             };
@@ -17073,11 +17746,10 @@ impl DirectSummaryPlanCompiler<'_> {
                                 actuals,
                                 active,
                             )?;
-                            if *spread {
+                            if spread {
                                 entries
                                     .push(KernelSummaryRecordEntry::Spread { value: value.value });
                             } else {
-                                let name = self.builder.terms_mut().intern_name(name);
                                 entries.push(KernelSummaryRecordEntry::Field {
                                     name,
                                     value: value.value,
@@ -17092,24 +17764,24 @@ impl DirectSummaryPlanCompiler<'_> {
                             mode: fixed_mode,
                             formal_projection_input: None,
                         })
-                    } else if outputs.is_empty() && node.inputs.is_empty() {
+                    } else if outputs.is_empty() && node_inputs.is_empty() {
                         let absent = self.builder.terms().absent();
                         Some(term_value(self, absent))
                     } else {
                         None
                     }
                 }
-                KernelOwnerNodeKind::Then => {
-                    let has_output = node
-                        .inputs
+                PackedKernelOwnerNodeKind::Then => {
+                    let has_output = node_inputs
                         .iter()
-                        .any(|edge| matches!(edge.role, KernelOwnerEdgeRole::ThenOutput));
-                    let mut dependencies = Vec::with_capacity(node.inputs.len());
+                        .any(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::ThenOutput));
+                    let mut dependencies = Vec::with_capacity(node_inputs.len());
                     let mut selected = None;
-                    for edge in &node.inputs {
+                    for edge in node_inputs {
                         if !matches!(
                             edge.role,
-                            KernelOwnerEdgeRole::ThenInput | KernelOwnerEdgeRole::ThenOutput
+                            PackedKernelOwnerEdgeRole::ThenInput
+                                | PackedKernelOwnerEdgeRole::ThenOutput
                         ) {
                             return None;
                         }
@@ -17119,8 +17791,9 @@ impl DirectSummaryPlanCompiler<'_> {
                             actuals,
                             active,
                         )?;
-                        if matches!(edge.role, KernelOwnerEdgeRole::ThenOutput)
-                            || (!has_output && matches!(edge.role, KernelOwnerEdgeRole::ThenInput))
+                        if matches!(edge.role, PackedKernelOwnerEdgeRole::ThenOutput)
+                            || (!has_output
+                                && matches!(edge.role, PackedKernelOwnerEdgeRole::ThenInput))
                         {
                             if selected.replace(value.value).is_some() {
                                 return None;
@@ -17138,13 +17811,14 @@ impl DirectSummaryPlanCompiler<'_> {
                         formal_projection_input: None,
                     })
                 }
-                KernelOwnerNodeKind::Infix { operation } => {
+                PackedKernelOwnerNodeKind::Infix { operation } => {
+                    let operation = owner.symbol(*operation)?;
                     let mut left = None;
                     let mut right = None;
-                    for edge in &node.inputs {
+                    for edge in node_inputs {
                         let slot = match edge.role {
-                            KernelOwnerEdgeRole::InfixLeft => &mut left,
-                            KernelOwnerEdgeRole::InfixRight => &mut right,
+                            PackedKernelOwnerEdgeRole::InfixLeft => &mut left,
+                            PackedKernelOwnerEdgeRole::InfixRight => &mut right,
                             _ => return None,
                         };
                         if slot
@@ -17188,28 +17862,27 @@ impl DirectSummaryPlanCompiler<'_> {
                         formal_projection_input: None,
                     })
                 }
-                KernelOwnerNodeKind::Arrow => {
-                    let outputs = node
-                        .inputs
+                PackedKernelOwnerNodeKind::Arrow => {
+                    let outputs = node_inputs
                         .iter()
-                        .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ArrowOutput))
+                        .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::ArrowOutput))
                         .collect::<Vec<_>>();
                     let [output] = outputs.as_slice() else {
                         return None;
                     };
-                    if node.inputs.len() != 1 {
+                    if node_inputs.len() != 1 {
                         return None;
                     }
                     self.compile_expression(owner_id, output.expression.0 as usize, actuals, active)
                 }
-                KernelOwnerNodeKind::Delimiter if node.inputs.is_empty() => {
+                PackedKernelOwnerNodeKind::Delimiter if node_inputs.is_empty() => {
                     Some(PlannedSummaryValue {
                         value: self.push_node(KernelSummaryNode::ContextualHole),
                         mode: fixed_mode,
                         formal_projection_input: None,
                     })
                 }
-                KernelOwnerNodeKind::Unknown if node.inputs.is_empty() => {
+                PackedKernelOwnerNodeKind::Unknown if node_inputs.is_empty() => {
                     let unknown = self.builder.terms().unknown();
                     Some(term_value(self, unknown))
                 }
@@ -17313,9 +17986,13 @@ fn fuse_constant_summary_record_selectors(
     entries: &[KernelSummaryRecordEntry],
     nodes: &[KernelSummaryNode],
     constants: &[Option<TypeTermId>],
-) -> Option<(KernelSummaryValueId, bool, Vec<(KernelPattern, TypeTermId)>)> {
+) -> Option<(
+    KernelSummaryValueId,
+    bool,
+    Vec<(crate::PackedKernelPattern, TypeTermId)>,
+)> {
     let mut selector = None;
-    let mut patterns = None::<Vec<KernelPattern>>;
+    let mut patterns = None::<Vec<crate::PackedKernelPattern>>;
     let mut has_dynamic_field = false;
     let mut syntax_discriminating = false;
     for entry in entries {
@@ -17347,10 +18024,7 @@ fn fuse_constant_summary_record_selectors(
         {
             return None;
         }
-        let field_patterns = arms
-            .iter()
-            .map(|arm| arm.pattern.clone())
-            .collect::<Vec<_>>();
+        let field_patterns = arms.iter().map(|arm| arm.pattern).collect::<Vec<_>>();
         if patterns
             .as_ref()
             .is_some_and(|patterns| *patterns != field_patterns)
@@ -18054,19 +18728,23 @@ fn constant_summary_select(
 fn constant_summary_pattern_accepts(
     builder: &ComponentProgramBuilder,
     selector: TypeTermId,
-    pattern: &KernelPattern,
+    pattern: &crate::PackedKernelPattern,
 ) -> bool {
     match pattern {
-        KernelPattern::Wildcard | KernelPattern::Binding { .. } => true,
-        KernelPattern::Number => matches!(builder.terms().term(selector), TypeTerm::Number),
-        KernelPattern::Text => matches!(builder.terms().term(selector), TypeTerm::Text),
-        KernelPattern::Bits { width } => {
+        crate::PackedKernelPattern::Wildcard | crate::PackedKernelPattern::Binding { .. } => true,
+        crate::PackedKernelPattern::Number => {
+            matches!(builder.terms().term(selector), TypeTerm::Number)
+        }
+        crate::PackedKernelPattern::Text => {
+            matches!(builder.terms().term(selector), TypeTerm::Text)
+        }
+        crate::PackedKernelPattern::Bits { width } => {
             matches!(builder.terms().term(selector), TypeTerm::Bits(actual) if actual == *width)
         }
-        KernelPattern::Tag { name, .. } => {
-            matches!(builder.terms().term(selector), TypeTerm::VariantSet(variants) if variants.iter().any(|variant| builder.terms().name(variant.tag()) == name.as_ref()))
+        crate::PackedKernelPattern::Tag { name, .. } => {
+            matches!(builder.terms().term(selector), TypeTerm::VariantSet(variants) if variants.iter().any(|variant| variant.tag() == *name))
         }
-        KernelPattern::Invalid => false,
+        crate::PackedKernelPattern::Invalid => false,
     }
 }
 
@@ -18156,43 +18834,42 @@ fn insert_constant_summary_field(
 
 fn compile_direct_result_summaries(
     builder: &mut ComponentProgramBuilder,
-    project: &KernelProjectProgramInput,
+    project: &PackedKernelProjectProgram,
 ) -> Vec<Option<Arc<CompiledDirectSummary>>> {
     let targets = project
-        .owners
-        .iter()
-        .flat_map(|owner| owner.nodes.iter())
+        .owners()
+        .flat_map(|owner| owner.nodes().iter())
         .filter_map(|node| match node.kind {
-            KernelOwnerNodeKind::UserCall { target, .. } => Some(target),
+            PackedKernelOwnerNodeKind::UserCall { target, .. } => Some(target),
             _ => None,
         })
         .collect::<BTreeSet<_>>();
     let supported = targets
         .into_iter()
         .filter(|target| {
-            let Some(owner) = project.owners.get(target.0 as usize) else {
+            let Some(owner) = project.owner(*target) else {
                 return false;
             };
             direct_result_summary_supported(
                 project,
                 *target,
-                owner.result.0 as usize,
+                owner.result().0 as usize,
                 &mut BTreeSet::new(),
             )
         })
         .collect::<BTreeSet<_>>();
     let mut order = Vec::with_capacity(supported.len());
-    let mut states = vec![0_u8; project.owners.len()];
+    let mut states = vec![0_u8; project.definition_count()];
     for target in supported.iter().copied() {
         append_direct_summary_order(project, target, &supported, &mut states, &mut order);
     }
-    let mut summaries = vec![None; project.owners.len()];
+    let mut summaries = vec![None; project.definition_count()];
     for target in order {
-        let Some(owner) = project.owners.get(target.0 as usize) else {
+        let Some(owner) = project.owner(target) else {
             continue;
         };
-        let result = owner.result.0 as usize;
-        let actuals = (0..owner.formal_count)
+        let result = owner.result().0 as usize;
+        let actuals = (0..owner.formal_count())
             .map(PlannedSummaryActual::Formal)
             .collect::<Vec<_>>();
         let mut compiler = DirectSummaryPlanCompiler {
@@ -18220,7 +18897,7 @@ fn compile_direct_result_summaries(
             }),
             inputs: compiler.inputs.into_boxed_slice(),
             result_mode: result.mode,
-            formal_count: owner.formal_count as usize,
+            formal_count: owner.formal_count() as usize,
             constant_folded_nodes,
             selector_fused_records,
             deduplicated_nodes,
@@ -18233,7 +18910,7 @@ fn compile_direct_result_summaries(
 }
 
 fn append_direct_summary_order(
-    project: &KernelProjectProgramInput,
+    project: &PackedKernelProjectProgram,
     target: KernelOwnerId,
     supported: &BTreeSet<KernelOwnerId>,
     states: &mut [u8],
@@ -18246,11 +18923,11 @@ fn append_direct_summary_order(
         Some(_) => {}
     }
     states[index] = 1;
-    if let Some(owner) = project.owners.get(index) {
+    if let Some(owner) = project.owner_at(index) {
         let mut dependencies = BTreeSet::new();
         collect_direct_summary_call_targets(
             owner,
-            owner.result.0 as usize,
+            owner.result().0 as usize,
             &mut BTreeSet::new(),
             &mut dependencies,
         );
@@ -18265,7 +18942,7 @@ fn append_direct_summary_order(
 }
 
 fn collect_direct_summary_call_targets(
-    owner: &KernelOwnerProgramInput,
+    owner: PackedKernelOwnerProgramRef<'_>,
     expression: usize,
     active: &mut BTreeSet<usize>,
     targets: &mut BTreeSet<KernelOwnerId>,
@@ -18273,16 +18950,16 @@ fn collect_direct_summary_call_targets(
     if !active.insert(expression) {
         return;
     }
-    let Some(node) = owner.nodes.get(expression) else {
+    let Some(node) = owner.nodes().get(expression) else {
         active.remove(&expression);
         return;
     };
-    if let KernelOwnerNodeKind::UserCall { target, .. } = node.kind {
+    if let PackedKernelOwnerNodeKind::UserCall { target, .. } = node.kind {
         targets.insert(target);
     }
-    for edge in node.inputs.iter() {
+    for edge in node.inputs(owner) {
         let dependency = edge.expression.0 as usize;
-        if dependency < owner.nodes.len() {
+        if dependency < owner.node_count() {
             collect_direct_summary_call_targets(owner, dependency, active, targets);
         }
     }
@@ -18365,10 +19042,7 @@ fn emit_compiled_direct_summary(
                     context,
                     source_node,
                     &actual.mode_source,
-                    &fields
-                        .iter()
-                        .map(|field| builder.terms().name(*field).into())
-                        .collect::<Vec<Box<str>>>(),
+                    fields,
                     &mut BTreeSet::new(),
                 )?);
             }
@@ -18450,27 +19124,21 @@ fn compile_node(
     context: &OwnerCompileContext<'_>,
     stack: &mut Vec<KernelOwnerId>,
     index: usize,
-    node: &KernelOwnerNode,
+    node: &PackedKernelOwnerNode,
     output: TypeVariableId,
     output_mode: ModeVariableId,
     compile_mode: bool,
     mut syntax_discriminated_result: Option<&mut bool>,
     mut syntax_discriminated_root_output: Option<&mut Option<OutputId>>,
 ) -> Result<(), KernelOwnerBuildError> {
+    use crate::PackedKernelOwnerEdgeRole as KernelOwnerEdgeRole;
+    use crate::PackedKernelOwnerNodeKind as KernelOwnerNodeKind;
+    use crate::PackedKernelPattern as KernelPattern;
+    use crate::PackedKernelRenderConstructorKind as KernelRenderConstructorKind;
+
+    let node_inputs = node.inputs(context.input);
     match &node.kind {
-        KernelOwnerNodeKind::Known(ty) | KernelOwnerNodeKind::Source(ty) => {
-            if !type_is_recursively_closed(ty) {
-                return Err(KernelOwnerBuildError::new(format!(
-                    "kernel owner node {index} imports a non-closed ABI type {ty:?}"
-                )));
-            }
-            let provider = builder
-                .terms_mut()
-                .import_checked_type(ty, &mut |_| unreachable!("closed ABI type has no variable"));
-            builder.add_publish(output, [provider], PublishMode::Replace);
-        }
-        KernelOwnerNodeKind::KnownPacked(reference)
-        | KernelOwnerNodeKind::SourcePacked(reference) => {
+        KernelOwnerNodeKind::Known(reference) | KernelOwnerNodeKind::Source(reference) => {
             let provider =
                 resolve_packed_input_type(builder, context, *reference, index, "closed type")?;
             builder.add_publish(output, [provider], PublishMode::Replace);
@@ -18496,16 +19164,15 @@ fn compile_node(
             builder.add_publish(output, [bits], PublishMode::Replace);
         }
         KernelOwnerNodeKind::Tag(tag) => {
-            let tag = builder.terms_mut().variant_tag(tag);
+            let tag = VariantTerm::Tag(*tag);
             let variants = builder.terms_mut().variant_set([tag]);
             builder.add_publish(output, [variants], PublishMode::Replace);
         }
         KernelOwnerNodeKind::Record { tag } => {
-            compile_record(builder, context, index, node, output, tag.as_deref())?;
+            compile_record(builder, context, index, node, output, *tag)?;
         }
         KernelOwnerNodeKind::Block => {
-            let mut results = node
-                .inputs
+            let mut results = node_inputs
                 .iter()
                 .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::BlockResult));
             let result = results.next().ok_or_else(|| {
@@ -18534,8 +19201,7 @@ fn compile_node(
                 builder.add_collection(output, kind, items, []);
             }
             KernelCollectionKind::Bytes => {
-                let size = node
-                    .inputs
+                let size = node_inputs
                     .iter()
                     .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::CollectionItem))
                     .count();
@@ -18545,16 +19211,16 @@ fn compile_node(
             KernelCollectionKind::Map => {
                 let mut keys = Vec::new();
                 let mut values = Vec::new();
-                for edge in &node.inputs {
+                for edge in node_inputs {
                     if !matches!(edge.role, KernelOwnerEdgeRole::MapEntry) {
                         continue;
                     }
                     let entry_index = checked_expression_index(
                         edge.expression,
-                        context.input.nodes.len(),
+                        context.input.node_count(),
                         "map entry",
                     )?;
-                    let entry = &context.input.nodes[entry_index];
+                    let entry = &context.input.nodes()[entry_index];
                     if !matches!(entry.kind, KernelOwnerNodeKind::MapEntry) {
                         return Err(KernelOwnerBuildError::new(format!(
                             "kernel owner node {index} map edge targets non-entry node {entry_index}"
@@ -18585,7 +19251,7 @@ fn compile_node(
             builder.add_publish(output, [absent], PublishMode::Replace);
         }
         KernelOwnerNodeKind::FormalRead { formal, fields } => {
-            if !node.inputs.is_empty() {
+            if !node_inputs.is_empty() {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} formal read has explicit inputs"
                 )));
@@ -18599,11 +19265,12 @@ fn compile_node(
                         "kernel owner node {index} reads missing formal {formal}"
                     ))
                 })?;
-            let path = fields
-                .iter()
-                .map(|field| builder.terms_mut().intern_name(field))
-                .collect::<Vec<_>>();
-            builder.add_projection_into(provider, path.iter().copied(), output);
+            let path = context.input.path(*fields).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} formal read has an invalid packed path"
+                ))
+            })?;
+            builder.add_projection_into(provider, path.iter(), output);
             let requirement = context
                 .formal_requirements
                 .get(*formal as usize)
@@ -18613,13 +19280,13 @@ fn compile_node(
                         "kernel owner node {index} reads missing formal requirement {formal}"
                     ))
                 })?;
-            let requirement = requirement_projection(builder, requirement, &path);
+            let requirement = requirement_projection_iter(builder, requirement, path.iter());
             let requirement = builder.variable_term(requirement);
             let output_term = builder.variable_term(output);
             builder.add_unify(output_term, requirement);
         }
         KernelOwnerNodeKind::ContextRead { formal, fields } => {
-            if !node.inputs.is_empty() {
+            if !node_inputs.is_empty() {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} context read has explicit inputs"
                 )));
@@ -18633,11 +19300,12 @@ fn compile_node(
                         "kernel owner node {index} reads missing context formal {formal}"
                     ))
                 })?;
-            let path = fields
-                .iter()
-                .map(|field| builder.terms_mut().intern_name(field))
-                .collect::<Vec<_>>();
-            builder.add_projection_into(provider, path.iter().copied(), output);
+            let path = context.input.path(*fields).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} context read has an invalid packed path"
+                ))
+            })?;
+            builder.add_projection_into(provider, path.iter(), output);
             // PASSED is provider-only across the call boundary, but its
             // definition still owns a private structural requirement. Keep
             // that requirement connected to the detached occurrence so
@@ -18652,14 +19320,13 @@ fn compile_node(
                         "kernel owner node {index} reads missing context formal requirement {formal}"
                     ))
                 })?;
-            let requirement = requirement_projection(builder, requirement, &path);
+            let requirement = requirement_projection_iter(builder, requirement, path.iter());
             let requirement = builder.variable_term(requirement);
             let output_term = builder.variable_term(output);
             builder.add_unify(output_term, requirement);
         }
         KernelOwnerNodeKind::LexicalRead { fields } => {
-            let mut providers = node
-                .inputs
+            let mut providers = node_inputs
                 .iter()
                 .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider));
             let provider = providers.next().ok_or_else(|| {
@@ -18667,26 +19334,26 @@ fn compile_node(
                     "kernel owner node {index} lexical read has no provider"
                 ))
             })?;
-            if providers.next().is_some() || node.inputs.len() != 1 {
+            if providers.next().is_some() || node_inputs.len() != 1 {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} lexical read must have exactly one provider"
                 )));
             }
             let provider = edge_variable(context, index, provider)?;
-            let path = fields
-                .iter()
-                .map(|field| builder.terms_mut().intern_name(field))
-                .collect::<Vec<_>>();
+            let path = context.input.path(*fields).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} lexical read has an invalid packed path"
+                ))
+            })?;
             if path.is_empty() {
                 builder.add_alias(provider, output);
             } else {
-                builder.add_projection_into(provider, path, output);
+                builder.add_projection_into(provider, path.iter(), output);
             }
         }
         KernelOwnerNodeKind::ValueRead { fields, .. }
         | KernelOwnerNodeKind::DerivedRead { fields } => {
-            let mut providers = node
-                .inputs
+            let mut providers = node_inputs
                 .iter()
                 .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider));
             let provider = providers.next().ok_or_else(|| {
@@ -18694,21 +19361,21 @@ fn compile_node(
                     "kernel owner node {index} value read has no provider"
                 ))
             })?;
-            if providers.next().is_some() || node.inputs.len() != 1 {
+            if providers.next().is_some() || node_inputs.len() != 1 {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} value read must have exactly one provider"
                 )));
             }
             let provider = edge_variable(context, index, provider)?;
-            let path = fields
-                .iter()
-                .map(|field| builder.terms_mut().intern_name(field))
-                .collect::<Vec<_>>();
-            builder.add_projection_into(provider, path, output);
+            let path = context.input.path(*fields).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} value read has an invalid packed path"
+                ))
+            })?;
+            builder.add_projection_into(provider, path.iter(), output);
         }
         KernelOwnerNodeKind::PatternRead { pattern, fields } => {
-            let mut providers = node
-                .inputs
+            let mut providers = node_inputs
                 .iter()
                 .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider));
             let provider = providers.next().ok_or_else(|| {
@@ -18716,21 +19383,21 @@ fn compile_node(
                     "kernel owner node {index} pattern read has no provider"
                 ))
             })?;
-            if providers.next().is_some() || node.inputs.len() != 1 {
+            if providers.next().is_some() || node_inputs.len() != 1 {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} pattern read must have exactly one provider"
                 )));
             }
             let provider = edge_variable(context, index, provider)?;
-            let fields = fields
-                .iter()
-                .map(|field| builder.terms_mut().intern_name(field))
-                .collect::<Vec<_>>();
-            builder.add_pattern_projection_into(provider, pattern.clone(), fields, output);
+            let fields = context.input.path(*fields).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} pattern read has an invalid packed path"
+                ))
+            })?;
+            builder.add_pattern_projection_into(provider, *pattern, fields.iter(), output);
         }
         KernelOwnerNodeKind::CollectionItemRead => {
-            let mut providers = node
-                .inputs
+            let mut providers = node_inputs
                 .iter()
                 .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider));
             let provider = providers.next().ok_or_else(|| {
@@ -18738,7 +19405,7 @@ fn compile_node(
                     "kernel owner node {index} collection item read has no provider"
                 ))
             })?;
-            if providers.next().is_some() || node.inputs.len() != 1 {
+            if providers.next().is_some() || node_inputs.len() != 1 {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} collection item read must have exactly one provider"
                 )));
@@ -18747,7 +19414,7 @@ fn compile_node(
             builder.add_collection_item_projection(provider, output);
         }
         KernelOwnerNodeKind::FreshOut => {
-            if !node.inputs.is_empty() {
+            if !node_inputs.is_empty() {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} fresh OUT has explicit inputs"
                 )));
@@ -18766,14 +19433,14 @@ fn compile_node(
                     target.0
                 ))
             })?;
-            let target_owner = project.owners.get(target.0 as usize).ok_or_else(|| {
+            let target_owner = project.owner(*target).ok_or_else(|| {
                 KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} calls missing owner {}",
                     target.0
                 ))
             })?;
-            let mut actuals = vec![None; target_owner.formal_count as usize];
-            for edge in &node.inputs {
+            let mut actuals = vec![None; target_owner.formal_count() as usize];
+            for edge in node_inputs {
                 let (ordinal, variable) = match edge.role {
                     KernelOwnerEdgeRole::CallArgument { ordinal } => {
                         (ordinal, edge_variable(context, index, edge)?)
@@ -18933,8 +19600,8 @@ fn compile_node(
                 *selected |= specialization.result_syntax_selected;
             }
             let result = checked_expression_index(
-                target_owner.result,
-                target_owner.nodes.len(),
+                target_owner.result(),
+                target_owner.node_count(),
                 "user-call result",
             )?;
             // A formal-independent definition is already represented by its
@@ -18959,9 +19626,9 @@ fn compile_node(
             }
             if let KernelOwnerNodeKind::FormalRead { formal, fields }
             | KernelOwnerNodeKind::ContextRead { formal, fields } =
-                &target_owner.nodes[result].kind
+                &target_owner.nodes()[result].kind
             {
-                if !target_owner.nodes[result].inputs.is_empty() {
+                if !target_owner.nodes()[result].inputs(target_owner).is_empty() {
                     return Err(KernelOwnerBuildError::new(format!(
                         "kernel owner {} direct-result formal read has explicit inputs",
                         target.0
@@ -18973,18 +19640,22 @@ fn compile_node(
                         target.0
                     ))
                 })?;
-                let path = fields
-                    .iter()
-                    .map(|field| builder.terms_mut().intern_name(field))
-                    .collect::<Vec<_>>();
-                builder.add_projection_into(actual.variable, path.iter().copied(), output);
+                let path = target_owner.path(*fields).ok_or_else(|| {
+                    KernelOwnerBuildError::new(format!(
+                        "kernel owner {} direct-result formal read has an invalid packed path",
+                        target.0
+                    ))
+                })?;
+                let mode_path = path.iter().collect::<Vec<_>>();
+                builder.add_projection_into(actual.variable, path.iter(), output);
                 if matches!(
-                    &target_owner.nodes[result].kind,
+                    &target_owner.nodes()[result].kind,
                     KernelOwnerNodeKind::FormalRead { .. }
                 ) && (!builder.is_authoritative(actual.variable) || actual.requirement_backflow)
                 {
                     let requirement_root = builder.new_contextual_hole();
-                    let requirement = requirement_projection(builder, requirement_root, &path);
+                    let requirement =
+                        requirement_projection_iter(builder, requirement_root, path.iter());
                     let output_term = builder.variable_term(output);
                     let requirement = builder.variable_term(requirement);
                     builder.add_unify(output_term, requirement);
@@ -18997,7 +19668,7 @@ fn compile_node(
                     context,
                     index,
                     &actual.mode_source,
-                    fields,
+                    &mode_path,
                     &mut BTreeSet::new(),
                 )?;
                 mode_builder.set(output_mode, ModeEquation::Copy(projected_mode));
@@ -19039,11 +19710,11 @@ fn compile_node(
                 stack,
             )?;
             if let Some(receipt) = syntax_discriminated_root_output.as_deref_mut()
-                && matches!(target_owner.nodes[result].kind, KernelOwnerNodeKind::When)
+                && matches!(target_owner.nodes()[result].kind, KernelOwnerNodeKind::When)
             {
                 *receipt = Some(builder.add_output(
                     instance.expressions[result],
-                    target_owner.nodes[result].mode,
+                    target_owner.nodes()[result].mode,
                 ));
             }
             let provider = builder.variable_term(instance.expressions[result]);
@@ -19054,57 +19725,62 @@ fn compile_node(
             );
         }
         KernelOwnerNodeKind::FieldProjection { field } => {
-            let mut providers = node.inputs.iter().filter(|edge| {
-                matches!(
-                    &edge.role,
-                    KernelOwnerEdgeRole::AbiArgument { name }
-                        if matches!(name.as_ref(), "$pipe" | "input")
-                )
+            let mut providers = node_inputs.iter().filter(|edge| {
+                matches!(edge.role, KernelOwnerEdgeRole::AbiArgument { name }
+                    if context.input.symbol(name).is_some_and(|name| matches!(name, "$pipe" | "input")))
             });
             let provider = providers.next().ok_or_else(|| {
                 KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} field projection has no provider"
                 ))
             })?;
-            if providers.next().is_some() || node.inputs.len() != 1 {
+            if providers.next().is_some() || node_inputs.len() != 1 {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} field projection must have exactly one provider"
                 )));
             }
             let provider = edge_variable(context, index, provider)?;
-            let field = builder.terms_mut().intern_name(field);
-            builder.add_projection_into(provider, [field], output);
+            builder.add_projection_into(provider, [*field], output);
         }
         KernelOwnerNodeKind::RenderConstructor { kind } => {
-            let mut fields = Vec::with_capacity(node.inputs.len() + 1);
+            let mut fields = Vec::with_capacity(node_inputs.len() + 1);
             let mut direction = None;
-            for edge in &node.inputs {
-                let KernelOwnerEdgeRole::AbiArgument { name } = &edge.role else {
+            for edge in node_inputs {
+                let KernelOwnerEdgeRole::AbiArgument { name } = edge.role else {
                     return Err(KernelOwnerBuildError::new(format!(
                         "kernel owner node {index} render constructor has invalid edge {:?}",
                         edge.role
                     )));
                 };
                 let value = edge_variable(context, index, edge)?;
-                if name.as_ref() == "direction" {
+                let name_text = context.input.symbol(name).ok_or_else(|| {
+                    KernelOwnerBuildError::new(format!(
+                        "kernel owner node {index} render argument has an invalid symbol"
+                    ))
+                })?;
+                if name_text == "direction" {
                     direction = Some(value);
                 }
                 let value_term = builder.variable_term(value);
-                constrain_render_argument(builder, name, value_term);
-                let name = builder.terms_mut().intern_name(name);
+                constrain_render_argument(builder, name_text, value_term);
                 fields.push((name, value_term));
             }
             let kind = match kind {
                 KernelRenderConstructorKind::Fixed(tag) => {
-                    let tag = builder.terms_mut().variant_tag(tag);
+                    let tag = VariantTerm::Tag(*tag);
                     builder.terms_mut().variant_set([tag])
                 }
                 KernelRenderConstructorKind::StripeDirection => {
                     let kind = builder.new_authoritative_provider();
-                    let row_name = builder.terms_mut().variant_tag("Row");
-                    let row = builder.terms_mut().variant_set([row_name]);
-                    let stack_name = builder.terms_mut().variant_tag("Stack");
-                    let stack = builder.terms_mut().variant_set([stack_name]);
+                    let row_name = builder.terms_mut().intern_name("Row");
+                    let row = builder
+                        .terms_mut()
+                        .variant_set([VariantTerm::Tag(row_name)]);
+                    let stack_name = builder.terms_mut().intern_name("Stack");
+                    let stack = builder
+                        .terms_mut()
+                        .variant_set([VariantTerm::Tag(stack_name)]);
+                    let column_name = builder.terms_mut().intern_name("Column");
                     let fallback = builder.terms_mut().union([row, stack]);
                     match direction {
                         Some(direction) => {
@@ -19114,15 +19790,15 @@ fn compile_node(
                                 [
                                     KernelSelectArm {
                                         pattern: KernelPattern::Tag {
-                                            name: "Row".into(),
-                                            fields: Box::new([]),
+                                            name: row_name,
+                                            fields: boon_contract::PathId::ROOT,
                                         },
                                         output: row,
                                     },
                                     KernelSelectArm {
                                         pattern: KernelPattern::Tag {
-                                            name: "Column".into(),
-                                            fields: Box::new([]),
+                                            name: column_name,
+                                            fields: boon_contract::PathId::ROOT,
                                         },
                                         output: stack,
                                     },
@@ -19148,22 +19824,27 @@ fn compile_node(
         KernelOwnerNodeKind::PureBuiltin { kind } => {
             let mut arguments = BTreeMap::new();
             let mut argument_edges = BTreeMap::new();
-            for edge in &node.inputs {
-                let KernelOwnerEdgeRole::AbiArgument { name } = &edge.role else {
+            for edge in node_inputs {
+                let KernelOwnerEdgeRole::AbiArgument { name } = edge.role else {
                     return Err(KernelOwnerBuildError::new(format!(
                         "kernel owner node {index} pure builtin has invalid edge {:?}",
                         edge.role
                     )));
                 };
+                let name_text = context.input.symbol(name).ok_or_else(|| {
+                    KernelOwnerBuildError::new(format!(
+                        "kernel owner node {index} pure builtin argument has an invalid symbol"
+                    ))
+                })?;
                 let value = edge_variable(context, index, edge)?;
-                if arguments.insert(name.as_ref(), value).is_some() {
+                if arguments.insert(name_text, value).is_some() {
                     return Err(KernelOwnerBuildError::new(format!(
-                        "kernel owner node {index} pure builtin repeats argument `{name}`"
+                        "kernel owner node {index} pure builtin repeats argument `{name_text}`"
                     )));
                 }
-                argument_edges.insert(name.as_ref(), edge);
+                argument_edges.insert(name_text, edge);
                 let value = builder.variable_term(value);
-                constrain_pure_builtin_argument(builder, *kind, name, value);
+                constrain_pure_builtin_argument(builder, *kind, name_text, value);
             }
             let argument = |name: &str| {
                 arguments.get(name).copied().ok_or_else(|| {
@@ -19311,15 +19992,16 @@ fn compile_node(
                 | KernelPureBuiltinKind::BoolToggle => boolean_type(builder),
                 KernelPureBuiltinKind::TextToNumber => parsed_number_type(builder),
                 KernelPureBuiltinKind::RecordConstructor => {
-                    let fields = node
-                        .inputs
+                    let fields = node_inputs
                         .iter()
                         .map(|edge| {
-                            let KernelOwnerEdgeRole::AbiArgument { name } = &edge.role else {
+                            let KernelOwnerEdgeRole::AbiArgument { name } = edge.role else {
                                 unreachable!("pure builtin argument roles were validated above")
                             };
-                            let value = arguments[name.as_ref()];
-                            let name = builder.terms_mut().intern_name(name);
+                            let name_text = context.input.symbol(name).expect(
+                                "validated pure builtin argument symbol belongs to owner text",
+                            );
+                            let value = arguments[name_text];
                             (name, builder.variable_term(value))
                         })
                         .collect::<Vec<_>>();
@@ -19418,23 +20100,7 @@ fn compile_node(
             builder.add_publish(output, [result], PublishMode::Replace);
         }
         KernelOwnerNodeKind::FixedAbiCall { result } => {
-            if !node.inputs.is_empty() {
-                return Err(KernelOwnerBuildError::new(format!(
-                    "kernel owner node {index} fixed ABI call has explicit inputs"
-                )));
-            }
-            if !type_is_recursively_closed(result) {
-                return Err(KernelOwnerBuildError::new(format!(
-                    "kernel owner node {index} fixed ABI call imports a non-closed result {result:?}"
-                )));
-            }
-            let result = builder.terms_mut().import_checked_type(result, &mut |_| {
-                unreachable!("closed fixed ABI type has no variable")
-            });
-            builder.add_publish(output, [result], PublishMode::Replace);
-        }
-        KernelOwnerNodeKind::FixedAbiCallPacked { result } => {
-            if !node.inputs.is_empty() {
+            if !node_inputs.is_empty() {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} fixed ABI call has explicit inputs"
                 )));
@@ -19444,6 +20110,11 @@ fn compile_node(
             builder.add_publish(output, [result], PublishMode::Replace);
         }
         KernelOwnerNodeKind::HostEffect { operation } => {
+            let operation = context.input.symbol(*operation).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} host effect has an invalid operation symbol"
+                ))
+            })?;
             compile_host_effect(builder, context, index, node, output, operation)?;
         }
         KernelOwnerNodeKind::Latest => {
@@ -19467,12 +20138,12 @@ fn compile_node(
             let mut selector_parameter_derived = false;
             let mut arms = Vec::new();
             let possible_arms = possible_when_arm_references(context, index, node)?;
-            for edge in &node.inputs {
+            for edge in node_inputs {
                 match edge.role {
                     KernelOwnerEdgeRole::WhenInput => {
                         let selector_expression = edge.expression.0 as usize;
                         selector_parameter_derived = selector_expression
-                            < context.input.nodes.len()
+                            < context.input.node_count()
                             && context
                                 .formal_dependent_expressions
                                 .get(context.owner.0 as usize)
@@ -19500,7 +20171,7 @@ fn compile_node(
                         };
                         let arm = edge_variable(context, index, edge)?;
                         arms.push(KernelSelectArm {
-                            pattern: pattern.clone(),
+                            pattern: *pattern,
                             output: builder.variable_term(arm),
                         });
                     }
@@ -19530,7 +20201,9 @@ fn compile_node(
             }) {
                 let selector_requirement = builder.variable_term(selector);
                 for arm in &arms {
-                    if let Some(requirement) = pattern_requirement_term(builder, &arm.pattern) {
+                    if let Some(requirement) =
+                        pattern_requirement_term(builder, context.input, &arm.pattern)
+                    {
                         builder.add_unify(selector_requirement, requirement);
                     }
                 }
@@ -19543,8 +20216,7 @@ fn compile_node(
             );
         }
         KernelOwnerNodeKind::Then => {
-            let has_output = node
-                .inputs
+            let has_output = node_inputs
                 .iter()
                 .any(|edge| matches!(edge.role, KernelOwnerEdgeRole::ThenOutput));
             publish_selected_edges(
@@ -19561,9 +20233,14 @@ fn compile_node(
             )?;
         }
         KernelOwnerNodeKind::Infix { operation } => {
+            let operation = context.input.symbol(*operation).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} infix has an invalid operation symbol"
+                ))
+            })?;
             let mut left = None;
             let mut right = None;
-            for edge in &node.inputs {
+            for edge in node_inputs {
                 let slot = match edge.role {
                     KernelOwnerEdgeRole::InfixLeft => &mut left,
                     KernelOwnerEdgeRole::InfixRight => &mut right,
@@ -19644,8 +20321,7 @@ fn compile_node(
             }
         }
         KernelOwnerNodeKind::MatchArm { .. } => {
-            if node
-                .inputs
+            if node_inputs
                 .iter()
                 .any(|edge| matches!(edge.role, KernelOwnerEdgeRole::MatchOutput))
             {
@@ -19658,8 +20334,7 @@ fn compile_node(
                     |role| matches!(role, KernelOwnerEdgeRole::MatchOutput),
                     PublishMode::Replace,
                 )?;
-            } else if node
-                .inputs
+            } else if node_inputs
                 .iter()
                 .any(|edge| matches!(edge.role, KernelOwnerEdgeRole::RecordField { .. }))
             {
@@ -19681,12 +20356,11 @@ fn compile_node(
             )?;
         }
         KernelOwnerNodeKind::Flush => {
-            let payloads = node
-                .inputs
+            let payloads = node_inputs
                 .iter()
                 .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::FlushPayload))
                 .count();
-            if payloads != 1 || node.inputs.len() != 1 {
+            if payloads != 1 || node_inputs.len() != 1 {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} FLUSH must have exactly one payload; found {payloads}",
                 )));
@@ -19716,25 +20390,23 @@ fn compile_record(
     builder: &mut ComponentProgramBuilder,
     context: &OwnerCompileContext<'_>,
     node_index: usize,
-    node: &KernelOwnerNode,
+    node: &PackedKernelOwnerNode,
     output: TypeVariableId,
-    tag: Option<&str>,
+    tag: Option<SymbolId>,
 ) -> Result<(), KernelOwnerBuildError> {
     let mut entries = Vec::new();
-    for edge in &node.inputs {
-        let KernelOwnerEdgeRole::RecordField { name, spread } = &edge.role else {
+    for edge in node.inputs(context.input) {
+        let PackedKernelOwnerEdgeRole::RecordField { name, spread } = edge.role else {
             continue;
         };
         let value = edge_variable(context, node_index, edge)?;
         let value = builder.variable_term(value);
-        if *spread {
+        if spread {
             entries.push(KernelRecordEntry::Spread { value });
         } else {
-            let name = builder.terms_mut().intern_name(name);
             entries.push(KernelRecordEntry::Field { name, value });
         }
     }
-    let tag = tag.map(|tag| builder.terms_mut().intern_name(tag));
     builder.add_record(output, tag, entries);
     Ok(())
 }
@@ -19743,9 +20415,9 @@ fn publish_selected_edges(
     builder: &mut ComponentProgramBuilder,
     context: &OwnerCompileContext<'_>,
     node_index: usize,
-    node: &KernelOwnerNode,
+    node: &PackedKernelOwnerNode,
     output: TypeVariableId,
-    selected: impl Fn(&KernelOwnerEdgeRole) -> bool,
+    selected: impl Fn(&PackedKernelOwnerEdgeRole) -> bool,
     mode: PublishMode,
 ) -> Result<(), KernelOwnerBuildError> {
     let terms = selected_edge_terms(builder, context, node_index, node, selected)?;
@@ -19769,11 +20441,19 @@ fn requirement_projection(
     root: TypeVariableId,
     fields: &[SymbolId],
 ) -> TypeVariableId {
+    requirement_projection_iter(builder, root, fields.iter().copied())
+}
+
+fn requirement_projection_iter(
+    builder: &mut ComponentProgramBuilder,
+    root: TypeVariableId,
+    fields: impl IntoIterator<Item = SymbolId>,
+) -> TypeVariableId {
     let mut provider = root;
     for field in fields {
         let consumer = builder.new_variable();
         let consumer_term = builder.variable_term(consumer);
-        let scaffold = builder.terms_mut().object([(*field, consumer_term)], true);
+        let scaffold = builder.terms_mut().object([(field, consumer_term)], true);
         let provider_term = builder.variable_term(provider);
         builder.add_unify(provider_term, scaffold);
         provider = consumer;
@@ -19783,30 +20463,33 @@ fn requirement_projection(
 
 fn pattern_requirement_term(
     builder: &mut ComponentProgramBuilder,
-    pattern: &KernelPattern,
+    owner: PackedKernelOwnerProgramRef<'_>,
+    pattern: &crate::PackedKernelPattern,
 ) -> Option<TypeTermId> {
     Some(match pattern {
-        KernelPattern::Wildcard | KernelPattern::Binding { .. } | KernelPattern::Invalid => {
+        crate::PackedKernelPattern::Wildcard
+        | crate::PackedKernelPattern::Binding { .. }
+        | crate::PackedKernelPattern::Invalid => {
             return None;
         }
-        KernelPattern::Number => builder.terms().number(),
-        KernelPattern::Text => builder.terms().text(),
-        KernelPattern::Bits { width } => builder.terms_mut().bits(*width),
-        KernelPattern::Tag { name, fields } => {
+        crate::PackedKernelPattern::Number => builder.terms().number(),
+        crate::PackedKernelPattern::Text => builder.terms().text(),
+        crate::PackedKernelPattern::Bits { width } => builder.terms_mut().bits(*width),
+        crate::PackedKernelPattern::Tag { name, fields } => {
+            let fields = owner.path(*fields)?;
             if fields.is_empty() {
-                let tag = builder.terms_mut().variant_tag(name);
+                let tag = VariantTerm::Tag(*name);
                 builder.terms_mut().variant_set([tag])
             } else {
                 let fields = fields
                     .iter()
-                    .map(|field| {
-                        let name = builder.terms_mut().intern_name(field);
+                    .map(|name| {
                         let value = builder.new_contextual_hole();
                         (name, builder.variable_term(value))
                     })
                     .collect::<Vec<_>>();
                 let fields = builder.terms_mut().object(fields, true);
-                let tag = builder.terms_mut().tagged_variant(name, fields);
+                let tag = VariantTerm::Tagged { tag: *name, fields };
                 builder.terms_mut().variant_set([tag])
             }
         }
@@ -19817,10 +20500,10 @@ fn selected_edge_terms(
     builder: &mut ComponentProgramBuilder,
     context: &OwnerCompileContext<'_>,
     node_index: usize,
-    node: &KernelOwnerNode,
-    selected: impl Fn(&KernelOwnerEdgeRole) -> bool,
+    node: &PackedKernelOwnerNode,
+    selected: impl Fn(&PackedKernelOwnerEdgeRole) -> bool,
 ) -> Result<Vec<crate::TypeTermId>, KernelOwnerBuildError> {
-    node.inputs
+    node.inputs(context.input)
         .iter()
         .filter(|edge| selected(&edge.role))
         .map(|edge| {
@@ -19834,10 +20517,14 @@ fn node_mode_equation(
     mode_builder: &mut ModeProgramBuilder,
     context: &OwnerCompileContext<'_>,
     node_index: usize,
-    node: &KernelOwnerNode,
+    node: &PackedKernelOwnerNode,
 ) -> Result<ModeEquation, KernelOwnerBuildError> {
-    let copy = |selected: fn(&KernelOwnerEdgeRole) -> bool| {
-        let mut inputs = node.inputs.iter().filter(|edge| selected(&edge.role));
+    use crate::PackedKernelOwnerEdgeRole as KernelOwnerEdgeRole;
+    use crate::PackedKernelOwnerNodeKind as KernelOwnerNodeKind;
+
+    let node_inputs = node.inputs(context.input);
+    let copy = |selected: &dyn Fn(&PackedKernelOwnerEdgeRole) -> bool| {
+        let mut inputs = node_inputs.iter().filter(|edge| selected(&edge.role));
         let input = inputs.next().ok_or_else(|| {
             KernelOwnerBuildError::new(format!(
                 "kernel owner node {node_index} has no provider for its flow mode"
@@ -19853,6 +20540,16 @@ fn node_mode_equation(
     match &node.kind {
         KernelOwnerNodeKind::FormalRead { formal, fields }
         | KernelOwnerNodeKind::ContextRead { formal, fields } => {
+            let fields = context
+                .input
+                .path(*fields)
+                .ok_or_else(|| {
+                    KernelOwnerBuildError::new(format!(
+                        "kernel owner node {node_index} formal mode has an invalid packed path"
+                    ))
+                })?
+                .iter()
+                .collect::<Vec<_>>();
             let source = context
                 .formal_mode_sources
                 .get(*formal as usize)
@@ -19866,7 +20563,7 @@ fn node_mode_equation(
                 context,
                 node_index,
                 source,
-                fields,
+                &fields,
                 &mut BTreeSet::new(),
             )
             .map(ModeEquation::Copy)
@@ -19894,8 +20591,17 @@ fn node_mode_equation(
             // required for event fields inside an otherwise continuous
             // record: publishing the record as an owner result must not erase
             // the field's PresentOrAbsent surface.
-            let mut providers = node
-                .inputs
+            let fields = context
+                .input
+                .path(*fields)
+                .ok_or_else(|| {
+                    KernelOwnerBuildError::new(format!(
+                        "kernel owner node {node_index} value mode has an invalid packed path"
+                    ))
+                })?
+                .iter()
+                .collect::<Vec<_>>();
+            let mut providers = node_inputs
                 .iter()
                 .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider));
             let provider = providers.next().ok_or_else(|| {
@@ -19911,13 +20617,12 @@ fn node_mode_equation(
             if fields.is_empty() {
                 edge_mode_variable(context, node_index, provider).map(ModeEquation::Copy)
             } else {
-                projected_edge_mode_variable(mode_builder, context, node_index, provider, fields)
+                projected_edge_mode_variable(mode_builder, context, node_index, provider, &fields)
                     .map(ModeEquation::Copy)
             }
         }
         KernelOwnerNodeKind::PatternRead { .. } => {
-            let providers = node
-                .inputs
+            let providers = node_inputs
                 .iter()
                 .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider))
                 .count();
@@ -19934,8 +20639,17 @@ fn node_mode_equation(
         }
         KernelOwnerNodeKind::LexicalRead { fields }
         | KernelOwnerNodeKind::DerivedRead { fields } => {
-            let mut providers = node
-                .inputs
+            let fields = context
+                .input
+                .path(*fields)
+                .ok_or_else(|| {
+                    KernelOwnerBuildError::new(format!(
+                        "kernel owner node {node_index} lexical mode has an invalid packed path"
+                    ))
+                })?
+                .iter()
+                .collect::<Vec<_>>();
+            let mut providers = node_inputs
                 .iter()
                 .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider));
             let provider = providers.next().ok_or_else(|| {
@@ -19951,11 +20665,11 @@ fn node_mode_equation(
             if fields.is_empty() {
                 return edge_mode_variable(context, node_index, provider).map(ModeEquation::Copy);
             }
-            projected_edge_mode_variable(mode_builder, context, node_index, provider, fields)
+            projected_edge_mode_variable(mode_builder, context, node_index, provider, &fields)
                 .map(ModeEquation::Copy)
         }
         KernelOwnerNodeKind::CollectionItemRead => {
-            copy(|role| matches!(role, KernelOwnerEdgeRole::ReadProvider))
+            copy(&|role| matches!(role, KernelOwnerEdgeRole::ReadProvider))
         }
         KernelOwnerNodeKind::FreshOut => {
             let mut active = BTreeSet::new();
@@ -19970,27 +20684,26 @@ fn node_mode_equation(
                 None => Ok(ModeEquation::Fixed(node.mode)),
             }
         }
-        KernelOwnerNodeKind::Block => copy(|role| matches!(role, KernelOwnerEdgeRole::BlockResult)),
-        KernelOwnerNodeKind::Latest => node
-            .inputs
+        KernelOwnerNodeKind::Block => {
+            copy(&|role| matches!(role, KernelOwnerEdgeRole::BlockResult))
+        }
+        KernelOwnerNodeKind::Latest => node_inputs
             .iter()
             .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::LatestBranch))
             .map(|edge| edge_mode_variable(context, node_index, edge))
             .collect::<Result<Vec<_>, _>>()
             .map(|inputs| ModeEquation::Latest(inputs.into_boxed_slice())),
-        KernelOwnerNodeKind::When => copy(|role| matches!(role, KernelOwnerEdgeRole::WhenInput)),
+        KernelOwnerNodeKind::When => copy(&|role| matches!(role, KernelOwnerEdgeRole::WhenInput)),
         KernelOwnerNodeKind::Draining => {
-            copy(|role| matches!(role, KernelOwnerEdgeRole::DrainingInput))
+            copy(&|role| matches!(role, KernelOwnerEdgeRole::DrainingInput))
         }
         KernelOwnerNodeKind::MatchArm { .. } => {
-            if node
-                .inputs
+            if node_inputs
                 .iter()
                 .any(|edge| matches!(edge.role, KernelOwnerEdgeRole::MatchOutput))
             {
-                copy(|role| matches!(role, KernelOwnerEdgeRole::MatchOutput))
-            } else if node
-                .inputs
+                copy(&|role| matches!(role, KernelOwnerEdgeRole::MatchOutput))
+            } else if node_inputs
                 .iter()
                 .any(|edge| matches!(edge.role, KernelOwnerEdgeRole::RecordField { .. }))
             {
@@ -20000,36 +20713,36 @@ fn node_mode_equation(
             }
         }
         KernelOwnerNodeKind::Arrow => {
-            if node
-                .inputs
+            if node_inputs
                 .iter()
                 .any(|edge| matches!(edge.role, KernelOwnerEdgeRole::ArrowOutput))
             {
-                copy(|role| matches!(role, KernelOwnerEdgeRole::ArrowOutput))
+                copy(&|role| matches!(role, KernelOwnerEdgeRole::ArrowOutput))
             } else {
                 Ok(ModeEquation::Fixed(FlowMode::Absent))
             }
         }
         KernelOwnerNodeKind::PureBuiltin {
             kind: KernelPureBuiltinKind::ListMap,
-        } => copy(
-            |role| matches!(role, KernelOwnerEdgeRole::AbiArgument { name } if name.as_ref() == "new"),
-        ),
+        } => copy(&|role| {
+            matches!(role, KernelOwnerEdgeRole::AbiArgument { name }
+                if context.input.symbol(*name) == Some("new"))
+        }),
         KernelOwnerNodeKind::PureBuiltin {
             kind: KernelPureBuiltinKind::ListLatest,
-        } => copy(
-            |role| matches!(role, KernelOwnerEdgeRole::AbiArgument { name } if matches!(name.as_ref(), "$pipe" | "list")),
-        ),
-        KernelOwnerNodeKind::FieldProjection { .. } => copy(
-            |role| matches!(role, KernelOwnerEdgeRole::AbiArgument { name } if matches!(name.as_ref(), "$pipe" | "input")),
-        ),
+        } => copy(&|role| {
+            matches!(role, KernelOwnerEdgeRole::AbiArgument { name }
+                if context.input.symbol(*name).is_some_and(|name| matches!(name, "$pipe" | "list")))
+        }),
+        KernelOwnerNodeKind::FieldProjection { .. } => copy(&|role| {
+            matches!(role, KernelOwnerEdgeRole::AbiArgument { name }
+                if context.input.symbol(*name).is_some_and(|name| matches!(name, "$pipe" | "input")))
+        }),
         KernelOwnerNodeKind::UserCall { .. } => Err(KernelOwnerBuildError::new(format!(
             "kernel owner node {node_index} user-call mode must come from its invocation"
         ))),
         KernelOwnerNodeKind::Known(_)
-        | KernelOwnerNodeKind::KnownPacked(_)
         | KernelOwnerNodeKind::Source(_)
-        | KernelOwnerNodeKind::SourcePacked(_)
         | KernelOwnerNodeKind::Absent
         | KernelOwnerNodeKind::Text
         | KernelOwnerNodeKind::TextTemplate
@@ -20043,7 +20756,6 @@ fn node_mode_equation(
         | KernelOwnerNodeKind::RenderConstructor { .. }
         | KernelOwnerNodeKind::PureBuiltin { .. }
         | KernelOwnerNodeKind::FixedAbiCall { .. }
-        | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
         | KernelOwnerNodeKind::HostEffect { .. }
         | KernelOwnerNodeKind::Then
         | KernelOwnerNodeKind::Infix { .. }
@@ -20057,17 +20769,16 @@ fn node_mode_equation(
 fn possible_when_arm_references(
     context: &OwnerCompileContext<'_>,
     node_index: usize,
-    node: &KernelOwnerNode,
+    node: &PackedKernelOwnerNode,
 ) -> Result<BTreeSet<usize>, KernelOwnerBuildError> {
-    let arm_edges = node
-        .inputs
+    let inputs = node.inputs(context.input);
+    let arm_edges = inputs
         .iter()
-        .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::WhenArm))
+        .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::WhenArm))
         .collect::<Vec<_>>();
-    let selector = node
-        .inputs
+    let selector = inputs
         .iter()
-        .find(|edge| matches!(edge.role, KernelOwnerEdgeRole::WhenInput))
+        .find(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::WhenInput))
         .and_then(|edge| edge_static_variants(context, edge));
     let Some(selector) = selector else {
         return Ok(arm_edges
@@ -20079,12 +20790,12 @@ fn possible_when_arm_references(
     for tag in selector.iter().copied() {
         for edge in &arm_edges {
             let arm = referenced_node(context, node_index, edge)?;
-            let KernelOwnerNodeKind::MatchArm { pattern } = &arm.kind else {
+            let PackedKernelOwnerNodeKind::MatchArm { pattern } = &arm.kind else {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel owner node {node_index} WHEN targets a non-arm expression"
                 )));
             };
-            if static_pattern_accepts_tag(context.text, pattern, tag) {
+            if static_pattern_accepts_tag(pattern, tag) {
                 selected.insert(edge.expression.0 as usize);
                 break;
             }
@@ -20149,7 +20860,7 @@ fn compile_host_effect(
     builder: &mut ComponentProgramBuilder,
     context: &OwnerCompileContext<'_>,
     index: usize,
-    node: &KernelOwnerNode,
+    node: &PackedKernelOwnerNode,
     output: TypeVariableId,
     operation: &str,
 ) -> Result<(), KernelOwnerBuildError> {
@@ -20180,14 +20891,19 @@ fn compile_host_effect(
 
     let pipe_field = fields.first().map(|field| field.name);
     let mut arguments = BTreeMap::<&str, TypeVariableId>::new();
-    for edge in &node.inputs {
-        let KernelOwnerEdgeRole::AbiArgument { name } = &edge.role else {
+    for edge in node.inputs(context.input) {
+        let PackedKernelOwnerEdgeRole::AbiArgument { name } = edge.role else {
             return Err(KernelOwnerBuildError::new(format!(
                 "kernel owner node {index} host effect has invalid edge {:?}",
                 edge.role
             )));
         };
-        let name = if name.as_ref() == "$pipe" {
+        let name = context.input.symbol(name).ok_or_else(|| {
+            KernelOwnerBuildError::new(format!(
+                "kernel owner node {index} host effect argument has an invalid symbol"
+            ))
+        })?;
+        let name = if name == "$pipe" {
             pipe_field.ok_or_else(|| {
                 KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} cannot pipe into argument-free host effect `{operation}`"
@@ -20446,13 +21162,13 @@ type ActiveModeProjection = BTreeSet<(KernelOwnerId, usize, usize, bool, bool)>;
 fn owner_mode_input<'a>(
     context: &'a OwnerCompileContext<'a>,
     owner: KernelOwnerId,
-) -> Result<&'a KernelOwnerProgramInput, KernelOwnerBuildError> {
+) -> Result<PackedKernelOwnerProgramRef<'a>, KernelOwnerBuildError> {
     if owner == context.owner {
         return Ok(context.input);
     }
     context
         .project
-        .and_then(|project| project.owners.get(owner.0 as usize))
+        .and_then(|project| project.owner(owner))
         .ok_or_else(|| {
             KernelOwnerBuildError::new(format!(
                 "owner {} mode projection references missing owner {}",
@@ -20466,11 +21182,11 @@ fn mode_source_for_edge(
     owner: KernelOwnerId,
     expression_modes: &Arc<[ModeVariableId]>,
     formal_sources: &Arc<[ModeSource]>,
-    edge: &KernelOwnerInputEdge,
+    edge: &crate::PackedKernelOwnerInputEdge,
 ) -> Result<ModeSource, KernelOwnerBuildError> {
     let input = owner_mode_input(context, owner)?;
     let reference = edge.expression.0 as usize;
-    if reference < input.nodes.len() {
+    if reference < input.node_count() {
         return Ok(ModeSource::Expression {
             owner,
             expression: reference,
@@ -20478,12 +21194,12 @@ fn mode_source_for_edge(
             formal_sources: Arc::clone(formal_sources),
         });
     }
-    let external_index = reference - input.nodes.len();
-    let external = input.external_expressions.get(external_index).ok_or_else(|| {
+    let external_index = reference - input.node_count();
+    let external = input.external_expressions().get(external_index).ok_or_else(|| {
         KernelOwnerBuildError::new(format!(
             "owner {} mode projection references external expression {external_index} outside 0..{}",
             owner.0,
-            input.external_expressions.len()
+            input.external_expressions().len()
         ))
     })?;
     let project = context.project.ok_or_else(|| {
@@ -20492,15 +21208,12 @@ fn mode_source_for_edge(
             owner.0
         ))
     })?;
-    let target = project
-        .owners
-        .get(external.owner.0 as usize)
-        .ok_or_else(|| {
-            KernelOwnerBuildError::new(format!(
-                "owner {} mode projection references missing owner {}",
-                owner.0, external.owner.0
-            ))
-        })?;
+    let target = project.owner(external.owner).ok_or_else(|| {
+        KernelOwnerBuildError::new(format!(
+            "owner {} mode projection references missing owner {}",
+            owner.0, external.owner.0
+        ))
+    })?;
     let target_instance = context
         .principals
         .get(external.owner.0 as usize)
@@ -20512,11 +21225,11 @@ fn mode_source_for_edge(
         })?;
     let expression = match external.target {
         KernelExternalTarget::Expression(expression) => {
-            checked_expression_index(expression, target.nodes.len(), "external mode projection")?
+            checked_expression_index(expression, target.node_count(), "external mode projection")?
         }
         KernelExternalTarget::Result => checked_expression_index(
-            target.result,
-            target.nodes.len(),
+            target.result(),
+            target.node_count(),
             "external result mode projection",
         )?,
     };
@@ -20529,10 +21242,11 @@ fn mode_source_for_edge(
 }
 
 fn selected_mode_edge<'a>(
-    node: &'a KernelOwnerNode,
-    selected: impl Fn(&KernelOwnerEdgeRole) -> bool,
-) -> Option<&'a KernelOwnerInputEdge> {
-    node.inputs.iter().find(|edge| selected(&edge.role))
+    owner: PackedKernelOwnerProgramRef<'a>,
+    node: &'a PackedKernelOwnerNode,
+    selected: impl Fn(&PackedKernelOwnerEdgeRole) -> bool,
+) -> Option<&'a crate::PackedKernelOwnerInputEdge> {
+    node.inputs(owner).iter().find(|edge| selected(&edge.role))
 }
 
 fn merge_projected_modes(
@@ -20590,7 +21304,7 @@ fn user_call_result_mode_source(
     owner: KernelOwnerId,
     expression_modes: &Arc<[ModeVariableId]>,
     formal_sources: &Arc<[ModeSource]>,
-    node: &KernelOwnerNode,
+    node: &PackedKernelOwnerNode,
     target: KernelOwnerId,
     inherited_formal: Option<KernelInheritedFormal>,
 ) -> Result<ModeSource, KernelOwnerBuildError> {
@@ -20599,7 +21313,7 @@ fn user_call_result_mode_source(
             "kernel owner node {source_node} projects through a user call outside a project"
         ))
     })?;
-    let target_input = project.owners.get(target.0 as usize).ok_or_else(|| {
+    let target_input = project.owner(target).ok_or_else(|| {
         KernelOwnerBuildError::new(format!(
             "kernel owner node {source_node} projects through missing owner {}",
             target.0
@@ -20611,9 +21325,10 @@ fn user_call_result_mode_source(
             target.0
         ))
     })?;
-    let mut actuals = vec![None; target_input.formal_count as usize];
-    for edge in &node.inputs {
-        let KernelOwnerEdgeRole::CallArgument { ordinal } = edge.role else {
+    let mut actuals = vec![None; target_input.formal_count() as usize];
+    let owner_input = owner_mode_input(context, owner)?;
+    for edge in node.inputs(owner_input) {
+        let PackedKernelOwnerEdgeRole::CallArgument { ordinal } = edge.role else {
             continue;
         };
         let actual = mode_source_for_edge(context, owner, expression_modes, formal_sources, edge)?;
@@ -20665,8 +21380,8 @@ fn user_call_result_mode_source(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let result = checked_expression_index(
-        target_input.result,
-        target_input.nodes.len(),
+        target_input.result(),
+        target_input.node_count(),
         "projected user-call result",
     )?;
     Ok(ModeSource::Expression {
@@ -20681,8 +21396,8 @@ fn projected_edge_mode_variable(
     mode_builder: &mut ModeProgramBuilder,
     context: &OwnerCompileContext<'_>,
     node_index: usize,
-    edge: &KernelOwnerInputEdge,
-    fields: &[Box<str>],
+    edge: &crate::PackedKernelOwnerInputEdge,
+    fields: &[SymbolId],
 ) -> Result<ModeVariableId, KernelOwnerBuildError> {
     let source = mode_source_for_edge(
         context,
@@ -20706,7 +21421,7 @@ fn projected_mode_variable(
     context: &OwnerCompileContext<'_>,
     source_node: usize,
     source: &ModeSource,
-    fields: &[Box<str>],
+    fields: &[SymbolId],
     active: &mut ActiveModeProjection,
 ) -> Result<ModeVariableId, KernelOwnerBuildError> {
     let ModeSource::Expression {
@@ -20719,7 +21434,7 @@ fn projected_mode_variable(
         return Ok(source.root_mode());
     };
     let input = owner_mode_input(context, *owner)?;
-    let node = input.nodes.get(*expression).ok_or_else(|| {
+    let node = input.nodes().get(*expression).ok_or_else(|| {
         KernelOwnerBuildError::new(format!(
             "kernel owner node {source_node} projects missing owner {} expression {expression}",
             owner.0
@@ -20729,25 +21444,29 @@ fn projected_mode_variable(
     let unproven_branch = active.iter().any(|key| key.4)
         || matches!(
             node.kind,
-            KernelOwnerNodeKind::Latest | KernelOwnerNodeKind::When
+            PackedKernelOwnerNodeKind::Latest | PackedKernelOwnerNodeKind::When
         );
     let active_key = (*owner, *expression, fields.len(), false, unproven_branch);
     if !active.insert(active_key) {
         return Ok(mode);
     }
-    let follow = |edge: &KernelOwnerInputEdge| {
+    let follow = |edge: &crate::PackedKernelOwnerInputEdge| {
         mode_source_for_edge(context, *owner, expression_modes, formal_sources, edge)
     };
     let result = match &node.kind {
-        KernelOwnerNodeKind::FormalRead {
+        PackedKernelOwnerNodeKind::FormalRead {
             formal,
             fields: provider_fields,
         }
-        | KernelOwnerNodeKind::ContextRead {
+        | PackedKernelOwnerNodeKind::ContextRead {
             formal,
             fields: provider_fields,
         } => {
-            let mut combined = provider_fields.to_vec();
+            let mut combined = input
+                .path(*provider_fields)
+                .expect("packed formal mode path remains valid")
+                .iter()
+                .collect::<Vec<_>>();
             combined.extend_from_slice(fields);
             let provider = formal_sources.get(*formal as usize).ok_or_else(|| {
                 KernelOwnerBuildError::new(format!(
@@ -20763,7 +21482,7 @@ fn projected_mode_variable(
                 active,
             )?
         }
-        KernelOwnerNodeKind::FreshOut => output_binding_collection_item_mode_variable(
+        PackedKernelOwnerNodeKind::FreshOut => output_binding_collection_item_mode_variable(
             mode_builder,
             context,
             *expression,
@@ -20771,25 +21490,29 @@ fn projected_mode_variable(
             active,
         )?
         .unwrap_or(mode),
-        KernelOwnerNodeKind::LexicalRead {
+        PackedKernelOwnerNodeKind::LexicalRead {
             fields: provider_fields,
         }
-        | KernelOwnerNodeKind::ValueRead {
+        | PackedKernelOwnerNodeKind::ValueRead {
             fields: provider_fields,
             ..
         }
-        | KernelOwnerNodeKind::DerivedRead {
+        | PackedKernelOwnerNodeKind::DerivedRead {
             fields: provider_fields,
         }
-        | KernelOwnerNodeKind::PatternRead {
+        | PackedKernelOwnerNodeKind::PatternRead {
             fields: provider_fields,
             ..
         } => {
-            let provider = selected_mode_edge(node, |role| {
-                matches!(role, KernelOwnerEdgeRole::ReadProvider)
+            let provider = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::ReadProvider)
             });
             if let Some(provider) = provider {
-                let mut combined = provider_fields.to_vec();
+                let mut combined = input
+                    .path(*provider_fields)
+                    .expect("packed read mode path remains valid")
+                    .iter()
+                    .collect::<Vec<_>>();
                 combined.extend_from_slice(fields);
                 let provider = follow(provider)?;
                 if combined.is_empty() {
@@ -20808,7 +21531,7 @@ fn projected_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::UserCall {
+        PackedKernelOwnerNodeKind::UserCall {
             target,
             inherited_formal,
         } => {
@@ -20824,9 +21547,9 @@ fn projected_mode_variable(
             )?;
             projected_mode_variable(mode_builder, context, source_node, &result, fields, active)?
         }
-        KernelOwnerNodeKind::Block => {
-            if let Some(edge) = selected_mode_edge(node, |role| {
-                matches!(role, KernelOwnerEdgeRole::BlockResult)
+        PackedKernelOwnerNodeKind::Block => {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::BlockResult)
             }) {
                 let provider = follow(edge)?;
                 projected_mode_variable(
@@ -20841,9 +21564,9 @@ fn projected_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::Draining => {
-            if let Some(edge) = selected_mode_edge(node, |role| {
-                matches!(role, KernelOwnerEdgeRole::DrainingInput)
+        PackedKernelOwnerNodeKind::Draining => {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::DrainingInput)
             }) {
                 let provider = follow(edge)?;
                 projected_mode_variable(
@@ -20858,9 +21581,9 @@ fn projected_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::MatchArm { .. } => {
-            if let Some(edge) = selected_mode_edge(node, |role| {
-                matches!(role, KernelOwnerEdgeRole::MatchOutput)
+        PackedKernelOwnerNodeKind::MatchArm { .. } => {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::MatchOutput)
             }) {
                 let provider = follow(edge)?;
                 projected_mode_variable(
@@ -20875,9 +21598,9 @@ fn projected_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::Arrow => {
-            if let Some(edge) = selected_mode_edge(node, |role| {
-                matches!(role, KernelOwnerEdgeRole::ArrowOutput)
+        PackedKernelOwnerNodeKind::Arrow => {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::ArrowOutput)
             }) {
                 let provider = follow(edge)?;
                 projected_mode_variable(
@@ -20892,9 +21615,9 @@ fn projected_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::CollectionItemRead => {
-            if let Some(edge) = selected_mode_edge(node, |role| {
-                matches!(role, KernelOwnerEdgeRole::ReadProvider)
+        PackedKernelOwnerNodeKind::CollectionItemRead => {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::ReadProvider)
             }) {
                 let provider = follow(edge)?;
                 if fields.is_empty() {
@@ -20920,13 +21643,13 @@ fn projected_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::PureBuiltin {
+        PackedKernelOwnerNodeKind::PureBuiltin {
             kind: KernelPureBuiltinKind::ListMap,
         } if fields.is_empty() => {
-            if let Some(edge) = selected_mode_edge(
-                node,
-                |role| matches!(role, KernelOwnerEdgeRole::AbiArgument { name } if name.as_ref() == "$pipe"),
-            ) {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::AbiArgument { name }
+                    if input.symbol(*name) == Some("$pipe"))
+            }) {
                 let provider = follow(edge)?;
                 projected_mode_variable(
                     mode_builder,
@@ -20938,7 +21661,7 @@ fn projected_mode_variable(
                 )?
             } else {
                 let inputs = node
-                    .inputs
+                    .inputs(input)
                     .iter()
                     .map(|edge| {
                         let provider = follow(edge)?;
@@ -20955,13 +21678,13 @@ fn projected_mode_variable(
                 merge_contextual_call_modes(mode_builder, inputs, node.mode, mode)
             }
         }
-        KernelOwnerNodeKind::PureBuiltin {
+        PackedKernelOwnerNodeKind::PureBuiltin {
             kind: KernelPureBuiltinKind::ListMap,
         } => {
-            if let Some(edge) = selected_mode_edge(
-                node,
-                |role| matches!(role, KernelOwnerEdgeRole::AbiArgument { name } if name.as_ref() == "new"),
-            ) {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::AbiArgument { name }
+                    if input.symbol(*name) == Some("new"))
+            }) {
                 let provider = follow(edge)?;
                 projected_mode_variable(
                     mode_builder,
@@ -20975,11 +21698,11 @@ fn projected_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::PureBuiltin {
+        PackedKernelOwnerNodeKind::PureBuiltin {
             kind: KernelPureBuiltinKind::ListLatest,
         } if fields.is_empty() => {
             let inputs = node
-                .inputs
+                .inputs(input)
                 .iter()
                 .map(|edge| {
                     let provider = follow(edge)?;
@@ -20995,13 +21718,13 @@ fn projected_mode_variable(
                 .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?;
             merge_contextual_call_modes(mode_builder, inputs, node.mode, mode)
         }
-        KernelOwnerNodeKind::PureBuiltin {
+        PackedKernelOwnerNodeKind::PureBuiltin {
             kind: KernelPureBuiltinKind::ListLatest,
         } => {
-            if let Some(edge) = selected_mode_edge(
-                node,
-                |role| matches!(role, KernelOwnerEdgeRole::AbiArgument { name } if matches!(name.as_ref(), "$pipe" | "list")),
-            ) {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::AbiArgument { name }
+                    if input.symbol(*name).is_some_and(|name| matches!(name, "$pipe" | "list")))
+            }) {
                 let provider = follow(edge)?;
                 if fields.is_empty() {
                     projected_mode_variable(
@@ -21026,10 +21749,10 @@ fn projected_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::When if fields.is_empty() => {
-            if let Some(edge) =
-                selected_mode_edge(node, |role| matches!(role, KernelOwnerEdgeRole::WhenInput))
-            {
+        PackedKernelOwnerNodeKind::When if fields.is_empty() => {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::WhenInput)
+            }) {
                 let provider = follow(edge)?;
                 projected_mode_variable(
                     mode_builder,
@@ -21043,16 +21766,18 @@ fn projected_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::Latest | KernelOwnerNodeKind::When => {
-            let selected = |role: &KernelOwnerEdgeRole| match &node.kind {
-                KernelOwnerNodeKind::Latest => {
-                    matches!(role, KernelOwnerEdgeRole::LatestBranch)
+        PackedKernelOwnerNodeKind::Latest | PackedKernelOwnerNodeKind::When => {
+            let selected = |role: &PackedKernelOwnerEdgeRole| match &node.kind {
+                PackedKernelOwnerNodeKind::Latest => {
+                    matches!(role, PackedKernelOwnerEdgeRole::LatestBranch)
                 }
-                KernelOwnerNodeKind::When => matches!(role, KernelOwnerEdgeRole::WhenArm),
+                PackedKernelOwnerNodeKind::When => {
+                    matches!(role, PackedKernelOwnerEdgeRole::WhenArm)
+                }
                 _ => false,
             };
             let projected = node
-                .inputs
+                .inputs(input)
                 .iter()
                 .filter(|edge| selected(&edge.role))
                 .map(|edge| {
@@ -21069,13 +21794,13 @@ fn projected_mode_variable(
                 .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?;
             merge_projected_modes(mode_builder, projected, mode)
         }
-        KernelOwnerNodeKind::PureBuiltin { .. }
-        | KernelOwnerNodeKind::RenderConstructor { .. }
-        | KernelOwnerNodeKind::HostEffect { .. }
+        PackedKernelOwnerNodeKind::PureBuiltin { .. }
+        | PackedKernelOwnerNodeKind::RenderConstructor { .. }
+        | PackedKernelOwnerNodeKind::HostEffect { .. }
             if fields.is_empty() =>
         {
             let inputs = node
-                .inputs
+                .inputs(input)
                 .iter()
                 .map(|edge| {
                     let provider = follow(edge)?;
@@ -21091,13 +21816,13 @@ fn projected_mode_variable(
                 .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?;
             merge_contextual_call_modes(mode_builder, inputs, node.mode, mode)
         }
-        KernelOwnerNodeKind::Record { .. } if !fields.is_empty() => {
+        PackedKernelOwnerNodeKind::Record { .. } if !fields.is_empty() => {
             let field = &fields[0];
-            if let Some(edge) = selected_mode_edge(node, |role| {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
                 matches!(
                     role,
-                    KernelOwnerEdgeRole::RecordField { name, spread: false }
-                        if name.as_ref() == field.as_ref()
+                    PackedKernelOwnerEdgeRole::RecordField { name, spread: false }
+                        if name == field
                 )
             }) {
                 let provider = follow(edge)?;
@@ -21111,12 +21836,12 @@ fn projected_mode_variable(
                 )?
             } else {
                 let projected_spreads = node
-                    .inputs
+                    .inputs(input)
                     .iter()
                     .filter(|edge| {
                         matches!(
                             edge.role,
-                            KernelOwnerEdgeRole::RecordField { spread: true, .. }
+                            PackedKernelOwnerEdgeRole::RecordField { spread: true, .. }
                         )
                     })
                     .map(|edge| {
@@ -21156,7 +21881,7 @@ fn projected_collection_item_mode_variable(
     context: &OwnerCompileContext<'_>,
     source_node: usize,
     source: &ModeSource,
-    fields: &[Box<str>],
+    fields: &[SymbolId],
     active: &mut ActiveModeProjection,
 ) -> Result<ModeVariableId, KernelOwnerBuildError> {
     let ModeSource::Expression {
@@ -21169,7 +21894,7 @@ fn projected_collection_item_mode_variable(
         return Ok(source.root_mode());
     };
     let input = owner_mode_input(context, *owner)?;
-    let node = input.nodes.get(*expression).ok_or_else(|| {
+    let node = input.nodes().get(*expression).ok_or_else(|| {
         KernelOwnerBuildError::new(format!(
             "kernel owner node {source_node} projects an item from missing owner {} expression {expression}",
             owner.0
@@ -21180,18 +21905,18 @@ fn projected_collection_item_mode_variable(
     if !active.insert(active_key) {
         return Ok(mode);
     }
-    let follow = |edge: &KernelOwnerInputEdge| {
+    let follow = |edge: &crate::PackedKernelOwnerInputEdge| {
         mode_source_for_edge(context, *owner, expression_modes, formal_sources, edge)
     };
     let result = match &node.kind {
-        KernelOwnerNodeKind::Collection {
+        PackedKernelOwnerNodeKind::Collection {
             kind: KernelCollectionKind::List | KernelCollectionKind::Set,
             ..
         } => {
             let projected = node
-                .inputs
+                .inputs(input)
                 .iter()
-                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::CollectionItem))
+                .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::CollectionItem))
                 .map(|edge| {
                     let provider = follow(edge)?;
                     projected_mode_variable(
@@ -21206,13 +21931,13 @@ fn projected_collection_item_mode_variable(
                 .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?;
             merge_projected_modes(mode_builder, projected, mode)
         }
-        KernelOwnerNodeKind::PureBuiltin {
+        PackedKernelOwnerNodeKind::PureBuiltin {
             kind: KernelPureBuiltinKind::ListMap,
         } => {
-            if let Some(edge) = selected_mode_edge(
-                node,
-                |role| matches!(role, KernelOwnerEdgeRole::AbiArgument { name } if name.as_ref() == "new"),
-            ) {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::AbiArgument { name }
+                    if input.symbol(*name) == Some("new"))
+            }) {
                 let provider = follow(edge)?;
                 projected_mode_variable(
                     mode_builder,
@@ -21226,13 +21951,13 @@ fn projected_collection_item_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::PureBuiltin {
+        PackedKernelOwnerNodeKind::PureBuiltin {
             kind: KernelPureBuiltinKind::ListFilter | KernelPureBuiltinKind::ListSort,
         } => {
-            if let Some(edge) = selected_mode_edge(
-                node,
-                |role| matches!(role, KernelOwnerEdgeRole::AbiArgument { name } if matches!(name.as_ref(), "$pipe" | "list")),
-            ) {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::AbiArgument { name }
+                    if input.symbol(*name).is_some_and(|name| matches!(name, "$pipe" | "list")))
+            }) {
                 let provider = follow(edge)?;
                 projected_collection_item_mode_variable(
                     mode_builder,
@@ -21246,22 +21971,25 @@ fn projected_collection_item_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::LexicalRead {
+        PackedKernelOwnerNodeKind::LexicalRead {
             fields: provider_fields,
         }
-        | KernelOwnerNodeKind::ValueRead {
+        | PackedKernelOwnerNodeKind::ValueRead {
             fields: provider_fields,
             ..
         }
-        | KernelOwnerNodeKind::DerivedRead {
+        | PackedKernelOwnerNodeKind::DerivedRead {
             fields: provider_fields,
         }
-        | KernelOwnerNodeKind::PatternRead {
+        | PackedKernelOwnerNodeKind::PatternRead {
             fields: provider_fields,
             ..
-        } if provider_fields.is_empty() => {
-            if let Some(edge) = selected_mode_edge(node, |role| {
-                matches!(role, KernelOwnerEdgeRole::ReadProvider)
+        } if input
+            .path(*provider_fields)
+            .is_some_and(PackedKernelPathRef::is_empty) =>
+        {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::ReadProvider)
             }) {
                 let provider = follow(edge)?;
                 projected_collection_item_mode_variable(
@@ -21276,9 +22004,9 @@ fn projected_collection_item_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::Block => {
-            if let Some(edge) = selected_mode_edge(node, |role| {
-                matches!(role, KernelOwnerEdgeRole::BlockResult)
+        PackedKernelOwnerNodeKind::Block => {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::BlockResult)
             }) {
                 let provider = follow(edge)?;
                 projected_collection_item_mode_variable(
@@ -21293,9 +22021,9 @@ fn projected_collection_item_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::Draining => {
-            if let Some(edge) = selected_mode_edge(node, |role| {
-                matches!(role, KernelOwnerEdgeRole::DrainingInput)
+        PackedKernelOwnerNodeKind::Draining => {
+            if let Some(edge) = selected_mode_edge(input, node, |role| {
+                matches!(role, PackedKernelOwnerEdgeRole::DrainingInput)
             }) {
                 let provider = follow(edge)?;
                 projected_collection_item_mode_variable(
@@ -21310,7 +22038,7 @@ fn projected_collection_item_mode_variable(
                 mode
             }
         }
-        KernelOwnerNodeKind::UserCall {
+        PackedKernelOwnerNodeKind::UserCall {
             target,
             inherited_formal,
         } => {
@@ -21343,7 +22071,7 @@ fn output_binding_collection_item_mode_variable(
     mode_builder: &mut ModeProgramBuilder,
     context: &OwnerCompileContext<'_>,
     source_node: usize,
-    fields: &[Box<str>],
+    fields: &[SymbolId],
     active: &mut ActiveModeProjection,
 ) -> Result<Option<ModeVariableId>, KernelOwnerBuildError> {
     let Some((consumer_index, list)) = output_binding_collection_driver(context, source_node)?
@@ -21371,24 +22099,25 @@ fn output_binding_collection_item_mode_variable(
 fn output_binding_collection_driver<'a>(
     context: &'a OwnerCompileContext<'_>,
     source_node: usize,
-) -> Result<Option<(usize, &'a KernelOwnerInputEdge)>, KernelOwnerBuildError> {
+) -> Result<Option<(usize, &'a crate::PackedKernelOwnerInputEdge)>, KernelOwnerBuildError> {
     let mut consumers = context
         .input
-        .nodes
+        .nodes()
         .iter()
         .enumerate()
         .filter(|(_, node)| {
             matches!(
                 node.kind,
-                KernelOwnerNodeKind::PureBuiltin {
+                PackedKernelOwnerNodeKind::PureBuiltin {
                     kind: KernelPureBuiltinKind::ListPredicate
                         | KernelPureBuiltinKind::ListFilter
                         | KernelPureBuiltinKind::ListMap
                         | KernelPureBuiltinKind::ListFind
                         | KernelPureBuiltinKind::ListSort
                 }
-            ) && node.inputs.iter().any(|edge| {
-                matches!(&edge.role, KernelOwnerEdgeRole::AbiArgument { name } if name.as_ref() == "item")
+            ) && node.inputs(context.input).iter().any(|edge| {
+                matches!(edge.role, PackedKernelOwnerEdgeRole::AbiArgument { name }
+                    if context.input.symbol(name) == Some("item"))
                     && edge.expression.0 as usize == source_node
             })
         });
@@ -21400,8 +22129,9 @@ fn output_binding_collection_driver<'a>(
             "kernel owner node {source_node} is driven by multiple contextual collection calls"
         )));
     }
-    let list = selected_mode_edge(consumer, |role| {
-        matches!(role, KernelOwnerEdgeRole::AbiArgument { name } if matches!(name.as_ref(), "$pipe" | "list"))
+    let list = selected_mode_edge(context.input, consumer, |role| {
+        matches!(role, PackedKernelOwnerEdgeRole::AbiArgument { name }
+            if context.input.symbol(*name).is_some_and(|name| matches!(name, "$pipe" | "list")))
     })
     .ok_or_else(|| {
         KernelOwnerBuildError::new(format!(
@@ -21422,7 +22152,7 @@ fn output_binding_collection_driver<'a>(
 fn bind_output_capability_requirement(
     builder: &mut ComponentProgramBuilder,
     context: &OwnerCompileContext<'_>,
-    edge: &KernelOwnerInputEdge,
+    edge: &crate::PackedKernelOwnerInputEdge,
     requirement: TypeVariableId,
 ) -> Result<(), KernelOwnerBuildError> {
     let Some((output, fields)) =
@@ -21437,10 +22167,6 @@ fn bind_output_capability_requirement(
         requirement
     } else {
         let root = builder.new_contextual_hole();
-        let fields = fields
-            .iter()
-            .map(|field| builder.terms_mut().intern_name(field))
-            .collect::<Vec<_>>();
         let projected = requirement_projection(builder, root, &fields);
         let projected = builder.variable_term(projected);
         let requirement = builder.variable_term(requirement);
@@ -21467,20 +22193,20 @@ fn output_capability_read_path(
     context: &OwnerCompileContext<'_>,
     expression: usize,
     active: &mut BTreeSet<usize>,
-) -> Result<Option<(usize, Vec<Box<str>>)>, KernelOwnerBuildError> {
-    if expression >= context.input.nodes.len() || !active.insert(expression) {
+) -> Result<Option<(usize, Vec<SymbolId>)>, KernelOwnerBuildError> {
+    if expression >= context.input.node_count() || !active.insert(expression) {
         return Ok(None);
     }
-    let node = &context.input.nodes[expression];
+    let node = &context.input.nodes()[expression];
+    let inputs = node.inputs(context.input);
     let result = match &node.kind {
-        KernelOwnerNodeKind::FreshOut => Some((expression, Vec::new())),
-        KernelOwnerNodeKind::LexicalRead { fields }
-        | KernelOwnerNodeKind::ValueRead { fields, .. }
-        | KernelOwnerNodeKind::DerivedRead { fields } => {
-            let providers = node
-                .inputs
+        PackedKernelOwnerNodeKind::FreshOut => Some((expression, Vec::new())),
+        PackedKernelOwnerNodeKind::LexicalRead { fields }
+        | PackedKernelOwnerNodeKind::ValueRead { fields, .. }
+        | PackedKernelOwnerNodeKind::DerivedRead { fields } => {
+            let providers = inputs
                 .iter()
-                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider))
+                .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::ReadProvider))
                 .collect::<Vec<_>>();
             let [provider] = providers.as_slice() else {
                 active.remove(&expression);
@@ -21488,7 +22214,13 @@ fn output_capability_read_path(
             };
             output_capability_read_path(context, provider.expression.0 as usize, active)?.map(
                 |(output, mut path)| {
-                    path.extend(fields.iter().cloned());
+                    path.extend(
+                        context
+                            .input
+                            .path(*fields)
+                            .expect("packed output-capability path remains valid")
+                            .iter(),
+                    );
                     (output, path)
                 },
             )
@@ -21505,12 +22237,13 @@ fn expression_requirement_variable(
     expression: usize,
     active: &mut BTreeSet<usize>,
 ) -> Result<Option<TypeVariableId>, KernelOwnerBuildError> {
-    if expression >= context.input.nodes.len() || !active.insert(expression) {
+    if expression >= context.input.node_count() || !active.insert(expression) {
         return Ok(None);
     }
-    let node = &context.input.nodes[expression];
+    let node = &context.input.nodes()[expression];
+    let inputs = node.inputs(context.input);
     let result = match &node.kind {
-        KernelOwnerNodeKind::FormalRead { formal, fields } => {
+        PackedKernelOwnerNodeKind::FormalRead { formal, fields } => {
             let root = context
                 .formal_requirements
                 .get(*formal as usize)
@@ -21520,18 +22253,17 @@ fn expression_requirement_variable(
                         "kernel owner node {expression} reads missing formal requirement {formal}"
                     ))
                 })?;
-            let fields = fields
-                .iter()
-                .map(|field| builder.terms_mut().intern_name(field))
-                .collect::<Vec<_>>();
-            Some(requirement_projection(builder, root, &fields))
+            let fields = context
+                .input
+                .path(*fields)
+                .expect("packed formal requirement path remains valid");
+            Some(requirement_projection_iter(builder, root, fields.iter()))
         }
-        KernelOwnerNodeKind::LexicalRead { fields }
-        | KernelOwnerNodeKind::DerivedRead { fields } => {
-            let providers = node
-                .inputs
+        PackedKernelOwnerNodeKind::LexicalRead { fields }
+        | PackedKernelOwnerNodeKind::DerivedRead { fields } => {
+            let providers = inputs
                 .iter()
-                .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider))
+                .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::ReadProvider))
                 .collect::<Vec<_>>();
             let [provider] = providers.as_slice() else {
                 active.remove(&expression);
@@ -21547,17 +22279,16 @@ fn expression_requirement_variable(
                 active.remove(&expression);
                 return Ok(None);
             };
-            let fields = fields
-                .iter()
-                .map(|field| builder.terms_mut().intern_name(field))
-                .collect::<Vec<_>>();
-            Some(requirement_projection(builder, root, &fields))
+            let fields = context
+                .input
+                .path(*fields)
+                .expect("packed lexical requirement path remains valid");
+            Some(requirement_projection_iter(builder, root, fields.iter()))
         }
-        KernelOwnerNodeKind::Block => {
-            let provider = node
-                .inputs
+        PackedKernelOwnerNodeKind::Block => {
+            let provider = inputs
                 .iter()
-                .find(|edge| matches!(edge.role, KernelOwnerEdgeRole::BlockResult));
+                .find(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::BlockResult));
             match provider {
                 Some(provider) => expression_requirement_variable(
                     builder,
@@ -21568,11 +22299,12 @@ fn expression_requirement_variable(
                 None => None,
             }
         }
-        KernelOwnerNodeKind::PureBuiltin {
+        PackedKernelOwnerNodeKind::PureBuiltin {
             kind: KernelPureBuiltinKind::ListFilter | KernelPureBuiltinKind::ListSort,
         } => {
-            let provider = node.inputs.iter().find(|edge| {
-                matches!(&edge.role, KernelOwnerEdgeRole::AbiArgument { name } if matches!(name.as_ref(), "$pipe" | "list"))
+            let provider = inputs.iter().find(|edge| {
+                matches!(edge.role, PackedKernelOwnerEdgeRole::AbiArgument { name }
+                    if context.input.symbol(name).is_some_and(|name| matches!(name, "$pipe" | "list")))
             });
             match provider {
                 Some(provider) => expression_requirement_variable(
@@ -21595,13 +22327,13 @@ fn expression_requirement_variable(
 fn edge_variable(
     context: &OwnerCompileContext<'_>,
     node_index: usize,
-    edge: &KernelOwnerInputEdge,
+    edge: &crate::PackedKernelOwnerInputEdge,
 ) -> Result<TypeVariableId, KernelOwnerBuildError> {
     let reference = edge.expression.0 as usize;
-    if reference < context.input.nodes.len() {
+    if reference < context.input.node_count() {
         return Ok(context.expressions[reference]);
     }
-    let external_index = reference - context.input.nodes.len();
+    let external_index = reference - context.input.node_count();
     if let Some(external_variables) = context.external_variables {
         return external_variables
             .get(external_index)
@@ -21616,13 +22348,13 @@ fn edge_variable(
     }
     let external = context
         .input
-        .external_expressions
+        .external_expressions()
         .get(external_index)
         .ok_or_else(|| {
             KernelOwnerBuildError::new(format!(
                 "input of owner {} node {node_index} references external expression {external_index} outside 0..{}",
                 context.owner.0,
-                context.input.external_expressions.len()
+                context.input.external_expressions().len()
             ))
         })?;
     let target_owner = context
@@ -21652,18 +22384,15 @@ fn edge_variable(
                     context.owner.0
                 ))
             })?;
-            let target_input = project
-                .owners
-                .get(external.owner.0 as usize)
-                .ok_or_else(|| {
-                    KernelOwnerBuildError::new(format!(
-                        "input of owner {} node {node_index} references missing owner {} result",
-                        context.owner.0, external.owner.0
-                    ))
-                })?;
+            let target_input = project.owner(external.owner).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "input of owner {} node {node_index} references missing owner {} result",
+                    context.owner.0, external.owner.0
+                ))
+            })?;
             let result = checked_expression_index(
-                target_input.result,
-                target_input.nodes.len(),
+                target_input.result(),
+                target_input.node_count(),
                 "external owner result",
             )?;
             Ok(target_owner.expressions[result])
@@ -21681,17 +22410,17 @@ fn edge_variable(
 fn edge_output_variable(
     context: &OwnerCompileContext<'_>,
     node_index: usize,
-    edge: &KernelOwnerInputEdge,
+    edge: &crate::PackedKernelOwnerInputEdge,
 ) -> Result<TypeVariableId, KernelOwnerBuildError> {
     let reference = edge.expression.0 as usize;
-    let node = context.input.nodes.get(reference).ok_or_else(|| {
+    let node = context.input.nodes().get(reference).ok_or_else(|| {
         KernelOwnerBuildError::new(format!(
             "OUT input of owner {} node {node_index} must reference a local output binding",
             context.owner.0
         ))
     })?;
     match &node.kind {
-        KernelOwnerNodeKind::FreshOut => context
+        PackedKernelOwnerNodeKind::FreshOut => context
             .expressions
             .get(reference)
             .copied()
@@ -21701,7 +22430,11 @@ fn edge_output_variable(
                     context.owner.0
                 ))
             }),
-        KernelOwnerNodeKind::FormalRead { formal, fields } if fields.is_empty() => context
+        PackedKernelOwnerNodeKind::FormalRead { formal, fields }
+            if context
+                .input
+                .path(*fields)
+                .is_some_and(PackedKernelPathRef::is_empty) => context
             .formals
             .get(*formal as usize)
             .copied()
@@ -21721,26 +22454,28 @@ fn edge_output_variable(
 fn edge_reads_output_capability(
     context: &OwnerCompileContext<'_>,
     _node_index: usize,
-    edge: &KernelOwnerInputEdge,
+    edge: &crate::PackedKernelOwnerInputEdge,
 ) -> Result<bool, KernelOwnerBuildError> {
     fn visit(
         context: &OwnerCompileContext<'_>,
         expression: usize,
         active: &mut BTreeSet<usize>,
     ) -> Result<bool, KernelOwnerBuildError> {
-        if expression >= context.input.nodes.len() || !active.insert(expression) {
+        if expression >= context.input.node_count() || !active.insert(expression) {
             return Ok(false);
         }
-        let node = &context.input.nodes[expression];
+        let node = &context.input.nodes()[expression];
         let result = match &node.kind {
-            KernelOwnerNodeKind::FreshOut | KernelOwnerNodeKind::CollectionItemRead => true,
-            KernelOwnerNodeKind::LexicalRead { .. }
-            | KernelOwnerNodeKind::ValueRead { .. }
-            | KernelOwnerNodeKind::DerivedRead { .. } => {
+            PackedKernelOwnerNodeKind::FreshOut | PackedKernelOwnerNodeKind::CollectionItemRead => {
+                true
+            }
+            PackedKernelOwnerNodeKind::LexicalRead { .. }
+            | PackedKernelOwnerNodeKind::ValueRead { .. }
+            | PackedKernelOwnerNodeKind::DerivedRead { .. } => {
                 let providers = node
-                    .inputs
+                    .inputs(context.input)
                     .iter()
-                    .filter(|edge| matches!(edge.role, KernelOwnerEdgeRole::ReadProvider))
+                    .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::ReadProvider))
                     .collect::<Vec<_>>();
                 let [provider] = providers.as_slice() else {
                     active.remove(&expression);
@@ -21760,21 +22495,21 @@ fn edge_reads_output_capability(
 fn referenced_node<'a>(
     context: &'a OwnerCompileContext<'a>,
     node_index: usize,
-    edge: &KernelOwnerInputEdge,
-) -> Result<&'a KernelOwnerNode, KernelOwnerBuildError> {
+    edge: &crate::PackedKernelOwnerInputEdge,
+) -> Result<&'a PackedKernelOwnerNode, KernelOwnerBuildError> {
     let reference = edge.expression.0 as usize;
-    if reference < context.input.nodes.len() {
-        return context.input.nodes.get(reference).ok_or_else(|| {
+    if reference < context.input.node_count() {
+        return context.input.nodes().get(reference).ok_or_else(|| {
             KernelOwnerBuildError::new(format!(
                 "owner {} node {node_index} references missing local node {reference}",
                 context.owner.0
             ))
         });
     }
-    let external_index = reference - context.input.nodes.len();
+    let external_index = reference - context.input.node_count();
     let external = context
         .input
-        .external_expressions
+        .external_expressions()
         .get(external_index)
         .ok_or_else(|| {
             KernelOwnerBuildError::new(format!(
@@ -21788,26 +22523,23 @@ fn referenced_node<'a>(
             context.owner.0
         ))
     })?;
-    let target = project
-        .owners
-        .get(external.owner.0 as usize)
-        .ok_or_else(|| {
-            KernelOwnerBuildError::new(format!(
-                "owner {} node {node_index} references missing owner {}",
-                context.owner.0, external.owner.0
-            ))
-        })?;
+    let target = project.owner(external.owner).ok_or_else(|| {
+        KernelOwnerBuildError::new(format!(
+            "owner {} node {node_index} references missing owner {}",
+            context.owner.0, external.owner.0
+        ))
+    })?;
     let expression = match external.target {
         KernelExternalTarget::Expression(expression) => {
-            checked_expression_index(expression, target.nodes.len(), "external node reference")?
+            checked_expression_index(expression, target.node_count(), "external node reference")?
         }
         KernelExternalTarget::Result => checked_expression_index(
-            target.result,
-            target.nodes.len(),
+            target.result(),
+            target.node_count(),
             "external result node reference",
         )?,
     };
-    target.nodes.get(expression).ok_or_else(|| {
+    target.nodes().get(expression).ok_or_else(|| {
         KernelOwnerBuildError::new(format!(
             "owner {} node {node_index} references missing owner {} node {expression}",
             context.owner.0, external.owner.0
@@ -21818,22 +22550,22 @@ fn referenced_node<'a>(
 fn edge_mode_variable(
     context: &OwnerCompileContext<'_>,
     node_index: usize,
-    edge: &KernelOwnerInputEdge,
+    edge: &crate::PackedKernelOwnerInputEdge,
 ) -> Result<ModeVariableId, KernelOwnerBuildError> {
     let reference = edge.expression.0 as usize;
-    if reference < context.input.nodes.len() {
+    if reference < context.input.node_count() {
         return Ok(context.expression_modes[reference]);
     }
-    let external_index = reference - context.input.nodes.len();
+    let external_index = reference - context.input.node_count();
     let external = context
         .input
-        .external_expressions
+        .external_expressions()
         .get(external_index)
         .ok_or_else(|| {
             KernelOwnerBuildError::new(format!(
                 "mode input of owner {} node {node_index} references external expression {external_index} outside 0..{}",
                 context.owner.0,
-                context.input.external_expressions.len()
+                context.input.external_expressions().len()
             ))
         })?;
     let target_owner = context
@@ -21864,8 +22596,7 @@ fn edge_mode_variable(
                 ))
             })?;
             let target_input = project
-                .owners
-                .get(external.owner.0 as usize)
+                .owner(external.owner)
                 .ok_or_else(|| {
                     KernelOwnerBuildError::new(format!(
                         "mode input of owner {} node {node_index} references missing owner {} result",
@@ -21873,8 +22604,8 @@ fn edge_mode_variable(
                     ))
                 })?;
             let result = checked_expression_index(
-                target_input.result,
-                target_input.nodes.len(),
+                target_input.result(),
+                target_input.node_count(),
                 "external owner result mode",
             )?;
             Ok(target_owner.expression_modes[result])
@@ -21907,6 +22638,29 @@ mod tests {
             role,
             expression: KernelExpressionId(expression),
         }
+    }
+
+    fn pack_test_project(
+        input: &KernelProjectProgramInput,
+    ) -> (
+        ProjectTextSnapshot,
+        crate::TypeTermArena,
+        PackedKernelProjectProgram,
+    ) {
+        let facts = vec![KernelDefinitionFactsInput::default(); input.owners.len()];
+        let text = crate::text::compatibility_project_text_snapshot(
+            &input.owners,
+            &facts,
+            &crate::KernelAbiInput::default(),
+        )
+        .expect("test project text is valid");
+        let mut terms = crate::TypeTermArena::with_text(text.clone());
+        let mut rich = input.clone();
+        crate::pack_project_closed_type_roots(&mut rich, &mut terms)
+            .expect("test project closed roots pack");
+        let packed =
+            crate::pack_kernel_project_program(rich, &terms).expect("test project owner rows pack");
+        (text, terms, packed)
     }
 
     fn project_result(snapshot: &KernelCheckedSnapshot, owner: u32) -> FlowType {
@@ -25451,7 +26205,8 @@ mod tests {
         let program = KernelProjectProgramInput {
             owners: vec![callee, wrapper, caller(0, false), caller(1, true)].into_boxed_slice(),
         };
-        let discriminated = project_syntax_discriminated_formals(&program);
+        let (_, _, packed_program) = pack_test_project(&program);
+        let discriminated = project_syntax_discriminated_formals(&packed_program);
         assert_eq!(discriminated[0].as_ref(), [0]);
         assert_eq!(
             discriminated[1].as_ref(),
@@ -26569,6 +27324,8 @@ mod tests {
         let text = builder.terms().text();
         let value_name = builder.terms_mut().intern_name("value");
         let fixed_name = builder.terms_mut().intern_name("fixed");
+        let dark_name = builder.terms_mut().intern_name("Dark");
+        let light_name = builder.terms_mut().intern_name("Light");
         let mut nodes = vec![
             KernelSummaryNode::Input(0),
             KernelSummaryNode::Term(number),
@@ -26578,16 +27335,16 @@ mod tests {
                 syntax_discriminating: true,
                 arms: vec![
                     KernelSummarySelectArm {
-                        pattern: KernelPattern::Tag {
-                            name: "Dark".into(),
-                            fields: Box::new([]),
+                        pattern: crate::PackedKernelPattern::Tag {
+                            name: dark_name,
+                            fields: boon_contract::PathId::ROOT,
                         },
                         output: KernelSummaryValueId(1),
                     },
                     KernelSummarySelectArm {
-                        pattern: KernelPattern::Tag {
-                            name: "Light".into(),
-                            fields: Box::new([]),
+                        pattern: crate::PackedKernelPattern::Tag {
+                            name: light_name,
+                            fields: boon_contract::PathId::ROOT,
                         },
                         output: KernelSummaryValueId(2),
                     },
@@ -27872,15 +28629,16 @@ mod tests {
             result: KernelExpressionId(4),
         };
 
-        let wrapper_text = crate::text::compatibility_project_text_snapshot(
-            std::slice::from_ref(&wrapper),
-            std::slice::from_ref(&KernelDefinitionFactsInput::default()),
-            &crate::KernelAbiInput::default(),
-        )
-        .unwrap();
-        let wrapper_terms = crate::TypeTermArena::with_text(wrapper_text.clone());
-        let wrapper_variants =
-            infer_static_variants(&wrapper_text, &wrapper_terms, &wrapper, &[None]);
+        let wrapper_program = KernelProjectProgramInput {
+            owners: vec![wrapper.clone()].into_boxed_slice(),
+        };
+        let (wrapper_text, wrapper_terms, packed_wrapper) = pack_test_project(&wrapper_program);
+        let wrapper_variants = infer_static_variants(
+            &wrapper_text,
+            &wrapper_terms,
+            packed_wrapper.owner_at(0).expect("wrapper remains present"),
+            &[None],
+        );
         assert!(
             wrapper_variants[0].is_none(),
             "the nested selector must remain unknown to the compile-time root-tag shortcut",

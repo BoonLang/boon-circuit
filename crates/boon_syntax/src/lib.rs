@@ -410,13 +410,12 @@ pub struct ParsedSourceFile {
 /// identity, insertion of an earlier-sorting unit cannot renumber existing
 /// units, and a rename deliberately creates a different identity. The owning
 /// compiler project supplies the outer project identity.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-pub struct SourceUnitId(String);
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SourceUnitId(Arc<str>);
 
 impl SourceUnitId {
     pub fn from_path(path: &str) -> Result<Self, SourceBundleError> {
-        normalize_source_path(path).map(Self)
+        normalize_source_path(path).map(|path| Self(path.into()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -424,7 +423,16 @@ impl SourceUnitId {
     }
 
     pub fn into_string(self) -> String {
-        self.0
+        self.0.as_ref().to_owned()
+    }
+}
+
+impl Serialize for SourceUnitId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
     }
 }
 

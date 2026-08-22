@@ -3,6 +3,7 @@ use crate::{
     KernelAbiInput, KernelCheckedSnapshot, KernelCompileWork, KernelDefinitionFactsInput,
     KernelDemandedDefinitionSnapshot, KernelInterfaceSnapshot, KernelOwnerBuildError,
     KernelOwnerId, KernelProjectProgramInput, KernelSolveError, KernelSolvedProject,
+    PackedKernelProjectProgram,
 };
 use boon_contract::{
     PackedTextCatalogBuilder, ProjectTextSnapshot, QualifiedPathId, QualifiedSymbolId,
@@ -110,6 +111,7 @@ impl KernelProjectInputBuilder {
             &definition_facts,
             &abi,
         )?;
+        crate::validate_compatibility_project_input(&program, &definition_facts)?;
         let basis_fingerprints = Arc::from(crate::project_definition_basis_fingerprints(
             &program,
             &definition_facts,
@@ -117,6 +119,7 @@ impl KernelProjectInputBuilder {
         let mut terms = crate::TypeTermArena::with_text(text.clone());
         crate::pack_project_closed_type_roots(&mut program, &mut terms)?;
         let packed_input_term_count = terms.len();
+        let program = crate::pack_kernel_project_program(program, &terms)?;
         KernelProjectInput::from_explicit_text(
             program,
             definition_facts,
@@ -163,11 +166,11 @@ impl Default for KernelProjectInputBuilder {
 pub struct KernelProjectInput {
     syntax_units: Box<[KernelSyntaxUnitInput]>,
     links: KernelResolvedProjectLinkOverlay,
-    program: Arc<KernelProjectProgramInput>,
-    /// One coarse immutable authority for parser/linker facts. The solve and
-    /// checked products retain this same allocation instead of cloning every
-    /// relocation, presentation row, and literal payload into owner outputs.
-    definition_facts: Arc<[KernelDefinitionFactsInput]>,
+    program: Arc<PackedKernelProjectProgram>,
+    /// Single immutable packed authority for every post-construction consumer.
+    /// Rich compatibility facts live only in the one-shot construction state
+    /// and are released after code, interfaces, and receipts have been sealed.
+    runtime_facts: Arc<crate::PackedDefinitionFactsStore>,
     abi: Arc<KernelAbiInput>,
     text: ProjectTextSnapshot,
     /// One-shot state moved into `KernelSession` before this input can be
@@ -179,6 +182,7 @@ pub struct KernelProjectInput {
 
 #[derive(Debug)]
 struct KernelProjectConstruction {
+    definition_facts: Arc<[KernelDefinitionFactsInput]>,
     terms: crate::TypeTermArena,
     packed_input_term_count: usize,
     basis_fingerprints_v14: Arc<[[u8; 32]]>,
@@ -239,7 +243,7 @@ impl KernelProjectInput {
     }
 
     fn from_explicit_text(
-        program: KernelProjectProgramInput,
+        program: PackedKernelProjectProgram,
         definition_facts: Box<[KernelDefinitionFactsInput]>,
         definition_keys: Box<[StableCheckOwnerKey]>,
         abi: KernelAbiInput,
@@ -248,17 +252,17 @@ impl KernelProjectInput {
         packed_input_term_count: usize,
         basis_fingerprints_v14: Arc<[[u8; 32]]>,
     ) -> Result<Self, KernelOwnerBuildError> {
-        if program.owners.len() != definition_facts.len() {
+        if program.definition_count() != definition_facts.len() {
             return Err(KernelOwnerBuildError::new(format!(
                 "kernel project input has {} owners but {} definition-fact tables",
-                program.owners.len(),
+                program.definition_count(),
                 definition_facts.len()
             )));
         }
-        if program.owners.len() != definition_keys.len() {
+        if program.definition_count() != definition_keys.len() {
             return Err(KernelOwnerBuildError::new(format!(
                 "kernel project input has {} owners but {} stable definition keys",
-                program.owners.len(),
+                program.definition_count(),
                 definition_keys.len()
             )));
         }
@@ -312,6 +316,8 @@ impl KernelProjectInput {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let definition_facts: Arc<[KernelDefinitionFactsInput]> = Arc::from(definition_facts);
+        let runtime_facts = crate::pack_definition_facts_store(&text, definition_facts.as_ref())?;
         Ok(Self {
             syntax_units,
             links: KernelResolvedProjectLinkOverlay {
@@ -319,9 +325,10 @@ impl KernelProjectInput {
                 definition_by_key,
             },
             program: Arc::new(program),
-            definition_facts: Arc::from(definition_facts),
+            runtime_facts,
             abi: Arc::new(abi),
             construction: Some(KernelProjectConstruction {
+                definition_facts,
                 terms,
                 packed_input_term_count,
                 basis_fingerprints_v14,
@@ -331,11 +338,19 @@ impl KernelProjectInput {
     }
 
     pub fn definition_count(&self) -> usize {
-        self.program.owners.len()
+        self.program.definition_count()
     }
 
-    pub fn program(&self) -> &KernelProjectProgramInput {
+    pub fn program(&self) -> &PackedKernelProjectProgram {
         self.program.as_ref()
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.program.call_count()
+    }
+
+    pub fn definition_result(&self, owner: KernelOwnerId) -> Option<crate::KernelExpressionId> {
+        self.program.definition_result(owner)
     }
 
     pub fn syntax_units(&self) -> &[KernelSyntaxUnitInput] {
@@ -346,8 +361,79 @@ impl KernelProjectInput {
         &self.links
     }
 
-    pub fn definition_facts(&self) -> &[KernelDefinitionFactsInput] {
-        &self.definition_facts
+    pub fn expression_relocations(
+        &self,
+        owner: KernelOwnerId,
+    ) -> Option<&[crate::KernelExpressionRelocation]> {
+        Some(self.runtime_facts(owner)?.expression_relocations())
+    }
+
+    pub fn statement_relocations(
+        &self,
+        owner: KernelOwnerId,
+    ) -> Option<&[boon_syntax::StableStatementKey]> {
+        Some(self.runtime_facts(owner)?.statement_relocations())
+    }
+
+    pub fn diagnostic_values(&self, owner: KernelOwnerId) -> Option<&[crate::KernelExpressionId]> {
+        Some(self.runtime_facts(owner)?.diagnostic_values())
+    }
+
+    pub fn statement_count(&self, owner: KernelOwnerId) -> Option<usize> {
+        Some(self.runtime_facts(owner)?.statements().len())
+    }
+
+    pub fn statement_value(
+        &self,
+        owner: KernelOwnerId,
+        statement: crate::KernelStatementId,
+    ) -> Option<Option<crate::KernelExpressionId>> {
+        self.runtime_facts(owner)?
+            .statements()
+            .get(statement.0 as usize)
+            .filter(|row| row.id == statement)
+            .map(|row| row.value)
+    }
+
+    pub fn render_slot_statement(
+        &self,
+        owner: KernelOwnerId,
+        ordinal: usize,
+    ) -> Option<(crate::KernelStatementId, crate::KernelExpressionId)> {
+        self.runtime_facts(owner)?
+            .statements()
+            .iter()
+            .filter_map(|row| {
+                (row.value_use == crate::KernelStatementValueUse::RenderSlot)
+                    .then_some(row.value)
+                    .flatten()
+                    .map(|value| (row.id, value))
+            })
+            .nth(ordinal)
+    }
+
+    pub fn parameter_name(&self, owner: KernelOwnerId, ordinal: u32) -> Option<&str> {
+        let declaration = self
+            .runtime_facts(owner)?
+            .declarations()
+            .iter()
+            .find(|declaration| {
+                matches!(
+                    declaration.origin,
+                    crate::KernelDeclarationOrigin::Parameter {
+                        ordinal: candidate,
+                        ..
+                    } if candidate == ordinal
+                )
+            })?;
+        self.program.owner(owner)?.symbol(declaration.name)
+    }
+
+    pub(crate) fn runtime_facts(
+        &self,
+        owner: KernelOwnerId,
+    ) -> Option<crate::PackedDefinitionFactsRef<'_>> {
+        self.runtime_facts.definition(owner)
     }
 
     pub fn abi(&self) -> &KernelAbiInput {
@@ -368,14 +454,21 @@ impl KernelProjectInput {
         &self,
         construction: KernelProjectConstruction,
     ) -> Result<crate::KernelProjectProgram, KernelOwnerBuildError> {
+        let KernelProjectConstruction {
+            definition_facts,
+            terms,
+            packed_input_term_count,
+            basis_fingerprints_v14,
+        } = construction;
         crate::compile_project_program_with_definition_facts_abi_text_and_terms(
             Arc::clone(&self.program),
-            Arc::clone(&self.definition_facts),
+            definition_facts,
+            Arc::clone(&self.runtime_facts),
             Arc::clone(&self.abi),
             self.text.clone(),
-            construction.terms,
-            construction.packed_input_term_count,
-            construction.basis_fingerprints_v14,
+            terms,
+            packed_input_term_count,
+            basis_fingerprints_v14,
         )
     }
 }
@@ -475,7 +568,6 @@ impl KernelDemandedCheckSnapshot {
                 .expect("validated demanded owner retains its stable key");
             let definition = crate::KernelDefinitionRef::from_authorities(
                 self.project.program(),
-                self.project.definition_facts(),
                 &self.definition_code,
                 dense_owner,
             )
@@ -1223,13 +1315,12 @@ mod tests {
         );
         let refs = project
             .program()
-            .owners
-            .iter()
-            .map(|owner| match owner.nodes[0].kind {
-                KernelOwnerNodeKind::KnownPacked(reference)
-                | KernelOwnerNodeKind::SourcePacked(reference)
-                | KernelOwnerNodeKind::FixedAbiCallPacked { result: reference } => reference,
-                ref rich => panic!("project retained compatibility-only rich root {rich:?}"),
+            .owners()
+            .map(|owner| match owner.nodes()[0].kind {
+                crate::PackedKernelOwnerNodeKind::Known(reference)
+                | crate::PackedKernelOwnerNodeKind::Source(reference)
+                | crate::PackedKernelOwnerNodeKind::FixedAbiCall { result: reference } => reference,
+                packed => panic!("project retained unexpected packed root {packed:?}"),
             })
             .collect::<Vec<_>>();
         assert!(refs.windows(2).all(|pair| pair[0] == pair[1]));
@@ -1302,11 +1393,9 @@ mod tests {
 
     #[test]
     fn failed_preparation_replays_the_original_error_after_consuming_construction() {
-        let mut invalid = value_owner(KernelOwnerNodeKind::Number);
-        invalid.result = crate::KernelExpressionId(1);
-        let project = KernelProjectInput::new(
+        let mut project = KernelProjectInput::new(
             KernelProjectProgramInput {
-                owners: vec![invalid].into_boxed_slice(),
+                owners: vec![value_owner(KernelOwnerNodeKind::Number)].into_boxed_slice(),
             },
             vec![KernelDefinitionFactsInput::default()].into_boxed_slice(),
             vec![StableCheckOwnerKey::UnitRoot(
@@ -1314,7 +1403,11 @@ mod tests {
             )]
             .into_boxed_slice(),
         )
-        .expect("project construction defers dense result validation to preparation");
+        .expect("the test starts from one valid packed project");
+        Arc::get_mut(&mut project.program)
+            .expect("the unshared test project owns its packed program")
+            .corrupt_result_for_test(0, crate::KernelExpressionId(1))
+            .expect("the test project retains owner zero");
         let mut session = KernelSession::new(project);
 
         let first = session
@@ -1335,11 +1428,26 @@ mod tests {
     fn project_input_rejects_cross_unit_definition_relocations() {
         let definition_unit = SourceUnitId::from_path("definition.bn").unwrap();
         let foreign_unit = SourceUnitId::from_path("foreign.bn").unwrap();
+        let statement = boon_syntax::StableStatementKey {
+            source_unit_id: definition_unit.clone(),
+            route: boon_syntax::StableStatementRoute {
+                owner: None,
+                statement_route: Vec::new(),
+            },
+        };
         let error = KernelProjectInput::new(
             KernelProjectProgramInput {
                 owners: vec![value_owner(KernelOwnerNodeKind::Number)].into_boxed_slice(),
             },
             vec![KernelDefinitionFactsInput {
+                linkage: crate::KernelDefinitionLinkage {
+                    root_statement: Some(crate::KernelStatementId(0)),
+                    public_declaration: Some(crate::KernelDeclarationReference::Local(
+                        crate::KernelDeclarationId(0),
+                    )),
+                    result_expression: Some(crate::KernelExpressionId(0)),
+                    context_formal_ordinal: None,
+                },
                 relocations: crate::KernelDefinitionRelocations {
                     expressions: vec![crate::KernelExpressionRelocation::Authored(
                         boon_syntax::StableExpressionKey {
@@ -1348,7 +1456,56 @@ mod tests {
                         },
                     )]
                     .into_boxed_slice(),
-                    statements: Box::new([]),
+                    statements: vec![statement].into_boxed_slice(),
+                },
+                statements: vec![crate::KernelStatementInput {
+                    id: crate::KernelStatementId(0),
+                    kind: crate::KernelStatementKind::Field {
+                        name: "value".into(),
+                    },
+                    value: Some(crate::KernelExpressionId(0)),
+                    value_use: crate::KernelStatementValueUse::RuntimeValue,
+                    children: Box::new([]),
+                }]
+                .into_boxed_slice(),
+                declarations: vec![crate::KernelDeclarationInput {
+                    id: crate::KernelDeclarationId(0),
+                    origin: crate::KernelDeclarationOrigin::Statement {
+                        statement: crate::KernelStatementId(0),
+                    },
+                    name: "value".into(),
+                    kind: crate::KernelDeclarationKind::Field,
+                    value: Some(crate::KernelExpressionId(0)),
+                    declared_flow_type: None,
+                }]
+                .into_boxed_slice(),
+                presentation: crate::KernelDefinitionPresentation {
+                    containing_scope: crate::KernelScopeReference::ProjectRoot,
+                    scopes: Box::new([]),
+                    expressions: vec![crate::KernelExpressionPresentation {
+                        expression: crate::KernelExpressionId(0),
+                        scope: crate::KernelScopeReference::ProjectRoot,
+                        declaration: Some(crate::KernelDeclarationReference::Local(
+                            crate::KernelDeclarationId(0),
+                        )),
+                        declaration_scope: None,
+                        span: crate::KernelSourceSpan::default(),
+                    }]
+                    .into_boxed_slice(),
+                    statements: vec![crate::KernelStatementPresentation {
+                        statement: crate::KernelStatementId(0),
+                        scope: crate::KernelScopeReference::ProjectRoot,
+                        body_scope: None,
+                        span: crate::KernelSourceSpan::default(),
+                    }]
+                    .into_boxed_slice(),
+                    declarations: vec![crate::KernelDeclarationPresentation {
+                        declaration: crate::KernelDeclarationId(0),
+                        scope: crate::KernelScopeReference::ProjectRoot,
+                        body_scope: None,
+                        span: crate::KernelSourceSpan::default(),
+                    }]
+                    .into_boxed_slice(),
                 },
                 ..KernelDefinitionFactsInput::default()
             }]
@@ -1359,7 +1516,8 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("expression relocation from source unit")
+                .contains("expression relocation from source unit"),
+            "unexpected cross-unit relocation error: {error}"
         );
     }
 
@@ -1540,8 +1698,8 @@ mod tests {
             panic!("checked demand returned another product")
         };
         assert!(Arc::ptr_eq(
-            &checked_snapshot.definition_facts,
-            &session.project.definition_facts,
+            checked_snapshot.definition_code.runtime_facts_store(),
+            &session.project.runtime_facts,
         ));
         assert!(Arc::ptr_eq(
             &checked_snapshot.program,

@@ -16088,15 +16088,27 @@ fn checked_image_kernel_authority_context(
     scope_owners: &[CheckedShardOwnerKeyV2],
     authority: &CheckedImageKernelAuthorityV1,
 ) -> Result<CheckedImageKernelAuthorityContextV1, String> {
+    checked_image_kernel_authority_context_from_scope_owners(
+        program.source_bundle_digest_v1,
+        program.role,
+        scope_owners,
+        authority,
+    )
+}
+
+fn checked_image_kernel_authority_context_from_scope_owners(
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    role: ProgramRole,
+    scope_owners: &[CheckedShardOwnerKeyV2],
+    authority: &CheckedImageKernelAuthorityV1,
+) -> Result<CheckedImageKernelAuthorityContextV1, String> {
     if authority.schema != CHECKED_IMAGE_KERNEL_AUTHORITY_SCHEMA_V1 {
         return Err(format!(
             "unsupported checked kernel authority schema `{}`",
             authority.schema
         ));
     }
-    if authority.source_bundle_digest_v1 != program.source_bundle_digest_v1
-        || authority.role != program.role
-    {
+    if authority.source_bundle_digest_v1 != source_bundle_digest_v1 || authority.role != role {
         return Err(
             "checked kernel authority differs from the completed checked program".to_owned(),
         );
@@ -16112,6 +16124,73 @@ fn checked_image_kernel_authority_context(
             },
         );
     }
+    checked_image_kernel_authority_context_from_rows(definition_seal_rows, authority)
+}
+
+fn checked_image_kernel_authority_context_from_publication(
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    role: ProgramRole,
+    authority: &CheckedImageKernelAuthorityV1,
+    publication: &boon_checked::CheckedImageKernelPublicationV1,
+) -> Result<CheckedImageKernelAuthorityContextV1, String> {
+    if authority.schema != CHECKED_IMAGE_KERNEL_AUTHORITY_SCHEMA_V1 {
+        return Err(format!(
+            "unsupported checked kernel authority schema `{}`",
+            authority.schema
+        ));
+    }
+    if authority.source_bundle_digest_v1 != source_bundle_digest_v1 || authority.role != role {
+        return Err(
+            "checked kernel authority differs from the completed checked program".to_owned(),
+        );
+    }
+    let mut definition_seal_rows =
+        BTreeMap::<CheckedShardOwnerKeyV2, Vec<CheckedImageDefinitionAuthorityIdentityV1>>::new();
+    for (ordinal, definition) in authority.definitions.iter().enumerate() {
+        let projection = publication
+            .__kernel_projection_for_route(
+                CheckedImageRowDomainV2::Scope,
+                definition.root_scope.0 as usize,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "compact checked definition {ordinal} root scope {} has no published Scope route",
+                    definition.root_scope.0,
+                )
+            })?;
+        let key = publication
+            .__kernel_projection_key(projection)
+            .ok_or_else(|| {
+                format!(
+                    "compact checked definition {ordinal} root scope {} references a missing projection",
+                    definition.root_scope.0,
+                )
+            })?;
+        if key.region != CheckedShardRegionV2::Definition {
+            return Err(format!(
+                "compact checked definition {ordinal} root scope {} does not target a definition projection",
+                definition.root_scope.0,
+            ));
+        }
+        validate_runtime_packed_definition_owner(role, ordinal, definition, &key.owner)?;
+        definition_seal_rows
+            .entry(key.owner.clone())
+            .or_default()
+            .push(CheckedImageDefinitionAuthorityIdentityV1 {
+                definition_key_digest: definition.definition_key_digest,
+                fingerprint: definition.fingerprint,
+            });
+    }
+    checked_image_kernel_authority_context_from_rows(definition_seal_rows, authority)
+}
+
+fn checked_image_kernel_authority_context_from_rows(
+    definition_seal_rows: BTreeMap<
+        CheckedShardOwnerKeyV2,
+        Vec<CheckedImageDefinitionAuthorityIdentityV1>,
+    >,
+    authority: &CheckedImageKernelAuthorityV1,
+) -> Result<CheckedImageKernelAuthorityContextV1, String> {
     let mut definition_seals = BTreeMap::new();
     for (owner, mut seals) in definition_seal_rows {
         seals.sort_unstable();
@@ -16726,9 +16805,29 @@ fn checked_image_handoff_from_kernel_publication(
         .map(|scope| checked_owner_for_scope(program, &callable_owners, scope.id))
         .collect::<Result<Vec<_>, _>>()?;
     let authority = checked_image_kernel_authority_context(program, &scope_owners, authority)?;
+    checked_image_handoff_from_kernel_publication_parts(
+        program.source_bundle_digest_v1,
+        program.role,
+        authority,
+        publication,
+    )
+}
+
+fn checked_image_handoff_from_kernel_publication_parts(
+    expected_source_bundle_digest_v1: SourceBundleDigestV1,
+    expected_role: ProgramRole,
+    authority: CheckedImageKernelAuthorityContextV1,
+    publication: boon_checked::CheckedImageKernelPublicationV1,
+) -> Result<
+    (
+        CheckedImageHandoffV4,
+        std::sync::Arc<boon_checked::CheckedImageKernelPairingV1>,
+    ),
+    String,
+> {
     let (source_bundle_digest_v1, role, projections, routes, pairing) =
         publication.__typechecker_into_parts();
-    if source_bundle_digest_v1 != program.source_bundle_digest_v1 || role != program.role {
+    if source_bundle_digest_v1 != expected_source_bundle_digest_v1 || role != expected_role {
         return Err(
             "kernel checked-image publication differs from its completed checked program"
                 .to_owned(),
@@ -16894,6 +16993,122 @@ pub fn seal_project_checked_program_construction_with_kernel_publication_and_pai
     )
 }
 
+/// Exact entity cardinalities owned by a compact RuntimePacked construction.
+///
+/// These are the exact shape counts already owned by the sibling packed
+/// semantic construction. They cover every identity that crosses the compact
+/// checked-to-semantic boundary. `DeclId(0)` remains the language sentinel, so
+/// declaration routes are dense from one; the other domains start at zero.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RuntimePackedCheckedEntityCountsV1 {
+    pub scope_count: usize,
+    pub declaration_count: usize,
+    pub statement_count: usize,
+    pub expression_count: usize,
+    pub callable_count: usize,
+    pub context_formal_count: usize,
+    pub call_count: usize,
+    pub pattern_binding_count: usize,
+    pub source_count: usize,
+    pub state_count: usize,
+    pub list_count: usize,
+    pub occurrence_count: usize,
+}
+
+/// One compact resource route in final checked coordinates.
+///
+/// The checked-image route must live in the expression's projection and must
+/// relocate to the target declaration's projection when those differ.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimePackedCheckedResourceRouteV1 {
+    pub expression: CheckedExprId,
+    pub target: DeclId,
+}
+
+/// Borrowed authority needed to seal a RuntimePacked checked image without a
+/// [`CheckedProgramFields`] compatibility owner.
+///
+/// Stable definition owners are read directly from the move-only publication's
+/// existing Scope projection keys. The caller therefore neither reconstructs
+/// nor clones a second owner/string table. Resource routes are borrowed from
+/// the sibling packed semantic construction and are consumed only for
+/// cross-route validation.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimePackedCheckedSealContextV1<'a> {
+    pub source_bundle_digest_v1: SourceBundleDigestV1,
+    pub role: ProgramRole,
+    pub entity_counts: RuntimePackedCheckedEntityCountsV1,
+    pub resource_routes: &'a [RuntimePackedCheckedResourceRouteV1],
+}
+
+/// Seal only the compact proof products required by RuntimePacked semantic
+/// construction.
+///
+/// Both the kernel authority and publication are consumed. In particular, the
+/// runtime-flow projection moves into the sealed handoff rather than cloning
+/// its dense digest table. No [`CheckedProgramFields`] or [`CheckedProgram`]
+/// value is constructed at this boundary.
+#[doc(hidden)]
+pub fn seal_project_runtime_packed_checked_authority_with_kernel_publication(
+    parsed: &ProjectSyntaxSnapshot,
+    context: RuntimePackedCheckedSealContextV1<'_>,
+    authority: CheckedImageKernelAuthorityV1,
+    publication: boon_checked::CheckedImageKernelPublicationV1,
+) -> Result<boon_checked::RuntimePackedCheckedSealV1, String> {
+    if context.source_bundle_digest_v1 != parsed.source_bundle_digest_v1() {
+        return Err(format!(
+            "compact checked authority source digest {} differs from parsed source digest {}",
+            context.source_bundle_digest_v1,
+            parsed.source_bundle_digest_v1(),
+        ));
+    }
+    validate_runtime_packed_definition_roots(
+        context.role,
+        context.entity_counts.scope_count,
+        &authority.definitions,
+        &publication,
+    )?;
+    let authority_context = checked_image_kernel_authority_context_from_publication(
+        context.source_bundle_digest_v1,
+        context.role,
+        &authority,
+        &publication,
+    )?;
+    let (image_handoff, pairing) = checked_image_handoff_from_kernel_publication_parts(
+        context.source_bundle_digest_v1,
+        context.role,
+        authority_context,
+        publication,
+    )?;
+    validate_runtime_packed_entity_routes(
+        &image_handoff,
+        context.role,
+        &authority.definitions,
+        context.entity_counts,
+        context.resource_routes.len(),
+    )?;
+    validate_runtime_packed_resource_routes(&image_handoff, context.resource_routes)?;
+    let pairing_receipt = boon_checked::CheckedImageKernelPairingReceiptV1::__typechecker_new(
+        pairing,
+        &image_handoff,
+    );
+    let runtime_flow_terms = checked_runtime_flow_term_handoff_from_projection(
+        authority.runtime_flow_terms,
+        context.entity_counts.expression_count,
+        context.source_bundle_digest_v1,
+        context.role,
+        &image_handoff,
+    )?;
+    Ok(boon_checked::RuntimePackedCheckedSealV1::__typechecker_new(
+        image_handoff,
+        pairing_receipt,
+        runtime_flow_terms,
+    ))
+}
+
 /// Seal a RuntimePacked checked construction without materializing rich call
 /// rows or parser-owned structural occurrence routes.
 ///
@@ -16993,6 +17208,440 @@ fn validate_runtime_packed_call_routes(
         return Err(format!(
             "RuntimePacked checked image has {expected_dense_index} dense Call routes for {packed_call_count} authoritative packed calls",
         ));
+    }
+    Ok(())
+}
+
+fn validate_runtime_packed_definition_roots(
+    role: ProgramRole,
+    scope_count: usize,
+    definitions: &[CheckedImageDefinitionAuthoritySealV1],
+    publication: &boon_checked::CheckedImageKernelPublicationV1,
+) -> Result<(), String> {
+    let scope_count = u32::try_from(scope_count)
+        .map_err(|_| "compact checked scope count exceeds u32".to_owned())?;
+    if scope_count == 0 {
+        return Err("compact checked authority has no project-root scope".to_owned());
+    }
+    for (ordinal, definition) in definitions.iter().enumerate() {
+        if definition.root_scope.0 >= scope_count {
+            return Err(format!(
+                "compact checked definition {ordinal} root scope {} is outside authoritative scope count {scope_count}",
+                definition.root_scope.0,
+            ));
+        }
+        let projection = publication
+            .__kernel_projection_for_route(
+                CheckedImageRowDomainV2::Scope,
+                definition.root_scope.0 as usize,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "compact checked definition {ordinal} root scope {} has no published Scope route",
+                    definition.root_scope.0,
+                )
+            })?;
+        let key = publication.__kernel_projection_key(projection).ok_or_else(|| {
+            format!(
+                "compact checked definition {ordinal} root scope {} references a missing projection",
+                definition.root_scope.0,
+            )
+        })?;
+        if key.region != CheckedShardRegionV2::Definition {
+            return Err(format!(
+                "compact checked definition {ordinal} root scope {} does not target a definition projection",
+                definition.root_scope.0,
+            ));
+        }
+        validate_runtime_packed_definition_owner(role, ordinal, definition, &key.owner)?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_packed_definition_owner(
+    role: ProgramRole,
+    ordinal: usize,
+    definition: &CheckedImageDefinitionAuthoritySealV1,
+    owner: &CheckedShardOwnerKeyV2,
+) -> Result<(), String> {
+    let owner_role = match owner {
+        CheckedShardOwnerKeyV2::ProgramTopLevel { role } => {
+            if definition.root_scope.0 != 0 {
+                return Err(format!(
+                    "compact checked top-level definition {ordinal} has non-root scope {}",
+                    definition.root_scope.0,
+                ));
+            }
+            *role
+        }
+        CheckedShardOwnerKeyV2::Callable {
+            role,
+            callable_kind: CheckedShardCallableKindV2::User,
+            ..
+        } => *role,
+        CheckedShardOwnerKeyV2::Callable { callable_kind, .. } => {
+            return Err(format!(
+                "compact checked definition {ordinal} is owned by non-user callable kind {callable_kind:?}",
+            ));
+        }
+    };
+    if owner_role != role {
+        return Err(format!(
+            "compact checked definition {ordinal} owner role {owner_role:?} differs from program role {role:?}",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_runtime_packed_entity_routes(
+    image_handoff: &CheckedImageHandoffV4,
+    role: ProgramRole,
+    definitions: &[CheckedImageDefinitionAuthoritySealV1],
+    counts: RuntimePackedCheckedEntityCountsV1,
+    resource_route_count: usize,
+) -> Result<(), String> {
+    for (domain, count, first_dense_index) in [
+        (CheckedImageRowDomainV2::Scope, counts.scope_count, 0u32),
+        (
+            CheckedImageRowDomainV2::Declaration,
+            counts.declaration_count,
+            1u32,
+        ),
+        (
+            CheckedImageRowDomainV2::Statement,
+            counts.statement_count,
+            0u32,
+        ),
+        (
+            CheckedImageRowDomainV2::Expression,
+            counts.expression_count,
+            0u32,
+        ),
+        (
+            CheckedImageRowDomainV2::ContextFormal,
+            counts.context_formal_count,
+            0u32,
+        ),
+        (
+            CheckedImageRowDomainV2::PatternBinding,
+            counts.pattern_binding_count,
+            0u32,
+        ),
+        (
+            CheckedImageRowDomainV2::ResourceProjection,
+            resource_route_count,
+            0u32,
+        ),
+        (CheckedImageRowDomainV2::Source, counts.source_count, 0u32),
+        (CheckedImageRowDomainV2::State, counts.state_count, 0u32),
+        (CheckedImageRowDomainV2::List, counts.list_count, 0u32),
+        (
+            CheckedImageRowDomainV2::Occurrence,
+            counts.occurrence_count,
+            0u32,
+        ),
+    ] {
+        validate_runtime_packed_dense_route_domain(
+            image_handoff,
+            domain,
+            count,
+            first_dense_index,
+        )?;
+    }
+    validate_runtime_packed_callable_routes(image_handoff, counts.callable_count)?;
+    validate_runtime_packed_call_routes(image_handoff, counts.call_count)?;
+    validate_runtime_packed_route_regions(image_handoff, role)?;
+
+    let root_projection_id = image_handoff
+        .entity_projection(CheckedImageRowDomainV2::Scope, 0)
+        .ok_or_else(|| "compact checked image has no project-root Scope route zero".to_owned())?;
+    let root_projection = image_handoff
+        .projection(root_projection_id)
+        .ok_or_else(|| {
+            format!(
+                "compact checked image root Scope route references missing projection {}",
+                root_projection_id.0,
+            )
+        })?;
+    if !matches!(
+        &root_projection.stable_key.owner,
+        CheckedShardOwnerKeyV2::ProgramTopLevel { role: owner_role } if *owner_role == role
+    ) || root_projection.stable_key.region != CheckedShardRegionV2::Definition
+    {
+        return Err(
+            "compact checked image root Scope route does not target the program definition"
+                .to_owned(),
+        );
+    }
+
+    for (ordinal, definition) in definitions.iter().enumerate() {
+        let scope = definition.root_scope.0 as usize;
+        let projection_id = image_handoff
+            .entity_projection(CheckedImageRowDomainV2::Scope, scope)
+            .ok_or_else(|| format!("compact checked image has no Scope route {scope}"))?;
+        let projection = image_handoff.projection(projection_id).ok_or_else(|| {
+            format!(
+                "compact checked image Scope route {scope} references missing projection {}",
+                projection_id.0,
+            )
+        })?;
+        if projection.stable_key.region != CheckedShardRegionV2::Definition {
+            return Err(format!(
+                "compact checked image definition {ordinal} Scope route {scope} is not a definition projection",
+            ));
+        }
+        validate_runtime_packed_definition_owner(
+            role,
+            ordinal,
+            definition,
+            &projection.stable_key.owner,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_packed_callable_routes(
+    image_handoff: &CheckedImageHandoffV4,
+    expected_count: usize,
+) -> Result<(), String> {
+    let actual_count = image_handoff
+        .entity_routes
+        .iter()
+        .filter(|route| route.domain == CheckedImageRowDomainV2::Callable)
+        .count();
+    if actual_count != expected_count {
+        return Err(format!(
+            "compact checked image has {actual_count} Callable routes for {expected_count} authoritative callables",
+        ));
+    }
+    for route in image_handoff
+        .entity_routes
+        .iter()
+        .filter(|route| route.domain == CheckedImageRowDomainV2::Callable)
+    {
+        let declaration_projection = image_handoff
+            .entity_projection(
+                CheckedImageRowDomainV2::Declaration,
+                route.dense_index as usize,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "compact checked Callable route {} has no matching declaration route",
+                    route.dense_index,
+                )
+            })?;
+        let callable = image_handoff.projection(route.projection).ok_or_else(|| {
+            format!(
+                "compact checked Callable route {} references missing projection {}",
+                route.dense_index, route.projection.0,
+            )
+        })?;
+        let declaration = image_handoff
+            .projection(declaration_projection)
+            .ok_or_else(|| {
+                format!(
+                    "compact checked Callable route {} declaration references missing projection {}",
+                    route.dense_index, declaration_projection.0,
+                )
+            })?;
+        let callable_owner_is_valid = match &callable.stable_key.owner {
+            CheckedShardOwnerKeyV2::Callable {
+                callable_kind: CheckedShardCallableKindV2::User,
+                ..
+            } => callable.stable_key.owner == declaration.stable_key.owner,
+            CheckedShardOwnerKeyV2::Callable {
+                callable_kind:
+                    CheckedShardCallableKindV2::Builtin | CheckedShardCallableKindV2::External,
+                ..
+            } => true,
+            CheckedShardOwnerKeyV2::ProgramTopLevel { .. } => false,
+        };
+        if callable.stable_key.region != CheckedShardRegionV2::Interface
+            || declaration.stable_key.region != CheckedShardRegionV2::Definition
+            || !callable_owner_is_valid
+        {
+            return Err(format!(
+                "compact checked Callable route {} is not the interface sibling of its declaration",
+                route.dense_index,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_packed_route_regions(
+    image_handoff: &CheckedImageHandoffV4,
+    role: ProgramRole,
+) -> Result<(), String> {
+    for route in &image_handoff.entity_routes {
+        let projection = image_handoff.projection(route.projection).ok_or_else(|| {
+            format!(
+                "compact checked image {:?} route {} references missing projection {}",
+                route.domain, route.dense_index, route.projection.0,
+            )
+        })?;
+        let owner_role = match &projection.stable_key.owner {
+            CheckedShardOwnerKeyV2::ProgramTopLevel { role } => *role,
+            CheckedShardOwnerKeyV2::Callable { role, .. } => *role,
+        };
+        if owner_role != role {
+            return Err(format!(
+                "compact checked image {:?} route {} has owner role {owner_role:?} instead of {role:?}",
+                route.domain, route.dense_index,
+            ));
+        }
+        let valid_region = match route.domain {
+            CheckedImageRowDomainV2::Scope
+            | CheckedImageRowDomainV2::Declaration
+            | CheckedImageRowDomainV2::Statement
+            | CheckedImageRowDomainV2::Expression
+            | CheckedImageRowDomainV2::PatternBinding
+            | CheckedImageRowDomainV2::ResourceProjection
+            | CheckedImageRowDomainV2::Occurrence => {
+                projection.stable_key.region == CheckedShardRegionV2::Definition
+            }
+            CheckedImageRowDomainV2::Callable | CheckedImageRowDomainV2::ContextFormal => {
+                projection.stable_key.region == CheckedShardRegionV2::Interface
+                    && matches!(
+                        projection.stable_key.owner,
+                        CheckedShardOwnerKeyV2::Callable { .. }
+                    )
+            }
+            CheckedImageRowDomainV2::Call => matches!(
+                projection.stable_key.region,
+                CheckedShardRegionV2::Invocation { .. }
+            ),
+            CheckedImageRowDomainV2::Source
+            | CheckedImageRowDomainV2::State
+            | CheckedImageRowDomainV2::List => matches!(
+                projection.stable_key.region,
+                CheckedShardRegionV2::Definition | CheckedShardRegionV2::TopLevelAuthority { .. }
+            ),
+            CheckedImageRowDomainV2::Header
+            | CheckedImageRowDomainV2::CallResultPath
+            | CheckedImageRowDomainV2::OrderChain
+            | CheckedImageRowDomainV2::SourceUnitMetadata
+            | CheckedImageRowDomainV2::SourcePayloadShape
+            | CheckedImageRowDomainV2::HostPort
+            | CheckedImageRowDomainV2::OutputRootType
+            | CheckedImageRowDomainV2::ExpressionType
+            | CheckedImageRowDomainV2::FunctionType
+            | CheckedImageRowDomainV2::NamedValueType
+            | CheckedImageRowDomainV2::RenderSlot
+            | CheckedImageRowDomainV2::Diagnostic => false,
+        };
+        if !valid_region {
+            return Err(format!(
+                "compact checked image {:?} route {} targets invalid region {:?}",
+                route.domain, route.dense_index, projection.stable_key.region,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_packed_dense_route_domain(
+    image_handoff: &CheckedImageHandoffV4,
+    domain: CheckedImageRowDomainV2,
+    expected_count: usize,
+    first_dense_index: u32,
+) -> Result<(), String> {
+    let expected_count = u32::try_from(expected_count)
+        .map_err(|_| format!("compact checked {domain:?} route count exceeds u32"))?;
+    first_dense_index
+        .checked_add(expected_count)
+        .ok_or_else(|| format!("compact checked {domain:?} route range exceeds u32"))?;
+    let mut expected_dense_index = first_dense_index;
+    for route in image_handoff
+        .entity_routes
+        .iter()
+        .filter(|route| route.domain == domain)
+    {
+        if route.dense_index != expected_dense_index {
+            if route.dense_index < expected_dense_index {
+                return Err(format!(
+                    "compact checked image repeats {domain:?} route {}",
+                    route.dense_index,
+                ));
+            }
+            return Err(format!(
+                "compact checked image is missing {domain:?} route {expected_dense_index} before route {}",
+                route.dense_index,
+            ));
+        }
+        image_handoff.projection(route.projection).ok_or_else(|| {
+            format!(
+                "compact checked image {domain:?} route {} references missing projection {}",
+                route.dense_index, route.projection.0,
+            )
+        })?;
+        expected_dense_index += 1;
+    }
+    let actual_count = expected_dense_index - first_dense_index;
+    if actual_count != expected_count {
+        return Err(format!(
+            "compact checked image has {actual_count} dense {domain:?} routes for {expected_count} authoritative entities",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_runtime_packed_resource_routes(
+    image_handoff: &CheckedImageHandoffV4,
+    resource_routes: &[RuntimePackedCheckedResourceRouteV1],
+) -> Result<(), String> {
+    let mut previous_expression = None;
+    for (ordinal, route) in resource_routes.iter().enumerate() {
+        if previous_expression.is_some_and(|previous| previous >= route.expression) {
+            return Err(format!(
+                "compact checked resource routes are not strictly ordered at expression {}",
+                route.expression.0,
+            ));
+        }
+        previous_expression = Some(route.expression);
+        let resource_projection = image_handoff
+            .entity_projection(CheckedImageRowDomainV2::ResourceProjection, ordinal)
+            .ok_or_else(|| {
+                format!("compact checked resource projection {ordinal} has no checked-image route",)
+            })?;
+        let expression_projection = image_handoff
+            .entity_projection(
+                CheckedImageRowDomainV2::Expression,
+                route.expression.0 as usize,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "compact checked resource projection {ordinal} expression {} has no checked-image route",
+                    route.expression.0,
+                )
+            })?;
+        if resource_projection != expression_projection {
+            return Err(format!(
+                "compact checked resource projection {ordinal} is detached from expression {}",
+                route.expression.0,
+            ));
+        }
+        let target_projection = image_handoff
+            .entity_projection(
+                CheckedImageRowDomainV2::Declaration,
+                route.target.0 as usize,
+            )
+            .ok_or_else(|| {
+                format!(
+                    "compact checked resource projection {ordinal} target {} has no checked-image route",
+                    route.target.0,
+                )
+            })?;
+        if target_projection != resource_projection
+            && !image_handoff
+                .projection_relocations(resource_projection)
+                .is_some_and(|relocations| relocations.contains(&target_projection))
+        {
+            return Err(format!(
+                "compact checked resource projection {ordinal} has no relocation to target {}",
+                route.target.0,
+            ));
+        }
     }
     Ok(())
 }
@@ -17206,16 +17855,32 @@ fn checked_runtime_flow_term_handoff(
             &fields.expressions,
         )?,
     };
-    if projection.expression_count() != fields.expressions.len() {
+    checked_runtime_flow_term_handoff_from_projection(
+        projection,
+        fields.expressions.len(),
+        fields.source_bundle_digest_v1,
+        fields.role,
+        image_handoff,
+    )
+}
+
+fn checked_runtime_flow_term_handoff_from_projection(
+    projection: boon_checked::CheckedRuntimeFlowTermProjectionV1,
+    expression_count: usize,
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    role: ProgramRole,
+    image_handoff: &CheckedImageHandoffV4,
+) -> Result<boon_checked::CheckedRuntimeFlowTermHandoffV1, String> {
+    if projection.expression_count() != expression_count {
         return Err(format!(
             "checked runtime flow-term projection has {} expressions for {} checked rows",
             projection.expression_count(),
-            fields.expressions.len()
+            expression_count,
         ));
     }
     let handoff = projection.seal(
-        fields.source_bundle_digest_v1,
-        fields.role,
+        source_bundle_digest_v1,
+        role,
         image_handoff.local_image_digest,
     );
     handoff.validate_authority(

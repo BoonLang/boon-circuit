@@ -104,7 +104,7 @@ impl PathRow {
 /// fingerprints are discarded on freeze. The exact symbol lookup table is
 /// retained temporarily while the rich compiler-input adapter still presents
 /// strings; direct packed-syntax input will make that table removable too.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct PackedTextCatalog {
     bytes: Box<[u8]>,
     symbols: Box<[SymbolRow]>,
@@ -176,10 +176,7 @@ impl PackedTextCatalog {
         self.path(id).map(PathRow::stable_digest)
     }
 
-    fn lookup_path<'a>(
-        &self,
-        segments: impl IntoIterator<Item = &'a str>,
-    ) -> Option<PathId> {
+    fn lookup_path<'a>(&self, segments: impl IntoIterator<Item = &'a str>) -> Option<PathId> {
         let mut path = PathId::ROOT;
         for segment in segments {
             let symbol = self.lookup_symbol(segment)?;
@@ -307,6 +304,14 @@ pub struct ProjectTextSnapshot {
     catalog: Arc<PackedTextCatalog>,
 }
 
+impl PartialEq for ProjectTextSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.catalog == other.catalog
+    }
+}
+
+impl Eq for ProjectTextSnapshot {}
+
 impl ProjectTextSnapshot {
     pub const fn authority_id(&self) -> TextAuthorityId {
         self.authority
@@ -379,6 +384,21 @@ impl ProjectTextSnapshot {
         self.catalog.path(id).map(PathRow::depth)
     }
 
+    /// Resolve one authored path segment without allocating a temporary path.
+    /// `ordinal` is zero-based from the root, even though paths are stored as
+    /// parent-linked rows from leaf to root.
+    pub fn path_symbol_at(&self, id: PathId, ordinal: u32) -> Option<SymbolId> {
+        let depth = self.catalog.path(id)?.depth();
+        if ordinal >= depth {
+            return None;
+        }
+        let mut current = id;
+        for _ in 0..depth - ordinal - 1 {
+            current = self.catalog.path(current)?.parent()?;
+        }
+        self.catalog.path(current)?.segment()
+    }
+
     pub fn path_digest(&self, id: PathId) -> Option<[u8; 32]> {
         self.catalog.path_digest(id)
     }
@@ -386,10 +406,7 @@ impl ProjectTextSnapshot {
     /// Resolve one temporary rich path to its already-interned project
     /// coordinate without allocating. New packed producers carry `PathId`
     /// directly and never call this method.
-    pub fn lookup_path<'a>(
-        &self,
-        segments: impl IntoIterator<Item = &'a str>,
-    ) -> Option<PathId> {
+    pub fn lookup_path<'a>(&self, segments: impl IntoIterator<Item = &'a str>) -> Option<PathId> {
         self.catalog.lookup_path(segments)
     }
 
@@ -860,6 +877,19 @@ mod tests {
         );
         assert_eq!(catalog.lookup_path(["alpha", "missing"]), None);
         assert_eq!(catalog.path_depth(first.coordinate()), Some(2));
+        assert_eq!(
+            catalog
+                .path_symbol_at(first.coordinate(), 0)
+                .and_then(|symbol| catalog.symbol(symbol)),
+            Some("alpha")
+        );
+        assert_eq!(
+            catalog
+                .path_symbol_at(first.coordinate(), 1)
+                .and_then(|symbol| catalog.symbol(symbol)),
+            Some("beta")
+        );
+        assert_eq!(catalog.path_symbol_at(first.coordinate(), 2), None);
     }
 
     #[test]

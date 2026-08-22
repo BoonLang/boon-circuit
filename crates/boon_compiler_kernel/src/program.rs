@@ -1,4 +1,4 @@
-use crate::{TypeTerm, TypeTermArena, TypeTermId, TypeVariableId};
+use crate::{PackedKernelPattern, TypeTerm, TypeTermArena, TypeTermId, TypeVariableId};
 use boon_checked::FlowMode;
 use boon_contract::{ProjectTextSnapshot, SymbolId};
 use serde::Serialize;
@@ -56,9 +56,9 @@ pub enum KernelPattern {
     Invalid,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelSelectArm {
-    pub pattern: KernelPattern,
+    pub pattern: PackedKernelPattern,
     pub output: TypeTermId,
 }
 
@@ -151,9 +151,9 @@ pub enum KernelSummaryNode {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelSummarySelectArm {
-    pub pattern: KernelPattern,
+    pub pattern: PackedKernelPattern,
     pub output: KernelSummaryValueId,
 }
 
@@ -218,7 +218,7 @@ pub(crate) struct PackedOperationTable {
     rows: Box<[PackedOperation]>,
     terms: Box<[TypeTermId]>,
     names: Box<[SymbolId]>,
-    patterns: Box<[KernelPattern]>,
+    patterns: Box<[PackedKernelPattern]>,
     select_arms: Box<[KernelSelectArm]>,
     record_entries: Box<[KernelRecordEntry]>,
     summary_programs: Box<[Arc<KernelSummaryProgram>]>,
@@ -302,7 +302,7 @@ pub(crate) enum KernelOperationRef<'a> {
     },
     PatternProjection {
         provider: TypeVariableId,
-        pattern: &'a KernelPattern,
+        pattern: PackedKernelPattern,
         fields: &'a [SymbolId],
         consumer: TypeVariableId,
     },
@@ -340,7 +340,7 @@ struct PackedOperationBuilder {
     rows: Vec<PackedOperation>,
     terms: Vec<TypeTermId>,
     names: Vec<SymbolId>,
-    patterns: Vec<KernelPattern>,
+    patterns: Vec<PackedKernelPattern>,
     select_arms: Vec<KernelSelectArm>,
     record_entries: Vec<KernelRecordEntry>,
     summary_programs: Vec<Arc<KernelSummaryProgram>>,
@@ -378,7 +378,7 @@ impl PackedOperationBuilder {
         append_column(&mut self.names, values, "kernel operation name column")
     }
 
-    fn push_pattern(&mut self, pattern: KernelPattern) -> u32 {
+    fn push_pattern(&mut self, pattern: PackedKernelPattern) -> u32 {
         let id =
             u32::try_from(self.patterns.len()).expect("kernel operation pattern count exceeds u32");
         self.patterns.push(pattern);
@@ -468,7 +468,7 @@ fn operation_ref<'a>(
     rows: &[PackedOperation],
     terms: &'a [TypeTermId],
     names: &'a [SymbolId],
-    patterns: &'a [KernelPattern],
+    patterns: &[PackedKernelPattern],
     select_arms: &'a [KernelSelectArm],
     record_entries: &'a [KernelRecordEntry],
     summary_programs: &'a [Arc<KernelSummaryProgram>],
@@ -506,7 +506,7 @@ fn operation_ref<'a>(
             consumer,
         } => KernelOperationRef::PatternProjection {
             provider,
-            pattern: &patterns[pattern as usize],
+            pattern: patterns[pattern as usize],
             fields: &names[fields.bounds()],
             consumer,
         },
@@ -767,6 +767,7 @@ impl ComponentProgramBuilder {
             "label",
             "Ready",
             "Dark",
+            "Light",
         ]);
         Self {
             terms,
@@ -916,7 +917,7 @@ impl ComponentProgramBuilder {
     pub fn add_pattern_projection_into(
         &mut self,
         provider: TypeVariableId,
-        pattern: KernelPattern,
+        pattern: PackedKernelPattern,
         fields: impl IntoIterator<Item = SymbolId>,
         consumer: TypeVariableId,
     ) -> OperationId {

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod call_view;
+mod checked_view;
 mod contextual_expansion;
 mod core_lowering;
 mod definition_templates;

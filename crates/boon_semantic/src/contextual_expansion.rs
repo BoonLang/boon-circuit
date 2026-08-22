@@ -6867,6 +6867,23 @@ impl<'a> SemanticExpressionBuilder<'a> {
         self.retain_ordinary_calls = true;
     }
 
+    /// Resolve one match binding from the explicit rich editor projection or
+    /// the ordinary packed kernel authority.
+    ///
+    /// RuntimePacked deliberately carries no duplicate rich binding table.
+    /// Projection strings are materialized only here because the semantic
+    /// value-frame/output rows that consume them still own `Vec<String>`.
+    fn pattern_binding_parts(&self, declaration: DeclId) -> Option<(CheckedExprId, Vec<String>)> {
+        if let Some(binding) = self.lookup.pattern_binding(self.program, declaration) {
+            return Some((binding.selector, binding.projection.clone()));
+        }
+        let binding = self.kernel_input?.pattern_binding(declaration)?;
+        Some((
+            binding.selector(),
+            binding.projection().map(str::to_owned).collect(),
+        ))
+    }
+
     fn schedule_ordinary_definition(&mut self, callable: SemanticCallableId) {
         if self.ordinary_definition_scheduled.insert(callable) {
             self.ordinary_definition_order.push(callable);
@@ -7691,13 +7708,10 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     .declaration(self.program, target)
                     .ok_or(ExpansionError::MissingDeclaration(target))?;
                 if declaration.kind == boon_checked::CheckedDeclarationKind::PatternBinding {
-                    let binding = self
-                        .lookup
-                        .pattern_binding(self.program, target)
+                    let (selector, mut fields) = self
+                        .pattern_binding_parts(target)
                         .ok_or(ExpansionError::MissingDeclaration(target))?;
-                    let input =
-                        self.expand_in_frame(binding.selector, scoped.frame, scoped.value_frame)?;
-                    let mut fields = binding.projection.clone();
+                    let input = self.expand_in_frame(selector, scoped.frame, scoped.value_frame)?;
                     fields.extend(projection);
                     return self.project(&expression, owner, input, fields);
                 }
@@ -8759,12 +8773,9 @@ impl<'a> SemanticExpressionBuilder<'a> {
             let mut frame_bindings = bindings
                 .iter()
                 .map(|binding| {
-                    let projection = self
-                        .lookup
-                        .pattern_binding(self.program, *binding)
-                        .ok_or(ExpansionError::MissingDeclaration(*binding))?
-                        .projection
-                        .clone();
+                    let (_, projection) = self
+                        .pattern_binding_parts(*binding)
+                        .ok_or(ExpansionError::MissingDeclaration(*binding))?;
                     Ok((*binding, projection))
                 })
                 .collect::<Result<Vec<_>, ExpansionError>>()?;
@@ -8789,12 +8800,9 @@ impl<'a> SemanticExpressionBuilder<'a> {
                             .lookup
                             .declaration(self.program, *binding)
                             .ok_or(ExpansionError::MissingDeclaration(*binding))?;
-                        let projection = self
-                            .lookup
-                            .pattern_binding(self.program, *binding)
-                            .ok_or(ExpansionError::MissingDeclaration(*binding))?
-                            .projection
-                            .clone();
+                        let (_, projection) = self
+                            .pattern_binding_parts(*binding)
+                            .ok_or(ExpansionError::MissingDeclaration(*binding))?;
                         Ok(SemanticPatternBinding {
                             name: declaration.name.clone(),
                             projection,

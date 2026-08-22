@@ -283,6 +283,8 @@ struct RuntimePackedPublicationFixture {
     authority: CheckedImageKernelAuthorityV1,
     authority_handoff: CheckedImageHandoffV4,
     call_count: usize,
+    entity_counts: RuntimePackedCheckedEntityCountsV1,
+    resource_routes: Box<[RuntimePackedCheckedResourceRouteV1]>,
 }
 
 fn runtime_packed_publication_fixture() -> RuntimePackedPublicationFixture {
@@ -352,6 +354,29 @@ fn runtime_packed_publication_fixture() -> RuntimePackedPublicationFixture {
     let authority_handoff =
         checked_image_handoff_with_call_occurrences(&rich_fields, &occurrences, Some(&authority))
             .expect("fixture derives its authority-backed checked image");
+    let entity_counts = RuntimePackedCheckedEntityCountsV1 {
+        scope_count: rich_fields.scopes.len(),
+        declaration_count: rich_fields.declarations.len(),
+        statement_count: rich_fields.statements.len(),
+        expression_count: rich_fields.expressions.len(),
+        callable_count: rich_fields.callables.len(),
+        context_formal_count: rich_fields.context_formals.len(),
+        call_count: rich_fields.calls.len(),
+        pattern_binding_count: rich_fields.pattern_bindings.len(),
+        source_count: rich_fields.sources.len(),
+        state_count: rich_fields.states.len(),
+        list_count: rich_fields.lists.len(),
+        occurrence_count: rich_fields.occurrences.len(),
+    };
+    let resource_routes = rich_fields
+        .resource_projection_requirements
+        .iter()
+        .map(|requirement| RuntimePackedCheckedResourceRouteV1 {
+            expression: requirement.expression,
+            target: requirement.target,
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     let mut packed_fields = rich_fields;
     packed_fields.calls.clear();
     let packed_construction =
@@ -363,6 +388,8 @@ fn runtime_packed_publication_fixture() -> RuntimePackedPublicationFixture {
         authority,
         authority_handoff,
         call_count,
+        entity_counts,
+        resource_routes,
     }
 }
 
@@ -474,6 +501,145 @@ fn runtime_packed_kernel_publication_seals_without_rich_call_rows() {
     receipt
         .__kernel_validate(&pairing, program.image_handoff())
         .expect("returned receipt binds the publication pairing and sealed image");
+}
+
+#[test]
+fn runtime_packed_direct_seal_consumes_only_compact_authorities() {
+    let fixture = runtime_packed_publication_fixture();
+    let publication = runtime_packed_publication_with_call_routes(
+        &fixture.authority_handoff,
+        fixture.authority.source_bundle_digest_v1,
+        fixture.authority.role,
+        &[0],
+    )
+    .expect("fixture rebuilds the packed publication");
+    let pairing = publication.__kernel_pairing();
+    let source_bundle_digest_v1 = fixture.authority.source_bundle_digest_v1;
+    let role = fixture.authority.role;
+    let seal = seal_project_runtime_packed_checked_authority_with_kernel_publication(
+        &fixture.project,
+        RuntimePackedCheckedSealContextV1 {
+            source_bundle_digest_v1,
+            role,
+            entity_counts: fixture.entity_counts,
+            resource_routes: &fixture.resource_routes,
+        },
+        fixture.authority,
+        publication,
+    )
+    .expect("compact authorities seal without CheckedProgramFields");
+
+    seal.pairing_receipt()
+        .__kernel_validate(&pairing, seal.image_handoff())
+        .expect("direct seal retains the exact publication pairing");
+    assert_eq!(
+        seal.runtime_flow_terms().expression_count(),
+        fixture.entity_counts.expression_count,
+    );
+}
+
+#[test]
+fn runtime_packed_direct_seal_checks_every_routed_domain_count() {
+    let fixture = runtime_packed_publication_fixture();
+    validate_runtime_packed_entity_routes(
+        &fixture.authority_handoff,
+        fixture.authority.role,
+        &fixture.authority.definitions,
+        fixture.entity_counts,
+        fixture.resource_routes.len(),
+    )
+    .expect("fixture has exact compact route coverage");
+
+    macro_rules! rejects_changed_count {
+        ($field:ident) => {{
+            let mut counts = fixture.entity_counts;
+            counts.$field += 1;
+            let error = validate_runtime_packed_entity_routes(
+                &fixture.authority_handoff,
+                fixture.authority.role,
+                &fixture.authority.definitions,
+                counts,
+                fixture.resource_routes.len(),
+            )
+            .expect_err(concat!(
+                "compact seal must reject a stale ",
+                stringify!($field)
+            ));
+            assert!(!error.is_empty(), "{}", stringify!($field));
+        }};
+    }
+
+    rejects_changed_count!(scope_count);
+    rejects_changed_count!(declaration_count);
+    rejects_changed_count!(statement_count);
+    rejects_changed_count!(expression_count);
+    rejects_changed_count!(callable_count);
+    rejects_changed_count!(context_formal_count);
+    rejects_changed_count!(call_count);
+    rejects_changed_count!(pattern_binding_count);
+    rejects_changed_count!(source_count);
+    rejects_changed_count!(state_count);
+    rejects_changed_count!(list_count);
+    rejects_changed_count!(occurrence_count);
+
+    let error = validate_runtime_packed_entity_routes(
+        &fixture.authority_handoff,
+        fixture.authority.role,
+        &fixture.authority.definitions,
+        fixture.entity_counts,
+        fixture.resource_routes.len() + 1,
+    )
+    .expect_err("compact seal must reject a stale resource route count");
+    assert!(error.contains("ResourceProjection"), "{error}");
+}
+
+#[test]
+fn runtime_packed_direct_seal_rejects_unrouted_domains_and_wrong_callable_projection() {
+    let fixture = runtime_packed_publication_fixture();
+    let mut unexpected = fixture.authority_handoff.clone();
+    let mut extra = unexpected
+        .entity_routes
+        .first()
+        .cloned()
+        .expect("fixture has entity routes");
+    extra.domain = CheckedImageRowDomainV2::Header;
+    extra.dense_index = 0;
+    unexpected.entity_routes.push(extra);
+    unexpected
+        .entity_routes
+        .sort_unstable_by_key(|route| (route.domain, route.dense_index));
+    let error = validate_runtime_packed_entity_routes(
+        &unexpected,
+        fixture.authority.role,
+        &fixture.authority.definitions,
+        fixture.entity_counts,
+        fixture.resource_routes.len(),
+    )
+    .expect_err("compact seal must reject a route for an anonymous row domain");
+    assert!(
+        error.contains("Header") && error.contains("invalid region"),
+        "{error}"
+    );
+
+    let mut wrong_callable = fixture.authority_handoff.clone();
+    let root_projection = wrong_callable
+        .entity_projection(CheckedImageRowDomainV2::Scope, 0)
+        .expect("fixture has root Scope route");
+    wrong_callable
+        .entity_routes
+        .iter_mut()
+        .find(|route| route.domain == CheckedImageRowDomainV2::Callable)
+        .expect("fixture has a Callable route")
+        .projection = root_projection;
+    let error = validate_runtime_packed_entity_routes(
+        &wrong_callable,
+        fixture.authority.role,
+        &fixture.authority.definitions,
+        fixture.entity_counts,
+        fixture.resource_routes.len(),
+    )
+    .expect_err("compact seal must reject a Callable route outside its interface sibling");
+    assert!(error.contains("interface sibling"), "{error}");
 }
 
 #[test]
